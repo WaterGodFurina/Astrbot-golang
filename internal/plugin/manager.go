@@ -349,6 +349,23 @@ func (m *Manager) List() []*LoadedPlugin {
 	return result
 }
 
+// ListInfo returns plugin info as serializable maps.
+func (m *Manager) ListInfo() []map[string]interface{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make([]map[string]interface{}, 0, len(m.plugins))
+	for _, p := range m.plugins {
+		result = append(result, map[string]interface{}{
+			"name":        p.Name,
+			"version":     p.Version,
+			"description": p.Description,
+			"path":        p.Path,
+			"loaded":      p.so != nil,
+		})
+	}
+	return result
+}
+
 // AllCommands returns command handlers from all loaded plugins.
 func (m *Manager) AllCommands() []CommandHandler {
 	m.mu.RLock()

@@ -19,8 +19,8 @@ func TestIssue9512_DictKeysNotCleared(t *testing.T) {
 		"provider_settings": map[string]interface{}{
 			"max_context_length": 50,
 		},
-		"plugin_config":  map[string]interface{}{}, // empty dict
-		"wake_prefix":    "/",
+		"plugin_config": map[string]interface{}{}, // empty dict
+		"wake_prefix":   "/",
 	}
 
 	// Write a user config that has extra keys in the dict
@@ -67,6 +67,6 @@ func TestIssue9512_DictKeysNotCleared(t *testing.T) {
 		// but it should not have removed anything
 	}
 
-	_ = cfgPath // used for potential file operations
+	_ = cfgPath      // used for potential file operations
 	_ = os.WriteFile // referenced to avoid unused import
 }

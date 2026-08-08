@@ -28,9 +28,9 @@ type Job struct {
 
 // CronJobManager manages scheduled tasks.
 type CronJobManager struct {
-	mu    sync.Mutex
-	jobs  map[string]*Job
-	stop  chan struct{}
+	mu   sync.Mutex
+	jobs map[string]*Job
+	stop chan struct{}
 }
 
 // NewCronJobManager creates a manager.
@@ -111,6 +111,22 @@ func (m *CronJobManager) List() []*Job {
 	result := make([]*Job, 0, len(m.jobs))
 	for _, j := range m.jobs {
 		result = append(result, j)
+	}
+	return result
+}
+
+// ListInfo returns job info as serializable maps.
+func (m *CronJobManager) ListInfo() []map[string]interface{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]map[string]interface{}, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		result = append(result, map[string]interface{}{
+			"id":       j.ID,
+			"name":     j.Name,
+			"schedule": j.Schedule,
+			"next_run": j.NextRun.Unix(),
+		})
 	}
 	return result
 }

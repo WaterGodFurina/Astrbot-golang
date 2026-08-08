@@ -12,9 +12,9 @@ type mockEvent struct {
 	messages *message.MessageChain
 }
 
-func (m *mockEvent) GetUnifiedMsgOrigin() string               { return m.origin }
-func (m *mockEvent) GetSenderID() string                       { return m.senderID }
-func (m *mockEvent) GetMessages() *message.MessageChain       { return m.messages }
+func (m *mockEvent) GetUnifiedMsgOrigin() string        { return m.origin }
+func (m *mockEvent) GetSenderID() string                { return m.senderID }
+func (m *mockEvent) GetMessages() *message.MessageChain { return m.messages }
 
 // TestIssue9377_SessionBoundToSender verifies the fix for issue #9377:
 // In a group chat, a session_waiter should only trigger for the original
@@ -23,12 +23,12 @@ func TestIssue9377_SessionBoundToSender(t *testing.T) {
 	originalSender := &mockEvent{
 		origin:   "aiocqhttp:group_12345",
 		senderID: "user_alice",
-		messages: &message.MessageChain{Components: []message.Component{}},
+		messages: &message.MessageChain{Chain: []message.Component{}},
 	}
 	otherMember := &mockEvent{
 		origin:   "aiocqhttp:group_12345",
 		senderID: "user_bob",
-		messages: &message.MessageChain{Components: []message.Component{}},
+		messages: &message.MessageChain{Chain: []message.Component{}},
 	}
 
 	// Create a session with DefaultSessionFilter

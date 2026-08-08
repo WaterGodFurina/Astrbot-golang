@@ -26,10 +26,10 @@ type Event interface {
 
 // SessionController controls a single session's lifecycle.
 type SessionController struct {
-	mu           sync.Mutex
-	done         chan struct{}
-	err          error
-	timer        *time.Timer
+	mu            sync.Mutex
+	done          chan struct{}
+	err           error
+	timer         *time.Timer
 	historyChains []*message.MessageChain
 }
 

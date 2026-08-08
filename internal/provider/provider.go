@@ -1,276 +1,284 @@
-// Package provider implements LLM provider management and request decoration.
-// Ported from astrbot/core/provider/ and astrbot/core/astr_main_agent.py
-//
-// Bug fix for issue #9573: UMO max_context_length not taking effect.
-// The Python code used `or` short-circuit:
-//   cfg = config.provider_settings or plugin_context.get_config(umo=...).get("provider_settings", {})
-// Since global provider_settings is always a non-empty dict, the UMO-specific
-// config was never fetched. Fix: merge global + UMO configs, with UMO overriding.
+// Package provider implements LLM provider interfaces and management.
+// Ported from astrbot/core/provider/provider.py and manager.py
 package provider
 
 import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
+
+	"github.com/AstrBotDevs/AstrBot/internal/log"
 )
 
-// ProviderType identifies an LLM provider type.
+var logger = log.GetDefault().WithComponent("Provider")
+
+// ProviderType identifies the category of a provider.
 type ProviderType string
 
 const (
-	ProviderOpenAI    ProviderType = "openai"
-	ProviderAnthropic ProviderType = "anthropic"
-	ProviderGemini    ProviderType = "gemini"
-	ProviderDashScope ProviderType = "dashscope"
-	ProviderCustom    ProviderType = "custom"
+	ProviderTypeChat      ProviderType = "chat_completion"
+	ProviderTypeSTT       ProviderType = "speech_to_text"
+	ProviderTypeTTS       ProviderType = "text_to_speech"
+	ProviderTypeEmbedding ProviderType = "embedding"
+	ProviderTypeRerank    ProviderType = "rerank"
 )
 
-// Provider is the interface every LLM provider implements.
-type Provider interface {
-	ID() string
-	Type() ProviderType
-	Chat(ctx context.Context, req *Request) (*Response, error)
-	Embed(ctx context.Context, text string) ([]float32, error)
+// AbstractProvider is the base interface all providers implement.
+type AbstractProvider interface {
+	// Meta returns provider metadata.
+	Meta() ProviderMeta
+	// SetModel sets the current model name.
+	SetModel(model string)
+	// GetModel returns the current model name.
+	GetModel() string
+	// Test verifies the provider is working.
+	Test(ctx context.Context) error
 }
 
-// Request is an LLM request.
-type Request struct {
-	Model          string
-	SystemPrompt   string
-	Messages       []Message
-	Tools          []ToolDefinition
-	MaxTokens      int
-	Temperature    float64
-	Stream         bool
-	SessionID      string
-	ImageURLs      []string
-	AudioURLs      []string
-	ExtraHeaders   map[string]string
+// ChatProvider handles LLM text chat.
+type ChatProvider interface {
+	AbstractProvider
+	// TextChat sends a chat request and returns a response.
+	TextChat(ctx context.Context, req *ProviderRequest) (*LLMResponse, error)
+	// TextChatStream sends a chat request and returns a streaming response channel.
+	TextChatStream(ctx context.Context, req *ProviderRequest) (<-chan *LLMResponse, error)
 }
 
-// Message is a single message in the conversation.
-type Message struct {
-	Role       string // "system", "user", "assistant", "tool"
-	Content    string
-	ToolCalls  []ToolCall
-	ToolCallID string
-	Timestamp  time.Time
+// STTProvider handles speech-to-text.
+type STTProvider interface {
+	AbstractProvider
+	GetText(ctx context.Context, audioURL string) (string, error)
 }
 
-// ToolCall represents a tool invocation by the LLM.
-type ToolCall struct {
-	ID        string
-	Name      string
-	Arguments string // JSON string
+// TTSProvider handles text-to-speech.
+type TTSProvider interface {
+	AbstractProvider
+	GetAudio(ctx context.Context, text string) (string, error)
+	SupportStream() bool
 }
 
-// ToolDefinition describes an LLM-callable tool.
-// FIXED #9533: tool names are sanitized to match ^[a-zA-Z0-9_-]+$
-type ToolDefinition struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	Parameters  interface{} `json:"parameters"`
+// EmbeddingProvider handles text embeddings.
+type EmbeddingProvider interface {
+	AbstractProvider
+	GetEmbedding(ctx context.Context, text string) ([]float32, error)
+	GetEmbeddings(ctx context.Context, texts []string) ([][]float32, error)
+	GetDim() int
 }
 
-// SanitizeToolName replaces invalid characters in tool names.
-// Issue #9533: MCP tool names containing "." caused LLM API rejection.
-func SanitizeToolName(name string) string {
-	var out []byte
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		if (c >= 'a' && c <= 'z') ||
-			(c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') ||
-			c == '_' || c == '-' {
-			out = append(out, c)
-		} else {
-			out = append(out, '_')
-		}
+// RerankProvider handles document reranking.
+type RerankProvider interface {
+	AbstractProvider
+	Rerank(ctx context.Context, query string, documents []string, topN int) ([]*RerankResult, error)
+}
+
+// BaseProvider provides common provider state.
+type BaseProvider struct {
+	mu               sync.RWMutex
+	modelName        string
+	providerConfig   map[string]interface{}
+	providerSettings map[string]interface{}
+}
+
+// SetModel sets the current model.
+func (b *BaseProvider) SetModel(model string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.modelName = model
+}
+
+// GetModel returns the current model.
+func (b *BaseProvider) GetModel() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.modelName
+}
+
+// Config returns the provider config.
+func (b *BaseProvider) Config() map[string]interface{} {
+	return b.providerConfig
+}
+
+// Settings returns the provider settings.
+func (b *BaseProvider) Settings() map[string]interface{} {
+	return b.providerSettings
+}
+
+// Meta returns provider metadata.
+func (b *BaseProvider) Meta() ProviderMeta {
+	id, _ := b.providerConfig["id"].(string)
+	if id == "" {
+		id = "default"
 	}
-	if len(out) == 0 {
-		return "tool"
+	typeName, _ := b.providerConfig["type"].(string)
+	return ProviderMeta{
+		ID:           id,
+		Model:        b.GetModel(),
+		Type:         typeName,
+		ProviderType: CapChatCompletion,
 	}
-	return string(out)
 }
 
-// Response is an LLM response.
-type Response struct {
-	Content      string
-	ToolCalls    []ToolCall
-	FinishReason string
-	Usage        Usage
+// Test verifies the provider. Override in implementations.
+func (b *BaseProvider) Test(ctx context.Context) error {
+	return fmt.Errorf("test not implemented for this provider")
 }
 
-// Usage tracks token usage.
-type Usage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens       int
+// NewBaseProvider creates a base provider.
+func NewBaseProvider(config, settings map[string]interface{}) BaseProvider {
+	model, _ := config["model"].(string)
+	return BaseProvider{
+		modelName:        model,
+		providerConfig:   config,
+		providerSettings: settings,
+	}
 }
 
-// ProviderSettings contains per-provider configuration.
-type ProviderSettings struct {
-	MaxContextLength    int      `json:"max_context_length"`
-	DequeueContextLength int     `json:"dequeue_context_length"`
-	PromptPrefix        string   `json:"prompt_prefix"`
-	EnableWebSearch     bool     `json:"enable_web_search"`
-	WebSearchProviders  []string `json:"web_search_providers"`
-	RequestMaxRetries   int      `json:"request_max_retries"`
+// ProviderManager manages all registered providers.
+type ProviderManager struct {
+	mu         sync.RWMutex
+	providers  map[string]AbstractProvider
+	chatProvID string // default chat provider ID
+	sttProvID  string // default STT provider ID
+	ttsProvID  string // default TTS provider ID
+	embProvID  string // default embedding provider ID
 }
 
-// ProviderConfig represents the configuration for a provider instance.
-type ProviderConfig struct {
-	ID             string
-	Type           ProviderType
-	APIKey         string
-	APIBase        string
-	Model          string
-	ProxyURL       string
-	CACertPath     string
-	Timeout        time.Duration
-	Settings       ProviderSettings
-}
-
-// Manager manages all provider instances.
-type Manager struct {
-	mu        sync.RWMutex
-	providers map[string]Provider
-	defaultID string
-}
-
-// NewManager creates an empty provider manager.
-func NewManager() *Manager {
-	return &Manager{providers: make(map[string]Provider)}
+// NewProviderManager creates a manager.
+func NewProviderManager() *ProviderManager {
+	return &ProviderManager{providers: make(map[string]AbstractProvider)}
 }
 
 // Register adds a provider.
-func (m *Manager) Register(p Provider) {
-	m.mu.Lock()
-	m.providers[p.ID()] = p
-	if m.defaultID == "" {
-		m.defaultID = p.ID()
-	}
-	m.mu.Unlock()
+func (pm *ProviderManager) Register(id string, p AbstractProvider) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.providers[id] = p
+	logger.Info("Registered provider: %s (type=%s, model=%s)", id, p.Meta().Type, p.GetModel())
+}
+
+// Unregister removes a provider.
+func (pm *ProviderManager) Unregister(id string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	delete(pm.providers, id)
 }
 
 // Get returns a provider by ID.
-func (m *Manager) Get(id string) Provider {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.providers[id]
+func (pm *ProviderManager) Get(id string) AbstractProvider {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.providers[id]
 }
 
-// GetDefault returns the default provider.
-func (m *Manager) GetDefault() Provider {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.defaultID == "" {
-		return nil
-	}
-	return m.providers[m.defaultID]
-}
-
-// All returns all providers.
-func (m *Manager) All() []Provider {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	result := make([]Provider, 0, len(m.providers))
-	for _, p := range m.providers {
-		result = append(result, p)
-	}
-	return result
-}
-
-// MergeProviderSettings merges global and UMO-specific settings.
-// UMO settings override global ones.
-// FIXED #9573: Python code used `or` short-circuit which always chose global.
-func MergeProviderSettings(global, umo ProviderSettings) ProviderSettings {
-	merged := global // start with global
-
-	// UMO overrides global for non-zero/non-empty values
-	if umo.MaxContextLength != 0 {
-		merged.MaxContextLength = umo.MaxContextLength
-	}
-	if umo.DequeueContextLength != 0 {
-		merged.DequeueContextLength = umo.DequeueContextLength
-	}
-	if umo.PromptPrefix != "" {
-		merged.PromptPrefix = umo.PromptPrefix
-	}
-	if umo.EnableWebSearch {
-		merged.EnableWebSearch = umo.EnableWebSearch
-	}
-	if len(umo.WebSearchProviders) > 0 {
-		merged.WebSearchProviders = umo.WebSearchProviders
-	}
-	if umo.RequestMaxRetries != 0 {
-		merged.RequestMaxRetries = umo.RequestMaxRetries
-	}
-	return merged
-}
-
-// DecorateLLMRequest applies configuration to an LLM request.
-// FIXED #9573: Merge global + UMO settings instead of `or` short-circuit.
-func DecorateLLMRequest(req *Request, globalSettings, umoSettings ProviderSettings) {
-	// Merge settings: UMO overrides global (fix for #9573)
-	cfg := MergeProviderSettings(globalSettings, umoSettings)
-
-	// Apply prompt prefix
-	if cfg.PromptPrefix != "" {
-		req.SystemPrompt = cfg.PromptPrefix + "\n" + req.SystemPrompt
-	}
-
-	// Sanitize tool names (fix for #9533)
-	for i := range req.Tools {
-		req.Tools[i].Name = SanitizeToolName(req.Tools[i].Name)
-	}
-}
-
-// EnforceMaxTurns trims the message history to maxTurns.
-// If maxTurns is -1, no limit is applied.
-func EnforceMaxTurns(messages []Message, maxTurns int) []Message {
-	if maxTurns < 0 || maxTurns >= len(messages) {
-		return messages
-	}
-	// Keep the system message if present
-	var system []Message
-	var rest []Message
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			system = append(system, msg)
-		} else {
-			rest = append(rest, msg)
+// GetChatProvider returns the default chat provider.
+func (pm *ProviderManager) GetChatProvider() ChatProvider {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.chatProvID != "" {
+		if p, ok := pm.providers[pm.chatProvID].(ChatProvider); ok {
+			return p
 		}
 	}
-	if maxTurns < len(rest) {
-		rest = rest[len(rest)-maxTurns:]
-	}
-	return append(system, rest...)
-}
-
-// FormatContext generates the system prompt with context.
-func FormatContext(messages []Message, maxTokens int) string {
-	var parts []string
-	for _, msg := range messages {
-		role := msg.Role
-		content := msg.Content
-		if role == "system" {
-			parts = append(parts, content)
-		} else {
-			parts = append(parts, fmt.Sprintf("%s: %s", role, content))
+	// Fallback: find first chat provider
+	for _, p := range pm.providers {
+		if cp, ok := p.(ChatProvider); ok {
+			return cp
 		}
 	}
-	return joinStrings(parts, "\n")
+	return nil
 }
 
-func joinStrings(parts []string, sep string) string {
-	if len(parts) == 0 {
-		return ""
+// GetSTTProvider returns the default STT provider.
+func (pm *ProviderManager) GetSTTProvider() STTProvider {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.sttProvID != "" {
+		if p, ok := pm.providers[pm.sttProvID].(STTProvider); ok {
+			return p
+		}
 	}
-	result := parts[0]
-	for _, p := range parts[1:] {
-		result += sep + p
+	for _, p := range pm.providers {
+		if sp, ok := p.(STTProvider); ok {
+			return sp
+		}
 	}
-	return result
+	return nil
+}
+
+// GetTTSProvider returns the default TTS provider.
+func (pm *ProviderManager) GetTTSProvider() TTSProvider {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.ttsProvID != "" {
+		if p, ok := pm.providers[pm.ttsProvID].(TTSProvider); ok {
+			return p
+		}
+	}
+	for _, p := range pm.providers {
+		if tp, ok := p.(TTSProvider); ok {
+			return tp
+		}
+	}
+	return nil
+}
+
+// GetEmbeddingProvider returns the default embedding provider.
+func (pm *ProviderManager) GetEmbeddingProvider() EmbeddingProvider {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.embProvID != "" {
+		if p, ok := pm.providers[pm.embProvID].(EmbeddingProvider); ok {
+			return p
+		}
+	}
+	for _, p := range pm.providers {
+		if ep, ok := p.(EmbeddingProvider); ok {
+			return ep
+		}
+	}
+	return nil
+}
+
+// SetDefaultChatProvider sets the default chat provider ID.
+func (pm *ProviderManager) SetDefaultChatProvider(id string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.chatProvID = id
+}
+
+// SetDefaultSTTProvider sets the default STT provider ID.
+func (pm *ProviderManager) SetDefaultSTTProvider(id string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.sttProvID = id
+}
+
+// SetDefaultTTSProvider sets the default TTS provider ID.
+func (pm *ProviderManager) SetDefaultTTSProvider(id string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.ttsProvID = id
+}
+
+// SetDefaultEmbeddingProvider sets the default embedding provider ID.
+func (pm *ProviderManager) SetDefaultEmbeddingProvider(id string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.embProvID = id
+}
+
+// All returns all provider IDs.
+func (pm *ProviderManager) All() []string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	ids := make([]string, 0, len(pm.providers))
+	for id := range pm.providers {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// Close cleans up all providers.
+func (pm *ProviderManager) Close() {
+	// Nothing to do for now; individual providers may implement io.Closer
 }

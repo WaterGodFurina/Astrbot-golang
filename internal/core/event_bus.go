@@ -36,21 +36,50 @@ type EventSource struct {
 	IsAdmin    bool
 }
 
-// Event represents an incoming message event.
-type Event struct {
-	Type        EventType
-	Source      EventSource
-	Message     *message.MessageChain
-	RawMessage  string
+// MessageObj holds the raw platform message metadata.
+type MessageObj struct {
+	MessageID   string
+	SelfID      string
+	SessionID   string
+	MessageType string // GroupMessage, FriendMessage, OtherMessage
+	Platform    string
 	MessageStr  string
+	RawMessage  interface{}
 	Timestamp   time.Time
-	Reply       *Event // quoted reply target
-	Metadata    map[string]interface{}
 }
 
-// GetUnifiedMsgOrigin returns platform:conversation_id.
-func (e *Event) GetUnifiedMsgOrigin() string {
+// Event represents an incoming message event.
+// Ported from astrbot/core/platform/astr_message_event.py
+type Event struct {
+	Type       EventType
+	Source     EventSource
+	Message    *message.MessageChain
+	RawMessage string
+	MessageStr string
+	Timestamp  time.Time
+	Reply      *Event // quoted reply target
+	Metadata   map[string]interface{}
+
+	// Pipeline state
+	MessageObj        *MessageObj
+	PlainText         string
+	IsAtOrWakeCommand bool
+	WakeCommand       string
+	CallLLM           bool
+	Role              string // "user", "admin", etc.
+	Result            *message.MessageEventResult
+	stopped           bool
+	HasSendOper       bool
+}
+
+// UnifiedMsgOrigin returns platform:conversation_id.
+func (e *Event) UnifiedMsgOrigin() string {
 	return fmt.Sprintf("%s:%s", e.Source.Platform, e.Source.ConvID)
+}
+
+// GetUnifiedMsgOrigin returns platform:conversation_id (alias).
+func (e *Event) GetUnifiedMsgOrigin() string {
+	return e.UnifiedMsgOrigin()
 }
 
 // GetSenderID returns the sender's user ID.
@@ -63,26 +92,95 @@ func (e *Event) GetMessages() *message.MessageChain {
 	return e.Message
 }
 
+// GetMessageType returns "GroupMessage" or "FriendMessage".
+func (e *Event) GetMessageType() string {
+	if e.Source.IsGroup {
+		return "GroupMessage"
+	}
+	return "FriendMessage"
+}
+
+// GetGroupID returns the group ID or empty string.
+func (e *Event) GetGroupID() string {
+	if e.Source.IsGroup {
+		return e.Source.ConvID
+	}
+	return ""
+}
+
+// GetPlatformID returns the platform name.
+func (e *Event) GetPlatformID() string {
+	return e.Source.Platform
+}
+
+// Stop marks the event as stopped (no further stage processing).
+func (e *Event) Stop() {
+	e.stopped = true
+}
+
+// IsStopped returns true if the event was stopped.
+func (e *Event) IsStopped() bool {
+	return e.stopped
+}
+
+// SetResult sets the event result.
+func (e *Event) SetResult(result *message.MessageEventResult) {
+	e.Result = result
+}
+
+// GetResult returns the event result.
+func (e *Event) GetResult() *message.MessageEventResult {
+	return e.Result
+}
+
+// ClearResult clears the event result.
+func (e *Event) ClearResult() {
+	e.Result = nil
+}
+
+// SetExtra sets a metadata key.
+func (e *Event) SetExtra(key string, value interface{}) {
+	if e.Metadata == nil {
+		e.Metadata = make(map[string]interface{})
+	}
+	e.Metadata[key] = value
+}
+
+// GetExtra returns a metadata value.
+func (e *Event) GetExtra(key string) interface{} {
+	return e.Metadata[key]
+}
+
+// HasSendOper returns whether a send operation was performed.
+func (e *Event) HasSend() bool {
+	return e.HasSendOper
+}
+
 // PipelineStage processes events in sequence.
 type PipelineStage interface {
 	Name() string
 	Process(ctx context.Context, event *Event) (*StageResult, error)
 }
 
+// EventBusPublisher is the interface for publishing events (used by platform adapters).
+type EventBusPublisher interface {
+	Publish(event *Event) error
+}
+
 // StageResult controls pipeline flow.
 type StageResult struct {
-	Continue  bool   // true = continue to next stage, false = stop
-	Reply     string // immediate reply text (if any)
+	Continue   bool   // true = continue to next stage, false = stop
+	Reply      string // immediate reply text (if any)
 	ReplyChain *message.MessageChain
-	Error     error
+	Error      error
 }
 
 // EventBus dispatches events to pipeline schedulers.
 type EventBus struct {
-	mu        sync.RWMutex
+	mu         sync.RWMutex
 	schedulers map[string]*PipelineScheduler // keyed by config_id
-	queue     chan *Event
-	stopCh    chan struct{}
+	queue      chan *Event
+	stopCh     chan struct{}
 }
 
 // NewEventBus creates a new event bus.
@@ -134,6 +232,7 @@ func (bus *EventBus) Stop() {
 }
 
 func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
+	logger.Info("EventBus: dispatching message %q (schedulers=%d)", event.MessageStr, len(bus.schedulers))
 	bus.mu.RLock()
 	defer bus.mu.RUnlock()
 
@@ -165,15 +264,24 @@ func (s *PipelineScheduler) AddStage(stage PipelineStage) {
 }
 
 // Process runs the event through all stages.
-func (s *PipelineScheduler) Process(ctx context.Context, event *Event) (*StageResult, error) {
+func (s *PipelineScheduler) Process(ctx context.Context, event *Event) (result *StageResult, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Pipeline panic while processing event %q: %v", event.MessageStr, r)
+			result = &StageResult{Continue: true}
+			err = nil
+		}
+	}()
 	for _, stage := range s.stages {
-		result, err := stage.Process(ctx, event)
+		result, err = stage.Process(ctx, event)
 		if err != nil {
 			return nil, fmt.Errorf("stage %s: %w", stage.Name(), err)
 		}
 		if result != nil && !result.Continue {
+			logger.Info("Pipeline: stage %s stopped event %q", stage.Name(), event.MessageStr)
 			return result, nil
 		}
 	}
+	logger.Info("Pipeline: all stages passed for %q", event.MessageStr)
 	return &StageResult{Continue: false}, nil
 }

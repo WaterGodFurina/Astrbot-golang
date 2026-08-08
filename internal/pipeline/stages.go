@@ -1,14 +1,33 @@
 // Package pipeline implements the message processing stages.
 // Ported from astrbot/core/pipeline/
+//
+// The pipeline processes events through 9 ordered stages:
+//  1. WakingCheckStage      - Check wake conditions
+//  2. WhitelistCheckStage   - Check whitelist/blacklist
+//  3. SessionStatusCheckStage - Check session enabled
+//  4. RateLimitStage         - Check rate limit
+//  5. ContentSafetyCheckStage - Check content safety
+//  6. PreProcessStage        - Preprocess media, STT, path mapping
+//  7. ProcessStage           - Plugin handler execution + LLM agent
+//  8. ResultDecorateStage    - Decorate result (prefix, T2I, TTS, etc.)
+//  9. RespondStage           - Send message chain to platform
 package pipeline
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/AstrBotDevs/AstrBot/internal/contentsafety"
+	"github.com/AstrBotDevs/AstrBot/internal/conversation"
 	"github.com/AstrBotDevs/AstrBot/internal/core"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/AstrBotDevs/AstrBot/internal/platform"
+	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/AstrBotDevs/AstrBot/internal/ratelimit"
+	"github.com/AstrBotDevs/AstrBot/internal/star"
 	"github.com/AstrBotDevs/AstrBot/pkg/message"
 )
 
@@ -17,195 +36,1118 @@ var logger = log.GetDefault().WithComponent("Pipeline")
 // StageResult controls pipeline flow after a stage.
 type StageResult = core.StageResult
 
-// WhitelistCheckStage filters events by whitelist/blacklist.
-type WhitelistCheckStage struct {
-	whitelist map[string]bool
-	blacklist map[string]bool
+// PipelineContext provides shared context for all stages.
+type PipelineContext struct {
+	AstrbotConfig  map[string]interface{}
+	PluginManager  *star.Manager
+	ConvManager    *conversation.Manager
+	SessionService *conversation.SessionServiceManager
+	PlatformMgr    *platform.PlatformManager
+	// PersonaResolver resolves a persona's system prompt by conversation UMO
+	// and persona id. Optional.
+	PersonaResolver func(umo, personaID string) string
 }
 
-// NewWhitelistCheckStage creates the stage.
-func NewWhitelistCheckStage() *WhitelistCheckStage {
-	return &WhitelistCheckStage{
-		whitelist: make(map[string]bool),
-		blacklist: make(map[string]bool),
-	}
+// PipelineStage is the interface every stage must implement.
+type PipelineStage interface {
+	Name() string
+	Initialize(ctx *PipelineContext) error
+	Process(ctx context.Context, event *core.Event) (*StageResult, error)
 }
 
-// Name returns the stage name.
-func (s *WhitelistCheckStage) Name() string { return "whitelist_check" }
+// ---------------------------------------------------------------------------
+// Stage 1: WakingCheckStage
+// ---------------------------------------------------------------------------
 
-// SetWhitelist replaces the whitelist.
-func (s *WhitelistCheckStage) SetWhitelist(ids []string) {
-	s.whitelist = make(map[string]bool, len(ids))
-	for _, id := range ids {
-		s.whitelist[id] = true
-	}
-}
-
-// SetBlacklist replaces the blacklist.
-func (s *WhitelistCheckStage) SetBlacklist(ids []string) {
-	s.blacklist = make(map[string]bool, len(ids))
-	for _, id := range ids {
-		s.blacklist[id] = true
-	}
-}
-
-// Process checks if the event's sender is allowed.
-func (s *WhitelistCheckStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
-	// Whitelist is not yet configured -> allow all
-	if len(s.whitelist) == 0 && len(s.blacklist) == 0 {
-		return &StageResult{Continue: true}, nil
-	}
-
-	senderKey := event.Source.Platform + ":" + event.Source.SenderID
-	if s.blacklist[senderKey] {
-		return &StageResult{Continue: false}, nil
-	}
-	if len(s.whitelist) > 0 && !s.whitelist[senderKey] {
-		return &StageResult{Continue: false}, nil
-	}
-	return &StageResult{Continue: true}, nil
-}
-
-// WakingCheckStage determines if the bot should respond (wake prefix, @mention).
+// WakingCheckStage checks whether the bot should wake up for this message.
+// Ported from astrbot/core/pipeline/waking_check/stage.py
 type WakingCheckStage struct {
-	mu          sync.RWMutex
-	wakePrefix  string
-	botID       string
+	wakePrefixes []string
+	nickname     []string
+	wakeByAt     bool
+	wakeByPrefix bool
+	wakeByFriend bool
+	cmdPrefix    string
+	aiWakePrefix string
 }
 
-// NewWakingCheckStage creates the stage.
-func NewWakingCheckStage(botID, wakePrefix string) *WakingCheckStage {
+func NewWakingCheckStage() *WakingCheckStage {
 	return &WakingCheckStage{
-		botID:      botID,
-		wakePrefix: wakePrefix,
+		wakeByAt:     true,
+		wakeByPrefix: true,
+		// Friend messages require an explicit wake prefix by default (user-facing
+		// behavior: chat must be triggered with "<prefix>[ai word] <text>").
+		wakeByFriend: false,
+		cmdPrefix:    "/",
 	}
 }
 
-// Name returns the stage name.
 func (s *WakingCheckStage) Name() string { return "waking_check" }
 
-// Process checks wake conditions.
+func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
+	// wake_prefix lives at the top level of the config (astrbot/core/config/default.py:294),
+	// not inside platform_settings.
+	if raw, ok := ctx.AstrbotConfig["wake_prefix"]; ok {
+		switch v := raw.(type) {
+		case []interface{}:
+			for _, p := range v {
+				if str, ok := p.(string); ok && str != "" {
+					s.wakePrefixes = append(s.wakePrefixes, str)
+				}
+			}
+		case []string:
+			for _, str := range v {
+				if str != "" {
+					s.wakePrefixes = append(s.wakePrefixes, str)
+				}
+			}
+		case string:
+			if v != "" {
+				s.wakePrefixes = append(s.wakePrefixes, v)
+			}
+		}
+	}
+	// Fall back to the "/" command prefix (Python DEFAULT_CONFIG ships wake_prefix=["/"])
+	if len(s.wakePrefixes) == 0 && s.cmdPrefix != "" {
+		s.wakePrefixes = append(s.wakePrefixes, s.cmdPrefix)
+	}
+	if platformSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
+		if nicknames, ok := platformSettings["nickname"].([]interface{}); ok {
+			for _, n := range nicknames {
+				if str, ok := n.(string); ok && str != "" {
+					s.nickname = append(s.nickname, str)
+				}
+			}
+		}
+		if v, ok := platformSettings["wake_by_at"].(bool); ok {
+			s.wakeByAt = v
+		}
+		if v, ok := platformSettings["wake_by_prefix"].(bool); ok {
+			s.wakeByPrefix = v
+		}
+		if v, ok := platformSettings["wake_by_friend"].(bool); ok {
+			s.wakeByFriend = v
+		}
+		// friend_message_needs_wake_prefix=true means friend chat must use a prefix.
+		if v, ok := platformSettings["friend_message_needs_wake_prefix"].(bool); ok && v {
+			s.wakeByFriend = false
+		}
+	}
+
+	// AI wake word: provider_settings.wake_prefix (e.g. "ai").
+	// When set, LLM chat requires "<prefix><ai word> <text>".
+	if providerSettings, ok := ctx.AstrbotConfig["provider_settings"].(map[string]interface{}); ok {
+		if v, ok := providerSettings["wake_prefix"].(string); ok {
+			s.aiWakePrefix = strings.TrimSpace(v)
+		}
+	}
+
+	// Command prefix
+	if cmdSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
+		if v, ok := cmdSettings["cmd_prefix"].(string); ok && v != "" {
+			s.cmdPrefix = v
+		}
+	}
+
+	logger.Info("WakingCheck initialized: prefixes=%v, nicknames=%v, wakeByAt=%v, wakeByPrefix=%v, wakeByFriend=%v, aiWakePrefix=%q",
+		s.wakePrefixes, s.nickname, s.wakeByAt, s.wakeByPrefix, s.wakeByFriend, s.aiWakePrefix)
+	return nil
+}
+
 func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
-	if event.Source.IsAdmin {
-		event.Source.IsAtBot = true
+	// If the event already has is_at_or_wake_command set, skip
+	if event.IsAtOrWakeCommand {
 		return &StageResult{Continue: true}, nil
 	}
 
-	// Check @bot
-	if event.Message != nil {
-		for _, comp := range event.Message.Components {
-			if at, ok := comp.(*message.At); ok && at.TargetID == s.botID {
-				event.Source.IsAtBot = true
+	// Use the pure-text message string (Python's event.message_str), which
+	// excludes At components, so "/help" is matched by the "/" wake prefix.
+	text := event.MessageStr
+	if text == "" {
+		text = event.PlainText
+	}
+	if text == "" {
+		text = extractPlainText(event.Message)
+	}
+	logger.Info("WakingCheck: text=%q plaintext=%q prefixes=%v wakeByPrefix=%v wakeByFriend=%v isGroup=%v",
+		text, event.PlainText, s.wakePrefixes, s.wakeByPrefix, s.wakeByFriend, event.Source.IsGroup)
+
+	// Check wake prefixes
+	if s.wakeByPrefix && len(s.wakePrefixes) > 0 {
+		for _, prefix := range s.wakePrefixes {
+			if strings.HasPrefix(text, prefix) {
+				s.applyPrefixWake(event, text, prefix)
 				return &StageResult{Continue: true}, nil
 			}
 		}
 	}
 
-	// Check wake prefix
-	msgStr := strings.TrimSpace(event.MessageStr)
-	s.mu.RLock()
-	prefix := s.wakePrefix
-	s.mu.RUnlock()
+	// Check nicknames
+	if s.wakeByPrefix && len(s.nickname) > 0 {
+		for _, nick := range s.nickname {
+			if strings.Contains(text, nick) {
+				event.IsAtOrWakeCommand = true
+				event.SetExtra("llm_wake", false)
+				logger.Debug("Woken by nickname '%s'", nick)
+				return &StageResult{Continue: true}, nil
+			}
+		}
+	}
 
-	if prefix != "" && strings.HasPrefix(msgStr, prefix) {
-		event.Source.IsAtBot = true
-		event.MessageStr = strings.TrimPrefix(msgStr, prefix)
+	// Check @mention
+	if s.wakeByAt && event.Message != nil {
+		for _, comp := range event.Message.Chain {
+			if at, ok := comp.(*message.At); ok {
+				if at.TargetID == event.Source.SelfID {
+					event.IsAtOrWakeCommand = true
+					// Group @-wake also supports prefix chat: "@bot /你好" triggers LLM.
+					atText := strings.TrimSpace(text)
+					matched := false
+					if s.wakeByPrefix && len(s.wakePrefixes) > 0 {
+						for _, prefix := range s.wakePrefixes {
+							if strings.HasPrefix(atText, prefix) {
+								s.applyPrefixWake(event, atText, prefix)
+								matched = true
+								break
+							}
+						}
+					}
+					if !matched {
+						event.SetExtra("llm_wake", false)
+						logger.Debug("Woken by @mention (no prefix, chat disabled)")
+					}
+					return &StageResult{Continue: true}, nil
+				}
+			}
+			if _, ok := comp.(*message.AtAll); ok {
+				// AtAll does not wake the bot by default
+				continue
+			}
+		}
+	}
+
+	// Friend messages wake (configurable)
+	if s.wakeByFriend && !event.Source.IsGroup {
+		event.IsAtOrWakeCommand = true
+		event.SetExtra("llm_wake", false)
 		return &StageResult{Continue: true}, nil
 	}
 
-	// Private message always wakes
-	if !event.Source.IsGroup {
-		event.Source.IsAtBot = true
-		return &StageResult{Continue: true}, nil
-	}
-
-	return &StageResult{Continue: false}, nil
+	// Not woken — allow plugin handlers to decide (they may have their own filters)
+	// In Python, this sets is_wake=False and continues; if no handlers match, the event is stopped.
+	event.IsAtOrWakeCommand = false
+	return &StageResult{Continue: true}, nil
 }
 
-// CommandStage processes commands registered by plugins.
-type CommandStage struct {
-	commandMap map[string]CommandHandler
+// applyPrefixWake strips the wake prefix (and optional AI wake word) from the
+// event text and marks whether LLM chat should be triggered.
+func (s *WakingCheckStage) applyPrefixWake(event *core.Event, text, prefix string) {
+	event.IsAtOrWakeCommand = true
+	trimmed := strings.TrimSpace(strings.TrimPrefix(text, prefix))
+	event.WakeCommand = trimmed
+	// AI wake word: when provider_settings.wake_prefix is configured
+	// (e.g. "ai"), LLM chat requires "<prefix><ai wake word> <text>".
+	// Without an AI wake word, the prefix alone triggers chat.
+	if s.aiWakePrefix != "" {
+		if strings.HasPrefix(trimmed, s.aiWakePrefix) {
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, s.aiWakePrefix))
+			event.SetExtra("llm_wake", true)
+		} else {
+			// AI wake word configured but not present: do not trigger chat
+			event.SetExtra("llm_wake", false)
+		}
+	} else {
+		event.SetExtra("llm_wake", true)
+	}
+	// Strip the wake prefix so command filters match the bare command
+	// (mirrors astrbot/core/pipeline/waking_check/stage.py).
+	event.MessageStr = trimmed
+	event.PlainText = trimmed
+	logger.Info("Woken by prefix '%s', stripped to %q (llm_wake=%v)",
+		prefix, event.MessageStr, event.GetExtra("llm_wake"))
 }
 
-// CommandHandler is a function that handles a command.
-type CommandHandler func(ctx context.Context, event *core.Event, args []string) (*StageResult, error)
+// ---------------------------------------------------------------------------
+// Stage 2: WhitelistCheckStage
+// ---------------------------------------------------------------------------
 
-// NewCommandStage creates the stage.
-func NewCommandStage() *CommandStage {
-	return &CommandStage{commandMap: make(map[string]CommandHandler)}
+// WhitelistCheckStage filters events by whitelist/blacklist.
+// Ported from astrbot/core/pipeline/whitelist_check/stage.py
+type WhitelistCheckStage struct {
+	enableWhitelist       bool
+	whitelist             map[string]bool
+	wlIgnoreAdminOnGroup  bool
+	wlIgnoreAdminOnFriend bool
+	wlLog                 bool
 }
 
-// Name returns the stage name.
-func (s *CommandStage) Name() string { return "command" }
-
-// Register adds a command.
-func (s *CommandStage) Register(name string, handler CommandHandler) {
-	s.commandMap[strings.ToLower(name)] = handler
+func NewWhitelistCheckStage() *WhitelistCheckStage {
+	return &WhitelistCheckStage{
+		whitelist: make(map[string]bool),
+	}
 }
 
-// Process handles command messages.
-func (s *CommandStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
-	if !event.Source.IsAtBot {
+func (s *WhitelistCheckStage) Name() string { return "whitelist_check" }
+
+func (s *WhitelistCheckStage) Initialize(ctx *PipelineContext) error {
+	if platformSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
+		if v, ok := platformSettings["enable_id_white_list"].(bool); ok {
+			s.enableWhitelist = v
+		}
+		if ids, ok := platformSettings["id_whitelist"].([]interface{}); ok {
+			for _, id := range ids {
+				if str, ok := id.(string); ok && strings.TrimSpace(str) != "" {
+					s.whitelist[strings.TrimSpace(str)] = true
+				}
+			}
+		}
+		if v, ok := platformSettings["wl_ignore_admin"].(bool); ok {
+			s.wlIgnoreAdminOnGroup = v
+			s.wlIgnoreAdminOnFriend = v
+		}
+		if v, ok := platformSettings["wl_log"].(bool); ok {
+			s.wlLog = v
+		}
+	}
+	logger.Info("WhitelistCheck initialized: enable=%v, whitelist_size=%d", s.enableWhitelist, len(s.whitelist))
+	return nil
+}
+
+func (s *WhitelistCheckStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	if !s.enableWhitelist {
 		return &StageResult{Continue: true}, nil
 	}
 
-	msgStr := strings.TrimSpace(event.MessageStr)
-	if msgStr == "" {
+	// An empty whitelist means the check is disabled (all sessions allowed),
+	// mirroring astrbot/core/pipeline/whitelist_check/stage.py.
+	if len(s.whitelist) == 0 {
 		return &StageResult{Continue: true}, nil
 	}
 
-	parts := strings.Fields(msgStr)
-	if len(parts) == 0 {
+	// Admin bypass
+	if event.Role == "admin" {
+		if s.wlIgnoreAdminOnGroup && event.Source.IsGroup {
+			return &StageResult{Continue: true}, nil
+		}
+		if s.wlIgnoreAdminOnFriend && !event.Source.IsGroup {
+			return &StageResult{Continue: true}, nil
+		}
+	}
+
+	unifiedOrigin := event.UnifiedMsgOrigin()
+	groupID := event.Source.ConvID
+
+	if !s.whitelist[unifiedOrigin] && !s.whitelist[strings.TrimSpace(groupID)] {
+		if s.wlLog {
+			logger.Info("Session %s not in allowlist, stopping event", unifiedOrigin)
+		}
+		event.Stop()
+		return &StageResult{Continue: false}, nil
+	}
+
+	return &StageResult{Continue: true}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: SessionStatusCheckStage
+// ---------------------------------------------------------------------------
+
+// SessionStatusCheckStage checks if the session is overall enabled.
+// Ported from astrbot/core/pipeline/session_status_check/stage.py
+type SessionStatusCheckStage struct {
+	sessionService *conversation.SessionServiceManager
+	convMgr        *conversation.Manager
+}
+
+func NewSessionStatusCheckStage() *SessionStatusCheckStage {
+	return &SessionStatusCheckStage{}
+}
+
+func (s *SessionStatusCheckStage) Name() string { return "session_status_check" }
+
+func (s *SessionStatusCheckStage) Initialize(ctx *PipelineContext) error {
+	s.sessionService = ctx.SessionService
+	s.convMgr = ctx.ConvManager
+	return nil
+}
+
+func (s *SessionStatusCheckStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	if s.sessionService == nil {
 		return &StageResult{Continue: true}, nil
 	}
 
-	cmdName := strings.ToLower(parts[0])
-	handler, ok := s.commandMap[cmdName]
+	umo := event.UnifiedMsgOrigin()
+	if !s.sessionService.IsSessionEnabled(umo) {
+		logger.Debug("Session %s is disabled; stopping event", umo)
+
+		// Workaround for #2309: create conversation if not exists
+		if s.convMgr != nil {
+			convID := s.convMgr.GetCurrConversationID(umo)
+			if convID == "" {
+				s.convMgr.NewConversation(umo, event.Source.Platform)
+			}
+		}
+
+		event.Stop()
+		return &StageResult{Continue: false}, nil
+	}
+	return &StageResult{Continue: true}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: RateLimitStage
+// ---------------------------------------------------------------------------
+
+// RateLimitStage checks rate limits per session.
+// Ported from astrbot/core/pipeline/rate_limit_check/stage.py
+type RateLimitStage struct {
+	limiter *ratelimit.RateLimiter
+}
+
+func NewRateLimitStage() *RateLimitStage {
+	return &RateLimitStage{}
+}
+
+func (s *RateLimitStage) Name() string { return "rate_limit" }
+
+func (s *RateLimitStage) Initialize(ctx *PipelineContext) error {
+	maxReq := 20
+	windowSeconds := 60
+	strategy := ratelimit.StrategyStall
+
+	if platformSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
+		if v, ok := platformSettings["rate_limit"].(float64); ok && v > 0 {
+			maxReq = int(v)
+		}
+		if v, ok := platformSettings["rate_limit_time"].(float64); ok && v > 0 {
+			windowSeconds = int(v)
+		}
+		if v, ok := platformSettings["rate_limit_strategy"].(string); ok {
+			if v == "discard" {
+				strategy = ratelimit.StrategyDiscard
+			}
+		}
+	}
+
+	s.limiter = ratelimit.NewRateLimiter(maxReq, DurationFromSeconds(windowSeconds), strategy)
+	logger.Info("RateLimit initialized: max=%d, window=%ds, strategy=%v", maxReq, windowSeconds, strategy)
+	return nil
+}
+
+func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	sessionID := event.UnifiedMsgOrigin()
+	allowed, stall := s.limiter.Allow(sessionID)
+	if !allowed {
+		if stall > 0 {
+			logger.Info("Session %s rate-limited, stalling for %.2fs", sessionID, stall.Seconds())
+			// In Go, we don't block the pipeline. Instead, we stop the event
+			// (equivalent to Python's async sleep + resume).
+			// A production implementation would use a timer + goroutine.
+			event.Stop()
+			return &StageResult{Continue: false}, nil
+		}
+		logger.Info("Session %s rate-limited, discarded", sessionID)
+		event.Stop()
+		return &StageResult{Continue: false}, nil
+	}
+	return &StageResult{Continue: true}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5: ContentSafetyCheckStage
+// ---------------------------------------------------------------------------
+
+// ContentSafetyCheckStage checks message content against safety rules.
+// Ported from astrbot/core/pipeline/content_safety_check/stage.py
+type ContentSafetyCheckStage struct {
+	selector *contentsafety.StrategySelector
+}
+
+func NewContentSafetyCheckStage() *ContentSafetyCheckStage {
+	return &ContentSafetyCheckStage{}
+}
+
+func (s *ContentSafetyCheckStage) Name() string { return "content_safety_check" }
+
+func (s *ContentSafetyCheckStage) Initialize(ctx *PipelineContext) error {
+	config := map[string]interface{}{}
+	if cs, ok := ctx.AstrbotConfig["content_safety"].(map[string]interface{}); ok {
+		config = cs
+	}
+	s.selector = contentsafety.NewStrategySelector(config)
+	logger.Info("ContentSafetyCheck initialized: enabled=%v", s.selector.IsEnabled())
+	return nil
+}
+
+func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	if !s.selector.IsEnabled() {
+		return &StageResult{Continue: true}, nil
+	}
+
+	text := event.PlainText
+	if text == "" {
+		text = extractPlainText(event.Message)
+	}
+
+	// Also check quoted reply text
+	texts := []string{text}
+	if event.Message != nil {
+		for _, comp := range event.Message.Chain {
+			if reply, ok := comp.(*message.Reply); ok && reply.Chain != nil {
+				for _, rc := range reply.Chain {
+					if plain, ok := rc.(*message.Plain); ok && plain.Text != "" {
+						texts = append(texts, plain.Text)
+					}
+				}
+			}
+		}
+	}
+
+	ok, info := s.selector.Check(strings.Join(texts, "\n"))
 	if !ok {
+		if event.IsAtOrWakeCommand {
+			// Set a block result
+			event.Result = &message.MessageEventResult{}
+			event.Result.Chain = []message.Component{&message.Plain{Text: "Your message or the model response contains inappropriate content and has been blocked."}}
+		}
+		event.Stop()
+		logger.Info("Content safety check failed: %s", info)
+		return &StageResult{Continue: false}, nil
+	}
+	return &StageResult{Continue: true}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Stage 6: PreProcessStage
+// ---------------------------------------------------------------------------
+
+// PreProcessStage normalizes media components, maps paths, and runs STT.
+// Ported from astrbot/core/pipeline/preprocess_stage/stage.py
+type PreProcessStage struct {
+	config map[string]interface{}
+}
+
+func NewPreProcessStage() *PreProcessStage {
+	return &PreProcessStage{}
+}
+
+func (s *PreProcessStage) Name() string { return "preprocess" }
+
+func (s *PreProcessStage) Initialize(ctx *PipelineContext) error {
+	s.config = ctx.AstrbotConfig
+	return nil
+}
+
+func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	if event.Message == nil || len(event.Message.Chain) == 0 {
 		return &StageResult{Continue: true}, nil
 	}
 
-	return handler(ctx, event, parts[1:])
+	// Build the plain text representation of the message
+	plainText := extractPlainText(event.Message)
+	event.PlainText = plainText
+
+	// Normalize image paths: file:// URIs → local paths
+	for i, comp := range event.Message.Chain {
+		if img, ok := comp.(*message.Image); ok {
+			normalizeImagePath(img)
+			event.Message.Chain[i] = img
+		}
+		// Convert Record components to plain text via STT would happen here
+		// (requires actual STT service, skip for now)
+	}
+
+	logger.Debug("PreProcess: plain_text='%s', components=%d", plainText, len(event.Message.Chain))
+	return &StageResult{Continue: true}, nil
 }
 
-// ProcessStage handles LLM request/response.
+// ---------------------------------------------------------------------------
+// Stage 7: ProcessStage
+// ---------------------------------------------------------------------------
+
+// ProcessStage dispatches to plugin handlers (star) and/or LLM agent.
+// Ported from astrbot/core/pipeline/process_stage/stage.py
 type ProcessStage struct {
-	llmHandler func(ctx context.Context, event *core.Event) (*StageResult, error)
+	pluginMgr     *star.Manager
+	convMgr       *conversation.Manager
+	config        map[string]interface{}
+	personaPrompt func(umo, personaID string) string
 }
 
-// NewProcessStage creates the stage.
-func NewProcessStage(handler func(ctx context.Context, event *core.Event) (*StageResult, error)) *ProcessStage {
-	return &ProcessStage{llmHandler: handler}
+func NewProcessStage() *ProcessStage {
+	return &ProcessStage{}
 }
 
-// Name returns the stage name.
+// SetPersonaResolver registers a callback that resolves a persona's system
+// prompt for a conversation (persona id -> prompt text).
+func (s *ProcessStage) SetPersonaResolver(fn func(umo, personaID string) string) {
+	s.personaPrompt = fn
+}
+
+// personaID extracts the persona id from the provider settings.
+func personaID(settings map[string]interface{}) string {
+	if p, ok := settings["persona"].(string); ok {
+		return p
+	}
+	return ""
+}
+
 func (s *ProcessStage) Name() string { return "process" }
 
-// Process delegates to the LLM handler.
+func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
+	s.pluginMgr = ctx.PluginManager
+	s.convMgr = ctx.ConvManager
+	s.config = ctx.AstrbotConfig
+	if ctx.PersonaResolver != nil {
+		s.personaPrompt = ctx.PersonaResolver
+	}
+	return nil
+}
+
 func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
-	if s.llmHandler == nil {
+	// Try plugin handlers first
+	activated := s.findMatchingHandlers(event)
+	if len(activated) > 0 {
+		// Execute handlers in priority order
+		for _, handler := range activated {
+			if event.IsStopped() {
+				break
+			}
+			if err := s.executeHandler(ctx, event, handler); err != nil {
+				logger.Error("Handler %s failed: %v", handler.HandlerFullName, err)
+			}
+		}
+		// If any handler produced a result, yield
+		if event.Result != nil {
+			return &StageResult{Continue: true}, nil
+		}
+	}
+
+	// If not woken, stop
+	if !event.IsAtOrWakeCommand {
+		event.Stop()
+		return &StageResult{Continue: false}, nil
+	}
+
+	// Call LLM agent
+	if s.shouldCallLLM(event) {
+		if err := s.callLLMAgent(ctx, event); err != nil {
+			logger.Error("LLM agent call failed: %v", err)
+			event.Result = &message.MessageEventResult{}
+			event.Result.Chain = []message.Component{&message.Plain{Text: "LLM 调用失败: " + err.Error()}}
+		}
+	}
+
+	return &StageResult{Continue: true}, nil
+}
+
+// findMatchingHandlers returns plugin handlers that match this event.
+func (s *ProcessStage) findMatchingHandlers(event *core.Event) []*star.StarHandlerMetadata {
+	if s.pluginMgr == nil {
+		return nil
+	}
+	registry := s.pluginMgr.Handlers()
+	if registry == nil {
+		return nil
+	}
+
+	// Get all filter-type handlers, sorted by priority
+	handlers := registry.GetFilterHandlers()
+	result := []*star.StarHandlerMetadata{}
+
+	for _, handler := range handlers {
+		if !handler.Enabled {
+			continue
+		}
+		// Build filter context from event
+		fctx := &star.FilterContext{
+			MessageStr:    event.MessageStr,
+			IsAtOrWake:    event.IsAtOrWakeCommand,
+			EventSenderID: event.Source.SenderID,
+			EventPlatform: event.Source.Platform,
+			EventRole:     event.Role,
+		}
+		// Check each filter on the handler
+		matched := false
+		for _, filter := range handler.EventFilters {
+			if filter.Match(fctx) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			logger.Info("ProcessStage: handler %s matched for message %q", handler.HandlerFullName, event.MessageStr)
+			result = append(result, handler)
+		}
+	}
+
+	return result
+}
+
+// executeHandler invokes a single handler.
+func (s *ProcessStage) executeHandler(ctx context.Context, event *core.Event, handler *star.StarHandlerMetadata) error {
+	if handler.Handler == nil {
+		return nil
+	}
+	return handler.Handler(event)
+}
+
+// shouldCallLLM returns true if the LLM agent should be invoked.
+func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
+	// Check if provider is enabled
+	if settings, ok := s.config["provider_settings"].(map[string]interface{}); ok {
+		if enabled, ok := settings["enable"].(bool); ok && !enabled {
+			return false
+		}
+	}
+
+	// Don't call LLM if the event was already handled and stopped
+	if event.IsStopped() {
+		return false
+	}
+
+	// Explicitly requested
+	if event.CallLLM {
+		return true
+	}
+
+	// Chat is only triggered via "<prefix>[ai word] <text>" (llm_wake set by
+	// WakingCheckStage). @mention / nickname / auto friend wake only handle
+	// commands and never start a chat.
+	if v, ok := event.GetExtra("llm_wake").(bool); ok {
+		return v
+	}
+
+	return false
+}
+
+// callLLMAgent invokes the LLM provider and sets the result.
+func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) error {
+	prompt := event.PlainText
+	if prompt == "" {
+		prompt = event.MessageStr
+	}
+	if prompt == "" {
+		prompt = extractPlainText(event.Message)
+	}
+	logger.Info("callLLMAgent: prompt=%q plaintext=%q messagestr=%q", prompt, event.PlainText, event.MessageStr)
+	if prompt == "" {
+		return nil
+	}
+
+	providerCfg, providerSettings, err := s.resolveProvider()
+	if err != nil {
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 " + err.Error()}}
+		return nil
+	}
+
+	// Append user message to conversation history
+	personaID := ""
+	if s.convMgr != nil {
+		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "user", prompt)
+		conv := s.convMgr.GetConversation(event.UnifiedMsgOrigin())
+		if conv != nil {
+			personaID = conv.Persona
+			providerSettings["persona"] = conv.Persona
+		}
+	}
+	// Fall back to the global default persona (provider_settings.default_personality)
+	if personaID == "" {
+		if v, ok := providerSettings["default_personality"].(string); ok {
+			personaID = v
+			providerSettings["persona"] = v
+		}
+	}
+
+	// Resolve the persona system prompt (conv.Persona holds the persona id).
+	systemPrompt := ""
+	if s.personaPrompt != nil {
+		systemPrompt = s.personaPrompt(event.UnifiedMsgOrigin(), personaID)
+	}
+	if systemPrompt == "" {
+		systemPrompt = personaPrompt(providerSettings)
+	}
+
+	req := &provider.ProviderRequest{
+		Prompt:       prompt,
+		SessionID:    event.UnifiedMsgOrigin(),
+		SystemPrompt: systemPrompt,
+		Conversation: s.convMgr,
+		Contexts:     conversationHistory(s.convMgr, event.UnifiedMsgOrigin()),
+	}
+
+	providerType, _ := providerCfg["type"].(string)
+	if providerType == "" {
+		providerType, _ = providerCfg["provider"].(string)
+	}
+	if providerType == "" {
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 模型提供商配置缺少 type 字段，请重新配置提供商"}}
+		return nil
+	}
+
+	// Merge the provider source config (api_base/key live on the source,
+	// mirroring astrbot/core/provider/manager.py get_merged_provider_config).
+	mergedCfg := mergeProviderSource(providerCfg, s.config["provider_sources"])
+
+	inst, err := provider.CreateProvider(providerType, mergedCfg, providerSettings)
+	if err != nil {
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 初始化模型提供商失败: " + err.Error()}}
+		return nil
+	}
+
+	llmCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	resp, err := inst.TextChat(llmCtx, req)
+	if err != nil {
+		logger.Error("LLM call failed: %v", err)
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
+		return nil
+	}
+
+	if resp.Role == "err" {
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 " + resp.CompletionText}}
+		return nil
+	}
+
+	// Append assistant reply to history
+	if s.convMgr != nil {
+		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "assistant", resp.CompletionText)
+	}
+
+	event.Result = &message.MessageEventResult{}
+	event.Result.Chain = []message.Component{&message.Plain{Text: resp.CompletionText}}
+	return nil
+}
+
+// resolveProvider picks the provider config to use for this chat.
+func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]interface{}, error) {
+	providers, _ := s.config["provider"].([]interface{})
+	providerSettings, _ := s.config["provider_settings"].(map[string]interface{})
+	if providerSettings == nil {
+		providerSettings = map[string]interface{}{}
+	}
+
+	selected, _ := providerSettings["default_provider_id"].(string)
+
+	if selected != "" {
+		for _, p := range providers {
+			pc, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if id, _ := pc["id"].(string); id == selected {
+				return pc, providerSettings, nil
+			}
+		}
+	}
+	// Fallback: first enabled provider
+	for _, p := range providers {
+		pc, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if enable, _ := pc["enable"].(bool); enable {
+			return pc, providerSettings, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("未找到可用的模型提供商，请先配置")
+}
+
+// personaPrompt extracts the persona system prompt from settings.
+func personaPrompt(settings map[string]interface{}) string {
+	if p, ok := settings["persona"].(string); ok {
+		return p
+	}
+	return ""
+}
+
+// conversationHistory converts conversation history to LLM context messages.
+func conversationHistory(convMgr *conversation.Manager, umo string) []map[string]interface{} {
+	if convMgr == nil {
+		return nil
+	}
+	conv := convMgr.GetConversation(umo)
+	if conv == nil {
+		return nil
+	}
+	return conv.History
+}
+
+// mergeProviderSource overlays the provider source config onto a provider config
+// (source provides api_base/key etc.; provider values win; id stays the provider's).
+// Ported from astrbot/core/provider/manager.py get_merged_provider_config.
+func mergeProviderSource(pc map[string]interface{}, sourcesRaw interface{}) map[string]interface{} {
+	sourceID, _ := pc["provider_source_id"].(string)
+	if sourceID == "" {
+		return pc
+	}
+	sources, _ := sourcesRaw.([]interface{})
+	var source map[string]interface{}
+	for _, s := range sources {
+		if sm, ok := s.(map[string]interface{}); ok {
+			if id, _ := sm["id"].(string); id == sourceID {
+				source = sm
+				break
+			}
+		}
+	}
+	if source == nil {
+		return pc
+	}
+	merged := map[string]interface{}{}
+	for k, v := range source {
+		merged[k] = v
+	}
+	for k, v := range pc {
+		merged[k] = v
+	}
+	return merged
+}
+
+// ---------------------------------------------------------------------------
+// Stage 8: ResultDecorateStage
+// ---------------------------------------------------------------------------
+
+// ResultDecorateStage applies decorations to the result (prefix, split, at, quote).
+// Ported from astrbot/core/pipeline/result_decorate/stage.py
+type ResultDecorateStage struct {
+	replyPrefix      string
+	replyWithMention bool
+	replyWithQuote   bool
+	maxSegmentLength int
+}
+
+func NewResultDecorateStage() *ResultDecorateStage {
+	return &ResultDecorateStage{}
+}
+
+func (s *ResultDecorateStage) Name() string { return "result_decorate" }
+
+func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
+	if platformSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
+		if v, ok := platformSettings["reply_prefix"].(string); ok {
+			s.replyPrefix = v
+		}
+		if v, ok := platformSettings["reply_with_mention"].(bool); ok {
+			s.replyWithMention = v
+		}
+		if v, ok := platformSettings["reply_with_quote"].(bool); ok {
+			s.replyWithQuote = v
+		}
+	}
+	return nil
+}
+
+func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	if event.Result == nil || len(event.Result.Chain) == 0 {
 		return &StageResult{Continue: true}, nil
 	}
-	return s.llmHandler(ctx, event)
+
+	// Apply reply prefix
+	if s.replyPrefix != "" {
+		for i, comp := range event.Result.Chain {
+			if plain, ok := comp.(*message.Plain); ok {
+				event.Result.Chain[i] = &message.Plain{Text: s.replyPrefix + plain.Text}
+				break
+			}
+		}
+	}
+
+	// Apply @mention (only for group messages)
+	if s.replyWithMention && event.Source.IsGroup {
+		// Insert At component at the beginning
+		at := &message.At{TargetID: event.Source.SenderID, Name: event.Source.SenderName}
+		newChain := make([]message.Component, 0, len(event.Result.Chain)+1)
+		newChain = append(newChain, at)
+		// Add newline after @
+		if len(event.Result.Chain) > 0 {
+			if plain, ok := event.Result.Chain[0].(*message.Plain); ok {
+				event.Result.Chain[0] = &message.Plain{Text: "\n" + plain.Text}
+			}
+		}
+		newChain = append(newChain, event.Result.Chain...)
+		event.Result.Chain = newChain
+	}
+
+	// Apply reply quote
+	if s.replyWithQuote && event.MessageObj != nil && event.MessageObj.MessageID != "" {
+		reply := &message.Reply{MessageID: event.MessageObj.MessageID}
+		newChain := make([]message.Component, 0, len(event.Result.Chain)+1)
+		newChain = append(newChain, reply)
+		newChain = append(newChain, event.Result.Chain...)
+		event.Result.Chain = newChain
+	}
+
+	return &StageResult{Continue: true}, nil
 }
 
-// ResultStage sends the reply back to the platform.
-type ResultStage struct {
-	sender func(sessionID string, text string) error
+// ---------------------------------------------------------------------------
+// Stage 9: RespondStage
+// ---------------------------------------------------------------------------
+
+// RespondStage sends the result message chain to the platform.
+// Ported from astrbot/core/pipeline/respond/stage.py
+type RespondStage struct {
+	platformMgr *platform.PlatformManager
 }
 
-// NewResultStage creates the stage.
-func NewResultStage(sender func(string, string) error) *ResultStage {
-	return &ResultStage{sender: sender}
+func NewRespondStage() *RespondStage {
+	return &RespondStage{}
 }
 
-// Name returns the stage name.
-func (s *ResultStage) Name() string { return "result" }
+func (s *RespondStage) Name() string { return "respond" }
 
-// Process sends any accumulated reply.
-func (s *ResultStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
-	// The reply would be set by the process stage on the event metadata
-	// For now this is a pass-through
+func (s *RespondStage) Initialize(ctx *PipelineContext) error {
+	s.platformMgr = ctx.PlatformMgr
+	return nil
+}
+
+func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	if event.Result == nil || len(event.Result.Chain) == 0 {
+		return &StageResult{Continue: false}, nil
+	}
+
+	// Validate components: skip empty Plain
+	validChain := make([]message.Component, 0, len(event.Result.Chain))
+	for _, comp := range event.Result.Chain {
+		if plain, ok := comp.(*message.Plain); ok {
+			if strings.TrimSpace(plain.Text) == "" {
+				continue
+			}
+		}
+		validChain = append(validChain, comp)
+	}
+
+	if len(validChain) == 0 {
+		logger.Debug("Respond: no valid components to send")
+		return &StageResult{Continue: false}, nil
+	}
+
+	// Send via platform manager
+	if s.platformMgr != nil {
+		chain := event.Result.ToMessageChain()
+		chain.Chain = validChain
+		err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
+		if err != nil {
+			logger.Error("Failed to send message chain: %v", err)
+		}
+	}
+
+	// Clear the result
+	event.Result = nil
 	return &StageResult{Continue: false}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// extractPlainText extracts all plain text from a message chain.
+func extractPlainText(mc *message.MessageChain) string {
+	if mc == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, comp := range mc.Chain {
+		switch c := comp.(type) {
+		case *message.Plain:
+			sb.WriteString(c.Text)
+		case *message.At:
+			if c.Name != "" {
+				sb.WriteString("@" + c.Name)
+			} else {
+				sb.WriteString("@" + c.TargetID)
+			}
+		case *message.Reply:
+			if c.Chain != nil {
+				// Reply.Chain is []Component, not *MessageChain
+				for _, rc := range c.Chain {
+					if plain, ok := rc.(*message.Plain); ok {
+						sb.WriteString(plain.Text)
+					}
+				}
+			}
+		}
+	}
+	return sb.String()
+}
+
+// normalizeImagePath converts file:// URIs to local paths.
+func normalizeImagePath(img *message.Image) {
+	if img.File == "" {
+		return
+	}
+	if strings.HasPrefix(img.File, "file://") {
+		img.File = strings.TrimPrefix(img.File, "file://")
+	}
+}
+
+// DurationFromSeconds creates a duration from seconds.
+func DurationFromSeconds(sec int) time.Duration {
+	return time.Duration(sec) * time.Second
+}
+
+// BuildDefaultPipeline creates the default 9-stage pipeline matching Python.
+func BuildDefaultPipeline(pctx *PipelineContext) ([]PipelineStage, error) {
+	stages := []PipelineStage{
+		NewWakingCheckStage(),
+		NewWhitelistCheckStage(),
+		NewSessionStatusCheckStage(),
+		NewRateLimitStage(),
+		NewContentSafetyCheckStage(),
+		NewPreProcessStage(),
+		NewProcessStage(),
+		NewResultDecorateStage(),
+		NewRespondStage(),
+	}
+	for _, s := range stages {
+		if err := s.Initialize(pctx); err != nil {
+			return nil, err
+		}
+	}
+	return stages, nil
+}
+
+// Pipeline orchestrates stages.
+type Pipeline struct {
+	stages []PipelineStage
+	mu     sync.RWMutex
+}
+
+// NewPipeline creates a pipeline.
+func NewPipeline() *Pipeline {
+	return &Pipeline{}
+}
+
+// SetStages replaces all stages.
+func (p *Pipeline) SetStages(stages []PipelineStage) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stages = stages
+}
+
+// Process runs the event through all stages.
+func (p *Pipeline) Process(ctx context.Context, event *core.Event) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	for _, stage := range p.stages {
+		result, err := stage.Process(ctx, event)
+		if err != nil {
+			return err
+		}
+		if result != nil && !result.Continue {
+			return nil
+		}
+		if event.IsStopped() {
+			logger.Debug("Stage %s stopped event propagation", stage.Name())
+			return nil
+		}
+	}
+	return nil
 }

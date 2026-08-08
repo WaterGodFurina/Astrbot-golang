@@ -115,11 +115,11 @@ func (b *LocalBooter) WriteFile(ctx context.Context, path, content string) error
 
 // DockerBooter executes commands inside a Docker container.
 type DockerBooter struct {
-	mu         sync.Mutex
-	running    bool
+	mu          sync.Mutex
+	running     bool
 	containerID string
-	image      string
-	cancel     context.CancelFunc
+	image       string
+	cancel      context.CancelFunc
 }
 
 // NewDockerBooter creates a Docker-based sandbox booter.

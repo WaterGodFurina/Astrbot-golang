@@ -23,7 +23,7 @@ const logo = `
 `
 
 func main() {
-        webuiDir := flag.String("webui-dir", "", "Directory path for WebUI static files")
+	webuiDir := flag.String("webui-dir", "webui", "Directory path for WebUI static files (default: ./webui, falls back to embedded dist)")
         resetPassword := flag.Bool("reset-password", false, "Reset the dashboard initial password on startup")
         flag.Parse()
 

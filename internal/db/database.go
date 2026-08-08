@@ -24,9 +24,9 @@ import (
 
 // Database wraps a SQLite connection with AstrBot's schema.
 type Database struct {
-	mu    sync.RWMutex
-	db    *sql.DB
-	path  string
+	mu   sync.RWMutex
+	db   *sql.DB
+	path string
 }
 
 // New opens (or creates) a SQLite database at the given path.

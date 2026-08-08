@@ -90,7 +90,7 @@ func NewHTTPClient(proxyURL, caCertPath string, timeout time.Duration) (*HTTPCli
 	return &HTTPClient{
 		client: &http.Client{
 			Transport: transport,
-			Timeout:  timeout,
+			Timeout:   timeout,
 		},
 		userAgent: "AstrBot/1.0 Go",
 	}, nil
