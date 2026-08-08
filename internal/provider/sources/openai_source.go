@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
@@ -168,46 +169,97 @@ func (s *OpenAISource) TextChat(ctx context.Context, req *provider.ProviderReque
 	return llmResp, nil
 }
 
-// TextChatStream sends a streaming chat request.
+// TextChatStream sends a streaming chat request (SSE).
 func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.ProviderRequest) (<-chan *provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, true)
 	resp, err := s.doRequest(ctx, body)
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	ch := make(chan *provider.LLMResponse, 100)
 	go func() {
-		defer resp.Body.Close()
 		defer close(ch)
-		decoder := json.NewDecoder(resp.Body)
-		for decoder.More() {
+		defer resp.Body.Close()
+
+		// Tool call fragments arrive as partial JSON across many chunks, so we
+		// accumulate per-index fragments and emit the consolidated calls once
+		// the stream finishes.
+		type toolAcc struct {
+			id, name, args string
+		}
+		var toolCalls []toolAcc
+		content := new(strings.Builder)
+		reasoning := new(strings.Builder)
+
+		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var chunk struct {
 				Choices []struct {
 					Delta struct {
-						Role    string `json:"role"`
-						Content string `json:"content"`
+						Role      string `json:"role"`
+						Content   string `json:"content"`
+						Reasoning string `json:"reasoning_content"`
+						ToolCalls []struct {
+							Index    int    `json:"index"`
+							ID       string `json:"id"`
+							Function struct {
+								Name      string `json:"name"`
+								Arguments string `json:"arguments"`
+							} `json:"function"`
+						} `json:"tool_calls"`
 					} `json:"delta"`
 					FinishReason string `json:"finish_reason"`
 				} `json:"choices"`
 			}
-			if err := decoder.Decode(&chunk); err != nil {
-				if err == io.EOF {
-					break
-				}
-				ch <- &provider.LLMResponse{Role: "err", CompletionText: err.Error()}
-				return
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				return false
 			}
-			if len(chunk.Choices) > 0 {
-				choice := chunk.Choices[0]
-				llmResp := &provider.LLMResponse{
-					Role:           choice.Delta.Role,
-					CompletionText: choice.Delta.Content,
+			for _, choice := range chunk.Choices {
+				if choice.Delta.Content != "" {
+					content.WriteString(choice.Delta.Content)
+					ch <- &provider.LLMResponse{
+						Role:           "assistant",
+						IsChunk:        true,
+						CompletionText: choice.Delta.Content,
+					}
 				}
-				if choice.FinishReason != "" {
-					llmResp.Role = "assistant"
+				if choice.Delta.Reasoning != "" {
+					reasoning.WriteString(choice.Delta.Reasoning)
 				}
-				ch <- llmResp
+				for _, tc := range choice.Delta.ToolCalls {
+					for len(toolCalls) <= tc.Index {
+						toolCalls = append(toolCalls, toolAcc{})
+					}
+					if tc.ID != "" {
+						toolCalls[tc.Index].id = tc.ID
+					}
+					if tc.Function.Name != "" {
+						toolCalls[tc.Index].name = tc.Function.Name
+					}
+					toolCalls[tc.Index].args += tc.Function.Arguments
+				}
 			}
+			return false
+		})
+		_ = reader.scan()
+
+		if len(toolCalls) > 0 {
+			final := &provider.LLMResponse{Role: "assistant", CompletionText: content.String(), ReasoningContent: reasoning.String()}
+			for _, tc := range toolCalls {
+				final.ToolsCallName = append(final.ToolsCallName, tc.name)
+				final.ToolsCallIDs = append(final.ToolsCallIDs, tc.id)
+				argsMap := map[string]interface{}{}
+				if tc.args != "" {
+					_ = json.Unmarshal([]byte(tc.args), &argsMap)
+				}
+				final.ToolsCallArgs = append(final.ToolsCallArgs, argsMap)
+			}
+			ch <- final
 		}
 	}()
 	return ch, nil

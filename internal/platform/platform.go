@@ -138,6 +138,19 @@ type PlatformAdapter interface {
 	Send(sessionID string, chain *message.MessageChain) error
 }
 
+// StreamFragmenter is an optional capability for platforms that support
+// native stream-edit messaging (e.g. QQ C2C streaming protocol). The
+// accumulated text replaces the same message on each fragment, so clients see
+// one progressively-updated message instead of many separate ones.
+type StreamFragmenter interface {
+	// StreamStart opens a streaming message and returns its message id.
+	StreamStart(sessionID, text string) (msgID string, err error)
+	// StreamUpdate updates an in-progress streaming message.
+	StreamUpdate(sessionID, msgID, text string) error
+	// StreamEnd finalizes the streaming message with its final text.
+	StreamEnd(sessionID, msgID, text string) error
+}
+
 // AstrMessageEvent is the core event object flowing through the pipeline.
 // Ported from astrbot/core/platform/astr_message_event.py
 type AstrMessageEvent struct {
@@ -608,7 +621,28 @@ func (pm *PlatformManager) StopAll() {
 
 // Send sends a message chain to a session.
 func (pm *PlatformManager) Send(platformID, sessionID string, chain *message.MessageChain) error {
+	adapter := pm.resolveAdapter(platformID)
+	if adapter == nil {
+		return fmt.Errorf("platform %s not found", platformID)
+	}
+	return adapter.Send(sessionID, chain)
+}
+
+// GetFragmenter returns a platform's native stream-edit capability, or nil.
+func (pm *PlatformManager) GetFragmenter(platformID string) StreamFragmenter {
+	adapter := pm.resolveAdapter(platformID)
+	if adapter == nil {
+		return nil
+	}
+	if frag, ok := adapter.(StreamFragmenter); ok {
+		return frag
+	}
+	return nil
+}
+
+func (pm *PlatformManager) resolveAdapter(platformID string) PlatformAdapter {
 	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 	adapter := pm.adapters[platformID]
 	if adapter == nil {
 		// Events carry the platform type (e.g. "qq_official"); adapters are
@@ -620,9 +654,5 @@ func (pm *PlatformManager) Send(platformID, sessionID string, chain *message.Mes
 			}
 		}
 	}
-	pm.mu.RUnlock()
-	if adapter == nil {
-		return fmt.Errorf("platform %s not found", platformID)
-	}
-	return adapter.Send(sessionID, chain)
+	return adapter
 }

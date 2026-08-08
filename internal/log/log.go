@@ -45,7 +45,11 @@ type Logger struct {
 	out         io.Writer
 	subscribers []chan LogEntry
 	useColor    bool
+	history     []LogEntry
 }
+
+// maxHistory caps the number of buffered log entries returned by History().
+const maxHistory = 200
 
 // LogEntry represents a single log record.
 type LogEntry struct {
@@ -111,10 +115,15 @@ func (l *Logger) log(level Level, component, format string, args ...interface{})
 		Message:   fmt.Sprintf(format, args...),
 	}
 
-	l.mu.RLock()
+	l.mu.Lock()
+	// Buffer recent entries for the WebUI log history (mirrors Python's LogBroker cache).
+	l.history = append(l.history, entry)
+	if len(l.history) > maxHistory {
+		l.history = l.history[len(l.history)-maxHistory:]
+	}
 	subs := make([]chan LogEntry, len(l.subscribers))
 	copy(subs, l.subscribers)
-	l.mu.RUnlock()
+	l.mu.Unlock()
 
 	for _, ch := range subs {
 		select {
@@ -137,6 +146,16 @@ func (l *Logger) log(level Level, component, format string, args ...interface{})
 	}
 	fmt.Fprintf(out, "%s[%s] [%s] [%s] %s%s\n",
 		color, ts, levelNames[level], entry.Component, entry.Message, reset)
+}
+
+// History returns the buffered log entries (newest first is NOT applied;
+// entries are in chronological order).
+func (l *Logger) History() []LogEntry {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	out := make([]LogEntry, len(l.history))
+	copy(out, l.history)
+	return out
 }
 
 func (l *Logger) Debug(format string, args ...interface{}) {

@@ -15,10 +15,13 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/AstrBotDevs/AstrBot/internal/contentsafety"
 	"github.com/AstrBotDevs/AstrBot/internal/conversation"
@@ -27,6 +30,8 @@ import (
 	"github.com/AstrBotDevs/AstrBot/internal/platform"
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
 	"github.com/AstrBotDevs/AstrBot/internal/ratelimit"
+	"github.com/AstrBotDevs/AstrBot/internal/sandbox"
+	"github.com/AstrBotDevs/AstrBot/internal/skills"
 	"github.com/AstrBotDevs/AstrBot/internal/star"
 	"github.com/AstrBotDevs/AstrBot/pkg/message"
 )
@@ -46,6 +51,16 @@ type PipelineContext struct {
 	// PersonaResolver resolves a persona's system prompt by conversation UMO
 	// and persona id. Optional.
 	PersonaResolver func(umo, personaID string) string
+	// PersonaSkillsResolver returns the skill allow-list configured on a
+	// persona. nil = unrestricted, empty slice = no skills allowed.
+	// Optional.
+	PersonaSkillsResolver func(personaID string) []string
+	// SkillManager provides active skills for LLM system prompt injection.
+	// Optional.
+	SkillManager *skills.SkillManager
+	// SandboxManager routes computer-use tools when the sandbox runtime is
+	// active. Optional.
+	SandboxManager *sandbox.Manager
 }
 
 // PipelineStage is the interface every stage must implement.
@@ -572,6 +587,10 @@ type ProcessStage struct {
 	convMgr       *conversation.Manager
 	config        map[string]interface{}
 	personaPrompt func(umo, personaID string) string
+	personaSkills func(personaID string) []string
+	skillMgr      *skills.SkillManager
+	platformMgr   *platform.PlatformManager
+	sandboxMgr    *sandbox.Manager
 }
 
 func NewProcessStage() *ProcessStage {
@@ -582,6 +601,12 @@ func NewProcessStage() *ProcessStage {
 // prompt for a conversation (persona id -> prompt text).
 func (s *ProcessStage) SetPersonaResolver(fn func(umo, personaID string) string) {
 	s.personaPrompt = fn
+}
+
+// SetPersonaSkillsResolver registers a callback that resolves a persona's
+// skill allow-list (persona id -> allowed skill names).
+func (s *ProcessStage) SetPersonaSkillsResolver(fn func(personaID string) []string) {
+	s.personaSkills = fn
 }
 
 // personaID extracts the persona id from the provider settings.
@@ -598,8 +623,14 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.pluginMgr = ctx.PluginManager
 	s.convMgr = ctx.ConvManager
 	s.config = ctx.AstrbotConfig
+	s.skillMgr = ctx.SkillManager
+	s.platformMgr = ctx.PlatformMgr
+	s.sandboxMgr = ctx.SandboxManager
 	if ctx.PersonaResolver != nil {
 		s.personaPrompt = ctx.PersonaResolver
+	}
+	if ctx.PersonaSkillsResolver != nil {
+		s.personaSkills = ctx.PersonaSkillsResolver
 	}
 	return nil
 }
@@ -769,6 +800,17 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		systemPrompt = personaPrompt(providerSettings)
 	}
 
+	// Inject active skills into the system prompt (mirrors Python's
+	// astr_main_agent._ensure_persona_and_skills).
+	systemPrompt = s.applySkills(systemPrompt, providerSettings, personaID)
+
+	// computer_use_runtime drives whether local/sandbox tools are exposed and
+	// whether the local-mode hint is appended to the system prompt.
+	computerUseRuntime := "local"
+	if v, ok := providerSettings["computer_use_runtime"].(string); ok && v != "" {
+		computerUseRuntime = v
+	}
+
 	req := &provider.ProviderRequest{
 		Prompt:       prompt,
 		SessionID:    event.UnifiedMsgOrigin(),
@@ -798,14 +840,87 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 
-	llmCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	llmCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
-	resp, err := inst.TextChat(llmCtx, req)
+
+	// Inject active tools (built-in + MCP servers) so the model can call them.
+	req.Tools = s.collectTools(computerUseRuntime)
+	toolNames := make([]string, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		if fn, ok := t["function"].(map[string]interface{}); ok {
+			if name, ok := fn["name"].(string); ok {
+				toolNames = append(toolNames, name)
+			}
+		}
+	}
+	logger.Info("callLLMAgent: injecting %d tool(s): %v", len(toolNames), toolNames)
+
+	// Computer Use "local" runtime: announce host access in the system prompt.
+	switch computerUseRuntime {
+	case "local":
+		req.SystemPrompt += "\n" + localModePrompt() + "\n"
+	case "sandbox":
+		req.SystemPrompt += "\n" + sandboxModePrompt() + "\n"
+	}
+
+	// Streaming is only supported for providers that implement ChatProvider;
+	// the OpenAI-compatible path covers most backends.
+	streamingEnabled := false
+	if v, ok := providerSettings["streaming_response"].(bool); ok {
+		streamingEnabled = v
+	}
+
+	// Tool-call loop: up to 5 rounds of tool execution + follow-up.
+	messages := append([]map[string]interface{}{}, req.Contexts...)
+	messages = append(messages, req.ToUserMessage())
+
+	streamer := newStreamSender(s, event)
+	defer streamer.flush()
+
+	resp, err := s.chatRound(llmCtx, inst, req, streamingEnabled, streamer)
 	if err != nil {
 		logger.Error("LLM call failed: %v", err)
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
 		return nil
+	}
+
+	for round := 0; round < 5 && len(resp.ToolsCallName) > 0; round++ {
+		// Append the assistant tool-call message
+		assistantMsg := map[string]interface{}{
+			"role":       "assistant",
+			"content":    resp.CompletionText,
+			"tool_calls": buildToolCallsMessage(resp),
+		}
+		messages = append(messages, assistantMsg)
+
+		// Execute each requested tool and append tool results
+		for i, name := range resp.ToolsCallName {
+			args := map[string]interface{}{}
+			if i < len(resp.ToolsCallArgs) {
+				args = resp.ToolsCallArgs[i]
+			}
+			toolID := ""
+			if i < len(resp.ToolsCallIDs) {
+				toolID = resp.ToolsCallIDs[i]
+			}
+			result := s.executeTool(event, computerUseRuntime, name, args)
+			messages = append(messages, map[string]interface{}{
+				"role":         "tool",
+				"tool_call_id": toolID,
+				"content":      result,
+			})
+		}
+
+		// Follow-up request with tool results
+		req.Contexts = messages
+		resp, err = s.chatRound(llmCtx, inst, req, streamingEnabled, streamer)
+		if err != nil {
+			logger.Error("LLM tool-loop call failed: %v", err)
+			event.Result = &message.MessageEventResult{}
+			event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
+			return nil
+		}
 	}
 
 	if resp.Role == "err" {
@@ -819,8 +934,476 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "assistant", resp.CompletionText)
 	}
 
+	streamer.flush()
+	if streamer.sentAny() {
+		// Text was already streamed to the platform incrementally; mark the
+		// event so RespondStage does not send a duplicate full message.
+		event.SetExtra("streamed", true)
+	}
+
 	event.Result = &message.MessageEventResult{}
 	event.Result.Chain = []message.Component{&message.Plain{Text: resp.CompletionText}}
+	return nil
+}
+
+// chatRound issues a single LLM request. When streaming is enabled it consumes
+// the stream channel, forwards content deltas to the platform incrementally,
+// and consolidates content + tool calls into a single response.
+func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider, req *provider.ProviderRequest, streaming bool, streamer *streamSender) (*provider.LLMResponse, error) {
+	if !streaming {
+		return inst.TextChat(ctx, req)
+	}
+	streamCh, err := inst.TextChatStream(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	full := &provider.LLMResponse{Role: "assistant", CompletionText: "", ToolsCallName: []string{}, ToolsCallArgs: []map[string]interface{}{}, ToolsCallIDs: []string{}}
+	var content, reasoning strings.Builder
+	for chunk := range streamCh {
+		if chunk.Role == "err" {
+			return &provider.LLMResponse{Role: "err", CompletionText: chunk.CompletionText}, nil
+		}
+		if chunk.IsChunk {
+			content.WriteString(chunk.CompletionText)
+			reasoning.WriteString(chunk.ReasoningContent)
+			streamer.push(chunk.CompletionText)
+			continue
+		}
+		if len(chunk.ToolsCallName) > 0 {
+			full.ToolsCallName = chunk.ToolsCallName
+			full.ToolsCallArgs = chunk.ToolsCallArgs
+			full.ToolsCallIDs = chunk.ToolsCallIDs
+		}
+		if chunk.CompletionText != "" && !chunk.IsChunk {
+			content.WriteString(chunk.CompletionText)
+		}
+	}
+	full.CompletionText = content.String()
+	full.ReasoningContent = reasoning.String()
+	return full, nil
+}
+
+// streamSender emits streamed content.
+//
+// Priority:
+//  1. Native stream-edit messaging (QQ C2C) — deltas are throttled into a
+//     single progressively-updated message. Requires markdown permission on
+//     QQ Open Platform; if the fragment call fails we fall back to #2.
+//  2. Sentence segmentation — complete sentences (。！？!?；;\n) are sent as
+//     separate natural messages as they form.
+//
+// Group chats and unsupported platforms get no incremental sends; the final
+// response is delivered once by RespondStage (matches AstrBot).
+type streamSender struct {
+	stage     *ProcessStage
+	event     *core.Event
+	pending   strings.Builder
+	lastFlush time.Time
+	frag      platform.StreamFragmenter
+	msgID     string
+	sent      bool
+	done      bool
+	segMode   bool
+	fragWarn  bool
+}
+
+func newStreamSender(stage *ProcessStage, event *core.Event) *streamSender {
+	ss := &streamSender{stage: stage, event: event, lastFlush: time.Now()}
+	if stage.platformMgr != nil && !event.Source.IsGroup {
+		ss.frag = stage.platformMgr.GetFragmenter(event.Source.Platform)
+		if ss.frag == nil {
+			ss.segMode = true
+		}
+	}
+	return ss
+}
+
+func (ss *streamSender) push(text string) {
+	if text == "" {
+		return
+	}
+	ss.pending.WriteString(text)
+	if ss.frag != nil {
+		// Throttle: refresh the streamed message at most ~2x/sec.
+		if time.Since(ss.lastFlush) >= 500*time.Millisecond {
+			ss.flushFragment(false)
+		}
+		return
+	}
+	if ss.segMode {
+		ss.flushSentences()
+	}
+}
+
+// flushFragment pushes the full accumulated text through the native
+// stream-edit protocol (final=true also emits the state=10 end fragment).
+func (ss *streamSender) flushFragment(final bool) {
+	if ss.pending.Len() == 0 {
+		return
+	}
+	text := ss.pending.String()
+	ss.lastFlush = time.Now()
+	if ss.msgID == "" {
+		id, err := ss.frag.StreamStart(ss.event.Source.ConvID, text)
+		if err != nil {
+			ss.onFragFailure(err)
+			return
+		}
+		ss.msgID = id
+	} else if err := ss.frag.StreamUpdate(ss.event.Source.ConvID, ss.msgID, text); err != nil {
+		ss.onFragFailure(err)
+		return
+	}
+	ss.sent = true
+	if final {
+		if err := ss.frag.StreamEnd(ss.event.Source.ConvID, ss.msgID, text); err != nil {
+			logger.Warn("stream end failed: %v", err)
+		}
+	}
+}
+
+// onFragFailure switches from native streaming to sentence segmentation so
+// the user still gets progressive output when the platform rejects streaming.
+func (ss *streamSender) onFragFailure(err error) {
+	if !ss.fragWarn {
+		logger.Warn("native streaming unavailable (%v); falling back to sentence segmentation", err)
+		ss.fragWarn = true
+	}
+	ss.frag = nil
+	ss.segMode = true
+	ss.msgID = ""
+	ss.flushSentences()
+}
+
+// flushSentences sends every complete sentence that has accumulated so far.
+func (ss *streamSender) flushSentences() {
+	for {
+		s := ss.pending.String()
+		if len(s) > sentenceMaxLen {
+			seg, rest := cutUTF8(s, sentenceMaxLen)
+			if seg != "" {
+				ss.sendSegment(seg)
+				ss.pending.Reset()
+				ss.pending.WriteString(rest)
+				continue
+			}
+		}
+		seg, rest := cutAtSentenceBoundary(s)
+		if seg == "" {
+			return
+		}
+		ss.sendSegment(seg)
+		ss.pending.Reset()
+		ss.pending.WriteString(rest)
+	}
+}
+
+func (ss *streamSender) sendSegment(text string) {
+	// Trim paragraph-break whitespace so segments don't render with stray
+	// blank lines, and drop whitespace-only fragments entirely.
+	text = strings.TrimSpace(text)
+	if text == "" || ss.stage.platformMgr == nil {
+		return
+	}
+	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: text}}}
+	if err := ss.stage.platformMgr.Send(ss.event.Source.Platform, ss.event.Source.ConvID, chain); err != nil {
+		logger.Warn("stream segment send failed: %v", err)
+		return
+	}
+	ss.sent = true
+}
+
+const sentenceMaxLen = 1500
+
+// sentenceTerminators are the characters that end a natural sentence.
+const sentenceTerminators = "。！？!?；;\n"
+
+// cutAtSentenceBoundary splits s at the LAST sentence-terminating rune,
+// returning the prefix (including the full terminator rune) and the remainder.
+// Returns ("", s) when no boundary exists.
+func cutAtSentenceBoundary(s string) (string, string) {
+	idx := strings.LastIndexAny(s, sentenceTerminators)
+	if idx < 0 {
+		return "", s
+	}
+	_, size := utf8.DecodeRuneInString(s[idx:])
+	if size <= 0 {
+		size = 1
+	}
+	end := idx + size
+	return s[:end], s[end:]
+}
+
+// cutUTF8 returns the longest prefix of s that is valid UTF-8 and at most max
+// bytes, together with the remainder. It never splits a multi-byte rune.
+func cutUTF8(s string, max int) (string, string) {
+	if len(s) <= max {
+		return "", s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	if cut == 0 {
+		_, size := utf8.DecodeRuneInString(s)
+		cut = size
+	}
+	return s[:cut], s[cut:]
+}
+
+func (ss *streamSender) flush() {
+	if ss.done {
+		return
+	}
+	ss.done = true
+	switch {
+	case ss.frag != nil:
+		ss.flushFragment(true)
+	case ss.segMode:
+		if ss.pending.Len() > 0 {
+			ss.sendSegment(ss.pending.String())
+			ss.pending.Reset()
+		}
+	}
+}
+
+func (ss *streamSender) sentAny() bool {
+	return ss.sent
+}
+
+// applySkills appends the active-skills section to the system prompt.
+// It mirrors Python's astr_main_agent._ensure_persona_and_skills: only active
+// skills are listed, persona skill allow-lists are honored, and a runtime of
+// "none" warns that Computer Use is disabled.
+func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[string]interface{}, personaID string) string {
+	if s.skillMgr == nil {
+		return systemPrompt
+	}
+	runtime := "local"
+	if v, ok := providerSettings["computer_use_runtime"].(string); ok && v != "" {
+		runtime = v
+	}
+	active := s.skillMgr.ListSkills(true, runtime)
+	if len(active) == 0 {
+		return systemPrompt
+	}
+
+	// Honor the persona's skill allow-list (nil = unrestricted).
+	if s.personaSkills != nil && personaID != "" {
+		allowed := s.personaSkills(personaID)
+		if allowed != nil {
+			if len(allowed) == 0 {
+				active = nil
+			} else {
+				allowSet := make(map[string]bool, len(allowed))
+				for _, name := range allowed {
+					allowSet[name] = true
+				}
+				filtered := active[:0:0]
+				for _, sk := range active {
+					if allowSet[sk.Name] {
+						filtered = append(filtered, sk)
+					}
+				}
+				active = filtered
+			}
+		}
+	}
+	if len(active) == 0 {
+		return systemPrompt
+	}
+
+	logger.Info("callLLMAgent: injecting %d skill(s) into system prompt", len(active))
+	systemPrompt += "\n" + skills.BuildSkillsPrompt(active) + "\n"
+	if runtime == "none" {
+		systemPrompt += "User has not enabled the Computer Use feature. " +
+			"You cannot use shell or Python to perform skills. " +
+			"If you need to use these capabilities, ask the user to enable Computer Use in the AstrBot WebUI -> Config.\n"
+	}
+	return systemPrompt
+}
+
+// buildToolCallsMessage converts LLMResponse tool calls into the OpenAI
+// assistant message tool_calls structure.
+func buildToolCallsMessage(resp *provider.LLMResponse) []map[string]interface{} {
+	result := []map[string]interface{}{}
+	for i, name := range resp.ToolsCallName {
+		args := map[string]interface{}{}
+		if i < len(resp.ToolsCallArgs) {
+			args = resp.ToolsCallArgs[i]
+		}
+		argsJSON, _ := json.Marshal(args)
+		id := ""
+		if i < len(resp.ToolsCallIDs) {
+			id = resp.ToolsCallIDs[i]
+		}
+		result = append(result, map[string]interface{}{
+			"id":   id,
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      name,
+				"arguments": string(argsJSON),
+			},
+		})
+	}
+	return result
+}
+
+// collectTools builds the OpenAI tool schema for all active tools
+// (built-in tools + enabled MCP servers + Computer Use local tools).
+func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]interface{} {
+	tools := []map[string]interface{}{}
+
+	// Built-in tools with real Go executors
+	for _, name := range builtinToolSchemas() {
+		tools = append(tools, map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        name,
+				"description": "AstrBot 内置工具",
+				"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+			},
+		})
+	}
+
+	// Computer Use local runtime tools (shell/python/file/grep)
+	if computerUseRuntime == "local" {
+		tools = append(tools, collectLocalTools()...)
+	} else if computerUseRuntime == "sandbox" {
+		tools = append(tools, collectSandboxTools()...)
+	}
+
+	// MCP server tools (enabled servers from data/mcp_server.json)
+	if data, err := os.ReadFile("data/mcp_server.json"); err == nil {
+		var mcpCfg struct {
+			McpServers map[string]map[string]interface{} `json:"mcpServers"`
+		}
+		if json.Unmarshal(data, &mcpCfg) == nil {
+			for name, cfg := range mcpCfg.McpServers {
+				if active, _ := cfg["active"].(bool); !active {
+					continue
+				}
+				safeName := sanitizeToolName(name)
+				tools = append(tools, map[string]interface{}{
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":        safeName,
+						"description": "MCP 服务器工具（" + name + "）",
+						"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+					},
+				})
+			}
+		}
+	}
+	return tools
+}
+
+// sanitizeToolName replaces characters invalid for OpenAI tool names
+// (^[a-zA-Z0-9_-]+$) with underscores.
+func sanitizeToolName(name string) string {
+	var sb strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune('_')
+		}
+	}
+	return sb.String()
+}
+
+// builtinToolSchemas returns the names of built-in tools with executors.
+func builtinToolSchemas() []string {
+	return []string{}
+}
+
+// executeTool runs a tool call and returns the result text.
+// Dispatches to the Computer Use local or sandbox executors; MCP execution is pending.
+func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args map[string]interface{}) string {
+	umo := event.UnifiedMsgOrigin()
+	if runtime == "sandbox" {
+		if result, handled := s.executeSandboxTool(name, args); handled {
+			return result
+		}
+	}
+	switch name {
+	case "astrbot_execute_shell":
+		return executeLocalShell(umo, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
+	case "astrbot_shell_session":
+		return executeShellSession(umo, argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
+	case "astrbot_execute_python":
+		return executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
+	case "astrbot_file_read_tool":
+		return executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0))
+	case "astrbot_file_write_tool":
+		return executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
+	case "astrbot_file_edit_tool":
+		return executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
+	case "astrbot_grep_tool":
+		return executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
+	}
+	return fmt.Sprintf("工具 %s 执行失败: 该工具尚未实现 Go 端执行器", name)
+}
+
+// executeSandboxTool routes computer-use tools into the sandbox runtime.
+func (s *ProcessStage) executeSandboxTool(name string, args map[string]interface{}) (string, bool) {
+	if s.sandboxMgr == nil {
+		return "Sandbox manager not configured.", true
+	}
+	ctx := context.Background()
+	timeout := argInt(args, "timeout", 0)
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+		defer cancel()
+	}
+	switch name {
+	case "astrbot_execute_shell":
+		if err := s.ensureSandboxStarted(ctx); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return sandboxShell(ctx, s.sandboxMgr, argString(args, "command")), true
+	case "astrbot_execute_python":
+		if err := s.ensureSandboxStarted(ctx); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return sandboxPython(ctx, s.sandboxMgr, argString(args, "code")), true
+	case "astrbot_file_read_tool":
+		if err := s.ensureSandboxStarted(ctx); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return sandboxFileRead(ctx, s.sandboxMgr, argString(args, "path")), true
+	case "astrbot_file_write_tool":
+		if err := s.ensureSandboxStarted(ctx); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return sandboxFileWrite(ctx, s.sandboxMgr, argString(args, "path"), argString(args, "content")), true
+	case "astrbot_file_edit_tool":
+		if err := s.ensureSandboxStarted(ctx); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return sandboxFileEdit(ctx, s.sandboxMgr, argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all")), true
+	case "astrbot_grep_tool":
+		if err := s.ensureSandboxStarted(ctx); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return sandboxGrep(ctx, s.sandboxMgr, argString(args, "pattern"), argString(args, "path")), true
+	}
+	return "", false
+}
+
+// ensureSandboxStarted lazily starts the sandbox booter on first use.
+func (s *ProcessStage) ensureSandboxStarted(ctx context.Context) error {
+	if s.sandboxMgr.IsRunning() {
+		return nil
+	}
+	if err := s.sandboxMgr.Start(ctx); err != nil {
+		return err
+	}
+	if s.skillMgr != nil {
+		_ = s.sandboxMgr.SyncSkills(ctx)
+	}
 	return nil
 }
 
@@ -1008,6 +1591,12 @@ func (s *RespondStage) Initialize(ctx *PipelineContext) error {
 }
 
 func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	// Content was already streamed to the platform incrementally by
+	// ProcessStage; skip the duplicate final send.
+	if streamed, _ := event.GetExtra("streamed").(bool); streamed {
+		return &StageResult{Continue: false}, nil
+	}
+
 	if event.Result == nil || len(event.Result.Chain) == 0 {
 		return &StageResult{Continue: false}, nil
 	}

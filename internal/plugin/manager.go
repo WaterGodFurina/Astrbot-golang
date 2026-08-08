@@ -22,6 +22,7 @@ package plugin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -43,6 +44,28 @@ type Context struct {
 	Cancel    context.CancelFunc
 }
 
+// GetConfig loads the calling plugin's config (plugins/<pluginDir>/<name>/config.json).
+// The plugin name is derived from the directory the .so lives in, falling back
+// to the file name without extension.
+func (c *Context) GetConfig(pluginName string) map[string]interface{} {
+	if pluginName == "" {
+		return map[string]interface{}{}
+	}
+	base := c.PluginDir
+	if base == "" {
+		base = "data/plugins"
+	}
+	data, err := os.ReadFile(filepath.Join(base, pluginName, "config.json"))
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	var cfg map[string]interface{}
+	if json.Unmarshal(data, &cfg) != nil {
+		return map[string]interface{}{}
+	}
+	return cfg
+}
+
 // HandlerRegistry collects command/event handlers from plugins.
 type HandlerRegistry struct {
 	mu       sync.RWMutex
@@ -59,6 +82,9 @@ type CommandHandler struct {
 	Usage       string
 	Permission  string
 	Handler     func(ctx context.Context, args []string) (string, error)
+	// HandlerEx is the same as Handler but additionally receives the plugin
+	// Context (config/data access). Preferred over Handler when set.
+	HandlerEx func(pc *Context, ctx context.Context, args []string) (string, error)
 }
 
 // FilterHandler defines an event filter registered by a plugin.
@@ -140,9 +166,10 @@ type LoadedPlugin struct {
 
 // Manager loads and manages .so plugins.
 type Manager struct {
-	mu      sync.RWMutex
-	plugins map[string]*LoadedPlugin
-	ctx     *Context
+	mu            sync.RWMutex
+	plugins       map[string]*LoadedPlugin
+	failedPlugins []FailedPlugin
+	ctx           *Context
 }
 
 // NewManager creates a plugin manager.
@@ -262,9 +289,14 @@ func (m *Manager) LoadDir(dir string) ([]*LoadedPlugin, []error) {
 
 	var loaded []*LoadedPlugin
 	var errs []error
+	m.failedPlugins = nil
 
 	for _, entry := range entries {
 		if entry.IsDir() {
+			continue
+		}
+		// Disabled plugins (.so.disable) are skipped, not loaded.
+		if strings.HasSuffix(entry.Name(), ".so.disable") {
 			continue
 		}
 		if !strings.HasSuffix(entry.Name(), ".so") {
@@ -274,6 +306,12 @@ func (m *Manager) LoadDir(dir string) ([]*LoadedPlugin, []error) {
 		p, err := m.LoadPlugin(path)
 		if err != nil {
 			logger.Error("Failed to load %s: %v", entry.Name(), err)
+			m.failedPlugins = append(m.failedPlugins, FailedPlugin{
+				Name:    strings.TrimSuffix(entry.Name(), ".so"),
+				Path:    path,
+				Reason:  err.Error(),
+				Enabled: false,
+			})
 			errs = append(errs, fmt.Errorf("%s: %w", entry.Name(), err))
 			continue
 		}
@@ -386,6 +424,17 @@ func (m *Manager) AllHooks() []HookHandler {
 		hooks = append(hooks, p.registry.Hooks()...)
 	}
 	return hooks
+}
+
+// AllFilters returns filter handlers from all loaded plugins.
+func (m *Manager) AllFilters() []FilterHandler {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var filters []FilterHandler
+	for _, p := range m.plugins {
+		filters = append(filters, p.registry.Filters()...)
+	}
+	return filters
 }
 
 // TriggerHook runs all hooks matching the event name.

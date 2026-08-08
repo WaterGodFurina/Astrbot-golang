@@ -46,6 +46,7 @@ type Lifecycle struct {
 	dashboard       *dashboard.Server
 	backupExporter  *backup.Exporter
 	pluginMgr       *plugin.Manager
+	pluginCtx       *plugin.Context
 	skillMgr        *skills.SkillManager
 	sandboxMgr      *sandbox.Manager
 	eventBus        *core.EventBus
@@ -122,6 +123,31 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.platformMgr = platform.NewPlatformManager()
 	logger.Info("Platform manager initialized")
 
+	// 7.2. Initialize skill manager + sandbox manager (must precede pipeline
+	// build so ProcessStage can inject skills into the LLM system prompt).
+	l.skillMgr = skills.NewSkillManager("data/skills", "data/plugins", "data")
+	logger.Info("Skill manager initialized (%d skills)", len(l.skillMgr.ListSkills(false, "local")))
+	l.sandboxMgr = sandbox.NewManager(l.skillMgr)
+	if cfg := l.configMgr.Get("default"); cfg != nil {
+		if all := cfg.All(); all != nil {
+			if ps, ok := all["provider_settings"].(map[string]interface{}); ok {
+				if runtime, _ := ps["computer_use_runtime"].(string); runtime == "sandbox" {
+					image := ""
+					if sb, ok := ps["sandbox"].(map[string]interface{}); ok {
+						if ci, ok := sb["cua_image"].(map[string]interface{}); ok {
+							if model, _ := ci["model"].(string); model != "" {
+								image = model
+							}
+						}
+					}
+					l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
+					logger.Info("Sandbox manager booter set (docker, image=%s)", image)
+				}
+			}
+		}
+	}
+	logger.Info("Sandbox manager initialized")
+
 	// 7.5. Build pipeline schedulers
 	for _, confID := range l.configMgr.IDs() {
 		if err := l.buildPipelineScheduler(confID); err != nil {
@@ -146,6 +172,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		PluginDir: "data/plugins",
 		Logger:    log.GetDefault().WithComponent("Plugin"),
 	}
+	l.pluginCtx = pluginCtx
 	l.pluginMgr = plugin.NewManager(pluginCtx)
 	if err := os.MkdirAll("data/plugins", 0755); err != nil {
 		logger.Warn("Failed to create plugins dir: %v", err)
@@ -157,21 +184,25 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	} else {
 		logger.Info("Plugins loaded: %d", len(loaded))
 	}
+	// Bridge .so plugin commands into the pipeline's star handler system.
+	star.RegisterPluginCommands(l.starMgr, pluginCtx, l.pluginMgr.AllCommands())
+	star.RegisterPluginFilters(l.starMgr, l.pluginMgr.AllFilters())
+	star.RegisterPluginHooks(l.starMgr, l.pluginMgr.AllHooks())
+	// Apply persisted command configs (enabled/renames/permissions).
+	if cfg := l.configMgr.Get("default"); cfg != nil {
+		if all := cfg.All(); all != nil {
+			if records, ok := all["command_configs"].(map[string]interface{}); ok {
+				star.ApplyCommandConfigs(l.starMgr.Handlers(), records)
+			}
+		}
+	}
 
-	// 11. Initialize skill manager
-	l.skillMgr = skills.NewSkillManager("data/skills", "data/plugins", "data")
-	logger.Info("Skill manager initialized (%d skills)", len(l.skillMgr.ListSkills(false, "local")))
-
-	// 12. Initialize sandbox manager
-	l.sandboxMgr = sandbox.NewManager(l.skillMgr)
-	logger.Info("Sandbox manager initialized")
-
-	// 12.5. Load platform adapters from config
+	// 11. Load platform adapters from config
 	if err := l.loadPlatforms(ctx); err != nil {
 		logger.Error("Failed to load platforms: %v", err)
 	}
 
-	// 13. Start dashboard API server
+	// 12. Start dashboard API server
 	managers := map[string]interface{}{
 		"config":        l.configMgr,
 		"provider":      l.providerMgr,
@@ -179,6 +210,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		"conversation":  l.conversationMgr,
 		"cron":          l.cronMgr,
 		"plugin":        l.pluginMgr,
+		"star":          l.starMgr,
 		"knowledgebase": l.kbMgr,
 		"skills":        l.skillMgr,
 	}
@@ -188,6 +220,9 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}
 	l.dashboard.SetOnPlatformsChanged(func() {
 		go l.ReloadPlatforms(ctx)
+	})
+	l.dashboard.SetOnPluginsChanged(func() {
+		l.RebridgePlugins()
 	})
 	go func() {
 		if err := l.dashboard.Start(ctx); err != nil {
@@ -229,11 +264,14 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 		cfgMap = cfg.All()
 	}
 	ctx := &pipeline.PipelineContext{
-		AstrbotConfig:   cfgMap,
-		ConvManager:     l.conversationMgr,
-		PluginManager:   l.starMgr,
-		PlatformMgr:     l.platformMgr,
-		PersonaResolver: personaResolver,
+		AstrbotConfig:         cfgMap,
+		ConvManager:           l.conversationMgr,
+		PluginManager:         l.starMgr,
+		PlatformMgr:           l.platformMgr,
+		PersonaResolver:       personaResolver,
+		PersonaSkillsResolver: personaSkillsResolver,
+		SkillManager:          l.skillMgr,
+		SandboxManager:        l.sandboxMgr,
 	}
 
 	stageFactory := []func() core.PipelineStage{
@@ -340,6 +378,59 @@ func personaResolver(umo, personaID string) string {
 		}
 	}
 	return ""
+}
+
+// personaSkillsResolver returns the skill allow-list configured on a persona
+// (data/personas.json). nil = unrestricted, empty slice = no skills allowed.
+func personaSkillsResolver(personaID string) []string {
+	if personaID == "" {
+		return nil
+	}
+	data, err := os.ReadFile("data/personas.json")
+	if err != nil {
+		return nil
+	}
+	var store struct {
+		Personas []map[string]interface{} `json:"personas"`
+	}
+	if json.Unmarshal(data, &store) != nil {
+		return nil
+	}
+	for _, p := range store.Personas {
+		if id, _ := p["persona_id"].(string); id != personaID {
+			continue
+		}
+		skillsRaw, ok := p["skills"]
+		if !ok || skillsRaw == nil {
+			return nil
+		}
+		list, ok := skillsRaw.([]interface{})
+		if !ok {
+			return nil
+		}
+		result := make([]string, 0, len(list))
+		for _, v := range list {
+			if name, ok := v.(string); ok {
+				result = append(result, name)
+			}
+		}
+		return result
+	}
+	return nil
+}
+
+// RebridgePlugins re-registers .so plugin commands/filters/hooks after plugin
+// changes (enable/disable/reload) so the pipeline picks up the latest set.
+func (l *Lifecycle) RebridgePlugins() {
+	if l.starMgr == nil || l.pluginMgr == nil {
+		return
+	}
+	star.RemovePluginCommands(l.starMgr)
+	star.RemovePluginFilters(l.starMgr)
+	star.RemovePluginHooks(l.starMgr)
+	star.RegisterPluginCommands(l.starMgr, l.pluginCtx, l.pluginMgr.AllCommands())
+	star.RegisterPluginFilters(l.starMgr, l.pluginMgr.AllFilters())
+	star.RegisterPluginHooks(l.starMgr, l.pluginMgr.AllHooks())
 }
 
 // loadPlatforms reads the platform configs and instantiates adapters.

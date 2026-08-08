@@ -15,6 +15,11 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -114,12 +119,17 @@ func (b *LocalBooter) WriteFile(ctx context.Context, path, content string) error
 }
 
 // DockerBooter executes commands inside a Docker container.
+//
+// Mirrors AstrBot's Docker sandbox logic (computer_tools/booters/boxlite.py
+// and bay_manager.py): a long-lived sandbox container is created once and
+// reused; shell/python/file operations run inside it via `docker exec`, and
+// files are transferred via the Docker CLI.
 type DockerBooter struct {
 	mu          sync.Mutex
 	running     bool
 	containerID string
+	name        string
 	image       string
-	cancel      context.CancelFunc
 }
 
 // NewDockerBooter creates a Docker-based sandbox booter.
@@ -127,7 +137,10 @@ func NewDockerBooter(image string) *DockerBooter {
 	if image == "" {
 		image = "ubuntu:22.04"
 	}
-	return &DockerBooter{image: image}
+	return &DockerBooter{
+		image: image,
+		name:  fmt.Sprintf("astrbot-sandbox-%d", time.Now().UnixNano()),
+	}
 }
 
 func (b *DockerBooter) Type() BooterType { return BooterDocker }
@@ -136,10 +149,34 @@ func (b *DockerBooter) Start(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.running {
-		return fmt.Errorf("docker booter already running")
+		return nil
 	}
-	// In production: docker run -d --rm <image> sleep infinity
-	logger.Info("Docker sandbox booter started (image=%s)", b.image)
+	// Reuse an existing managed container if one is still running.
+	if out, err := dockerOutput(ctx, "ps", "-aq", "--filter", "label=astrbot.sandbox=managed"); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if _, err := dockerOutput(ctx, "inspect", "-f", "{{.State.Running}}", line); err == nil {
+				b.containerID = line
+				b.running = true
+				logger.Info("Docker sandbox booter reusing container %s", line)
+				return nil
+			}
+		}
+	}
+	// Create a fresh container that idles until exec'd into.
+	args := []string{"run", "-d", "--name", b.name,
+		"--label", "astrbot.sandbox=managed",
+		"--workdir", "/workspace", b.image, "tail", "-f", "/dev/null"}
+	if out, err := dockerOutput(ctx, args...); err != nil {
+		logger.Warn("docker run failed: %v (%s)", err, strings.TrimSpace(out))
+		return fmt.Errorf("start docker sandbox: %w", err)
+	} else {
+		b.containerID = strings.TrimSpace(out)
+	}
+	logger.Info("Docker sandbox booter started (image=%s, container=%s)", b.image, b.containerID)
 	b.running = true
 	return nil
 }
@@ -147,15 +184,14 @@ func (b *DockerBooter) Start(ctx context.Context) error {
 func (b *DockerBooter) Stop() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.running {
+	if !b.running || b.containerID == "" {
 		return nil
 	}
-	// In production: docker stop <containerID>
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, _ = dockerOutput(ctx, "rm", "-f", b.containerID)
 	b.running = false
-	if b.cancel != nil {
-		b.cancel()
-	}
-	logger.Info("Docker sandbox booter stopped")
+	logger.Info("Docker sandbox booter stopped (container=%s)", b.containerID)
 	return nil
 }
 
@@ -166,21 +202,143 @@ func (b *DockerBooter) IsRunning() bool {
 }
 
 func (b *DockerBooter) Exec(ctx context.Context, cmd string, args []string, workdir string) (string, string, int, error) {
-	// In production: docker exec <containerID> <cmd> <args...>
-	return "", "", 0, fmt.Errorf("docker booter exec not yet implemented")
+	b.mu.Lock()
+	cid := b.containerID
+	b.mu.Unlock()
+	if cid == "" {
+		return "", "", -1, fmt.Errorf("docker sandbox not running")
+	}
+	dockerArgs := []string{"exec"}
+	if workdir != "" {
+		dockerArgs = append(dockerArgs, "-w", workdir)
+	}
+	dockerArgs = append(dockerArgs, cid)
+	if cmd == "sh" || cmd == "/bin/sh" {
+		// Pass a single command string so pipes/redirection work.
+		joined := strings.Join(args, " ")
+		dockerArgs = append(dockerArgs, "sh", "-c", joined)
+	} else {
+		dockerArgs = append(dockerArgs, cmd)
+		dockerArgs = append(dockerArgs, args...)
+	}
+	var stdout, stderr strings.Builder
+	code, err := dockerRun(ctx, dockerArgs, nil, &stdout, &stderr)
+	return stdout.String(), stderr.String(), code, err
 }
 
 func (b *DockerBooter) ListSkills(ctx context.Context) ([]skills.SandboxCacheEntry, error) {
-	// In production: docker exec <containerID> find /workspace/skills -name SKILL.md
-	return nil, nil
+	b.mu.Lock()
+	cid := b.containerID
+	b.mu.Unlock()
+	if cid == "" {
+		return nil, fmt.Errorf("docker sandbox not running")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	out, err := dockerOutput(ctx, "exec", cid, "sh", "-c",
+		"find /workspace/skills -name SKILL.md -o -name skill.md 2>/dev/null")
+	if err != nil {
+		return nil, err
+	}
+	var entries []skills.SandboxCacheEntry
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		dir := filepath.Dir(line)
+		name := filepath.Base(dir)
+		desc := ""
+		if content, err := b.ReadFile(ctx, line); err == nil {
+			desc = skills.ParseFrontmatterDescription(content)
+		}
+		entries = append(entries, skills.SandboxCacheEntry{
+			Name:        name,
+			Description: desc,
+			Path:        strings.ReplaceAll(line, "\\", "/"),
+		})
+	}
+	return entries, nil
 }
 
 func (b *DockerBooter) ReadFile(ctx context.Context, path string) (string, error) {
-	return "", fmt.Errorf("docker booter ReadFile not yet implemented")
+	b.mu.Lock()
+	cid := b.containerID
+	b.mu.Unlock()
+	if cid == "" {
+		return "", fmt.Errorf("docker sandbox not running")
+	}
+	out, err := dockerOutput(ctx, "exec", cid, "sh", "-c", "cat '"+strings.ReplaceAll(path, "'", "'\\''")+"' 2>/dev/null || echo '__NO_SUCH_FILE__'")
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(out, "__NO_SUCH_FILE__") {
+		return "", fmt.Errorf("file not found: %s", path)
+	}
+	return out, nil
 }
 
 func (b *DockerBooter) WriteFile(ctx context.Context, path, content string) error {
-	return fmt.Errorf("docker booter WriteFile not yet implemented")
+	b.mu.Lock()
+	cid := b.containerID
+	b.mu.Unlock()
+	if cid == "" {
+		return fmt.Errorf("docker sandbox not running")
+	}
+	// mkdir -p parent, then cat > file via stdin.
+	parent := filepath.Dir(path)
+	if _, err := dockerOutput(ctx, "exec", cid, "sh", "-c", "mkdir -p '"+strings.ReplaceAll(parent, "'", "'\\''")+"'"); err != nil {
+		return err
+	}
+	var stdout, stderr strings.Builder
+	code, err := dockerRun(ctx, []string{"exec", "-i", cid, "sh", "-c", "cat > '" + strings.ReplaceAll(path, "'", "'\\''") + "'"}, strings.NewReader(content), &stdout, &stderr)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("write file failed (exit %d): %s", code, stderr.String())
+	}
+	return nil
+}
+
+// dockerOutput runs a docker command and returns stdout as a string.
+func dockerOutput(ctx context.Context, args ...string) (string, error) {
+	var stdout, stderr strings.Builder
+	code, err := dockerRun(ctx, args, nil, &stdout, &stderr)
+	if err != nil {
+		return stdout.String(), err
+	}
+	if code != 0 {
+		return stdout.String(), fmt.Errorf("docker %v failed (exit %d): %s", args, code, stderr.String())
+	}
+	return stdout.String(), nil
+}
+
+// dockerRun executes the `docker` CLI, optionally feeding stdin, and captures
+// stdout/stderr. Returns the process exit code.
+func dockerRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr *strings.Builder) (int, error) {
+	bin := os.Getenv("ASTRBOT_DOCKER_BIN")
+	if bin == "" {
+		bin = "docker"
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
+	if stdout != nil {
+		cmd.Stdout = stdout
+	}
+	if stderr != nil {
+		cmd.Stderr = stderr
+	}
+	err := cmd.Run()
+	if err == nil {
+		return 0, nil
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode(), nil
+	}
+	return -1, err
 }
 
 // Manager manages the sandbox lifecycle and skill synchronization.

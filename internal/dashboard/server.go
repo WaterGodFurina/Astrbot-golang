@@ -16,6 +16,8 @@ import (
 
 	"github.com/AstrBotDevs/AstrBot/internal/config"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/AstrBotDevs/AstrBot/internal/plugin"
+	"github.com/AstrBotDevs/AstrBot/internal/skills"
 )
 
 //go:embed web/dist/*
@@ -43,13 +45,29 @@ type Server struct {
 	personaMgr         interface{} // *persona.PersonaManager
 	personas           *personaStore
 	chat               *chatStore
+	mcp                *mcpStore
+	starMgr            interface{} // *star.Manager
 	onPlatformsChanged func()
+	onPluginsChanged   func()
 }
 
 // SetOnPlatformsChanged registers a callback invoked after platform config changes
 // (create/update/delete bots) so the runtime can reload adapters.
 func (s *Server) SetOnPlatformsChanged(fn func()) {
 	s.onPlatformsChanged = fn
+}
+
+// SetOnPluginsChanged registers a callback invoked after plugin changes
+// (enable/disable/reload) so the runtime can re-bridge plugin commands.
+func (s *Server) SetOnPluginsChanged(fn func()) {
+	s.onPluginsChanged = fn
+}
+
+// notifyPluginsChanged triggers the plugin reload callback if registered.
+func (s *Server) notifyPluginsChanged() {
+	if s.onPluginsChanged != nil {
+		s.onPluginsChanged()
+	}
 }
 
 // NewServer creates a dashboard server with password management.
@@ -62,6 +80,7 @@ func NewServer(port int, configPath string) *Server {
 	s.auth = NewPasswordManager(configPath)
 	s.personas = newPersonaStore(filepath.Dir(configPath))
 	s.chat = newChatStore(filepath.Dir(configPath))
+	s.mcp = newMCPStore(filepath.Dir(configPath))
 	s.setupRoutes()
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
@@ -93,6 +112,9 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		}
 		if v, ok := managers["plugin"]; ok {
 			s.pluginMgr = v
+		}
+		if v, ok := managers["star"]; ok {
+			s.starMgr = v
 		}
 		if v, ok := managers["knowledgebase"]; ok {
 			s.kbMgr = v
@@ -427,6 +449,19 @@ func apiOK(data interface{}) map[string]interface{} {
 	}
 }
 
+// apiOKMsg builds a success response with a user-facing message
+// (the WebUI shows res.data.message in toasts).
+func apiOKMsg(message string, data interface{}) map[string]interface{} {
+	if data == nil {
+		data = map[string]interface{}{}
+	}
+	return map[string]interface{}{
+		"status":  "ok",
+		"message": message,
+		"data":    data,
+	}
+}
+
 // apiError builds a standard error response.
 func apiError(message string) map[string]interface{} {
 	return map[string]interface{}{
@@ -676,11 +711,32 @@ func (s *Server) getCronJobs() []interface{} {
 	return result
 }
 
+// skillSetActive toggles a skill's active state via the skill manager.
+func (s *Server) skillSetActive(name string, active bool) error {
+	if s.skillMgr == nil {
+		return fmt.Errorf("技能管理器不可用")
+	}
+	sm, ok := s.skillMgr.(*skills.SkillManager)
+	if !ok || sm == nil {
+		return fmt.Errorf("技能管理器不可用")
+	}
+	return sm.SetSkillActive(name, active)
+}
+
+// skillDelete removes a skill via the skill manager.
+func (s *Server) skillDelete(name string) error {
+	if s.skillMgr == nil {
+		return fmt.Errorf("技能管理器不可用")
+	}
+	sm, ok := s.skillMgr.(*skills.SkillManager)
+	if !ok || sm == nil {
+		return fmt.Errorf("技能管理器不可用")
+	}
+	return sm.DeleteSkill(name)
+}
+
 // getPluginList returns all plugins.
 func (s *Server) getPluginList() []interface{} {
-	if s.pluginMgr == nil {
-		return []interface{}{}
-	}
 	pm, ok := s.pluginMgr.(interface {
 		ListPluginsInfo() []map[string]interface{}
 	})
@@ -693,6 +749,95 @@ func (s *Server) getPluginList() []interface{} {
 		result[i] = p
 	}
 	return result
+}
+
+// pluginManagerIface returns the plugin manager (*plugin.Manager).
+func (s *Server) pluginManager() *plugin.Manager {
+	pm, _ := s.pluginMgr.(*plugin.Manager)
+	return pm
+}
+
+func (s *Server) pluginByID(id string) map[string]interface{} {
+	pm := s.pluginManager()
+	if pm == nil {
+		return map[string]interface{}{}
+	}
+	for _, p := range pm.ListPluginsInfo() {
+		if name, _ := p["name"].(string); name == id {
+			return p
+		}
+	}
+	return map[string]interface{}{}
+}
+
+func (s *Server) pluginFailed() map[string]interface{} {
+	pm := s.pluginManager()
+	if pm == nil {
+		return map[string]interface{}{}
+	}
+	return pm.ListFailedPlugins()
+}
+
+func (s *Server) pluginSetEnabled(id string, enabled bool) {
+	pm := s.pluginManager()
+	if pm == nil {
+		return
+	}
+	if enabled {
+		if err := pm.EnablePlugin(id); err != nil {
+			logger.Warn("EnablePlugin(%s): %v", id, err)
+		}
+	} else {
+		if err := pm.DisablePlugin(id); err != nil {
+			logger.Warn("DisablePlugin(%s): %v", id, err)
+		}
+	}
+	s.notifyPluginsChanged()
+}
+
+func (s *Server) pluginReload(id string) {
+	pm := s.pluginManager()
+	if pm == nil {
+		return
+	}
+	if id == "" {
+		pm.ReloadAll()
+	} else {
+		_ = pm.Reload(id)
+	}
+	s.notifyPluginsChanged()
+}
+
+func (s *Server) pluginUninstall(id string, deleteConfig bool) {
+	pm := s.pluginManager()
+	if pm == nil {
+		return
+	}
+	_ = pm.Uninstall(id, deleteConfig)
+}
+
+func (s *Server) pluginConfigSchema(id string) map[string]interface{} {
+	pm := s.pluginManager()
+	if pm == nil {
+		return map[string]interface{}{}
+	}
+	return pm.ConfigSchema(id)
+}
+
+func (s *Server) pluginLoadConfig(id string) map[string]interface{} {
+	pm := s.pluginManager()
+	if pm == nil {
+		return map[string]interface{}{}
+	}
+	return pm.LoadConfig(id)
+}
+
+func (s *Server) pluginSaveConfig(id string, cfg map[string]interface{}) {
+	pm := s.pluginManager()
+	if pm == nil || cfg == nil {
+		return
+	}
+	_ = pm.SaveConfig(id, cfg)
 }
 
 // getKBList returns all knowledge bases.

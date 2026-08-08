@@ -103,7 +103,7 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 	}, nil
 }
 
-// TextChatStream sends a streaming chat request.
+// TextChatStream sends a streaming chat request (SSE).
 func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.ProviderRequest) (<-chan *provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, true)
 	jsonBody, err := json.Marshal(body)
@@ -122,12 +122,17 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+	}
+
 	ch := make(chan *provider.LLMResponse, 100)
 	go func() {
-		defer resp.Body.Close()
 		defer close(ch)
-		decoder := json.NewDecoder(resp.Body)
-		for decoder.More() {
+		defer resp.Body.Close()
+		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var event struct {
 				Type  string `json:"type"`
 				Delta struct {
@@ -135,19 +140,24 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 					Text string `json:"text"`
 				} `json:"delta"`
 			}
-			if err := decoder.Decode(&event); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				return false
 			}
-			if event.Type == "content_block_delta" && event.Delta.Text != "" {
-				ch <- &provider.LLMResponse{
-					Role:           "assistant",
-					CompletionText: event.Delta.Text,
+			switch event.Type {
+			case "content_block_delta":
+				if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
+					ch <- &provider.LLMResponse{
+						Role:           "assistant",
+						IsChunk:        true,
+						CompletionText: event.Delta.Text,
+					}
 				}
+			case "message_stop":
+				return true
 			}
-		}
+			return false
+		})
+		_ = reader.scan()
 	}()
 	return ch, nil
 }

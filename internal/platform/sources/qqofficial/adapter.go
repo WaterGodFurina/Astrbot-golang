@@ -911,3 +911,53 @@ func (a *Adapter) postMessage(path string, payload map[string]interface{}) error
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// QQ C2C native streaming protocol (state=1 start/update, state=10 end).
+// Mirrors Python's qqofficial_message_event.send_streaming: each fragment
+// carries the FULL accumulated text and replaces the same message, so the
+// client sees a single progressively-updated message.
+// ---------------------------------------------------------------------------
+
+// streamFragment sends one C2C streaming fragment and returns the message id.
+func (a *Adapter) streamFragment(openID string, state int, id string, index int, text string) (string, error) {
+	payload := map[string]interface{}{
+		"content":  text,
+		"msg_type": 1,
+		"msg_seq":  rand.Intn(10000) + 1,
+		"state":    state,
+		"index":    index,
+		"reset":    false,
+	}
+	if id != "" {
+		payload["id"] = id
+	}
+	data, err := a.apiRequest(http.MethodPost, "/v2/users/"+openID+"/messages", payload)
+	if err != nil {
+		return "", err
+	}
+	msgID := ""
+	if data != nil {
+		if v, ok := data["id"].(string); ok {
+			msgID = v
+		}
+	}
+	return msgID, nil
+}
+
+// StreamStart opens a C2C streaming message.
+func (a *Adapter) StreamStart(sessionID, text string) (string, error) {
+	return a.streamFragment(sessionID, 1, "", 0, text)
+}
+
+// StreamUpdate updates an in-progress C2C streaming message.
+func (a *Adapter) StreamUpdate(sessionID, msgID, text string) error {
+	_, err := a.streamFragment(sessionID, 1, msgID, 1, text)
+	return err
+}
+
+// StreamEnd finalizes the C2C streaming message.
+func (a *Adapter) StreamEnd(sessionID, msgID, text string) error {
+	_, err := a.streamFragment(sessionID, 10, msgID, 2, text)
+	return err
+}

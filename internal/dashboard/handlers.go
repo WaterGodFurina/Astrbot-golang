@@ -3,15 +3,21 @@
 package dashboard
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/AstrBotDevs/AstrBot/internal/log"
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/AstrBotDevs/AstrBot/internal/star"
 )
 
 // ── Auth handlers ────────────────────────────────────────────
@@ -986,19 +992,52 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		plugins := s.getPluginList()
 		writeJSON(w, http.StatusOK, apiOK(plugins))
 	case "by-id":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		if r.Method == http.MethodPost {
+			pluginID := r.URL.Query().Get("plugin_id")
+			s.pluginUninstall(pluginID, true)
+			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
+		} else {
+			pluginID := r.URL.Query().Get("plugin_id")
+			writeJSON(w, http.StatusOK, apiOK(s.pluginByID(pluginID)))
+		}
 	case "enabled":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "plugin enabled not implemented",
-		}))
+		var body struct {
+			PluginID string `json:"plugin_id"`
+			Enabled  bool   `json:"enabled"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		s.pluginSetEnabled(body.PluginID, body.Enabled)
+		writeJSON(w, http.StatusOK, apiOKMsg("插件状态已更新", map[string]interface{}{}))
 	case "failed":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"failed_plugins": map[string]interface{}{},
-		}))
+		writeJSON(w, http.StatusOK, apiOK(s.pluginFailed()))
 	case "reload":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "plugins reloaded",
-		}))
+		var body struct {
+			PluginID string `json:"plugin_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		s.pluginReload(body.PluginID)
+		writeJSON(w, http.StatusOK, apiOKMsg("插件已重载", map[string]interface{}{}))
+	case "config":
+		if len(parts) > 1 && parts[1] == "schema" {
+			pluginID := r.URL.Query().Get("plugin_id")
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"config_schema": s.pluginConfigSchema(pluginID),
+			}))
+		} else {
+			pluginID := r.URL.Query().Get("plugin_id")
+			if r.Method == http.MethodPost {
+				var body struct {
+					Config map[string]interface{} `json:"config"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				s.pluginSaveConfig(pluginID, body.Config)
+				writeJSON(w, http.StatusOK, apiOKMsg("插件配置已保存", map[string]interface{}{}))
+			} else {
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"config": s.pluginLoadConfig(pluginID),
+				}))
+			}
+		}
 	case "market":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"market": []interface{}{},
@@ -1009,8 +1048,6 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"content": "",
 		}))
-	case "config":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "config-files":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"files": []interface{}{},
@@ -1042,7 +1079,32 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			"supported": true,
 		}))
 	default:
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		// /api/v1/plugins/{plugin_id} and /api/v1/plugins/{plugin_id}/config
+		pluginID := sub
+		if len(parts) > 1 && parts[1] == "config" {
+			if r.Method == http.MethodPost || r.Method == http.MethodPut {
+				var body struct {
+					Config map[string]interface{} `json:"config"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				s.pluginSaveConfig(pluginID, body.Config)
+				writeJSON(w, http.StatusOK, apiOKMsg("插件配置已保存", map[string]interface{}{}))
+			} else {
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"config": s.pluginLoadConfig(pluginID),
+				}))
+			}
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			writeJSON(w, http.StatusOK, apiOK(s.pluginByID(pluginID)))
+		case http.MethodDelete, http.MethodPost:
+			s.pluginUninstall(pluginID, false)
+			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
+		default:
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		}
 	}
 }
 
@@ -1352,9 +1414,14 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request, parts []str
 	if len(parts) > 0 {
 		sub = parts[0]
 	}
+	// PATCH /api/v1/tools/{tool_id}/enabled|permission
+	if len(parts) > 1 && r.Method == http.MethodPatch {
+		s.updateTool(w, r, parts[0], parts[1])
+		return
+	}
 	switch sub {
 	case "", "list":
-		writeJSON(w, http.StatusOK, apiOK([]interface{}{}))
+		writeJSON(w, http.StatusOK, apiOK(s.listTools()))
 	case "by-name":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "archive":
@@ -1372,18 +1439,119 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request, parts []str
 			"files": []interface{}{},
 		}))
 	case "by-id":
-		if len(parts) > 1 {
-			switch parts[1] {
-			case "enabled":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-			case "permission":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-			default:
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	default:
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	}
+}
+
+// builtinToolNames lists the AstrBot built-in tools (readonly entries).
+func builtinToolNames() []string {
+	return []string{
+		"web_search_tavily", "web_search_baidu", "web_search_bocha",
+		"web_search_brave", "web_search_exa", "web_search_firecrawl",
+		"tavily_extract_web_page", "firecrawl_extract_web_page", "exa_get_contents",
+		"send_message_to_user", "get_group_message_history", "future_task",
+		"astr_kb_search",
+	}
+}
+
+// listTools returns the tool list for the dashboard tools panel.
+// Built-in tools are readonly; MCP server tools come from the MCP store.
+func (s *Server) listTools() []interface{} {
+	cfg := s.getConfigSnapshot()
+	permissions, _ := cfg["tool_permissions"].(map[string]interface{})
+	if permissions == nil {
+		permissions = map[string]interface{}{}
+	}
+
+	result := []interface{}{}
+	for _, name := range builtinToolNames() {
+		result = append(result, map[string]interface{}{
+			"name":                    name,
+			"description":             "AstrBot 内置工具",
+			"parameters":              map[string]interface{}{},
+			"active":                  true,
+			"origin":                  "builtin",
+			"origin_name":             "AstrBot Core",
+			"origin_display_name":     "AstrBot Core",
+			"readonly":                true,
+			"builtin_config_statuses": []interface{}{},
+			"builtin_config_tags":     []interface{}{},
+		})
+	}
+
+	if s.mcp != nil {
+		for _, server := range s.mcp.list() {
+			name, _ := server["name"].(string)
+			active, _ := server["active"].(bool)
+			if name == "" {
+				continue
 			}
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			perm := "member"
+			configured := false
+			if rec, ok := permissions[name].(map[string]interface{}); ok {
+				if p, ok := rec["permission"].(string); ok && p != "" {
+					perm = p
+					configured = true
+				}
+			}
+			result = append(result, map[string]interface{}{
+				"name":                  name,
+				"description":           "MCP 服务器工具（" + name + "）",
+				"parameters":            map[string]interface{}{},
+				"active":                active,
+				"origin":                "mcp",
+				"origin_name":           name,
+				"origin_display_name":   name,
+				"readonly":              false,
+				"permission":            perm,
+				"permission_configured": configured,
+			})
 		}
+	}
+	return result
+}
+
+// updateTool handles PATCH /api/v1/tools/{tool_id}/enabled|permission.
+func (s *Server) updateTool(w http.ResponseWriter, r *http.Request, toolID, action string) {
+	switch action {
+	case "enabled":
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		// Built-in tools are readonly; MCP tools map to their server active flag.
+		for _, name := range builtinToolNames() {
+			if name == toolID {
+				writeJSON(w, http.StatusOK, apiError("内置工具不可禁用"))
+				return
+			}
+		}
+		if s.mcp != nil {
+			if err := s.mcp.setEnabled(toolID, body.Enabled); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, apiOKMsg("工具状态已更新", map[string]interface{}{}))
+	case "permission":
+		var body struct {
+			Permission string `json:"permission"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Permission != "admin" && body.Permission != "member" {
+			writeJSON(w, http.StatusOK, apiError("权限类型必须为 admin 或 member"))
+			return
+		}
+		cfg := s.getConfigSnapshot()
+		permissions, _ := cfg["tool_permissions"].(map[string]interface{})
+		if permissions == nil {
+			permissions = map[string]interface{}{}
+		}
+		permissions[toolID] = map[string]interface{}{"permission": body.Permission}
+		_ = s.setConfigData("tool_permissions", permissions)
+		writeJSON(w, http.StatusOK, apiOKMsg("工具权限已更新", map[string]interface{}{}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
@@ -1396,41 +1564,278 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 	if len(parts) > 0 {
 		sub = parts[0]
 	}
-	switch sub {
-	case "servers":
-		if len(parts) > 1 {
-			switch parts[1] {
-			case "by-name":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	if s.mcp == nil {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		return
+	}
+	// /api/v1/mcp/servers/{server_name}[/enabled|/test]
+	if sub == "servers" && len(parts) > 1 {
+		// Reserved keywords take precedence over the {server_name} path param.
+		switch parts[1] {
+		case "by-name":
+			s.mcpByID(w, r)
+			return
+		case "enabled":
+			var body struct {
+				ServerName string `json:"server_name"`
+				Enabled    bool   `json:"enabled"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := s.mcp.setEnabled(body.ServerName, body.Enabled); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("MCP server 状态已更新", map[string]interface{}{}))
+			return
+		case "test":
+			var body struct {
+				ServerName string `json:"server_name"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			s.testMCPServer(w, r, body.ServerName)
+			return
+		}
+		serverName := parts[1]
+		if len(parts) > 2 {
+			switch parts[2] {
 			case "enabled":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "MCP server enabled not implemented",
-				}))
+				var body struct {
+					ServerName string `json:"server_name"`
+					Enabled    bool   `json:"enabled"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				if body.ServerName != "" {
+					serverName = body.ServerName
+				}
+				if err := s.mcp.setEnabled(serverName, body.Enabled); err != nil {
+					writeJSON(w, http.StatusOK, apiError(err.Error()))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOKMsg("MCP server 状态已更新", map[string]interface{}{}))
 			case "test":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "MCP server test not implemented",
-				}))
+				s.testMCPServer(w, r, serverName)
 			default:
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 			}
-		} else if r.Method == http.MethodPost {
+			return
+		}
+		switch r.Method {
+		case http.MethodPut, http.MethodPatch:
+			var body struct {
+				ServerName string                 `json:"server_name"`
+				Config     map[string]interface{} `json:"config"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.ServerName != "" {
+				serverName = body.ServerName
+			}
+			if body.Config == nil {
+				body.Config = map[string]interface{}{}
+			}
+			body.Config["name"] = serverName
+			if err := s.mcp.upsert(serverName, body.Config); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("MCP server 已更新", map[string]interface{}{}))
+		case http.MethodDelete:
+			if err := s.mcp.delete(serverName); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("MCP server 已删除", map[string]interface{}{}))
+		default:
+			writeJSON(w, http.StatusOK, apiOK(s.mcp.get(serverName)))
+		}
+		return
+	}
+	switch sub {
+	case "servers":
+		if len(parts) > 1 {
+			// by-name / enabled / test are handled before the main switch
+			// (reserved keywords take precedence over {server_name}).
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		} else if r.Method == http.MethodPost {
+			var body map[string]interface{}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			name, _ := body["name"].(string)
+			if name == "" {
+				writeJSON(w, http.StatusOK, apiError("Server name cannot be empty"))
+				return
+			}
+			if err := s.mcp.upsert(name, body); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("MCP server 已添加", map[string]interface{}{}))
 		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"servers": []interface{}{},
-			}))
+			writeJSON(w, http.StatusOK, apiOK(s.mcp.list()))
 		}
 	case "providers":
 		if len(parts) > 1 && parts[1] == "modelscope" && len(parts) > 2 && parts[2] == "sync" {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"message": "ModelScope sync not implemented",
-			}))
+			var body struct {
+				AccessToken string `json:"access_token"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			count, err := s.syncModelScopeMCPServers(body.AccessToken)
+			if err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg(
+				fmt.Sprintf("同步成功，共同步 %d 个 MCP 服务器", count),
+				map[string]interface{}{"synced": count},
+			))
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		}
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// mcpByID handles PUT/DELETE/GET /api/v1/mcp/servers/by-name.
+func (s *Server) mcpByID(w http.ResponseWriter, r *http.Request) {
+	serverName := r.URL.Query().Get("server_name")
+	var body struct {
+		ServerName string                 `json:"server_name"`
+		Config     map[string]interface{} `json:"config"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.ServerName != "" {
+		serverName = body.ServerName
+	}
+	switch r.Method {
+	case http.MethodPut:
+		if body.Config == nil {
+			body.Config = map[string]interface{}{}
+		}
+		body.Config["name"] = serverName
+		if err := s.mcp.upsert(serverName, body.Config); err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOKMsg("MCP server 已更新", map[string]interface{}{}))
+	case http.MethodDelete:
+		if err := s.mcp.delete(serverName); err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOKMsg("MCP server 已删除", map[string]interface{}{}))
+	default:
+		writeJSON(w, http.StatusOK, apiOK(s.mcp.get(serverName)))
+	}
+}
+
+// syncModelScopeMCPServers syncs MCP servers from the ModelScope platform.
+// Ported from astrbot/core/provider/func_tool_manager.py sync_modelscope_mcp_servers.
+func (s *Server) syncModelScopeMCPServers(accessToken string) (int, error) {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return 0, fmt.Errorf("缺少 ModelScope access token")
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest(http.MethodGet,
+		"https://www.modelscope.cn/openapi/v1/mcp/servers/operational", nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("网络连接错误: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("ModelScope API 请求失败: HTTP %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	var payload struct {
+		Data struct {
+			McpServerList []struct {
+				Name            string `json:"name"`
+				OperationalURLs []struct {
+					URL string `json:"url"`
+				} `json:"operational_urls"`
+			} `json:"mcp_server_list"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, fmt.Errorf("解析 ModelScope 响应失败: %v", err)
+	}
+	synced := 0
+	for _, server := range payload.Data.McpServerList {
+		name := strings.TrimSpace(server.Name)
+		if name == "" || len(server.OperationalURLs) == 0 {
+			continue
+		}
+		serverURL := strings.TrimSpace(server.OperationalURLs[0].URL)
+		if serverURL == "" {
+			continue
+		}
+		cfg := map[string]interface{}{
+			"url":       serverURL,
+			"transport": "sse",
+			"active":    true,
+			"provider":  "modelscope",
+			"name":      name,
+		}
+		if err := s.mcp.upsert(name, cfg); err != nil {
+			continue
+		}
+		synced++
+	}
+	if synced == 0 {
+		return 0, nil
+	}
+	logger.Info("Synced %d MCP server(s) from ModelScope", synced)
+	return synced, nil
+}
+
+// (stdio: check command exists; sse/http: try a HEAD/GET request).
+func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request, serverName string) {
+	cfg := s.mcp.get(serverName)
+	if len(cfg) == 0 {
+		writeJSON(w, http.StatusOK, apiError("Server does not exist"))
+		return
+	}
+	result := map[string]interface{}{
+		"name":    serverName,
+		"success": true,
+		"error":   nil,
+	}
+	transport, _ := cfg["transport"].(string)
+	if transport == "" {
+		transport, _ = cfg["type"].(string)
+	}
+	switch transport {
+	case "stdio":
+		command, _ := cfg["command"].(string)
+		if command == "" {
+			result["success"] = false
+			result["error"] = "MCP stdio server 缺少 command"
+		}
+	case "sse", "streamable_http", "http", "":
+		url, _ := cfg["url"].(string)
+		if url == "" {
+			result["success"] = false
+			result["error"] = "MCP server 缺少 url"
+		} else {
+			client := &http.Client{Timeout: 10 * time.Second}
+			resp, err := client.Get(url)
+			if err != nil {
+				result["success"] = false
+				result["error"] = err.Error()
+			} else {
+				resp.Body.Close()
+			}
+		}
+	default:
+		result["success"] = false
+		result["error"] = "不支持的 transport: " + transport
+	}
+	writeJSON(w, http.StatusOK, apiOK(result))
 }
 
 // ── Logs handlers ────────────────────────────────────────────
@@ -1442,8 +1847,18 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request, parts []stri
 	}
 	switch sub {
 	case "", "history":
+		entries := log.GetDefault().History()
+		logs := make([]interface{}, 0, len(entries))
+		for _, entry := range entries {
+			logs = append(logs, map[string]interface{}{
+				"level":    sseLogLevel(entry.Level),
+				"time":     float64(entry.Timestamp.UnixMilli()) / 1000.0,
+				"data":     fmt.Sprintf("[%s] [%s] %s", entry.Timestamp.Format("2006-01-02 15:04:05.000"), sseLogLevel(entry.Level), entry.Message),
+				"category": "system",
+			})
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"logs": []interface{}{},
+			"logs": logs,
 		}))
 	case "live":
 		s.handleLogStream(w, r)
@@ -1990,16 +2405,33 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request, parts []
 	if len(parts) > 0 {
 		sub = parts[0]
 	}
+	// PATCH /api/v1/commands/{handler_full_name}
+	if r.Method == http.MethodPatch && sub != "" && sub != "by-id" {
+		s.updateCommand(w, r, sub)
+		return
+	}
 	switch sub {
 	case "", "list":
+		items := s.listCommandDescriptors()
+		total := len(items)
+		disabled := 0
+		conflicts := 0
+		for _, item := range items {
+			if enabled, ok := item["enabled"].(bool); ok && !enabled {
+				disabled++
+			}
+			if hasConflict, ok := item["has_conflict"].(bool); ok && hasConflict {
+				conflicts++
+			}
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"items": []interface{}{},
+			"items": items,
 			"summary": map[string]interface{}{
-				"total":     0,
-				"disabled":  0,
-				"conflicts": 0,
+				"total":     total,
+				"disabled":  disabled,
+				"conflicts": conflicts,
 			},
-			"wake_prefix": []interface{}{},
+			"wake_prefix": s.getWakePrefix(),
 		}))
 	case "conflicts":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -2007,15 +2439,155 @@ func (s *Server) handleCommands(w http.ResponseWriter, r *http.Request, parts []
 		}))
 	case "by-id":
 		if r.Method == http.MethodPatch {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"message": "command updated",
-			}))
+			commandID := r.URL.Query().Get("command_id")
+			if commandID == "" {
+				commandID = r.URL.Query().Get("handler_full_name")
+			}
+			s.updateCommand(w, r, commandID)
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		}
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// getWakePrefix returns the current wake prefix list.
+func (s *Server) getWakePrefix() []interface{} {
+	cfg := s.getConfigSnapshot()
+	if wp, ok := cfg["wake_prefix"].([]interface{}); ok {
+		return wp
+	}
+	return []interface{}{"/"}
+}
+
+// listCommandDescriptors collects command descriptors for the management UI.
+func (s *Server) listCommandDescriptors() []map[string]interface{} {
+	sm, ok := s.starMgr.(*star.Manager)
+	if !ok || sm == nil {
+		return []map[string]interface{}{}
+	}
+	descriptors := star.CollectCommandDescriptors(sm.Handlers())
+	// Apply persisted configs (enabled / renamed command / permission)
+	cfg := s.getConfigSnapshot()
+	records, _ := cfg["command_configs"].(map[string]interface{})
+
+	result := make([]map[string]interface{}, 0, len(descriptors))
+	for _, d := range descriptors {
+		item := descriptorToDict(d)
+		if records != nil {
+			if rec, ok := records[d.HandlerFullName].(map[string]interface{}); ok {
+				if enabled, ok := rec["enabled"].(bool); ok {
+					item["enabled"] = enabled
+				}
+				if cmd, ok := rec["effective_command"].(string); ok && cmd != "" {
+					item["effective_command"] = cmd
+				}
+				if perm, ok := rec["permission"].(string); ok && perm != "" {
+					item["permission"] = perm
+				}
+			}
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+// descriptorToDict converts a star descriptor to the dashboard dict format.
+func descriptorToDict(d *star.CommandDescriptor) map[string]interface{} {
+	aliases := d.Aliases
+	if aliases == nil {
+		aliases = []string{}
+	}
+	return map[string]interface{}{
+		"handler_full_name":   d.HandlerFullName,
+		"handler_name":        d.HandlerName,
+		"plugin":              d.PluginName,
+		"plugin_display_name": d.PluginName,
+		"module_path":         d.ModulePath,
+		"description":         d.Description,
+		"type":                d.CommandType,
+		"parent_signature":    d.ParentSignature,
+		"original_command":    d.OriginalCommand,
+		"current_fragment":    d.CurrentFragment,
+		"effective_command":   d.EffectiveCommand,
+		"aliases":             aliases,
+		"permission":          d.Permission,
+		"enabled":             d.Enabled,
+		"is_group":            d.IsGroup,
+		"has_conflict":        d.HasConflict,
+		"reserved":            d.Reserved,
+		"sub_commands":        []interface{}{},
+	}
+}
+
+// updateCommand handles PATCH /api/v1/commands/{id} for enabled/alias/permission.
+func (s *Server) updateCommand(w http.ResponseWriter, r *http.Request, handlerFullName string) {
+	var body struct {
+		Enabled         *bool    `json:"enabled"`
+		Alias           *string  `json:"alias"`
+		Aliases         []string `json:"aliases"`
+		PermissionGroup *string  `json:"permission_group"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	sm, ok := s.starMgr.(*star.Manager)
+	if !ok || sm == nil {
+		writeJSON(w, http.StatusOK, apiError("指令管理器不可用"))
+		return
+	}
+	handler := sm.Handlers().Get(handlerFullName)
+	if handler == nil {
+		writeJSON(w, http.StatusOK, apiError("指定的处理函数不存在或不是指令"))
+		return
+	}
+
+	// Load persisted config
+	cfg := s.getConfigSnapshot()
+	records, _ := cfg["command_configs"].(map[string]interface{})
+	if records == nil {
+		records = map[string]interface{}{}
+	}
+	rec, _ := records[handlerFullName].(map[string]interface{})
+	if rec == nil {
+		rec = map[string]interface{}{}
+	}
+
+	if body.Enabled != nil {
+		handler.Enabled = *body.Enabled
+		rec["enabled"] = *body.Enabled
+	}
+	if body.Alias != nil && strings.TrimSpace(*body.Alias) != "" {
+		desc, err := star.RenameCommand(sm.Handlers(), handlerFullName, *body.Alias)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		rec["effective_command"] = desc.EffectiveCommand
+	}
+	if body.PermissionGroup != nil {
+		perm := strings.TrimSpace(*body.PermissionGroup)
+		if perm != "admin" && perm != "member" {
+			writeJSON(w, http.StatusOK, apiError("权限类型必须为 admin 或 member"))
+			return
+		}
+		star.SetHandlerPermission(handler, perm)
+		rec["permission"] = perm
+	}
+	records[handlerFullName] = rec
+	_ = s.setConfigData("command_configs", records)
+
+	writeJSON(w, http.StatusOK, apiOK(s.findCommandPayload(sm, handlerFullName)))
+}
+
+// findCommandPayload returns the updated descriptor dict for a command.
+func (s *Server) findCommandPayload(sm *star.Manager, handlerFullName string) map[string]interface{} {
+	for _, d := range star.CollectCommandDescriptors(sm.Handlers()) {
+		if d.HandlerFullName == handlerFullName {
+			return descriptorToDict(d)
+		}
+	}
+	return map[string]interface{}{}
 }
 
 // ── System handlers ──────────────────────────────────────────
@@ -2450,36 +3022,47 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 			"skills": skills,
 		}))
 	case "batch":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		s.uploadSkillsBatch(w, r)
 	case "by-name":
+		skillName := r.URL.Query().Get("skill_name")
 		if r.Method == http.MethodPatch {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"message": "skill updated",
-			}))
+			var body struct {
+				SkillName string `json:"skill_name"`
+				Enabled   *bool  `json:"enabled"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.SkillName != "" {
+				skillName = body.SkillName
+			}
+			if body.Enabled != nil {
+				if err := s.skillSetActive(skillName, *body.Enabled); err != nil {
+					writeJSON(w, http.StatusOK, apiError(err.Error()))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOKMsg("技能状态已更新", map[string]interface{}{}))
+			} else {
+				writeJSON(w, http.StatusOK, apiOKMsg("技能已更新", map[string]interface{}{}))
+			}
 		} else if r.Method == http.MethodDelete {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"message": "skill deleted",
-			}))
+			if err := s.skillDelete(skillName); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("技能已删除", map[string]interface{}{}))
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		}
+	case "files":
+		s.listSkillFiles(w, r)
+	case "file":
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
+			s.updateSkillFile(w, r)
+		} else {
+			s.getSkillFile(w, r)
 		}
 	case "archive":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"message": "skill archive download not implemented",
-		}))
-	case "file":
-		if len(parts) > 1 {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"content": "",
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"content": "",
-			}))
-		}
-	case "files":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"files": []interface{}{},
 		}))
 	case "neo":
 		if len(parts) > 1 {
@@ -2533,6 +3116,326 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// skillFileEditable reports whether a skill file may be edited in the WebUI.
+func skillFileEditable(name string) bool {
+	editableSuffixes := map[string]bool{
+		".css": true, ".html": true, ".ini": true, ".js": true,
+		".json": true, ".md": true, ".py": true, ".sh": true,
+		".toml": true, ".ts": true, ".txt": true, ".yaml": true, ".yml": true,
+	}
+	editableNames := map[string]bool{"Dockerfile": true, "Makefile": true}
+	if editableNames[name] {
+		return true
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	return editableSuffixes[ext]
+}
+
+// skillFilePath resolves a file path inside data/skills/<name>, guarding
+// against path traversal.
+func skillFilePath(skillName, relPath string) (string, error) {
+	root, err := filepath.Abs(filepath.Join("data", "skills", skillName))
+	if err != nil {
+		return "", err
+	}
+	target := filepath.Join(root, filepath.Clean("/"+relPath))
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(abs, root+string(os.PathSeparator)) && abs != root {
+		return "", fmt.Errorf("非法路径")
+	}
+	return abs, nil
+}
+
+// listSkillFiles implements GET /api/v1/skills/files.
+func (s *Server) listSkillFiles(w http.ResponseWriter, r *http.Request) {
+	skillName := r.URL.Query().Get("skill_name")
+	relPath := r.URL.Query().Get("path")
+	target, err := skillFilePath(skillName, relPath)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError(err.Error()))
+		return
+	}
+	info, err := os.Stat(target)
+	if err != nil || !info.IsDir() {
+		writeJSON(w, http.StatusOK, apiError("目录不存在"))
+		return
+	}
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError(err.Error()))
+		return
+	}
+	result := []interface{}{}
+	for _, e := range entries {
+		epath := filepath.Join(target, e.Name())
+		estat, _ := os.Stat(epath)
+		isDir := e.IsDir()
+		size := int64(0)
+		editable := false
+		if !isDir && estat != nil {
+			size = estat.Size()
+			editable = skillFileEditable(e.Name()) && size <= 512*1024
+		}
+		result = append(result, map[string]interface{}{
+			"name":     e.Name(),
+			"path":     filepath.Join(relPath, e.Name()),
+			"type":     map[bool]string{true: "directory"}[isDir] + map[bool]string{false: "file"}[isDir],
+			"size":     size,
+			"editable": editable,
+		})
+	}
+	// directories first, then by name
+	sort.SliceStable(result, func(i, j int) bool {
+		a := result[i].(map[string]interface{})
+		b := result[j].(map[string]interface{})
+		at, _ := a["type"].(string)
+		bt, _ := b["type"].(string)
+		if at != bt {
+			return at == "directory"
+		}
+		return a["name"].(string) < b["name"].(string)
+	})
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"name":    skillName,
+		"path":    relPath,
+		"entries": result,
+	}))
+}
+
+// getSkillFile implements GET /api/v1/skills/file.
+func (s *Server) getSkillFile(w http.ResponseWriter, r *http.Request) {
+	skillName := r.URL.Query().Get("skill_name")
+	relPath := r.URL.Query().Get("path")
+	if relPath == "" {
+		relPath = "SKILL.md"
+	}
+	target, err := skillFilePath(skillName, relPath)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError(err.Error()))
+		return
+	}
+	info, err := os.Stat(target)
+	if err != nil || info.IsDir() {
+		writeJSON(w, http.StatusOK, apiError("文件不存在"))
+		return
+	}
+	if !skillFileEditable(filepath.Base(target)) {
+		writeJSON(w, http.StatusOK, apiError("Unsupported file type"))
+		return
+	}
+	if info.Size() > 512*1024 {
+		writeJSON(w, http.StatusOK, apiError("File is too large"))
+		return
+	}
+	content, err := os.ReadFile(target)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"name":     skillName,
+		"path":     relPath,
+		"content":  string(content),
+		"size":     info.Size(),
+		"editable": true,
+	}))
+}
+
+// updateSkillFile implements POST /api/v1/skills/file.
+func (s *Server) updateSkillFile(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SkillName string `json:"skill_name"`
+		Path      string `json:"path"`
+		Content   string `json:"content"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Path == "" {
+		body.Path = "SKILL.md"
+	}
+	if len([]byte(body.Content)) > 512*1024 {
+		writeJSON(w, http.StatusOK, apiError("File content is too large"))
+		return
+	}
+	target, err := skillFilePath(body.SkillName, body.Path)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError(err.Error()))
+		return
+	}
+	if !skillFileEditable(filepath.Base(target)) {
+		writeJSON(w, http.StatusOK, apiError("Unsupported file type"))
+		return
+	}
+	if err := os.WriteFile(target, []byte(body.Content), 0644); err != nil {
+		writeJSON(w, http.StatusOK, apiError(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOKMsg("文件已保存", map[string]interface{}{}))
+}
+
+// uploadSkillsBatch handles POST /api/v1/skills/batch (multipart "files").
+// Each file is a .zip skill package containing a SKILL.md; it is extracted
+// into data/skills/<name>/ (mirrors astrbot skills_service.batch_upload_skills).
+func (s *Server) uploadSkillsBatch(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		writeJSON(w, http.StatusOK, apiError("解析上传失败: "+err.Error()))
+		return
+	}
+	files := r.MultipartForm.File["files"]
+	if len(files) == 0 {
+		writeJSON(w, http.StatusOK, apiError("No files provided"))
+		return
+	}
+
+	succeeded := []interface{}{}
+	failed := []interface{}{}
+	skipped := []interface{}{}
+	skillsRoot := "data/skills"
+
+	for _, fh := range files {
+		filename := filepath.Base(fh.Filename)
+		if !strings.HasSuffix(strings.ToLower(filename), ".zip") {
+			failed = append(failed, map[string]interface{}{"filename": filename, "error": "Only .zip files are supported"})
+			continue
+		}
+		src, err := fh.Open()
+		if err != nil {
+			failed = append(failed, map[string]interface{}{"filename": filename, "error": err.Error()})
+			continue
+		}
+		skillName, installErr := installSkillFromZip(src, fh.Size, skillsRoot, strings.TrimSuffix(filename, ".zip"))
+		src.Close()
+		if installErr != nil {
+			if strings.Contains(installErr.Error(), "already exists") {
+				skipped = append(skipped, map[string]interface{}{
+					"filename": filename,
+					"name":     strings.TrimSuffix(filename, ".zip"),
+					"error":    "Skill already exists.",
+				})
+			} else {
+				failed = append(failed, map[string]interface{}{"filename": filename, "error": installErr.Error()})
+			}
+			continue
+		}
+		succeeded = append(succeeded, map[string]interface{}{"filename": filename, "name": skillName})
+	}
+
+	writeJSON(w, http.StatusOK, apiOKMsg("上传成功", map[string]interface{}{
+		"succeeded": succeeded,
+		"failed":    failed,
+		"skipped":   skipped,
+	}))
+}
+
+// installSkillFromZip extracts a skill zip into skillsRoot/<name>/.
+// The zip must contain a SKILL.md (either at the top level or under one
+// subdirectory). Returns the installed skill name.
+func installSkillFromZip(src io.ReaderAt, size int64, skillsRoot, nameHint string) (string, error) {
+	tmpDir, err := os.MkdirTemp("", "skill-upload-*")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	zr, err := zip.NewReader(src, size)
+	if err != nil {
+		return "", fmt.Errorf("invalid zip: %v", err)
+	}
+	for _, f := range zr.File {
+		dest := filepath.Join(tmpDir, filepath.Clean(f.Name))
+		if !strings.HasPrefix(dest, tmpDir+string(os.PathSeparator)) {
+			return "", fmt.Errorf("illegal path in zip: %s", f.Name)
+		}
+		if f.FileInfo().IsDir() {
+			_ = os.MkdirAll(dest, 0755)
+			continue
+		}
+		_ = os.MkdirAll(filepath.Dir(dest), 0755)
+		rc, err := f.Open()
+		if err != nil {
+			return "", err
+		}
+		out, err := os.Create(dest)
+		if err != nil {
+			rc.Close()
+			return "", err
+		}
+		_, _ = io.Copy(out, rc)
+		out.Close()
+		rc.Close()
+	}
+
+	// Locate SKILL.md
+	skillDir := ""
+	err = filepath.Walk(tmpDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && strings.EqualFold(info.Name(), "SKILL.md") {
+			skillDir = filepath.Dir(path)
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if skillDir == "" {
+		return "", fmt.Errorf("zip 中未找到 SKILL.md")
+	}
+
+	// Skill name: prefer SKILL.md frontmatter "name", then the containing
+	// directory (when SKILL.md sits in a sub-folder), then the zip file name.
+	name := skillFrontmatterName(filepath.Join(skillDir, "SKILL.md"))
+	if name == "" {
+		name = filepath.Base(skillDir)
+	}
+	if name == "." || name == string(os.PathSeparator) || name == "" {
+		name = nameHint
+	}
+	if name == "" {
+		return "", fmt.Errorf("无法确定技能名称")
+	}
+	name = sanitizeSkillDirName(name)
+
+	dest := filepath.Join(skillsRoot, name)
+	if _, err := os.Stat(dest); err == nil {
+		return "", fmt.Errorf("Skill already exists")
+	}
+	_ = os.MkdirAll(skillsRoot, 0755)
+	if err := os.Rename(skillDir, dest); err != nil {
+		if err2 := copyDir(skillDir, dest); err2 != nil {
+			return "", err2
+		}
+	}
+	return name, nil
+}
+
+// copyDir recursively copies a directory.
+func copyDir(src, dst string) error {
+	_ = os.MkdirAll(dst, 0755)
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0644)
+	})
 }
 
 func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -2634,4 +3537,42 @@ func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request, parts []st
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// skillFrontmatterName extracts the "name" field from a SKILL.md frontmatter.
+func skillFrontmatterName(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(data), "\n")
+	inFrontmatter := false
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "---") {
+			if !inFrontmatter {
+				inFrontmatter = true
+				continue
+			}
+			break
+		}
+		if inFrontmatter && strings.HasPrefix(line, "name:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "name:"))
+		}
+	}
+	return ""
+}
+
+// sanitizeSkillDirName keeps skill directory names filesystem-safe.
+func sanitizeSkillDirName(name string) string {
+	var sb strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-', r == '.', r > 127:
+			sb.WriteRune(r)
+		default:
+			sb.WriteRune('_')
+		}
+	}
+	return sb.String()
 }

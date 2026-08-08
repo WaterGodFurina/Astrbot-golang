@@ -133,8 +133,7 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 	go func() {
 		defer resp.Body.Close()
 		defer close(ch)
-		decoder := json.NewDecoder(resp.Body)
-		for decoder.More() {
+		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var chunk struct {
 				Candidates []struct {
 					Content struct {
@@ -144,23 +143,23 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 					} `json:"content"`
 				} `json:"candidates"`
 			}
-			if err := decoder.Decode(&chunk); err != nil {
-				if err == io.EOF {
-					break
-				}
-				return
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				return false
 			}
 			for _, cand := range chunk.Candidates {
 				for _, part := range cand.Content.Parts {
 					if part.Text != "" {
 						ch <- &provider.LLMResponse{
 							Role:           "assistant",
+							IsChunk:        true,
 							CompletionText: part.Text,
 						}
 					}
 				}
 			}
-		}
+			return false
+		})
+		_ = reader.scan()
 	}()
 	return ch, nil
 }

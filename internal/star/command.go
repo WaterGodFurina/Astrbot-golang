@@ -77,6 +77,17 @@ func (cf *CommandFilter) CommandName() string {
 	return cf.commandName
 }
 
+// Aliases returns the registered aliases.
+func (cf *CommandFilter) Aliases() []string {
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+	result := make([]string, 0, len(cf.alias))
+	for a := range cf.alias {
+		result = append(result, a)
+	}
+	return result
+}
+
 // SetCommandName updates the command name and invalidates caches.
 func (cf *CommandFilter) SetCommandName(name string) {
 	cf.mu.Lock()
@@ -369,13 +380,19 @@ type CommandDescriptor struct {
 	IsGroup          bool                 `json:"is_group"`
 	IsSubCommand     bool                 `json:"is_sub_command"`
 	HasConflict      bool                 `json:"has_conflict"`
+	Reserved         bool                 `json:"reserved"`
 	SubCommands      []*CommandDescriptor `json:"sub_commands"`
+}
+
+// HandlerLookup is the minimal registry interface used by descriptor helpers.
+type HandlerLookup interface {
+	Get(fullName string) *StarHandlerMetadata
 }
 
 // RenameCommand renames a command or group and propagates the change.
 // FIXED #9366: When renaming a group, all child command filters' cached
 // parent names are invalidated, so they recompute against the new name.
-func RenameCommand(registry *HandlerRegistry, handlerFullName, newFragment string) (*CommandDescriptor, error) {
+func RenameCommand(registry HandlerLookup, handlerFullName, newFragment string) (*CommandDescriptor, error) {
 	handler := registry.Get(handlerFullName)
 	if handler == nil {
 		return nil, fmt.Errorf("handler not found: %s", handlerFullName)
@@ -400,7 +417,7 @@ func RenameCommand(registry *HandlerRegistry, handlerFullName, newFragment strin
 }
 
 // BuildDescriptor creates a descriptor from a handler.
-func BuildDescriptor(registry *HandlerRegistry, handler *StarHandlerMetadata) *CommandDescriptor {
+func BuildDescriptor(registry HandlerLookup, handler *StarHandlerMetadata) *CommandDescriptor {
 	desc := &CommandDescriptor{
 		HandlerFullName: handler.HandlerFullName,
 		HandlerName:     handler.HandlerName,
