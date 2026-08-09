@@ -61,12 +61,125 @@ func pluginReply(t *testing.T, m *SubprocessManager, id string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	text, err := inst.Client.HandleCommand(ctx, "test", nil, &pluginsdk.Event{})
+	text, _, err := inst.Client.HandleCommand(ctx, "test", nil, &pluginsdk.Event{})
 	if err != nil {
 		t.Fatalf("HandleCommand: %v", err)
 	}
 	return text
 }
+
+// TestNewSDKCapabilities exercises the extended SDK surface end-to-end across a
+// real subprocess: LLM tools, on_llm_request hooks, and result hooks.
+func TestNewSDKCapabilities(t *testing.T) {
+	requirePlugin(t)
+	m := newTestManager(t)
+	id := "test_plugin"
+	if _, err := m.Load(context.Background(), id, testPluginBin); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer m.Unload(id)
+
+	inst := m.Get(id)
+	if inst == nil || inst.Meta == nil {
+		t.Fatalf("plugin not loaded")
+	}
+
+	// Tools are reported in Register metadata.
+	foundTool := false
+	for _, td := range inst.Meta.Tools {
+		if td.Name == "echo_tool" {
+			foundTool = true
+			break
+		}
+	}
+	if !foundTool {
+		t.Fatalf("echo_tool not reported in Register metadata: %+v", inst.Meta.Tools)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// LLM tool execution.
+	text, isErr, err := inst.Client.HandleTool(ctx, "echo_tool", map[string]any{"text": "hi"}, &pluginsdk.Event{})
+	if err != nil || isErr {
+		t.Fatalf("HandleTool: err=%v isErr=%v", err, isErr)
+	}
+	if text != "tool:hi" {
+		t.Fatalf("HandleTool result = %q, want %q", text, "tool:hi")
+	}
+
+	// on_llm_request hook: modifies the system prompt.
+	sp, stop, err := inst.Client.HandleLLMRequest(ctx, "inject", &pluginsdk.Event{}, "base", "user")
+	if err != nil {
+		t.Fatalf("HandleLLMRequest: %v", err)
+	}
+	if stop {
+		t.Fatalf("unexpected stop")
+	}
+	if !strings.Contains(sp, "[injected]") {
+		t.Fatalf("system prompt not injected: %q", sp)
+	}
+
+	// Result hook: decorates the outgoing chain.
+	chain := []pluginsdk.Component{pluginsdk.Text("hi")}
+	newChain, stop, err := inst.Client.HandleHook(ctx, "decorate", &pluginsdk.Event{}, chain)
+	if err != nil {
+		t.Fatalf("HandleHook(decorate): %v", err)
+	}
+	if stop {
+		t.Fatalf("unexpected stop")
+	}
+	if len(newChain) != 2 || newChain[1].Text != "[decorated]" {
+		t.Fatalf("decorated chain mismatch: %+v", newChain)
+	}
+}
+
+// TestHostServiceReverseCalls exercises the bidirectional HostService across a
+// real subprocess: the plugin calls ChatLLM / SetConfig / GetConfig back into
+// the host over the go-plugin broker.
+func TestHostServiceReverseCalls(t *testing.T) {
+	requirePlugin(t)
+
+	// Install fake host hooks before launching the plugin client.
+	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
+		ChatLLM: func(prompt, systemPrompt string) (string, error) {
+			return "echo:" + prompt, nil
+		},
+		SetConfig: func(pluginName string, cfg map[string]any) error {
+			saved[pluginName] = cfg
+			return nil
+		},
+		GetConfig: func(pluginName string) (map[string]any, error) {
+			if cfg, ok := saved[pluginName]; ok {
+				return cfg, nil
+			}
+			return map[string]any{}, nil
+		},
+	})
+	defer pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{})
+
+	m := newTestManager(t)
+	id := "test_plugin"
+	if _, err := m.Load(context.Background(), id, testPluginBin); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer m.Unload(id)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	inst := m.Get(id)
+	text, _, err := inst.Client.HandleCommand(ctx, "hosttest", nil, &pluginsdk.Event{})
+	if err != nil {
+		t.Fatalf("HandleCommand(hosttest): %v", err)
+	}
+	if text != "llm=echo:ping cfg=v" {
+		t.Fatalf("hosttest result = %q, want %q", text, "llm=echo:ping cfg=v")
+	}
+}
+
+// saved is shared state backing the fake SetConfig/GetConfig hooks in
+// TestHostServiceReverseCalls.
+var saved = map[string]map[string]any{}
 
 func TestLoadUnload(t *testing.T) {
 	requirePlugin(t)
@@ -349,6 +462,228 @@ var _ = syscall.Syscall
 		t.Fatalf("expected loaded plugin, got %+v", inst)
 	}
 	if err := m.Unload("evil"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaticScanDetectsDirectives(t *testing.T) {
+	dir := t.TempDir()
+	src := `package main
+
+import (
+	"reflect"
+
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+)
+
+//go:linkname getpid syscall.Getpid
+
+//go:generate echo "hacked"
+
+func main() { _ = reflect.ValueOf }
+`
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := StaticScan(dir)
+	if err != nil {
+		t.Fatalf("StaticScan: %v", err)
+	}
+	var imports, directives []string
+	for _, f := range findings {
+		switch f.Import {
+		case "os/exec", "syscall", "unsafe", "reflect":
+			imports = append(imports, f.Import)
+		default:
+			directives = append(directives, f.Import)
+		}
+	}
+	if !containsStr(imports, "reflect") {
+		t.Errorf("reflect import should be flagged, got %v", imports)
+	}
+	if !containsStr(directives, "go:linkname") || !containsStr(directives, "go:generate") {
+		t.Errorf("linkname/go:generate should be flagged, got %v", directives)
+	}
+}
+
+func TestInstallSourceMetadata(t *testing.T) {
+	requirePlugin(t)
+	m := newTestManager(t)
+	ctx := context.Background()
+
+	src := filepath.Join("testdata", "plugin")
+	inst, err := m.InstallFromSource(ctx, "meta", src, InstallOptions{
+		InstallMethod:  "market",
+		RegistryURL:    "https://astrbotgomarket.350430.xyz/package.json",
+		RegistryName:   "AstrBot-Go 插件市场",
+		MarketPluginID: "WaterGodFurina/echo",
+		Repo:           "https://github.com/WaterGodFurina/Astrbot-golang",
+	})
+	if err != nil {
+		t.Fatalf("InstallFromSource: %v", err)
+	}
+	_ = inst
+
+	list := m.ListInfo()
+	var found map[string]interface{}
+	for _, p := range list {
+		if name, _ := p["name"].(string); name == "testplugin" {
+			found = p
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("installed plugin missing from ListInfo: %v", list)
+	}
+	if repo, _ := found["repo"].(string); repo != "https://github.com/WaterGodFurina/Astrbot-golang" {
+		t.Errorf("repo not exposed: %v", found["repo"])
+	}
+	srcMap, ok := found["install_source"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("install_source missing from ListInfo: %v", found)
+	}
+	if srcMap["install_method"] != "market" || srcMap["market_plugin_id"] != "WaterGodFurina/echo" {
+		t.Errorf("install_source fields mismatch: %v", srcMap)
+	}
+	if up, _ := found["updates_enabled"].(bool); !up {
+		t.Errorf("updates_enabled should be true for market installs")
+	}
+	if mn, _ := found["marketplace_name"].(string); mn != "testplugin" {
+		t.Errorf("marketplace_name mismatch: %q", mn)
+	}
+
+	if err := m.Unload("meta"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListInfoLegacySourceFallback(t *testing.T) {
+	m := newTestManager(t)
+	man := &Manifest{Version: 1}
+	man.Upsert(ManifestEntry{
+		ID:      "legacy",
+		Name:    "legacy_plugin",
+		Source:  "https://github.com/Owner/legacy",
+		Binary:  "/tmp/nonexistent",
+		Enabled: false,
+	})
+	if err := man.Save(m.manifestPath()); err != nil {
+		t.Fatal(err)
+	}
+
+	list := m.ListInfo()
+	var found map[string]interface{}
+	for _, p := range list {
+		if name, _ := p["name"].(string); name == "legacy_plugin" {
+			found = p
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("legacy entry missing from ListInfo: %v", list)
+	}
+	if repo, _ := found["repo"].(string); repo != "https://github.com/Owner/legacy" {
+		t.Errorf("legacy repo should fall back to source, got: %v", found["repo"])
+	}
+	srcMap, ok := found["install_source"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("install_source missing: %v", found)
+	}
+	if srcMap["install_method"] != "repository" {
+		t.Errorf("legacy URL source should be presented as repository, got: %v", srcMap["install_method"])
+	}
+	if up, _ := found["updates_enabled"].(bool); !up {
+		t.Errorf("legacy entry should be updatable")
+	}
+}
+
+func TestReadmeCachedAtInstall(t *testing.T) {
+	requirePlugin(t)
+	m := newTestManager(t)
+	ctx := context.Background()
+
+	src := t.TempDir()
+	srcMain := `package main
+
+import (
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+)
+
+func main() { sdk.Serve(&sdk.Plugin{Name: "docplugin"}) }
+`
+	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(srcMain), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	readme := "# Doc Plugin\n\nDocumentation here.\n"
+	if err := os.WriteFile(filepath.Join(src, "README.md"), []byte(readme), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.InstallFromSource(ctx, "docplugin", src, InstallOptions{}); err != nil {
+		t.Fatalf("InstallFromSource: %v", err)
+	}
+	if got := m.Readme("docplugin"); got != readme {
+		t.Errorf("Readme should read cached README, got %q", got)
+	}
+	if err := m.Unload("docplugin"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRawRepoDocURLs(t *testing.T) {
+	urls := rawRepoDocURLs("https://github.com/Owner/Repo.git", []string{"README.md"})
+	if len(urls) != 3 {
+		t.Fatalf("expected 3 branch URLs, got %d", len(urls))
+	}
+	if urls[0] != "https://raw.githubusercontent.com/Owner/Repo/HEAD/README.md" {
+		t.Errorf("unexpected first URL: %s", urls[0])
+	}
+	if got := rawRepoDocURLs("https://gitlab.com/Owner/Repo", []string{"README.md"}); got != nil {
+		t.Errorf("non-github repos should return nil, got %v", got)
+	}
+	if got := rawRepoDocURLs("git@github.com:Owner/Repo.git", []string{"README.md"}); len(got) != 3 {
+		t.Errorf("ssh github shorthand should parse, got %v", got)
+	}
+}
+
+func TestBindSourceAndReinstall(t *testing.T) {
+	requirePlugin(t)
+	m := newTestManager(t)
+	ctx := context.Background()
+
+	src := filepath.Join("testdata", "plugin")
+	if _, err := m.InstallFromSource(ctx, "reinst", src, InstallOptions{}); err != nil {
+		t.Fatalf("InstallFromSource: %v", err)
+	}
+
+	if err := m.BindSource("reinst", "market", "https://registry.example.com/pkg.json",
+		"示例市场", "Owner/plugin", "https://github.com/Owner/plugin", ""); err != nil {
+		t.Fatalf("BindSource: %v", err)
+	}
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		t.Fatalf("load manifest: %v", err)
+	}
+	e := man.Get("reinst")
+	if e == nil || e.InstallMethod != "market" || e.MarketPluginID != "Owner/plugin" {
+		t.Fatalf("bind source not persisted: %+v", e)
+	}
+
+	if err := m.Unload("reinst"); err != nil {
+		t.Fatal(err)
+	}
+	// Reinstall from persisted source (local dir source is carried in manifest).
+	inst, err := m.ReinstallSource(ctx, "reinst", InstallOptions{})
+	if err != nil {
+		t.Fatalf("ReinstallSource: %v", err)
+	}
+	if inst == nil || m.Get("reinst") == nil {
+		t.Fatalf("plugin not reloaded after reinstall")
+	}
+	if got := pluginReply(t, m, "reinst"); got != "pong" {
+		t.Errorf("reinstalled plugin reply: %q", got)
+	}
+	if err := m.Unload("reinst"); err != nil {
 		t.Fatal(err)
 	}
 }

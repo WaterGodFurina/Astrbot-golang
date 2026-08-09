@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AstrBotDevs/AstrBot/internal/config"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
 	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
@@ -144,11 +145,11 @@ func deepMerge(dst, src map[string]interface{}) {
 // Ported from astrbot/core/config/default.py CONFIG_METADATA_2 (subset for Go-supported platforms).
 // getSystemMetadata returns the metadata for the system-config page (system_group only).
 // Ported from astrbot/dashboard/services/config_service.py get_system_schema.
-func (s *Server) getSystemMetadata() map[string]interface{} {
+func (s *Server) getSystemMetadata() *config.OrderedJSON {
 	metadata := metadataFromJSON()
-	for g := range metadata {
-		if g != "system_group" {
-			delete(metadata, g)
+	for _, k := range metadata.Keys() {
+		if k != "system_group" {
+			metadata.Delete(k)
 		}
 	}
 	return metadata
@@ -157,11 +158,11 @@ func (s *Server) getSystemMetadata() map[string]interface{} {
 // getProfileMetadata returns the metadata for the config-profiles page.
 // Ported from astrbot/dashboard/services/config_service.py get_profile_schema
 // (CONFIG_METADATA_3: ai/platform/plugin/ext groups + platform adapter templates).
-func (s *Server) getProfileMetadata() map[string]interface{} {
+func (s *Server) getProfileMetadata() *config.OrderedJSON {
 	metadata := metadataFromJSON()
-	for g := range metadata {
-		if g != "ai_group" && g != "platform_group" && g != "plugin_group" && g != "ext_group" {
-			delete(metadata, g)
+	for _, k := range metadata.Keys() {
+		if k != "ai_group" && k != "platform_group" && k != "plugin_group" && k != "ext_group" {
+			metadata.Delete(k)
 		}
 	}
 	s.injectPlatformSection(metadata)
@@ -169,77 +170,58 @@ func (s *Server) getProfileMetadata() map[string]interface{} {
 }
 
 // getConfigMetadata returns the full metadata for system-config/runtime.
-func (s *Server) getConfigMetadata() map[string]interface{} {
+func (s *Server) getConfigMetadata() *config.OrderedJSON {
 	metadata := metadataFromJSON()
 	s.injectPlatformSection(metadata)
-	providerGroup := map[string]interface{}{
-		"name": "provider_group.name",
-		"metadata": map[string]interface{}{
-			"provider_settings": map[string]interface{}{
-				"description": "provider_group.provider_settings.description",
-				"type":        "object",
-				"items": map[string]interface{}{
-					"provider_settings.enable": map[string]interface{}{
-						"description": "provider_group.provider_settings.enable.description",
-						"type":        "bool",
-					},
-					"provider_settings.default_provider_id": map[string]interface{}{
-						"description": "provider_group.provider_settings.default_provider_id.description",
-						"type":        "string",
-					},
-					"provider_settings.wake_prefix": map[string]interface{}{
-						"description": "provider_group.provider_settings.wake_prefix.description",
-						"type":        "string",
-					},
-					"provider_settings.prompt_prefix": map[string]interface{}{
-						"description": "provider_group.provider_settings.prompt_prefix.description",
-						"type":        "string",
-					},
-					"provider_settings.identifier": map[string]interface{}{
-						"description": "provider_group.provider_settings.identifier.description",
-						"type":        "bool",
-					},
-					"provider_settings.display_reasoning_text": map[string]interface{}{
-						"description": "provider_group.provider_settings.display_reasoning_text.description",
-						"type":        "bool",
-					},
-					"provider_settings.max_context_length": map[string]interface{}{
-						"description": "provider_group.provider_settings.max_context_length.description",
-						"type":        "int",
-					},
-					"provider_settings.dequeue_context_length": map[string]interface{}{
-						"description": "provider_group.provider_settings.dequeue_context_length.description",
-						"type":        "int",
-					},
-					"provider_settings.request_max_retries": map[string]interface{}{
-						"description": "provider_group.provider_settings.request_max_retries.description",
-						"type":        "int",
-					},
-					"provider_settings.web_search": map[string]interface{}{
-						"description": "provider_group.provider_settings.web_search.description",
-						"type":        "bool",
-					},
-					"provider_settings.streaming_response": map[string]interface{}{
-						"description": "provider_group.provider_settings.streaming_response.description",
-						"type":        "bool",
-					},
-				},
-			},
-			"provider": map[string]interface{}{
-				"description":     "大语言模型提供方",
-				"type":            "list",
-				"config_template": s.getProviderTemplates(),
-				"items":           s.getProviderItems(),
-			},
-		},
+	providerGroup := config.NewOrderedJSON()
+	providerGroup.Set("name", "provider_group.name")
+	providerSettings := config.NewOrderedJSON()
+	providerSettings.Set("description", "provider_group.provider_settings.description")
+	providerSettings.Set("type", "object")
+	settingsItems := config.NewOrderedJSON()
+	for _, item := range []struct {
+		key   string
+		typ   string
+		desc  string
+		extra map[string]interface{}
+	}{
+		{"provider_settings.enable", "bool", "provider_group.provider_settings.enable.description", nil},
+		{"provider_settings.default_provider_id", "string", "provider_group.provider_settings.default_provider_id.description", nil},
+		{"provider_settings.wake_prefix", "string", "provider_group.provider_settings.wake_prefix.description", nil},
+		{"provider_settings.prompt_prefix", "string", "provider_group.provider_settings.prompt_prefix.description", nil},
+		{"provider_settings.identifier", "bool", "provider_group.provider_settings.identifier.description", nil},
+		{"provider_settings.display_reasoning_text", "bool", "provider_group.provider_settings.display_reasoning_text.description", nil},
+		{"provider_settings.max_context_length", "int", "provider_group.provider_settings.max_context_length.description", nil},
+		{"provider_settings.dequeue_context_length", "int", "provider_group.provider_settings.dequeue_context_length.description", nil},
+		{"provider_settings.request_max_retries", "int", "provider_group.provider_settings.request_max_retries.description", nil},
+		{"provider_settings.web_search", "bool", "provider_group.provider_settings.web_search.description", nil},
+		{"provider_settings.streaming_response", "bool", "provider_group.provider_settings.streaming_response.description", nil},
+	} {
+		field := config.NewOrderedJSON()
+		field.Set("description", item.desc)
+		field.Set("type", item.typ)
+		for k, v := range item.extra {
+			field.Set(k, v)
+		}
+		settingsItems.Set(item.key, field)
 	}
-	metadata["provider_group"] = providerGroup
+	providerSettings.Set("items", settingsItems)
+	providerSection := config.NewOrderedJSON()
+	providerSection.Set("description", "大语言模型提供方")
+	providerSection.Set("type", "list")
+	providerSection.Set("config_template", s.getProviderTemplates())
+	providerSection.Set("items", s.getProviderItems())
+	metadataGroup := config.NewOrderedJSON()
+	metadataGroup.Set("provider_settings", providerSettings)
+	metadataGroup.Set("provider", providerSection)
+	providerGroup.Set("metadata", metadataGroup)
+	metadata.Set("provider_group", providerGroup)
 	return metadata
 }
 
 // injectPlatformSection adds the Go-supported platform adapter templates to the
 // platform_group metadata (mirrors Python's platform_registry injection).
-func (s *Server) injectPlatformSection(metadata map[string]interface{}) {
+func (s *Server) injectPlatformSection(metadata *config.OrderedJSON) {
 	platformSection := map[string]interface{}{
 		"description": "消息平台适配器",
 		"type":        "list",
@@ -363,295 +345,188 @@ func (s *Server) injectPlatformSection(metadata map[string]interface{}) {
 			},
 		},
 	}
-	if pg, ok := metadata["platform_group"].(map[string]interface{}); ok {
-		if md, ok := pg["metadata"].(map[string]interface{}); ok {
-			md["platform"] = platformSection
+	if pg, ok := metadata.Get("platform_group"); ok {
+		if pgMap, ok := config.GetOrderedJSON(pg); ok {
+			if md, ok := pgMap.Get("metadata"); ok {
+				if mdMap, ok := config.GetOrderedJSON(md); ok {
+					mdMap.Set("platform", platformSection)
+				}
+			}
 		}
 	}
+}
+
+// om builds an OrderedJSON from alternating key/value pairs, preserving the
+// given order (Go map literals would otherwise be alphabetized on marshal).
+func om(kv ...interface{}) *config.OrderedJSON {
+	o := config.NewOrderedJSON()
+	for i := 0; i+1 < len(kv); i += 2 {
+		o.Set(kv[i].(string), kv[i+1])
+	}
+	return o
 }
 
 // getProviderItems returns the provider config field schema shared by
 // /providers/schema and the system config metadata.
-func (s *Server) getProviderItems() map[string]interface{} {
-	return map[string]interface{}{
-		"id": map[string]interface{}{
-			"description": "名称",
-			"type":        "string",
-			"hint":        "此模型提供方的唯一标识。",
-		},
-		"type": map[string]interface{}{
-			"description": "类型",
-			"type":        "string",
-			"invisible":   true,
-		},
-		"provider": map[string]interface{}{
-			"description": "提供商",
-			"type":        "string",
-			"invisible":   true,
-		},
-		"provider_type": map[string]interface{}{
-			"description": "提供商类型",
-			"type":        "string",
-			"invisible":   true,
-		},
-		"enable": map[string]interface{}{
-			"description": "启用",
-			"type":        "bool",
-		},
-		"key": map[string]interface{}{
-			"description": "API Key",
-			"type":        "list",
-			"items":       map[string]interface{}{"type": "string"},
-		},
-		"api_base": map[string]interface{}{
-			"description": "API Base URL",
-			"type":        "string",
-		},
-		"proxy": map[string]interface{}{
-			"description": "代理地址",
-			"type":        "string",
-			"hint":        "留空则直连。格式示例: http://127.0.0.1:7890",
-		},
-		"timeout": map[string]interface{}{
-			"description": "请求超时时间（秒）",
-			"type":        "int",
-			"hint":        "默认 120 秒。",
-		},
-		"model": map[string]interface{}{
-			"description": "模型 ID",
-			"type":        "string",
-			"hint":        "模型名称，如 gpt-4o-mini, deepseek-chat。",
-		},
-		"max_context_tokens": map[string]interface{}{
-			"description": "模型上下文窗口大小",
-			"type":        "int",
-			"hint":        "模型最大上下文 Token 大小。如果为 0，则会自动从模型元数据填充（如有）",
-		},
-		"modalities": map[string]interface{}{
-			"description": "模型能力",
-			"type":        "list",
-			"items":       map[string]interface{}{"type": "string"},
-			"options":     []string{"text", "image", "audio", "tool_use"},
-			"labels":      []string{"文本", "图像", "音频", "工具使用"},
-			"render_type": "checkbox",
-			"hint":        "模型支持的模态及能力。",
-		},
-		"custom_headers": map[string]interface{}{
-			"description": "自定义请求头",
-			"type":        "dict",
-			"items":       map[string]interface{}{},
-			"hint":        "此处添加的键值对将被合并到 HTTP 请求头中。",
-		},
-		"custom_extra_body": map[string]interface{}{
-			"description": "自定义请求体参数",
-			"type":        "dict",
-			"items":       map[string]interface{}{},
-			"hint":        "用于在请求时添加额外的参数，如 temperature, top_p, max_tokens, reasoning_effort 等。",
-		},
-	}
+func (s *Server) getProviderItems() *config.OrderedJSON {
+	return om(
+		"id", om("description", "名称", "type", "string", "hint", "此模型提供方的唯一标识。"),
+		"type", om("description", "类型", "type", "string", "invisible", true),
+		"provider", om("description", "提供商", "type", "string", "invisible", true),
+		"provider_type", om("description", "提供商类型", "type", "string", "invisible", true),
+		"enable", om("description", "启用", "type", "bool"),
+		"key", om("description", "API Key", "type", "list", "items", om("type", "string")),
+		"api_base", om("description", "API Base URL", "type", "string"),
+		"proxy", om("description", "代理地址", "type", "string", "hint", "留空则直连。格式示例: http://127.0.0.1:7890"),
+		"timeout", om("description", "请求超时时间（秒）", "type", "int", "hint", "默认 120 秒。"),
+		"model", om("description", "模型 ID", "type", "string", "hint", "模型名称，如 gpt-4o-mini, deepseek-chat。"),
+		"max_context_tokens", om("description", "模型上下文窗口大小", "type", "int", "hint", "模型最大上下文 Token 大小。如果为 0，则会自动从模型元数据填充（如有）"),
+		"modalities", om("description", "模型能力", "type", "list", "items", om("type", "string"),
+			"options", []string{"text", "image", "audio", "tool_use"},
+			"labels", []string{"文本", "图像", "音频", "工具使用"},
+			"render_type", "checkbox",
+			"hint", "模型支持的模态及能力。"),
+		"custom_headers", om("description", "自定义请求头", "type", "dict", "items", om(), "hint", "此处添加的键值对将被合并到 HTTP 请求头中。"),
+		"custom_extra_body", om("description", "自定义请求体参数", "type", "dict", "items", om(), "hint", "用于在请求时添加额外的参数，如 temperature, top_p, max_tokens, reasoning_effort 等。"),
+	)
 }
 
 // getProviderTemplates returns provider config templates for the Go-supported providers.
-func (s *Server) getProviderTemplates() map[string]interface{} {
-	template := func(name, provider, providerType, apiBase string) map[string]interface{} {
-		return map[string]interface{}{
-			"id":            name,
-			"type":          name,
-			"provider":      provider,
-			"provider_type": providerType,
-			"enable":        false,
-			"api_base":      apiBase,
-			"key":           "",
-		}
+func (s *Server) getProviderTemplates() *config.OrderedJSON {
+	template := func(name, provider, providerType, apiBase string) *config.OrderedJSON {
+		return om("id", name, "type", name, "provider", provider,
+			"provider_type", providerType, "enable", false, "api_base", apiBase, "key", "")
 	}
-	return map[string]interface{}{
-		"openai":     template("openai", "openai_chat_completion", "chat_completion", "https://api.openai.com/v1"),
-		"openrouter": template("openrouter", "openrouter_chat_completion", "chat_completion", "https://openrouter.ai/api/v1"),
-		"anthropic":  template("anthropic", "anthropic_chat_completion", "chat_completion", "https://api.anthropic.com"),
-		"gemini":     template("gemini", "googlegenai_chat_completion", "chat_completion", "https://generativelanguage.googleapis.com/v1beta"),
-		"ollama":     template("ollama", "ollama_chat_completion", "chat_completion", "http://127.0.0.1:11434"),
-		"dashscope":  template("dashscope", "dashscope_chat_completion", "chat_completion", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-		"groq":       template("groq", "groq_chat_completion", "chat_completion", "https://api.groq.com/openai/v1"),
-		"xai": map[string]interface{}{
-			"id": "xai", "type": "xai_chat_completion", "provider": "xai_chat_completion",
-			"provider_type": "chat_completion", "enable": false,
-			"api_base": "https://api.x.ai/v1", "key": "", "xai_native_search": false,
-		},
-		"zhipu":      template("zhipu", "zhipu_chat_completion", "chat_completion", "https://open.bigmodel.cn/api/paas/v4"),
-		"longcat":    template("longcat", "longcat_chat_completion", "chat_completion", "https://api.longcat.chat/openai/v1"),
-		"aihubmix":   template("aihubmix", "aihubmix_chat_completion", "chat_completion", "https://aihubmix.com/v1"),
-		"xiaomi":     template("xiaomi", "xiaomi_chat_completion", "chat_completion", "https://api.xiaomimimo.com/v1"),
-		"openai_responses": map[string]interface{}{
-			"id": "openai_responses", "type": "openai_responses", "provider": "openai",
-			"provider_type": "chat_completion", "enable": false,
-			"api_base": "https://api.openai.com/v1", "key": "", "model": "",
-		},
-		"kimi_code": map[string]interface{}{
-			"id": "kimi_code", "type": "kimi_code_chat_completion", "provider": "kimi-code",
-			"provider_type": "chat_completion", "enable": false,
-			"api_base": "https://api.kimi.com/coding", "key": "", "model": "kimi-for-coding",
-		},
+	return om(
+		"openai", template("openai", "openai_chat_completion", "chat_completion", "https://api.openai.com/v1"),
+		"openrouter", template("openrouter", "openrouter_chat_completion", "chat_completion", "https://openrouter.ai/api/v1"),
+		"anthropic", template("anthropic", "anthropic_chat_completion", "chat_completion", "https://api.anthropic.com"),
+		"gemini", template("gemini", "googlegenai_chat_completion", "chat_completion", "https://generativelanguage.googleapis.com/v1beta"),
+		"ollama", template("ollama", "ollama_chat_completion", "chat_completion", "http://127.0.0.1:11434"),
+		"dashscope", template("dashscope", "dashscope_chat_completion", "chat_completion", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		"groq", template("groq", "groq_chat_completion", "chat_completion", "https://api.groq.com/openai/v1"),
+		"xai", om("id", "xai", "type", "xai_chat_completion", "provider", "xai_chat_completion",
+			"provider_type", "chat_completion", "enable", false,
+			"api_base", "https://api.x.ai/v1", "key", "", "xai_native_search", false),
+		"zhipu", template("zhipu", "zhipu_chat_completion", "chat_completion", "https://open.bigmodel.cn/api/paas/v4"),
+		"longcat", template("longcat", "longcat_chat_completion", "chat_completion", "https://api.longcat.chat/openai/v1"),
+		"aihubmix", template("aihubmix", "aihubmix_chat_completion", "chat_completion", "https://aihubmix.com/v1"),
+		"xiaomi", template("xiaomi", "xiaomi_chat_completion", "chat_completion", "https://api.xiaomimimo.com/v1"),
+		"openai_responses", om("id", "openai_responses", "type", "openai_responses", "provider", "openai",
+			"provider_type", "chat_completion", "enable", false,
+			"api_base", "https://api.openai.com/v1", "key", "", "model", ""),
+		"kimi_code", om("id", "kimi_code", "type", "kimi_code_chat_completion", "provider", "kimi-code",
+			"provider_type", "chat_completion", "enable", false,
+			"api_base", "https://api.kimi.com/coding", "key", "", "model", "kimi-for-coding"),
 		// Non-chat capabilities (STT / TTS / Embedding / Rerank). The type field
 		// must match the provider registered in internal/provider/sources/init.go.
-		"openai_whisper": map[string]interface{}{
-			"id": "whisper", "type": "openai_whisper", "provider": "openai",
-			"provider_type": "speech_to_text", "enable": false,
-			"api_key": "", "api_base": "https://api.openai.com/v1", "model": "whisper-1",
-		},
-		"openai_tts": map[string]interface{}{
-			"id": "openai_tts", "type": "openai_tts", "provider": "openai",
-			"provider_type": "text_to_speech", "enable": false,
-			"api_key": "", "api_base": "https://api.openai.com/v1", "model": "tts-1",
-			"voice": "alloy",
-		},
-		"azure_tts": map[string]interface{}{
-			"id": "azure_tts", "type": "azure_tts", "provider": "microsoft",
-			"provider_type": "text_to_speech", "enable": false,
-			"azure_tts_subscription_key": "", "azure_tts_region": "eastus",
-			"azure_tts_voice": "zh-CN-YunxiaNeural",
-		},
-		"elevenlabs_tts": map[string]interface{}{
-			"id": "elevenlabs_tts", "type": "elevenlabs_tts_api", "provider": "elevenlabs",
-			"provider_type": "text_to_speech", "enable": false,
-			"api_key": "", "api_base": "https://api.elevenlabs.io/v1",
-			"model": "eleven_multilingual_v2", "elevenlabs-tts-voice-id": "JBFqnCBsd6RMkjVDRZzb",
-		},
-		"fishaudio_tts": map[string]interface{}{
-			"id": "fishaudio_tts", "type": "fishaudio_tts_api", "provider": "fishaudio",
-			"provider_type": "text_to_speech", "enable": false,
-			"api_key": "", "api_base": "https://api.fish-audio.cn/v1",
-			"model": "s2-pro", "fishaudio-tts-character": "可莉",
-		},
-		"minimax_tts": map[string]interface{}{
-			"id": "minimax_tts", "type": "minimax_tts_api", "provider": "minimax",
-			"provider_type": "text_to_speech", "enable": false,
-			"api_key": "", "api_base": "https://api.minimax.chat/v1/t2a_v2",
-			"minimax-group-id": "", "minimax-voice-id": "",
-		},
-		"edge_tts": map[string]interface{}{
-			"id": "edge_tts", "type": "edge_tts", "provider": "microsoft",
-			"provider_type": "text_to_speech", "enable": false,
-			"edge-tts-voice": "zh-CN-XiaoxiaoNeural",
-		},
-		"volcengine_tts": map[string]interface{}{
-			"id": "volcengine_tts", "type": "volcengine_tts", "provider": "volcengine",
-			"provider_type": "text_to_speech", "enable": false,
-			"api_key": "", "appid": "", "volcengine_cluster": "",
-			"volcengine_voice_type": "", "api_base": "https://openspeech.bytedance.com/api/v1/tts",
-		},
-		"gemini_tts": map[string]interface{}{
-			"id": "gemini_tts", "type": "gemini_tts", "provider": "google",
-			"provider_type": "text_to_speech", "enable": false,
-			"gemini_tts_api_key": "", "gemini_tts_api_base": "https://generativelanguage.googleapis.com/v1beta",
-			"gemini_tts_model": "gemini-2.5-flash-preview-tts", "gemini_tts_voice_name": "Leda",
-		},
-		"mimo_tts": map[string]interface{}{
-			"id": "mimo_tts", "type": "mimo_tts_api", "provider": "mimo",
-			"provider_type": "text_to_speech", "enable": false,
-			"api_key": "", "api_base": "https://api.xiaomimimo.com/v1", "model": "mimo-v2.5-tts",
-			"mimo-tts-voice": "mimo_default",
-		},
-		"mimo_stt": map[string]interface{}{
-			"id": "mimo_stt", "type": "mimo_stt_api", "provider": "mimo",
-			"provider_type": "speech_to_text", "enable": false,
-			"api_key": "", "api_base": "https://api.xiaomimimo.com/v1", "model": "mimo-v2.5-asr",
-		},
-		"openai_embedding": map[string]interface{}{
-			"id": "openai_embedding", "type": "openai_embedding", "provider": "openai",
-			"provider_type": "embedding", "enable": false,
-			"embedding_api_key": "", "embedding_api_base": "https://api.openai.com/v1",
-			"embedding_model": "text-embedding-3-small", "embedding_dimensions": 1024,
-		},
-		"gemini_embedding": map[string]interface{}{
-			"id": "gemini_embedding", "type": "gemini_embedding", "provider": "google",
-			"provider_type": "embedding", "enable": false,
-			"embedding_api_key": "", "embedding_api_base": "https://generativelanguage.googleapis.com",
-			"embedding_model": "gemini-embedding-exp-03-07", "embedding_dimensions": 768,
-		},
-		"nvidia_embedding": map[string]interface{}{
-			"id": "nvidia_embedding", "type": "nvidia_embedding", "provider": "nvidia",
-			"provider_type": "embedding", "enable": false,
-			"embedding_api_key": "", "embedding_api_base": "https://integrate.api.nvidia.com/v1",
-			"embedding_model": "nvidia/llama-nemotron-embed-1b-v2", "embedding_dimensions": 1024,
-		},
-		"ollama_embedding": map[string]interface{}{
-			"id": "ollama_embedding", "type": "ollama_embedding", "provider": "ollama",
-			"provider_type": "embedding", "enable": false,
-			"embedding_api_base": "http://localhost:11434", "embedding_model": "nomic-embed-text",
-			"embedding_dimensions": 768,
-		},
-		"dashscope_embedding": map[string]interface{}{
-			"id": "dashscope_embedding", "type": "dashscope_embedding", "provider": "dashscope",
-			"provider_type": "embedding", "enable": false,
-			"embedding_api_key": "", "embedding_api_base": "https://dashscope.aliyuncs.com/api/v1",
-			"embedding_model": "text-embedding-v4", "embedding_dimensions": 1024,
-		},
-		"tei_rerank": map[string]interface{}{
-			"id": "tei_rerank", "type": "tei_rerank", "provider": "tei",
-			"provider_type": "rerank", "enable": false,
-			"rerank_api_key": "", "rerank_api_base": "http://127.0.0.1:8080", "model": "",
-		},
-		"bailian_rerank": map[string]interface{}{
-			"id": "bailian_rerank", "type": "bailian_rerank", "provider": "dashscope",
-			"provider_type": "rerank", "enable": false,
-			"rerank_api_key": "", "rerank_api_base": "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
-			"rerank_model": "qwen3-rerank",
-		},
-		"nvidia_rerank": map[string]interface{}{
-			"id": "nvidia_rerank", "type": "nvidia_rerank", "provider": "nvidia",
-			"provider_type": "rerank", "enable": false,
-			"nvidia_rerank_api_key": "", "nvidia_rerank_api_base": "https://ai.api.nvidia.com/v1/retrieval",
-			"nvidia_rerank_model": "nv-rerank-qa-mistral-4b:1",
-		},
-		"vllm_rerank": map[string]interface{}{
-			"id": "vllm_rerank", "type": "vllm_rerank", "provider": "vllm",
-			"provider_type": "rerank", "enable": false,
-			"rerank_api_base": "http://127.0.0.1:8000", "rerank_api_suffix": "/v1/rerank",
-			"rerank_model": "BAAI/bge-reranker-base",
-		},
-		"xinference_rerank": map[string]interface{}{
-			"id": "xinference_rerank", "type": "xinference_rerank", "provider": "xinference",
-			"provider_type": "rerank", "enable": false,
-			"rerank_api_base": "http://127.0.0.1:8000", "rerank_model": "BAAI/bge-reranker-base",
-		},
+		"openai_whisper", om("id", "whisper", "type", "openai_whisper", "provider", "openai",
+			"provider_type", "speech_to_text", "enable", false,
+			"api_key", "", "api_base", "https://api.openai.com/v1", "model", "whisper-1"),
+		"openai_tts", om("id", "openai_tts", "type", "openai_tts", "provider", "openai",
+			"provider_type", "text_to_speech", "enable", false,
+			"api_key", "", "api_base", "https://api.openai.com/v1", "model", "tts-1",
+			"voice", "alloy"),
+		"azure_tts", om("id", "azure_tts", "type", "azure_tts", "provider", "microsoft",
+			"provider_type", "text_to_speech", "enable", false,
+			"azure_tts_subscription_key", "", "azure_tts_region", "eastus",
+			"azure_tts_voice", "zh-CN-YunxiaNeural"),
+		"elevenlabs_tts", om("id", "elevenlabs_tts", "type", "elevenlabs_tts_api", "provider", "elevenlabs",
+			"provider_type", "text_to_speech", "enable", false,
+			"api_key", "", "api_base", "https://api.elevenlabs.io/v1",
+			"model", "eleven_multilingual_v2", "elevenlabs-tts-voice-id", "JBFqnCBsd6RMkjVDRZzb"),
+		"fishaudio_tts", om("id", "fishaudio_tts", "type", "fishaudio_tts_api", "provider", "fishaudio",
+			"provider_type", "text_to_speech", "enable", false,
+			"api_key", "", "api_base", "https://api.fish-audio.cn/v1",
+			"model", "s2-pro", "fishaudio-tts-character", "可莉"),
+		"minimax_tts", om("id", "minimax_tts", "type", "minimax_tts_api", "provider", "minimax",
+			"provider_type", "text_to_speech", "enable", false,
+			"api_key", "", "api_base", "https://api.minimax.chat/v1/t2a_v2",
+			"minimax-group-id", "", "minimax-voice-id", ""),
+		"edge_tts", om("id", "edge_tts", "type", "edge_tts", "provider", "microsoft",
+			"provider_type", "text_to_speech", "enable", false,
+			"edge-tts-voice", "zh-CN-XiaoxiaoNeural"),
+		"volcengine_tts", om("id", "volcengine_tts", "type", "volcengine_tts", "provider", "volcengine",
+			"provider_type", "text_to_speech", "enable", false,
+			"api_key", "", "appid", "", "volcengine_cluster", "",
+			"volcengine_voice_type", "", "api_base", "https://openspeech.bytedance.com/api/v1/tts"),
+		"gemini_tts", om("id", "gemini_tts", "type", "gemini_tts", "provider", "google",
+			"provider_type", "text_to_speech", "enable", false,
+			"gemini_tts_api_key", "", "gemini_tts_api_base", "https://generativelanguage.googleapis.com/v1beta",
+			"gemini_tts_model", "gemini-2.5-flash-preview-tts", "gemini_tts_voice_name", "Leda"),
+		"mimo_tts", om("id", "mimo_tts", "type", "mimo_tts_api", "provider", "mimo",
+			"provider_type", "text_to_speech", "enable", false,
+			"api_key", "", "api_base", "https://api.xiaomimimo.com/v1", "model", "mimo-v2.5-tts",
+			"mimo-tts-voice", "mimo_default"),
+		"mimo_stt", om("id", "mimo_stt", "type", "mimo_stt_api", "provider", "mimo",
+			"provider_type", "speech_to_text", "enable", false,
+			"api_key", "", "api_base", "https://api.xiaomimimo.com/v1", "model", "mimo-v2.5-asr"),
+		"openai_embedding", om("id", "openai_embedding", "type", "openai_embedding", "provider", "openai",
+			"provider_type", "embedding", "enable", false,
+			"embedding_api_key", "", "embedding_api_base", "https://api.openai.com/v1",
+			"embedding_model", "text-embedding-3-small", "embedding_dimensions", 1024),
+		"gemini_embedding", om("id", "gemini_embedding", "type", "gemini_embedding", "provider", "google",
+			"provider_type", "embedding", "enable", false,
+			"embedding_api_key", "", "embedding_api_base", "https://generativelanguage.googleapis.com",
+			"embedding_model", "gemini-embedding-exp-03-07", "embedding_dimensions", 768),
+		"nvidia_embedding", om("id", "nvidia_embedding", "type", "nvidia_embedding", "provider", "nvidia",
+			"provider_type", "embedding", "enable", false,
+			"embedding_api_key", "", "embedding_api_base", "https://integrate.api.nvidia.com/v1",
+			"embedding_model", "nvidia/llama-nemotron-embed-1b-v2", "embedding_dimensions", 1024),
+		"ollama_embedding", om("id", "ollama_embedding", "type", "ollama_embedding", "provider", "ollama",
+			"provider_type", "embedding", "enable", false,
+			"embedding_api_base", "http://localhost:11434", "embedding_model", "nomic-embed-text",
+			"embedding_dimensions", 768),
+		"dashscope_embedding", om("id", "dashscope_embedding", "type", "dashscope_embedding", "provider", "dashscope",
+			"provider_type", "embedding", "enable", false,
+			"embedding_api_key", "", "embedding_api_base", "https://dashscope.aliyuncs.com/api/v1",
+			"embedding_model", "text-embedding-v4", "embedding_dimensions", 1024),
+		"tei_rerank", om("id", "tei_rerank", "type", "tei_rerank", "provider", "tei",
+			"provider_type", "rerank", "enable", false,
+			"rerank_api_key", "", "rerank_api_base", "http://127.0.0.1:8080", "model", ""),
+		"bailian_rerank", om("id", "bailian_rerank", "type", "bailian_rerank", "provider", "dashscope",
+			"provider_type", "rerank", "enable", false,
+			"rerank_api_key", "", "rerank_api_base", "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+			"rerank_model", "qwen3-rerank"),
+		"nvidia_rerank", om("id", "nvidia_rerank", "type", "nvidia_rerank", "provider", "nvidia",
+			"provider_type", "rerank", "enable", false,
+			"nvidia_rerank_api_key", "", "nvidia_rerank_api_base", "https://ai.api.nvidia.com/v1/retrieval",
+			"nvidia_rerank_model", "nv-rerank-qa-mistral-4b:1"),
+		"vllm_rerank", om("id", "vllm_rerank", "type", "vllm_rerank", "provider", "vllm",
+			"provider_type", "rerank", "enable", false,
+			"rerank_api_base", "http://127.0.0.1:8000", "rerank_api_suffix", "/v1/rerank",
+			"rerank_model", "BAAI/bge-reranker-base"),
+		"xinference_rerank", om("id", "xinference_rerank", "type", "xinference_rerank", "provider", "xinference",
+			"provider_type", "rerank", "enable", false,
+			"rerank_api_base", "http://127.0.0.1:8000", "rerank_model", "BAAI/bge-reranker-base"),
 		// Agent runner backends (remote HTTP APIs). Mirrors the Python
 		// templates; the type values match the agent_runner_type config options
 		// so a created source can be selected as an agent runner provider.
-		"dify": map[string]interface{}{
-			"id": "dify_app_default", "type": "dify", "provider": "dify",
-			"provider_type": "agent_runner", "enable": true,
-			"dify_api_type": "chat", "dify_api_key": "",
-			"dify_api_base": "https://api.dify.ai/v1",
-			"dify_workflow_output_key": "astrbot_wf_output",
-			"dify_query_input_key": "astrbot_text_query",
-			"variables": map[string]interface{}{}, "timeout": 60, "proxy": "",
-		},
-		"coze": map[string]interface{}{
-			"id": "coze", "type": "coze", "provider": "coze",
-			"provider_type": "agent_runner", "enable": true,
-			"coze_api_key": "", "bot_id": "", "coze_api_base": "https://api.coze.cn",
-			"timeout": 60, "proxy": "",
-		},
-		"dashscope_agent": map[string]interface{}{
-			"id": "dashscope", "type": "dashscope", "provider": "dashscope",
-			"provider_type": "agent_runner", "enable": true,
-			"dashscope_app_type": "agent", "dashscope_api_key": "", "dashscope_app_id": "",
-			"rag_options": map[string]interface{}{
-				"pipeline_ids": []interface{}{}, "file_ids": []interface{}{}, "output_reference": false,
-			},
-			"variables": map[string]interface{}{}, "timeout": 60, "proxy": "",
-		},
-		"deerflow": map[string]interface{}{
-			"id": "deerflow", "type": "deerflow", "provider": "deerflow",
-			"provider_type": "agent_runner", "enable": true,
-			"deerflow_api_base": "http://127.0.0.1:2026", "deerflow_api_key": "",
-			"deerflow_auth_header": "", "deerflow_assistant_id": "lead_agent",
-			"deerflow_model_name": "", "deerflow_thinking_enabled": false,
-			"deerflow_plan_mode": false, "deerflow_subagent_enabled": false,
-			"deerflow_max_concurrent_subagents": 3, "deerflow_recursion_limit": 1000,
-			"timeout": 300,
-		},
-	}
+		"dify", om("id", "dify_app_default", "type", "dify", "provider", "dify",
+			"provider_type", "agent_runner", "enable", true,
+			"dify_api_type", "chat", "dify_api_key", "",
+			"dify_api_base", "https://api.dify.ai/v1",
+			"dify_workflow_output_key", "astrbot_wf_output",
+			"dify_query_input_key", "astrbot_text_query",
+			"variables", om(), "timeout", 60, "proxy", ""),
+		"coze", om("id", "coze", "type", "coze", "provider", "coze",
+			"provider_type", "agent_runner", "enable", true,
+			"coze_api_key", "", "bot_id", "", "coze_api_base", "https://api.coze.cn",
+			"timeout", 60, "proxy", ""),
+		"dashscope_agent", om("id", "dashscope", "type", "dashscope", "provider", "dashscope",
+			"provider_type", "agent_runner", "enable", true,
+			"dashscope_app_type", "agent", "dashscope_api_key", "", "dashscope_app_id", "",
+			"rag_options", om("pipeline_ids", []interface{}{}, "file_ids", []interface{}{}, "output_reference", false),
+			"variables", om(), "timeout", 60, "proxy", ""),
+		"deerflow", om("id", "deerflow", "type", "deerflow", "provider", "deerflow",
+			"provider_type", "agent_runner", "enable", true,
+			"deerflow_api_base", "http://127.0.0.1:2026", "deerflow_api_key", "",
+			"deerflow_auth_header", "", "deerflow_assistant_id", "lead_agent",
+			"deerflow_model_name", "", "deerflow_thinking_enabled", false,
+			"deerflow_plan_mode", false, "deerflow_subagent_enabled", false,
+			"deerflow_max_concurrent_subagents", 3, "deerflow_recursion_limit", 1000,
+			"timeout", 300),
+	)
 }
 
 // ── Config handlers (legacy /api/config/) ───────────────────
@@ -1252,10 +1127,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 				DeleteData   bool `json:"delete_data"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			s.pluginUninstall(pluginID, body.DeleteConfig)
+			s.pluginUninstall(pluginID, body.DeleteConfig, body.DeleteData)
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
 		case http.MethodPost:
-			s.pluginUninstall(pluginID, true)
+			s.pluginUninstall(pluginID, true, true)
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
 		default:
 			writeJSON(w, http.StatusOK, apiOK(s.pluginByID(pluginID)))
@@ -1285,41 +1160,43 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			}))
 		} else {
 			pluginID := r.URL.Query().Get("plugin_id")
-			if r.Method == http.MethodPost {
+			if r.Method == http.MethodPost || r.Method == http.MethodPut {
 				var body struct {
-					Config map[string]interface{} `json:"config"`
+					PluginID string                 `json:"plugin_id"`
+					Config   map[string]interface{} `json:"config"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&body)
+				if pluginID == "" {
+					pluginID = body.PluginID
+				}
 				s.pluginSaveConfig(pluginID, body.Config)
 				writeJSON(w, http.StatusOK, apiOKMsg("插件配置已保存", map[string]interface{}{}))
 			} else {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"config": s.pluginLoadConfig(pluginID),
-				}))
+				writeJSON(w, http.StatusOK, apiOK(s.pluginConfigPayload(pluginID)))
 			}
 		}
 	case "market":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"market": []interface{}{},
-		}))
+		market, err := s.fetchPluginMarket(
+			r.URL.Query().Get("custom_registry"),
+			strings.EqualFold(r.URL.Query().Get("force_refresh"), "true"),
+		)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("获取插件市场失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(market))
 	case "page":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "readme":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"content": "",
-		}))
+		s.handlePluginDocs(w, r, s.subPluginMgr.Readme)
 	case "config-files":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"files": []interface{}{},
 		}))
 	case "changelog":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"content": "",
-		}))
+		s.handlePluginDocs(w, r, s.subPluginMgr.Changelog)
 	case "update":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "plugin update not implemented",
-		}))
+		s.handlePluginUpdate(w, r, parts[1:])
 	case "install":
 		s.handlePluginInstall(w, r, parts)
 	case "validate":
@@ -1331,28 +1208,46 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			"supported": true,
 		}))
 	default:
-		// /api/v1/plugins/{plugin_id} and /api/v1/plugins/{plugin_id}/config
+		// /api/v1/plugins/{plugin_id}, /{plugin_id}/config, /{plugin_id}/source,
+		// /{plugin_id}/update and /{plugin_id}/reload
 		pluginID := sub
-		if len(parts) > 1 && parts[1] == "config" {
-			if r.Method == http.MethodPost || r.Method == http.MethodPut {
-				var body struct {
-					Config map[string]interface{} `json:"config"`
+		if len(parts) > 1 {
+			switch parts[1] {
+			case "config":
+				if r.Method == http.MethodPost || r.Method == http.MethodPut {
+					var body struct {
+						Config map[string]interface{} `json:"config"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					s.pluginSaveConfig(pluginID, body.Config)
+					writeJSON(w, http.StatusOK, apiOKMsg("插件配置已保存", map[string]interface{}{}))
+				} else {
+					writeJSON(w, http.StatusOK, apiOK(s.pluginConfigPayload(pluginID)))
 				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
-				s.pluginSaveConfig(pluginID, body.Config)
-				writeJSON(w, http.StatusOK, apiOKMsg("插件配置已保存", map[string]interface{}{}))
-			} else {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"config": s.pluginLoadConfig(pluginID),
-				}))
+				return
+			case "source":
+				s.handlePluginBindSource(w, r, pluginID)
+				return
+			case "update":
+				s.handlePluginUpdate(w, r, []string{pluginID})
+				return
+			case "reload":
+				s.pluginReload(pluginID)
+				writeJSON(w, http.StatusOK, apiOKMsg("插件已重载", map[string]interface{}{}))
+				return
+			case "readme":
+				s.handlePluginDocs(w, r, s.subPluginMgr.Readme)
+				return
+			case "changelog":
+				s.handlePluginDocs(w, r, s.subPluginMgr.Changelog)
+				return
 			}
-			return
 		}
 		switch r.Method {
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, apiOK(s.pluginByID(pluginID)))
 		case http.MethodDelete, http.MethodPost:
-			s.pluginUninstall(pluginID, false)
+			s.pluginUninstall(pluginID, false, false)
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
 		default:
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -1369,13 +1264,22 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		writeJSON(w, http.StatusOK, apiError("插件子系统未初始化"))
 		return
 	}
+
+	// GET /api/v1/plugins/install/progress?install_id=... returns live progress
+	// so the WebUI can poll while the install request is in flight.
+	if len(parts) > 1 && parts[1] == "progress" {
+		writeJSON(w, http.StatusOK, apiOK(s.getInstallProgress(r.URL.Query().Get("install_id"))))
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusOK, apiError("method not allowed"))
 		return
 	}
 
-	var source, id string
+	var source, id, installID string
 	var ignoreRisk bool
+	var installMethod, registryURL, registryName, marketPluginID, repo, downloadURL string
 
 	method := "url"
 	if len(parts) > 1 {
@@ -1385,12 +1289,26 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	switch method {
 	case "url", "git", "github":
 		var body struct {
-			URL        string `json:"url"`
-			IgnoreRisk bool   `json:"ignore_risk"`
+			URL             string `json:"url"`
+			IgnoreRisk      bool   `json:"ignore_risk"`
+			InstallID       string `json:"install_id"`
+			InstallMethod   string `json:"install_method"`
+			RegistryURL     string `json:"registry_url"`
+			RegistryName    string `json:"registry_name"`
+			MarketPluginID  string `json:"market_plugin_id"`
+			Repo            string `json:"repo"`
+			DownloadURL     string `json:"download_url"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		source = strings.TrimSpace(body.URL)
 		ignoreRisk = body.IgnoreRisk
+		installID = body.InstallID
+		installMethod = body.InstallMethod
+		registryURL = body.RegistryURL
+		registryName = body.RegistryName
+		marketPluginID = body.MarketPluginID
+		repo = body.Repo
+		downloadURL = body.DownloadURL
 	case "upload":
 		file, fh, err := r.FormFile("file")
 		if err != nil {
@@ -1420,6 +1338,13 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		source = archive
 		id = idFromSource(fh.Filename)
 		ignoreRisk = r.FormValue("ignore_risk") == "true"
+		installID = r.FormValue("install_id")
+		installMethod = r.FormValue("install_method")
+		registryURL = r.FormValue("registry_url")
+		registryName = r.FormValue("registry_name")
+		marketPluginID = r.FormValue("market_plugin_id")
+		repo = r.FormValue("repo")
+		downloadURL = r.FormValue("download_url")
 	default:
 		writeJSON(w, http.StatusOK, apiError("未知安装方式: "+method))
 		return
@@ -1433,13 +1358,32 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		id = idFromSource(source)
 	}
 
+	// For market/repository installs the url IS the repository; default the
+	// persisted repo so the WebUI can offer reinstall / change-source.
+	if repo == "" && (installMethod == "market" || installMethod == "repository") {
+		repo = source
+	}
+
+	s.setInstallProgress(installID, &installStatus{Status: "installing", Percent: 0, Text: "准备安装…"})
+	defer s.setInstallProgress(installID, &installStatus{Status: "done", Percent: 100, Text: "安装完成"})
+
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
-	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{IgnoreRisk: ignoreRisk})
+	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{
+		IgnoreRisk:     ignoreRisk,
+		Progress:       s.installProgressCallback(installID),
+		InstallMethod:  installMethod,
+		RegistryURL:    registryURL,
+		RegistryName:   registryName,
+		MarketPluginID: marketPluginID,
+		Repo:           repo,
+		DownloadURL:    downloadURL,
+	})
 	if err != nil {
 		var riskErr *plugin.RiskError
 		if errors.As(err, &riskErr) {
+			s.setInstallProgress(installID, &installStatus{Status: "error", Text: "检测到风险代码"})
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"status":  "error",
 				"code":    "plugin_risk",
@@ -1450,6 +1394,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			})
 			return
 		}
+		s.setInstallProgress(installID, &installStatus{Status: "error", Text: err.Error()})
 		writeJSON(w, http.StatusOK, apiError("插件安装失败: "+err.Error()))
 		return
 	}
@@ -1458,6 +1403,178 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	writeJSON(w, http.StatusOK, apiOKMsg("插件安装成功", map[string]interface{}{
 		"name":    inst.Name,
 		"version": inst.Version,
+	}))
+}
+
+// handlePluginUpdate updates/reinstalls plugins. The batch route
+// POST /api/v1/plugins/update accepts {plugin_id} (single) or {names: [...]}
+// (batch); the single route POST /api/v1/plugins/{plugin_id}/update passes the
+// id directly. Each plugin is reinstalled from its persisted install source.
+func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, parts []string) {
+	if s.subPluginMgr == nil {
+		writeJSON(w, http.StatusOK, apiError("插件子系统未初始化"))
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusOK, apiError("method not allowed"))
+		return
+	}
+
+	ids := []string{}
+	if len(parts) == 1 {
+		ids = append(ids, parts[0])
+	} else {
+		var body struct {
+			PluginID string   `json:"plugin_id"`
+			Names    []string `json:"names"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.PluginID != "" {
+			ids = append(ids, body.PluginID)
+		} else {
+			ids = body.Names
+		}
+	}
+	if len(ids) == 0 {
+		writeJSON(w, http.StatusOK, apiError("缺少要更新的插件"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+
+	type result struct {
+		Name    string `json:"name"`
+		Status  string `json:"status"`
+		Message string `json:"message"`
+	}
+	results := make([]result, 0, len(ids))
+	for _, id := range ids {
+		pid, name, ok := s.resolveSubprocessPlugin(id)
+		if !ok {
+			results = append(results, result{Name: id, Status: "error", Message: "插件不存在或非子进程插件"})
+			continue
+		}
+		inst, err := s.subPluginMgr.ReinstallSource(ctx, pid, plugin.InstallOptions{
+			Progress: s.installProgressCallback(""),
+		})
+		if err != nil {
+			var riskErr *plugin.RiskError
+			if errors.As(err, &riskErr) {
+				results = append(results, result{Name: name, Status: "error", Message: "源码包含风险代码"})
+			} else {
+				results = append(results, result{Name: name, Status: "error", Message: err.Error()})
+			}
+			continue
+		}
+		results = append(results, result{Name: inst.Name, Status: "ok", Message: "更新成功"})
+	}
+
+	s.notifyPluginsChanged()
+	if len(ids) == 1 && len(results) == 1 && results[0].Status == "error" {
+		writeJSON(w, http.StatusOK, apiError("插件更新失败: "+results[0].Message))
+		return
+	}
+	failed := 0
+	for _, r := range results {
+		if r.Status != "ok" {
+			failed++
+		}
+	}
+	msg := "更新完成"
+	if failed > 0 {
+		msg = fmt.Sprintf("更新完成，其中 %d/%d 个插件失败", failed, len(results))
+	}
+	writeJSON(w, http.StatusOK, apiOKMsg(msg, map[string]interface{}{
+		"results": results,
+	}))
+}
+
+// handlePluginBindSource binds an installed plugin to a marketplace/repository
+// source (POST /api/v1/plugins/{plugin_id}/source), persisting the install
+// source so reinstall/update resolves from the new registry.
+func (s *Server) handlePluginBindSource(w http.ResponseWriter, r *http.Request, pluginID string) {
+	if s.subPluginMgr == nil {
+		writeJSON(w, http.StatusOK, apiError("插件子系统未初始化"))
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusOK, apiError("method not allowed"))
+		return
+	}
+
+	var body struct {
+		InstallMethod   string `json:"install_method"`
+		RegistryURL     string `json:"registry_url"`
+		RegistryName    string `json:"registry_name"`
+		MarketPluginID  string `json:"market_plugin_id"`
+		Repo            string `json:"repo"`
+		DownloadURL     string `json:"download_url"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	pid, _, ok := s.resolveSubprocessPlugin(pluginID)
+	if !ok {
+		writeJSON(w, http.StatusOK, apiError("插件不存在或非子进程插件"))
+		return
+	}
+	method := strings.ToLower(strings.TrimSpace(body.InstallMethod))
+	if method != "" && method != "market" && method != "repository" {
+		writeJSON(w, http.StatusOK, apiError("不支持的插件源类型: "+method))
+		return
+	}
+	if err := s.subPluginMgr.BindSource(pid, method, body.RegistryURL, body.RegistryName,
+		body.MarketPluginID, body.Repo, body.DownloadURL); err != nil {
+		writeJSON(w, http.StatusOK, apiError("绑定插件源失败: "+err.Error()))
+		return
+	}
+	s.notifyPluginsChanged()
+	writeJSON(w, http.StatusOK, apiOKMsg("插件源已更新", map[string]interface{}{}))
+}
+
+// handlePluginDocs serves plugin README/CHANGELOG content
+// (GET /api/v1/plugins/{id}/readme, /changelog and the query variants). When
+// the subprocess runtime is unavailable it falls back to the legacy .so
+// manager's local README lookup.
+func (s *Server) handlePluginDocs(w http.ResponseWriter, r *http.Request, subprocess func(string) string) {
+	pluginID := r.URL.Query().Get("plugin_id")
+	if pluginID == "" {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		for i := len(parts) - 1; i >= 0; i-- {
+			if parts[i] == "plugins" && i+1 < len(parts) {
+				pluginID = parts[i+1]
+				break
+			}
+		}
+	}
+	if pluginID == "" {
+		writeJSON(w, http.StatusOK, apiError("缺少插件 ID"))
+		return
+	}
+
+	if s.subPluginMgr != nil && subprocess != nil {
+		content := subprocess(pluginID)
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"content": content,
+		}))
+		return
+	}
+
+	// Legacy .so manager fallback: read the local README from the plugin dir.
+	content := ""
+	if pm := s.pluginManager(); pm != nil {
+		if dir := pm.PluginDataDir(pluginID); dir != "" {
+			base := filepath.Dir(dir)
+			for _, file := range []string{"README.md", "readme.md"} {
+				if b, err := os.ReadFile(filepath.Join(base, file)); err == nil {
+					content = string(b)
+					break
+				}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"content": content,
 	}))
 }
 
@@ -2481,6 +2598,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, parts []stri
 	}
 	switch sub {
 	case "":
+		if r.Method == http.MethodPost {
+			// The WebUI chat page sends a message here and expects an SSE
+			// stream back (mirrors Python's _send_chat).
+			s.handleChatSend(w, r)
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"sessions": s.chat.listSessions(),
 		}))

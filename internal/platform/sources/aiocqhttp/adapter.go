@@ -40,6 +40,9 @@ type Adapter struct {
 	mu         sync.Mutex
 	conns      map[*websocket.Conn]struct{} // active reverse-WS connections
 	groupConvs map[string]bool              // convID -> is group (from received events)
+
+	pendingMu sync.Mutex
+	pending   map[string]chan map[string]interface{} // echo -> response channel
 }
 
 // New creates an aiocqhttp adapter from config.
@@ -48,6 +51,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		EventBus:   eventBus,
 		conns:      make(map[*websocket.Conn]struct{}),
 		groupConvs: make(map[string]bool),
+		pending:    make(map[string]chan map[string]interface{}),
 		upgrader: websocket.Upgrader{
 			// OneBot implementations connect from arbitrary origins.
 			CheckOrigin: func(r *http.Request) bool { return true },
@@ -251,9 +255,107 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			a.handleEvent(msg)
 			continue
 		}
-		if _, hasEcho := msg["echo"]; hasEcho {
+		if echo, hasEcho := msg["echo"].(string); hasEcho {
 			logger.Debug("OneBot API response: %v", msg)
+			a.pendingMu.Lock()
+			if ch, ok := a.pending[echo]; ok {
+				delete(a.pending, echo)
+				select {
+				case ch <- msg:
+				default:
+				}
+				close(ch)
+			}
+			a.pendingMu.Unlock()
 		}
+	}
+}
+
+// CallAction sends a OneBot v11 API call over an active reverse-WS connection
+// and waits for the echo'd response (up to actionTimeout). Returns the action's
+// "data" object.
+func (a *Adapter) CallAction(api string, params map[string]any) (map[string]any, error) {
+	echo := fmt.Sprintf("astrbot-%d-%d", time.Now().UnixNano(), actionSeq.Add(1))
+	payload, err := json.Marshal(map[string]interface{}{
+		"action": api,
+		"params": params,
+		"echo":   echo,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	a.mu.Lock()
+	conns := make([]*websocket.Conn, 0, len(a.conns))
+	for c := range a.conns {
+		conns = append(conns, c)
+	}
+	a.mu.Unlock()
+
+	if len(conns) == 0 {
+		return nil, fmt.Errorf("aiocqhttp: no active WebSocket connection to call %s", api)
+	}
+
+	ch := make(chan map[string]interface{}, 1)
+	a.pendingMu.Lock()
+	a.pending[echo] = ch
+	a.pendingMu.Unlock()
+	defer func() {
+		a.pendingMu.Lock()
+		delete(a.pending, echo)
+		a.pendingMu.Unlock()
+	}()
+
+	// Try each connection; drop ones that fail so future calls pick a healthy peer.
+	var lastErr error
+	for _, c := range conns {
+		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := c.WriteMessage(websocket.TextMessage, payload); err != nil {
+			a.removeConn(c)
+			lastErr = err
+			continue
+		}
+		select {
+		case resp := <-ch:
+			return parseActionResult(resp)
+		case <-time.After(actionTimeout):
+			return nil, fmt.Errorf("aiocqhttp: call %s timed out (no echo response)", api)
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no reachable connection")
+	}
+	return nil, fmt.Errorf("aiocqhttp: failed to call %s: %w", api, lastErr)
+}
+
+// actionTimeout bounds how long CallAction waits for an echo response.
+const actionTimeout = 10 * time.Second
+
+var actionSeq = &actionCounter{}
+
+type actionCounter struct{ n int64 }
+
+func (c *actionCounter) Add(delta int64) int64 {
+	c.n += delta
+	return c.n
+}
+
+// parseActionResult unwraps the OneBot v11 response envelope, returning its
+// "data" object. Array data is wrapped under the key "list" so callers always
+// receive a JSON object across the RPC boundary.
+func parseActionResult(resp map[string]interface{}) (map[string]interface{}, error) {
+	if status, _ := resp["status"].(string); status != "" && status != "ok" {
+		if msg, _ := resp["msg"].(string); msg != "" {
+			return nil, fmt.Errorf("aiocqhttp: action failed: %s", msg)
+		}
+	}
+	switch data := resp["data"].(type) {
+	case map[string]interface{}:
+		return data, nil
+	case []interface{}:
+		return map[string]interface{}{"list": data}, nil
+	default:
+		return map[string]interface{}{}, nil
 	}
 }
 
@@ -269,11 +371,12 @@ func (a *Adapter) removeConn(c *websocket.Conn) {
 	delete(a.conns, c)
 }
 
-// handleEvent processes a OneBot v11 event.
+// handleEvent processes a OneBot v11 event, dispatching to message or notice
+// handling by post_type.
 func (a *Adapter) handleEvent(raw map[string]interface{}) {
 	postType, _ := raw["post_type"].(string)
-	if postType != "message" {
-		return
+	if postType == "" {
+		postType = "message"
 	}
 
 	// Track the bot's own ID from the event's self field so @-mentions of the
@@ -286,6 +389,39 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 		}
 	}
 
+	switch postType {
+	case "message":
+		a.handleMessage(raw)
+	case "notice":
+		a.handleNotice(raw)
+	default:
+		// "request" and meta events are not published to plugins yet.
+		logger.Debug("aiocqhttp: ignoring event post_type=%q", postType)
+	}
+}
+
+// publishEvent sends a core.Event to the bus (nil-safe).
+func (a *Adapter) publishEvent(event *core.Event) {
+	if a.EventBus == nil {
+		logger.Error("aiocqhttp event bus not configured; cannot publish")
+		return
+	}
+	if err := a.EventBus.Publish(event); err != nil {
+		logger.Error("Failed to publish event: %v", err)
+	}
+}
+
+// rawJSON marshals the raw OneBot event to a JSON string (best effort).
+func rawJSON(raw map[string]interface{}) string {
+	if raw == nil {
+		return ""
+	}
+	b, _ := json.Marshal(raw)
+	return string(b)
+}
+
+// handleMessage processes a OneBot v11 message event.
+func (a *Adapter) handleMessage(raw map[string]interface{}) {
 	messageType, _ := raw["message_type"].(string)
 	isGroup := messageType == "group"
 
@@ -314,6 +450,13 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 	// Convert message segments
 	msgChain := a.convertFromCQFormat(raw)
 
+	msgID, _ := raw["message_id"].(string)
+	if msgID == "" {
+		if id, ok := raw["message_id"].(float64); ok {
+			msgID = fmt.Sprintf("%v", int64(id))
+		}
+	}
+
 	// Publish event
 	event := &core.Event{
 		Type: core.EventMessage,
@@ -327,17 +470,85 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 		},
 		Message:    msgChain,
 		MessageStr: extractPlainText(msgChain),
+		RawMessage: rawJSON(raw),
 		Timestamp:  time.Now(),
 		Metadata:   make(map[string]interface{}),
+		MessageObj: &core.MessageObj{
+			MessageID:   msgID,
+			SelfID:      a.SelfID,
+			SessionID:   convID,
+			MessageType: messageType,
+			Platform:    "aiocqhttp",
+			MessageStr:  extractPlainText(msgChain),
+			RawMessage:  raw,
+			Timestamp:   time.Now(),
+		},
 	}
 
-	if a.EventBus == nil {
-		logger.Error("aiocqhttp event bus not configured; cannot publish")
+	a.publishEvent(event)
+}
+
+// handleNotice processes a OneBot v11 notice event (recall, ban, etc.) and
+// publishes it as a notice event so plugins (e.g. recall-cancel) can react.
+func (a *Adapter) handleNotice(raw map[string]interface{}) {
+	noticeType, _ := raw["notice_type"].(string)
+	if noticeType == "" {
 		return
 	}
-	if err := a.EventBus.Publish(event); err != nil {
-		logger.Error("Failed to publish event: %v", err)
+	isGroup := false
+	convID := ""
+	if gid, ok := raw["group_id"]; ok {
+		isGroup = true
+		convID = fmt.Sprintf("%v", gid)
 	}
+	senderID := fmt.Sprintf("%v", raw["operator_id"])
+	if senderID == "<nil>" || senderID == "" {
+		senderID = fmt.Sprintf("%v", raw["user_id"])
+	}
+	if !isGroup {
+		convID = senderID
+	}
+
+	msgID, _ := raw["message_id"].(string)
+	if msgID == "" {
+		if id, ok := raw["message_id"].(float64); ok {
+			msgID = fmt.Sprintf("%v", int64(id))
+		}
+	}
+
+	a.mu.Lock()
+	if convID != "" {
+		a.groupConvs[convID] = isGroup
+	}
+	a.mu.Unlock()
+
+	event := &core.Event{
+		Type: core.EventNotice,
+		Source: core.EventSource{
+			Platform:   "aiocqhttp",
+			SelfID:     a.SelfID,
+			SenderID:   senderID,
+			ConvID:     convID,
+			IsGroup:    isGroup,
+		},
+		MessageStr: "",
+		RawMessage: rawJSON(raw),
+		Timestamp:  time.Now(),
+		Metadata:   make(map[string]interface{}),
+		MessageObj: &core.MessageObj{
+			MessageID:   msgID,
+			SelfID:      a.SelfID,
+			SessionID:   convID,
+			MessageType: "notice_" + noticeType,
+			Platform:    "aiocqhttp",
+			RawMessage:  raw,
+			Timestamp:   time.Now(),
+		},
+	}
+	if noticeType == "group_recall" || noticeType == "friend_recall" {
+		event.MessageStr = "[撤回通知]"
+	}
+	a.publishEvent(event)
 }
 
 // convertFromCQFormat converts OneBot v11 message segments to MessageChain.

@@ -51,6 +51,9 @@ type Toolchain struct {
 	Version string
 }
 
+// ProgressFunc receives download progress (bytes) during provisioning.
+type ProgressFunc func(downloaded, total int64)
+
 // New returns a Toolchain using the version from ASTRBOT_GO_VERSION or the
 // default.
 func New() *Toolchain {
@@ -90,10 +93,16 @@ func (tc *Toolchain) GoBin() (string, error) {
 // Ensure provisions the bundled toolchain (download + extract) if needed and
 // returns the `go` binary path. It never overwrites an existing bundle.
 func (tc *Toolchain) Ensure() (string, error) {
+	return tc.EnsureWithProgress(nil)
+}
+
+// EnsureWithProgress is like Ensure but also reports download progress through
+// the callback (the download is ~150-200MB on first run).
+func (tc *Toolchain) EnsureWithProgress(progress ProgressFunc) (string, error) {
 	if bin, err := tc.GoBin(); err == nil {
 		return bin, nil
 	}
-	return tc.downloadAndExtract()
+	return tc.downloadAndExtract(progress)
 }
 
 // GOROOT returns the root of the bundled distribution, or "" if not present.
@@ -131,10 +140,14 @@ func (tc *Toolchain) BundledRoot() string {
 // GOROOT from the executable's location, which covers both the bundled
 // toolchain (<BaseDir>/go/bin/go) and a system-installed go.
 func (tc *Toolchain) BuildEnv(extra map[string]string) []string {
+	cgo := "0"
+	if CGOEnabled() {
+		cgo = "1"
+	}
 	env := []string{
 		"GO111MODULE=on",
 		"GOFLAGS=-mod=mod",
-		"CGO_ENABLED=0",
+		"CGO_ENABLED=" + cgo,
 		"GOPATH=" + tc.GOPATH(),
 	}
 	for k, v := range extra {
@@ -143,11 +156,25 @@ func (tc *Toolchain) BuildEnv(extra map[string]string) []string {
 	return append(os.Environ(), env...)
 }
 
+// CGOEnabled reports whether plugin builds may use cgo. cgo is only usable
+// when a C compiler exists on the host (the bundled Go toolchain does not ship
+// one). Override with ASTRBOT_PLUGIN_CGO=0/1 to force.
+func CGOEnabled() bool {
+	if v := os.Getenv("ASTRBOT_PLUGIN_CGO"); v != "" {
+		return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "on")
+	}
+	for _, c := range []string{"cc", "gcc", "clang"} {
+		if _, err := exec.LookPath(c); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // downloadAndExtract provisions the official Go distribution under BaseDir.
-func (tc *Toolchain) downloadAndExtract() (string, error) {
+func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	if !supportsBundledGo() {
-		return "", fmt.Errorf("bundled Go is not supported on %s/%s (set %s or install Go, e.g. `pkg install golang` on Termux)",
-			runtime.GOOS, runtime.GOARCH, EnvGoBin)
+		return "", fmt.Errorf("%s", tc.unsupportedHint())
 	}
 
 	base := tc.BaseDir()
@@ -160,7 +187,7 @@ func (tc *Toolchain) downloadAndExtract() (string, error) {
 	url := downloadURL(archive)
 
 	logger.Info("Downloading Go toolchain %s from %s", archive, url)
-	if err := downloadFile(url, dest); err != nil {
+	if err := downloadFile(url, dest, progress); err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
 	}
 	if err := tc.verifyChecksum(dest, archive); err != nil {
@@ -178,6 +205,24 @@ func (tc *Toolchain) downloadAndExtract() (string, error) {
 		return "", fmt.Errorf("extracted toolchain missing go binary: %s", bin)
 	}
 	return bin, nil
+}
+
+// unsupportedHint returns a friendly, platform-aware message when no bundled
+// Go archive exists for the current platform (e.g. Termux/Android).
+func (tc *Toolchain) unsupportedHint() string {
+	if runtime.GOOS == "android" {
+		prefix := os.Getenv("PREFIX")
+		if prefix == "" {
+			prefix = "/data/data/com.termux/files/usr"
+		}
+		return "Termux (Android) 没有官方 Go 工具链可用。请在 Termux 中执行：\n" +
+			"  pkg update && pkg install golang\n" +
+			"安装后让 `go` 出现在 PATH 中，或设置环境变量：\n" +
+			fmt.Sprintf("  export ASTRBOT_GO_BIN=%s/bin/go\n", prefix) +
+			"然后重启 AstrBot。"
+	}
+	return fmt.Sprintf("bundled Go is not supported on %s/%s (set %s to an existing go binary)",
+		runtime.GOOS, runtime.GOARCH, EnvGoBin)
 }
 
 // verifyChecksum fetches "<file>.sha256" from the mirror and compares it.
@@ -295,8 +340,9 @@ func userStateDir() string {
 	return "."
 }
 
-// downloadFile streams a URL to dest with a progress timeout.
-func downloadFile(url, dest string) error {
+// downloadFile streams a URL to dest with a progress timeout, logging and
+// reporting download progress every ~10%.
+func downloadFile(url, dest string, progress ProgressFunc) error {
 	client := &http.Client{Timeout: 30 * time.Minute}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -311,8 +357,55 @@ func downloadFile(url, dest string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	return copyWithProgress(f, resp.Body, resp.ContentLength, progress)
+}
+
+// copyWithProgress copies r to w, logging percentage milestones and invoking
+// the progress callback (when set).
+func copyWithProgress(w io.Writer, r io.Reader, total int64, progress ProgressFunc) error {
+	buf := make([]byte, 64*1024)
+	var written int64
+	lastPct := -1
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			written += int64(n)
+			if total > 0 {
+				pct := int(written * 100 / total)
+				if pct != lastPct && pct%10 == 0 {
+					lastPct = pct
+					logger.Info("Downloading Go toolchain: %d%% (%s / %s)",
+						pct, humanSize(written), humanSize(total))
+				}
+			}
+			if progress != nil {
+				progress(written, total)
+			}
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+}
+
+// humanSize formats a byte count as a human-readable size (e.g. "123.4 MiB").
+func humanSize(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // extractArchive unpacks a Go official archive (tar.gz or zip) into dir,

@@ -100,7 +100,13 @@ func (c *Compiler) Vet(ctx context.Context, srcDir string) error {
 // Build compiles the Go module at srcDir into outputPath. The environment is
 // derived from the toolchain (CGO_ENABLED=0, isolated GOPATH).
 func (c *Compiler) Build(ctx context.Context, srcDir, outputPath string) error {
-	goBin, err := c.tc.Ensure()
+	return c.BuildWithProgress(ctx, srcDir, outputPath, nil)
+}
+
+// BuildWithProgress is like Build but reports toolchain download progress via
+// the callback when the bundled Go toolchain has to be provisioned first.
+func (c *Compiler) BuildWithProgress(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc) error {
+	goBin, err := c.tc.EnsureWithProgress(progress)
 	if err != nil {
 		return fmt.Errorf("ensure toolchain: %w", err)
 	}

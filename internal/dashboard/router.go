@@ -110,6 +110,10 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	// ── Chat ──────────────────────────────────────────────
 	case "chat":
 		s.handleChat(w, r, rest)
+	case "unified-chat":
+		s.handleUnifiedChatWS(w, r)
+	case "live-chat":
+		s.handleUnifiedChatWS(w, r)
 
 	// ── Updates ──────────────────────────────────────────
 	case "update", "updates":

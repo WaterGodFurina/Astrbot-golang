@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -48,10 +50,7 @@ type Lifecycle struct {
 	cronMgr          *cron.CronJobManager
 	dashboard        *dashboard.Server
 	backupExporter   *backup.Exporter
-	pluginMgr        *plugin.Manager
-	pluginCtx        *plugin.Context
 	subPluginMgr     *plugin.SubprocessManager
-	legacyPluginMode bool
 	toolchain        *toolchain.Toolchain
 	skillMgr         *skills.SkillManager
 	sandboxMgr       *sandbox.Manager
@@ -102,13 +101,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.configMgr.Register("default", cfg)
 	logger.Info("Config loaded (integrity check passed)")
 
-	// Plugin mode: false (default) uses the subprocess plugin runtime only;
-	// true keeps the legacy .so plugin runtime.
-	l.legacyPluginMode = false
-	if cfg != nil {
-		l.legacyPluginMode = cfg.GetBool("legacy_plugin_mode")
-	}
-	logger.Info("Plugin mode: legacy_plugin_mode=%v", l.legacyPluginMode)
+	// 插件方案：全面采用子进程插件运行时（go-plugin + gRPC），
+	// 已舍弃 legacy .so 方案（不再加载/桥接 .so 插件）。
 
 	// Apply the log level from config unless ASTRBOT_LOG_LEVEL is set
 	// explicitly in the environment (env takes precedence).
@@ -116,6 +110,24 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		if lvl := cfg.GetString("log_level"); lvl != "" {
 			log.GetDefault().SetLevel(log.ParseLevel(lvl))
 			logger.Info("Log level set from config: %s", lvl)
+		}
+	}
+
+	// 日志保存：log_file_enable 开启时写分段文件（每段 log_file_max_mb MB，保留最近 3 段）。
+	// 未开启则只在内存保留 ~1MB 环形日志（前端 console 页/运存都不会无限增长）。
+	if cfg.GetBool("log_file_enable") {
+		path := cfg.GetString("log_file_path")
+		if path == "" {
+			path = "logs/astrbot.log"
+		}
+		maxMB := cfg.GetInt("log_file_max_mb")
+		if maxMB <= 0 {
+			maxMB = 5
+		}
+		if err := log.GetDefault().EnableFileLog(path, int64(maxMB)<<20, 3); err != nil {
+			logger.Warn("启用分段日志文件失败: %v", err)
+		} else {
+			logger.Info("分段日志已启用: %s (每段 %d MB)", path, maxMB)
 		}
 	}
 
@@ -220,44 +232,14 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// star pipeline, and re-bridges after a crash-restart swaps an instance.
 	l.subPluginMgr = plugin.NewSubprocessManager(l.toolchain, "data")
 	l.subPluginMgr.OnInstancesChanged = func() { l.RebridgePlugins() }
+	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
+	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
+	// back into the host.
+	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins)
 	l.subPluginMgr.LoadInstalled(ctx)
 	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr.List())
 
-	// 10. Load .so plugins (legacy runtime). Skipped when legacy_plugin_mode
-	// is false (default): the subprocess runtime (SubprocessManager) is the
-	// only plugin runtime in that case, and pluginMgr stays nil.
-	if l.legacyPluginMode {
-		pluginCtx := &plugin.Context{
-			DataDir:   "data",
-			ConfigDir: "data",
-			PluginDir: "data/plugins",
-			Logger:    log.GetDefault().WithComponent("Plugin"),
-		}
-		l.pluginCtx = pluginCtx
-		l.pluginMgr = plugin.NewManager(pluginCtx)
-		if err := os.MkdirAll("data/plugins", 0755); err != nil {
-			logger.Warn("Failed to create plugins dir: %v", err)
-		}
-		if loaded, errs := l.pluginMgr.LoadDir("data/plugins"); len(errs) > 0 {
-			for _, e := range errs {
-				logger.Warn("Plugin load error: %v", e)
-			}
-		} else {
-			logger.Info("Plugins loaded: %d", len(loaded))
-		}
-		// Bridge .so plugin commands into the pipeline's star handler system.
-		star.RegisterPluginCommands(l.starMgr, pluginCtx, l.pluginMgr.AllCommands())
-		star.RegisterPluginFilters(l.starMgr, l.pluginMgr.AllFilters())
-		star.RegisterPluginHooks(l.starMgr, l.pluginMgr.AllHooks())
-		// Apply persisted command configs (enabled/renames/permissions).
-		if cfg := l.configMgr.Get("default"); cfg != nil {
-			if all := cfg.All(); all != nil {
-				if records, ok := all["command_configs"].(map[string]interface{}); ok {
-					star.ApplyCommandConfigs(l.starMgr.Handlers(), records)
-				}
-			}
-		}
-	}
+	// (已舍弃 legacy .so 方案：不再加载/桥接 .so 插件)
 
 	// 11. Load platform adapters from config
 	if err := l.loadPlatforms(ctx); err != nil {
@@ -269,9 +251,9 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		"config":            l.configMgr,
 		"provider":          l.providerMgr,
 		"platform":          l.platformMgr,
+		"event_bus":         l.eventBus,
 		"conversation":      l.conversationMgr,
 		"cron":              l.cronMgr,
-		"plugin":            l.pluginMgr,
 		"plugin_subprocess": l.subPluginMgr,
 		"star":              l.starMgr,
 		"knowledgebase":     l.kbMgr,
@@ -310,10 +292,23 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		}
 	}()
 
+	// 周期归还 Go 堆给 OS：长时间运行下 Go GC 不会把内存还给系统，RSS 只涨不降
+	// （用户感知"保存配置/禁用插件后运存不释放"）。每 5 分钟强制回收一次。
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				runtime.GC()
+				debug.FreeOSMemory()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	// Trigger startup hooks
-	if l.pluginMgr != nil {
-		l.pluginMgr.TriggerHook(ctx, "startup")
-	}
 	l.subPluginMgr.TriggerHook(ctx, "startup")
 
 	logger.Info("AstrBot Go started - API on :6185")
@@ -428,6 +423,17 @@ func mustJSON(v interface{}) []byte {
 	return b
 }
 
+// chatLLMForPlugins backs sdk.Host.ChatLLM: calls the host's default chat LLM
+// provider with the given prompt + system prompt.
+func (l *Lifecycle) chatLLMForPlugins(prompt, systemPrompt string) (string, error) {
+	cfg := l.configMgr.Get("default")
+	cfgMap := map[string]interface{}{}
+	if cfg != nil {
+		cfgMap = cfg.All()
+	}
+	return pipeline.ChatLLMFromConfig(cfgMap, prompt, systemPrompt)
+}
+
 // buildPipelineScheduler assembles the full 9-stage pipeline for a config ID
 // and registers it with the event bus.
 func (l *Lifecycle) buildPipelineScheduler(confID string) error {
@@ -451,6 +457,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 		CronManager:           l.cronMgr,
 		Database:              l.database,
 		EventBus:              l.eventBus,
+		SubPlugins:            l.subPluginMgr,
 	}
 
 	stageFactory := []func() core.PipelineStage{
@@ -493,9 +500,6 @@ func (l *Lifecycle) Stop() {
 	if l.sandboxMgr != nil {
 		l.sandboxMgr.Stop()
 	}
-	if l.pluginMgr != nil {
-		l.pluginMgr.UnloadAll()
-	}
 	if l.subPluginMgr != nil {
 		l.subPluginMgr.Shutdown()
 	}
@@ -533,6 +537,10 @@ func (l *Lifecycle) ReloadPlatforms(ctx context.Context) {
 	l.platformMgr.Clear()
 	if err := l.loadPlatforms(ctx); err != nil {
 		logger.Error("Failed to reload platforms: %v", err)
+	}
+	// Re-register the dashboard-chat reply sink that Clear() wiped.
+	if l.dashboard != nil && l.dashboard.ChatAdapter() != nil {
+		l.platformMgr.Register(l.dashboard.ChatAdapter())
 	}
 }
 
@@ -659,7 +667,7 @@ func personaSkillsResolver(personaID string) []string {
 
 // RebridgePlugins re-registers plugin commands/filters/hooks after plugin
 // changes (enable/disable/reload/install/unload) so the pipeline picks up the
-// latest set. Covers both the legacy .so runtime and the subprocess runtime.
+// latest set. 全面采用子进程插件运行时（legacy .so 已舍弃）。
 func (l *Lifecycle) RebridgePlugins() {
 	if l.starMgr == nil {
 		return
@@ -667,11 +675,6 @@ func (l *Lifecycle) RebridgePlugins() {
 	star.RemovePluginCommands(l.starMgr)
 	star.RemovePluginFilters(l.starMgr)
 	star.RemovePluginHooks(l.starMgr)
-	if l.legacyPluginMode && l.pluginMgr != nil {
-		star.RegisterPluginCommands(l.starMgr, l.pluginCtx, l.pluginMgr.AllCommands())
-		star.RegisterPluginFilters(l.starMgr, l.pluginMgr.AllFilters())
-		star.RegisterPluginHooks(l.starMgr, l.pluginMgr.AllHooks())
-	}
 	if l.subPluginMgr != nil {
 		star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr.List())
 	}

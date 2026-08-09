@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -98,6 +100,20 @@ type InstallOptions struct {
 	// IgnoreRisk skips the static-scan risk gate and installs the plugin even
 	// when risky imports are found (user explicitly confirmed on the WebUI).
 	IgnoreRisk bool
+	// Progress receives toolchain download progress (bytes) during the first
+	// plugin build, when the bundled Go has to be downloaded (~150-200MB).
+	Progress func(downloaded, total int64)
+
+	// Install source metadata persisted into the manifest so the WebUI can
+	// offer reinstall / change-source. installMethod is one of "market",
+	// "repository", "url" or "upload"; registryURL/marketPluginID describe a
+	// marketplace binding, repo/downloadURL the actual fetch targets.
+	InstallMethod  string
+	RegistryURL    string
+	RegistryName   string
+	MarketPluginID string
+	Repo           string
+	DownloadURL    string
 }
 
 // RiskError is returned by InstallFromSource when the static scan found risky
@@ -148,7 +164,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	}
 
 	artifact := filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id), artifactName(id))
-	if err := m.compiler.Build(ctx, srcDir, artifact); err != nil {
+	if err := m.compiler.BuildWithProgress(ctx, srcDir, artifact, opts.Progress); err != nil {
 		return nil, fmt.Errorf("build plugin %s: %w", id, err)
 	}
 
@@ -156,25 +172,55 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if err != nil {
 		return nil, err
 	}
-	if err := m.recordInstall(inst, source, artifact); err != nil {
+	if err := m.recordInstall(inst, source, artifact, opts); err != nil {
 		logger.Warn("Plugin %s installed but manifest persist failed: %v", id, err)
 	}
+	m.cachePluginDocs(inst.Name, srcDir)
 	return inst, nil
 }
 
+// cachePluginDocs copies the plugin's README.md and CHANGELOG.md from the
+// fetched source into its config/data directory so the WebUI readme/changelog
+// endpoints can serve them without re-fetching (mirrors Python's
+// plugin_dir/README.md lookup).
+func (m *SubprocessManager) cachePluginDocs(name, srcDir string) {
+	dir := filepath.Join(m.dataDir, "plugins", name)
+	_ = os.MkdirAll(dir, 0o755)
+	for _, src := range []string{"README.md", "readme.md", "CHANGELOG.md", "changelog.md"} {
+		content, err := os.ReadFile(filepath.Join(srcDir, src))
+		if err != nil {
+			continue
+		}
+		dst := filepath.Join(dir, src)
+		if err := os.WriteFile(dst, content, 0o644); err != nil {
+			logger.Warn("Cache docs %s for plugin %s: %v", src, name, err)
+		}
+	}
+}
+
 // recordInstall upserts the plugin into the persisted install manifest.
-func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact string) error {
+func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact string, opts InstallOptions) error {
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
 		return err
 	}
 	man.Upsert(ManifestEntry{
-		ID:      inst.ID,
-		Name:    inst.Name,
-		Version: inst.Version,
-		Source:  source,
-		Binary:  artifact,
-		Enabled: true,
+		ID:             inst.ID,
+		Name:           inst.Name,
+		Version:        inst.Version,
+		Source:         source,
+		Binary:         artifact,
+		Enabled:        true,
+		InstallMethod:  opts.InstallMethod,
+		RegistryURL:    opts.RegistryURL,
+		RegistryName:   opts.RegistryName,
+		MarketPluginID: opts.MarketPluginID,
+		Repo:           opts.Repo,
+		DownloadURL:    opts.DownloadURL,
+		// 记录插件在 data 下创建的目录，供卸载时精确清理。
+		ConfigDir: filepath.Join("plugins_config", inst.Name),
+		DataDir:   filepath.Join("plugins_data", sanitizeID(inst.ID)),
+		DocsDir:   filepath.Join("plugins", inst.Name),
 	})
 	return man.Save(m.manifestPath())
 }
@@ -201,6 +247,10 @@ func (m *SubprocessManager) Load(ctx context.Context, id, binary string) (*Plugi
 	inst, err := m.startInstance(ctx, id, binary)
 	if err != nil {
 		return nil, err
+	}
+	// 落盘 config schema 缓存，供插件禁用后仍能渲染配置对话框。
+	if inst.Meta != nil {
+		m.cacheConfigSchema(inst.Name, inst.Meta)
 	}
 
 	m.mu.Lock()
@@ -344,7 +394,14 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 		return nil, fmt.Errorf("plugin binary not found: %s", abs)
 	}
 
+	// 插件子进程工作目录设为统一数据根目录 data/plugins_data/<id>，插件写相对
+	// 路径的运行时数据（修仙存档、表情库等）自动落盘于此，便于管理/备份/卸载。
+	pluginDataRoot := m.pluginDataRoot(id)
+	if err := os.MkdirAll(pluginDataRoot, 0o755); err != nil {
+		return nil, fmt.Errorf("create plugin data dir: %w", err)
+	}
 	cmd := exec.Command(abs)
+	cmd.Dir = pluginDataRoot
 	raw := goplugin.NewClient(&goplugin.ClientConfig{
 		HandshakeConfig:  pluginsdk.Handshake,
 		Plugins:          pluginsdk.PluginMap,
@@ -413,7 +470,6 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 		StartedAt: time.Now(),
 	}, nil
 }
-
 // startWatch polls the child process for exit and triggers crash handling.
 func (m *SubprocessManager) startWatch(inst *PluginInstance) {
 	go func() {
@@ -542,7 +598,7 @@ func (m *SubprocessManager) TriggerHook(ctx context.Context, event string) {
 			if h.Event != event {
 				continue
 			}
-			if err := inst.Client.HandleHook(ctx, h.Name, &pluginsdk.Event{}); err != nil {
+			if _, _, err := inst.Client.HandleHook(ctx, h.Name, &pluginsdk.Event{}, nil); err != nil {
 				logger.Warn("Hook %s (%s) on plugin %s failed: %v", h.Name, h.Event, inst.ID, err)
 			}
 		}
@@ -570,10 +626,37 @@ func (m *SubprocessManager) markFailed(inst *PluginInstance, err error) {
 	inst.stopped = true
 	inst.failed = err
 	inst.mu.Unlock()
+
+	// Release the process and RPC client resources.
+	go m.teardownInstance(inst)
 }
 
-// teardownInstance gracefully asks the plugin to clean up, then kills the
-// process. Safe to call multiple times.
+// needMemoryReclaim throttles forced GC + OS memory return: at most once per
+// 30s and only when the Go heap is non-trivial, so a plugin crash-restart loop
+// cannot churn.
+func needMemoryReclaim() bool {
+	lastReclaimMu.Lock()
+	defer lastReclaimMu.Unlock()
+	if time.Since(lastReclaimAt) < 30*time.Second {
+		return false
+	}
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	if ms.HeapAlloc < 8<<20 {
+		return false
+	}
+	lastReclaimAt = time.Now()
+	return true
+}
+
+var (
+	lastReclaimMu sync.Mutex
+	lastReclaimAt time.Time
+)
+
+// teardownInstance gracefully asks the plugin to clean up, kills the process,
+// then releases the RPC client (gRPC conn + HostService server) so repeated
+// reloads do not leak connections/goroutines. Safe to call multiple times.
 func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	if inst == nil || inst.raw == nil {
 		return
@@ -586,4 +669,14 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 		}
 	}
 	inst.raw.Kill()
+	if inst.Client != nil {
+		_ = inst.Client.Close()
+	}
+	// 归还 Go 堆给 OS：插件子进程被杀后其内存已由 OS 回收，但宿主 Go 运行时
+	// 默认不会把释放的对象还给系统（RSS 只涨不降）。这里强制 GC + 归还，
+	// 解决"插件禁用/重载后运存不释放"。
+	if needMemoryReclaim() {
+		runtime.GC()
+		debug.FreeOSMemory()
+	}
 }

@@ -203,6 +203,13 @@ func (bus *EventBus) RegisterScheduler(confID string, scheduler *PipelineSchedul
 	bus.mu.Unlock()
 }
 
+// GetScheduler returns the pipeline scheduler registered for a config ID.
+func (bus *EventBus) GetScheduler(confID string) *PipelineScheduler {
+	bus.mu.RLock()
+	defer bus.mu.RUnlock()
+	return bus.schedulers[confID]
+}
+
 // Start begins dispatching events.
 func (bus *EventBus) Start(ctx context.Context) error {
 	for {

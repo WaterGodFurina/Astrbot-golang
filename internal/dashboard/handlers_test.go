@@ -2,10 +2,12 @@ package dashboard
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/AstrBotDevs/AstrBot/internal/config"
 	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 )
 
@@ -178,4 +180,146 @@ func TestGetPluginListNilLegacyManager(t *testing.T) {
 	if failed := s.pluginFailed(); failed == nil {
 		t.Fatal("pluginFailed should return a non-nil map with a nil legacy manager")
 	}
+}
+
+// TestPluginSourceRoutes guards that the per-plugin source/update/reload routes
+// are dispatched to their handlers instead of falling into the uninstall branch.
+func TestPluginSourceRoutes(t *testing.T) {
+	s := NewServer(0, "/tmp/test_pw.json")
+	defer s.Stop()
+
+	// Bind-source on a non-existent subprocess plugin: must NOT uninstall, and
+	// must return an error rather than silently succeeding.
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/v1/plugins/nonexistent/source",
+		strings.NewReader(`{"install_method":"market","market_plugin_id":"a/b"}`))
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	var v map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if st, _ := v["status"].(string); st != "error" {
+		t.Errorf("bind-source on unknown plugin should error, got: %s", w.Body.String())
+	}
+
+	// Single-plugin update route must not uninstall.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/plugins/nonexistent/update", nil)
+	w = httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	v = map[string]interface{}{}
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if st, _ := v["status"].(string); st != "error" {
+		t.Errorf("update on unknown plugin should error, got: %s", w.Body.String())
+	}
+
+	// Batch update route with empty body.
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/plugins/update", nil)
+	w = httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	v = map[string]interface{}{}
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	if st, _ := v["status"].(string); st != "error" {
+		t.Errorf("batch update with no ids should error, got: %s", w.Body.String())
+	}
+}
+
+// TestMetadataOrderPreserved verifies the served config metadata keeps the
+// Python CONFIG_METADATA_3 group/section order instead of alphabetical order.
+func TestMetadataOrderPreserved(t *testing.T) {
+	s := NewServer(0, "/tmp/test_pw.json")
+	defer s.Stop()
+
+	for _, path := range []string{"/api/system-config/schema", "/api/system-config/runtime"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		s.mux.ServeHTTP(w, req)
+		var v map[string]interface{}
+		if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+			t.Fatalf("%s invalid json: %v", path, err)
+		}
+		data, ok := v["data"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s no data: %s", path, w.Body.String())
+		}
+		md, ok := data["metadata"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("%s no metadata: %s", path, w.Body.String())
+		}
+		// Re-derive order from raw JSON key sequence.
+		order := rawKeys(t, w.Body.Bytes(), data, "metadata")
+		if len(order) == 0 {
+			t.Fatalf("%s metadata empty", path)
+		}
+		// ai_group must come before platform_group, which must come before
+		// plugin_group / ext_group (Python order), and provider_group last.
+		pos := map[string]int{}
+		for i, k := range order {
+			pos[k] = i
+		}
+		if pos["ai_group"] > pos["platform_group"] {
+			t.Errorf("%s: ai_group(%d) should be before platform_group(%d): %v", path, pos["ai_group"], pos["platform_group"], order)
+		}
+		if pos["platform_group"] > pos["plugin_group"] {
+			t.Errorf("%s: platform_group(%d) should be before plugin_group(%d): %v", path, pos["platform_group"], pos["plugin_group"], order)
+		}
+		if _, ok := pos["provider_group"]; ok {
+			if pos["provider_group"] < pos["ext_group"] {
+				t.Errorf("%s: provider_group(%d) should be last: %v", path, pos["provider_group"], order)
+			}
+		}
+		_ = md
+	}
+
+	// Section order within ai_group must follow Python (agent_runner first).
+	md := s.getConfigMetadata()
+	ai, _ := md.Get("ai_group")
+	aiMap, _ := config.GetOrderedJSON(ai)
+	if aiMap == nil {
+		t.Fatal("ai_group missing")
+	}
+	aiMeta, _ := aiMap.Get("metadata")
+	aiMetaMap, _ := config.GetOrderedJSON(aiMeta)
+	if aiMetaMap == nil {
+		t.Fatal("ai_group.metadata missing")
+	}
+	secs := aiMetaMap.Keys()
+	if secs[0] != "agent_runner" {
+		t.Errorf("ai_group first section = %q, want agent_runner: %v", secs[0], secs)
+	}
+	if secs[len(secs)-1] != "others" {
+		t.Errorf("ai_group last section = %q, want others: %v", secs[len(secs)-1], secs)
+	}
+}
+
+// rawKeys reconstructs the ordered top-level key list of the JSON object at
+// objPath within the full response body (writeJSON emits OrderedJSON in order).
+func rawKeys(t *testing.T, body []byte, obj map[string]interface{}, key string) []string {
+	t.Helper()
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	ordered, err := config.ParseOrderedJSON([]byte(body))
+	if err != nil {
+		t.Fatalf("ordered parse: %v", err)
+	}
+	dataO, _ := ordered.Get("data")
+	dataOM, ok := config.GetOrderedJSON(dataO)
+	if !ok {
+		return nil
+	}
+	mdO, ok := dataOM.Get(key)
+	if !ok {
+		return nil
+	}
+	mdOM, ok := config.GetOrderedJSON(mdO)
+	if !ok {
+		return nil
+	}
+	return mdOM.Keys()
 }

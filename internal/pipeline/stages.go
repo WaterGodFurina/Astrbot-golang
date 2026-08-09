@@ -35,12 +35,14 @@ import (
 	"github.com/AstrBotDevs/AstrBot/internal/db"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
 	"github.com/AstrBotDevs/AstrBot/internal/platform"
+	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
 	"github.com/AstrBotDevs/AstrBot/internal/ratelimit"
 	"github.com/AstrBotDevs/AstrBot/internal/sandbox"
 	"github.com/AstrBotDevs/AstrBot/internal/skills"
 	"github.com/AstrBotDevs/AstrBot/internal/star"
 	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 )
 
 var logger = log.GetDefault().WithComponent("Pipeline")
@@ -88,6 +90,10 @@ type PipelineContext struct {
 	// EventBus allows stages to re-publish events (e.g. rate-limit stall).
 	// Optional.
 	EventBus *core.EventBus
+	// SubPlugins is the subprocess plugin runtime. When set, ProcessStage and
+	// ResultDecorateStage use it to collect LLM tools, apply on_llm_request
+	// hooks, and run result-decoration hooks. Optional.
+	SubPlugins *plugin.SubprocessManager
 }
 
 // PipelineStage is the interface every stage must implement.
@@ -620,6 +626,9 @@ type ProcessStage struct {
 	cronMgr       *cron.CronJobManager
 	database      *db.Database
 	providerConf  *ProviderSettings
+	// subPlugins is the subprocess plugin runtime: source of LLM tools and
+	// on_llm_request hooks.
+	subPlugins *plugin.SubprocessManager
 
 	// MCP servers (data/mcp_server.json). Loaded lazily on the first tool
 	// collection; full tool name = "<sanitized_server>.<tool_name>".
@@ -665,6 +674,7 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.sandboxMgr = ctx.SandboxManager
 	s.cronMgr = ctx.CronManager
 	s.database = ctx.Database
+	s.subPlugins = ctx.SubPlugins
 	s.providerConf = bindProviderSettings(ctx.AstrbotConfig)
 	if ctx.PersonaResolver != nil {
 		s.personaPrompt = ctx.PersonaResolver
@@ -679,6 +689,10 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 }
 
 func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	// Run subprocess plugin on_message hooks (mirrors Python's
+	// @filter.on_message): plugins observe every incoming message.
+	dispatchSubprocessHooks(s.subPlugins, event, "on_message")
+
 	// Record the incoming message for statistics (message_count).
 	if s.database != nil {
 		msg := event.MessageStr
@@ -862,6 +876,26 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// astr_main_agent._ensure_persona_and_skills).
 	systemPrompt = s.applySkills(systemPrompt, providerSettings, personaID)
 
+	// Apply on_llm_request hooks from subprocess plugins: they may modify the
+	// system prompt (e.g. identity injection) or stop the LLM call entirely.
+	if s.subPlugins != nil {
+		sp, stop, err := s.applyLLMRequestHooks(event, systemPrompt, prompt)
+		if err != nil {
+			logger.Warn("plugin on_llm_request hook failed: %v", err)
+		} else {
+			systemPrompt = sp
+			if stop {
+				logger.Info("plugin on_llm_request hook stopped the LLM call")
+				event.Stop()
+				return nil
+			}
+		}
+	}
+
+	// on_waiting_llm_request fires right before the provider call (e.g. a
+	// plugin may show a "processing" indicator).
+	dispatchSubprocessHooks(s.subPlugins, event, "on_waiting_llm_request")
+
 	// computer_use_runtime drives whether local/sandbox tools are exposed and
 	// whether the local-mode hint is appended to the system prompt.
 	computerUseRuntime := "local"
@@ -1013,6 +1047,10 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "user", prompt)
 		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "assistant", resp.CompletionText)
 	}
+
+	// on_llm_response fires after the LLM reply is produced (e.g. plugins that
+	// capture conversation memory).
+	dispatchSubprocessHooks(s.subPlugins, event, "on_llm_response")
 
 	streamer.flush()
 	if streamer.sentAny() {
@@ -1392,6 +1430,115 @@ func buildToolCallsMessage(resp *provider.LLMResponse) []map[string]interface{} 
 	return result
 }
 
+// dispatchSubprocessHooks runs every loaded subprocess plugin's hooks whose
+// Event matches the given event name. These are pipeline-adjacent events
+// (on_message, on_llm_response, on_after_message_sent, on_waiting_llm_request)
+// that are not star filter handlers.
+func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, hookEvent string) {
+	if sub == nil {
+		return
+	}
+	sdkEvent := star.CoreEventToSDK(event)
+	for _, inst := range sub.List() {
+		if inst.Client == nil || inst.Meta == nil {
+			continue
+		}
+		for _, h := range inst.Meta.Hooks {
+			if h.Event != hookEvent {
+				continue
+			}
+			if _, _, err := inst.Client.HandleHook(context.Background(), h.Name, sdkEvent, nil); err != nil {
+				logger.Warn("Plugin %s hook %s (%s) failed: %v", inst.Name, h.Name, hookEvent, err)
+			}
+		}
+	}
+}
+
+// applyLLMRequestHooks runs every loaded subprocess plugin's on_llm_request
+// hooks, letting them modify the system prompt or stop the LLM call.
+func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, userPrompt string) (string, bool, error) {	if s.subPlugins == nil {
+		return systemPrompt, false, nil
+	}
+	sdkEvent := star.CoreEventToSDK(event)
+	for _, inst := range s.subPlugins.List() {
+		if inst.Client == nil || inst.Meta == nil {
+			continue
+		}
+		for _, h := range inst.Meta.Hooks {
+			if h.Event != "on_llm_request" {
+				continue
+			}
+			sp, stop, err := inst.Client.HandleLLMRequest(context.Background(), h.Name, sdkEvent, systemPrompt, userPrompt)
+			if err != nil {
+				logger.Warn("Plugin %s on_llm_request hook %s failed: %v", inst.Name, h.Name, err)
+				continue
+			}
+			systemPrompt = sp
+			if stop {
+				return systemPrompt, true, nil
+			}
+		}
+	}
+	return systemPrompt, false, nil
+}
+
+// collectPluginTools returns the OpenAI tool schemas contributed by all loaded
+// subprocess plugins (each plugin's registered LLM function tools).
+func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
+	if s.subPlugins == nil {
+		return nil
+	}
+	var out []map[string]interface{}
+	for _, inst := range s.subPlugins.List() {
+		if inst.Meta == nil {
+			continue
+		}
+		for _, t := range inst.Meta.Tools {
+			params := map[string]interface{}{}
+			if len(t.ParamsJson) > 0 {
+				_ = json.Unmarshal(t.ParamsJson, &params)
+			}
+			out = append(out, map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":        t.Name,
+					"description": t.Description,
+					"parameters":  params,
+				},
+			})
+		}
+	}
+	return out
+}
+
+// executePluginTool dispatches a tool call to the subprocess plugin that
+// registered a tool with the given name. Returns (result, handled).
+func (s *ProcessStage) executePluginTool(event *core.Event, name string, args map[string]interface{}) (string, bool) {
+	if s.subPlugins == nil {
+		return "", false
+	}
+	sdkEvent := star.CoreEventToSDK(event)
+	for _, inst := range s.subPlugins.List() {
+		if inst.Client == nil || inst.Meta == nil {
+			continue
+		}
+		for _, t := range inst.Meta.Tools {
+			if t.Name != name {
+				continue
+			}
+			text, isErr, err := inst.Client.HandleTool(context.Background(), name, args, sdkEvent)
+			if err != nil {
+				return fmt.Sprintf("插件工具 %s 执行失败: %v", name, err), true
+			}
+			if isErr {
+				return "插件工具 " + name + " 返回错误: " + text, true
+			}
+			return text, true
+		}
+	}
+	return "", false
+}
+
 // collectTools builds the OpenAI tool schema for all active tools
 // (built-in tools + enabled MCP servers + Computer Use local tools).
 func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]interface{} {
@@ -1417,6 +1564,8 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	for _, schema := range s.mcpSchemas {
 		tools = append(tools, schema)
 	}
+	// Subprocess plugin LLM function tools.
+	tools = append(tools, s.collectPluginTools()...)
 	return tools
 }
 
@@ -1699,6 +1848,9 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 	if result, handled := s.executeMCPTool(context.Background(), name, args); handled {
 		return result
 	}
+	if result, handled := s.executePluginTool(event, name, args); handled {
+		return result
+	}
 	switch name {
 	case "astrbot_execute_shell":
 		return executeLocalShell(umo, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
@@ -1891,6 +2043,7 @@ type ResultDecorateStage struct {
 	replyWithMention bool
 	replyWithQuote   bool
 	maxSegmentLength int
+	subPlugins       *plugin.SubprocessManager
 }
 
 func NewResultDecorateStage() *ResultDecorateStage {
@@ -1904,6 +2057,7 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 	s.replyPrefix = ps.ReplyPrefix
 	s.replyWithMention = ps.ReplyWithMention
 	s.replyWithQuote = ps.ReplyWithQuote
+	s.subPlugins = ctx.SubPlugins
 	return nil
 }
 
@@ -1947,7 +2101,102 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		event.Result.Chain = newChain
 	}
 
+	// Run subprocess plugin on_decorating_result hooks (may rewrite the chain,
+	// e.g. message transforms) and stop the pipeline if requested.
+	if s.subPlugins != nil && len(event.Result.Chain) > 0 {
+		sdkChain := chainToSDK(event.Result.Chain)
+		stop, err := s.applyResultHooks(event, &sdkChain)
+		if err != nil {
+			logger.Warn("plugin on_decorating_result hook failed: %v", err)
+		}
+		if len(sdkChain) > 0 {
+			event.Result.Chain = plugin.ComponentsFromSDK(sdkChain)
+		}
+		if stop {
+			return &StageResult{Continue: false}, nil
+		}
+	}
+
 	return &StageResult{Continue: true}, nil
+}
+
+// applyResultHooks runs every loaded subprocess plugin's on_decorating_result
+// hooks against the outgoing chain.
+func (s *ResultDecorateStage) applyResultHooks(event *core.Event, chain *[]pluginsdk.Component) (bool, error) {
+	sdkEvent := star.CoreEventToSDK(event)
+	cur := *chain
+	for _, inst := range s.subPlugins.List() {
+		if inst.Client == nil || inst.Meta == nil {
+			continue
+		}
+		for _, h := range inst.Meta.Hooks {
+			if h.Event != "on_decorating_result" && h.Event != "on_result_handling" {
+				continue
+			}
+			hookName := h.Name
+			newChain, stop, err := inst.Client.HandleHook(context.Background(), hookName, sdkEvent, cur)
+			if err != nil {
+				logger.Warn("Plugin %s result hook %s failed: %v", inst.Name, hookName, err)
+				continue
+			}
+			cur = newChain
+			if stop {
+				return true, nil
+			}
+		}
+	}
+	*chain = cur
+	return false, nil
+}
+
+// chainToSDK converts a host result chain into SDK components for hook RPCs.
+func chainToSDK(chain []message.Component) []pluginsdk.Component {
+	out := make([]pluginsdk.Component, 0, len(chain))
+	for _, c := range chain {
+		if c == nil {
+			continue
+		}
+		comp := pluginsdk.Component{Type: pluginsdk.ComponentType(c.Type())}
+		switch v := c.(type) {
+		case *message.Plain:
+			comp.Text = v.Text
+		case *message.At:
+			comp.TargetID = v.TargetID
+			comp.Name = v.Name
+		case *message.Image:
+			comp.URL = v.URL
+			comp.Path = v.Path
+			comp.File = v.File
+			comp.Base64 = v.Base64
+			comp.FileID = v.FileID
+		case *message.Record:
+			comp.URL = v.URL
+			comp.Path = v.Path
+			comp.File = v.File
+			comp.FileID = v.FileID
+		case *message.File:
+			comp.URL = v.URL
+			comp.Path = v.Path
+			comp.FileID = v.FileID
+			comp.Name = v.Name
+		case *message.Video:
+			comp.URL = v.URL
+			comp.Path = v.Path
+			comp.FileID = v.FileID
+		case *message.Face:
+			comp.ID = v.ID
+		case *message.Emoji:
+			comp.ID = v.ID
+			comp.URL = v.URL
+		case *message.Json:
+			comp.Data = v.Data
+		case *message.Reply:
+			comp.ID = v.MessageID
+			comp.Text = v.MessageStr
+		}
+		out = append(out, comp)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1958,6 +2207,7 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 // Ported from astrbot/core/pipeline/respond/stage.py
 type RespondStage struct {
 	platformMgr *platform.PlatformManager
+	subPlugins  *plugin.SubprocessManager
 }
 
 func NewRespondStage() *RespondStage {
@@ -1968,6 +2218,7 @@ func (s *RespondStage) Name() string { return "respond" }
 
 func (s *RespondStage) Initialize(ctx *PipelineContext) error {
 	s.platformMgr = ctx.PlatformMgr
+	s.subPlugins = ctx.SubPlugins
 	return nil
 }
 
@@ -2005,6 +2256,10 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 		err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
 		if err != nil {
 			logger.Error("Failed to send message chain: %v", err)
+		} else if s.subPlugins != nil {
+			// on_after_message_sent fires after a reply is delivered (e.g.
+			// plugins that clean up pending state or react to sent messages).
+			dispatchSubprocessHooks(s.subPlugins, event, "on_after_message_sent")
 		}
 	}
 

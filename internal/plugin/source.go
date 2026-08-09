@@ -22,7 +22,18 @@ import (
 // forbiddenImports are packages plugin source may not import (safety
 // blacklist). Plugins run as subprocesses; these primitives allow arbitrary
 // host execution / memory tricks and are surfaced to the user as risks.
-var forbiddenImports = []string{"os/exec", "syscall", "unsafe"}
+var forbiddenImports = []string{"os/exec", "syscall", "unsafe", "reflect"}
+
+// riskyDirectives are comment directives in the plugin's own source that can
+// bypass import-level scanning or execute arbitrary code at build time.
+var riskyDirectives = []struct {
+	marker string
+	name   string
+	desc   string
+}{
+	{"//go:linkname", "go:linkname", "链接到内部符号，可绕过 import 限制执行底层操作"},
+	{"//go:generate", "go:generate", "在编译期执行任意命令（可生成危险代码）"},
+}
 
 // ScanFinding describes one risky import in the plugin source.
 type ScanFinding struct {
@@ -64,13 +75,19 @@ func StaticScan(srcDir string) ([]ScanFinding, error) {
 	return findings, nil
 }
 
-// scanFile parses one Go file and returns findings for blacklisted imports.
+// scanFile parses one Go file and returns findings for blacklisted imports and
+// risky directives (//go:linkname, //go:generate).
 func scanFile(srcDir, path string) ([]ScanFinding, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
 	if err != nil {
 		return nil, err
 	}
+	rel := path
+	if r, err := filepath.Rel(srcDir, path); err == nil {
+		rel = r
+	}
+
 	var findings []ScanFinding
 	for _, imp := range f.Imports {
 		p, err := strconv.Unquote(imp.Path.Value)
@@ -81,10 +98,6 @@ func scanFile(srcDir, path string) ([]ScanFinding, error) {
 			continue
 		}
 		pos := fset.Position(imp.Pos())
-		rel := path
-		if r, err := filepath.Rel(srcDir, path); err == nil {
-			rel = r
-		}
 		findings = append(findings, ScanFinding{
 			File:    rel,
 			Line:    pos.Line,
@@ -92,6 +105,27 @@ func scanFile(srcDir, path string) ([]ScanFinding, error) {
 			Snippet: lineAt(path, pos.Line),
 		})
 	}
+
+	// Risky comment directives: //go:linkname and //go:generate can bypass
+	// import-level detection (compile-time injection / symbol linking).
+	if data, err := os.ReadFile(path); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, d := range riskyDirectives {
+			for i, ln := range lines {
+				if !strings.Contains(ln, d.marker) {
+					continue
+				}
+				findings = append(findings, ScanFinding{
+					File:    rel,
+					Line:    i + 1,
+					Import:  d.name,
+					Snippet: strings.TrimSpace(ln),
+				})
+				break // one finding per directive per file is enough
+			}
+		}
+	}
+
 	return findings, nil
 }
 

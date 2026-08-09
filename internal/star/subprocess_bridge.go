@@ -34,7 +34,9 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 	for _, cmd := range meta.Commands {
 		cmd := cmd
 		handler := &StarHandlerMetadata{
-			HandlerFullName:   "plugin_" + cmd.Name,
+			// 用插件 ID 限定 full name，避免不同插件注册同名指令时互相覆盖
+			// （否则 WebUI 重命名一个指令会连带影响另一个同名指令）。
+			HandlerFullName:   "plugin_" + inst.ID + "_" + cmd.Name,
 			HandlerName:       cmd.Name,
 			HandlerModulePath: "data.plugins",
 			Handler: func(event interface{}) error {
@@ -47,9 +49,15 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if len(parts) > 1 {
 					args = parts[1:]
 				}
-				text, err := client.HandleCommand(context.Background(), cmd.Name, args, coreEventToSDK(e))
+				text, chain, err := client.HandleCommand(context.Background(), cmd.Name, args, CoreEventToSDK(e))
 				if err != nil {
 					text = "插件执行失败: " + err.Error()
+					chain = nil
+				}
+				if len(chain) > 0 {
+					e.Result = message.NewMessageEventResult()
+					e.Result.Chain = plugin.ComponentsFromSDK(chain)
+					return nil
 				}
 				if text == "" {
 					return nil
@@ -72,7 +80,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 	for _, f := range meta.Filters {
 		f := f
 		handler := &StarHandlerMetadata{
-			HandlerFullName:   "plugin_filter_" + f.Name,
+			HandlerFullName:   "plugin_filter_" + inst.ID + "_" + f.Name,
 			HandlerName:       f.Name,
 			HandlerModulePath: "data.plugins",
 			Handler: func(event interface{}) error {
@@ -80,7 +88,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if !ok {
 					return nil
 				}
-				allow, err := client.HandleFilter(context.Background(), f.Name, coreEventToSDK(e))
+				allow, err := client.HandleFilter(context.Background(), f.Name, CoreEventToSDK(e))
 				if err != nil {
 					return nil
 				}
@@ -98,6 +106,14 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 	}
 
 	for _, h := range meta.Hooks {
+		// on_llm_request / on_decorating_result hooks are invoked directly by
+		// the pipeline stages (ProcessStage / ResultDecorateStage) because they
+		// carry plugin-specific payloads (ProviderRequest / result chain); they
+		// are not star pipeline handlers.
+		switch h.Event {
+		case "on_llm_request", "on_decorating_result", "on_result_handling":
+			continue
+		}
 		et, ok := hookEventType(h.Event)
 		if !ok {
 			// lifecycle hooks (startup/shutdown) are fired by the lifecycle
@@ -106,7 +122,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 		}
 		h := h
 		handler := &StarHandlerMetadata{
-			HandlerFullName:   "plugin_hook_" + h.Name,
+			HandlerFullName:   "plugin_hook_" + inst.ID + "_" + h.Name,
 			HandlerName:       h.Name,
 			HandlerModulePath: "data.plugins",
 			Handler: func(event interface{}) error {
@@ -114,7 +130,8 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if !ok {
 					return nil
 				}
-				return client.HandleHook(context.Background(), h.Name, coreEventToSDK(e))
+				_, _, err := client.HandleHook(context.Background(), h.Name, CoreEventToSDK(e), nil)
+				return err
 			},
 			EventType:    et,
 			EventFilters: []HandlerFilter{&AlwaysMatchFilter{}},
@@ -130,9 +147,9 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 	}
 }
 
-// coreEventToSDK converts a host core.Event into the SDK's serializable Event
+// CoreEventToSDK converts a host core.Event into the SDK's serializable Event
 // view that crosses the gRPC boundary.
-func coreEventToSDK(e *core.Event) *pluginsdk.Event {
+func CoreEventToSDK(e *core.Event) *pluginsdk.Event {
 	if e == nil {
 		return &pluginsdk.Event{}
 	}
@@ -152,6 +169,9 @@ func coreEventToSDK(e *core.Event) *pluginsdk.Event {
 		RawMessage: e.RawMessage,
 		Timestamp:  e.Timestamp.Unix(),
 		Metadata:   e.Metadata,
+	}
+	if e.MessageObj != nil {
+		out.MessageID = e.MessageObj.MessageID
 	}
 	if e.Message != nil {
 		for _, c := range e.Message.Chain {

@@ -19,9 +19,11 @@ import (
 
 	"github.com/AstrBotDevs/AstrBot/internal/config"
 	"github.com/AstrBotDevs/AstrBot/internal/conversation"
+	"github.com/AstrBotDevs/AstrBot/internal/core"
 	"github.com/AstrBotDevs/AstrBot/internal/cron"
 	"github.com/AstrBotDevs/AstrBot/internal/db"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/AstrBotDevs/AstrBot/internal/platform"
 	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
 	"github.com/AstrBotDevs/AstrBot/internal/skills"
@@ -44,6 +46,9 @@ type Server struct {
 	configMgr          interface{} // *config.ConfigManager
 	providerMgr        interface{} // *provider.ProviderManager
 	platformMgr        interface{} // *platform.PlatformManager
+	eventBus           interface{} // *core.EventBus
+	chatAdapter        *chatStreamAdapter
+	chatBus            *core.EventBus
 	conversationMgr    interface{} // *conversation.Manager
 	cronMgr            interface{} // *cron.CronJobManager
 	pluginMgr          interface{} // *plugin.Manager (legacy .so)
@@ -60,6 +65,39 @@ type Server struct {
 	onPlatformsChanged func()
 	onPluginsChanged   func()
 	onConfigChanged    func()
+	// installProgress tracks plugin install progress (keyed by install_id) so
+	// the WebUI can poll it while an install request is in flight.
+	installProgressMu sync.Mutex
+	installProgress   map[string]*installStatus
+	// marketCache caches fetched plugin market registry data (keyed by registry
+	// URL) so repeated WebUI requests don't hammer the remote.
+	marketMu    sync.Mutex
+	marketCache map[string]*marketCacheEntry
+}
+
+// defaultPluginMarketURL is the default plugin marketplace registry served by
+// the AstrBot-Go community market (GitHub Pages).
+const defaultPluginMarketURL = "https://astrbotgomarket.350430.xyz/package.json"
+
+// marketCacheEntry is one cached registry snapshot.
+type marketCacheEntry struct {
+	data      interface{}
+	fetchedAt time.Time
+}
+
+// installStatus is the live progress state of one plugin install.
+type installStatus struct {
+	Status     string `json:"status"` // "downloading" | "installing" | "done" | "error"
+	Percent    int    `json:"percent"`
+	Text       string `json:"text"`
+	Downloaded int64  `json:"downloaded"`
+	Total      int64  `json:"total"`
+}
+
+// ChatAdapter returns the dashboard-chat reply sink adapter (nil when not
+// created). Used by the lifecycle to re-register it after platform reloads.
+func (s *Server) ChatAdapter() *chatStreamAdapter {
+	return s.chatAdapter
 }
 
 // SetOnPlatformsChanged registers a callback invoked after platform config changes
@@ -105,7 +143,10 @@ func NewServer(port int, configPath string) *Server {
 	s.auth = NewPasswordManager(configPath)
 	s.personas = newPersonaStore(filepath.Dir(configPath))
 	s.chat = newChatStore(filepath.Dir(configPath))
+	s.chatAdapter = newChatStreamAdapter()
 	s.mcp = newMCPStore(filepath.Dir(configPath))
+	s.installProgress = make(map[string]*installStatus)
+	s.marketCache = make(map[string]*marketCacheEntry)
 	s.setupRoutes()
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
@@ -128,6 +169,17 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		}
 		if v, ok := managers["platform"]; ok {
 			s.platformMgr = v
+			if pm, ok := v.(*platform.PlatformManager); ok {
+				// Register the dashboard-chat reply sink so the pipeline's
+				// RespondStage / streamSender routes webchat replies here.
+				pm.Register(s.chatAdapter)
+			}
+		}
+		if v, ok := managers["event_bus"]; ok {
+			s.eventBus = v
+			if bus, ok := v.(*core.EventBus); ok {
+				s.chatBus = bus
+			}
 		}
 		if v, ok := managers["conversation"]; ok {
 			s.conversationMgr = v
@@ -647,6 +699,17 @@ func extractToken(r *http.Request) string {
 
 // Start begins serving.
 func (s *Server) Start(ctx context.Context) error {
+	// Honor dashboard.disable_access_log (default true): keep the API response
+	// log line off unless explicitly enabled.
+	if cm, ok := s.configMgr.(*config.ConfigManager); ok {
+		if cfg := cm.Get("default"); cfg != nil {
+			if dash, ok := cfg.Get("dashboard").(map[string]interface{}); ok {
+				if v, ok := dash["disable_access_log"].(bool); ok {
+					setAPILogDisabled(v)
+				}
+			}
+		}
+	}
 	// Print startup banner with URLs
 	if s.auth != nil {
 		s.auth.PrintStartupBanner(s.port, getLocalIPs())
@@ -679,8 +742,22 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(data)
-	logger.Info("API response: %s", mustMarshal(data))
+	if apiLogDisabled {
+		return
+	}
+	s := mustMarshal(data)
+	if len(s) > 300 {
+		s = s[:300] + "...(truncated)"
+	}
+	logger.Debug("API response: %s", s)
 }
+
+// apiLogDisabled gates the per-request "API response" log line (default true,
+// mirroring dashboard.disable_access_log). Logging every response floods the
+// console page and inflates the log history, freezing the WebUI.
+var apiLogDisabled = true
+
+func setAPILogDisabled(v bool) { apiLogDisabled = v }
 
 // SetWebUIDir sets the external WebUI static files directory.
 // When set, serveWebUI reads from this directory first, falling back to the embedded dist.
@@ -1187,10 +1264,58 @@ func (s *Server) unregisterProvider(id string) {
 	}
 }
 
+// setInstallProgress updates the progress state for an install_id.
+func (s *Server) setInstallProgress(id string, st *installStatus) {
+	if id == "" {
+		return
+	}
+	s.installProgressMu.Lock()
+	defer s.installProgressMu.Unlock()
+	s.installProgress[id] = st
+}
+
+// getInstallProgress returns the current progress state for an install_id.
+func (s *Server) getInstallProgress(id string) *installStatus {
+	s.installProgressMu.Lock()
+	defer s.installProgressMu.Unlock()
+	if st := s.installProgress[id]; st != nil {
+		return st
+	}
+	return &installStatus{Status: "unknown"}
+}
+
+// installProgressCallback builds a progress callback that records toolchain
+// download progress (the ~150-200MB first-time download) for the given install_id.
+func (s *Server) installProgressCallback(installID string) func(downloaded, total int64) {
+	return func(downloaded, total int64) {
+		if installID == "" {
+			return
+		}
+		percent := 0
+		if total > 0 {
+			percent = int(downloaded * 100 / total)
+		}
+		s.setInstallProgress(installID, &installStatus{
+			Status:     "downloading",
+			Percent:    percent,
+			Text:       "下载 Go 工具链…",
+			Downloaded: downloaded,
+			Total:      total,
+		})
+	}
+}
+
 func (s *Server) pluginByID(id string) map[string]interface{} {
 	for _, p := range s.getPluginList() {
 		if m, ok := p.(map[string]interface{}); ok {
 			if name, _ := m["name"].(string); name == id {
+				// WebUI "行为" 详情页需要 commands/tools/hooks 组件；从插件
+				// Register 元数据填充（否则显示"未知"）。
+				if _, pname, ok2 := s.resolveSubprocessPlugin(id); ok2 && s.subPluginMgr != nil {
+					if comps := s.subPluginMgr.Components(pname); comps != nil {
+						m["components"] = comps
+					}
+				}
 				return m
 			}
 		}
@@ -1283,9 +1408,9 @@ func (s *Server) pluginReload(id string) {
 	s.notifyPluginsChanged()
 }
 
-func (s *Server) pluginUninstall(id string, deleteConfig bool) {
+func (s *Server) pluginUninstall(id string, deleteConfig, deleteData bool) {
 	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
-		if err := s.subPluginMgr.Uninstall(pid, deleteConfig); err != nil {
+		if err := s.subPluginMgr.Uninstall(pid, deleteConfig, deleteData); err != nil {
 			logger.Warn("Uninstall(%s): %v", id, err)
 		}
 		s.notifyPluginsChanged()
@@ -1308,6 +1433,45 @@ func (s *Server) pluginConfigSchema(id string) map[string]interface{} {
 		return map[string]interface{}{}
 	}
 	return pm.ConfigSchema(id)
+}
+
+// pluginConfigPayload returns the plugin config dialog payload consumed by the
+// WebUI's AstrBotConfig component: {plugin_name, log_level, metadata, config,
+// i18n}. metadata is keyed by the plugin name and carries the flat schema
+// ("items"), matching the Python reference (config_service.get_plugin_config).
+func (s *Server) pluginConfigPayload(id string) map[string]interface{} {
+	name := id
+	sub := false
+	if _, n, ok := s.resolveSubprocessPlugin(id); ok {
+		name = n
+		sub = true
+	}
+
+	items := map[string]interface{}{}
+	if sub && s.subPluginMgr != nil {
+		items = s.subPluginMgr.FlatSchema(name)
+	}
+	metadata := map[string]interface{}{}
+	if len(items) > 0 {
+		metadata[name] = map[string]interface{}{
+			"description": name + " 配置",
+			"type":        "object",
+			"items":       items,
+		}
+	}
+
+	cfg := s.pluginLoadConfig(id)
+	if sub && s.subPluginMgr != nil {
+		cfg = s.subPluginMgr.LoadConfigWithDefaults(name)
+	}
+
+	return map[string]interface{}{
+		"plugin_name": id,
+		"log_level":   nil,
+		"metadata":    metadata,
+		"config":      cfg,
+		"i18n":        map[string]interface{}{},
+	}
 }
 
 func (s *Server) pluginLoadConfig(id string) map[string]interface{} {

@@ -100,15 +100,28 @@ SDK 也支持声明式写法（直接在 `sdk.Plugin{Commands: []sdk.Command{...
 
 安装插件前会静态扫描源码，发现 `os/exec`、`syscall`、`unsafe` 等危险包时，**WebUI 弹出风险对话框并列出具体代码行**，由用户选择"无视风险，继续安装"或"取消安装"。
 
+## 已知局限与注意事项
+
+1. **cgo 支持（自适应）**：用户机器若装有 C 编译器（`cc`/`gcc`/`clang`），插件编译自动启用 `CGO_ENABLED=1`，因此依赖 cgo 的库（如 `github.com/mattn/go-sqlite3`）在**有 C 工具链的机器上可编译**；无 C 编译器时回退纯 Go（`CGO_ENABLED=0`）。可用 `ASTRBOT_PLUGIN_CGO=0/1` 强制。注意：自带的 Go 工具链不含 C 编译器，cgo 构建依赖系统已有的 C 环境；纯 Go 替代库（如 `modernc.org/sqlite`）则任何机器都能编。
+2. **首次安装需下载 Go 工具链（约 150–200MB）**：WebUI 安装对话框会显示实时下载进度，日志每 10% 一报。可设置 `ASTRBOT_GO_BIN` 指向本机已有的 Go 以跳过下载。
+3. **静态扫描的检测范围与盲区**：
+   - 已检测：插件自身源码直接 `import` 的 `os/exec`、`syscall`、`unsafe`、`reflect`，以及 `//go:linkname`、`//go:generate` 指令（均有文件/行号/代码行，可人工判断）
+   - **固有盲区（无法可靠拦截）**：
+     - **间接导入**：插件 A 导入的外部包 B 内部使用 `os/exec`——由于 SDK 本身经 go-plugin 就依赖 `os/exec`，对依赖树做此扫描会把所有插件都标红，故不设阻断
+     - **误报**：`os/exec` 执行 `ls` 等无害命令也会被标记
+   - 结论：风险提示仅供人工判断，不构成安全保证。
+4. **编译需要网络**：`go mod download` 会拉取依赖，离线环境安装插件会失败。
+5. **Termux（Android）**：官方没有 Android 的 Go 包，需先 `pkg install golang` 再设 `ASTRBOT_GO_BIN` 指向它，或手动安装 Go。
+
 ## 安装与热重载
 
 - WebUI「安装插件」支持上传 `.zip` 归档或填 Git/归档 URL
 - 安装 = 下载源码 → 静态扫描 → 编译 → 启动子进程 → 桥接进管线
 - 崩溃自动重启（带退避与次数上限）；重载零停机（先起新进程再杀旧进程）
 
-## 向后兼容
+## 插件方案
 
-配置项 `legacy_plugin_mode`（默认 `false`）置为 `true` 时启用旧 `.so` 加载路径（仅 Linux）。
+插件系统已全面采用子进程方案（go-plugin + gRPC），旧 `.so` 插件方案及其 `legacy_plugin_mode` 配置项已彻底移除，不再提供 `.so` 加载路径。
 
 ## Provider 支持情况
 

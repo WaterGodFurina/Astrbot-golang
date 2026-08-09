@@ -8,36 +8,65 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
+
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 )
 
 // ListInfo returns dashboard-compatible plugin info: running subprocess
 // instances plus installed-but-disabled plugins from the persisted manifest,
 // so the WebUI keeps showing plugins that were switched off.
 func (m *SubprocessManager) ListInfo() []map[string]interface{} {
-	result := make([]map[string]interface{}, 0, len(m.instances))
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		man = &Manifest{Version: 1}
+	}
+	entryByID := make(map[string]*ManifestEntry, len(man.Plugins))
+	for i := range man.Plugins {
+		entryByID[man.Plugins[i].ID] = &man.Plugins[i]
+	}
+
+	result := make([]map[string]interface{}, 0, len(m.instances)+len(man.Plugins))
 	for _, inst := range m.List() {
 		desc := ""
 		if inst.Meta != nil {
 			desc = inst.Meta.Description
 		}
-		result = append(result, map[string]interface{}{
-			"name":        inst.Name,
-			"version":     inst.Version,
-			"description": desc,
-			"path":        inst.Binary,
-			"id":          inst.ID,
-			"loaded":      true,
-			"enabled":     true,
-			"activated":   true,
-			"reserved":    false,
-			"author":      "",
-		})
-	}
-	man, err := LoadManifest(m.manifestPath())
-	if err != nil {
-		return result
+		info := map[string]interface{}{
+			"name":           inst.Name,
+			"marketplace_name": strings.ReplaceAll(inst.Name, "_", "-"),
+			"version":        inst.Version,
+			"description":    desc,
+			"path":           inst.Binary,
+			"id":             inst.ID,
+			"loaded":         true,
+			"enabled":        true,
+			"activated":      true,
+			"reserved":       false,
+			"author":         "",
+			"repo":           "",
+			"install_source": nil,
+			"updates_enabled": true,
+			"update_disabled_reason": "",
+		}
+		if e := entryByID[inst.ID]; e != nil {
+			info["repo"] = e.Repo
+			if info["repo"] == "" {
+				info["repo"] = e.Source
+			}
+			info["install_source"] = e.installSourceMap()
+			info["updates_enabled"] = updatesEnabled(e.InstallMethod)
+			if !updatesEnabled(e.InstallMethod) {
+				info["update_disabled_reason"] = "该插件缺少可用的安装源或仓库地址，无法更新或重新安装"
+			}
+		}
+		result = append(result, info)
 	}
 	for _, e := range man.Plugins {
 		if e.Enabled {
@@ -46,20 +75,77 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		if m.Get(e.ID) != nil {
 			continue
 		}
+		repo := e.Repo
+		if repo == "" {
+			repo = e.Source
+		}
 		result = append(result, map[string]interface{}{
-			"name":        e.Name,
-			"version":     e.Version,
-			"description": "插件已禁用",
-			"path":        e.Binary,
-			"id":          e.ID,
-			"loaded":      false,
-			"enabled":     false,
-			"activated":   false,
-			"reserved":    false,
-			"author":      "",
+			"name":           e.Name,
+			"marketplace_name": strings.ReplaceAll(e.Name, "_", "-"),
+			"version":        e.Version,
+			"description":    "插件已禁用",
+			"path":           e.Binary,
+			"id":             e.ID,
+			"loaded":         false,
+			"enabled":        false,
+			"activated":      false,
+			"reserved":       false,
+			"author":         "",
+			"repo":           repo,
+			"install_source": e.installSourceMap(),
+			"updates_enabled": updatesEnabled(e.InstallMethod),
+			"update_disabled_reason": "",
 		})
 	}
 	return result
+}
+
+// installSourceMap serializes the manifest entry into the dashboard's
+// install_source contract consumed by the WebUI (install method, registry,
+// market plugin id, repo, download URL).
+func (e *ManifestEntry) installSourceMap() map[string]interface{} {
+	if e == nil {
+		return nil
+	}
+	method := e.InstallMethod
+	if method == "" {
+		// Legacy entries installed before install-source tracking: a git/archive
+		// source is still reinstallable, so present it as a repository source.
+		if isRepoURL(e.Source) {
+			method = "repository"
+		} else {
+			method = "url"
+		}
+	}
+	return map[string]interface{}{
+		"schema_version":   1,
+		"root_dir_name":    e.ID,
+		"install_method":   method,
+		"registry_url":     e.RegistryURL,
+		"registry_name":    e.RegistryName,
+		"market_plugin_id": e.MarketPluginID,
+		"repo":             e.Repo,
+		"download_url":     e.DownloadURL,
+		"implicit":         false,
+	}
+}
+
+// isRepoURL reports whether a source looks like a git clone / archive URL that
+// can be re-fetched on update.
+func isRepoURL(source string) bool {
+	s := strings.ToLower(strings.TrimSpace(source))
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") ||
+		strings.HasPrefix(s, "git@") || strings.HasPrefix(s, "ssh://")
+}
+
+// updatesEnabled reports whether the plugin's install method allows updates
+// (market and repository installs can be refreshed).
+func updatesEnabled(method string) bool {
+	m := strings.ToLower(method)
+	if m == "" {
+		return true // legacy: reinstallable from its stored source
+	}
+	return m == "market" || m == "repository"
 }
 
 // ListFailedPlugins wraps Failed() into the dashboard's /plugins/failed
@@ -113,16 +199,96 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 	return man.Save(m.manifestPath())
 }
 
+// BindSource updates the persisted install source of an installed plugin so
+// future update/reinstall requests resolve from the new registry/repository.
+// It mirrors the dashboard's install_source record (market or repository).
+func (m *SubprocessManager) BindSource(id string, method, registryURL, registryName, marketPluginID, repo, downloadURL string) error {
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return err
+	}
+	entry := man.Get(id)
+	if entry == nil {
+		return fmt.Errorf("plugin %s not in install manifest", id)
+	}
+	if method != "" {
+		entry.InstallMethod = method
+	}
+	if registryURL != "" {
+		entry.RegistryURL = registryURL
+	}
+	if registryName != "" {
+		entry.RegistryName = registryName
+	}
+	if marketPluginID != "" {
+		entry.MarketPluginID = marketPluginID
+	}
+	if repo != "" {
+		entry.Repo = repo
+	}
+	if downloadURL != "" {
+		entry.DownloadURL = downloadURL
+	}
+	return man.Save(m.manifestPath())
+}
+
+// ReinstallSource reinstalls a plugin from its persisted source: it unloads
+// the running instance (if any), re-fetches, re-scans, re-builds and reloads
+// the plugin, updating the manifest. Source metadata is carried over.
+func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts InstallOptions) (*PluginInstance, error) {
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return nil, err
+	}
+	entry := man.Get(id)
+	if entry == nil {
+		return nil, fmt.Errorf("plugin %s not in install manifest", id)
+	}
+	if m.Get(id) != nil {
+		if err := m.Unload(id); err != nil {
+			return nil, fmt.Errorf("unload plugin %s: %w", id, err)
+		}
+	}
+
+	source := entry.DownloadURL
+	if source == "" {
+		source = entry.Source
+	}
+	if source == "" {
+		source = entry.Repo
+	}
+	if source == "" {
+		return nil, fmt.Errorf("plugin %s has no install source", id)
+	}
+
+	carry := InstallOptions{
+		IgnoreRisk:     opts.IgnoreRisk,
+		Progress:       opts.Progress,
+		InstallMethod:  entry.InstallMethod,
+		RegistryURL:    entry.RegistryURL,
+		RegistryName:   entry.RegistryName,
+		MarketPluginID: entry.MarketPluginID,
+		Repo:           entry.Repo,
+		DownloadURL:    entry.DownloadURL,
+	}
+	return m.InstallFromSource(ctx, id, source, carry)
+}
+
 // Uninstall removes an installed plugin: unloads it, drops the manifest entry,
 // deletes its compiled binary directory and optionally its config directory.
-func (m *SubprocessManager) Uninstall(id string, deleteConfig bool) error {
+// Uninstall removes a plugin. deleteConfig 是否删除插件配置
+// (data/plugins_config/<name>)，deleteData 是否删除插件运行时数据
+// (data/plugins/<name>/data)。二进制与文档缓存始终清理。
+func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) error {
 	name := id
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
 		return err
 	}
+	var entry *ManifestEntry
 	if e := man.Get(id); e != nil {
 		name = e.Name
+		entry = e
 	}
 	if m.Get(id) != nil {
 		if err := m.Unload(id); err != nil {
@@ -133,15 +299,41 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig bool) error {
 	if err := man.Save(m.manifestPath()); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id))); err != nil {
-		return err
-	}
-	if deleteConfig {
-		if err := os.RemoveAll(filepath.Join(m.dataDir, "plugins", name)); err != nil {
-			return err
+
+	// 二进制目录（始终删除）。
+	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id)))
+
+	// 目录足迹：优先用安装时记录的 manifest 条目，旧版本安装则按 name 推导。
+	cfgDir := filepath.Join(m.dataDir, "plugins_config", name)
+	docsDir := filepath.Join(m.dataDir, "plugins", name)
+	dataRoot := filepath.Join(m.dataDir, "plugins_data", sanitizeID(id))
+	if entry != nil {
+		if entry.ConfigDir != "" {
+			cfgDir = filepath.Join(m.dataDir, entry.ConfigDir)
+		}
+		if entry.DocsDir != "" {
+			docsDir = filepath.Join(m.dataDir, entry.DocsDir)
+		}
+		if entry.DataDir != "" {
+			dataRoot = filepath.Join(m.dataDir, entry.DataDir)
 		}
 	}
-	logger.Info("Plugin %s uninstalled (deleteConfig=%v)", id, deleteConfig)
+
+	if deleteData {
+		_ = os.RemoveAll(dataRoot)
+		// 含 data/ 与文档缓存。
+		_ = os.RemoveAll(docsDir)
+	} else {
+		// 只清文档缓存文件，保留运行时数据目录(plugins_data/ 与 data/)。
+		for _, f := range []string{"README.md", "readme.md", "CHANGELOG.md", "changelog.md", "config_schema.json"} {
+			_ = os.Remove(filepath.Join(docsDir, f))
+		}
+	}
+	if deleteConfig {
+		_ = os.RemoveAll(cfgDir)
+	}
+
+	logger.Info("Plugin %s uninstalled (deleteConfig=%v deleteData=%v)", id, deleteConfig, deleteData)
 	return nil
 }
 
@@ -162,26 +354,94 @@ func (m *SubprocessManager) instanceByName(name string) *PluginInstance {
 // ConfigSchema returns the plugin's config schema exported via Register().
 func (m *SubprocessManager) ConfigSchema(name string) map[string]interface{} {
 	inst := m.instanceByName(name)
+	if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
+		var schema map[string]interface{}
+		if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
+			logger.Warn("ConfigSchema(%s): %v", name, err)
+		} else {
+			return schema
+		}
+	}
+	// 插件已禁用/未加载时回退到落盘的 schema 缓存，保证配置对话框仍可渲染。
+	if data, err := os.ReadFile(m.schemaCachePath(name)); err == nil {
+		var schema map[string]interface{}
+		if json.Unmarshal(data, &schema) == nil {
+			return schema
+		}
+	}
+	return map[string]interface{}{}
+}
+
+// schemaCachePath returns the persisted config-schema cache for a plugin
+// (under plugins_config/<name>/ alongside config.json).
+func (m *SubprocessManager) schemaCachePath(name string) string {
+	return filepath.Join(m.dataDir, "plugins_config", name, "config_schema.json")
+}
+
+// cacheConfigSchema persists a loaded plugin's config schema so the WebUI can
+// render its config dialog even while the plugin is disabled (unloaded).
+func (m *SubprocessManager) cacheConfigSchema(name string, meta *sdkv1.RegisterResponse) {
+	if meta == nil || len(meta.ConfigSchemaJson) == 0 {
+		return
+	}
+	path := m.schemaCachePath(name)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, meta.ConfigSchemaJson, 0o644)
+}
+
+// Components returns the plugin's behavior components (commands / llm tools /
+// hooks) consumed by the WebUI "行为" detail page. Empty map when the plugin
+// is not loaded.
+func (m *SubprocessManager) Components(name string) map[string]interface{} {
+	inst := m.instanceByName(name)
 	if inst == nil || inst.Meta == nil {
-		return map[string]interface{}{}
+		return nil
 	}
-	if len(inst.Meta.ConfigSchemaJson) == 0 {
-		return map[string]interface{}{}
+	out := map[string]interface{}{}
+	cmds := make([]interface{}, 0, len(inst.Meta.Commands))
+	for _, c := range inst.Meta.Commands {
+		cmds = append(cmds, map[string]interface{}{
+			"cmd": c.Name, "name": c.Name, "handler_name": c.Name,
+			"desc": c.Description, "aliases": c.Aliases,
+			"permission": c.Permission, "type": "指令",
+		})
 	}
-	var schema map[string]interface{}
-	if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
-		logger.Warn("ConfigSchema(%s): %v", name, err)
-		return map[string]interface{}{}
+	tools := make([]interface{}, 0, len(inst.Meta.Tools))
+	for _, t := range inst.Meta.Tools {
+		tools = append(tools, map[string]interface{}{
+			"name": t.Name, "handler_name": t.Name, "desc": t.Description, "type": "函数工具",
+		})
 	}
-	return schema
+	hooks := make([]interface{}, 0, len(inst.Meta.Hooks))
+	for _, h := range inst.Meta.Hooks {
+		hooks = append(hooks, map[string]interface{}{
+			"name": h.Name, "handler_name": h.Name,
+			"event_type": h.Event, "event_type_h": h.Event, "type": "事件监听器",
+		})
+	}
+	if len(cmds) > 0 {
+		out["command"] = cmds
+	}
+	if len(tools) > 0 {
+		out["llm_tool"] = tools
+	}
+	if len(hooks) > 0 {
+		out["hook"] = hooks
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
-// configPath returns plugins/<name>/config.json.
+// configPath returns plugins_config/<name>/config.json. 插件配置项统一存放在
+// data/plugins_config/ 下、按插件名分文件夹，与源码/运行时数据(data/plugins/)
+// 分开，方便用户直接编辑配置文件。
 func (m *SubprocessManager) configPath(name string) string {
-	return filepath.Join(m.dataDir, "plugins", name, "config.json")
+	return filepath.Join(m.dataDir, "plugins_config", name, "config.json")
 }
 
-// LoadConfig reads the plugin config from plugins/<name>/config.json.
+// LoadConfig reads the plugin config from plugins_config/<name>/config.json.
 func (m *SubprocessManager) LoadConfig(name string) map[string]interface{} {
 	data, err := os.ReadFile(m.configPath(name))
 	if err != nil {
@@ -192,6 +452,100 @@ func (m *SubprocessManager) LoadConfig(name string) map[string]interface{} {
 		return map[string]interface{}{}
 	}
 	return cfg
+}
+
+// FlatSchema returns the plugin's config schema as a flat {key: {type,...}}
+// map (the "items" the WebUI renders). It normalizes the
+// {"type":"object","properties":{...}} form (used by the Go SDK's
+// ConfigSchema) to the properties map, and recursively converts nested
+// "properties" into "items" (the shape the WebUI AstrBotConfig renders for
+// object groups), so both flat and grouped layouts work.
+func (m *SubprocessManager) FlatSchema(name string) map[string]interface{} {
+	schema := m.ConfigSchema(name)
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		schema = props
+	}
+	return normalizeSchema(schema)
+}
+
+// normalizeSchema converts every nested {"properties":{...}} into
+// {"items":{...}} recursively, matching the WebUI config component's
+// expectations. Existing "items" (array element schemas) are preserved. It also
+// maps JSON-Schema style types to the AstrBot/WebUI config types
+// (boolean→bool, integer→int, number→float, array→list) so inputs render.
+func normalizeSchema(schema map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(schema))
+	for key, metaAny := range schema {
+		meta, ok := metaAny.(map[string]interface{})
+		if !ok {
+			out[key] = metaAny
+			continue
+		}
+		nm := make(map[string]interface{}, len(meta))
+		for k, v := range meta {
+			nm[k] = v
+		}
+		if t, ok := nm["type"].(string); ok {
+			if mapped, ok := jsonSchemaToAstrBotType[t]; ok {
+				nm["type"] = mapped
+			}
+		}
+		if props, ok := nm["properties"].(map[string]interface{}); ok {
+			if _, hasItems := nm["items"]; !hasItems {
+				nm["items"] = normalizeSchema(props)
+			}
+		}
+		out[key] = nm
+	}
+	return out
+}
+
+// jsonSchemaToAstrBotType maps JSON-Schema config types to the types the WebUI
+// ConfigItemRenderer understands.
+var jsonSchemaToAstrBotType = map[string]string{
+	"boolean": "bool",
+	"integer": "int",
+	"number":  "float",
+	"array":   "list",
+}
+
+// LoadConfigWithDefaults returns the plugin config merged with its schema
+// defaults, so the WebUI config dialog shows every field (with defaults) even
+// before the user saves anything.
+func (m *SubprocessManager) LoadConfigWithDefaults(name string) map[string]interface{} {
+	cfg := m.LoadConfig(name)
+	if cfg == nil {
+		cfg = map[string]interface{}{}
+	}
+	mergeSchemaDefaults(cfg, m.FlatSchema(name))
+	return cfg
+}
+
+// mergeSchemaDefaults fills cfg with each schema key's "default" value (and
+// recurses into object groups) when the key is absent.
+func mergeSchemaDefaults(cfg, schema map[string]interface{}) {
+	for key, metaAny := range schema {
+		meta, ok := metaAny.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if def, ok := meta["default"]; ok {
+			if _, exists := cfg[key]; !exists {
+				cfg[key] = def
+			}
+			continue
+		}
+		if itemsAny, ok := meta["items"].(map[string]interface{}); ok {
+			cur, _ := cfg[key].(map[string]interface{})
+			if cur == nil {
+				cur = map[string]interface{}{}
+			}
+			mergeSchemaDefaults(cur, itemsAny)
+			if len(cur) > 0 {
+				cfg[key] = cur
+			}
+		}
+	}
 }
 
 // SaveConfig persists the plugin config to plugins/<name>/config.json.
@@ -208,10 +562,152 @@ func (m *SubprocessManager) SaveConfig(name string, cfg map[string]interface{}) 
 	return os.WriteFile(path, data, 0644)
 }
 
-// PluginDataDir returns the per-plugin data directory (plugins/<name>/data),
+// pluginDataRoot returns the unified per-plugin data root directory
+// (data/plugins_data/<id>). Plugins are launched with this as their working
+// directory, so their relative-path data files land here.
+func (m *SubprocessManager) pluginDataRoot(id string) string {
+	return filepath.Join(m.dataDir, "plugins_data", sanitizeID(id))
+}
+
+// PluginDataDir returns the per-plugin data directory (data/plugins_data/<id>),
 // creating it if needed.
-func (m *SubprocessManager) PluginDataDir(name string) string {
-	dir := filepath.Join(m.dataDir, "plugins", name, "data")
-	_ = os.MkdirAll(dir, 0755)
+func (m *SubprocessManager) PluginDataDir(id string) string {
+	dir := m.pluginDataRoot(id)
+	_ = os.MkdirAll(dir, 0o755)
 	return dir
+}
+
+// docsPath returns the per-plugin docs directory (plugins/<name>) where
+// README.md/CHANGELOG.md are cached at install time.
+func (m *SubprocessManager) docsPath(name string) string {
+	return filepath.Join(m.dataDir, "plugins", name)
+}
+
+// Readme returns the plugin's README content, reading from the locally cached
+// copy captured at install time. When the cache is missing (plugin installed
+// before caching was added) it falls back to fetching from the plugin's repo
+// URL. Returns an empty string when no README is available.
+func (m *SubprocessManager) Readme(id string) string {
+	name := m.resolveName(id)
+	if name == "" {
+		return ""
+	}
+	for _, file := range []string{"README.md", "readme.md"} {
+		if content := m.readCachedDoc(name, file); content != "" {
+			return content
+		}
+	}
+	return m.fetchRepoDoc(name, []string{"README.md", "readme.md"})
+}
+
+// Changelog returns the plugin's CHANGELOG content with the same cache-first,
+// repo-fallback semantics as Readme.
+func (m *SubprocessManager) Changelog(id string) string {
+	name := m.resolveName(id)
+	if name == "" {
+		return ""
+	}
+	for _, file := range []string{"CHANGELOG.md", "changelog.md"} {
+		if content := m.readCachedDoc(name, file); content != "" {
+			return content
+		}
+	}
+	return m.fetchRepoDoc(name, []string{"CHANGELOG.md", "changelog.md"})
+}
+
+// resolveName maps a plugin id/name to the canonical plugin name (used for the
+// docs directory). Falls back to the id itself so legacy entries still resolve.
+func (m *SubprocessManager) resolveName(id string) string {
+	if inst := m.instanceByName(id); inst != nil {
+		return inst.Name
+	}
+	if man, err := LoadManifest(m.manifestPath()); err == nil {
+		if e := man.Get(id); e != nil {
+			if e.Name != "" {
+				return e.Name
+			}
+			return e.ID
+		}
+	}
+	return id
+}
+
+// readCachedDoc reads a cached doc file from the plugin docs directory.
+func (m *SubprocessManager) readCachedDoc(name, file string) string {
+	content, err := os.ReadFile(filepath.Join(m.docsPath(name), file))
+	if err != nil {
+		return ""
+	}
+	return string(content)
+}
+
+// fetchRepoDoc fetches a doc file (README.md/CHANGELOG.md) from the plugin's
+// GitHub repository when it was not cached locally. repoDocFile returns the
+// first successful fetch, or "" when unavailable.
+func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) string {
+	repo := m.repoURLFor(name)
+	if repo == "" {
+		return ""
+	}
+	rawURLs := rawRepoDocURLs(repo, candidates)
+	client := &http.Client{Timeout: 15 * time.Second}
+	for _, rawURL := range rawURLs {
+		resp, err := client.Get(rawURL)
+		if err != nil {
+			continue
+		}
+		content, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK && len(content) > 0 {
+			return string(content)
+		}
+	}
+	return ""
+}
+
+// repoURLFor returns the plugin's repository URL (manifest Repo, else Source).
+func (m *SubprocessManager) repoURLFor(name string) string {
+	if man, err := LoadManifest(m.manifestPath()); err == nil {
+		for i := range man.Plugins {
+			e := &man.Plugins[i]
+			if e.Name == name || e.ID == name {
+				if e.Repo != "" {
+					return e.Repo
+				}
+				return e.Source
+			}
+		}
+	}
+	return ""
+}
+
+// rawRepoDocURLs builds raw.githubusercontent.com URLs for candidate doc files
+// across the default branch heads (HEAD, main, master).
+func rawRepoDocURLs(repo string, candidates []string) []string {
+	host := ""
+	path := ""
+	if u, err := url.Parse(repo); err == nil {
+		host = u.Host
+		path = strings.Trim(u.Path, "/")
+	} else {
+		// git@host:owner/repo.git shorthand
+		if at := strings.Index(repo, "@"); at >= 0 {
+			rest := strings.TrimPrefix(repo[at+1:], ":")
+			if i := strings.Index(rest, "/"); i > 0 {
+				host = repo[at+1 : strings.Index(repo[at+1:], ":")+at+1]
+				path = rest
+			}
+		}
+	}
+	if host == "" || !strings.EqualFold(host, "github.com") || strings.Count(path, "/") < 1 {
+		return nil
+	}
+	path = strings.TrimSuffix(path, ".git")
+	var out []string
+	for _, branch := range []string{"HEAD", "main", "master"} {
+		for _, file := range candidates {
+			out = append(out, "https://raw.githubusercontent.com/"+path+"/"+branch+"/"+file)
+		}
+	}
+	return out
 }

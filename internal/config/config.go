@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -68,6 +69,75 @@ type AstrBotConfig struct {
 	schema       map[string]interface{}
 	saveRevision int64
 	committedRev int64
+	// orderTmpl is the canonical key ordering used when writing the config
+	// file, so saved keys keep the Python DEFAULT_CONFIG order instead of
+	// being alphabetized by encoding/json.
+	orderTmpl *OrderedJSON
+}
+
+// setOrderTemplate seeds the key ordering used when saving. Parsing the full
+// default config is done lazily once per process.
+func (c *AstrBotConfig) setOrderTemplate() {
+	if c.orderTmpl != nil {
+		return
+	}
+	tmpl, err := ParseOrderedJSON([]byte(DefaultConfigJSONRaw))
+	if err != nil {
+		return
+	}
+	c.orderTmpl = tmpl
+}
+
+// orderedWrite converts the plain data map into an OrderedJSON whose keys
+// follow the default config order (unknown keys appended at the end).
+func (c *AstrBotConfig) orderedWrite() interface{} {
+	c.setOrderTemplate()
+	return applyOrderTemplate(c.data, c.orderTmpl)
+}
+
+// applyOrderTemplate rebuilds a value so object keys follow the template's
+// order. Values not present in the template keep alphabetical order.
+func applyOrderTemplate(v interface{}, tmpl *OrderedJSON) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := NewOrderedJSON()
+		if tmpl != nil {
+			for _, k := range tmpl.Keys() {
+				child, ok := t[k]
+				if !ok {
+					continue
+				}
+				var childTmpl *OrderedJSON
+				if tv, ok := tmpl.Get(k); ok {
+					if o, ok := tv.(*OrderedJSON); ok {
+						childTmpl = o
+					}
+				}
+				out.Set(k, applyOrderTemplate(child, childTmpl))
+			}
+		}
+		// Remaining keys not covered by the template, sorted for determinism.
+		extra := make([]string, 0)
+		for k := range t {
+			if tmpl != nil && tmpl.Has(k) {
+				continue
+			}
+			extra = append(extra, k)
+		}
+		sort.Strings(extra)
+		for _, k := range extra {
+			out.Set(k, applyOrderTemplate(t[k], nil))
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = applyOrderTemplate(e, tmpl)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // New creates a new AstrBotConfig. If the config file doesn't exist,
@@ -220,7 +290,6 @@ func (c *AstrBotConfig) Path() string { return c.configPath }
 // save writes the config to a temp file then renames atomically.
 func (c *AstrBotConfig) save(indent int) error {
 	c.mu.Lock()
-	snapshot := copyMap(c.data)
 	c.saveRevision++
 	rev := c.saveRevision
 	c.mu.Unlock()
@@ -244,7 +313,8 @@ func (c *AstrBotConfig) save(indent int) error {
 	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", repeatSpace(indent))
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(snapshot); err != nil {
+	ordered := c.orderedWrite()
+	if err := enc.Encode(ordered); err != nil {
 		tmp.Close()
 		return fmt.Errorf("encode: %w", err)
 	}

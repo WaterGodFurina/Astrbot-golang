@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -43,13 +44,20 @@ type Logger struct {
 	mu          sync.RWMutex
 	level       Level
 	out         io.Writer
+	fileOut     io.Writer
 	subscribers []chan LogEntry
 	useColor    bool
 	history     []LogEntry
+	historyBytes int
 }
 
 // maxHistory caps the number of buffered log entries returned by History().
 const maxHistory = 200
+
+// maxHistoryBytes bounds the in-memory log history by total text size (~1MB,
+// "流动日志消除法"): the console page only ever holds a bounded buffer so a
+// long-running process cannot bloat memory.
+const maxHistoryBytes = 1 << 20 // 1 MiB
 
 // LogEntry represents a single log record.
 type LogEntry struct {
@@ -67,6 +75,121 @@ var defaultLogger = &Logger{
 
 // GetDefault returns the default logger instance.
 func GetDefault() *Logger { return defaultLogger }
+
+// EnableFileLog starts writing every log line to a segmented file (path may be
+// relative to the working dir). When the current segment exceeds maxBytes the
+// file rotates: astrbot.log -> astrbot.log.1 -> astrbot.log.2 -> ... and the
+// oldest segments beyond keepSegs are pruned. Logging to stdout continues.
+func (l *Logger) EnableFileLog(path string, maxBytes int64, keepSegs int) error {
+	w, err := newSegmentedWriter(path, maxBytes, keepSegs)
+	if err != nil {
+		return err
+	}
+	l.mu.Lock()
+	l.fileOut = w
+	l.mu.Unlock()
+	return nil
+}
+
+// DisableFileLog stops segmented file logging and closes the file.
+func (l *Logger) DisableFileLog() {
+	l.mu.Lock()
+	if w, ok := l.fileOut.(*segmentedWriter); ok {
+		_ = w.Close()
+	}
+	l.fileOut = nil
+	l.mu.Unlock()
+}
+
+// segmentedWriter rotates a log file into numbered segments once it exceeds
+// maxBytes, keeping the most recent keepSegs segments.
+type segmentedWriter struct {
+	mu       sync.Mutex
+	path     string // e.g. logs/astrbot.log
+	maxBytes int64
+	keepSegs int
+	file     *os.File
+	size     int64
+}
+
+func newSegmentedWriter(path string, maxBytes int64, keepSegs int) (*segmentedWriter, error) {
+	if maxBytes <= 0 {
+		maxBytes = 5 << 20
+	}
+	if keepSegs <= 0 {
+		keepSegs = 3
+	}
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+	}
+	w := &segmentedWriter{path: path, maxBytes: maxBytes, keepSegs: keepSegs}
+	if err := w.open(); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (w *segmentedWriter) open() error {
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
+	w.file = f
+	w.size = info.Size()
+	return nil
+}
+
+func (w *segmentedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return len(p), nil
+	}
+	if w.size+int64(len(p)) > w.maxBytes {
+		_ = w.rotateLocked()
+	}
+	n, err := w.file.Write(p)
+	w.size += int64(n)
+	return n, err
+}
+
+func (w *segmentedWriter) rotateLocked() error {
+	if w.file != nil {
+		_ = w.file.Close()
+		w.file = nil
+	}
+	// shift segments: .n -> .n+1, current -> .1
+	for i := w.keepSegs - 1; i >= 1; i-- {
+		old := fmt.Sprintf("%s.%d", w.path, i)
+		next := fmt.Sprintf("%s.%d", w.path, i+1)
+		if _, err := os.Stat(old); err == nil {
+			_ = os.Remove(next)
+			_ = os.Rename(old, next)
+		}
+	}
+	seg1 := fmt.Sprintf("%s.1", w.path)
+	_ = os.Remove(seg1)
+	_ = os.Rename(w.path, seg1)
+	return w.open()
+}
+
+func (w *segmentedWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file != nil {
+		err := w.file.Close()
+		w.file = nil
+		return err
+	}
+	return nil
+}
 
 // SetLevel sets the minimum log level.
 func (l *Logger) SetLevel(level Level) {
@@ -116,13 +239,20 @@ func (l *Logger) log(level Level, component, format string, args ...interface{})
 	}
 
 	l.mu.Lock()
-	// Buffer recent entries for the WebUI log history (mirrors Python's LogBroker cache).
+	// Buffer recent entries for the WebUI log history. Bound by BOTH entry count
+	// and total text size (~1MB) so a long session cannot bloat memory.
 	l.history = append(l.history, entry)
-	if len(l.history) > maxHistory {
-		l.history = l.history[len(l.history)-maxHistory:]
+	for len(l.history) > maxHistory || l.historyBytes > maxHistoryBytes {
+		l.historyBytes -= len(l.history[0].Message)
+		l.history = l.history[1:]
+		if len(l.history) == 0 {
+			break
+		}
 	}
+	l.historyBytes += len(entry.Message)
 	subs := make([]chan LogEntry, len(l.subscribers))
 	copy(subs, l.subscribers)
+	fileOut := l.fileOut
 	l.mu.Unlock()
 
 	for _, ch := range subs {
@@ -144,8 +274,15 @@ func (l *Logger) log(level Level, component, format string, args ...interface{})
 		color = levelColors[level]
 		reset = colorReset
 	}
-	fmt.Fprintf(out, "%s[%s] [%s] [%s] %s%s\n",
+	line := fmt.Sprintf("%s[%s] [%s] [%s] %s%s\n",
 		color, ts, levelNames[level], entry.Component, entry.Message, reset)
+	fmt.Fprint(out, line)
+
+	if fileOut != nil {
+		// Plain (no color) line for the segmented log file.
+		plain := fmt.Sprintf("[%s] [%s] [%s] %s\n", ts, levelNames[level], entry.Component, entry.Message)
+		_, _ = io.WriteString(fileOut, plain)
+	}
 }
 
 // History returns the buffered log entries (newest first is NOT applied;
