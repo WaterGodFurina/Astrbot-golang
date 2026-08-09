@@ -22,7 +22,7 @@ func newTestDeps(t *testing.T) (Deps, *star.Manager) {
 	deps := Deps{
 		StarMgr:         sm,
 		ConfigMgr:       cm,
-		ConversationMgr: conversation.NewManager(),
+		ConversationMgr: conversation.NewManager(nil),
 	}
 	RegisterBuiltin(deps)
 	return deps, sm

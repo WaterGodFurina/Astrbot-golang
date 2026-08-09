@@ -7,14 +7,20 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/AstrBotDevs/AstrBot/internal/config"
+	"github.com/AstrBotDevs/AstrBot/internal/conversation"
+	"github.com/AstrBotDevs/AstrBot/internal/cron"
+	"github.com/AstrBotDevs/AstrBot/internal/db"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
 	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 	"github.com/AstrBotDevs/AstrBot/internal/skills"
@@ -47,6 +53,8 @@ type Server struct {
 	chat               *chatStore
 	mcp                *mcpStore
 	starMgr            interface{} // *star.Manager
+	database           *db.Database
+	startTime          time.Time
 	onPlatformsChanged func()
 	onPluginsChanged   func()
 }
@@ -73,9 +81,10 @@ func (s *Server) notifyPluginsChanged() {
 // NewServer creates a dashboard server with password management.
 func NewServer(port int, configPath string) *Server {
 	s := &Server{
-		mux:      http.NewServeMux(),
-		handlers: make(map[string]http.HandlerFunc),
-		port:     port,
+		mux:       http.NewServeMux(),
+		handlers:  make(map[string]http.HandlerFunc),
+		port:      port,
+		startTime: time.Now(),
 	}
 	s.auth = NewPasswordManager(configPath)
 	s.personas = newPersonaStore(filepath.Dir(configPath))
@@ -124,6 +133,11 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		}
 		if v, ok := managers["persona"]; ok {
 			s.personaMgr = v
+		}
+		if v, ok := managers["database"]; ok {
+			if dbm, ok := v.(*db.Database); ok {
+				s.database = dbm
+			}
 		}
 	}
 	return s
@@ -395,29 +409,157 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 
 // getBaseStats returns the dashboard statistics consumed by StatsPage.vue.
 func (s *Server) getBaseStats() map[string]interface{} {
-	start := time.Now()
+	started := s.startTime
+	running := time.Since(started)
+	messageCount := 0
+	todayCalls := 0
+	if s.database != nil {
+		messageCount = s.database.TotalMessageCount()
+		todayCalls = s.database.TodayProviderCalls()
+	}
 	return map[string]interface{}{
-		"message_count":       0,
+		"message_count":       messageCount,
 		"platform_count":      len(s.getBotList()),
 		"platform":            []interface{}{},
 		"message_time_series": [][]int{},
 		"memory": map[string]interface{}{
-			"process": 0,
-			"system":  0,
+			"process": processMemoryMB(),
+			"system":  systemMemoryMB(),
 		},
-		"cpu_percent": 0,
-		"running": map[string]interface{}{
-			"hours":   0,
-			"minutes": 0,
-			"seconds": 0,
-		},
-		"thread_count": 0,
-		"start_time":   start.Unix(),
+		"cpu_percent":  processCPUPercent(),
+		"today_calls":  todayCalls,
+		"running":      runningComponents(running),
+		"thread_count": runtime.NumGoroutine(),
+		"start_time":   started.Unix(),
 	}
+}
+
+// runningComponents splits a duration into hours/minutes/seconds.
+func runningComponents(d time.Duration) map[string]interface{} {
+	total := int(d.Seconds())
+	return map[string]interface{}{
+		"hours":   total / 3600,
+		"minutes": (total % 3600) / 60,
+		"seconds": total % 60,
+	}
+}
+
+// processMemoryMB returns the process resident set size in MB (Linux /proc).
+func processMemoryMB() int {
+	data, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		return 0
+	}
+	pages, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return int(pages * 4096 >> 20)
+}
+
+// systemMemoryMB returns total system RAM in MB (Linux /proc/meminfo).
+func systemMemoryMB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "MemTotal:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
+					return int(kb >> 10)
+				}
+			}
+		}
+	}
+	return 0
+}
+
+// processCPUPercent returns the process CPU usage percentage (Linux /proc).
+// It samples the process utime+stime vs total CPU over a 300ms window.
+func processCPUPercent() float64 {
+	pid := os.Getpid()
+	read := func(path string) (int64, int64, bool) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return 0, 0, false
+		}
+		if path == "/proc/stat" {
+			// first line: cpu  user nice system idle ...
+			line := strings.SplitN(string(data), "\n", 2)[0]
+			fields := strings.Fields(line)
+			if len(fields) < 5 {
+				return 0, 0, false
+			}
+			var total int64
+			for _, f := range fields[1:] {
+				v, err := strconv.ParseInt(f, 10, 64)
+				if err == nil {
+					total += v
+				}
+			}
+			return total, 0, true
+		}
+		// /proc/<pid>/stat: field 14 = utime, 15 = stime (1-indexed after pid)
+		str := string(data)
+		idx := strings.LastIndex(str, ")")
+		if idx < 0 {
+			return 0, 0, false
+		}
+		rest := strings.Fields(str[idx+1:])
+		if len(rest) < 13 {
+			return 0, 0, false
+		}
+		utime, e1 := strconv.ParseInt(rest[11], 10, 64)
+		stime, e2 := strconv.ParseInt(rest[12], 10, 64)
+		if e1 != nil || e2 != nil {
+			return 0, 0, false
+		}
+		return utime + stime, 0, true
+	}
+
+	proc1, _, ok1 := read(fmt.Sprintf("/proc/%d/stat", pid))
+	total1, _, ok2 := read("/proc/stat")
+	if !ok1 || !ok2 {
+		return 0
+	}
+	time.Sleep(300 * time.Millisecond)
+	proc2, _, _ := read(fmt.Sprintf("/proc/%d/stat", pid))
+	total2, _, _ := read("/proc/stat")
+
+	dProc := proc2 - proc1
+	dTotal := total2 - total1
+	if dTotal <= 0 {
+		return 0
+	}
+	cpus := float64(runtime.NumCPU())
+	percent := float64(dProc) / float64(dTotal) * 100 * cpus
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	return round1(percent)
+}
+
+func round1(v float64) float64 {
+	return math.Round(v*10) / 10
 }
 
 // getProviderTokenStats returns provider token statistics for StatsPage.vue.
 func (s *Server) getProviderTokenStats() map[string]interface{} {
+	todayCalls := 0
+	todayTokens := 0
+	if s.database != nil {
+		todayCalls = s.database.TodayProviderCalls()
+		todayTokens = s.database.TodayProviderTokens()
+	}
 	return map[string]interface{}{
 		"days": 7,
 		"trend": map[string]interface{}{
@@ -432,8 +574,8 @@ func (s *Server) getProviderTokenStats() map[string]interface{} {
 		"range_success_rate":    0,
 		"range_by_provider":     []interface{}{},
 		"range_by_umo":          []interface{}{},
-		"today_total_tokens":    0,
-		"today_total_calls":     0,
+		"today_total_tokens":    todayTokens,
+		"today_total_calls":     todayCalls,
 	}
 }
 
@@ -692,23 +834,235 @@ func (s *Server) getConversationList() []interface{} {
 	return cm.GetAllConversations()
 }
 
+// getActiveUMOs returns active session UMOs and their info, mirroring
+// Python's session_management_service.list_active_umos.
+func (s *Server) getActiveUMOs() map[string]interface{} {
+	umos := []string{}
+	if s.conversationMgr != nil {
+		if cm, ok := s.conversationMgr.(interface{ ActiveUMOs() []string }); ok {
+			umos = cm.ActiveUMOs()
+		}
+	}
+	infos := make([]interface{}, 0, len(umos))
+	for _, umo := range umos {
+		infos = append(infos, conversation.BuildUMOInfo(umo))
+	}
+	return map[string]interface{}{
+		"umos":      umos,
+		"umo_infos": infos,
+	}
+}
+
+// getConversationDetail returns a single conversation by cid.
+func (s *Server) getConversationDetail(cid string) map[string]interface{} {
+	if s.conversationMgr == nil {
+		return nil
+	}
+	cm, ok := s.conversationMgr.(interface {
+		GetConversationByCID(cid string) map[string]interface{}
+	})
+	if !ok {
+		return nil
+	}
+	return cm.GetConversationByCID(cid)
+}
+
+// conversationDeleteByCID removes a conversation by cid.
+func (s *Server) conversationDeleteByCID(cid string) bool {
+	if s.conversationMgr == nil {
+		return false
+	}
+	cm, ok := s.conversationMgr.(interface {
+		DeleteConversationByCID(cid string) bool
+	})
+	if !ok {
+		return false
+	}
+	return cm.DeleteConversationByCID(cid)
+}
+
+// conversationUpdateByCID patches a conversation (title/persona/history).
+func (s *Server) conversationUpdateByCID(cid string, patch map[string]interface{}) bool {
+	if s.conversationMgr == nil {
+		return false
+	}
+	if title, ok := patch["title"].(string); ok {
+		if cm, ok := s.conversationMgr.(interface {
+			SetTitleByCID(cid, title string) bool
+		}); ok {
+			cm.SetTitleByCID(cid, title)
+		}
+	}
+	if persona, ok := patch["persona_id"].(string); ok {
+		if cm, ok := s.conversationMgr.(interface {
+			SetPersonaByCID(cid, personaID string) bool
+		}); ok {
+			cm.SetPersonaByCID(cid, persona)
+		}
+	}
+	if raw, ok := patch["history"].([]interface{}); ok {
+		history := make([]map[string]interface{}, 0, len(raw))
+		for _, item := range raw {
+			if m, ok := item.(map[string]interface{}); ok {
+				history = append(history, m)
+			}
+		}
+		if cm, ok := s.conversationMgr.(interface {
+			ReplaceHistoryByCID(cid string, history []map[string]interface{}) bool
+		}); ok {
+			return cm.ReplaceHistoryByCID(cid, history)
+		}
+	}
+	return true
+}
+
 // getCronJobs returns all cron jobs.
 func (s *Server) getCronJobs() []interface{} {
 	if s.cronMgr == nil {
 		return []interface{}{}
 	}
 	cm, ok := s.cronMgr.(interface {
-		ListJobsInfo() []map[string]interface{}
+		ListInfo() []map[string]interface{}
 	})
 	if !ok {
 		return []interface{}{}
 	}
-	jobs := cm.ListJobsInfo()
+	jobs := cm.ListInfo()
 	result := make([]interface{}, len(jobs))
 	for i, j := range jobs {
 		result[i] = j
 	}
 	return result
+}
+
+// cronCreateJob creates a cron job from a WebUI payload.
+func (s *Server) cronCreateJob(body map[string]interface{}) (map[string]interface{}, string) {
+	cm, ok := s.cronMgr.(interface {
+		AddActiveJob(name, cronExpr string, payload map[string]interface{}, description, timezone string, runOnce bool, runAt time.Time) (*cron.Job, error)
+	})
+	if !ok || cm == nil {
+		return nil, "cron manager not available"
+	}
+	name, _ := body["name"].(string)
+	if name == "" {
+		name = "active_agent_task"
+	}
+	cronExpr, _ := body["cron_expression"].(string)
+	note, _ := body["note"].(string)
+	if note == "" {
+		note, _ = body["description"].(string)
+	}
+	if note == "" {
+		note = name
+	}
+	timezone, _ := body["timezone"].(string)
+	runOnce, _ := body["run_once"].(bool)
+	var runAt time.Time
+	runAtRaw := ""
+	if r, ok := body["run_at"].(string); ok && strings.TrimSpace(r) != "" {
+		runAtRaw = r
+		if t, err := cron.ParseRunAt(r); err == nil {
+			runAt = t
+			// A concrete execution time implies a one-time task unless a cron
+			// expression is explicitly provided.
+			runOnce = true
+		}
+	}
+	if cronExpr != "" {
+		runOnce = false
+	}
+	payload := map[string]interface{}{"note": note, "origin": "api"}
+	if runAtRaw != "" {
+		payload["run_at"] = runAtRaw
+	}
+	if session, ok := body["session"].(string); ok {
+		payload["session"] = session
+	}
+	job, err := cm.AddActiveJob(name, cronExpr, payload, note, timezone, runOnce, runAt)
+	if err != nil {
+		return nil, err.Error()
+	}
+	return cron.SerializeJob(job), ""
+}
+
+// cronDeleteJob removes a cron job by id.
+func (s *Server) cronDeleteJob(jobID string) bool {
+	cm, ok := s.cronMgr.(interface {
+		Remove(id string)
+	})
+	if !ok || cm == nil {
+		return false
+	}
+	cm.Remove(jobID)
+	return true
+}
+
+// cronRunJob immediately executes a job's handler in a background goroutine.
+func (s *Server) cronRunJob(jobID string) error {
+	cm, ok := s.cronMgr.(interface {
+		RunNow(id string) error
+	})
+	if !ok || cm == nil {
+		return fmt.Errorf("cron manager not available")
+	}
+	return cm.RunNow(jobID)
+}
+
+// cronUpdateJob patches an existing cron job in place (enabled toggle and/or// schedule fields), keeping it in the list even when disabled.
+func (s *Server) cronUpdateJob(jobID string, body map[string]interface{}) (map[string]interface{}, string) {
+	cm, ok := s.cronMgr.(interface {
+		Get(id string) *cron.Job
+		SetEnabled(id string, enabled bool) bool
+		UpdateJob(job *cron.Job)
+	})
+	if !ok || cm == nil {
+		return nil, "cron manager not available"
+	}
+	job := cm.Get(jobID)
+	if job == nil {
+		return nil, "job not found"
+	}
+	changed := false
+	if v, ok := body["enabled"].(bool); ok {
+		cm.SetEnabled(jobID, v)
+	}
+	if v, ok := body["name"].(string); ok && v != "" {
+		job.Name = v
+		changed = true
+	}
+	if v, ok := body["note"].(string); ok && v != "" {
+		job.Payload["note"] = v
+		job.Description = v
+		changed = true
+	} else if v, ok := body["description"].(string); ok && v != "" {
+		job.Description = v
+		changed = true
+	}
+	if v, ok := body["cron_expression"].(string); ok {
+		job.CronExpression = v
+		job.RunOnce = false
+		changed = true
+	}
+	if v, ok := body["run_at"].(string); ok && strings.TrimSpace(v) != "" {
+		if t, err := cron.ParseRunAt(v); err == nil {
+			job.RunAt = t
+			job.RunOnce = true
+			job.Payload["run_at"] = v
+			changed = true
+		}
+	}
+	if v, ok := body["timezone"].(string); ok {
+		job.Timezone = v
+		changed = true
+	}
+	if v, ok := body["session"].(string); ok && v != "" {
+		job.Payload["session"] = v
+		changed = true
+	}
+	if changed {
+		cm.UpdateJob(job)
+	}
+	return cron.SerializeJob(job), ""
 }
 
 // skillSetActive toggles a skill's active state via the skill manager.

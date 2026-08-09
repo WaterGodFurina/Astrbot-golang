@@ -1,0 +1,270 @@
+package cron
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Cron expression support (5 fields: minute hour day-of-month month day-of-week).
+//
+// Supported per field:
+//   - `*`                any value
+//   - `*/step`           every `step`
+//   - `a-b`              inclusive range
+//   - `a-b/step`         range with step
+//   - `a,b,c`            list
+//   - single value
+//   - month/dow names: jan..dec, sun..sat (dow: 0=sun or 7=sun)
+
+var monthNames = map[string]int{
+	"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+	"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+var dowNames = map[string]int{
+	"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
+}
+
+// fieldSpec is one cron field (minute, hour, dom, month, dow).
+type fieldSpec struct {
+	any      bool
+	values   map[int]bool
+	step     int
+	hasStep  bool
+	from, to int
+	rangeAny bool
+}
+
+// cronSchedule is a parsed 5-field cron expression.
+type cronSchedule struct {
+	minute, hour, dom, month, dow *fieldSpec
+}
+
+// ParseRunAt parses a one-time execution datetime in a lenient, Python
+// fromisoformat-like manner. Accepts RFC3339, "YYYY-MM-DDTHH:MM[:SS]", and
+// space-separated variants. Naive (timezone-less) inputs are interpreted in
+// the server's local timezone, matching Python's naive-datetime handling.
+func ParseRunAt(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty run_at")
+	}
+	tzLayouts := []string{
+		time.RFC3339,
+		"2006-01-02 15:04:05 -07:00",
+	}
+	for _, layout := range tzLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, nil
+		}
+	}
+	naiveLayouts := []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02T15:04",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02",
+	}
+	for _, layout := range naiveLayouts {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("run_at must be ISO datetime, e.g. 2026-02-02T08:00:00+08:00")
+}
+
+// ParseCron parses a 5-field cron expression.
+func ParseCron(expr string) (*cronSchedule, error) {
+	fields := strings.Fields(strings.TrimSpace(expr))
+	if len(fields) != 5 {
+		return nil, fmt.Errorf("cron expression must have 5 fields, got %d: %q", len(fields), expr)
+	}
+	s := &cronSchedule{}
+	var err error
+	if s.minute, err = parseField(fields[0], 0, 59, nil); err != nil {
+		return nil, fmt.Errorf("minute: %w", err)
+	}
+	if s.hour, err = parseField(fields[1], 0, 23, nil); err != nil {
+		return nil, fmt.Errorf("hour: %w", err)
+	}
+	if s.dom, err = parseField(fields[2], 1, 31, nil); err != nil {
+		return nil, fmt.Errorf("day-of-month: %w", err)
+	}
+	if s.month, err = parseField(fields[3], 1, 12, monthNames); err != nil {
+		return nil, fmt.Errorf("month: %w", err)
+	}
+	if s.dow, err = parseField(fields[4], 0, 7, dowNames); err != nil {
+		return nil, fmt.Errorf("day-of-week: %w", err)
+	}
+	// Normalize dow 7 -> 0 (Sunday) so the spec is consistent.
+	if s.dow.values != nil && s.dow.values[7] {
+		s.dow.values[0] = true
+	}
+	if s.dow.rangeAny && s.dow.to == 7 {
+		s.dow.to = 0
+	}
+	return s, nil
+}
+
+// parseField parses one cron field. names maps month/dow names to numbers.
+func parseField(field string, min, max int, names map[string]int) (*fieldSpec, error) {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return nil, fmt.Errorf("empty field")
+	}
+	// A field may be a comma list; if any element is a range/step, expand here.
+	parts := strings.Split(field, ",")
+	spec := &fieldSpec{values: map[int]bool{}}
+	hadValue := false
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("empty list element in %q", field)
+		}
+		if err := applyFieldPart(spec, part, min, max, names); err != nil {
+			return nil, err
+		}
+		hadValue = true
+	}
+	if !hadValue {
+		return nil, fmt.Errorf("empty field")
+	}
+	return spec, nil
+}
+
+func applyFieldPart(spec *fieldSpec, part string, min, max int, names map[string]int) error {
+	step := 1
+	stepPart := ""
+	if i := strings.Index(part, "/"); i >= 0 {
+		stepPart = part[i+1:]
+		part = part[:i]
+		if stepPart == "" {
+			return fmt.Errorf("empty step in %q", part+"/")
+		}
+		var err error
+		step, err = strconv.Atoi(stepPart)
+		if err != nil || step <= 0 {
+			return fmt.Errorf("invalid step %q", stepPart)
+		}
+	}
+	if part == "*" {
+		if step > 1 {
+			spec.any = true
+			spec.hasStep = true
+			spec.step = step
+			for v := min; v <= max; v++ {
+				if (v-min)%step == 0 {
+					spec.values[v] = true
+				}
+			}
+		} else {
+			spec.any = true
+			for v := min; v <= max; v++ {
+				spec.values[v] = true
+			}
+		}
+		return nil
+	}
+	if i := strings.Index(part, "-"); i >= 0 {
+		fromStr := part[:i]
+		toStr := part[i+1:]
+		from, err := parseFieldValue(fromStr, min, max, names)
+		if err != nil {
+			return err
+		}
+		to, err := parseFieldValue(toStr, min, max, names)
+		if err != nil {
+			return err
+		}
+		if from > to {
+			from, to = to, from
+		}
+		spec.rangeAny = true
+		spec.from, spec.to = from, to
+		for v := from; v <= to; v++ {
+			if (v-from)%step == 0 {
+				spec.values[v] = true
+			}
+		}
+		return nil
+	}
+	v, err := parseFieldValue(part, min, max, names)
+	if err != nil {
+		return err
+	}
+	spec.values[v] = true
+	return nil
+}
+
+func parseFieldValue(s string, min, max int, names map[string]int) (int, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if names != nil {
+		if v, ok := names[s]; ok {
+			if v < min || v > max {
+				return 0, fmt.Errorf("value %q out of range [%d,%d]", s, min, max)
+			}
+			return v, nil
+		}
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid value %q", s)
+	}
+	if v < min || v > max {
+		return 0, fmt.Errorf("value %d out of range [%d,%d]", v, min, max)
+	}
+	return v, nil
+}
+
+func (f *fieldSpec) matches(v int) bool {
+	if f.rangeAny && !f.any {
+		// Range already expanded into values during parse.
+		return f.values[v]
+	}
+	return f.values[v]
+}
+
+// Next returns the next time after `after` matching the schedule (in the same
+// location as `after`).
+func (s *cronSchedule) Next(after time.Time) time.Time {
+	loc := after.Location()
+	t := after.Truncate(time.Minute).Add(time.Minute)
+	// Safety bound: ~5 years of per-minute iterations (never reached for a
+	// valid schedule; time.Date normalizes overflowing fields).
+	for i := 0; i < 366*24*60*5; i++ {
+		y, m, d := t.Date()
+		h := t.Hour()
+		mn := t.Minute()
+		if !s.month.matches(int(m)) {
+			t = time.Date(y, time.Month(int(m)+1), 1, 0, 0, 0, 0, loc)
+			continue
+		}
+		domMatch := s.dom.matches(d)
+		dowMatch := s.dow.matches(int(t.Weekday()))
+		dayMatch := domMatch || dowMatch
+		switch {
+		case s.dom.any && !s.dow.any:
+			dayMatch = dowMatch
+		case !s.dom.any && s.dow.any:
+			dayMatch = domMatch
+		case s.dom.any && s.dow.any:
+			dayMatch = true
+		}
+		if !dayMatch {
+			t = time.Date(y, m, d+1, 0, 0, 0, 0, loc)
+			continue
+		}
+		if !s.hour.matches(h) {
+			t = time.Date(y, m, d, h+1, 0, 0, 0, loc)
+			continue
+		}
+		if !s.minute.matches(mn) {
+			t = time.Date(y, m, d, h, mn+1, 0, 0, loc)
+			continue
+		}
+		return t
+	}
+	return time.Time{}
+}

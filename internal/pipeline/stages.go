@@ -26,6 +26,8 @@ import (
 	"github.com/AstrBotDevs/AstrBot/internal/contentsafety"
 	"github.com/AstrBotDevs/AstrBot/internal/conversation"
 	"github.com/AstrBotDevs/AstrBot/internal/core"
+	"github.com/AstrBotDevs/AstrBot/internal/cron"
+	"github.com/AstrBotDevs/AstrBot/internal/db"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
 	"github.com/AstrBotDevs/AstrBot/internal/platform"
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
@@ -61,6 +63,11 @@ type PipelineContext struct {
 	// SandboxManager routes computer-use tools when the sandbox runtime is
 	// active. Optional.
 	SandboxManager *sandbox.Manager
+	// CronManager schedules future tasks (future_task tool). Optional.
+	CronManager *cron.CronJobManager
+	// Database records platform messages / provider calls for statistics.
+	// Optional.
+	Database *db.Database
 }
 
 // PipelineStage is the interface every stage must implement.
@@ -591,6 +598,8 @@ type ProcessStage struct {
 	skillMgr      *skills.SkillManager
 	platformMgr   *platform.PlatformManager
 	sandboxMgr    *sandbox.Manager
+	cronMgr       *cron.CronJobManager
+	database      *db.Database
 }
 
 func NewProcessStage() *ProcessStage {
@@ -626,6 +635,8 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.skillMgr = ctx.SkillManager
 	s.platformMgr = ctx.PlatformMgr
 	s.sandboxMgr = ctx.SandboxManager
+	s.cronMgr = ctx.CronManager
+	s.database = ctx.Database
 	if ctx.PersonaResolver != nil {
 		s.personaPrompt = ctx.PersonaResolver
 	}
@@ -636,6 +647,17 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 }
 
 func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	// Record the incoming message for statistics (message_count).
+	if s.database != nil {
+		msg := event.MessageStr
+		if msg == "" {
+			msg = extractPlainText(event.Message)
+		}
+		if msg != "" {
+			_ = s.database.RecordPlatformMessage(event.Source.Platform, event.UnifiedMsgOrigin(), event.Source.SenderID, msg)
+		}
+	}
+
 	// Try plugin handlers first
 	activated := s.findMatchingHandlers(event)
 	if len(activated) > 0 {
@@ -773,11 +795,14 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 
-	// Append user message to conversation history
+	// Resolve the conversation. Mirrors Python's `_get_session_conv`: the
+	// conversation is lazily created if it does not exist yet. The current
+	// user message is appended to history only after the LLM round finishes
+	// (Python appends the user+assistant pair post-completion), so the prompt
+	// is not duplicated in req.Contexts.
 	personaID := ""
 	if s.convMgr != nil {
-		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "user", prompt)
-		conv := s.convMgr.GetConversation(event.UnifiedMsgOrigin())
+		conv := s.convMgr.GetOrCreateConversation(event.UnifiedMsgOrigin(), event.Source.Platform)
 		if conv != nil {
 			personaID = conv.Persona
 			providerSettings["persona"] = conv.Persona
@@ -884,6 +909,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
 		return nil
 	}
+	s.recordProviderCall(providerCfg, event.UnifiedMsgOrigin(), resp)
 
 	for round := 0; round < 5 && len(resp.ToolsCallName) > 0; round++ {
 		// Append the assistant tool-call message
@@ -921,6 +947,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 			event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
 			return nil
 		}
+		s.recordProviderCall(providerCfg, event.UnifiedMsgOrigin(), resp)
 	}
 
 	if resp.Role == "err" {
@@ -929,8 +956,11 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 
-	// Append assistant reply to history
+	// Append user + assistant reply to history (Python appends the pair
+	// post-completion; the user message is intentionally not in req.Contexts
+	// since it is sent as the current prompt).
 	if s.convMgr != nil {
+		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "user", prompt)
 		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "assistant", resp.CompletionText)
 	}
 
@@ -1171,6 +1201,23 @@ func (ss *streamSender) sentAny() bool {
 	return ss.sent
 }
 
+// recordProviderCall persists an LLM call for statistics (provider_stats).
+func (s *ProcessStage) recordProviderCall(providerCfg map[string]interface{}, umo string, resp *provider.LLMResponse) {
+	if s.database == nil || resp == nil || resp.Role == "err" {
+		return
+	}
+	providerID, _ := providerCfg["id"].(string)
+	model, _ := providerCfg["model"].(string)
+	input := 0
+	output := 0
+	if resp.Usage != nil {
+		input = resp.Usage.InputOther + resp.Usage.InputCached
+		output = resp.Usage.Output
+	}
+	now := float64(time.Now().UnixMilli()) / 1000
+	_ = s.database.RecordProviderCall(umo, providerID, model, input, 0, output, now, now)
+}
+
 // applySkills appends the active-skills section to the system prompt.
 // It mirrors Python's astr_main_agent._ensure_persona_and_skills: only active
 // skills are listed, persona skill allow-lists are honored, and a runtime of
@@ -1273,6 +1320,11 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 		tools = append(tools, collectSandboxTools()...)
 	}
 
+	// Proactive capability: future_task tool.
+	if addCronTools(s.config) {
+		tools = append(tools, futureTaskToolSchema())
+	}
+
 	// MCP server tools (enabled servers from data/mcp_server.json)
 	if data, err := os.ReadFile("data/mcp_server.json"); err == nil {
 		var mcpCfg struct {
@@ -1342,8 +1394,27 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 		return executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
 	case "astrbot_grep_tool":
 		return executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
+	case "future_task":
+		return executeFutureTask(s.cronMgr, umo, event.GetSenderID(), args)
 	}
 	return fmt.Sprintf("工具 %s 执行失败: 该工具尚未实现 Go 端执行器", name)
+}
+
+// addCronTools reports whether the proactive future_task tool should be
+// injected (provider_settings.proactive_capability.add_cron_tools, default true).
+func addCronTools(config map[string]interface{}) bool {
+	ps, _ := config["provider_settings"].(map[string]interface{})
+	if ps == nil {
+		return true
+	}
+	pc, _ := ps["proactive_capability"].(map[string]interface{})
+	if pc == nil {
+		return true
+	}
+	if v, ok := pc["add_cron_tools"].(bool); ok {
+		return v
+	}
+	return true
 }
 
 // executeSandboxTool routes computer-use tools into the sandbox runtime.

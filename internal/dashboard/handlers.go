@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1187,9 +1188,7 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request, parts []
 			"sessions": convs,
 		}))
 	case "active-umos":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"active_umos": []interface{}{},
-		}))
+		writeJSON(w, http.StatusOK, apiOK(s.getActiveUMOs()))
 	case "provider":
 		if r.Method == http.MethodPatch {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -2027,6 +2026,10 @@ func (s *Server) handleCron(w http.ResponseWriter, r *http.Request, parts []stri
 			if len(parts) > 2 {
 				switch parts[2] {
 				case "run":
+					if err := s.cronRunJob(jobID); err != nil {
+						writeJSON(w, http.StatusBadRequest, apiError("执行任务失败: "+err.Error()))
+						return
+					}
 					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 						"message": "job " + jobID + " executed",
 					}))
@@ -2036,27 +2039,46 @@ func (s *Server) handleCron(w http.ResponseWriter, r *http.Request, parts []stri
 			} else {
 				switch r.Method {
 				case http.MethodPatch:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "job updated",
-					}))
+					var body map[string]interface{}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					updated, errMsg := s.cronUpdateJob(jobID, body)
+					if errMsg != "" {
+						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+							"message": errMsg,
+						}))
+						return
+					}
+					updated["message"] = "job updated"
+					writeJSON(w, http.StatusOK, apiOK(updated))
 				case http.MethodDelete:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "job deleted",
-					}))
+					if s.cronDeleteJob(jobID) {
+						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+							"message": "job deleted",
+						}))
+					} else {
+						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+							"message": "job not found",
+						}))
+					}
 				default:
 					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 				}
 			}
 		} else {
 			if r.Method == http.MethodPost {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "job created",
-				}))
+				var body map[string]interface{}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				created, errMsg := s.cronCreateJob(body)
+				if errMsg != "" {
+					writeJSON(w, http.StatusBadRequest, apiOK(map[string]interface{}{
+						"message": errMsg,
+					}))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOK(created))
 			} else {
 				jobs := s.getCronJobs()
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"jobs": jobs,
-				}))
+				writeJSON(w, http.StatusOK, apiOK(jobs))
 			}
 		}
 	default:
@@ -2735,7 +2757,7 @@ func (s *Server) handleBotTypes(w http.ResponseWriter, r *http.Request, parts []
 	switch sub {
 	case "", "list":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"bot_types": []interface{}{},
+			"bot_types": s.listBotTypes(),
 		}))
 	case "by-id":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -2745,6 +2767,62 @@ func (s *Server) handleBotTypes(w http.ResponseWriter, r *http.Request, parts []
 		}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	}
+}
+
+// listBotTypes returns the supported platform types (mirrors Python's
+// BotConfigService.list_bot_types / platform_registry). Proactive message
+// support drives the future-task delivery dialog in the WebUI.
+func (s *Server) listBotTypes() []interface{} {
+	return []interface{}{
+		map[string]interface{}{
+			"type":                      "qq_official",
+			"id":                        "qq_official",
+			"description":               "QQ 官方机器人（Websocket）适配器",
+			"display_name":              "QQ 官方机器人",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "qq_official", "enable": true,
+				"appid": "", "secret": "",
+				"enable_group_c2c": true, "enable_guild_direct_message": true,
+			},
+		},
+		map[string]interface{}{
+			"type":                      "aiocqhttp",
+			"id":                        "aiocqhttp",
+			"description":               "OneBot v11 适配器（反向 WebSocket）",
+			"display_name":              "OneBot v11",
+			"support_streaming_message": false,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "aiocqhttp", "enable": true,
+				"ws_reverse_host": "0.0.0.0", "ws_reverse_port": 6199, "ws_reverse_token": "",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "webchat",
+			"id":                        "webchat",
+			"description":               "内置 WebChat 适配器",
+			"display_name":              "WebChat",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "webchat", "enable": false,
+			},
+		},
+		map[string]interface{}{
+			"type":                      "telegram",
+			"id":                        "telegram",
+			"description":               "Telegram Bot 适配器",
+			"display_name":              "Telegram",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "telegram", "enable": true,
+				"telegram_token": "your_bot_token",
+			},
+		},
 	}
 }
 
@@ -3445,34 +3523,100 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 	}
 	switch sub {
 	case "", "list":
+		page := 1
+		pageSize := 20
+		if p, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && p > 0 {
+			page = p
+		}
+		if ps, err := strconv.Atoi(r.URL.Query().Get("page_size")); err == nil && ps > 0 {
+			pageSize = ps
+		}
+		if pageSize > 100 {
+			pageSize = 100
+		}
+		all := s.getConversationList()
+		total := len(all)
+		totalPages := (total + pageSize - 1) / pageSize
+		if totalPages < 1 {
+			totalPages = 1
+		}
+		start := (page - 1) * pageSize
+		end := start + pageSize
+		if start > total {
+			start = total
+		}
+		if end > total {
+			end = total
+		}
+		var items []interface{}
+		if start <= total {
+			items = all[start:end]
+		} else {
+			items = []interface{}{}
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"conversations": s.getConversationList(),
+			"conversations": items,
+			"pagination": map[string]interface{}{
+				"page":        page,
+				"page_size":   pageSize,
+				"total":       total,
+				"total_pages": totalPages,
+			},
 		}))
 	case "by-id":
 		if len(parts) > 1 {
 			convID := parts[1]
 			if len(parts) > 2 && parts[2] == "messages" {
 				if r.Method == http.MethodPut {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "conversation " + convID + " messages updated",
-					}))
+					var body struct {
+						History []map[string]interface{} `json:"history"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					if s.conversationUpdateByCID(convID, map[string]interface{}{"history": body.History}) {
+						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+							"message": "conversation " + convID + " messages updated",
+						}))
+					} else {
+						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+							"message": "conversation not found",
+						}))
+					}
 				} else {
 					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 				}
 			} else {
 				switch r.Method {
 				case http.MethodGet:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"id": convID,
-					}))
+					detail := s.getConversationDetail(convID)
+					if detail == nil {
+						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+							"message": "conversation not found",
+						}))
+						return
+					}
+					writeJSON(w, http.StatusOK, apiOK(detail))
 				case http.MethodPatch:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "conversation " + convID + " updated",
-					}))
+					var body map[string]interface{}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					if s.conversationUpdateByCID(convID, body) {
+						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+							"message": "conversation " + convID + " updated",
+						}))
+					} else {
+						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+							"message": "conversation not found",
+						}))
+					}
 				case http.MethodDelete:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "conversation " + convID + " deleted",
-					}))
+					if s.conversationDeleteByCID(convID) {
+						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+							"message": "conversation " + convID + " deleted",
+						}))
+					} else {
+						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+							"message": "conversation not found",
+						}))
+					}
 				default:
 					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 				}
@@ -3481,8 +3625,19 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		}
 	case "batch-delete":
+		var body struct {
+			ConversationIDs []string `json:"conversation_ids"`
+			UserID          string   `json:"user_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		deleted := 0
+		for _, id := range body.ConversationIDs {
+			if s.conversationDeleteByCID(id) {
+				deleted++
+			}
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"deleted": 0,
+			"deleted": deleted,
 		}))
 	case "export":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{

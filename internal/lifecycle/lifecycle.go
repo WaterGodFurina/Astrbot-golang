@@ -29,6 +29,7 @@ import (
 	"github.com/AstrBotDevs/AstrBot/internal/skills"
 	"github.com/AstrBotDevs/AstrBot/internal/star"
 	"github.com/AstrBotDevs/AstrBot/internal/star/builtin"
+	"github.com/AstrBotDevs/AstrBot/pkg/message"
 )
 
 var logger = log.GetDefault().WithComponent("Core")
@@ -96,7 +97,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	logger.Info("Config loaded (integrity check passed)")
 
 	// 3. Initialize conversation manager
-	l.conversationMgr = conversation.NewManager()
+	l.conversationMgr = conversation.NewManager(database)
 	logger.Info("Conversation manager initialized")
 
 	// 4. Initialize knowledge base manager
@@ -157,7 +158,40 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	logger.Info("Pipeline schedulers built (%d configs)", len(l.pipelineMapping))
 
 	// 8. Cron manager
-	l.cronMgr = cron.NewCronJobManager()
+	l.cronMgr = cron.NewCronJobManager(database)
+	// Fire handler for active_agent jobs: the task note is fed through the
+	// normal chat pipeline (like a user message), so the LLM generates the
+	// reply and RespondStage delivers it to the job's target session.
+	l.cronMgr.RegisterHandler("active_agent", func(ctx context.Context, job *cron.Job) error {
+		session, _ := job.Payload["session"].(string)
+		note, _ := job.Payload["note"].(string)
+		if session == "" {
+			return fmt.Errorf("active_agent job %s has no session", job.ID)
+		}
+		platformID, convID := splitUMO(session)
+		senderID, _ := job.Payload["sender_id"].(string)
+		if senderID == "" {
+			senderID = convID
+		}
+		chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: note}}}
+		evt := &core.Event{
+			Type:              core.EventMessage,
+			Source:            core.EventSource{Platform: platformID, ConvID: convID, SenderID: senderID, SenderName: senderID},
+			Message:           chain,
+			MessageStr:        note,
+			PlainText:         note,
+			Timestamp:         time.Now(),
+			Metadata:          map[string]interface{}{"proactive": true},
+			IsAtOrWakeCommand: true,
+			CallLLM:           true,
+		}
+		if l.eventBus != nil {
+			return l.eventBus.Publish(evt)
+		}
+		return fmt.Errorf("event bus not available")
+	})
+	l.cronMgr.SetNextRunFn(cronNextRun)
+	l.cronMgr.Load()
 	go l.cronMgr.Start(ctx)
 	logger.Info("Cron job manager started")
 
@@ -213,6 +247,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		"star":          l.starMgr,
 		"knowledgebase": l.kbMgr,
 		"skills":        l.skillMgr,
+		"database":      l.database,
 	}
 	l.dashboard = dashboard.NewServerWithManagers(6185, "data/cmd_config.json", managers)
 	if l.webuiDir != "" {
@@ -272,6 +307,8 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 		PersonaSkillsResolver: personaSkillsResolver,
 		SkillManager:          l.skillMgr,
 		SandboxManager:        l.sandboxMgr,
+		CronManager:           l.cronMgr,
+		Database:              l.database,
 	}
 
 	stageFactory := []func() core.PipelineStage{
@@ -352,6 +389,43 @@ func (l *Lifecycle) ReloadPlatforms(ctx context.Context) {
 	if err := l.loadPlatforms(ctx); err != nil {
 		logger.Error("Failed to reload platforms: %v", err)
 	}
+}
+
+// cronNextRun computes the next run time for a cron job (cron expression or
+// one-time run_at), honoring the job's timezone.
+func cronNextRun(job *cron.Job) (time.Time, error) {
+	loc := time.Local
+	if job.Timezone != "" {
+		if tz, err := time.LoadLocation(job.Timezone); err == nil {
+			loc = tz
+		}
+	}
+	now := time.Now().In(loc)
+	if job.RunOnce {
+		if job.RunAt.IsZero() {
+			return time.Time{}, fmt.Errorf("run_once job has no run_at")
+		}
+		return job.RunAt.In(loc), nil
+	}
+	if job.CronExpression == "" {
+		return time.Time{}, fmt.Errorf("job %s has no cron expression", job.ID)
+	}
+	sched, err := cron.ParseCron(job.CronExpression)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return sched.Next(now), nil
+}
+
+// splitUMO splits a unified_msg_origin ("platform:convID") into platform id and
+// conversation id.
+func splitUMO(umo string) (string, string) {
+	for i := 0; i < len(umo); i++ {
+		if umo[i] == ':' {
+			return umo[:i], umo[i+1:]
+		}
+	}
+	return umo, umo
 }
 
 // personaResolver resolves a persona's system prompt from data/personas.json
