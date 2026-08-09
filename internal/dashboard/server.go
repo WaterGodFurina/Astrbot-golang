@@ -23,6 +23,7 @@ import (
 	"github.com/AstrBotDevs/AstrBot/internal/db"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
 	"github.com/AstrBotDevs/AstrBot/internal/plugin"
+	"github.com/AstrBotDevs/AstrBot/internal/provider"
 	"github.com/AstrBotDevs/AstrBot/internal/skills"
 )
 
@@ -45,7 +46,8 @@ type Server struct {
 	platformMgr        interface{} // *platform.PlatformManager
 	conversationMgr    interface{} // *conversation.Manager
 	cronMgr            interface{} // *cron.CronJobManager
-	pluginMgr          interface{} // *plugin.Manager
+	pluginMgr          interface{} // *plugin.Manager (legacy .so)
+	subPluginMgr       *plugin.SubprocessManager
 	kbMgr              interface{} // *knowledgebase.Manager
 	skillMgr           interface{} // *skills.SkillManager
 	personaMgr         interface{} // *persona.PersonaManager
@@ -57,6 +59,7 @@ type Server struct {
 	startTime          time.Time
 	onPlatformsChanged func()
 	onPluginsChanged   func()
+	onConfigChanged    func()
 }
 
 // SetOnPlatformsChanged registers a callback invoked after platform config changes
@@ -75,6 +78,19 @@ func (s *Server) SetOnPluginsChanged(fn func()) {
 func (s *Server) notifyPluginsChanged() {
 	if s.onPluginsChanged != nil {
 		s.onPluginsChanged()
+	}
+}
+
+// SetOnConfigChanged registers a callback invoked after config is persisted,
+// so the runtime can rebuild the pipeline and pick up the new settings.
+func (s *Server) SetOnConfigChanged(fn func()) {
+	s.onConfigChanged = fn
+}
+
+// notifyConfigChanged triggers the config reload callback if registered.
+func (s *Server) notifyConfigChanged() {
+	if s.onConfigChanged != nil {
+		s.onConfigChanged()
 	}
 }
 
@@ -121,6 +137,11 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		}
 		if v, ok := managers["plugin"]; ok {
 			s.pluginMgr = v
+		}
+		if v, ok := managers["plugin_subprocess"]; ok {
+			if pm, ok := v.(*plugin.SubprocessManager); ok {
+				s.subPluginMgr = pm
+			}
 		}
 		if v, ok := managers["star"]; ok {
 			s.starMgr = v
@@ -775,10 +796,19 @@ func (s *Server) setConfigData(key string, value interface{}) error {
 	if cfg == nil {
 		return fmt.Errorf("default config not found")
 	}
+	if key == "dashboard" {
+		if m, ok := value.(map[string]interface{}); ok {
+			s.injectAuthFields(m)
+		}
+	}
 	if err := cfg.Set(key, value); err != nil {
 		return err
 	}
-	return cfg.Save()
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	s.notifyConfigChanged()
+	return nil
 }
 
 // setConfigDataAll merges multiple keys into the default config and persists it.
@@ -794,10 +824,32 @@ func (s *Server) setConfigDataAll(updates map[string]interface{}) error {
 	if cfg == nil {
 		return fmt.Errorf("default config not found")
 	}
+	if dash, ok := updates["dashboard"].(map[string]interface{}); ok {
+		s.injectAuthFields(dash)
+	}
 	if err := cfg.Update(updates); err != nil {
 		return err
 	}
-	return cfg.Save()
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	s.notifyConfigChanged()
+	return nil
+}
+
+// injectAuthFields re-asserts the dashboard auth fields from the password
+// manager so config saves never wipe them out.
+func (s *Server) injectAuthFields(dash map[string]interface{}) {
+	if s.auth == nil {
+		return
+	}
+	dash["username"] = s.auth.Username()
+	if h := s.auth.HashedPassword(); h != "" {
+		dash["pbkdf2_password"] = h
+	}
+	if sec := s.auth.JWTSecret(); sec != "" {
+		dash["jwt_secret"] = sec
+	}
 }
 
 // getProviderList returns the provider list from config.
@@ -1089,18 +1141,28 @@ func (s *Server) skillDelete(name string) error {
 	return sm.DeleteSkill(name)
 }
 
-// getPluginList returns all plugins.
+// getPluginList returns all plugins: legacy .so plugins plus subprocess
+// plugins. Entries are keyed by name and the subprocess runtime wins on
+// collisions (a plugin id belongs to one runtime only).
 func (s *Server) getPluginList() []interface{} {
-	pm, ok := s.pluginMgr.(interface {
-		ListPluginsInfo() []map[string]interface{}
-	})
-	if !ok {
-		return []interface{}{}
+	byName := make(map[string]interface{})
+	if pm := s.pluginManager(); pm != nil {
+		for _, p := range pm.ListPluginsInfo() {
+			if name, _ := p["name"].(string); name != "" {
+				byName[name] = p
+			}
+		}
 	}
-	plugins := pm.ListPluginsInfo()
-	result := make([]interface{}, len(plugins))
-	for i, p := range plugins {
-		result[i] = p
+	if s.subPluginMgr != nil {
+		for _, p := range s.subPluginMgr.ListInfo() {
+			if name, _ := p["name"].(string); name != "" {
+				byName[name] = p
+			}
+		}
+	}
+	result := make([]interface{}, 0, len(byName))
+	for _, p := range byName {
+		result = append(result, p)
 	}
 	return result
 }
@@ -1111,28 +1173,74 @@ func (s *Server) pluginManager() *plugin.Manager {
 	return pm
 }
 
-func (s *Server) pluginByID(id string) map[string]interface{} {
-	pm := s.pluginManager()
-	if pm == nil {
-		return map[string]interface{}{}
+// providerManager returns the runtime provider manager, or nil.
+func (s *Server) providerManager() *provider.ProviderManager {
+	pm, _ := s.providerMgr.(*provider.ProviderManager)
+	return pm
+}
+
+// unregisterProvider removes a provider instance from the runtime manager so a
+// deleted provider stops being usable immediately.
+func (s *Server) unregisterProvider(id string) {
+	if pm := s.providerManager(); pm != nil {
+		pm.Unregister(id)
 	}
-	for _, p := range pm.ListPluginsInfo() {
-		if name, _ := p["name"].(string); name == id {
-			return p
+}
+
+func (s *Server) pluginByID(id string) map[string]interface{} {
+	for _, p := range s.getPluginList() {
+		if m, ok := p.(map[string]interface{}); ok {
+			if name, _ := m["name"].(string); name == id {
+				return m
+			}
 		}
 	}
 	return map[string]interface{}{}
 }
 
 func (s *Server) pluginFailed() map[string]interface{} {
-	pm := s.pluginManager()
-	if pm == nil {
-		return map[string]interface{}{}
+	result := map[string]interface{}{}
+	if pm := s.pluginManager(); pm != nil {
+		for k, v := range pm.ListFailedPlugins() {
+			result[k] = v
+		}
 	}
-	return pm.ListFailedPlugins()
+	if s.subPluginMgr != nil {
+		for k, v := range s.subPluginMgr.ListFailedPlugins() {
+			result[k] = v
+		}
+	}
+	return result
+}
+
+// resolveSubprocessPlugin maps an identifier (id or name) onto the subprocess
+// runtime, returning the manifest ID, the plugin name and whether the plugin
+// belongs to the subprocess runtime at all.
+func (s *Server) resolveSubprocessPlugin(id string) (string, string, bool) {
+	if s.subPluginMgr == nil {
+		return "", "", false
+	}
+	if inst := s.subPluginMgr.Get(id); inst != nil {
+		return inst.ID, inst.Name, true
+	}
+	for _, p := range s.subPluginMgr.ListInfo() {
+		pid, _ := p["id"].(string)
+		name, _ := p["name"].(string)
+		if pid == id || name == id {
+			return pid, name, true
+		}
+	}
+	return "", "", false
 }
 
 func (s *Server) pluginSetEnabled(id string, enabled bool) {
+	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
+		if err := s.subPluginMgr.SetEnabled(pid, enabled); err != nil {
+			logger.Warn("SetEnabled(%s): %v", id, err)
+		}
+		s.notifyPluginsChanged()
+		return
+	}
 	pm := s.pluginManager()
 	if pm == nil {
 		return
@@ -1150,27 +1258,51 @@ func (s *Server) pluginSetEnabled(id string, enabled bool) {
 }
 
 func (s *Server) pluginReload(id string) {
+	if id == "" {
+		if pm := s.pluginManager(); pm != nil {
+			pm.ReloadAll()
+		}
+		if s.subPluginMgr != nil {
+			s.subPluginMgr.LoadInstalled(context.Background())
+		}
+		s.notifyPluginsChanged()
+		return
+	}
+	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
+		if err := s.subPluginMgr.Reload(context.Background(), pid); err != nil {
+			logger.Warn("Reload(%s): %v", id, err)
+		}
+		s.notifyPluginsChanged()
+		return
+	}
 	pm := s.pluginManager()
 	if pm == nil {
 		return
 	}
-	if id == "" {
-		pm.ReloadAll()
-	} else {
-		_ = pm.Reload(id)
-	}
+	_ = pm.Reload(id)
 	s.notifyPluginsChanged()
 }
 
 func (s *Server) pluginUninstall(id string, deleteConfig bool) {
+	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
+		if err := s.subPluginMgr.Uninstall(pid, deleteConfig); err != nil {
+			logger.Warn("Uninstall(%s): %v", id, err)
+		}
+		s.notifyPluginsChanged()
+		return
+	}
 	pm := s.pluginManager()
 	if pm == nil {
 		return
 	}
 	_ = pm.Uninstall(id, deleteConfig)
+	s.notifyPluginsChanged()
 }
 
 func (s *Server) pluginConfigSchema(id string) map[string]interface{} {
+	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
+		return s.subPluginMgr.ConfigSchema(name)
+	}
 	pm := s.pluginManager()
 	if pm == nil {
 		return map[string]interface{}{}
@@ -1179,6 +1311,9 @@ func (s *Server) pluginConfigSchema(id string) map[string]interface{} {
 }
 
 func (s *Server) pluginLoadConfig(id string) map[string]interface{} {
+	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
+		return s.subPluginMgr.LoadConfig(name)
+	}
 	pm := s.pluginManager()
 	if pm == nil {
 		return map[string]interface{}{}
@@ -1187,6 +1322,14 @@ func (s *Server) pluginLoadConfig(id string) map[string]interface{} {
 }
 
 func (s *Server) pluginSaveConfig(id string, cfg map[string]interface{}) {
+	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
+		if cfg != nil {
+			if err := s.subPluginMgr.SaveConfig(name, cfg); err != nil {
+				logger.Warn("SaveConfig(%s): %v", id, err)
+			}
+		}
+		return
+	}
 	pm := s.pluginManager()
 	if pm == nil || cfg == nil {
 		return

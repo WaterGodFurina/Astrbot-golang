@@ -22,6 +22,11 @@ type OpenAISource struct {
 	apiBase string
 	apiKey  string
 	client  *http.Client
+	// extraHeaders are additional HTTP headers applied to every request.
+	extraHeaders map[string]string
+	// postProcessBody mutates the chat request body right before it is sent.
+	// Thin OpenAI-compatible subclasses use this to customize payloads.
+	postProcessBody func(body map[string]interface{})
 }
 
 // NewOpenAISource creates an OpenAI provider.
@@ -196,6 +201,7 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 		var toolCalls []toolAcc
 		content := new(strings.Builder)
 		reasoning := new(strings.Builder)
+		var usage *provider.TokenUsage
 
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var chunk struct {
@@ -215,9 +221,20 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 					} `json:"delta"`
 					FinishReason string `json:"finish_reason"`
 				} `json:"choices"`
+				Usage *struct {
+					PromptTokens     int `json:"prompt_tokens"`
+					CompletionTokens int `json:"completion_tokens"`
+					TotalTokens      int `json:"total_tokens"`
+				} `json:"usage"`
 			}
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				return false
+			}
+			if chunk.Usage != nil {
+				usage = &provider.TokenUsage{
+					InputOther: chunk.Usage.PromptTokens,
+					Output:     chunk.Usage.CompletionTokens,
+				}
 			}
 			for _, choice := range chunk.Choices {
 				if choice.Delta.Content != "" {
@@ -248,8 +265,8 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 		})
 		_ = reader.scan()
 
+		final := &provider.LLMResponse{Role: "assistant", CompletionText: content.String(), ReasoningContent: reasoning.String(), Usage: usage}
 		if len(toolCalls) > 0 {
-			final := &provider.LLMResponse{Role: "assistant", CompletionText: content.String(), ReasoningContent: reasoning.String()}
 			for _, tc := range toolCalls {
 				final.ToolsCallName = append(final.ToolsCallName, tc.name)
 				final.ToolsCallIDs = append(final.ToolsCallIDs, tc.id)
@@ -259,8 +276,8 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 				}
 				final.ToolsCallArgs = append(final.ToolsCallArgs, argsMap)
 			}
-			ch <- final
 		}
+		ch <- final
 	}()
 	return ch, nil
 }
@@ -286,6 +303,11 @@ func (s *OpenAISource) buildRequestBody(req *provider.ProviderRequest, stream bo
 		"model":  s.GetModel(),
 		"stream": stream,
 	}
+	if stream {
+		// Ask the server to include usage in the final streamed chunk so token
+		// statistics are available for streaming calls too.
+		body["stream_options"] = map[string]interface{}{"include_usage": true}
+	}
 
 	// Build messages
 	messages := []map[string]interface{}{}
@@ -308,6 +330,11 @@ func (s *OpenAISource) buildRequestBody(req *provider.ProviderRequest, stream bo
 		body["tools"] = req.Tools
 	}
 
+	// Let thin OpenAI-compatible subclasses customize the payload before send.
+	if s.postProcessBody != nil {
+		s.postProcessBody(body)
+	}
+
 	return body
 }
 
@@ -323,5 +350,8 @@ func (s *OpenAISource) doRequest(ctx context.Context, body map[string]interface{
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+	for k, v := range s.extraHeaders {
+		httpReq.Header.Set(k, v)
+	}
 	return s.client.Do(httpReq)
 }

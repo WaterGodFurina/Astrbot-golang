@@ -6,9 +6,11 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
 	"github.com/AstrBotDevs/AstrBot/internal/star"
 )
@@ -102,11 +105,24 @@ func (s *Server) getConfigSnapshot() map[string]interface{} {
 		}
 	}
 	if s.auth != nil {
-		cfg["dashboard"] = map[string]interface{}{
-			"username": s.auth.Username(),
-			"host":     "0.0.0.0",
-			"port":     s.port,
+		// Preserve persisted dashboard auth fields (pbkdf2_password,
+		// jwt_secret, ...) so a WebUI save round-trip does not drop them.
+		dash := map[string]interface{}{}
+		if pd, ok := persisted["dashboard"].(map[string]interface{}); ok {
+			for k, v := range pd {
+				dash[k] = v
+			}
 		}
+		dash["username"] = s.auth.Username()
+		dash["host"] = "0.0.0.0"
+		dash["port"] = s.port
+		if h := s.auth.HashedPassword(); h != "" {
+			dash["pbkdf2_password"] = h
+		}
+		if sec := s.auth.JWTSecret(); sec != "" {
+			dash["jwt_secret"] = sec
+		}
+		cfg["dashboard"] = dash
 	}
 	return cfg
 }
@@ -437,24 +453,204 @@ func (s *Server) getProviderItems() map[string]interface{} {
 
 // getProviderTemplates returns provider config templates for the Go-supported providers.
 func (s *Server) getProviderTemplates() map[string]interface{} {
-	template := func(name, providerType, apiBase string) map[string]interface{} {
+	template := func(name, provider, providerType, apiBase string) map[string]interface{} {
 		return map[string]interface{}{
 			"id":            name,
 			"type":          name,
-			"provider":      providerType,
-			"provider_type": "chat_completion",
+			"provider":      provider,
+			"provider_type": providerType,
 			"enable":        false,
 			"api_base":      apiBase,
 			"key":           "",
 		}
 	}
 	return map[string]interface{}{
-		"openai":     template("openai", "openai_chat_completion", "https://api.openai.com/v1"),
-		"openrouter": template("openrouter", "openrouter_chat_completion", "https://openrouter.ai/api/v1"),
-		"anthropic":  template("anthropic", "anthropic_chat_completion", "https://api.anthropic.com"),
-		"gemini":     template("gemini", "googlegenai_chat_completion", "https://generativelanguage.googleapis.com/v1beta"),
-		"ollama":     template("ollama", "ollama_chat_completion", "http://127.0.0.1:11434"),
-		"dashscope":  template("dashscope", "dashscope_chat_completion", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		"openai":     template("openai", "openai_chat_completion", "chat_completion", "https://api.openai.com/v1"),
+		"openrouter": template("openrouter", "openrouter_chat_completion", "chat_completion", "https://openrouter.ai/api/v1"),
+		"anthropic":  template("anthropic", "anthropic_chat_completion", "chat_completion", "https://api.anthropic.com"),
+		"gemini":     template("gemini", "googlegenai_chat_completion", "chat_completion", "https://generativelanguage.googleapis.com/v1beta"),
+		"ollama":     template("ollama", "ollama_chat_completion", "chat_completion", "http://127.0.0.1:11434"),
+		"dashscope":  template("dashscope", "dashscope_chat_completion", "chat_completion", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		"groq":       template("groq", "groq_chat_completion", "chat_completion", "https://api.groq.com/openai/v1"),
+		"xai": map[string]interface{}{
+			"id": "xai", "type": "xai_chat_completion", "provider": "xai_chat_completion",
+			"provider_type": "chat_completion", "enable": false,
+			"api_base": "https://api.x.ai/v1", "key": "", "xai_native_search": false,
+		},
+		"zhipu":      template("zhipu", "zhipu_chat_completion", "chat_completion", "https://open.bigmodel.cn/api/paas/v4"),
+		"longcat":    template("longcat", "longcat_chat_completion", "chat_completion", "https://api.longcat.chat/openai/v1"),
+		"aihubmix":   template("aihubmix", "aihubmix_chat_completion", "chat_completion", "https://aihubmix.com/v1"),
+		"xiaomi":     template("xiaomi", "xiaomi_chat_completion", "chat_completion", "https://api.xiaomimimo.com/v1"),
+		"openai_responses": map[string]interface{}{
+			"id": "openai_responses", "type": "openai_responses", "provider": "openai",
+			"provider_type": "chat_completion", "enable": false,
+			"api_base": "https://api.openai.com/v1", "key": "", "model": "",
+		},
+		"kimi_code": map[string]interface{}{
+			"id": "kimi_code", "type": "kimi_code_chat_completion", "provider": "kimi-code",
+			"provider_type": "chat_completion", "enable": false,
+			"api_base": "https://api.kimi.com/coding", "key": "", "model": "kimi-for-coding",
+		},
+		// Non-chat capabilities (STT / TTS / Embedding / Rerank). The type field
+		// must match the provider registered in internal/provider/sources/init.go.
+		"openai_whisper": map[string]interface{}{
+			"id": "whisper", "type": "openai_whisper", "provider": "openai",
+			"provider_type": "speech_to_text", "enable": false,
+			"api_key": "", "api_base": "https://api.openai.com/v1", "model": "whisper-1",
+		},
+		"openai_tts": map[string]interface{}{
+			"id": "openai_tts", "type": "openai_tts", "provider": "openai",
+			"provider_type": "text_to_speech", "enable": false,
+			"api_key": "", "api_base": "https://api.openai.com/v1", "model": "tts-1",
+			"voice": "alloy",
+		},
+		"azure_tts": map[string]interface{}{
+			"id": "azure_tts", "type": "azure_tts", "provider": "microsoft",
+			"provider_type": "text_to_speech", "enable": false,
+			"azure_tts_subscription_key": "", "azure_tts_region": "eastus",
+			"azure_tts_voice": "zh-CN-YunxiaNeural",
+		},
+		"elevenlabs_tts": map[string]interface{}{
+			"id": "elevenlabs_tts", "type": "elevenlabs_tts_api", "provider": "elevenlabs",
+			"provider_type": "text_to_speech", "enable": false,
+			"api_key": "", "api_base": "https://api.elevenlabs.io/v1",
+			"model": "eleven_multilingual_v2", "elevenlabs-tts-voice-id": "JBFqnCBsd6RMkjVDRZzb",
+		},
+		"fishaudio_tts": map[string]interface{}{
+			"id": "fishaudio_tts", "type": "fishaudio_tts_api", "provider": "fishaudio",
+			"provider_type": "text_to_speech", "enable": false,
+			"api_key": "", "api_base": "https://api.fish-audio.cn/v1",
+			"model": "s2-pro", "fishaudio-tts-character": "可莉",
+		},
+		"minimax_tts": map[string]interface{}{
+			"id": "minimax_tts", "type": "minimax_tts_api", "provider": "minimax",
+			"provider_type": "text_to_speech", "enable": false,
+			"api_key": "", "api_base": "https://api.minimax.chat/v1/t2a_v2",
+			"minimax-group-id": "", "minimax-voice-id": "",
+		},
+		"edge_tts": map[string]interface{}{
+			"id": "edge_tts", "type": "edge_tts", "provider": "microsoft",
+			"provider_type": "text_to_speech", "enable": false,
+			"edge-tts-voice": "zh-CN-XiaoxiaoNeural",
+		},
+		"volcengine_tts": map[string]interface{}{
+			"id": "volcengine_tts", "type": "volcengine_tts", "provider": "volcengine",
+			"provider_type": "text_to_speech", "enable": false,
+			"api_key": "", "appid": "", "volcengine_cluster": "",
+			"volcengine_voice_type": "", "api_base": "https://openspeech.bytedance.com/api/v1/tts",
+		},
+		"gemini_tts": map[string]interface{}{
+			"id": "gemini_tts", "type": "gemini_tts", "provider": "google",
+			"provider_type": "text_to_speech", "enable": false,
+			"gemini_tts_api_key": "", "gemini_tts_api_base": "https://generativelanguage.googleapis.com/v1beta",
+			"gemini_tts_model": "gemini-2.5-flash-preview-tts", "gemini_tts_voice_name": "Leda",
+		},
+		"mimo_tts": map[string]interface{}{
+			"id": "mimo_tts", "type": "mimo_tts_api", "provider": "mimo",
+			"provider_type": "text_to_speech", "enable": false,
+			"api_key": "", "api_base": "https://api.xiaomimimo.com/v1", "model": "mimo-v2.5-tts",
+			"mimo-tts-voice": "mimo_default",
+		},
+		"mimo_stt": map[string]interface{}{
+			"id": "mimo_stt", "type": "mimo_stt_api", "provider": "mimo",
+			"provider_type": "speech_to_text", "enable": false,
+			"api_key": "", "api_base": "https://api.xiaomimimo.com/v1", "model": "mimo-v2.5-asr",
+		},
+		"openai_embedding": map[string]interface{}{
+			"id": "openai_embedding", "type": "openai_embedding", "provider": "openai",
+			"provider_type": "embedding", "enable": false,
+			"embedding_api_key": "", "embedding_api_base": "https://api.openai.com/v1",
+			"embedding_model": "text-embedding-3-small", "embedding_dimensions": 1024,
+		},
+		"gemini_embedding": map[string]interface{}{
+			"id": "gemini_embedding", "type": "gemini_embedding", "provider": "google",
+			"provider_type": "embedding", "enable": false,
+			"embedding_api_key": "", "embedding_api_base": "https://generativelanguage.googleapis.com",
+			"embedding_model": "gemini-embedding-exp-03-07", "embedding_dimensions": 768,
+		},
+		"nvidia_embedding": map[string]interface{}{
+			"id": "nvidia_embedding", "type": "nvidia_embedding", "provider": "nvidia",
+			"provider_type": "embedding", "enable": false,
+			"embedding_api_key": "", "embedding_api_base": "https://integrate.api.nvidia.com/v1",
+			"embedding_model": "nvidia/llama-nemotron-embed-1b-v2", "embedding_dimensions": 1024,
+		},
+		"ollama_embedding": map[string]interface{}{
+			"id": "ollama_embedding", "type": "ollama_embedding", "provider": "ollama",
+			"provider_type": "embedding", "enable": false,
+			"embedding_api_base": "http://localhost:11434", "embedding_model": "nomic-embed-text",
+			"embedding_dimensions": 768,
+		},
+		"dashscope_embedding": map[string]interface{}{
+			"id": "dashscope_embedding", "type": "dashscope_embedding", "provider": "dashscope",
+			"provider_type": "embedding", "enable": false,
+			"embedding_api_key": "", "embedding_api_base": "https://dashscope.aliyuncs.com/api/v1",
+			"embedding_model": "text-embedding-v4", "embedding_dimensions": 1024,
+		},
+		"tei_rerank": map[string]interface{}{
+			"id": "tei_rerank", "type": "tei_rerank", "provider": "tei",
+			"provider_type": "rerank", "enable": false,
+			"rerank_api_key": "", "rerank_api_base": "http://127.0.0.1:8080", "model": "",
+		},
+		"bailian_rerank": map[string]interface{}{
+			"id": "bailian_rerank", "type": "bailian_rerank", "provider": "dashscope",
+			"provider_type": "rerank", "enable": false,
+			"rerank_api_key": "", "rerank_api_base": "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+			"rerank_model": "qwen3-rerank",
+		},
+		"nvidia_rerank": map[string]interface{}{
+			"id": "nvidia_rerank", "type": "nvidia_rerank", "provider": "nvidia",
+			"provider_type": "rerank", "enable": false,
+			"nvidia_rerank_api_key": "", "nvidia_rerank_api_base": "https://ai.api.nvidia.com/v1/retrieval",
+			"nvidia_rerank_model": "nv-rerank-qa-mistral-4b:1",
+		},
+		"vllm_rerank": map[string]interface{}{
+			"id": "vllm_rerank", "type": "vllm_rerank", "provider": "vllm",
+			"provider_type": "rerank", "enable": false,
+			"rerank_api_base": "http://127.0.0.1:8000", "rerank_api_suffix": "/v1/rerank",
+			"rerank_model": "BAAI/bge-reranker-base",
+		},
+		"xinference_rerank": map[string]interface{}{
+			"id": "xinference_rerank", "type": "xinference_rerank", "provider": "xinference",
+			"provider_type": "rerank", "enable": false,
+			"rerank_api_base": "http://127.0.0.1:8000", "rerank_model": "BAAI/bge-reranker-base",
+		},
+		// Agent runner backends (remote HTTP APIs). Mirrors the Python
+		// templates; the type values match the agent_runner_type config options
+		// so a created source can be selected as an agent runner provider.
+		"dify": map[string]interface{}{
+			"id": "dify_app_default", "type": "dify", "provider": "dify",
+			"provider_type": "agent_runner", "enable": true,
+			"dify_api_type": "chat", "dify_api_key": "",
+			"dify_api_base": "https://api.dify.ai/v1",
+			"dify_workflow_output_key": "astrbot_wf_output",
+			"dify_query_input_key": "astrbot_text_query",
+			"variables": map[string]interface{}{}, "timeout": 60, "proxy": "",
+		},
+		"coze": map[string]interface{}{
+			"id": "coze", "type": "coze", "provider": "coze",
+			"provider_type": "agent_runner", "enable": true,
+			"coze_api_key": "", "bot_id": "", "coze_api_base": "https://api.coze.cn",
+			"timeout": 60, "proxy": "",
+		},
+		"dashscope_agent": map[string]interface{}{
+			"id": "dashscope", "type": "dashscope", "provider": "dashscope",
+			"provider_type": "agent_runner", "enable": true,
+			"dashscope_app_type": "agent", "dashscope_api_key": "", "dashscope_app_id": "",
+			"rag_options": map[string]interface{}{
+				"pipeline_ids": []interface{}{}, "file_ids": []interface{}{}, "output_reference": false,
+			},
+			"variables": map[string]interface{}{}, "timeout": 60, "proxy": "",
+		},
+		"deerflow": map[string]interface{}{
+			"id": "deerflow", "type": "deerflow", "provider": "deerflow",
+			"provider_type": "agent_runner", "enable": true,
+			"deerflow_api_base": "http://127.0.0.1:2026", "deerflow_api_key": "",
+			"deerflow_auth_header": "", "deerflow_assistant_id": "lead_agent",
+			"deerflow_model_name": "", "deerflow_thinking_enabled": false,
+			"deerflow_plan_mode": false, "deerflow_subagent_enabled": false,
+			"deerflow_max_concurrent_subagents": 3, "deerflow_recursion_limit": 1000,
+			"timeout": 300,
+		},
 	}
 }
 
@@ -735,7 +931,8 @@ func (s *Server) setProviderEnabled(id string, enabled bool) map[string]interfac
 	return map[string]interface{}{"message": "未找到对应提供商"}
 }
 
-// deleteProviderByID removes a provider config by id.
+// deleteProviderByID removes a provider config by id and unregisters its
+// runtime instance.
 func (s *Server) deleteProviderByID(id string) error {
 	cfg := s.getConfigSnapshot()
 	providers, _ := cfg["provider"].([]interface{})
@@ -748,7 +945,60 @@ func (s *Server) deleteProviderByID(id string) error {
 		}
 		next = append(next, p)
 	}
-	return s.setConfigData("provider", next)
+	if err := s.setConfigData("provider", next); err != nil {
+		return err
+	}
+	s.unregisterProvider(id)
+	s.cleanProviderSettingsRefs(id)
+	return nil
+}
+
+// cleanProviderSettingsRefs clears provider_settings references that point at a
+// deleted provider id (default_provider_id, provider_pool, default_*_provider_id).
+func (s *Server) cleanProviderSettingsRefs(id string) {
+	cfg := s.getConfigSnapshot()
+	ps, _ := cfg["provider_settings"].(map[string]interface{})
+	if ps == nil {
+		return
+	}
+	changed := false
+	refKeys := []string{
+		"default_provider_id",
+		"default_stt_provider_id",
+		"default_tts_provider_id",
+		"default_embedding_provider_id",
+		"default_rerank_provider_id",
+		"default_image_caption_provider_id",
+		"llm_compress_provider_id",
+		"coze_agent_runner_provider_id",
+		"dify_agent_runner_provider_id",
+		"dashscope_agent_runner_provider_id",
+		"deerflow_agent_runner_provider_id",
+	}
+	for _, k := range refKeys {
+		if v, _ := ps[k].(string); v == id {
+			ps[k] = ""
+			changed = true
+		}
+	}
+	if pool, _ := ps["provider_pool"].([]interface{}); len(pool) > 0 {
+		next := make([]interface{}, 0, len(pool))
+		for _, v := range pool {
+			if s2, _ := v.(string); s2 == id {
+				changed = true
+				continue
+			}
+			next = append(next, v)
+		}
+		if len(next) != len(pool) {
+			ps["provider_pool"] = next
+		}
+	}
+	if changed {
+		if err := s.setConfigData("provider_settings", ps); err != nil {
+			logger.Warn("cleanProviderSettingsRefs(%s): %v", id, err)
+		}
+	}
 }
 
 // ── Platform / Bot handlers ─────────────────────────────────
@@ -993,12 +1243,21 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		plugins := s.getPluginList()
 		writeJSON(w, http.StatusOK, apiOK(plugins))
 	case "by-id":
-		if r.Method == http.MethodPost {
-			pluginID := r.URL.Query().Get("plugin_id")
+		pluginID := r.URL.Query().Get("plugin_id")
+		switch r.Method {
+		case http.MethodDelete:
+			// WebUI uninstall sends DELETE with a {delete_config, delete_data} body.
+			var body struct {
+				DeleteConfig bool `json:"delete_config"`
+				DeleteData   bool `json:"delete_data"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			s.pluginUninstall(pluginID, body.DeleteConfig)
+			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
+		case http.MethodPost:
 			s.pluginUninstall(pluginID, true)
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
-		} else {
-			pluginID := r.URL.Query().Get("plugin_id")
+		default:
 			writeJSON(w, http.StatusOK, apiOK(s.pluginByID(pluginID)))
 		}
 	case "enabled":
@@ -1062,15 +1321,7 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			"message": "plugin update not implemented",
 		}))
 	case "install":
-		if len(parts) > 1 {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"message": "plugin install via " + parts[1] + " not implemented",
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"message": "plugin install not implemented",
-			}))
-		}
+		s.handlePluginInstall(w, r, parts)
 	case "validate":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"valid": true,
@@ -1107,6 +1358,130 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		}
 	}
+}
+
+// handlePluginInstall installs a plugin via the subprocess runtime from a git
+// URL, archive URL, or uploaded file. When the static scan finds risky imports
+// and ignore_risk is not set, it returns code=plugin_risk with the offending
+// code locations so the WebUI can prompt the user (ignore & continue / cancel).
+func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, parts []string) {
+	if s.subPluginMgr == nil {
+		writeJSON(w, http.StatusOK, apiError("插件子系统未初始化"))
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusOK, apiError("method not allowed"))
+		return
+	}
+
+	var source, id string
+	var ignoreRisk bool
+
+	method := "url"
+	if len(parts) > 1 {
+		method = parts[1]
+	}
+
+	switch method {
+	case "url", "git", "github":
+		var body struct {
+			URL        string `json:"url"`
+			IgnoreRisk bool   `json:"ignore_risk"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		source = strings.TrimSpace(body.URL)
+		ignoreRisk = body.IgnoreRisk
+	case "upload":
+		file, fh, err := r.FormFile("file")
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("未收到插件文件: "+err.Error()))
+			return
+		}
+		defer file.Close()
+		tmp, err := os.MkdirTemp("", "astrbot-plugin-upload-*")
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("创建临时目录失败"))
+			return
+		}
+		defer os.RemoveAll(tmp)
+		// Preserve the extension so the archive is recognized as .zip/.tar.gz.
+		archive := filepath.Join(tmp, filepath.Base(fh.Filename))
+		out, err := os.Create(archive)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("保存上传文件失败"))
+			return
+		}
+		if _, err := io.Copy(out, file); err != nil {
+			out.Close()
+			writeJSON(w, http.StatusOK, apiError("保存上传文件失败: "+err.Error()))
+			return
+		}
+		out.Close()
+		source = archive
+		id = idFromSource(fh.Filename)
+		ignoreRisk = r.FormValue("ignore_risk") == "true"
+	default:
+		writeJSON(w, http.StatusOK, apiError("未知安装方式: "+method))
+		return
+	}
+
+	if source == "" {
+		writeJSON(w, http.StatusOK, apiError("插件地址不能为空"))
+		return
+	}
+	if id == "" {
+		id = idFromSource(source)
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+
+	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{IgnoreRisk: ignoreRisk})
+	if err != nil {
+		var riskErr *plugin.RiskError
+		if errors.As(err, &riskErr) {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":  "error",
+				"code":    "plugin_risk",
+				"message": fmt.Sprintf("插件源码包含 %d 处风险代码", len(riskErr.Findings)),
+				"data": map[string]interface{}{
+					"risks": riskErr.Findings,
+				},
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, apiError("插件安装失败: "+err.Error()))
+		return
+	}
+
+	s.notifyPluginsChanged()
+	writeJSON(w, http.StatusOK, apiOKMsg("插件安装成功", map[string]interface{}{
+		"name":    inst.Name,
+		"version": inst.Version,
+	}))
+}
+
+// idFromSource derives a stable plugin id from an install source.
+func idFromSource(source string) string {
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		if u, err := url.Parse(source); err == nil {
+			seg := strings.Trim(u.Path, "/")
+			if i := strings.LastIndex(seg, "/"); i >= 0 {
+				seg = seg[i+1:]
+			}
+			seg = strings.TrimSuffix(seg, ".git")
+			if seg != "" {
+				return seg
+			}
+		}
+	}
+	base := strings.TrimSuffix(filepath.Base(source), ".zip")
+	base = strings.TrimSuffix(base, ".tar.gz")
+	base = strings.TrimSuffix(base, ".tgz")
+	if base != "" && base != "." && base != "/" {
+		return base
+	}
+	return "plugin"
 }
 
 // ── Knowledge base handlers ──────────────────────────────────
@@ -1251,12 +1626,6 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		return
 	}
 
-	// /api/v1/persona-folders[/{folder_id}]
-	if sub == "" && len(parts) > 0 && strings.HasPrefix(r.URL.Path, "/api/v1/persona-folders") {
-		s.handlePersonaFolders(w, r)
-		return
-	}
-
 	switch sub {
 	case "", "list":
 		switch r.Method {
@@ -1350,13 +1719,28 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 	}
 }
 
+// splitAfterMarker splits a URL path on the LAST occurrence of marker and
+// returns the remaining segments. Used for routes with variable prefixes
+// (/api/persona-folders vs /api/v1/persona-folders).
+func splitAfterMarker(path, marker string) []string {
+	idx := strings.Index(path, marker)
+	if idx < 0 {
+		return nil
+	}
+	rest := path[idx+len(marker):]
+	if rest == "" {
+		return []string{}
+	}
+	return strings.Split(rest, "/")
+}
+
 // handlePersonaFolders handles GET/POST /api/v1/persona-folders and PUT/DELETE /api/v1/persona-folders/{folder_id}.
 func (s *Server) handlePersonaFolders(w http.ResponseWriter, r *http.Request) {
 	if s.personas == nil {
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		return
 	}
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/persona-folders/"), "/")
+	parts := splitAfterMarker(r.URL.Path, "/persona-folders/")
 	if len(parts) > 0 && parts[0] != "" {
 		folderID := parts[0]
 		switch r.Method {

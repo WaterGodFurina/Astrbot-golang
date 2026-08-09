@@ -13,6 +13,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -53,17 +54,28 @@ type Booter interface {
 	WriteFile(ctx context.Context, path, content string) error
 }
 
-// LocalBooter executes commands as local subprocesses with restricted env.
-// This is the simplest backend — no container isolation, but restricted PATH.
+// LocalBooter executes commands as local subprocesses with restricted env,
+// backing the sandbox's /workspace onto a host directory. This gives a working
+// sandbox runtime without Docker: file operations are mapped into the host
+// root so anything written via sandbox file tools can be read back, and vice
+// versa.
 type LocalBooter struct {
 	mu      sync.Mutex
 	running bool
 	cancel  context.CancelFunc
+	root    string // host directory backing the sandbox /workspace
 }
 
 // NewLocalBooter creates a local sandbox booter.
 func NewLocalBooter() *LocalBooter {
 	return &LocalBooter{}
+}
+
+// SetRoot overrides the host directory that backs the sandbox /workspace.
+func (b *LocalBooter) SetRoot(root string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.root = root
 }
 
 func (b *LocalBooter) Type() BooterType { return BooterLocal }
@@ -74,8 +86,14 @@ func (b *LocalBooter) Start(ctx context.Context) error {
 	if b.running {
 		return fmt.Errorf("local booter already running")
 	}
+	if b.root == "" {
+		b.root = filepath.Join("data", "sandbox", "workspace")
+	}
+	if err := os.MkdirAll(b.root, 0755); err != nil {
+		return err
+	}
 	b.running = true
-	logger.Info("Local sandbox booter started")
+	logger.Info("Local sandbox booter started (root=%s)", b.root)
 	return nil
 }
 
@@ -99,24 +117,114 @@ func (b *LocalBooter) IsRunning() bool {
 	return b.running
 }
 
+// mapPath maps a sandbox path (/workspace/... or a relative path) onto the
+// host backing directory. Absolute paths outside /workspace are shadowed under
+// the root so the booter cannot touch the real host filesystem.
+func (b *LocalBooter) mapPath(path string) string {
+	p := filepath.Clean(filepath.FromSlash(strings.TrimSpace(path)))
+	p = strings.TrimPrefix(p, SandboxWorkdir)
+	p = strings.TrimPrefix(p, string(filepath.Separator))
+	b.mu.Lock()
+	root := b.root
+	b.mu.Unlock()
+	if root == "" {
+		root = filepath.Join("data", "sandbox", "workspace")
+	}
+	return filepath.Join(root, p)
+}
+
 func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workdir string) (string, string, int, error) {
-	// In production, this would exec a subprocess with restricted env/PATH.
-	// For now, return a placeholder.
-	return "", "", 0, fmt.Errorf("local booter exec not yet implemented")
+	b.mu.Lock()
+	running := b.running
+	b.mu.Unlock()
+	if !running {
+		return "", "", -1, fmt.Errorf("local sandbox not running")
+	}
+	dir := b.mapPath(workdir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", "", -1, err
+	}
+	c := exec.CommandContext(ctx, cmd, args...)
+	c.Dir = dir
+	var stdout, stderr bytes.Buffer
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+	err := c.Run()
+	if err == nil {
+		return stdout.String(), stderr.String(), 0, nil
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return stdout.String(), stderr.String(), ee.ExitCode(), nil
+	}
+	return stdout.String(), stderr.String(), -1, err
 }
 
 func (b *LocalBooter) ListSkills(ctx context.Context) ([]skills.SandboxCacheEntry, error) {
-	// In production, this would scan /workspace/skills/ inside the sandbox.
-	return nil, nil
+	b.mu.Lock()
+	running := b.running
+	b.mu.Unlock()
+	if !running {
+		return nil, fmt.Errorf("local sandbox not running")
+	}
+	skillsRoot := filepath.Join(b.mapPath(SandboxWorkdir), "skills")
+	var entries []skills.SandboxCacheEntry
+	_ = filepath.WalkDir(skillsRoot, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.EqualFold(d.Name(), "SKILL.md") {
+			return nil
+		}
+		dir := filepath.Base(filepath.Dir(p))
+		content, _ := os.ReadFile(p)
+		entries = append(entries, skills.SandboxCacheEntry{
+			Name:        dir,
+			Description: skills.ParseFrontmatterDescription(string(content)),
+			Path:        filepath.ToSlash(filepath.Join(SandboxWorkdir, "skills", dir, "SKILL.md")),
+		})
+		return nil
+	})
+	return entries, nil
 }
 
 func (b *LocalBooter) ReadFile(ctx context.Context, path string) (string, error) {
-	return "", fmt.Errorf("local booter ReadFile not yet implemented")
+	b.mu.Lock()
+	running := b.running
+	b.mu.Unlock()
+	if !running {
+		return "", fmt.Errorf("local sandbox not running")
+	}
+	host := b.mapPath(path)
+	data, err := os.ReadFile(host)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("file not found: %s", path)
+		}
+		return "", err
+	}
+	return string(data), nil
 }
 
 func (b *LocalBooter) WriteFile(ctx context.Context, path, content string) error {
-	return fmt.Errorf("local booter WriteFile not yet implemented")
+	b.mu.Lock()
+	running := b.running
+	b.mu.Unlock()
+	if !running {
+		return fmt.Errorf("local sandbox not running")
+	}
+	host := b.mapPath(path)
+	if err := os.MkdirAll(filepath.Dir(host), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(host, []byte(content), 0644)
 }
+
+// SandboxWorkdir is the sandbox workspace directory used as the cwd for
+// shell/python exec and the base for relative file paths.
+const SandboxWorkdir = "/workspace"
 
 // DockerBooter executes commands inside a Docker container.
 //
@@ -214,8 +322,13 @@ func (b *DockerBooter) Exec(ctx context.Context, cmd string, args []string, work
 	}
 	dockerArgs = append(dockerArgs, cid)
 	if cmd == "sh" || cmd == "/bin/sh" {
-		// Pass a single command string so pipes/redirection work.
-		joined := strings.Join(args, " ")
+		// Pass a single command string so pipes/redirection work. Callers may
+		// pass the command either as ["-c", "cmd"] or as ["cmd"].
+		cmdStart := 0
+		if len(args) > 0 && args[0] == "-c" {
+			cmdStart = 1
+		}
+		joined := strings.Join(args[cmdStart:], " ")
 		dockerArgs = append(dockerArgs, "sh", "-c", joined)
 	} else {
 		dockerArgs = append(dockerArgs, cmd)
@@ -268,7 +381,7 @@ func (b *DockerBooter) ReadFile(ctx context.Context, path string) (string, error
 	if cid == "" {
 		return "", fmt.Errorf("docker sandbox not running")
 	}
-	out, err := dockerOutput(ctx, "exec", cid, "sh", "-c", "cat '"+strings.ReplaceAll(path, "'", "'\\''")+"' 2>/dev/null || echo '__NO_SUCH_FILE__'")
+	out, err := dockerOutput(ctx, "exec", "-w", SandboxWorkdir, cid, "sh", "-c", "cat '"+strings.ReplaceAll(path, "'", "'\\''")+"' 2>/dev/null || echo '__NO_SUCH_FILE__'")
 	if err != nil {
 		return "", err
 	}
@@ -287,11 +400,11 @@ func (b *DockerBooter) WriteFile(ctx context.Context, path, content string) erro
 	}
 	// mkdir -p parent, then cat > file via stdin.
 	parent := filepath.Dir(path)
-	if _, err := dockerOutput(ctx, "exec", cid, "sh", "-c", "mkdir -p '"+strings.ReplaceAll(parent, "'", "'\\''")+"'"); err != nil {
+	if _, err := dockerOutput(ctx, "exec", "-w", SandboxWorkdir, cid, "sh", "-c", "mkdir -p '"+strings.ReplaceAll(parent, "'", "'\\''")+"'"); err != nil {
 		return err
 	}
 	var stdout, stderr strings.Builder
-	code, err := dockerRun(ctx, []string{"exec", "-i", cid, "sh", "-c", "cat > '" + strings.ReplaceAll(path, "'", "'\\''") + "'"}, strings.NewReader(content), &stdout, &stderr)
+	code, err := dockerRun(ctx, []string{"exec", "-i", "-w", SandboxWorkdir, cid, "sh", "-c", "cat > '" + strings.ReplaceAll(path, "'", "'\\''") + "'"}, strings.NewReader(content), &stdout, &stderr)
 	if err != nil {
 		return err
 	}

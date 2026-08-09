@@ -183,14 +183,28 @@ func (c *AstrBotConfig) SaveAsync() {
 	}()
 }
 
-// Update merges the given map into the config and saves.
+// Update merges the given map into the config and saves. Nested maps are
+// merged recursively, so a partial update (e.g. only provider_settings.*)
+// never wipes the rest of a section.
 func (c *AstrBotConfig) Update(updates map[string]interface{}) error {
 	c.mu.Lock()
-	for k, v := range updates {
-		c.data[k] = v
-	}
+	mergeMap(c.data, updates)
 	c.mu.Unlock()
 	return c.Save()
+}
+
+// mergeMap recursively overlays src onto dst. Leaf values from src replace dst;
+// nested maps are merged in place.
+func mergeMap(dst, src map[string]interface{}) {
+	for k, sv := range src {
+		if sm, ok := sv.(map[string]interface{}); ok {
+			if dm, ok := dst[k].(map[string]interface{}); ok {
+				mergeMap(dm, sm)
+				continue
+			}
+		}
+		dst[k] = sv
+	}
 }
 
 // All returns a copy of the full config map.

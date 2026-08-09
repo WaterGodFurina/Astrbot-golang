@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
@@ -132,6 +133,8 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 	go func() {
 		defer close(ch)
 		defer resp.Body.Close()
+		var usage *provider.TokenUsage
+		var content strings.Builder
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var event struct {
 				Type  string `json:"type"`
@@ -139,6 +142,16 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 					Type string `json:"type"`
 					Text string `json:"text"`
 				} `json:"delta"`
+				MessageStop *struct {
+					Usage struct {
+						InputTokens  int `json:"input_tokens"`
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
+				Usage *struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
 			}
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
 				return false
@@ -146,13 +159,28 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 			switch event.Type {
 			case "content_block_delta":
 				if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
+					content.WriteString(event.Delta.Text)
 					ch <- &provider.LLMResponse{
 						Role:           "assistant",
 						IsChunk:        true,
 						CompletionText: event.Delta.Text,
 					}
 				}
+			case "message_delta":
+				// Final cumulative usage arrives on the message_delta event.
+				if event.Usage != nil {
+					usage = &provider.TokenUsage{
+						InputOther: event.Usage.InputTokens,
+						Output:     event.Usage.OutputTokens,
+					}
+				}
 			case "message_stop":
+				// Emit a final consolidated chunk with usage.
+				ch <- &provider.LLMResponse{
+					Role:           "assistant",
+					CompletionText: content.String(),
+					Usage:          usage,
+				}
 				return true
 			}
 			return false

@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 )
 
 func TestHandlersReturnNamedObjects(t *testing.T) {
@@ -43,8 +45,12 @@ func TestHandlersReturnNamedObjects(t *testing.T) {
 			}
 		}},
 		{"GET", "/api/plugins", func(t *testing.T, body string) {
-			if !strings.Contains(body, `"plugins"`) {
-				t.Errorf("expected 'plugins' key in: %s", body)
+			var v map[string]interface{}
+			if err := json.Unmarshal([]byte(body), &v); err != nil {
+				t.Fatalf("invalid json: %v", err)
+			}
+			if _, ok := v["data"].([]interface{}); !ok {
+				t.Errorf("expected data to be an array in: %s", body)
 			}
 		}},
 		{"GET", "/api/providers", func(t *testing.T, body string) {
@@ -63,8 +69,12 @@ func TestHandlersReturnNamedObjects(t *testing.T) {
 			}
 		}},
 		{"GET", "/api/tools/list", func(t *testing.T, body string) {
-			if !strings.Contains(body, `"tools"`) {
-				t.Errorf("expected 'tools' key in: %s", body)
+			var v map[string]interface{}
+			if err := json.Unmarshal([]byte(body), &v); err != nil {
+				t.Fatalf("invalid json: %v", err)
+			}
+			if _, ok := v["data"].([]interface{}); !ok {
+				t.Errorf("expected data to be an array in: %s", body)
 			}
 		}},
 		{"GET", "/api/children", func(t *testing.T, body string) {
@@ -81,13 +91,21 @@ func TestHandlersReturnNamedObjects(t *testing.T) {
 			}
 		}},
 		{"GET", "/api/personas", func(t *testing.T, body string) {
-			if !strings.Contains(body, `"personas"`) {
-				t.Errorf("expected 'personas' key in: %s", body)
+			var v map[string]interface{}
+			if err := json.Unmarshal([]byte(body), &v); err != nil {
+				t.Fatalf("invalid json: %v", err)
+			}
+			if _, ok := v["data"].([]interface{}); !ok {
+				t.Errorf("expected data to be an array in: %s", body)
 			}
 		}},
 		{"GET", "/api/mcp/servers", func(t *testing.T, body string) {
-			if !strings.Contains(body, `"servers"`) {
-				t.Errorf("expected 'servers' key in: %s", body)
+			var v map[string]interface{}
+			if err := json.Unmarshal([]byte(body), &v); err != nil {
+				t.Fatalf("invalid json: %v", err)
+			}
+			if _, ok := v["data"].([]interface{}); !ok {
+				t.Errorf("expected data to be an array in: %s", body)
 			}
 		}},
 		{"GET", "/api/commands", func(t *testing.T, body string) {
@@ -138,5 +156,26 @@ func TestHandlersReturnNamedObjects(t *testing.T) {
 			s.mux.ServeHTTP(w, req)
 			tt.check(t, w.Body.String())
 		})
+	}
+}
+
+// TestGetPluginListNilLegacyManager guards against a typed-nil *plugin.Manager
+// (legacy_plugin_mode=false) causing getPluginList to panic on a nil receiver.
+func TestGetPluginListNilLegacyManager(t *testing.T) {
+	s := NewServer(0, "/tmp/test_pw.json")
+	defer s.Stop()
+	var nilMgr *plugin.Manager
+	s.pluginMgr = nilMgr // typed-nil inside interface{}
+
+	list := s.getPluginList()
+	if list == nil {
+		t.Fatal("getPluginList should return a non-nil list even with a nil legacy manager")
+	}
+	byID := s.pluginByID("anything")
+	if byID == nil {
+		t.Fatal("pluginByID should return a non-nil map with a nil legacy manager")
+	}
+	if failed := s.pluginFailed(); failed == nil {
+		t.Fatal("pluginFailed should return a non-nil map with a nil legacy manager")
 	}
 }

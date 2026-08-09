@@ -148,9 +148,30 @@ func sidCmd(e *core.Event) {
 func nameCmd(deps Deps, e *core.Event) {
 	umo := e.UnifiedMsgOrigin()
 	al := args(e)
+	autoName := e.Source.SenderName
+	manualNeeded := platformNeedsManualName(e.Source.Platform)
+
 	if len(al) == 0 || strings.TrimSpace(al[0]) == "" {
-		auto := state.umoAliases[umo]
-		reply(e, "Usage: /name <name>\nUMO: "+umo+"\nAlias: "+auto)
+		cur := state.umoAliases[umo]
+		if manualNeeded {
+			if cur == "" {
+				reply(e, fmt.Sprintf(
+					"当前平台「%s」无法自动获取昵称（QQ 官方私聊消息不携带用户名）。\n请使用 /name <你的名字> 设置，之后 LLM 才能识别你。\nUMO: %s",
+					e.Source.Platform, umo,
+				))
+			} else {
+				reply(e, fmt.Sprintf("当前昵称: %s\nUMO: %s", cur, umo))
+			}
+			return
+		}
+		if autoName != "" {
+			reply(e, fmt.Sprintf(
+				"当前平台「%s」会自动获取昵称：\n昵称: %s\nUMO: %s\n（无需手动设置；如需自定义可用 /name <名字> 覆盖）",
+				e.Source.Platform, autoName, umo,
+			))
+		} else {
+			reply(e, "Usage: /name <name>\nUMO: "+umo+"\nAlias: "+cur)
+		}
 		return
 	}
 	alias := strings.Join(al, " ")
@@ -159,6 +180,18 @@ func nameCmd(deps Deps, e *core.Event) {
 	state.mu.Unlock()
 	persistUmoAlias(deps, umo, alias)
 	reply(e, fmt.Sprintf("UMO name set to: %s\nUMO: %s", alias, umo))
+}
+
+// platformNeedsManualName reports whether the platform's messages carry a
+// sender nickname. QQ 官方 C2C messages do not include the username, so users
+// there must set it manually via /name; OneBot (aiocqhttp) and most other
+// platforms provide it automatically.
+func platformNeedsManualName(platform string) bool {
+	switch platform {
+	case "qq_official", "qq_official_webhook":
+		return true
+	}
+	return false
 }
 
 func persistUmoAlias(deps Deps, umo, alias string) {

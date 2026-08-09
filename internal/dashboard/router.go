@@ -72,8 +72,10 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		s.handleConversations(w, r, rest)
 
 	// ── Personas ─────────────────────────────────────────
-	case "personas", "persona-folders":
+	case "personas":
 		s.handlePersonas(w, r, rest)
+	case "persona-folders":
+		s.handlePersonaFolders(w, r)
 
 	// ── Tools / Skills ───────────────────────────────────
 	case "tools":

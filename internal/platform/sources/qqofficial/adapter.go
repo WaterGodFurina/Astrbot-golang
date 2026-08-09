@@ -486,6 +486,12 @@ func (a *Adapter) handleMessage(d map[string]interface{}, scene string) {
 	if senderOpenID == "" {
 		senderOpenID, _ = d["author"].(map[string]interface{})["member_openid"].(string)
 	}
+	// C2C messages carry no username (the QQ API does not expose it), so the
+	// nickname is left empty here; the pipeline resolves it via the user's
+	// `/name` alias when building the system reminder.
+	if senderOpenID == "" {
+		senderOpenID, _ = d["author"].(map[string]interface{})["member_openid"].(string)
+	}
 
 	chain := []message.Component{}
 	if int(msgType) == 103 {

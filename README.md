@@ -1,6 +1,6 @@
 # 注意:
 
-本项目还在移植（使用DeepSeek作为辅助），默认日志为debug（目前无法更改）。本项目不负责在使用本项目时所造成的任何后果
+本项目还在移植（使用DeepSeek作为辅助）。本项目不负责在使用本项目时所造成的任何后果。日志级别可通过配置文件 `data/cmd_config.json` 中的 `log_level`（DEBUG/INFO/WARN/ERROR/CRITICAL）或环境变量 `ASTRBOT_LOG_LEVEL` 设置，环境变量优先级更高，默认 INFO。
 
 # 原仓库
 
@@ -16,116 +16,115 @@ AstrBot 的 Go 语言移植版本，从 AstrBot 的 v4.27.2 移植而来。
 astrbot-go/
 ├── cmd/astrbot/               # 主入口
 ├── internal/
-│   ├── agent/                 # LLM Agent 系统 (tool, message, response, MCP client)
-│   ├── backup/                # 备份导入导出
-│   ├── config/                # 配置管理
-│   ├── contentsafety/        # 内容安全检查 (Keyword/LLM 策略)
-│   ├── conversation/          # 会话管理 (Conversation, SessionServiceManager)
-│   ├── core/                  # 事件总线 + Pipeline 调度器 + Event 模型
-│   ├── cron/                  # 定时任务管理
-│   ├── dashboard/             # WebUI API 服务器 + 路由 + 认证
-│   ├── db/                    # SQLite 数据库
-│   ├── i18n/                  # 国际化翻译系统
-│   ├── knowledgebase/         # 知识库
+│   ├── plugin/                # 子进程插件运行时 (go-plugin + gRPC：加载/编译/静态扫描/崩溃重启)
+│   ├── toolchain/             # 自带 Go 工具链 (自动下载、解压、路径管理)
+│   ├── star/                  # 指令系统 (子进程插件命令/filter/hook 桥接进管线)
 │   ├── lifecycle/             # 生命周期管理，组装所有模块
-│   ├── log/                   # 日志系统
-│   ├── persona/               # 人格/提示词管理
-│   ├── pipeline/              # 消息处理管线 (9 阶段 + Computer Use 工具执行)
-│   ├── platform/              # 平台适配器接口 + 注册系统
-│   │   └── sources/
-│   │       ├── aiocqhttp/     # OneBot v11 适配器
-│   │       ├── qqofficial/    # QQ 官方机器人适配器 (含 C2C 流式下发)
-│   │       ├── telegram/      # Telegram Bot 适配器
-│   │       └── webchat/       # 内置 WebChat 适配器
-│   ├── plugin/                # .so 插件加载系统
-│   ├── provider/              # LLM Provider 管理 (含 SSE 流式解析)
-│   │   └── sources/
-│   │       ├── openai_source.go      # OpenAI 兼容
-│   │       ├── anthropic_source.go   # Anthropic Claude
-│   │       ├── gemini_source.go      # Google Gemini
-│   │       ├── ollama_source.go      # Ollama 本地模型
-│   │       ├── dashscope_source.go   # 阿里通义千问
-│   │       └── sse.go                # 共享 SSE 解析器
-│   ├── ratelimit/             # 限流器 (Fixed Window, Stall/Discard)
-│   ├── sandbox/               # 沙箱管理 (Docker 容器执行)
-│   ├── session/               # 会话等待器
-│   ├── skills/                # 技能管理 (SKILL.md 发现 + LLM 注入)
-│   ├── star/                  # 指令系统 (含 .so 插件指令桥接)
-│   ├── t2i/                   # 文本转图片渲染
-│   └── utils/                 # IO 工具 + 媒体工具
+│   ├── pipeline/              # 消息处理管线 (9 阶段)
+│   ├── platform/              # 平台适配器 (qqofficial/telegram/aiocqhttp/webchat)
+│   ├── provider/              # LLM Provider 管理
+│   ├── dashboard/             # WebUI API 服务器 + 路由 + 认证
+│   ├── core/                  # 事件总线 + Pipeline 调度器
+│   ├── sandbox/               # 沙箱 (Docker/本地/Shipyard)
+│   ├── skills/                # 技能管理
+│   ├── conversation/          # 会话管理
+│   ├── config/                # 配置管理
+│   ├── db/                    # SQLite 数据库
+│   └── ...                    # 其余支持包
 ├── pkg/
-│   ├── message/               # 消息组件 + MessageEventResult + MessageChain
-│   ├── sdk/                   # 插件开发 SDK
-│   └── types/                 # 公共类型
+│   ├── message/               # 消息组件
+│   └── sdk/                   # 插件 SDK 文档入口 (SDK 本体在独立 module)
 ├── examples/
-│   └── echo_plugin/           # 示例 .so 插件
+│   └── echo_plugin/           # 子进程插件示例 (sdk.Serve)
 └── go.mod
 ```
 
-## Pipeline 消息处理管线 (完整 9 阶段)
+# 插件系统重构
 
-对齐 Python 版 `astrbot/core/pipeline/` 的 9 个有序阶段：
+插件系统已从 Linux 专用的 Go 原生 `.so` 方案重构为**子进程方案**（go-plugin + gRPC），解决旧方案的四大痛点：
 
-1. **WakingCheckStage** — 检查唤醒条件（前缀、@提及、私聊自动唤醒）
-2. **WhitelistCheckStage** — 白名单/黑名单过滤
-3. **SessionStatusCheckStage** — 会话启用状态检查
-4. **RateLimitStage** — 频率限制（Fixed Window 算法，Stall/Discard 策略）
-5. **ContentSafetyCheckStage** — 内容安全检查（Keyword/LLM 策略）
-6. **PreProcessStage** — 预处理（媒体路径映射、STT 语音转文字）
-7. **ProcessStage** — 插件 Handler 执行 + LLM Agent 调用（含技能注入、Computer Use 工具执行、流式输出）
-8. **ResultDecorateStage** — 结果装饰（回复前缀、@提及、引用回复、T2I）
-9. **RespondStage** — 发送消息链到平台
+| 痛点 | 旧 `.so` 方案 | 新子进程方案 |
+|------|--------------|--------------|
+| 平台 | 仅 Linux | Windows / macOS / Linux（含 Termux） |
+| 热卸载 | `.so` 无法卸载，内存不释放 | 杀掉子进程即被 OS 完全回收 |
+| 分发 | 每个平台单独编译二进制 | 只发 Go 源码，用户侧自动编译 |
+| 隔离 | 与主进程同地址空间，崩溃拖垮主进程 | 独立子进程，崩溃不影响主进程 |
 
-## Provider 系统
+## 插件 SDK
 
-本项目仅支持6种 LLM Provider:
-
-| Provider | 说明 |
-|----------|------|
-| OpenAI | OpenAI 兼容 API（含 tool calls 解析、SSE 流式响应） |
-| Anthropic | Claude 系列模型 |
-| Gemini | Google Gemini |
-| Ollama | 本地大模型 |
-| DashScope | 阿里通义千问 |
-| OpenRouter | OpenAI 兼容格式 |
-
-## 插件系统
-
-AstrBot-Go 使用 Go 原生 `plugin` 包加载 `.so` 共享库，替代 Python 的 importlib。
-
-### 插件接口
-
-每个 `.so` 插件需导出以下函数：
+SDK 是独立 module `github.com/WaterGodFurina/Astrbot-go-plugin-sdk`（本地 `~/astrbot-go-plugin-sdk`）。插件作者只需写一个 `main`，实现命令/过滤器/钩子：
 
 ```go
-func PluginName() string
-func PluginVersion() string
-func PluginDescription() string
-func Init(ctx *plugin.Context) error
-func RegisterHandlers(reg *plugin.HandlerRegistry)
-func Cleanup() error
+package main
+
+import (
+    sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+)
+
+func main() {
+    sdk.Serve(&sdk.Plugin{
+        Name:        "echo",
+        Version:     "1.0.0",
+        Description: "Echoes your message back",
+        OnLoad:      setup, // 启动钩子，可在里面动态注册
+    })
+}
 ```
 
-插件指令/过滤器/钩子会在生命周期启动时桥接到 star 指令系统，WebUI 中的启停/重载会自动重新桥接。
+命令处理函数可以拆到独立文件，通过 `setup()`（OnLoad 钩子）或 `init()` 注册：
 
-### 编译插件
-
-```bash
-go build -buildmode=plugin -o data/plugins/myplugin.so myplugin.go
+```go
+func setup() error {
+    sdk.RegisterCommand(sdk.Command{
+        Name:    "echo",
+        Aliases: []string{"repeat"},
+        Handler: func(e *sdk.Event, args []string) (string, error) {
+            return strings.Join(args, " "), nil
+        },
+    })
+    return nil
+}
 ```
 
-### 示例插件
+SDK 也支持声明式写法（直接在 `sdk.Plugin{Commands: []sdk.Command{...}}` 里声明），两者等价。
 
-见 `examples/echo_plugin/echo.go`
+## 自带 Go 工具链
+
+首次编译插件时，程序自动下载官方 Go 免安装包到用户私有目录（`~/.local/share/astrbot-go/` 等），无需用户装 Go：
+
+- `ASTRBOT_GO_BIN`：指定已有的 `go` 二进制（最高优先）
+- `ASTRBOT_GO_VERSION`：指定要下载的 Go 版本（默认 1.24.3）
+- `ASTRBOT_GO_MIRROR`：下载镜像
+
+## 静态扫描 + 风险提示
+
+安装插件前会静态扫描源码，发现 `os/exec`、`syscall`、`unsafe` 等危险包时，**WebUI 弹出风险对话框并列出具体代码行**，由用户选择"无视风险，继续安装"或"取消安装"。
+
+## 安装与热重载
+
+- WebUI「安装插件」支持上传 `.zip` 归档或填 Git/归档 URL
+- 安装 = 下载源码 → 静态扫描 → 编译 → 启动子进程 → 桥接进管线
+- 崩溃自动重启（带退避与次数上限）；重载零停机（先起新进程再杀旧进程）
+
+## 向后兼容
+
+配置项 `legacy_plugin_mode`（默认 `false`）置为 `true` 时启用旧 `.so` 加载路径（仅 Linux）。
+
+## Provider 支持情况
+
+| 能力 | 支持 |
+|------|------|
+| Chat / LLM (14) | OpenAI、OpenRouter、Anthropic、Gemini、Ollama、DashScope、Groq、xAI、智谱、LongCat、AIHubMix、小米（OpenAI 兼容薄封装）、Kimi-Code（Anthropic 协议）、OpenAI Responses API |
+| TTS (9) | OpenAI、Azure、ElevenLabs、FishAudio、Edge-TTS、MiniMax、火山引擎、Gemini、MiMo |
+| STT (2) | OpenAI Whisper、MiMo |
+| Embedding (5) | OpenAI、DashScope、Gemini、NVIDIA、Ollama |
+| Rerank (5) | TEI、百炼、NVIDIA、vLLM、Xinference |
 
 ## 构建
 
 ```bash
 # 主程序
 go build -o bin/astrbot ./cmd/astrbot
-
-# 插件
-go build -buildmode=plugin -o examples/echo_plugin/echo.so examples/echo_plugin/echo.go
 ```
 
 ## 测试
@@ -144,6 +143,6 @@ go test ./... -v
 
 ## 代码规模
 
-- 79 个 Go 文件
-- ~23,000 行 Go 代码
+- 124 个 Go 文件（含测试 150 个）
+- 约 34,000 行 Go 代码
 - 对齐 Python AstrBot v4.27.2 的核心架构

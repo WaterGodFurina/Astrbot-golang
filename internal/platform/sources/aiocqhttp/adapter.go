@@ -1,5 +1,10 @@
 // Package aiocqhttp implements the OneBot v11 platform adapter.
 // Ported from astrbot/core/platform/sources/aiocqhttp/
+//
+// Supported modes:
+//   - Reverse WebSocket (OneBot 实现主动连入本服务的 /ws 端点；事件与 API 调用
+//     都通过同一条连接传输) — 推荐，Send 通过连接下发 send_msg。
+//   - HTTP POST (OneBot 实现向 / 推送事件)。无可用 WebSocket 连接时 Send 会报错。
 package aiocqhttp
 
 import (
@@ -7,8 +12,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/AstrBotDevs/AstrBot/internal/core"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
@@ -27,13 +35,23 @@ type Adapter struct {
 	server   *http.Server
 	EventBus *core.EventBus
 	SelfID   string
-	mu       sync.Mutex
+	upgrader websocket.Upgrader
+
+	mu         sync.Mutex
+	conns      map[*websocket.Conn]struct{} // active reverse-WS connections
+	groupConvs map[string]bool              // convID -> is group (from received events)
 }
 
 // New creates an aiocqhttp adapter from config.
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		EventBus: eventBus,
+		EventBus:   eventBus,
+		conns:      make(map[*websocket.Conn]struct{}),
+		groupConvs: make(map[string]bool),
+		upgrader: websocket.Upgrader{
+			// OneBot implementations connect from arbitrary origins.
+			CheckOrigin: func(r *http.Request) bool { return true },
+		},
 	}
 	a.Host, _ = config["ws_reverse_host"].(string)
 	if a.Host == "" {
@@ -50,6 +68,17 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		a.SelfID = id
 	}
 	return a
+}
+
+// SetEventBus injects the event bus. This overrides BaseAdapter.SetEventBus so
+// both the embedded bus (used by PublishEvent) and this adapter's own field
+// (used by handleEvent) are wired, since lifecycle creates adapters via the
+// factory with a nil bus and injects it afterwards.
+func (a *Adapter) SetEventBus(bus platform.EventBus) {
+	a.BaseAdapter.SetEventBus(bus)
+	if be, ok := bus.(*core.EventBus); ok {
+		a.EventBus = be
+	}
 }
 
 // Start starts the HTTP server for reverse WebSocket connections.
@@ -84,19 +113,60 @@ func (a *Adapter) Stop() error {
 }
 
 // Send sends a message chain to a session.
+//
+// The target session (from core.Event.UnifiedMsgOrigin) is the convID. We
+// track which convIDs are groups from received events so the correct OneBot
+// action (send_group_msg vs send_private_msg) is chosen. Delivery happens over
+// the reverse WebSocket connection; an error is returned when none is active.
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
-	// Convert message chain to OneBot v11 format
 	segments := a.convertToCQFormat(chain)
-	msg := map[string]interface{}{
-		"action": "send_group_msg",
-		"params": map[string]interface{}{
-			"group_id": sessionID,
-			"message":  segments,
-		},
+	params := map[string]interface{}{"message": segments}
+	isGroup := a.groupConvs[sessionID]
+	if isGroup {
+		params["group_id"] = sessionID
+	} else {
+		params["user_id"] = sessionID
 	}
-	// In a full implementation, this would send via the WebSocket connection
-	_ = msg
-	return nil
+	return a.sendAction("send_msg", params)
+}
+
+// sendAction sends a OneBot v11 API call over an active reverse-WS connection.
+func (a *Adapter) sendAction(action string, params map[string]interface{}) error {
+	payload, err := json.Marshal(map[string]interface{}{
+		"action": action,
+		"params": params,
+		"echo":   fmt.Sprintf("astrbot-%d", time.Now().UnixNano()),
+	})
+	if err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	conns := make([]*websocket.Conn, 0, len(a.conns))
+	for c := range a.conns {
+		conns = append(conns, c)
+	}
+	a.mu.Unlock()
+
+	if len(conns) == 0 {
+		return fmt.Errorf("aiocqhttp: no active WebSocket connection to send %s", action)
+	}
+
+	// Try each connection; drop ones that fail so future sends pick a healthy peer.
+	var lastErr error
+	for _, c := range conns {
+		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := c.WriteMessage(websocket.TextMessage, payload); err != nil {
+			a.removeConn(c)
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no reachable connection")
+	}
+	return fmt.Errorf("aiocqhttp: failed to send %s: %w", action, lastErr)
 }
 
 // handleHTTP handles HTTP POST requests from OneBot v11 implementations.
@@ -126,11 +196,77 @@ func (a *Adapter) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleWebSocket handles WebSocket connections (placeholder for full WS support).
+// handleWebSocket serves the reverse WebSocket endpoint. OneBot
+// implementations connect here and both push events and receive API calls.
 func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Full WebSocket implementation would use gorilla/websocket
-	// For now, this is a placeholder
-	http.Error(w, "WebSocket not yet implemented", http.StatusNotImplemented)
+	if a.Token != "" {
+		auth := r.Header.Get("Authorization")
+		queryToken := r.URL.Query().Get("access_token")
+		if !strings.HasPrefix(auth, "Bearer "+a.Token) && auth != a.Token && queryToken != a.Token {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	conn, err := a.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logger.Error("WebSocket upgrade failed: %v", err)
+		return
+	}
+	a.addConn(conn)
+	logger.Info("Reverse WebSocket client connected (%s)", conn.RemoteAddr())
+
+	defer func() {
+		a.removeConn(conn)
+		conn.Close()
+		logger.Info("Reverse WebSocket client disconnected")
+	}()
+
+	// Heartbeat: respond to ping, and respect the peer's close/ping timeouts.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		return nil
+	})
+
+	for {
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				logger.Warn("WebSocket read error: %v", err)
+			}
+			return
+		}
+		if len(data) == 0 {
+			continue
+		}
+		// Reverse-WS frames are either events (post_type) or API responses
+		// (echo) to our send_msg calls.
+		var msg map[string]interface{}
+		if err := json.Unmarshal(data, &msg); err != nil {
+			logger.Warn("WebSocket message not JSON: %v", err)
+			continue
+		}
+		if _, hasPost := msg["post_type"]; hasPost {
+			a.handleEvent(msg)
+			continue
+		}
+		if _, hasEcho := msg["echo"]; hasEcho {
+			logger.Debug("OneBot API response: %v", msg)
+		}
+	}
+}
+
+func (a *Adapter) addConn(c *websocket.Conn) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.conns[c] = struct{}{}
+}
+
+func (a *Adapter) removeConn(c *websocket.Conn) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.conns, c)
 }
 
 // handleEvent processes a OneBot v11 event.
@@ -138,6 +274,16 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 	postType, _ := raw["post_type"].(string)
 	if postType != "message" {
 		return
+	}
+
+	// Track the bot's own ID from the event's self field so @-mentions of the
+	// bot can be detected by WakingCheckStage.
+	if a.SelfID == "" {
+		if self, ok := raw["self"].(map[string]interface{}); ok {
+			if id, ok := self["user_id"]; ok {
+				a.SelfID = fmt.Sprintf("%v", id)
+			}
+		}
 	}
 
 	messageType, _ := raw["message_type"].(string)
@@ -161,6 +307,9 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 	} else {
 		convID = senderID
 	}
+	a.mu.Lock()
+	a.groupConvs[convID] = isGroup
+	a.mu.Unlock()
 
 	// Convert message segments
 	msgChain := a.convertFromCQFormat(raw)
@@ -182,6 +331,10 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 		Metadata:   make(map[string]interface{}),
 	}
 
+	if a.EventBus == nil {
+		logger.Error("aiocqhttp event bus not configured; cannot publish")
+		return
+	}
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.Error("Failed to publish event: %v", err)
 	}

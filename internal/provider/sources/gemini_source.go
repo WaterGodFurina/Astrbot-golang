@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
@@ -133,6 +134,8 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 	go func() {
 		defer resp.Body.Close()
 		defer close(ch)
+		var usage *provider.TokenUsage
+		var content strings.Builder
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var chunk struct {
 				Candidates []struct {
@@ -142,13 +145,24 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 						} `json:"parts"`
 					} `json:"content"`
 				} `json:"candidates"`
+				UsageMetadata *struct {
+					PromptTokenCount     int `json:"promptTokenCount"`
+					CandidatesTokenCount int `json:"candidatesTokenCount"`
+				} `json:"usageMetadata"`
 			}
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				return false
 			}
+			if chunk.UsageMetadata != nil {
+				usage = &provider.TokenUsage{
+					InputOther: chunk.UsageMetadata.PromptTokenCount,
+					Output:     chunk.UsageMetadata.CandidatesTokenCount,
+				}
+			}
 			for _, cand := range chunk.Candidates {
 				for _, part := range cand.Content.Parts {
 					if part.Text != "" {
+						content.WriteString(part.Text)
 						ch <- &provider.LLMResponse{
 							Role:           "assistant",
 							IsChunk:        true,
@@ -160,6 +174,14 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 			return false
 		})
 		_ = reader.scan()
+		// Emit a final consolidated chunk so token usage reaches the pipeline.
+		if usage != nil || content.Len() > 0 {
+			ch <- &provider.LLMResponse{
+				Role:           "assistant",
+				CompletionText: content.String(),
+				Usage:          usage,
+			}
+		}
 	}()
 	return ch, nil
 }

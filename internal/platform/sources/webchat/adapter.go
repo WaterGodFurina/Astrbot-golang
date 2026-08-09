@@ -12,6 +12,7 @@ import (
 
 	"github.com/AstrBotDevs/AstrBot/internal/core"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/AstrBotDevs/AstrBot/internal/platform"
 	"github.com/AstrBotDevs/AstrBot/pkg/message"
 )
 
@@ -44,6 +45,14 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		a.Port = 6185
 	}
 	return a
+}
+
+// SetEventBus injects the event bus (implements platform.EventBusSetter so the
+// lifecycle wires it after construction, since the factory passes nil).
+func (a *Adapter) SetEventBus(bus platform.EventBus) {
+	if be, ok := bus.(*core.EventBus); ok {
+		a.EventBus = be
+	}
 }
 
 // Start starts the web chat server.
@@ -145,6 +154,11 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		Metadata:   make(map[string]interface{}),
 	}
 
+	if a.EventBus == nil {
+		logger.Error("webchat event bus not configured; cannot publish")
+		http.Error(w, "Event bus not configured", http.StatusInternalServerError)
+		return
+	}
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.Error("Failed to publish event: %v", err)
 		http.Error(w, "Internal error", http.StatusInternalServerError)

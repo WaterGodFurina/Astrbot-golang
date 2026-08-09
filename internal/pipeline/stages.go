@@ -17,13 +17,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
+	"io"
+	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/AstrBotDevs/AstrBot/internal/contentsafety"
+	"github.com/AstrBotDevs/AstrBot/internal/agent"
 	"github.com/AstrBotDevs/AstrBot/internal/conversation"
 	"github.com/AstrBotDevs/AstrBot/internal/core"
 	"github.com/AstrBotDevs/AstrBot/internal/cron"
@@ -39,6 +44,15 @@ import (
 )
 
 var logger = log.GetDefault().WithComponent("Pipeline")
+
+var (
+	// tagBlockRe matches <script>...</script> and <style>...</style> blocks.
+	tagBlockRe = regexp.MustCompile(`(?is)<(script|style)[^>]*>.*?</(script|style)>`)
+	// tagRe matches any HTML tag.
+	tagRe = regexp.MustCompile(`(?s)<[^>]*>`)
+	// whitespaceRe collapses runs of whitespace.
+	whitespaceRe = regexp.MustCompile(`\s+`)
+)
 
 // StageResult controls pipeline flow after a stage.
 type StageResult = core.StageResult
@@ -57,6 +71,9 @@ type PipelineContext struct {
 	// persona. nil = unrestricted, empty slice = no skills allowed.
 	// Optional.
 	PersonaSkillsResolver func(personaID string) []string
+	// UmoAliasResolver returns the display name a user set for a session UMO
+	// (via the /name command). Optional.
+	UmoAliasResolver func(umo string) string
 	// SkillManager provides active skills for LLM system prompt injection.
 	// Optional.
 	SkillManager *skills.SkillManager
@@ -68,6 +85,9 @@ type PipelineContext struct {
 	// Database records platform messages / provider calls for statistics.
 	// Optional.
 	Database *db.Database
+	// EventBus allows stages to re-publish events (e.g. rate-limit stall).
+	// Optional.
+	EventBus *core.EventBus
 }
 
 // PipelineStage is the interface every stage must implement.
@@ -89,6 +109,7 @@ type WakingCheckStage struct {
 	wakeByAt     bool
 	wakeByPrefix bool
 	wakeByFriend bool
+	ignoreAtAll  bool
 	cmdPrefix    string
 	aiWakePrefix string
 }
@@ -97,9 +118,9 @@ func NewWakingCheckStage() *WakingCheckStage {
 	return &WakingCheckStage{
 		wakeByAt:     true,
 		wakeByPrefix: true,
-		// Friend messages require an explicit wake prefix by default (user-facing
-		// behavior: chat must be triggered with "<prefix>[ai word] <text>").
-		wakeByFriend: false,
+		// Friend messages auto-wake unless friend_message_needs_wake_prefix is
+		// set (mirrors Python's private-chat wake logic); overridden below.
+		wakeByFriend: true,
 		cmdPrefix:    "/",
 	}
 }
@@ -109,66 +130,36 @@ func (s *WakingCheckStage) Name() string { return "waking_check" }
 func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
 	// wake_prefix lives at the top level of the config (astrbot/core/config/default.py:294),
 	// not inside platform_settings.
-	if raw, ok := ctx.AstrbotConfig["wake_prefix"]; ok {
-		switch v := raw.(type) {
-		case []interface{}:
-			for _, p := range v {
-				if str, ok := p.(string); ok && str != "" {
-					s.wakePrefixes = append(s.wakePrefixes, str)
-				}
-			}
-		case []string:
-			for _, str := range v {
-				if str != "" {
-					s.wakePrefixes = append(s.wakePrefixes, str)
-				}
-			}
-		case string:
-			if v != "" {
-				s.wakePrefixes = append(s.wakePrefixes, v)
-			}
-		}
-	}
+	s.wakePrefixes = append(s.wakePrefixes, toStringList(ctx.AstrbotConfig["wake_prefix"])...)
 	// Fall back to the "/" command prefix (Python DEFAULT_CONFIG ships wake_prefix=["/"])
 	if len(s.wakePrefixes) == 0 && s.cmdPrefix != "" {
 		s.wakePrefixes = append(s.wakePrefixes, s.cmdPrefix)
 	}
-	if platformSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
-		if nicknames, ok := platformSettings["nickname"].([]interface{}); ok {
-			for _, n := range nicknames {
-				if str, ok := n.(string); ok && str != "" {
-					s.nickname = append(s.nickname, str)
-				}
-			}
-		}
-		if v, ok := platformSettings["wake_by_at"].(bool); ok {
-			s.wakeByAt = v
-		}
-		if v, ok := platformSettings["wake_by_prefix"].(bool); ok {
-			s.wakeByPrefix = v
-		}
-		if v, ok := platformSettings["wake_by_friend"].(bool); ok {
-			s.wakeByFriend = v
-		}
-		// friend_message_needs_wake_prefix=true means friend chat must use a prefix.
-		if v, ok := platformSettings["friend_message_needs_wake_prefix"].(bool); ok && v {
-			s.wakeByFriend = false
-		}
+
+	ps := bindPlatformSettings(ctx.AstrbotConfig)
+	s.nickname = append(s.nickname, ps.Nickname...)
+	if ps.WakeByAt != nil {
+		s.wakeByAt = *ps.WakeByAt
+	}
+	if ps.WakeByPrefix != nil {
+		s.wakeByPrefix = *ps.WakeByPrefix
+	}
+	if ps.WakeByFriend != nil {
+		s.wakeByFriend = *ps.WakeByFriend
+	}
+	// friend_message_needs_wake_prefix=true means friend chat must use a prefix.
+	if ps.FriendMessageNeedsWakePrefix {
+		s.wakeByFriend = false
+	}
+	s.ignoreAtAll = ps.IgnoreAtAll
+	if ps.CmdPrefix != "" {
+		s.cmdPrefix = ps.CmdPrefix
 	}
 
 	// AI wake word: provider_settings.wake_prefix (e.g. "ai").
 	// When set, LLM chat requires "<prefix><ai word> <text>".
-	if providerSettings, ok := ctx.AstrbotConfig["provider_settings"].(map[string]interface{}); ok {
-		if v, ok := providerSettings["wake_prefix"].(string); ok {
-			s.aiWakePrefix = strings.TrimSpace(v)
-		}
-	}
-
-	// Command prefix
-	if cmdSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
-		if v, ok := cmdSettings["cmd_prefix"].(string); ok && v != "" {
-			s.cmdPrefix = v
-		}
+	if psAI := bindProviderSettings(ctx.AstrbotConfig); psAI != nil {
+		s.aiWakePrefix = strings.TrimSpace(psAI.WakePrefix)
 	}
 
 	logger.Info("WakingCheck initialized: prefixes=%v, nicknames=%v, wakeByAt=%v, wakeByPrefix=%v, wakeByFriend=%v, aiWakePrefix=%q",
@@ -209,14 +200,14 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 		for _, nick := range s.nickname {
 			if strings.Contains(text, nick) {
 				event.IsAtOrWakeCommand = true
-				event.SetExtra("llm_wake", false)
+				event.SetExtra("llm_wake", true)
 				logger.Debug("Woken by nickname '%s'", nick)
 				return &StageResult{Continue: true}, nil
 			}
 		}
 	}
 
-	// Check @mention
+	// Check @mention / @all / reply-quoting-bot (Python parity)
 	if s.wakeByAt && event.Message != nil {
 		for _, comp := range event.Message.Chain {
 			if at, ok := comp.(*message.At); ok {
@@ -235,15 +226,30 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 						}
 					}
 					if !matched {
-						event.SetExtra("llm_wake", false)
-						logger.Debug("Woken by @mention (no prefix, chat disabled)")
+						// @mention without a prefix still starts a chat
+						// (Python: is_at_or_wake_command triggers the LLM agent).
+						event.SetExtra("llm_wake", true)
+						logger.Debug("Woken by @mention (chat enabled)")
 					}
 					return &StageResult{Continue: true}, nil
 				}
 			}
 			if _, ok := comp.(*message.AtAll); ok {
-				// AtAll does not wake the bot by default
-				continue
+				if s.ignoreAtAll {
+					continue
+				}
+				event.IsAtOrWakeCommand = true
+				event.SetExtra("llm_wake", true)
+				logger.Debug("Woken by @all")
+				return &StageResult{Continue: true}, nil
+			}
+			if r, ok := comp.(*message.Reply); ok && !event.Source.IsGroup {
+				// quoting the bot in a private chat wakes it (Python parity)
+				if r.SenderID == event.Source.SelfID {
+					event.IsAtOrWakeCommand = true
+					event.SetExtra("llm_wake", true)
+					return &StageResult{Continue: true}, nil
+				}
 			}
 		}
 	}
@@ -251,7 +257,7 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 	// Friend messages wake (configurable)
 	if s.wakeByFriend && !event.Source.IsGroup {
 		event.IsAtOrWakeCommand = true
-		event.SetExtra("llm_wake", false)
+		event.SetExtra("llm_wake", true)
 		return &StageResult{Continue: true}, nil
 	}
 
@@ -312,25 +318,25 @@ func NewWhitelistCheckStage() *WhitelistCheckStage {
 func (s *WhitelistCheckStage) Name() string { return "whitelist_check" }
 
 func (s *WhitelistCheckStage) Initialize(ctx *PipelineContext) error {
-	if platformSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
-		if v, ok := platformSettings["enable_id_white_list"].(bool); ok {
-			s.enableWhitelist = v
-		}
-		if ids, ok := platformSettings["id_whitelist"].([]interface{}); ok {
-			for _, id := range ids {
-				if str, ok := id.(string); ok && strings.TrimSpace(str) != "" {
-					s.whitelist[strings.TrimSpace(str)] = true
-				}
-			}
-		}
-		if v, ok := platformSettings["wl_ignore_admin"].(bool); ok {
-			s.wlIgnoreAdminOnGroup = v
-			s.wlIgnoreAdminOnFriend = v
-		}
-		if v, ok := platformSettings["wl_log"].(bool); ok {
-			s.wlLog = v
+	ps := bindPlatformSettings(ctx.AstrbotConfig)
+	s.enableWhitelist = ps.EnableIDWhiteList
+	for _, id := range ps.IDWhitelist {
+		if id = strings.TrimSpace(id); id != "" {
+			s.whitelist[id] = true
 		}
 	}
+	// Prefer the per-scope keys; fall back to the generic wl_ignore_admin.
+	if ps.WLIgnoreAdminOnGroup != nil {
+		s.wlIgnoreAdminOnGroup = *ps.WLIgnoreAdminOnGroup
+	} else {
+		s.wlIgnoreAdminOnGroup = ps.WLIgnoreAdmin
+	}
+	if ps.WLIgnoreAdminOnFriend != nil {
+		s.wlIgnoreAdminOnFriend = *ps.WLIgnoreAdminOnFriend
+	} else {
+		s.wlIgnoreAdminOnFriend = ps.WLIgnoreAdmin
+	}
+	s.wlLog = ps.WLLog
 	logger.Info("WhitelistCheck initialized: enable=%v, whitelist_size=%d", s.enableWhitelist, len(s.whitelist))
 	return nil
 }
@@ -423,7 +429,8 @@ func (s *SessionStatusCheckStage) Process(ctx context.Context, event *core.Event
 // RateLimitStage checks rate limits per session.
 // Ported from astrbot/core/pipeline/rate_limit_check/stage.py
 type RateLimitStage struct {
-	limiter *ratelimit.RateLimiter
+	limiter  *ratelimit.RateLimiter
+	eventBus *core.EventBus
 }
 
 func NewRateLimitStage() *RateLimitStage {
@@ -433,22 +440,28 @@ func NewRateLimitStage() *RateLimitStage {
 func (s *RateLimitStage) Name() string { return "rate_limit" }
 
 func (s *RateLimitStage) Initialize(ctx *PipelineContext) error {
+	s.eventBus = ctx.EventBus
 	maxReq := 20
 	windowSeconds := 60
 	strategy := ratelimit.StrategyStall
 
-	if platformSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
-		if v, ok := platformSettings["rate_limit"].(float64); ok && v > 0 {
-			maxReq = int(v)
-		}
-		if v, ok := platformSettings["rate_limit_time"].(float64); ok && v > 0 {
-			windowSeconds = int(v)
-		}
-		if v, ok := platformSettings["rate_limit_strategy"].(string); ok {
-			if v == "discard" {
-				strategy = ratelimit.StrategyDiscard
-			}
-		}
+	ps := bindPlatformSettings(ctx.AstrbotConfig)
+	// Nested rate_limit {count,time,strategy} (current config format).
+	if ps.RateLimit.Count > 0 {
+		maxReq = ps.RateLimit.Count
+	}
+	if ps.RateLimit.Time > 0 {
+		windowSeconds = ps.RateLimit.Time
+	}
+	if ps.RateLimit.Strategy == "discard" {
+		strategy = ratelimit.StrategyDiscard
+	}
+	// Legacy flat keys override when present.
+	if v := int(ps.RateLimitTime); v > 0 {
+		windowSeconds = v
+	}
+	if ps.RateLimitStrategy == "discard" {
+		strategy = ratelimit.StrategyDiscard
 	}
 
 	s.limiter = ratelimit.NewRateLimiter(maxReq, DurationFromSeconds(windowSeconds), strategy)
@@ -462,10 +475,15 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 	if !allowed {
 		if stall > 0 {
 			logger.Info("Session %s rate-limited, stalling for %.2fs", sessionID, stall.Seconds())
-			// In Go, we don't block the pipeline. Instead, we stop the event
-			// (equivalent to Python's async sleep + resume).
-			// A production implementation would use a timer + goroutine.
-			event.Stop()
+			// Stall strategy: re-publish the event once the window frees up,
+			// matching Python's async sleep + resume. This must not block the
+			// single-goroutine event bus, so we schedule a delayed re-queue.
+			if s.eventBus != nil {
+				s.eventBus.PublishDelayed(event, stall)
+			} else {
+				// No bus reference (tests): fall back to stopping the event.
+				event.Stop()
+			}
 			return &StageResult{Continue: false}, nil
 		}
 		logger.Info("Session %s rate-limited, discarded", sessionID)
@@ -595,11 +613,21 @@ type ProcessStage struct {
 	config        map[string]interface{}
 	personaPrompt func(umo, personaID string) string
 	personaSkills func(personaID string) []string
+	umoAlias      func(umo string) string
 	skillMgr      *skills.SkillManager
 	platformMgr   *platform.PlatformManager
 	sandboxMgr    *sandbox.Manager
 	cronMgr       *cron.CronJobManager
 	database      *db.Database
+	providerConf  *ProviderSettings
+
+	// MCP servers (data/mcp_server.json). Loaded lazily on the first tool
+	// collection; full tool name = "<sanitized_server>.<tool_name>".
+	mcpMu      sync.Mutex
+	mcpLoaded  bool
+	mcpSig     string
+	mcpClients map[string]*agent.MCPClient       // sanitized server name -> client
+	mcpSchemas map[string]map[string]interface{} // full tool name -> OpenAI tool schema
 }
 
 func NewProcessStage() *ProcessStage {
@@ -637,11 +665,15 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.sandboxMgr = ctx.SandboxManager
 	s.cronMgr = ctx.CronManager
 	s.database = ctx.Database
+	s.providerConf = bindProviderSettings(ctx.AstrbotConfig)
 	if ctx.PersonaResolver != nil {
 		s.personaPrompt = ctx.PersonaResolver
 	}
 	if ctx.PersonaSkillsResolver != nil {
 		s.personaSkills = ctx.PersonaSkillsResolver
+	}
+	if ctx.UmoAliasResolver != nil {
+		s.umoAlias = ctx.UmoAliasResolver
 	}
 	return nil
 }
@@ -747,11 +779,10 @@ func (s *ProcessStage) executeHandler(ctx context.Context, event *core.Event, ha
 
 // shouldCallLLM returns true if the LLM agent should be invoked.
 func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
-	// Check if provider is enabled
-	if settings, ok := s.config["provider_settings"].(map[string]interface{}); ok {
-		if enabled, ok := settings["enable"].(bool); ok && !enabled {
-			return false
-		}
+	// Check if provider is enabled (absent key -> allowed, matching the
+	// original assertion logic).
+	if s.providerConf != nil && s.providerConf.Enable != nil && !*s.providerConf.Enable {
+		return false
 	}
 
 	// Don't call LLM if the event was already handled and stopped
@@ -764,9 +795,11 @@ func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
 		return true
 	}
 
-	// Chat is only triggered via "<prefix>[ai word] <text>" (llm_wake set by
-	// WakingCheckStage). @mention / nickname / auto friend wake only handle
-	// commands and never start a chat.
+	// Chat is triggered when the event was woken and llm_wake is set by
+	// WakingCheckStage. Prefix wake honors the optional AI wake word
+	// (provider_settings.wake_prefix); @mention / nickname / @all / friend
+	// auto-wake always enable chat (Python parity: is_at_or_wake_command runs
+	// the LLM agent).
 	if v, ok := event.GetExtra("llm_wake").(bool); ok {
 		return v
 	}
@@ -809,10 +842,10 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		}
 	}
 	// Fall back to the global default persona (provider_settings.default_personality)
-	if personaID == "" {
-		if v, ok := providerSettings["default_personality"].(string); ok {
-			personaID = v
-			providerSettings["persona"] = v
+	if personaID == "" && s.providerConf != nil {
+		personaID = s.providerConf.DefaultPersonality
+		if personaID != "" {
+			providerSettings["persona"] = personaID
 		}
 	}
 
@@ -832,8 +865,8 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// computer_use_runtime drives whether local/sandbox tools are exposed and
 	// whether the local-mode hint is appended to the system prompt.
 	computerUseRuntime := "local"
-	if v, ok := providerSettings["computer_use_runtime"].(string); ok && v != "" {
-		computerUseRuntime = v
+	if s.providerConf != nil && s.providerConf.ComputerUseRuntime != "" {
+		computerUseRuntime = s.providerConf.ComputerUseRuntime
 	}
 
 	req := &provider.ProviderRequest{
@@ -865,6 +898,13 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 
+	chatInst, ok := inst.(provider.ChatProvider)
+	if !ok {
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 提供商 " + providerType + " 不支持聊天能力"}}
+		return nil
+	}
+
 	llmCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
 
@@ -883,7 +923,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// Computer Use "local" runtime: announce host access in the system prompt.
 	switch computerUseRuntime {
 	case "local":
-		req.SystemPrompt += "\n" + localModePrompt() + "\n"
+		req.SystemPrompt += "\n" + localModePrompt(workspaceRoot(event.UnifiedMsgOrigin())) + "\n"
 	case "sandbox":
 		req.SystemPrompt += "\n" + sandboxModePrompt() + "\n"
 	}
@@ -891,8 +931,18 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// Streaming is only supported for providers that implement ChatProvider;
 	// the OpenAI-compatible path covers most backends.
 	streamingEnabled := false
-	if v, ok := providerSettings["streaming_response"].(bool); ok {
-		streamingEnabled = v
+	if s.providerConf != nil {
+		streamingEnabled = s.providerConf.StreamingResponse
+	}
+
+	// System context reminder (identifier / group name / datetime), appended as
+	// an extra user-content part like Python's astr_main_agent.
+	if reminder := s.buildSystemReminder(event); reminder != "" {
+		logger.Info("callLLMAgent: system_reminder=%q", reminder)
+		req.ExtraUserContentParts = append(req.ExtraUserContentParts, map[string]interface{}{
+			"type": "text",
+			"text": reminder,
+		})
 	}
 
 	// Tool-call loop: up to 5 rounds of tool execution + follow-up.
@@ -902,7 +952,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	streamer := newStreamSender(s, event)
 	defer streamer.flush()
 
-	resp, err := s.chatRound(llmCtx, inst, req, streamingEnabled, streamer)
+	resp, err := s.chatRound(llmCtx, chatInst, req, streamingEnabled, streamer)
 	if err != nil {
 		logger.Error("LLM call failed: %v", err)
 		event.Result = &message.MessageEventResult{}
@@ -940,7 +990,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 
 		// Follow-up request with tool results
 		req.Contexts = messages
-		resp, err = s.chatRound(llmCtx, inst, req, streamingEnabled, streamer)
+		resp, err = s.chatRound(llmCtx, chatInst, req, streamingEnabled, streamer)
 		if err != nil {
 			logger.Error("LLM tool-loop call failed: %v", err)
 			event.Result = &message.MessageEventResult{}
@@ -1004,7 +1054,13 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 			full.ToolsCallArgs = chunk.ToolsCallArgs
 			full.ToolsCallIDs = chunk.ToolsCallIDs
 		}
+		if chunk.Usage != nil {
+			full.Usage = chunk.Usage
+		}
 		if chunk.CompletionText != "" && !chunk.IsChunk {
+			// The final consolidated chunk carries the authoritative full text;
+			// replace (not append to) the accumulated deltas to avoid doubling.
+			content.Reset()
 			content.WriteString(chunk.CompletionText)
 		}
 	}
@@ -1201,6 +1257,46 @@ func (ss *streamSender) sentAny() bool {
 	return ss.sent
 }
 
+// buildSystemReminder builds the <system_reminder> context block for the LLM
+// request, mirroring Python's astr_main_agent._apply_system_context_reminder.
+func (s *ProcessStage) buildSystemReminder(event *core.Event) string {
+	if s.providerConf == nil {
+		return ""
+	}
+	var parts []string
+	if s.providerConf.Identifier {
+		nickname := event.Source.SenderName
+		if s.umoAlias != nil {
+			if alias := s.umoAlias(event.UnifiedMsgOrigin()); alias != "" {
+				nickname = alias
+			}
+		}
+		parts = append(parts, fmt.Sprintf("User ID: %s, Nickname: %s", event.Source.SenderID, nickname))
+	}
+	if s.providerConf.GroupNameDisplay && event.Source.IsGroup {
+		name := event.Source.GroupName
+		if name == "" {
+			name = event.Source.ConvID
+		}
+		parts = append(parts, fmt.Sprintf("Group name: %s", name))
+	}
+	if s.providerConf.DatetimeSystemPrompt {
+		loc := time.Local
+		if tz, ok := s.config["timezone"].(string); ok && tz != "" {
+			if l, err := time.LoadLocation(tz); err == nil {
+				loc = l
+			}
+		}
+		now := time.Now().In(loc)
+		parts = append(parts, fmt.Sprintf("Current datetime: %s, Weekday: %s",
+			now.Format("2006-01-02 15:04 (MST)"), now.Weekday().String()))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "<system_reminder>\n" + strings.Join(parts, "\n") + "</system_reminder>"
+}
+
 // recordProviderCall persists an LLM call for statistics (provider_stats).
 func (s *ProcessStage) recordProviderCall(providerCfg map[string]interface{}, umo string, resp *provider.LLMResponse) {
 	if s.database == nil || resp == nil || resp.Role == "err" {
@@ -1227,8 +1323,8 @@ func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[str
 		return systemPrompt
 	}
 	runtime := "local"
-	if v, ok := providerSettings["computer_use_runtime"].(string); ok && v != "" {
-		runtime = v
+	if s.providerConf != nil && s.providerConf.ComputerUseRuntime != "" {
+		runtime = s.providerConf.ComputerUseRuntime
 	}
 	active := s.skillMgr.ListSkills(true, runtime)
 	if len(active) == 0 {
@@ -1302,16 +1398,7 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	tools := []map[string]interface{}{}
 
 	// Built-in tools with real Go executors
-	for _, name := range builtinToolSchemas() {
-		tools = append(tools, map[string]interface{}{
-			"type": "function",
-			"function": map[string]interface{}{
-				"name":        name,
-				"description": "AstrBot 内置工具",
-				"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
-			},
-		})
-	}
+	tools = append(tools, builtinTools()...)
 
 	// Computer Use local runtime tools (shell/python/file/grep)
 	if computerUseRuntime == "local" {
@@ -1326,28 +1413,133 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	}
 
 	// MCP server tools (enabled servers from data/mcp_server.json)
-	if data, err := os.ReadFile("data/mcp_server.json"); err == nil {
-		var mcpCfg struct {
-			McpServers map[string]map[string]interface{} `json:"mcpServers"`
+	s.loadMCPTools()
+	for _, schema := range s.mcpSchemas {
+		tools = append(tools, schema)
+	}
+	return tools
+}
+
+// loadMCPTools (re)loads enabled MCP servers from data/mcp_server.json and
+// caches their tool schemas under "<sanitized_server>.<tool_name>".
+func (s *ProcessStage) loadMCPTools() {
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+
+	data, err := os.ReadFile("data/mcp_server.json")
+	if err != nil {
+		s.mcpClients = nil
+		s.mcpSchemas = nil
+		s.mcpLoaded = true
+		return
+	}
+	var mcpCfg struct {
+		McpServers map[string]map[string]interface{} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(data, &mcpCfg); err != nil {
+		logger.Warn("Failed to parse data/mcp_server.json: %v", err)
+		s.mcpClients = nil
+		s.mcpSchemas = nil
+		s.mcpLoaded = true
+		return
+	}
+
+	// Skip reloading when the file is unchanged since the last load.
+	sig, _ := json.Marshal(mcpCfg)
+	if s.mcpLoaded && s.mcpSig == string(sig) {
+		return
+	}
+
+	// Clean up previously connected clients.
+	if s.mcpLoaded {
+		for _, cl := range s.mcpClients {
+			cl.Cleanup()
 		}
-		if json.Unmarshal(data, &mcpCfg) == nil {
-			for name, cfg := range mcpCfg.McpServers {
-				if active, _ := cfg["active"].(bool); !active {
-					continue
-				}
-				safeName := sanitizeToolName(name)
-				tools = append(tools, map[string]interface{}{
-					"type": "function",
-					"function": map[string]interface{}{
-						"name":        safeName,
-						"description": "MCP 服务器工具（" + name + "）",
-						"parameters":  map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
-					},
-				})
+	}
+	s.mcpClients = make(map[string]*agent.MCPClient)
+	s.mcpSchemas = make(map[string]map[string]interface{})
+
+	for name, cfg := range mcpCfg.McpServers {
+		if active, _ := cfg["active"].(bool); !active {
+			continue
+		}
+		safeName := sanitizeToolName(name)
+		client := agent.NewMCPClient(name, cfg)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := client.Connect(ctx)
+		cancel()
+		if err != nil {
+			logger.Warn("MCP server %q connect failed: %v", name, err)
+			continue
+		}
+		s.mcpClients[safeName] = client
+		for _, tool := range client.Tools() {
+			fullName := safeName + "." + sanitizeToolName(tool.Name)
+			schema := map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":        fullName,
+					"description": "MCP 服务器工具（" + name + "）: " + tool.Description,
+					"parameters":  tool.InputSchema,
+				},
+			}
+			s.mcpSchemas[fullName] = schema
+		}
+		logger.Info("MCP server %q connected (%d tools)", name, len(client.Tools()))
+	}
+	s.mcpSig = string(sig)
+	s.mcpLoaded = true
+}
+
+// executeMCPTool dispatches a tool call to the matching MCP server. The tool
+// name format is "<sanitized_server>.<tool_name>". Returns ("", false) when
+// the name is not an MCP tool.
+func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map[string]interface{}) (string, bool) {
+	dot := strings.IndexByte(name, '.')
+	if dot <= 0 || dot == len(name)-1 {
+		return "", false
+	}
+	serverName := name[:dot]
+	toolName := name[dot+1:]
+
+	s.mcpMu.Lock()
+	client := s.mcpClients[serverName]
+	s.mcpMu.Unlock()
+	if client == nil {
+		return fmt.Sprintf("MCP 工具 %s 执行失败: 服务器 %q 未连接", name, serverName), true
+	}
+	result, err := client.CallTool(ctx, toolName, args)
+	if err != nil {
+		return fmt.Sprintf("MCP 工具 %s 执行失败: %v", name, err), true
+	}
+	if result.IsError {
+		return fmt.Sprintf("MCP 工具 %s 返回错误: %s", name, mcpContentText(result.Content)), true
+	}
+	text := mcpContentText(result.Content)
+	if text == "" {
+		return fmt.Sprintf("MCP 工具 %s 执行成功（无文本内容）", name), true
+	}
+	return text, true
+}
+
+// mcpContentText extracts the textual content from an MCP tool call result,
+// joining text-type blocks with newlines.
+func mcpContentText(content []map[string]interface{}) string {
+	var parts []string
+	for _, block := range content {
+		blockType, _ := block["type"].(string)
+		switch blockType {
+		case "text":
+			if text, ok := block["text"].(string); ok {
+				parts = append(parts, text)
+			}
+		default:
+			if text, ok := block["text"].(string); ok && text != "" {
+				parts = append(parts, text)
 			}
 		}
 	}
-	return tools
+	return strings.Join(parts, "\n")
 }
 
 // sanitizeToolName replaces characters invalid for OpenAI tool names
@@ -1365,19 +1557,147 @@ func sanitizeToolName(name string) string {
 	return sb.String()
 }
 
-// builtinToolSchemas returns the names of built-in tools with executors.
-func builtinToolSchemas() []string {
-	return []string{}
+// builtinTools returns the OpenAI tool schemas for built-in tools that have
+// real Go executors in executeTool. These are always available regardless of
+// the Computer Use runtime.
+func builtinTools() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "get_current_time",
+				"description": "获取当前日期和时间。可选指定 IANA 时区（如 Asia/Shanghai、UTC），缺省使用本地时区。",
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"timezone": map[string]interface{}{
+							"type":        "string",
+							"description": "IANA 时区名，如 Asia/Shanghai",
+						},
+					},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "web_fetch",
+				"description": "抓取指定 URL 的网页内容并返回纯文本（自动去除 HTML 标签）。用于联网查询资料、查看网页。",
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"url": map[string]interface{}{
+							"type":        "string",
+							"description": "要抓取的完整 URL（含 http:// 或 https://）",
+						},
+						"max_length": map[string]interface{}{
+							"type":        "integer",
+							"description": "返回的最大字符数，默认 20000",
+						},
+					},
+					"required": []interface{}{"url"},
+				},
+			},
+		},
+	}
+}
+
+// executeBuiltinTool runs a built-in tool by name and returns the result text.
+// Returns (result, handled); handled=false means the name is not a built-in.
+func executeBuiltinTool(name string, args map[string]interface{}) (string, bool) {
+	switch name {
+	case "get_current_time":
+		return executeGetCurrentTime(argString(args, "timezone")), true
+	case "web_fetch":
+		return executeWebFetch(argString(args, "url"), argInt(args, "max_length", 20000)), true
+	}
+	return "", false
+}
+
+// executeGetCurrentTime formats the current time, optionally in a given IANA
+// timezone.
+func executeGetCurrentTime(timezone string) string {
+	now := time.Now()
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.Local
+	}
+	return now.In(loc).Format("2006-01-02 15:04:05") + " " + loc.String()
+}
+
+// executeWebFetch fetches a URL and converts its content to plain text,
+// truncated to maxLength characters.
+func executeWebFetch(rawURL string, maxLength int) string {
+	if rawURL == "" {
+		return "web_fetch 错误: 缺少 url 参数"
+	}
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		return "web_fetch 错误: url 必须以 http:// 或 https:// 开头"
+	}
+	if maxLength <= 0 {
+		maxLength = 20000
+	}
+	if maxLength > 200000 {
+		maxLength = 200000
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return fmt.Sprintf("web_fetch 错误: 请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Sprintf("web_fetch 错误: HTTP %d", resp.StatusCode)
+	}
+
+	limited := io.LimitReader(resp.Body, int64(maxLength*2))
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return fmt.Sprintf("web_fetch 错误: 读取失败: %v", err)
+	}
+
+	text := string(body)
+	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/html") {
+		text = htmlToText(body)
+	}
+	text = strings.TrimSpace(text)
+	if len(text) > maxLength {
+		text = text[:maxLength]
+	}
+	if text == "" {
+		return "web_fetch 结果: 页面无文本内容"
+	}
+	return text
+}
+
+// htmlToText strips HTML tags/entities, collapsing runs of whitespace into a
+// single space.
+func htmlToText(body []byte) string {
+	// Drop script/style blocks first so their content is not surfaced.
+	s := string(body)
+	s = tagBlockRe.ReplaceAllString(s, " ")
+	s = tagRe.ReplaceAllString(s, " ")
+	s = html.UnescapeString(s)
+	s = whitespaceRe.ReplaceAllString(s, " ")
+	return s
 }
 
 // executeTool runs a tool call and returns the result text.
-// Dispatches to the Computer Use local or sandbox executors; MCP execution is pending.
+// Dispatches to built-in tools, MCP servers, and the Computer Use local or
+// sandbox executors.
 func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args map[string]interface{}) string {
 	umo := event.UnifiedMsgOrigin()
 	if runtime == "sandbox" {
 		if result, handled := s.executeSandboxTool(name, args); handled {
 			return result
 		}
+	}
+	if result, handled := executeBuiltinTool(name, args); handled {
+		return result
+	}
+	if result, handled := s.executeMCPTool(context.Background(), name, args); handled {
+		return result
 	}
 	switch name {
 	case "astrbot_execute_shell":
@@ -1401,20 +1721,14 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 }
 
 // addCronTools reports whether the proactive future_task tool should be
-// injected (provider_settings.proactive_capability.add_cron_tools, default true).
+// injected (provider_settings.proactive_capability.add_cron_tools; absent key
+// defaults to true).
 func addCronTools(config map[string]interface{}) bool {
-	ps, _ := config["provider_settings"].(map[string]interface{})
-	if ps == nil {
+	ps := bindProviderSettings(config)
+	if ps == nil || ps.Proactive.AddCronTools == nil {
 		return true
 	}
-	pc, _ := ps["proactive_capability"].(map[string]interface{})
-	if pc == nil {
-		return true
-	}
-	if v, ok := pc["add_cron_tools"].(bool); ok {
-		return v
-	}
-	return true
+	return *ps.Proactive.AddCronTools
 }
 
 // executeSandboxTool routes computer-use tools into the sandbox runtime.
@@ -1486,7 +1800,10 @@ func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]int
 		providerSettings = map[string]interface{}{}
 	}
 
-	selected, _ := providerSettings["default_provider_id"].(string)
+	selected := ""
+	if s.providerConf != nil {
+		selected = s.providerConf.DefaultProviderID
+	}
 
 	if selected != "" {
 		for _, p := range providers {
@@ -1583,17 +1900,10 @@ func NewResultDecorateStage() *ResultDecorateStage {
 func (s *ResultDecorateStage) Name() string { return "result_decorate" }
 
 func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
-	if platformSettings, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
-		if v, ok := platformSettings["reply_prefix"].(string); ok {
-			s.replyPrefix = v
-		}
-		if v, ok := platformSettings["reply_with_mention"].(bool); ok {
-			s.replyWithMention = v
-		}
-		if v, ok := platformSettings["reply_with_quote"].(bool); ok {
-			s.replyWithQuote = v
-		}
-	}
+	ps := bindPlatformSettings(ctx.AstrbotConfig)
+	s.replyPrefix = ps.ReplyPrefix
+	s.replyWithMention = ps.ReplyWithMention
+	s.replyWithQuote = ps.ReplyWithQuote
 	return nil
 }
 

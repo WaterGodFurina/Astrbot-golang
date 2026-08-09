@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/AstrBotDevs/AstrBot/internal/provider"
@@ -105,13 +106,17 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 		defer resp.Body.Close()
 		defer close(ch)
 		decoder := json.NewDecoder(resp.Body)
+		var usage *provider.TokenUsage
+		var content strings.Builder
 		for decoder.More() {
 			var chunk struct {
 				Message struct {
 					Role    string `json:"role"`
 					Content string `json:"content"`
 				} `json:"message"`
-				Done bool `json:"done"`
+				PromptEvalCount int  `json:"prompt_eval_count"`
+				EvalCount       int  `json:"eval_count"`
+				Done            bool `json:"done"`
 			}
 			if err := decoder.Decode(&chunk); err != nil {
 				if err == io.EOF {
@@ -120,9 +125,25 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 				return
 			}
 			if chunk.Message.Content != "" {
+				content.WriteString(chunk.Message.Content)
 				ch <- &provider.LLMResponse{
 					Role:           chunk.Message.Role,
+					IsChunk:        true,
 					CompletionText: chunk.Message.Content,
+				}
+			}
+			if chunk.PromptEvalCount > 0 || chunk.EvalCount > 0 {
+				usage = &provider.TokenUsage{
+					InputOther: chunk.PromptEvalCount,
+					Output:     chunk.EvalCount,
+				}
+			}
+			if chunk.Done {
+				// Final chunk: emit consolidated response with usage.
+				ch <- &provider.LLMResponse{
+					Role:           "assistant",
+					CompletionText: content.String(),
+					Usage:          usage,
 				}
 			}
 		}

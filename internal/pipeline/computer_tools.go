@@ -28,6 +28,23 @@ var errStopGrep = fmt.Errorf("grep result limit reached")
 
 const sandboxWorkdir = "/workspace"
 
+// sandboxResolvePath resolves a tool-supplied path for the sandbox runtime.
+// Mirroring Python's fs.py rule "In sandbox runtime, relative paths are passed
+// through unchanged", relative paths resolve under the sandbox working
+// directory (/workspace); absolute paths are used as-is. Paths are normalized
+// to POSIX separators so they are safe to hand to the container.
+func sandboxResolvePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return path
+	}
+	p := filepath.ToSlash(path)
+	if !strings.HasPrefix(p, "/") {
+		p = sandboxWorkdir + "/" + p
+	}
+	return p
+}
+
 func sandboxShell(ctx context.Context, mgr *sandbox.Manager, command string) string {
 	if strings.TrimSpace(command) == "" {
 		return "Error executing command: `command` must be a non-empty string."
@@ -61,12 +78,9 @@ func sandboxPython(ctx context.Context, mgr *sandbox.Manager, code string) strin
 }
 
 func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, path string) string {
-	path = strings.TrimSpace(path)
+	path = sandboxResolvePath(path)
 	if path == "" {
 		return "Error reading file: `path` must be a non-empty string."
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
 	}
 	content, err := mgr.ReadFile(ctx, path)
 	if err != nil {
@@ -76,12 +90,9 @@ func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, path string) str
 }
 
 func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, path, content string) string {
-	path = strings.TrimSpace(path)
+	path = sandboxResolvePath(path)
 	if path == "" {
 		return "Error writing file: `path` must be a non-empty string."
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
 	}
 	if err := mgr.WriteFile(ctx, path, content); err != nil {
 		return "Error writing file: " + err.Error()
@@ -90,12 +101,9 @@ func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, path, content s
 }
 
 func sandboxFileEdit(ctx context.Context, mgr *sandbox.Manager, path, old, new string, replaceAll bool) string {
-	path = strings.TrimSpace(path)
+	path = sandboxResolvePath(path)
 	if path == "" || old == "" {
 		return "Error editing file: `path` and `old` must be non-empty."
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
 	}
 	content, err := mgr.ReadFile(ctx, path)
 	if err != nil {
@@ -160,38 +168,93 @@ var localToolNames = []string{
 
 // workspaceRoot returns the per-conversation workspace directory used as the
 // cwd for shell/python tools and the base for relative file paths.
+//
+// The returned path is always absolute so that file tools, shell and python
+// executors all agree on the same base regardless of the process working
+// directory at call time.
 func workspaceRoot(umo string) string {
 	sanitized := regexp.MustCompile(`[^A-Za-z0-9_.\-]`).ReplaceAllString(umo, "_")
 	dir := filepath.Join("data", "workspaces", sanitized)
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
 	_ = os.MkdirAll(dir, 0755)
 	return dir
 }
 
-// allowedReadRoots lists directories file tools may read from.
-func allowedReadRoots(umo string) []string {
+// localTempRoots lists the temporary directories (mirroring Python's
+// get_astrbot_temp_path and get_astrbot_system_tmp_path) that file tools may
+// read from and write to.
+func localTempRoots() []string {
 	return []string{
-		workspaceRoot(umo),
-		filepath.Join("data", "skills"),
-		filepath.Join("data", "plugins"),
+		filepath.Join("data", "temp"),
+		filepath.Join(os.TempDir(), ".astrbot"),
 	}
 }
 
+// allowedReadRoots lists directories file tools may read from.
+func allowedReadRoots(umo string) []string {
+	return append([]string{
+		workspaceRoot(umo),
+		filepath.Join("data", "skills"),
+		filepath.Join("data", "plugins"),
+	}, localTempRoots()...)
+}
+
+// allowedWriteRoots lists directories file tools may write to (workspace and
+// temporary directories only; skills and plugins are read-only).
+func allowedWriteRoots(umo string) []string {
+	return append([]string{
+		workspaceRoot(umo),
+	}, localTempRoots()...)
+}
+
+// expandHome expands a leading ~ or ~/ to the current user's home directory,
+// mirroring Python's pathlib.Path.expanduser used in _resolve_tool_path.
+func expandHome(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	if path == "~" {
+		return home
+	}
+	if strings.HasPrefix(path, "~/") {
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
 // resolveLocalPath resolves a tool-supplied path relative to the workspace
-// root and enforces it stays within the allowed roots.
+// root, expanding ~ and normalizing to an absolute path, then enforces it
+// stays within the allowed roots. Returning an absolute path (like Python's
+// Path.resolve) lets the model feed the reported path straight back into
+// another tool without it being re-anchored under the workspace again.
 func resolveLocalPath(path, umo string, write bool) (string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return "", fmt.Errorf("`path` must be a non-empty string")
 	}
-	abs := path
-	if !filepath.IsAbs(abs) {
-		abs = filepath.Join(workspaceRoot(umo), path)
+	expanded := expandHome(path)
+	resolved := expanded
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(workspaceRoot(umo), expanded)
 	}
-	abs = filepath.Clean(abs)
-	for _, root := range allowedReadRoots(umo) {
-		rootAbs, _ := filepath.Abs(root)
-		if within, err := pathWithin(rootAbs, abs); err == nil && within {
-			return abs, nil
+	if abs, err := filepath.Abs(resolved); err == nil {
+		resolved = abs
+	}
+	resolved = filepath.Clean(resolved)
+	roots := allowedReadRoots(umo)
+	if write {
+		roots = allowedWriteRoots(umo)
+	}
+	for _, root := range roots {
+		rootAbs, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		if within, err := pathWithin(rootAbs, resolved); err == nil && within {
+			return resolved, nil
 		}
 	}
 	return "", fmt.Errorf("path %q is outside the allowed workspace and skill directories", path)
@@ -216,15 +279,24 @@ func pathWithin(root, target string) (bool, error) {
 	return !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "..", nil
 }
 
-// localModePrompt mirrors Python's _build_local_mode_prompt().
-func localModePrompt() string {
+// localModePrompt mirrors Python's _build_local_mode_prompt(). It announces
+// the host working directory so the model knows where shell/python/file tools
+// run and prefers relative paths (matching the tool descriptions that say
+// "If relative, will be in workspace root").
+func localModePrompt(workspacePath string) string {
 	osName := runtime.GOOS
+	workspaceNote := "Your working directory is `" + workspacePath + "`. " +
+		"Shell and Python commands run with this as their current directory " +
+		"(equivalent to `cd <working_dir> && <your command>`). Prefer relative paths; " +
+		"`astrbot_file_*` tools resolve relative paths from here and reject absolute " +
+		"paths outside the workspace, skills, plugins and temporary directories."
 	if osName == "windows" {
 		return "You have access to the host local environment and can execute shell commands and Python code. " +
 			"Current operating system: " + osName + ". " +
 			"The runtime shell is Windows PowerShell 5.1 (powershell.exe). " +
 			"Use Windows PowerShell 5.1-compatible syntax and cmdlets; do not use " +
 			"PowerShell 7-only syntax or assume Unix commands like cat/ls/grep are available. " +
+			workspaceNote + " " +
 			"Local shell commands automatically return a managed session when they " +
 			"outlive the initial wait. Use `astrbot_shell_session` to list, poll, " +
 			"write raw text or complete lines to, interrupt, or terminate those sessions. " +
@@ -235,6 +307,7 @@ func localModePrompt() string {
 	return "You have access to the host local environment and can execute shell commands and Python code. " +
 		"Current operating system: " + osName + ". " +
 		"The runtime shell is Unix-like. Use POSIX-compatible shell commands. " +
+		workspaceNote + " " +
 		"Local shell commands automatically return a managed session when they " +
 		"outlive the initial wait. Use `astrbot_shell_session` to list, poll, " +
 		"write raw text or complete lines to, interrupt, or terminate those sessions. " +
@@ -266,13 +339,13 @@ func collectLocalTools() []map[string]interface{} {
 			"type": "function",
 			"function": map[string]interface{}{
 				"name":        "astrbot_execute_shell",
-				"description": "Execute a command in the shell.",
+				"description": "The shell command to execute in the current runtime shell (for example, powershell.exe on Windows). Equivalent to `cd {working_dir} && {command}` where {working_dir} is the conversation workspace. Prefer relative paths.",
 				"parameters": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
 						"command": map[string]interface{}{
 							"type":        "string",
-							"description": "The shell command to execute in the current runtime shell.",
+							"description": "The shell command to execute in the current workspace.",
 						},
 						"background": map[string]interface{}{
 							"type":        "boolean",

@@ -1,0 +1,440 @@
+// Package toolchain manages the self-contained Go toolchain used to compile
+// plugins on the user's machine.
+//
+// Strategy (in order of preference):
+//  1. ASTRBOT_GO_BIN — explicit override (best for Termux/dev machines).
+//  2. A bundled official Go distribution at the per-OS user directory
+//     (downloaded and extracted on first use).
+//  3. A `go` binary already on PATH (system-installed Go).
+//  4. Download the official Go archive and extract it into the user dir.
+//
+// All artifacts live under the user's private directories, never in system
+// locations, so no root is required.
+package toolchain
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/AstrBotDevs/AstrBot/internal/log"
+)
+
+var logger = log.GetDefault().WithComponent("Toolchain")
+
+// DefaultGoVersion is the Go release bundled when none is pinned via
+// ASTRBOT_GO_VERSION.
+const DefaultGoVersion = "1.24.3"
+
+// envOverrides the values honored by the toolchain.
+const (
+	EnvGoBin    = "ASTRBOT_GO_BIN"     // path to an existing `go` binary
+	EnvGoVer    = "ASTRBOT_GO_VERSION" // e.g. "1.24.3"
+	EnvGoMirror = "ASTRBOT_GO_MIRROR"  // base URL of an official Go archive mirror
+)
+
+// Toolchain locates (and if needed provisions) a Go toolchain for building
+// plugin subprocesses.
+type Toolchain struct {
+	// Version is the Go release to bundle, e.g. "1.24.3".
+	Version string
+}
+
+// New returns a Toolchain using the version from ASTRBOT_GO_VERSION or the
+// default.
+func New() *Toolchain {
+	v := os.Getenv(EnvGoVer)
+	if v == "" {
+		v = DefaultGoVersion
+	}
+	return &Toolchain{Version: v}
+}
+
+// GoBin returns the resolved `go` binary path without provisioning, or an
+// error if no usable toolchain could be found and none is cached.
+func (tc *Toolchain) GoBin() (string, error) {
+	if p := os.Getenv(EnvGoBin); p != "" {
+		if tc.isExecutable(p) {
+			logger.Info("Using Go toolchain from ASTRBOT_GO_BIN: %s", p)
+			return p, nil
+		}
+		return "", fmt.Errorf("ASTRBOT_GO_BIN=%q does not point to an executable", p)
+	}
+
+	if tc.BundledRoot() != "" {
+		if bin := filepath.Join(tc.BundledRoot(), "bin", exe("go")); tc.isExecutable(bin) {
+			logger.Info("Using bundled Go toolchain: %s", bin)
+			return bin, nil
+		}
+	}
+
+	if p, err := exec.LookPath("go"); err == nil {
+		logger.Info("Using system Go toolchain: %s", p)
+		return p, nil
+	}
+
+	return "", fmt.Errorf("no Go toolchain found (set %s or run Ensure())", EnvGoBin)
+}
+
+// Ensure provisions the bundled toolchain (download + extract) if needed and
+// returns the `go` binary path. It never overwrites an existing bundle.
+func (tc *Toolchain) Ensure() (string, error) {
+	if bin, err := tc.GoBin(); err == nil {
+		return bin, nil
+	}
+	return tc.downloadAndExtract()
+}
+
+// GOROOT returns the root of the bundled distribution, or "" if not present.
+func (tc *Toolchain) GOROOT() string {
+	root := tc.BundledRoot()
+	if root == "" {
+		return ""
+	}
+	return filepath.Join(root, "go")
+}
+
+// GOPATH returns the private module cache dir for plugin compilation.
+func (tc *Toolchain) GOPATH() string {
+	return filepath.Join(userStateDir(), "gopath")
+}
+
+// BaseDir returns the per-OS private directory that hosts the toolchain.
+func (tc *Toolchain) BaseDir() string {
+	return filepath.Join(userStateDir(), "toolchain")
+}
+
+// BundledRoot returns the directory the official archive is extracted into
+// (<BaseDir>), or "" when the current platform cannot host a bundled Go.
+func (tc *Toolchain) BundledRoot() string {
+	if !supportsBundledGo() {
+		return ""
+	}
+	return tc.BaseDir()
+}
+
+// BuildEnv returns the environment for compiling a plugin with the bundled
+// (or system) toolchain. extra entries override defaults.
+//
+// GOROOT is intentionally NOT set: since Go 1.20 the go command infers its
+// GOROOT from the executable's location, which covers both the bundled
+// toolchain (<BaseDir>/go/bin/go) and a system-installed go.
+func (tc *Toolchain) BuildEnv(extra map[string]string) []string {
+	env := []string{
+		"GO111MODULE=on",
+		"GOFLAGS=-mod=mod",
+		"CGO_ENABLED=0",
+		"GOPATH=" + tc.GOPATH(),
+	}
+	for k, v := range extra {
+		env = append(env, k+"="+v)
+	}
+	return append(os.Environ(), env...)
+}
+
+// downloadAndExtract provisions the official Go distribution under BaseDir.
+func (tc *Toolchain) downloadAndExtract() (string, error) {
+	if !supportsBundledGo() {
+		return "", fmt.Errorf("bundled Go is not supported on %s/%s (set %s or install Go, e.g. `pkg install golang` on Termux)",
+			runtime.GOOS, runtime.GOARCH, EnvGoBin)
+	}
+
+	base := tc.BaseDir()
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return "", fmt.Errorf("create toolchain dir: %w", err)
+	}
+
+	archive := archiveName(tc.Version)
+	dest := filepath.Join(base, archive)
+	url := downloadURL(archive)
+
+	logger.Info("Downloading Go toolchain %s from %s", archive, url)
+	if err := downloadFile(url, dest); err != nil {
+		return "", fmt.Errorf("download %s: %w", url, err)
+	}
+	if err := tc.verifyChecksum(dest, archive); err != nil {
+		logger.Warn("Checksum verification failed for %s: %v (proceeding anyway)", archive, err)
+	}
+
+	logger.Info("Extracting Go toolchain %s", archive)
+	if err := extractArchive(dest, base); err != nil {
+		return "", fmt.Errorf("extract %s: %w", archive, err)
+	}
+	_ = os.Remove(dest)
+
+	bin := filepath.Join(base, "go", "bin", exe("go"))
+	if !tc.isExecutable(bin) {
+		return "", fmt.Errorf("extracted toolchain missing go binary: %s", bin)
+	}
+	return bin, nil
+}
+
+// verifyChecksum fetches "<file>.sha256" from the mirror and compares it.
+// Returns an error on any mismatch/failure.
+func (tc *Toolchain) verifyChecksum(dest, archive string) error {
+	if os.Getenv("ASTRBOT_GO_SKIP_VERIFY") != "" {
+		return nil
+	}
+	sumURL := checksumURL(archive)
+	resp, err := http.Get(sumURL)
+	if err != nil {
+		return fmt.Errorf("fetch checksum: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("checksum endpoint returned %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return fmt.Errorf("read checksum: %w", err)
+	}
+	fields := strings.Fields(string(body))
+	if len(fields) == 0 {
+		return fmt.Errorf("unexpected checksum body: %q", body)
+	}
+	want := strings.TrimSpace(fields[0])
+
+	f, err := os.Open(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("sha256 mismatch: got %s want %s", got, want)
+	}
+	logger.Info("Checksum verified for %s", archive)
+	return nil
+}
+
+func (tc *Toolchain) isExecutable(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
+}
+
+// downloadURL builds the mirror-aware URL for an official archive file.
+func downloadURL(archive string) string {
+	base := os.Getenv(EnvGoMirror)
+	if base == "" {
+		base = "https://go.dev/dl"
+	}
+	return strings.TrimRight(base, "/") + "/" + archive
+}
+
+// checksumURL builds the URL of the sha256 file. go.dev/dl only serves the
+// archives (redirecting to dl.google.com); the .sha256 files live on
+// dl.google.com directly.
+func checksumURL(archive string) string {
+	base := os.Getenv(EnvGoMirror)
+	if base == "" {
+		base = "https://dl.google.com/go"
+	}
+	return strings.TrimRight(base, "/") + "/" + archive + ".sha256"
+}
+
+// archiveName returns the official distribution archive file name for the
+// current platform, e.g. "go1.24.3.linux-amd64.tar.gz".
+func archiveName(version string) string {
+	ext := "tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = "zip"
+	}
+	return fmt.Sprintf("go%s.%s-%s.%s", version, runtime.GOOS, runtime.GOARCH, ext)
+}
+
+// supportsBundledGo reports whether the official Go archives cover this
+// platform. Termux (android) and exotic GOOS/GOARCH pairs are not covered.
+func supportsBundledGo() bool {
+	switch runtime.GOOS {
+	case "linux", "darwin", "windows":
+	default:
+		return false
+	}
+	switch runtime.GOARCH {
+	case "amd64", "arm64", "386", "arm":
+		return true
+	default:
+		return false
+	}
+}
+
+// userStateDir returns the per-OS private data dir for AstrBot Go state.
+//
+//	Windows: %LOCALAPPDATA%\AstrBot-Go
+//	macOS:   ~/Library/Application Support/AstrBot-Go
+//	other:   ~/.local/share/astrbot-go  (Linux / Termux)
+func userStateDir() string {
+	switch runtime.GOOS {
+	case "windows":
+		if base := os.Getenv("LOCALAPPDATA"); base != "" {
+			return filepath.Join(base, "AstrBot-Go")
+		}
+	case "darwin":
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "Library", "Application Support", "AstrBot-Go")
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "share", "astrbot-go")
+	}
+	return "."
+}
+
+// downloadFile streams a URL to dest with a progress timeout.
+func downloadFile(url, dest string) error {
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+// extractArchive unpacks a Go official archive (tar.gz or zip) into dir,
+// preserving the leading "go/" component so GOROOT becomes dir/go.
+func extractArchive(src, dir string) error {
+	if strings.HasSuffix(src, ".zip") {
+		return extractZip(src, dir)
+	}
+	return extractTarGz(src, dir)
+}
+
+func extractTarGz(src, dir string) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target, err := safeJoin(dir, hdr.Name)
+		if err != nil {
+			return err
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&0o755)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, tr); err != nil {
+				out.Close()
+				return err
+			}
+			out.Close()
+		}
+	}
+}
+
+func extractZip(src, dir string) error {
+	zr, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	for _, zf := range zr.File {
+		target, err := safeJoin(dir, zf.Name)
+		if err != nil {
+			return err
+		}
+		if zf.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		rc, err := zf.Open()
+		if err != nil {
+			return err
+		}
+		out, err := os.Create(target)
+		if err != nil {
+			rc.Close()
+			return err
+		}
+		if _, err := io.Copy(out, rc); err != nil {
+			out.Close()
+			rc.Close()
+			return err
+		}
+		out.Close()
+		rc.Close()
+	}
+	return nil
+}
+
+// safeJoin joins base+rel and rejects paths escaping base.
+func safeJoin(base, rel string) (string, error) {
+	if rel == "" || rel == "." {
+		return base, nil
+	}
+	target := filepath.Join(base, rel)
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return "", err
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return "", err
+	}
+	relPath, err := filepath.Rel(absBase, absTarget)
+	if err != nil || relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("archive entry escapes destination: %s", rel)
+	}
+	return target, nil
+}
+
+func exe(name string) string {
+	if runtime.GOOS == "windows" {
+		return name + ".exe"
+	}
+	return name
+}

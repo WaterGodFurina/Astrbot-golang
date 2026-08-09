@@ -31,6 +31,7 @@ type EventSource struct {
 	SenderID   string
 	SenderName string
 	ConvID     string // conversation/group ID
+	GroupName  string // group display name, when known
 	IsGroup    bool
 	IsAtBot    bool
 	IsAdmin    bool
@@ -224,6 +225,24 @@ func (bus *EventBus) Publish(event *Event) error {
 	default:
 		return fmt.Errorf("event bus queue full")
 	}
+}
+
+// PublishDelayed re-enqueues an event after the given delay. Used by the
+// rate-limit stall strategy so an over-window message is processed once the
+// window frees up instead of being dropped. If the queue is still full when
+// the timer fires, the event is dropped.
+func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
+	if delay <= 0 {
+		if err := bus.Publish(event); err != nil {
+			logger.Warn("Delayed publish (immediate) failed: %v", err)
+		}
+		return
+	}
+	time.AfterFunc(delay, func() {
+		if err := bus.Publish(event); err != nil {
+			logger.Warn("Delayed publish failed (queue full, event dropped): %v", err)
+		}
+	})
 }
 
 // Stop shuts down the event bus.

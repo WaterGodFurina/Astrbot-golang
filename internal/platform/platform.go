@@ -521,6 +521,14 @@ func (b *BaseAdapter) PublishEvent(msgStr string, msgObj *AstrBotMessage) error 
 	// Build message chain from AstrBotMessage components
 	chain := &message.MessageChain{Chain: msgObj.Message}
 
+	// Source identity: prefer the adapter's real bot id (msgObj.SelfID) over
+	// the config instance id, so @mention wake matching compares like-for-like
+	// (Python uses event.get_self_id()).
+	selfID := b.id
+	if msgObj.SelfID != "" {
+		selfID = msgObj.SelfID
+	}
+
 	event := &core.Event{
 		Type:       core.EventMessage,
 		Message:    chain,
@@ -536,7 +544,7 @@ func (b *BaseAdapter) PublishEvent(msgStr string, msgObj *AstrBotMessage) error 
 		},
 		Source: core.EventSource{
 			Platform:   b.platform,
-			SelfID:     b.id,
+			SelfID:     selfID,
 			SenderID:   msgObj.Sender.UserID,
 			SenderName: msgObj.Sender.Nickname,
 			ConvID:     convID,

@@ -237,6 +237,13 @@ func (pm *PasswordManager) JWTSecret() string {
 	return pm.jwtSecret
 }
 
+// HashedPassword returns the PBKDF2 password hash.
+func (pm *PasswordManager) HashedPassword() string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.hashedPassword
+}
+
 // PasswordChangeRequired returns whether the user must change their password.
 func (pm *PasswordManager) PasswordChangeRequired() bool {
 	pm.mu.RLock()

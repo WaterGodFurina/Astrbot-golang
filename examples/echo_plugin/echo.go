@@ -1,81 +1,66 @@
-// Example AstrBot Go plugin: "echo"
+// Example AstrBot Go plugin: "echo" (subprocess runtime).
 //
-// Build with:
+// Build with the bundled/system Go toolchain (this module is independent of
+// the AstrBot host):
 //
-//	go build -buildmode=plugin -o data/plugins/echo.so examples/echo_plugin/echo.go
+//	go build -o data/plugins/echo-<GOOS>-<GOARCH> .
 //
-// This plugin registers an "echo" command that echoes the user's message back.
+// The host launches the resulting binary as a child process and talks to it
+// over gRPC (go-plugin). This plugin registers an "echo" command that echoes
+// the user's message back.
 package main
 
 import (
-	"context"
 	"strings"
 
-	"github.com/AstrBotDevs/AstrBot/internal/plugin"
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 )
 
-func PluginName() string        { return "echo" }
-func PluginVersion() string     { return "1.0.0" }
-func PluginDescription() string { return "Echoes your message back" }
-
-// GetConfigSchema exports the plugin's config schema (optional symbol).
-// The dashboard renders a config dialog from this and saves to
-// data/plugins/<name>/config.json.
-func GetConfigSchema() map[string]interface{} {
-	return map[string]interface{}{
-		"description": "Echo 插件配置",
-		"type":        "object",
-		"items": map[string]interface{}{
-			"prefix": map[string]interface{}{
-				"description": "回复前缀",
-				"type":        "string",
-				"default":     "[Echo] ",
-			},
-			"upper": map[string]interface{}{
-				"description": "转大写",
-				"type":        "bool",
-				"default":     false,
-			},
-		},
-	}
-}
-
-func Init(ctx *plugin.Context) error {
-	ctx.Logger.Info("Echo plugin v1.0.0 loaded")
-	return nil
-}
-
-func RegisterHandlers(reg *plugin.HandlerRegistry) {
-	reg.RegisterCommand(plugin.CommandHandler{
+func main() {
+	sdk.Serve(&sdk.Plugin{
 		Name:        "echo",
-		Aliases:     []string{"repeat"},
-		Description: "Echoes your message",
-		Usage:       "echo <text>",
-		Permission:  "everyone",
-		HandlerEx: func(pc *plugin.Context, ctx context.Context, args []string) (string, error) {
-			if len(args) == 0 {
-				return "Usage: echo <text>", nil
-			}
-			text := strings.Join(args, " ")
-			cfg := pc.GetConfig("echo")
-			if p, ok := cfg["prefix"].(string); ok && p != "" {
-				text = p + text
-			}
-			if upper, ok := cfg["upper"].(bool); ok && upper {
-				text = strings.ToUpper(text)
-			}
-			return text, nil
+		Version:     "2.0.0",
+		Description: "Echoes your message back",
+		Author:      "AstrBot Devs",
+		ConfigSchema: map[string]any{
+			"description": "Echo 插件配置",
+			"type":        "object",
+			"items": map[string]any{
+				"prefix": map[string]any{
+					"description": "回复前缀",
+					"type":        "string",
+					"default":     "[Echo] ",
+				},
+				"upper": map[string]any{
+					"description": "转大写",
+					"type":        "bool",
+					"default":     false,
+				},
+			},
 		},
-	})
-
-	reg.RegisterHook(plugin.HookHandler{
-		Name:  "echo_on_start",
-		Event: "startup",
-		Handler: func(ctx context.Context) error {
-			// This runs when AstrBot starts
-			return nil
+		Commands: []sdk.Command{
+			{
+				Name:        "echo",
+				Aliases:     []string{"repeat"},
+				Description: "Echoes your message",
+				Usage:       "echo <text>",
+				Permission:  "everyone",
+				Handler: func(e *sdk.Event, args []string) (string, error) {
+					if len(args) == 0 {
+						return "Usage: echo <text>", nil
+					}
+					return strings.Join(args, " "), nil
+				},
+			},
+		},
+		Hooks: []sdk.Hook{
+			{
+				Name:  "echo_on_start",
+				Event: "startup",
+				Handler: func(e *sdk.Event) error {
+					return nil
+				},
+			},
 		},
 	})
 }
-
-func Cleanup() error { return nil }

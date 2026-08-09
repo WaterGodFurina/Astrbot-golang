@@ -105,6 +105,9 @@ func (ps *personaStore) upsertPersona(p map[string]interface{}) error {
 		id = "persona_" + nowStr()
 		p["persona_id"] = id
 	}
+	if fid, ok := p["folder_id"].(string); ok && fid == "" {
+		p["folder_id"] = nil
+	}
 	if _, ok := p["created_at"]; !ok {
 		p["created_at"] = nowStr()
 	}
@@ -220,7 +223,11 @@ func (ps *personaStore) movePersona(personaID, folderID string) error {
 	defer ps.mu.Unlock()
 	for _, p := range ps.data.Personas {
 		if pid, _ := p["persona_id"].(string); pid == personaID {
-			p["folder_id"] = folderID
+			if folderID == "" {
+				p["folder_id"] = nil
+			} else {
+				p["folder_id"] = folderID
+			}
 			p["updated_at"] = nowStr()
 			return ps.saveLocked()
 		}

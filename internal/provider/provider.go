@@ -77,6 +77,15 @@ type BaseProvider struct {
 	modelName        string
 	providerConfig   map[string]interface{}
 	providerSettings map[string]interface{}
+	capability       ProviderCapabilityType
+}
+
+// SetCapability records the provider capability reported by Meta(). Defaults
+// to CapChatCompletion when unset (legacy chat sources).
+func (b *BaseProvider) SetCapability(cap ProviderCapabilityType) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.capability = cap
 }
 
 // SetModel sets the current model.
@@ -110,11 +119,15 @@ func (b *BaseProvider) Meta() ProviderMeta {
 		id = "default"
 	}
 	typeName, _ := b.providerConfig["type"].(string)
+	capability := b.capability
+	if capability == "" {
+		capability = CapChatCompletion
+	}
 	return ProviderMeta{
 		ID:           id,
 		Model:        b.GetModel(),
 		Type:         typeName,
-		ProviderType: CapChatCompletion,
+		ProviderType: capability,
 	}
 }
 
@@ -141,6 +154,7 @@ type ProviderManager struct {
 	sttProvID  string // default STT provider ID
 	ttsProvID  string // default TTS provider ID
 	embProvID  string // default embedding provider ID
+	rerankID   string // default rerank provider ID
 }
 
 // NewProviderManager creates a manager.
@@ -239,6 +253,23 @@ func (pm *ProviderManager) GetEmbeddingProvider() EmbeddingProvider {
 	return nil
 }
 
+// GetRerankProvider returns the default rerank provider.
+func (pm *ProviderManager) GetRerankProvider() RerankProvider {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.rerankID != "" {
+		if p, ok := pm.providers[pm.rerankID].(RerankProvider); ok {
+			return p
+		}
+	}
+	for _, p := range pm.providers {
+		if rp, ok := p.(RerankProvider); ok {
+			return rp
+		}
+	}
+	return nil
+}
+
 // SetDefaultChatProvider sets the default chat provider ID.
 func (pm *ProviderManager) SetDefaultChatProvider(id string) {
 	pm.mu.Lock()
@@ -265,6 +296,13 @@ func (pm *ProviderManager) SetDefaultEmbeddingProvider(id string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.embProvID = id
+}
+
+// SetDefaultRerankProvider sets the default rerank provider ID.
+func (pm *ProviderManager) SetDefaultRerankProvider(id string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.rerankID = id
 }
 
 // All returns all provider IDs.

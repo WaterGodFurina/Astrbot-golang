@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 	"github.com/AstrBotDevs/AstrBot/internal/skills"
 	"github.com/AstrBotDevs/AstrBot/internal/star"
 	"github.com/AstrBotDevs/AstrBot/internal/star/builtin"
+	"github.com/AstrBotDevs/AstrBot/internal/toolchain"
 	"github.com/AstrBotDevs/AstrBot/pkg/message"
 )
 
@@ -36,26 +38,30 @@ var logger = log.GetDefault().WithComponent("Core")
 
 // Lifecycle orchestrates all AstrBot components.
 type Lifecycle struct {
-	mu              sync.Mutex
-	configMgr       *config.ConfigManager
-	database        *db.Database
-	providerMgr     *provider.ProviderManager
-	starMgr         *star.Manager
-	kbMgr           *knowledgebase.Manager
-	platformMgr     *platform.PlatformManager
-	cronMgr         *cron.CronJobManager
-	dashboard       *dashboard.Server
-	backupExporter  *backup.Exporter
-	pluginMgr       *plugin.Manager
-	pluginCtx       *plugin.Context
-	skillMgr        *skills.SkillManager
-	sandboxMgr      *sandbox.Manager
-	eventBus        *core.EventBus
-	conversationMgr *conversation.Manager
-	pipelineMapping map[string]*core.PipelineScheduler
-	webuiDir        string
-	cancel          context.CancelFunc
-	startedAt       time.Time
+	mu               sync.Mutex
+	configMgr        *config.ConfigManager
+	database         *db.Database
+	providerMgr      *provider.ProviderManager
+	starMgr          *star.Manager
+	kbMgr            *knowledgebase.Manager
+	platformMgr      *platform.PlatformManager
+	cronMgr          *cron.CronJobManager
+	dashboard        *dashboard.Server
+	backupExporter   *backup.Exporter
+	pluginMgr        *plugin.Manager
+	pluginCtx        *plugin.Context
+	subPluginMgr     *plugin.SubprocessManager
+	legacyPluginMode bool
+	toolchain        *toolchain.Toolchain
+	skillMgr         *skills.SkillManager
+	sandboxMgr       *sandbox.Manager
+	sandboxSig       string // last booter-selection signature (avoids needless rebuilds)
+	eventBus         *core.EventBus
+	conversationMgr  *conversation.Manager
+	pipelineMapping  map[string]*core.PipelineScheduler
+	webuiDir         string
+	cancel           context.CancelFunc
+	startedAt        time.Time
 }
 
 // New creates a Lifecycle.
@@ -96,6 +102,23 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.configMgr.Register("default", cfg)
 	logger.Info("Config loaded (integrity check passed)")
 
+	// Plugin mode: false (default) uses the subprocess plugin runtime only;
+	// true keeps the legacy .so plugin runtime.
+	l.legacyPluginMode = false
+	if cfg != nil {
+		l.legacyPluginMode = cfg.GetBool("legacy_plugin_mode")
+	}
+	logger.Info("Plugin mode: legacy_plugin_mode=%v", l.legacyPluginMode)
+
+	// Apply the log level from config unless ASTRBOT_LOG_LEVEL is set
+	// explicitly in the environment (env takes precedence).
+	if os.Getenv("ASTRBOT_LOG_LEVEL") == "" {
+		if lvl := cfg.GetString("log_level"); lvl != "" {
+			log.GetDefault().SetLevel(log.ParseLevel(lvl))
+			logger.Info("Log level set from config: %s", lvl)
+		}
+	}
+
 	// 3. Initialize conversation manager
 	l.conversationMgr = conversation.NewManager(database)
 	logger.Info("Conversation manager initialized")
@@ -129,24 +152,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.skillMgr = skills.NewSkillManager("data/skills", "data/plugins", "data")
 	logger.Info("Skill manager initialized (%d skills)", len(l.skillMgr.ListSkills(false, "local")))
 	l.sandboxMgr = sandbox.NewManager(l.skillMgr)
-	if cfg := l.configMgr.Get("default"); cfg != nil {
-		if all := cfg.All(); all != nil {
-			if ps, ok := all["provider_settings"].(map[string]interface{}); ok {
-				if runtime, _ := ps["computer_use_runtime"].(string); runtime == "sandbox" {
-					image := ""
-					if sb, ok := ps["sandbox"].(map[string]interface{}); ok {
-						if ci, ok := sb["cua_image"].(map[string]interface{}); ok {
-							if model, _ := ci["model"].(string); model != "" {
-								image = model
-							}
-						}
-					}
-					l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
-					logger.Info("Sandbox manager booter set (docker, image=%s)", image)
-				}
-			}
-		}
-	}
+	l.syncSandboxBooter()
 	logger.Info("Sandbox manager initialized")
 
 	// 7.5. Build pipeline schedulers
@@ -199,34 +205,56 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.backupExporter = backup.NewExporter("data")
 	logger.Info("Backup exporter initialized")
 
-	// 10. Load .so plugins
-	pluginCtx := &plugin.Context{
-		DataDir:   "data",
-		ConfigDir: "data",
-		PluginDir: "data/plugins",
-		Logger:    log.GetDefault().WithComponent("Plugin"),
-	}
-	l.pluginCtx = pluginCtx
-	l.pluginMgr = plugin.NewManager(pluginCtx)
-	if err := os.MkdirAll("data/plugins", 0755); err != nil {
-		logger.Warn("Failed to create plugins dir: %v", err)
-	}
-	if loaded, errs := l.pluginMgr.LoadDir("data/plugins"); len(errs) > 0 {
-		for _, e := range errs {
-			logger.Warn("Plugin load error: %v", e)
-		}
+	// 9.5. Resolve the plugin build toolchain (bundled Go). This only locates
+	// an existing toolchain — no network download happens at startup; the
+	// compiler provisions it lazily on first plugin build.
+	l.toolchain = toolchain.New()
+	if bin, err := l.toolchain.GoBin(); err != nil {
+		logger.Warn("Go build toolchain not available (plugin compile disabled): %v", err)
 	} else {
-		logger.Info("Plugins loaded: %d", len(loaded))
+		logger.Info("Plugin build toolchain: %s (GOROOT=%s, GOPATH=%s)", bin, l.toolchain.GOROOT(), l.toolchain.GOPATH())
 	}
-	// Bridge .so plugin commands into the pipeline's star handler system.
-	star.RegisterPluginCommands(l.starMgr, pluginCtx, l.pluginMgr.AllCommands())
-	star.RegisterPluginFilters(l.starMgr, l.pluginMgr.AllFilters())
-	star.RegisterPluginHooks(l.starMgr, l.pluginMgr.AllHooks())
-	// Apply persisted command configs (enabled/renames/permissions).
-	if cfg := l.configMgr.Get("default"); cfg != nil {
-		if all := cfg.All(); all != nil {
-			if records, ok := all["command_configs"].(map[string]interface{}); ok {
-				star.ApplyCommandConfigs(l.starMgr.Handlers(), records)
+
+	// 9.6. Subprocess plugin runtime (go-plugin child processes). Loads
+	// installed plugins from the manifest, bridges their handlers into the
+	// star pipeline, and re-bridges after a crash-restart swaps an instance.
+	l.subPluginMgr = plugin.NewSubprocessManager(l.toolchain, "data")
+	l.subPluginMgr.OnInstancesChanged = func() { l.RebridgePlugins() }
+	l.subPluginMgr.LoadInstalled(ctx)
+	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr.List())
+
+	// 10. Load .so plugins (legacy runtime). Skipped when legacy_plugin_mode
+	// is false (default): the subprocess runtime (SubprocessManager) is the
+	// only plugin runtime in that case, and pluginMgr stays nil.
+	if l.legacyPluginMode {
+		pluginCtx := &plugin.Context{
+			DataDir:   "data",
+			ConfigDir: "data",
+			PluginDir: "data/plugins",
+			Logger:    log.GetDefault().WithComponent("Plugin"),
+		}
+		l.pluginCtx = pluginCtx
+		l.pluginMgr = plugin.NewManager(pluginCtx)
+		if err := os.MkdirAll("data/plugins", 0755); err != nil {
+			logger.Warn("Failed to create plugins dir: %v", err)
+		}
+		if loaded, errs := l.pluginMgr.LoadDir("data/plugins"); len(errs) > 0 {
+			for _, e := range errs {
+				logger.Warn("Plugin load error: %v", e)
+			}
+		} else {
+			logger.Info("Plugins loaded: %d", len(loaded))
+		}
+		// Bridge .so plugin commands into the pipeline's star handler system.
+		star.RegisterPluginCommands(l.starMgr, pluginCtx, l.pluginMgr.AllCommands())
+		star.RegisterPluginFilters(l.starMgr, l.pluginMgr.AllFilters())
+		star.RegisterPluginHooks(l.starMgr, l.pluginMgr.AllHooks())
+		// Apply persisted command configs (enabled/renames/permissions).
+		if cfg := l.configMgr.Get("default"); cfg != nil {
+			if all := cfg.All(); all != nil {
+				if records, ok := all["command_configs"].(map[string]interface{}); ok {
+					star.ApplyCommandConfigs(l.starMgr.Handlers(), records)
+				}
 			}
 		}
 	}
@@ -238,16 +266,17 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 
 	// 12. Start dashboard API server
 	managers := map[string]interface{}{
-		"config":        l.configMgr,
-		"provider":      l.providerMgr,
-		"platform":      l.platformMgr,
-		"conversation":  l.conversationMgr,
-		"cron":          l.cronMgr,
-		"plugin":        l.pluginMgr,
-		"star":          l.starMgr,
-		"knowledgebase": l.kbMgr,
-		"skills":        l.skillMgr,
-		"database":      l.database,
+		"config":            l.configMgr,
+		"provider":          l.providerMgr,
+		"platform":          l.platformMgr,
+		"conversation":      l.conversationMgr,
+		"cron":              l.cronMgr,
+		"plugin":            l.pluginMgr,
+		"plugin_subprocess": l.subPluginMgr,
+		"star":              l.starMgr,
+		"knowledgebase":     l.kbMgr,
+		"skills":            l.skillMgr,
+		"database":          l.database,
 	}
 	l.dashboard = dashboard.NewServerWithManagers(6185, "data/cmd_config.json", managers)
 	if l.webuiDir != "" {
@@ -258,6 +287,13 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	})
 	l.dashboard.SetOnPluginsChanged(func() {
 		l.RebridgePlugins()
+	})
+	l.dashboard.SetOnConfigChanged(func() {
+		// Rebuild the pipeline so provider/platform settings changes (e.g. the
+		// default chat model) take effect immediately instead of on restart.
+		if err := l.ReloadPipelineScheduler("default"); err != nil {
+			logger.Error("Failed to reload pipeline after config change: %v", err)
+		}
 	})
 	go func() {
 		if err := l.dashboard.Start(ctx); err != nil {
@@ -275,7 +311,10 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}()
 
 	// Trigger startup hooks
-	l.pluginMgr.TriggerHook(ctx, "startup")
+	if l.pluginMgr != nil {
+		l.pluginMgr.TriggerHook(ctx, "startup")
+	}
+	l.subPluginMgr.TriggerHook(ctx, "startup")
 
 	logger.Info("AstrBot Go started - API on :6185")
 	return nil
@@ -285,7 +324,108 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 func (l *Lifecycle) ReloadPipelineScheduler(confID string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// Sandbox booter depends on provider_settings.computer_use_runtime and
+	// provider_settings.sandbox, which may have changed since startup (e.g. the
+	// user configured the sandbox via the WebUI). Re-select it so sandbox tools
+	// no longer fail with "no booter configured".
+	l.syncSandboxBooter()
 	return l.buildPipelineScheduler(confID)
+}
+
+// syncSandboxBooter selects the sandbox backend from the current config,
+// mirroring Python's computer_client.get_booter. It is a no-op when the
+// selection inputs are unchanged. Caller must hold l.mu.
+func (l *Lifecycle) syncSandboxBooter() {
+	if l.sandboxMgr == nil || l.configMgr == nil {
+		return
+	}
+	cfg := l.configMgr.Get("default")
+	if cfg == nil {
+		return
+	}
+	all := cfg.All()
+	ps, _ := all["provider_settings"].(map[string]interface{})
+	runtime, _ := ps["computer_use_runtime"].(string)
+	sandboxCfg, _ := ps["sandbox"].(map[string]interface{})
+	if sandboxCfg == nil {
+		sandboxCfg = map[string]interface{}{}
+	}
+
+	sig := runtime + "|" + string(mustJSON(sandboxCfg))
+	if sig == l.sandboxSig {
+		return
+	}
+	l.sandboxSig = sig
+
+	booterType, _ := sandboxCfg["booter"].(string)
+	if runtime != "sandbox" {
+		l.sandboxMgr.SetBooter(nil)
+		logger.Info("Sandbox booter cleared (computer_use_runtime=%q)", runtime)
+		return
+	}
+
+	switch booterType {
+	case "shipyard_neo", "":
+		// URL-based Bay sandbox (Shipyard Neo), the default backend.
+		ep, _ := sandboxCfg["shipyard_neo_endpoint"].(string)
+		token, _ := sandboxCfg["shipyard_neo_access_token"].(string)
+		profile, _ := sandboxCfg["shipyard_neo_profile"].(string)
+		ttl := 3600
+		if v := floatValue(sandboxCfg["shipyard_neo_ttl"]); v > 0 {
+			ttl = int(v)
+		}
+		l.sandboxMgr.SetBooter(sandbox.NewShipyardNeoBooter(ep, token, profile, ttl))
+		logger.Info("Sandbox booter set (shipyard_neo endpoint=%q profile=%q ttl=%d)", ep, profile, ttl)
+	case "boxlite":
+		// Boxlite = Docker-backed containers.
+		l.setDockerOrLocalBooter(sandboxCfg)
+	default:
+		// shipyard (legacy), cua, and unknown types are not implemented in Go;
+		// fall back to a docker/local backend.
+		logger.Warn("Sandbox booter type %q not implemented in Go; falling back to docker/local", booterType)
+		l.setDockerOrLocalBooter(sandboxCfg)
+	}
+}
+
+func (l *Lifecycle) setDockerOrLocalBooter(sandboxCfg map[string]interface{}) {
+	image := ""
+	if ci, ok := sandboxCfg["cua_image"].(map[string]interface{}); ok {
+		if model, _ := ci["model"].(string); model != "" {
+			image = model
+		}
+	}
+	if dockerAvailable() {
+		l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
+		logger.Info("Sandbox booter set (docker, image=%s)", image)
+		return
+	}
+	l.sandboxMgr.SetBooter(sandbox.NewLocalBooter())
+	logger.Info("Sandbox booter set (local, docker unavailable)")
+}
+
+// floatValue converts a JSON numeric (float64/int) to float64, returning 0 on
+// non-numeric values.
+func floatValue(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	case json.Number:
+		f, _ := n.Float64()
+		return f
+	}
+	return 0
+}
+
+// mustJSON serializes v deterministically (json sorts map keys), ignoring errors.
+func mustJSON(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 // buildPipelineScheduler assembles the full 9-stage pipeline for a config ID
@@ -305,10 +445,12 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 		PlatformMgr:           l.platformMgr,
 		PersonaResolver:       personaResolver,
 		PersonaSkillsResolver: personaSkillsResolver,
+		UmoAliasResolver:      l.umoAliasResolver,
 		SkillManager:          l.skillMgr,
 		SandboxManager:        l.sandboxMgr,
 		CronManager:           l.cronMgr,
 		Database:              l.database,
+		EventBus:              l.eventBus,
 	}
 
 	stageFactory := []func() core.PipelineStage{
@@ -354,6 +496,9 @@ func (l *Lifecycle) Stop() {
 	if l.pluginMgr != nil {
 		l.pluginMgr.UnloadAll()
 	}
+	if l.subPluginMgr != nil {
+		l.subPluginMgr.Shutdown()
+	}
 	if l.dashboard != nil {
 		l.dashboard.Stop()
 	}
@@ -389,6 +534,25 @@ func (l *Lifecycle) ReloadPlatforms(ctx context.Context) {
 	if err := l.loadPlatforms(ctx); err != nil {
 		logger.Error("Failed to reload platforms: %v", err)
 	}
+}
+
+// umoAliasResolver returns the display name a user set for a session (config
+// `umo_alias`, set via the /name command), or "".
+func (l *Lifecycle) umoAliasResolver(umo string) string {
+	if l.configMgr == nil {
+		return ""
+	}
+	cfg := l.configMgr.Get("default")
+	if cfg == nil {
+		return ""
+	}
+	all := cfg.All()
+	aliases, _ := all["umo_alias"].(map[string]interface{})
+	if aliases == nil {
+		return ""
+	}
+	alias, _ := aliases[umo].(string)
+	return alias
 }
 
 // cronNextRun computes the next run time for a cron job (cron expression or
@@ -493,18 +657,24 @@ func personaSkillsResolver(personaID string) []string {
 	return nil
 }
 
-// RebridgePlugins re-registers .so plugin commands/filters/hooks after plugin
-// changes (enable/disable/reload) so the pipeline picks up the latest set.
+// RebridgePlugins re-registers plugin commands/filters/hooks after plugin
+// changes (enable/disable/reload/install/unload) so the pipeline picks up the
+// latest set. Covers both the legacy .so runtime and the subprocess runtime.
 func (l *Lifecycle) RebridgePlugins() {
-	if l.starMgr == nil || l.pluginMgr == nil {
+	if l.starMgr == nil {
 		return
 	}
 	star.RemovePluginCommands(l.starMgr)
 	star.RemovePluginFilters(l.starMgr)
 	star.RemovePluginHooks(l.starMgr)
-	star.RegisterPluginCommands(l.starMgr, l.pluginCtx, l.pluginMgr.AllCommands())
-	star.RegisterPluginFilters(l.starMgr, l.pluginMgr.AllFilters())
-	star.RegisterPluginHooks(l.starMgr, l.pluginMgr.AllHooks())
+	if l.legacyPluginMode && l.pluginMgr != nil {
+		star.RegisterPluginCommands(l.starMgr, l.pluginCtx, l.pluginMgr.AllCommands())
+		star.RegisterPluginFilters(l.starMgr, l.pluginMgr.AllFilters())
+		star.RegisterPluginHooks(l.starMgr, l.pluginMgr.AllHooks())
+	}
+	if l.subPluginMgr != nil {
+		star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr.List())
+	}
 }
 
 // loadPlatforms reads the platform configs and instantiates adapters.
@@ -547,4 +717,20 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 		logger.Info("Platform %s (%s) started", adapter.ID(), adapter.Type())
 	}
 	return nil
+}
+
+// dockerAvailable reports whether the docker CLI is present on this host
+// (used to pick a sandbox backend). The result is cached after the first call.
+var dockerOnce sync.Once
+var dockerOK bool
+
+func dockerAvailable() bool {
+	dockerOnce.Do(func() {
+		_, err := exec.LookPath(os.Getenv("ASTRBOT_DOCKER_BIN"))
+		if err != nil {
+			_, err = exec.LookPath("docker")
+		}
+		dockerOK = err == nil
+	})
+	return dockerOK
 }

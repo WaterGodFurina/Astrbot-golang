@@ -57,7 +57,10 @@ func (s *Server) upsertProviderSource(config map[string]interface{}) error {
 	return s.setConfigData("provider_sources", sources)
 }
 
-// deleteProviderSource removes a provider source by id.
+// deleteProviderSource removes a provider source by id. Providers built on
+// this source are cascaded away too (mirrors Python's delete_provider_source,
+// which calls provider_manager.delete_provider(provider_source_id=...)), so no
+// orphan providers reference a deleted source.
 func (s *Server) deleteProviderSource(id string) error {
 	cfg := s.getConfigSnapshot()
 	sources, _ := cfg["provider_sources"].([]interface{})
@@ -75,7 +78,33 @@ func (s *Server) deleteProviderSource(id string) error {
 	if !found {
 		return fmt.Errorf("provider source %s not found", id)
 	}
-	return s.setConfigData("provider_sources", next)
+	if err := s.setConfigData("provider_sources", next); err != nil {
+		return err
+	}
+
+	// Cascade: drop providers whose provider_source_id points at the deleted
+	// source and unregister their runtime instances.
+	providers, _ := cfg["provider"].([]interface{})
+	kept := make([]interface{}, 0, len(providers))
+	removed := 0
+	for _, p := range providers {
+		if m, ok := p.(map[string]interface{}); ok {
+			if sid, _ := m["provider_source_id"].(string); sid == id {
+				if pid, _ := m["id"].(string); pid != "" {
+					s.unregisterProvider(pid)
+				}
+				removed++
+				continue
+			}
+		}
+		kept = append(kept, p)
+	}
+	if removed > 0 {
+		if err := s.setConfigData("provider", kept); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // fetchProviderSourceModels calls the provider API to list models for a source.

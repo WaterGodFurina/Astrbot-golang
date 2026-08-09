@@ -7,8 +7,10 @@ import (
 	"sync"
 )
 
-// ProviderFactory creates a provider from config.
-type ProviderFactory func(config, settings map[string]interface{}) (ChatProvider, error)
+// ProviderFactory creates a provider from config. Factories may return any
+// AbstractProvider (chat, STT, TTS, embedding or rerank); the concrete
+// capability is determined by the interfaces the instance implements.
+type ProviderFactory func(config, settings map[string]interface{}) (AbstractProvider, error)
 
 // providerRegistry holds provider type → factory mappings.
 var (
@@ -24,7 +26,7 @@ func RegisterProvider(typeName string, factory ProviderFactory) {
 }
 
 // CreateProvider instantiates a provider by type.
-func CreateProvider(typeName string, config, settings map[string]interface{}) (ChatProvider, error) {
+func CreateProvider(typeName string, config, settings map[string]interface{}) (AbstractProvider, error) {
 	providerRegistryMu.RLock()
 	factory, ok := providerRegistry[typeName]
 	providerRegistryMu.RUnlock()
