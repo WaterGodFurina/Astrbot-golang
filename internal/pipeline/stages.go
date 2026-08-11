@@ -47,6 +47,10 @@ import (
 
 var logger = log.GetDefault().WithComponent("Pipeline")
 
+// pluginRPCTimeout bounds every gRPC call into a subprocess plugin so a hung
+// plugin handler (infinite loop, deadlock) cannot freeze the pipeline forever.
+const pluginRPCTimeout = 30 * time.Second
+
 var (
 	// tagBlockRe matches <script>...</script> and <style>...</style> blocks.
 	tagBlockRe = regexp.MustCompile(`(?is)<(script|style)[^>]*>.*?</(script|style)>`)
@@ -908,7 +912,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		SessionID:    event.UnifiedMsgOrigin(),
 		SystemPrompt: systemPrompt,
 		Conversation: s.convMgr,
-		Contexts:     conversationHistory(s.convMgr, event.UnifiedMsgOrigin()),
+		Contexts:     s.conversationHistory(event.UnifiedMsgOrigin()),
 	}
 
 	providerType, _ := providerCfg["type"].(string)
@@ -1081,6 +1085,15 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 	var content, reasoning strings.Builder
 	for chunk := range streamCh {
 		if chunk.Role == "err" {
+			// err chunk 提前返回后，生产者 goroutine 仍可能继续向缓冲为 100
+			// 的 channel 写数据而被阻塞（泄漏 goroutine 与 resp.Body）。
+			// 用后台 goroutine 排空剩余流，直到生产者关闭 channel；这样既能
+			// 立刻返回错误，又能让生产者退出并执行其 defer（close(ch)、
+			// resp.Body.Close()），避免重复 Close。
+			go func() {
+				for range streamCh {
+				}
+			}()
 			return &provider.LLMResponse{Role: "err", CompletionText: chunk.CompletionText}, nil
 		}
 		if chunk.IsChunk {
@@ -1449,7 +1462,10 @@ func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, h
 			if h.Event != hookEvent {
 				continue
 			}
-			if _, _, err := inst.Client.HandleHook(context.Background(), h.Name, sdkEvent, nil); err != nil {
+			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+			_, _, err := inst.Client.HandleHook(rpcCtx, h.Name, sdkEvent, nil)
+			rpcCancel()
+			if err != nil {
 				logger.Warn("Plugin %s hook %s (%s) failed: %v", inst.Name, h.Name, hookEvent, err)
 			}
 		}
@@ -1470,7 +1486,9 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 			if h.Event != "on_llm_request" {
 				continue
 			}
-			sp, stop, err := inst.Client.HandleLLMRequest(context.Background(), h.Name, sdkEvent, systemPrompt, userPrompt)
+			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+			sp, stop, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
+			rpcCancel()
 			if err != nil {
 				logger.Warn("Plugin %s on_llm_request hook %s failed: %v", inst.Name, h.Name, err)
 				continue
@@ -1528,7 +1546,9 @@ func (s *ProcessStage) executePluginTool(event *core.Event, name string, args ma
 			if t.Name != name {
 				continue
 			}
-			text, isErr, err := inst.Client.HandleTool(context.Background(), name, args, sdkEvent)
+			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+			text, isErr, err := inst.Client.HandleTool(rpcCtx, name, args, sdkEvent)
+			rpcCancel()
 			if err != nil {
 				return fmt.Sprintf("插件工具 %s 执行失败: %v", name, err), true
 			}
@@ -1564,7 +1584,7 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	// MCP server tools (enabled servers from data/mcp_server.json). Loading is
 	// async so a slow MCP server never blocks the LLM call.
 	s.ensureMCPTools()
-	for _, schema := range s.mcpSchemas {
+	for _, schema := range s.mcpSchemasSnapshot() {
 		tools = append(tools, schema)
 	}
 	// Subprocess plugin LLM function tools.
@@ -1574,17 +1594,32 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 
 // loadMCPTools (re)loads enabled MCP servers from data/mcp_server.json and
 // caches their tool schemas under "<sanitized_server>.<tool_name>".
-// ensureMCPTools loads MCP server tools on first use. The first call blocks
-// until the connection succeeds or fails (bounded), so a tool call never races
-// a not-yet-connected client; subsequent calls are no-ops.
+// ensureMCPTools marks the schemas as loaded once (under the lock, avoiding a
+// TOCTOU double load when dashboard chat and the event bus pipeline run
+// concurrently) and kicks off the actual connection work in a goroutine so a
+// slow MCP server never blocks the LLM call.
 func (s *ProcessStage) ensureMCPTools() {
 	s.mcpMu.Lock()
 	if s.mcpLoaded {
 		s.mcpMu.Unlock()
 		return
 	}
+	s.mcpLoaded = true
 	s.mcpMu.Unlock()
-	s.loadMCPTools()
+	go s.loadMCPTools()
+}
+
+// mcpSchemasSnapshot returns a shallow copy of the MCP tool schema map so the
+// caller can iterate without holding the lock while loadMCPTools may be
+// replacing the map.
+func (s *ProcessStage) mcpSchemasSnapshot() []map[string]interface{} {
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+	schemas := make([]map[string]interface{}, 0, len(s.mcpSchemas))
+	for _, schema := range s.mcpSchemas {
+		schemas = append(schemas, schema)
+	}
+	return schemas
 }
 
 // loadMCPTools connects to enabled MCP servers and caches their tools. It runs
@@ -1679,7 +1714,10 @@ func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map
 		// unable to receive responses; reconnect once and retry with a fresh
 		// timeout.
 		logger.Warn("MCP tool %s call failed (%v), reconnecting and retrying...", name, err)
-		if rc := client.Reconnect(context.Background()); rc != nil {
+		reconnCtx, reconnCancel := context.WithTimeout(ctx, 30*time.Second)
+		rc := client.Reconnect(reconnCtx)
+		reconnCancel()
+		if rc != nil {
 			logger.Warn("MCP server %q reconnect failed: %v", serverName, rc)
 		} else {
 			retryCtx, retryCancel := context.WithTimeout(ctx, 60*time.Second)
@@ -2022,15 +2060,42 @@ func personaPrompt(settings map[string]interface{}) string {
 }
 
 // conversationHistory converts conversation history to LLM context messages.
-func conversationHistory(convMgr *conversation.Manager, umo string) []map[string]interface{} {
-	if convMgr == nil {
+// The history slice is shallow-copied so a concurrent AppendHistory (from
+// another message racing the same session) can never mutate the slice the LLM
+// is reading. When provider_settings.max_context_length is set (>0), the
+// history is truncated to the most recent 2*max_context_length entries,
+// keeping user/assistant message pairs together, and a short system hint notes
+// that older history was dropped.
+func (s *ProcessStage) conversationHistory(umo string) []map[string]interface{} {
+	if s.convMgr == nil {
 		return nil
 	}
-	conv := convMgr.GetConversation(umo)
+	conv := s.convMgr.GetConversation(umo)
 	if conv == nil {
 		return nil
 	}
-	return conv.History
+	history := append([]map[string]interface{}{}, conv.History...)
+
+	maxCtx := 0
+	if ps, ok := s.config["provider_settings"].(map[string]interface{}); ok {
+		if v, ok := ps["max_context_length"].(float64); ok && v > 0 {
+			maxCtx = int(v)
+		}
+	}
+	if maxCtx > 0 && len(history) > maxCtx*2 {
+		// Keep only the most recent 2*max_context_length entries, aligned to an
+		// even boundary so a user/assistant pair is never split.
+		start := len(history) - maxCtx*2
+		if start%2 != 0 {
+			start++
+		}
+		history = append([]map[string]interface{}{}, history[start:]...)
+		history = append(history, map[string]interface{}{
+			"role":    "system",
+			"content": "注意：由于对话上下文长度限制，更早的历史消息已被截断。",
+		})
+	}
+	return history
 }
 
 // mergeProviderSource overlays the provider source config onto a provider config
@@ -2166,7 +2231,9 @@ func (s *ResultDecorateStage) applyResultHooks(event *core.Event, chain *[]plugi
 				continue
 			}
 			hookName := h.Name
-			newChain, stop, err := inst.Client.HandleHook(context.Background(), hookName, sdkEvent, cur)
+			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+			newChain, stop, err := inst.Client.HandleHook(rpcCtx, hookName, sdkEvent, cur)
+			rpcCancel()
 			if err != nil {
 				logger.Warn("Plugin %s result hook %s failed: %v", inst.Name, hookName, err)
 				continue

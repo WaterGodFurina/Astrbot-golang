@@ -25,6 +25,45 @@ const startTimeout = 15 * time.Second
 // cleanupTimeout bounds the graceful Cleanup RPC before force-killing.
 const cleanupTimeout = 5 * time.Second
 
+// restartBudgetResetWindow: 超过该间隔没有崩溃，则 restarts 预算清零，
+// 使低频偶发崩溃不会被永久停用（预算只惩罚"连续/近期"崩溃）。
+const restartBudgetResetWindow = 10 * time.Minute
+
+// opLock is a refcounted per-plugin lifecycle lock. It serializes Reload /
+// handleExit-restart / Unload so a crashed plugin being restarted cannot be
+// concurrently reloaded/unloaded (which would orphan a process or resurrect a
+// disabled plugin). The refcount lets the entry be removed from the map only
+// when the last waiter is done, so a blocked waiter always shares the mutex
+// that the current holder locked.
+type opLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockOp acquires the per-plugin lifecycle lock for id and returns a release
+// function. Callers must release via defer.
+func (m *SubprocessManager) lockOp(id string) func() {
+	m.mu.Lock()
+	l, ok := m.opMu[id]
+	if !ok {
+		l = &opLock{}
+		m.opMu[id] = l
+	}
+	l.refs++
+	m.mu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		m.mu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(m.opMu, id)
+		}
+		m.mu.Unlock()
+	}
+}
+
 // PluginInstance is a running plugin subprocess.
 type PluginInstance struct {
 	ID        string
@@ -43,7 +82,9 @@ type PluginInstance struct {
 	raw      *goplugin.Client // go-plugin process client
 	stopped  bool             // set before intentional kill (suppresses restart)
 	restarts int              // consecutive crash-restart count for this instance
-	failed   error            // set when the plugin is marked failed
+	// lastRestartAt 记录上一次崩溃重启的时间，用于 restart 预算的基于时间衰减。
+	lastRestartAt time.Time
+	failed        error // set when the plugin is marked failed
 }
 
 // SubprocessManager manages plugins running as isolated child processes
@@ -57,11 +98,18 @@ type SubprocessManager struct {
 	mu          sync.RWMutex
 	instances   map[string]*PluginInstance
 	failures    map[string]error
+	opMu        map[string]*opLock // per-plugin lifecycle mutex (Reload/restart/Unload)
 	toolchain   *toolchain.Toolchain
 	compiler    *Compiler
 	dataDir     string
 	ctx         context.Context
 	cancel      context.CancelFunc
+	// gen 是"实例表代际"标记：Shutdown 换新表时自增。restart 在 startInstance
+	// 成功后写回 map 前对比 gen，代际不一致说明表已被换掉，需丢弃新实例并回收。
+	gen uint64
+	// manifestMu 串行化 manifest 的"读→改→写"整段（recordInstall/SetEnabled/
+	// BindSource/ReinstallSource/Uninstall），防止并发修改丢条目。
+	manifestMu sync.Mutex
 
 	// AutoRestart enables automatic restart of crashed plugins.
 	AutoRestart bool
@@ -84,6 +132,7 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 	return &SubprocessManager{
 		instances:        make(map[string]*PluginInstance),
 		failures:         make(map[string]error),
+		opMu:             make(map[string]*opLock),
 		toolchain:        tc,
 		compiler:         NewCompiler(tc),
 		dataDir:          dataDir,
@@ -241,7 +290,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 // endpoints can serve them without re-fetching (mirrors Python's
 // plugin_dir/README.md lookup).
 func (m *SubprocessManager) cachePluginDocs(name, srcDir string) {
-	dir := filepath.Join(m.dataDir, "plugins", name)
+	dir := filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
 	_ = os.MkdirAll(dir, 0o755)
 	for _, src := range []string{"README.md", "readme.md", "CHANGELOG.md", "changelog.md"} {
 		content, err := os.ReadFile(filepath.Join(srcDir, src))
@@ -257,6 +306,9 @@ func (m *SubprocessManager) cachePluginDocs(name, srcDir string) {
 
 // recordInstall upserts the plugin into the persisted install manifest.
 func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact string, opts InstallOptions) error {
+	// 串行化 manifest 的读→改→写，防止并发 Install/SetEnabled 互相覆盖丢条目。
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
 		return err
@@ -275,9 +327,9 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		Repo:           opts.Repo,
 		DownloadURL:    opts.DownloadURL,
 		// 记录插件在 data 下创建的目录，供卸载时精确清理。
-		ConfigDir: filepath.Join("plugins_config", inst.Name),
+		ConfigDir: filepath.Join("plugins_config", sanitizePluginName(inst.Name)),
 		DataDir:   filepath.Join("plugins_data", sanitizeID(inst.ID)),
-		DocsDir:   filepath.Join("plugins", inst.Name),
+		DocsDir:   filepath.Join("plugins", sanitizePluginName(inst.Name)),
 	})
 	return man.Save(m.manifestPath())
 }
@@ -326,8 +378,12 @@ func (m *SubprocessManager) Load(ctx context.Context, id, binary string) (*Plugi
 }
 
 // Reload restarts a plugin with zero downtime: start the new process first,
-// swap it in, then stop the old one.
+// swap it in, then stop the old one. The per-plugin lifecycle lock serializes
+// it against concurrent crash-restarts and unloads so no instance is orphaned.
 func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
+	unlock := m.lockOp(id)
+	defer unlock()
+
 	m.mu.RLock()
 	old, ok := m.instances[id]
 	m.mu.RUnlock()
@@ -340,7 +396,13 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 		return fmt.Errorf("reload plugin %s: %w", id, err)
 	}
 
+	// 防御性身份比对：锁内理论上不会被并发覆盖，但防止未来改动遗漏。
 	m.mu.Lock()
+	if cur, ok := m.instances[id]; !ok || cur != old {
+		m.mu.Unlock()
+		go m.teardownInstance(newInst)
+		return fmt.Errorf("plugin %s changed while reloading", id)
+	}
 	m.instances[id] = newInst
 	delete(m.failures, id)
 	m.mu.Unlock()
@@ -355,8 +417,13 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 	return nil
 }
 
-// Unload stops a plugin process; the OS fully reclaims its resources.
+// Unload stops a plugin process; the OS fully reclaims its resources. The
+// per-plugin lifecycle lock blocks a concurrent crash-restart in its start
+// window, so the plugin cannot "come back" after being disabled.
 func (m *SubprocessManager) Unload(id string) error {
+	unlock := m.lockOp(id)
+	defer unlock()
+
 	m.mu.Lock()
 	inst, ok := m.instances[id]
 	if !ok {
@@ -371,6 +438,7 @@ func (m *SubprocessManager) Unload(id string) error {
 	inst.mu.Unlock()
 	m.teardownInstance(inst)
 	logger.Info("Plugin %s unloaded", id)
+	m.notifyChanged()
 	return nil
 }
 
@@ -424,6 +492,9 @@ func (m *SubprocessManager) Shutdown() {
 		insts = append(insts, inst)
 	}
 	m.instances = make(map[string]*PluginInstance)
+	// 代际自增：在途 restart 写回 map 前会对比 gen，发现表已被换掉则丢弃
+	// 新实例并 teardown，避免实例落入无人回收的新表。
+	m.gen++
 	m.mu.Unlock()
 
 	for _, inst := range insts {
@@ -436,8 +507,12 @@ func (m *SubprocessManager) Shutdown() {
 }
 
 // SetAutoRestart enables/disables automatic crash restarts.
+// 保持导出字段为普通 bool 以便现有调用方直接赋值（如测试），读写统一走
+// m.mu 加锁同步，避免与 handleExit 的读取产生数据竞争。
 func (m *SubprocessManager) SetAutoRestart(enabled bool) {
+	m.mu.Lock()
 	m.AutoRestart = enabled
+	m.mu.Unlock()
 }
 
 // startInstance launches one plugin binary and performs the handshake + first
@@ -501,10 +576,19 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 		}
 		pc = res.pc
 	case <-time.After(startTimeout):
+		// 杀进程先让 dispense goroutine 结束，再取回可能已创建的
+		// *pluginsdk.Client（持有 gRPC conn + HostService server）并关闭，
+		// 避免反复 Load 泄漏连接与 goroutine。
 		raw.Kill()
+		if res := <-resCh; res.pc != nil {
+			_ = res.pc.Close()
+		}
 		return nil, fmt.Errorf("start plugin %s: handshake timed out after %v", id, startTimeout)
 	case <-m.ctx.Done():
 		raw.Kill()
+		if res := <-resCh; res.pc != nil {
+			_ = res.pc.Close()
+		}
 		return nil, fmt.Errorf("start plugin %s: manager shutting down", id)
 	}
 
@@ -512,6 +596,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 	defer cancel()
 	meta, err := pc.Register(regCtx)
 	if err != nil {
+		_ = pc.Close()
 		raw.Kill()
 		return nil, fmt.Errorf("plugin %s Register: %w", id, err)
 	}
@@ -538,8 +623,14 @@ func (m *SubprocessManager) startWatch(inst *PluginInstance) {
 				return
 			case <-ticker.C:
 				inst.mu.Lock()
+				stopped := inst.stopped
 				raw := inst.raw
 				inst.mu.Unlock()
+				// 已被主动卸载/禁用：进程退出前 watcher 直接结束，避免每个
+				// 正常卸载的实例残留一个常驻 ticker goroutine。
+				if stopped {
+					return
+				}
 				if raw == nil {
 					return
 				}
@@ -560,40 +651,80 @@ func (m *SubprocessManager) handleExit(inst *PluginInstance) {
 		inst.mu.Unlock()
 		return
 	}
+	// 重启预算基于时间衰减：距上次崩溃超过 restartBudgetResetWindow 则清零
+	// 预算，低频偶发崩溃不会被永久停用（只惩罚连续/近期崩溃）。
+	if !inst.lastRestartAt.IsZero() && time.Since(inst.lastRestartAt) > restartBudgetResetWindow {
+		inst.restarts = 0
+	}
 	inst.restarts++
+	inst.lastRestartAt = time.Now()
 	count := inst.restarts
 	inst.mu.Unlock()
 
 	m.mu.RLock()
 	_, loaded := m.instances[inst.ID]
+	autoRestart := m.AutoRestart
+	maxRestarts := m.MaxRestarts
 	m.mu.RUnlock()
 	if !loaded {
 		return
 	}
 
-	if !m.AutoRestart {
+	if !autoRestart {
 		m.markFailed(inst, fmt.Errorf("plugin %s exited unexpectedly (auto-restart disabled)", inst.ID))
 		return
 	}
-	if count > m.MaxRestarts {
+	if count > maxRestarts {
 		m.markFailed(inst, fmt.Errorf("plugin %s exited unexpectedly %d time(s)", inst.ID, count))
 		return
 	}
 
 	delay := m.RestartBaseDelay * time.Duration(count)
 	logger.Warn("Plugin %s exited unexpectedly, restarting in %v (attempt %d/%d)",
-		inst.ID, delay, count, m.MaxRestarts)
+		inst.ID, delay, count, maxRestarts)
 	select {
 	case <-time.After(delay):
 	case <-m.ctx.Done():
+		return
+	}
+
+	// 退避窗口内用户可能 Unload/禁用/卸载：持 per-id 生命周期锁重查，
+	// 插件已被停止、管理器已关闭或 map 里已不是本实例时不再拉起，
+	// 避免"禁用后自己活了"与对已卸载插件做幽灵重启。
+	unlock := m.lockOp(inst.ID)
+	defer unlock()
+
+	inst.mu.Lock()
+	stopped := inst.stopped
+	inst.mu.Unlock()
+	if stopped || m.ctx.Err() != nil {
+		return
+	}
+	m.mu.RLock()
+	cur, ok := m.instances[inst.ID]
+	m.mu.RUnlock()
+	if !ok || cur != inst {
 		return
 	}
 	m.restart(inst)
 }
 
 // restart starts a fresh instance for the same id/binary, seeding the restart
-// budget so a permanently-crashing plugin eventually trips MaxRestarts.
+// budget so a permanently-crashing plugin eventually trips MaxRestarts. It must
+// be called with the per-plugin lifecycle lock held (see handleExit).
 func (m *SubprocessManager) restart(inst *PluginInstance) {
+	// 防御性身份/上下文复查：与 handleExit 的复查一致，防止并发路径遗漏。
+	m.mu.RLock()
+	cur, ok := m.instances[inst.ID]
+	gen := m.gen
+	m.mu.RUnlock()
+	if !ok || cur != inst {
+		return
+	}
+	if m.ctx.Err() != nil {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	defer cancel()
 
@@ -604,9 +735,18 @@ func (m *SubprocessManager) restart(inst *PluginInstance) {
 	}
 	inst.mu.Lock()
 	newInst.restarts = inst.restarts
+	newInst.lastRestartAt = inst.lastRestartAt
 	inst.mu.Unlock()
 
 	m.mu.Lock()
+	// 写回前再查一次管理器是否已关闭（Shutdown 竞态），关闭则丢弃新实例。
+	// gen 对比兜底：若 Shutdown 已换过实例表（m.gen 自增），本实例属于旧代际，
+	// 写入新表无人回收，直接丢弃并 teardown。
+	if m.ctx.Err() != nil || gen != m.gen {
+		m.mu.Unlock()
+		go m.teardownInstance(newInst)
+		return
+	}
 	m.instances[inst.ID] = newInst
 	m.mu.Unlock()
 
@@ -686,6 +826,10 @@ func (m *SubprocessManager) markFailed(inst *PluginInstance, err error) {
 
 	// Release the process and RPC client resources.
 	go m.teardownInstance(inst)
+
+	// 通知宿主清理 star 注册表里的命令/过滤器/钩子闭包，否则残留 handler
+	// 会继续对已关闭的 conn 发 RPC。
+	m.notifyChanged()
 }
 
 // needMemoryReclaim throttles forced GC + OS memory return: at most once per

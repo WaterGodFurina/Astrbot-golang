@@ -10,7 +10,9 @@ import (
 	"go/token"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,7 +35,19 @@ var riskyDirectives = []struct {
 }{
 	{"//go:linkname", "go:linkname", "链接到内部符号，可绕过 import 限制执行底层操作"},
 	{"//go:generate", "go:generate", "在编译期执行任意命令（可生成危险代码）"},
+	{"#cgo CFLAGS", "cgo-CFLAGS", "cgo 编译标志，可注入任意编译期命令"},
+	{"#cgo LDFLAGS", "cgo-LDFLAGS", "cgo 链接标志，可注入任意编译期命令"},
 }
+
+// maxDownloadSize caps a single source download (zip/tar.gz archives).
+const maxDownloadSize int64 = 200 << 20 // 200MB
+
+// maxExtractSize / maxExtractFiles cap the total uncompressed archive size and
+// entry count so a malicious archive cannot exhaust disk/inodes during install.
+const (
+	maxExtractSize  int64 = 300 << 20 // 300MB 解压总量上限
+	maxExtractFiles int64 = 10000     // 解压条目数上限
+)
 
 // ScanFinding describes one risky import in the plugin source.
 type ScanFinding struct {
@@ -92,6 +106,18 @@ func scanFile(srcDir, path string) ([]ScanFinding, error) {
 	for _, imp := range f.Imports {
 		p, err := strconv.Unquote(imp.Path.Value)
 		if err != nil {
+			continue
+		}
+		// import "C"（cgo）：#cgo CFLAGS/LDFLAGS 与 import "C" 意味着编译期
+		// 会调用 C 编译器，可借此执行任意命令，作为风险项上报（不硬拒）。
+		if p == "C" {
+			pos := fset.Position(imp.Pos())
+			findings = append(findings, ScanFinding{
+				File:    rel,
+				Line:    pos.Line,
+				Import:  "cgo-import-C",
+				Snippet: lineAt(path, pos.Line),
+			})
 			continue
 		}
 		if !containsStr(forbiddenImports, p) {
@@ -183,6 +209,9 @@ func (m *SubprocessManager) fetchSource(ctx context.Context, id, source string) 
 		return dst, nil
 
 	case isArchiveURL(source):
+		if err := validateSourceURL(source); err != nil {
+			return cleanup(fmt.Errorf("invalid archive source %q: %w", source, err))
+		}
 		archive := filepath.Join(tmp, "src-archive"+filepath.Ext(source))
 		if err := downloadFile(ctx, source, archive); err != nil {
 			return cleanup(fmt.Errorf("download %s: %w", source, err))
@@ -192,7 +221,10 @@ func (m *SubprocessManager) fetchSource(ctx context.Context, id, source string) 
 		}
 		return dst, nil
 
-	case isHTTP(source):
+	case isRemoteURL(source):
+		if err := validateSourceURL(source); err != nil {
+			return cleanup(fmt.Errorf("invalid source %q: %w", source, err))
+		}
 		if err := gitClone(ctx, source, dst); err != nil {
 			return cleanup(fmt.Errorf("git clone %s: %w", source, err))
 		}
@@ -201,6 +233,79 @@ func (m *SubprocessManager) fetchSource(ctx context.Context, id, source string) 
 	default:
 		return cleanup(fmt.Errorf("unsupported plugin source %q (use a git URL, archive URL, or local directory)", source))
 	}
+}
+
+// isRemoteURL reports whether s is an http/https/git URL (as opposed to a
+// local directory or file).
+func isRemoteURL(s string) bool {
+	u, err := url.Parse(s)
+	if err != nil {
+		return false
+	}
+	switch u.Scheme {
+	case "http", "https", "git":
+		return true
+	}
+	return false
+}
+
+// validateSourceURL enforces safe source URLs: only http/https/git schemes, no
+// userinfo, and no loopback/private/link-local hosts (SSRF guard for archive
+// downloads and git clones).
+func validateSourceURL(raw string) error {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return fmt.Errorf("source URL 为空")
+	}
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return fmt.Errorf("source URL 解析失败: %w", err)
+	}
+	switch parsed.Scheme {
+	case "http", "https", "git":
+	default:
+		return fmt.Errorf("source URL 协议不支持（仅允许 http/https/git）: %q", raw)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("source URL 不允许包含用户信息(userinfo): %q", raw)
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return fmt.Errorf("source URL 缺少主机名: %q", raw)
+	}
+	if err := rejectLocalHost(host); err != nil {
+		return fmt.Errorf("source URL %q: %w", raw, err)
+	}
+	return nil
+}
+
+// rejectLocalHost rejects hosts that are or resolve to the local machine,
+// private or link-local networks (SSRF guard).
+func rejectLocalHost(host string) error {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "localhost" || h == "ip6-localhost" || strings.HasSuffix(h, ".localhost") {
+		return fmt.Errorf("不允许指向本机 host: %s", host)
+	}
+	if strings.HasSuffix(h, ".local") {
+		return fmt.Errorf("不允许指向 .local 主机: %s", host)
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			return fmt.Errorf("不允许指向本机/内网/链路本地地址: %s", host)
+		}
+		return nil
+	}
+	ips, err := net.LookupIP(h)
+	if err != nil {
+		// 解析失败不误杀：克隆/下载仍会失败并暴露连接错误。
+		return nil
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			return fmt.Errorf("域名解析到本机/内网/链路本地地址: %s (%s)", host, ip)
+		}
+	}
+	return nil
 }
 
 func isHTTP(s string) bool {
@@ -234,6 +339,11 @@ func isArchiveURL(s string) bool {
 }
 
 func gitClone(ctx context.Context, url, dest string) error {
+	// URL 以 "-" 开头会被 git 当作选项解析（如 --upload-pack=...），
+	// 直接拒绝，防止命令行参数注入。
+	if strings.HasPrefix(url, "-") {
+		return fmt.Errorf("git URL 不允许以 '-' 开头（拒绝选项注入）: %q", url)
+	}
 	gitBin, err := exec.LookPath("git")
 	if err != nil {
 		return fmt.Errorf("git not found on PATH (required to clone %s): %w", url, err)
@@ -265,25 +375,39 @@ func downloadFileWithProgress(ctx context.Context, url, dest string, progress fu
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
+	if resp.ContentLength > maxDownloadSize {
+		return fmt.Errorf("download %s exceeds size limit (%d bytes)", url, maxDownloadSize)
+	}
 	f, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// 限制实际读取的字节数（Content-Length 可缺失/不可信），超限报错。
+	limited := io.LimitReader(resp.Body, maxDownloadSize+1)
 	if progress == nil {
-		_, err = io.Copy(f, resp.Body)
-		return err
+		n, err := io.Copy(f, limited)
+		if err != nil {
+			return err
+		}
+		if n > maxDownloadSize {
+			return fmt.Errorf("download %s exceeds size limit (%d bytes)", url, maxDownloadSize)
+		}
+		return nil
 	}
 	buf := make([]byte, 64*1024)
 	var written int64
 	total := resp.ContentLength
 	for {
-		n, rerr := resp.Body.Read(buf)
+		n, rerr := limited.Read(buf)
 		if n > 0 {
 			if _, werr := f.Write(buf[:n]); werr != nil {
 				return werr
 			}
 			written += int64(n)
+			if written > maxDownloadSize {
+				return fmt.Errorf("download %s exceeds size limit (%d bytes)", url, maxDownloadSize)
+			}
 			progress(written, total)
 		}
 		if rerr == io.EOF {
@@ -346,7 +470,17 @@ func extractZip(src, dest string) error {
 		return err
 	}
 	defer zr.Close()
+	if len(zr.File) > int(maxExtractFiles) {
+		return fmt.Errorf("archive has too many entries (%d > %d)", len(zr.File), maxExtractFiles)
+	}
+	var total int64
 	for _, zf := range zr.File {
+		if total >= maxExtractSize {
+			return fmt.Errorf("archive exceeds total size limit (%d bytes)", maxExtractSize)
+		}
+		if zf.UncompressedSize64 > uint64(maxExtractSize-total) {
+			return fmt.Errorf("archive exceeds total size limit (%d bytes)", maxExtractSize)
+		}
 		target, err := safeJoin(dest, zf.Name)
 		if err != nil {
 			return err
@@ -369,13 +503,19 @@ func extractZip(src, dest string) error {
 			rc.Close()
 			return err
 		}
-		if _, err := io.Copy(out, rc); err != nil {
-			out.Close()
-			rc.Close()
+		n, err := io.Copy(out, io.LimitReader(rc, maxExtractSize-total+1))
+		cerr := out.Close()
+		rc.Close()
+		if err != nil {
 			return err
 		}
-		out.Close()
-		rc.Close()
+		if cerr != nil {
+			return cerr
+		}
+		total += n
+		if total > maxExtractSize {
+			return fmt.Errorf("archive exceeds total size limit (%d bytes)", maxExtractSize)
+		}
 	}
 	return nil
 }
@@ -392,6 +532,8 @@ func extractTarGz(src, dest string) error {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	var total int64
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -399,6 +541,13 @@ func extractTarGz(src, dest string) error {
 		}
 		if err != nil {
 			return err
+		}
+		entries++
+		if int64(entries) > maxExtractFiles {
+			return fmt.Errorf("archive has too many entries (%d > %d)", entries, maxExtractFiles)
+		}
+		if total >= maxExtractSize || hdr.Size > maxExtractSize-total {
+			return fmt.Errorf("archive exceeds total size limit (%d bytes)", maxExtractSize)
 		}
 		target, err := safeJoin(dest, hdr.Name)
 		if err != nil {
@@ -417,17 +566,33 @@ func extractTarGz(src, dest string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
+			n, err := io.Copy(out, io.LimitReader(tr, maxExtractSize-total+1))
+			cerr := out.Close()
+			if err != nil {
 				return err
 			}
-			out.Close()
+			if cerr != nil {
+				return cerr
+			}
+			total += n
+			if total > maxExtractSize {
+				return fmt.Errorf("archive exceeds total size limit (%d bytes)", maxExtractSize)
+			}
 		}
 	}
 }
 
-// safeJoin joins base+rel and rejects paths escaping base.
+// safeJoin joins base+rel and rejects paths escaping base (zip slip).
 func safeJoin(base, rel string) (string, error) {
+	// 绝对路径条目与 ".." 穿越直接拒绝（即使 Join 后不会逃逸也要拦截，
+	// 防止在 Windows 盘符/UNC 等边界产生歧义）。
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("archive entry uses absolute path: %s", rel)
+	}
+	clean := filepath.Clean(rel)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("archive entry escapes destination: %s", rel)
+	}
 	target := filepath.Join(base, rel)
 	absBase, err := filepath.Abs(base)
 	if err != nil {

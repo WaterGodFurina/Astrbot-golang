@@ -600,23 +600,54 @@ func splitUMO(umo string) (string, string) {
 	return umo, umo
 }
 
+// personaCache 缓存 data/personas.json 的解析结果，避免每次 LLM 调用都读盘。
+// 通过文件 mtime 判断内容是否变化，仅在有变更时重新读取。
+type personaCache struct {
+	mu      sync.Mutex
+	content []byte
+	modTime time.Time
+}
+
+var personaFileCache personaCache
+
+// loadPersonas 返回 data/personas.json 解析后的 persona 列表。
+// mtime 未变化时直接返回缓存内容，变化时才重读文件。
+func loadPersonas() []map[string]interface{} {
+	info, err := os.Stat("data/personas.json")
+	if err != nil {
+		return nil
+	}
+	personaFileCache.mu.Lock()
+	defer personaFileCache.mu.Unlock()
+	if personaFileCache.content != nil && personaFileCache.modTime.Equal(info.ModTime()) {
+		return parsePersonas(personaFileCache.content)
+	}
+	data, err := os.ReadFile("data/personas.json")
+	if err != nil {
+		return nil
+	}
+	personaFileCache.content = data
+	personaFileCache.modTime = info.ModTime()
+	return parsePersonas(data)
+}
+
+func parsePersonas(data []byte) []map[string]interface{} {
+	var store struct {
+		Personas []map[string]interface{} `json:"personas"`
+	}
+	if json.Unmarshal(data, &store) != nil {
+		return nil
+	}
+	return store.Personas
+}
+
 // personaResolver resolves a persona's system prompt from data/personas.json
 // (persisted by the dashboard persona store). Falls back to provider_settings.persona.
 func personaResolver(umo, personaID string) string {
 	if personaID == "" {
 		return ""
 	}
-	data, err := os.ReadFile("data/personas.json")
-	if err != nil {
-		return ""
-	}
-	var store struct {
-		Personas []map[string]interface{} `json:"personas"`
-	}
-	if json.Unmarshal(data, &store) != nil {
-		return ""
-	}
-	for _, p := range store.Personas {
+	for _, p := range loadPersonas() {
 		if id, _ := p["persona_id"].(string); id == personaID {
 			if prompt, ok := p["system_prompt"].(string); ok {
 				return prompt
@@ -632,17 +663,7 @@ func personaSkillsResolver(personaID string) []string {
 	if personaID == "" {
 		return nil
 	}
-	data, err := os.ReadFile("data/personas.json")
-	if err != nil {
-		return nil
-	}
-	var store struct {
-		Personas []map[string]interface{} `json:"personas"`
-	}
-	if json.Unmarshal(data, &store) != nil {
-		return nil
-	}
-	for _, p := range store.Personas {
+	for _, p := range loadPersonas() {
 		if id, _ := p["persona_id"].(string); id != personaID {
 			continue
 		}

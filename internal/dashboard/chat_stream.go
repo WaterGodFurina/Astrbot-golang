@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -46,15 +47,20 @@ func (a *chatStreamAdapter) Type() string { return "dashboard_chat" }
 func (a *chatStreamAdapter) Start(ctx context.Context) error { return nil }
 func (a *chatStreamAdapter) Stop() error                     { return nil }
 
-// Send forwards a reply chain to all subscribers of the session.
+// Send forwards a reply chain to all subscribers of the session. The channel
+// set is copied under the lock so a concurrent unsubscribe (delete) can never
+// race the map iteration.
 func (a *chatStreamAdapter) Send(sessionID string, chain *message.MessageChain) error {
 	a.mu.Lock()
-	subs := a.subscribers[sessionID]
+	targets := make([]chan *message.MessageChain, 0, len(a.subscribers[sessionID]))
+	for ch := range a.subscribers[sessionID] {
+		targets = append(targets, ch)
+	}
 	a.mu.Unlock()
-	if len(subs) == 0 {
+	if len(targets) == 0 {
 		return nil
 	}
-	for ch := range subs {
+	for _, ch := range targets {
 		select {
 		case ch <- chain:
 		default:
@@ -236,15 +242,18 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 }
 
 // processChatEvent runs the message through the "default" pipeline scheduler
-// as a webchat-platform event in a goroutine and returns a channel closed
-// when processing completes (nil if the pipeline is unavailable).
+// as a webchat-platform event and returns a channel closed when processing
+// completes (nil if the pipeline is unavailable).
+//
+// Preferred path: enqueue on the event bus so dashboard chat shares the same
+// single-goroutine pipeline as platform messages (the bus never runs two
+// ProcessStage invocations concurrently). Completion is observed via a
+// core.PipelineDone signal that the bus closes once the event is dispatched.
+// Fallback: when the bus is unavailable (queue full / no scheduler), run the
+// event through the scheduler directly in a goroutine.
 func (s *Server) processChatEvent(ctx context.Context, sessionID, text, providerID, model string, flags map[string]interface{}) <-chan struct{} {
 	bus, ok := s.eventBus.(*core.EventBus)
 	if !ok || bus == nil {
-		return nil
-	}
-	scheduler := bus.GetScheduler("default")
-	if scheduler == nil {
 		return nil
 	}
 	chain := message.NewMessageChain(&message.Plain{Text: text})
@@ -276,14 +285,25 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, text, provider
 		event.Metadata["flags"] = flags
 	}
 
-	done := make(chan struct{})
+	done := core.NewPipelineDone()
+	event.Metadata[core.MetadataPipelineDone] = done
+	if err := bus.Publish(event); err == nil {
+		return done.Done()
+	}
+
+	// Bus unavailable (queue full) or scheduler missing: fall back to running
+	// the event through the scheduler synchronously in a goroutine.
+	scheduler := bus.GetScheduler("default")
+	if scheduler == nil {
+		return nil
+	}
 	go func() {
-		defer close(done)
+		defer done.Signal()
 		if _, err := scheduler.Process(ctx, event); err != nil {
 			logger.Error("dashboard chat pipeline failed: %v", err)
 		}
 	}()
-	return done
+	return done.Done()
 }
 
 // sendSSE writes one SSE data frame.
@@ -343,9 +363,31 @@ var _ platform.PlatformAdapter = (*chatStreamAdapter)(nil)
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
+	// Origin 白名单：仅允许同源连接（浏览器 WebSocket 无法设置自定义
+	// Authorization 头，token 只能走 query，故用 Origin 校验防跨站 CSWSH）。
+	// 无 Origin 头的非浏览器客户端（curl/脚本）放行。
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		o, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		return o.Host == r.Host || o.Host == "localhost:6185" || o.Host == "127.0.0.1:6185"
 	},
+}
+
+// wsClient wraps a live websocket connection. gorilla websocket forbids
+// concurrent writers, so every frame is serialized behind writeMu; ctx is
+// cancelled when the connection closes (or fails to write) so in-flight
+// pipeline runs stop instead of living until the 300s deadline.
+type wsClient struct {
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 // handleUnifiedChatWS serves the WebUI's websocket chat transport
@@ -365,6 +407,9 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 		logger.Warn("websocket upgrade failed: %v", err)
 		return
 	}
+	wsCtx, wsCancel := context.WithCancel(context.Background())
+	client := &wsClient{conn: conn, ctx: wsCtx, cancel: wsCancel}
+	defer wsCancel()
 	defer conn.Close()
 
 	conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
@@ -399,20 +444,20 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 		case "bind":
 			// Acknowledge the session bind (Python sends session_bound).
 			if msg.SessionID == "" {
-				s.wsSend(conn, map[string]interface{}{
+				s.wsSend(client, map[string]interface{}{
 					"ct": "chat", "t": "error", "data": "session_id is required",
 					"code": "INVALID_MESSAGE_FORMAT",
 				})
 				continue
 			}
-			s.wsSend(conn, map[string]interface{}{
+			s.wsSend(client, map[string]interface{}{
 				"ct": "chat", "type": "session_bound", "session_id": msg.SessionID,
 				"message_id": fmt.Sprintf("ws_sub_%d", time.Now().UnixNano()),
 			})
 
 		case "interrupt":
 			// Best-effort: cancel the current pipeline run for the session.
-			s.wsSend(conn, map[string]interface{}{
+			s.wsSend(client, map[string]interface{}{
 				"ct": "chat", "t": "error", "data": "INTERRUPTED",
 				"code": "INTERRUPTED",
 				"message_id": msg.MessageID,
@@ -420,34 +465,39 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 
 		case "send":
 			if len(msg.Message) == 0 {
-				s.wsSend(conn, map[string]interface{}{
+				s.wsSend(client, map[string]interface{}{
 					"ct": "chat", "t": "error", "data": "Message content is empty",
 					"code": "INVALID_MESSAGE_FORMAT", "message_id": msg.MessageID,
 				})
 				continue
 			}
 			if msg.SessionID == "" {
-				s.wsSend(conn, map[string]interface{}{
+				s.wsSend(client, map[string]interface{}{
 					"ct": "chat", "t": "error", "data": "session_id is required",
 					"code": "INVALID_MESSAGE_FORMAT", "message_id": msg.MessageID,
 				})
 				continue
 			}
-			go s.handleWSMessageSend(conn, msg)
+			go s.handleWSMessageSend(client, msg)
 		}
 	}
 }
 
-// wsSend writes one JSON frame to the websocket.
-func (s *Server) wsSend(conn *websocket.Conn, payload map[string]interface{}) {
-	if err := conn.WriteJSON(payload); err != nil {
+// wsSend writes one JSON frame to the websocket. Writes are serialized per
+// connection (gorilla forbids concurrent writers); a failed write cancels the
+// connection lifecycle so pending pipeline runs are torn down.
+func (s *Server) wsSend(c *wsClient, payload map[string]interface{}) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := c.conn.WriteJSON(payload); err != nil {
+		c.cancel()
 		logger.Debug("ws send failed: %v", err)
 	}
 }
 
 // handleWSMessageSend runs a chat message through the pipeline and streams the
 // reply events back over the websocket (per message_id).
-func (s *Server) handleWSMessageSend(conn *websocket.Conn, msg struct {
+func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 	CT               string                   `json:"ct"`
 	T                string                   `json:"t"`
 	SessionID        string                   `json:"session_id"`
@@ -478,12 +528,12 @@ func (s *Server) handleWSMessageSend(conn *websocket.Conn, msg struct {
 	s.chat.appendMessage(sessionID, userRecord)
 
 	llmCheckpointID := fmt.Sprintf("c_%d", time.Now().UnixNano())
-	s.wsSend(conn, map[string]interface{}{
+	s.wsSend(c, map[string]interface{}{
 		"ct": "chat", "type": "user_message_saved",
 		"data":       map[string]interface{}{"id": userRecord["id"], "created_at": userRecord["created_at"], "llm_checkpoint_id": llmCheckpointID},
 		"message_id": messageID,
 	})
-	s.wsSend(conn, map[string]interface{}{
+	s.wsSend(c, map[string]interface{}{
 		"ct": "chat", "type": "run_started",
 		"data":       map[string]interface{}{"run_id": messageID},
 		"message_id": messageID,
@@ -492,10 +542,10 @@ func (s *Server) handleWSMessageSend(conn *websocket.Conn, msg struct {
 	ch := s.chatAdapter.subscribe(sessionID)
 	defer s.chatAdapter.unsubscribe(sessionID, ch)
 
-	done := s.processChatEvent(context.Background(), sessionID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags)
+	done := s.processChatEvent(c.ctx, sessionID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags)
 	if done == nil {
-		s.wsSend(conn, map[string]interface{}{"ct": "chat", "type": "error", "data": "对话管道不可用", "message_id": messageID})
-		s.wsSend(conn, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
+		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "error", "data": "对话管道不可用", "message_id": messageID})
+		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
 		return
 	}
 
@@ -503,8 +553,10 @@ func (s *Server) handleWSMessageSend(conn *websocket.Conn, msg struct {
 	deadline := time.After(300 * time.Second)
 	for {
 		select {
+		case <-c.ctx.Done():
+			return
 		case <-deadline:
-			s.wsSend(conn, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
+			s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
 			return
 		case <-done:
 			for {
@@ -512,7 +564,7 @@ func (s *Server) handleWSMessageSend(conn *websocket.Conn, msg struct {
 				case chain := <-ch:
 					if t := chainPlainText(chain); t != "" {
 						full.WriteString(t)
-						s.wsSend(conn, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": t, "message_id": messageID})
+						s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": t, "message_id": messageID})
 					}
 				default:
 					goto done
@@ -534,15 +586,15 @@ func (s *Server) handleWSMessageSend(conn *websocket.Conn, msg struct {
 					"created_at": time.Now().Format(time.RFC3339Nano),
 				}
 				s.chat.appendMessage(sessionID, botRecord)
-				s.wsSend(conn, map[string]interface{}{"ct": "chat", "type": "message_saved", "data": map[string]interface{}{"id": botRecord["id"], "created_at": botRecord["created_at"]}, "message_id": messageID})
-				s.wsSend(conn, map[string]interface{}{"ct": "chat", "type": "complete", "data": full.String(), "message_id": messageID})
+				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "message_saved", "data": map[string]interface{}{"id": botRecord["id"], "created_at": botRecord["created_at"]}, "message_id": messageID})
+				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "complete", "data": full.String(), "message_id": messageID})
 			}
-			s.wsSend(conn, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
+			s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
 			return
 		case chain := <-ch:
 			if t := chainPlainText(chain); t != "" {
 				full.WriteString(t)
-				s.wsSend(conn, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": t, "message_id": messageID})
+				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": t, "message_id": messageID})
 			}
 		}
 	}

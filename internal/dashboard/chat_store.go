@@ -51,12 +51,48 @@ func (cs *chatStore) load() {
 }
 
 func (cs *chatStore) save() error {
-	os.MkdirAll(filepath.Dir(cs.path), 0755)
 	data, err := json.MarshalIndent(cs.data, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cs.path, data, 0644)
+	// 原子写：先写临时文件并 Sync，再 Rename，避免中途崩溃留下半截 JSON。
+	return writeFileAtomic(cs.path, data, 0644)
+}
+
+// writeFileAtomic 将 data 原子地写入 path（临时文件 + fsync + rename）。
+// 供 chat_store / mcp_store 等 JSON 持久化使用，防止非原子 WriteFile
+// 在崩溃或并发读时读到不完整文件。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	tmpName = ""
+	return nil
 }
 
 // createSession creates a new chat session and returns it.

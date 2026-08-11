@@ -84,7 +84,10 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		"chat_id": sessionID,
 		"text":    text,
 	}
-	_, err := a.apiCall(context.Background(), "sendMessage", params)
+	// 用带超时的上下文发送，避免网络卡死时 sendMessage 无限期挂起。
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := a.apiCall(ctx, "sendMessage", params)
 	return err
 }
 

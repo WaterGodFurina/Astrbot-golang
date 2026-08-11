@@ -33,7 +33,11 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		entryByID[man.Plugins[i].ID] = &man.Plugins[i]
 	}
 
-	result := make([]map[string]interface{}, 0, len(m.instances)+len(man.Plugins))
+	// 容量预分配：在锁内读 len(m.instances)，避免无锁并发读写实例表。
+	m.mu.RLock()
+	instCap := len(m.instances)
+	m.mu.RUnlock()
+	result := make([]map[string]interface{}, 0, instCap+len(man.Plugins))
 	for _, inst := range m.List() {
 		desc := ""
 		if inst.Meta != nil {
@@ -174,6 +178,9 @@ func (m *SubprocessManager) ListFailedPlugins() map[string]interface{} {
 // binary from the manifest (idempotent when already running), disable unloads
 // it; the manifest Enabled flag is persisted either way.
 func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
+	// 串行化 manifest 读→改→写，防止并发 SetEnabled/BindSource 丢条目。
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
 		return err
@@ -184,7 +191,11 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 	}
 	if enabled {
 		if m.Get(id) == nil {
-			if _, err := m.Load(context.Background(), id, entry.Binary); err != nil {
+			// 用带超时的 context 调用 Load：插件二进制握手/注册卡死时避免
+			// WebUI 启用请求被阻塞 15-30s。
+			loadCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			if _, err := m.Load(loadCtx, id, entry.Binary); err != nil {
 				return err
 			}
 		}
@@ -204,6 +215,9 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 // future update/reinstall requests resolve from the new registry/repository.
 // It mirrors the dashboard's install_source record (market or repository).
 func (m *SubprocessManager) BindSource(id string, method, registryURL, registryName, marketPluginID, repo, downloadURL string) error {
+	// 串行化 manifest 读→改→写，防止并发修改互相覆盖。
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
 		return err
@@ -237,20 +251,19 @@ func (m *SubprocessManager) BindSource(id string, method, registryURL, registryN
 // the running instance (if any), re-fetches, re-scans, re-builds and reloads
 // the plugin, updating the manifest. Source metadata is carried over.
 func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts InstallOptions) (*PluginInstance, error) {
+	// 串行化 manifest 读取，防止与并发写互相覆盖；快照出所需字段后立即释放
+	// 锁（InstallFromSource 内部 recordInstall 会再次持 manifestMu，避免死锁）。
+	m.manifestMu.Lock()
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
+		m.manifestMu.Unlock()
 		return nil, err
 	}
 	entry := man.Get(id)
 	if entry == nil {
+		m.manifestMu.Unlock()
 		return nil, fmt.Errorf("plugin %s not in install manifest", id)
 	}
-	if m.Get(id) != nil {
-		if err := m.Unload(id); err != nil {
-			return nil, fmt.Errorf("unload plugin %s: %w", id, err)
-		}
-	}
-
 	source := entry.DownloadURL
 	if source == "" {
 		source = entry.Source
@@ -259,9 +272,9 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		source = entry.Repo
 	}
 	if source == "" {
+		m.manifestMu.Unlock()
 		return nil, fmt.Errorf("plugin %s has no install source", id)
 	}
-
 	carry := InstallOptions{
 		IgnoreRisk:     opts.IgnoreRisk,
 		CCChoice:       opts.CCChoice,
@@ -273,6 +286,14 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		Repo:           entry.Repo,
 		DownloadURL:    entry.DownloadURL,
 	}
+	m.manifestMu.Unlock()
+
+	if m.Get(id) != nil {
+		if err := m.Unload(id); err != nil {
+			return nil, fmt.Errorf("unload plugin %s: %w", id, err)
+		}
+	}
+
 	return m.InstallFromSource(ctx, id, source, carry)
 }
 
@@ -283,41 +304,50 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 // (data/plugins/<name>/data)。二进制与文档缓存始终清理。
 func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) error {
 	name := id
+	var entry *ManifestEntry
+	// 串行化 manifest 读→改→写：先读取条目，Unload 之后在锁内 Remove+Save。
+	m.manifestMu.Lock()
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
+		m.manifestMu.Unlock()
 		return err
 	}
-	var entry *ManifestEntry
 	if e := man.Get(id); e != nil {
 		name = e.Name
 		entry = e
 	}
 	if m.Get(id) != nil {
+		m.manifestMu.Unlock()
 		if err := m.Unload(id); err != nil {
 			return err
 		}
+		m.manifestMu.Lock()
 	}
 	man.Remove(id)
 	if err := man.Save(m.manifestPath()); err != nil {
+		m.manifestMu.Unlock()
 		return err
 	}
+	m.manifestMu.Unlock()
 
 	// 二进制目录（始终删除）。
 	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id)))
 
 	// 目录足迹：优先用安装时记录的 manifest 条目，旧版本安装则按 name 推导。
-	cfgDir := filepath.Join(m.dataDir, "plugins_config", name)
-	docsDir := filepath.Join(m.dataDir, "plugins", name)
+	// name 与 manifest 子路径都先 sanitize/校验，防止路径穿越导致误删
+	// dataDir 之外目录。
+	cfgDir := filepath.Join(m.dataDir, "plugins_config", sanitizePluginName(name))
+	docsDir := filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
 	dataRoot := filepath.Join(m.dataDir, "plugins_data", sanitizeID(id))
 	if entry != nil {
-		if entry.ConfigDir != "" {
-			cfgDir = filepath.Join(m.dataDir, entry.ConfigDir)
+		if p, err := m.safeDataDirPath(entry.ConfigDir); err == nil {
+			cfgDir = p
 		}
-		if entry.DocsDir != "" {
-			docsDir = filepath.Join(m.dataDir, entry.DocsDir)
+		if p, err := m.safeDataDirPath(entry.DocsDir); err == nil {
+			docsDir = p
 		}
-		if entry.DataDir != "" {
-			dataRoot = filepath.Join(m.dataDir, entry.DataDir)
+		if p, err := m.safeDataDirPath(entry.DataDir); err == nil {
+			dataRoot = p
 		}
 	}
 
@@ -337,6 +367,21 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 
 	logger.Info("Plugin %s uninstalled (deleteConfig=%v deleteData=%v)", id, deleteConfig, deleteData)
 	return nil
+}
+
+// safeDataDirPath joins a manifest-recorded relative subpath under dataDir,
+// rejecting any path that escapes dataDir (protects Uninstall's os.RemoveAll
+// from traversal in a tampered manifest).
+func (m *SubprocessManager) safeDataDirPath(sub string) (string, error) {
+	if sub == "" {
+		return m.dataDir, nil
+	}
+	abs := filepath.Join(m.dataDir, filepath.Clean(filepath.FromSlash(sub)))
+	rel, err := filepath.Rel(m.dataDir, abs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe data subpath: %s", sub)
+	}
+	return abs, nil
 }
 
 // instanceByName returns the running instance for a plugin identifier (id or
@@ -377,7 +422,7 @@ func (m *SubprocessManager) ConfigSchema(name string) map[string]interface{} {
 // schemaCachePath returns the persisted config-schema cache for a plugin
 // (under plugins_config/<name>/ alongside config.json).
 func (m *SubprocessManager) schemaCachePath(name string) string {
-	return filepath.Join(m.dataDir, "plugins_config", name, "config_schema.json")
+	return filepath.Join(m.dataDir, "plugins_config", sanitizePluginName(name), "config_schema.json")
 }
 
 // cacheConfigSchema persists a loaded plugin's config schema so the WebUI can
@@ -440,7 +485,7 @@ func (m *SubprocessManager) Components(name string) map[string]interface{} {
 // data/plugins_config/ 下、按插件名分文件夹，与源码/运行时数据(data/plugins/)
 // 分开，方便用户直接编辑配置文件。
 func (m *SubprocessManager) configPath(name string) string {
-	return filepath.Join(m.dataDir, "plugins_config", name, "config.json")
+	return filepath.Join(m.dataDir, "plugins_config", sanitizePluginName(name), "config.json")
 }
 
 // writeMetadataConfig writes the plugin's metadata.json content to the top of
@@ -632,7 +677,7 @@ func (m *SubprocessManager) PluginDataDir(id string) string {
 // docsPath returns the per-plugin docs directory (plugins/<name>) where
 // README.md/CHANGELOG.md are cached at install time.
 func (m *SubprocessManager) docsPath(name string) string {
-	return filepath.Join(m.dataDir, "plugins", name)
+	return filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
 }
 
 // Readme returns the plugin's README content, reading from the locally cached
@@ -668,7 +713,8 @@ func (m *SubprocessManager) Changelog(id string) string {
 }
 
 // resolveName maps a plugin id/name to the canonical plugin name (used for the
-// docs directory). Falls back to the id itself so legacy entries still resolve.
+// docs directory). 查不到实例/manifest 条目时返回空字符串，避免把调用方传入的
+// 原始 id（可能含路径穿越字符）当作文档目录名使用。
 func (m *SubprocessManager) resolveName(id string) string {
 	if inst := m.instanceByName(id); inst != nil {
 		return inst.Name
@@ -681,12 +727,14 @@ func (m *SubprocessManager) resolveName(id string) string {
 			return e.ID
 		}
 	}
-	return id
+	return ""
 }
 
 // readCachedDoc reads a cached doc file from the plugin docs directory.
+// name 再次经 sanitizePluginName 归一化（拒绝 /、\、.、.. 等穿越字符），
+// 即使上游传入异常值也不会逃逸 data/plugins 目录。
 func (m *SubprocessManager) readCachedDoc(name, file string) string {
-	content, err := os.ReadFile(filepath.Join(m.docsPath(name), file))
+	content, err := os.ReadFile(filepath.Join(m.docsPath(sanitizePluginName(name)), file))
 	if err != nil {
 		return ""
 	}

@@ -15,16 +15,24 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
-	"sync"
+	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
+
+	"github.com/AstrBotDevs/AstrBot/internal/log"
 )
+
+// logger 供统计查询等路径记录错误。
+var logger = log.GetDefault().WithComponent("DB")
+
+// schemaVersion 是数据库 schema 的当前版本，配合 PRAGMA user_version 做迁移。
+const schemaVersion = 1
 
 // Database wraps a SQLite connection with AstrBot's schema.
 type Database struct {
-	mu   sync.RWMutex
 	db   *sql.DB
 	path string
 }
@@ -42,8 +50,8 @@ func New(dbPath string) (*Database, error) {
 	// Unlike Python's SQLAlchemy where a single async connection pool caused
 	// cross-event-loop issues (#9572), Go's database/sql pool is inherently
 	// goroutine-safe and has no event loop binding.
-	// SetMaxOpenConns(1) for SQLite writes (single writer), but with WAL mode,
-	// reads can proceed concurrently from other connections.
+	// WAL 模式下任意时刻只有一个写者，这里允许 10 个连接：读取可并发进行，
+	// 写入靠 busy_timeout 排队 + withRetry 兜底，而非把连接数压到 1。
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(0) // No max lifetime for SQLite
@@ -54,7 +62,56 @@ func New(dbPath string) (*Database, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := d.quickCheck(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return d, nil
+}
+
+// quickCheck 运行 PRAGMA quick_check 做数据库完整性自检，结果非 "ok" 视为致命错误。
+func (d *Database) quickCheck() error {
+	var result string
+	if err := d.db.QueryRow("PRAGMA quick_check").Scan(&result); err != nil {
+		return fmt.Errorf("quick_check: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("database integrity check failed: %s", result)
+	}
+	return nil
+}
+
+// isBusyErr 判断错误是否为 SQLite 的写锁冲突（SQLITE_BUSY / SQLITE_LOCKED），
+// 供 withRetry 决定是否需要重试。
+func isBusyErr(err error) bool {
+	var se *sqlite3.Error
+	if errors.As(err, &se) {
+		return se.Code == sqlite3.ErrBusy || se.Code == sqlite3.ErrLocked
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "busy") || strings.Contains(msg, "locked")
+}
+
+// withRetry 对写操作做 SQLITE_BUSY 重试（初始 1 次 + 重试 3 次，递增退避
+// 50ms/200ms/500ms），作为 WAL + busy_timeout 之外的兜底：高并发写入下单个
+// 连接仍可能遇到 "database is locked"。
+func (d *Database) withRetry(fn func() error) error {
+	backoff := []time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond}
+	var lastErr error
+	for attempt := 0; attempt <= len(backoff); attempt++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isBusyErr(err) {
+			return err
+		}
+		if attempt < len(backoff) {
+			time.Sleep(backoff[attempt])
+		}
+	}
+	return lastErr
 }
 
 // Close closes the database.
@@ -343,6 +400,19 @@ func (d *Database) initSchema() error {
 			return fmt.Errorf("exec schema: %w\nSQL: %s", err, stmt)
 		}
 	}
+
+	// 迁移机制：以 PRAGMA user_version 记录 schema 版本。当前版本尚无迁移脚本，
+	// 仅确保版本号写入（后续 schema 变更在此处按版本递增执行 ALTER 等迁移）。
+	var version int
+	if err := d.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return fmt.Errorf("read user_version: %w", err)
+	}
+	if version < schemaVersion {
+		if _, err := d.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+			return fmt.Errorf("set user_version: %w", err)
+		}
+		logger.Info("SQLite schema migrated from version %d to %d", version, schemaVersion)
+	}
 	return nil
 }
 
@@ -579,48 +649,63 @@ func boolInt(b bool) int {
 }
 
 // RecordPlatformMessage inserts a received platform message for statistics.
+// 高频写点：经 withRetry 处理 SQLITE_BUSY，避免偶发 "database is locked" 丢消息。
 func (d *Database) RecordPlatformMessage(platformID, userID, senderID, content string) error {
-	_, err := d.db.Exec(
-		`INSERT INTO platform_message_history (platform_id, user_id, sender_id, content)
-		 VALUES (?, ?, ?, ?)`,
-		platformID, userID, senderID, content,
-	)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO platform_message_history (platform_id, user_id, sender_id, content)
+			 VALUES (?, ?, ?, ?)`,
+			platformID, userID, senderID, content,
+		)
+		return err
+	})
 }
 
 // TotalMessageCount returns the total number of recorded platform messages.
 func (d *Database) TotalMessageCount() int {
 	var n int
-	_ = d.db.QueryRow(`SELECT COUNT(*) FROM platform_message_history`).Scan(&n)
+	if err := d.db.QueryRow(`SELECT COUNT(*) FROM platform_message_history`).Scan(&n); err != nil {
+		logger.Error("TotalMessageCount: %v", err)
+		return 0
+	}
 	return n
 }
 
 // RecordProviderCall inserts a provider call record for statistics.
+// 高频写点：经 withRetry 处理 SQLITE_BUSY。
 func (d *Database) RecordProviderCall(umo, providerID, model string, inputOther, inputCached, output int, start, end float64) error {
-	_, err := d.db.Exec(
-		`INSERT INTO provider_stats (umo, provider_id, provider_model, token_input_other, token_input_cached, token_output, start_time, end_time)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		umo, providerID, model, inputOther, inputCached, output, start, end,
-	)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO provider_stats (umo, provider_id, provider_model, token_input_other, token_input_cached, token_output, start_time, end_time)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			umo, providerID, model, inputOther, inputCached, output, start, end,
+		)
+		return err
+	})
 }
 
 // TodayProviderCalls returns the number of provider calls recorded today.
 func (d *Database) TodayProviderCalls() int {
 	var n int
-	_ = d.db.QueryRow(
+	if err := d.db.QueryRow(
 		`SELECT COUNT(*) FROM provider_stats WHERE date(created_at) = date('now', 'localtime')`,
-	).Scan(&n)
+	).Scan(&n); err != nil {
+		logger.Error("TodayProviderCalls: %v", err)
+		return 0
+	}
 	return n
 }
 
 // TodayProviderTokens returns total tokens consumed today.
 func (d *Database) TodayProviderTokens() int {
 	var n int
-	_ = d.db.QueryRow(
+	if err := d.db.QueryRow(
 		`SELECT COALESCE(SUM(token_input_other + token_input_cached + token_output), 0) FROM provider_stats
 		 WHERE date(created_at) = date('now', 'localtime')`,
-	).Scan(&n)
+	).Scan(&n); err != nil {
+		logger.Error("TodayProviderTokens: %v", err)
+		return 0
+	}
 	return n
 }
 

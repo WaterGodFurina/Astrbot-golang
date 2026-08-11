@@ -94,6 +94,12 @@ func (s *Server) indexKBFile(kbID, docID, docName string, content []byte, chunkS
 		return 0, err
 	}
 
+	// 幂等性：同名文档重复上传、或上次嵌入失败留下残留分块时，
+	// 先清掉该 docID 的旧分块记录，避免 UNIQUE 冲突与"半成品"残留。
+	if err := s.database.DeleteKBChunks(kbID, docID); err != nil {
+		return 0, fmt.Errorf("清理旧分块记录失败: %w", err)
+	}
+
 	chunks := knowledgebase.ChunkText(string(content), chunkSize, chunkOverlap)
 	if len(chunks) == 0 {
 		return 0, fmt.Errorf("文档内容为空")
@@ -132,12 +138,19 @@ func (s *Server) indexKBFile(kbID, docID, docName string, content []byte, chunkS
 	}
 
 	// Phase 2: embed all chunks and write to nanovec.
+	// 嵌入/写入任一环节失败时，defer 回滚已写入的 SQLite 分块，
+	// 避免留下"有分块无向量"的半成品（下次可重新上传索引）。
 	vecs := make([][]float32, 0, len(vecChunks))
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			_ = s.database.DeleteKBChunks(kbID, docID)
+		}
+	}()
 	for _, c := range vecChunks {
 		v, err := s.embedChunk(ep, c.Content)
 		if err != nil {
-			// SQLite already has the records; leave nanovec to be rebuilt.
-			return len(vecChunks), fmt.Errorf("嵌入第 %d 块失败: %w（分块已保存，可稍后重建索引）", c.ChunkIdx, err)
+			return len(vecChunks), fmt.Errorf("嵌入第 %d 块失败: %w（分块已回滚，可稍后重试）", c.ChunkIdx, err)
 		}
 		vecs = append(vecs, v)
 	}
@@ -153,6 +166,7 @@ func (s *Server) indexKBFile(kbID, docID, docName string, content []byte, chunkS
 	if err := vdb.InsertBatch(vecChunks, vecs); err != nil {
 		return len(vecChunks), fmt.Errorf("写入向量索引失败: %w", err)
 	}
+	succeeded = true
 	return len(vecChunks), nil
 }
 

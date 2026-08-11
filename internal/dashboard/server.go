@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/AstrBotDevs/AstrBot/internal/config"
@@ -76,6 +77,7 @@ type Server struct {
 	// URL) so repeated WebUI requests don't hammer the remote.
 	marketMu    sync.Mutex
 	marketCache map[string]*marketCacheEntry
+	loginLimiter *loginRateLimiter
 }
 
 // defaultPluginMarketURL is the default plugin marketplace registry served by
@@ -152,12 +154,17 @@ func NewServer(port int, configPath string) *Server {
 	s.installProgress = make(map[string]*installStatus)
 	s.marketCache = make(map[string]*marketCacheEntry)
 	s.kbTasks = make(map[string]*kbUploadTask)
+	s.loginLimiter = newLoginRateLimiter()
 	s.setupRoutes()
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
 		Handler:      s.mux,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		// 注意：不设置 WriteTimeout —— 它会在请求开始时设定绝对截止，
+		// 掐断最长 300s 的 SSE 聊天流（/chat 与 /unified-chat）。慢连接/长流
+		// 由各 handler 自带的 deadline 与 r.Context().Done() 兜底。
+		IdleTimeout: 5 * time.Minute,
 	}
 	return s
 }
@@ -237,6 +244,42 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// loginRateLimitConfig reads dashboard.auth_rate_limit from the config and
+// returns (average_interval, max_burst, enabled). Defaults match the config
+// template (enable=true, 1.0s interval, burst 3).
+func (s *Server) loginRateLimitConfig() (float64, float64, bool) {
+	interval := 1.0
+	burst := 3.0
+	enabled := true
+	cfg := s.getConfigData("default")
+	if dash, ok := cfg["dashboard"].(map[string]interface{}); ok {
+		if arl, ok := dash["auth_rate_limit"].(map[string]interface{}); ok {
+			if v, ok := arl["enable"].(bool); ok {
+				enabled = v
+			}
+			if v, ok := arl["average_interval"].(float64); ok && v > 0 {
+				interval = v
+			}
+			if v, ok := arl["max_burst"].(float64); ok && v > 0 {
+				burst = v
+			}
+		}
+	}
+	return interval, burst, enabled
+}
+
+// trustProxyEnabled reports whether X-Forwarded-For should be honored when
+// deriving the client IP (dashboard.trust_proxy_headers).
+func (s *Server) trustProxyEnabled() bool {
+	cfg := s.getConfigData("default")
+	if dash, ok := cfg["dashboard"].(map[string]interface{}); ok {
+		if v, ok := dash["trust_proxy_headers"].(bool); ok {
+			return v
+		}
+	}
+	return false
+}
+
 // handleAuth handles authentication endpoints.
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, parts []string) {
 	if len(parts) == 0 {
@@ -293,6 +336,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
 		return
+	}
+	// Brute-force throttle: dashboard.auth_rate_limit.enable (default true)
+	// with average_interval / max_burst from config, keyed by client IP.
+	if s.loginLimiter != nil {
+		interval, burst, enabled := s.loginRateLimitConfig()
+		if enabled && !s.loginLimiter.Allow(clientIP(r, s.trustProxyEnabled()), interval, burst) {
+			writeJSON(w, http.StatusTooManyRequests, apiError("登录尝试过于频繁，请稍后再试"))
+			return
+		}
 	}
 	var creds struct {
 		Username        string `json:"username"`
@@ -380,8 +432,12 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		Username        string `json:"username"`
 		Password        string `json:"password"`
 		ConfirmPassword string `json:"confirm_password"`
+		OldPassword     string `json:"old_password"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的请求体"))
+		return
+	}
 	if s.auth == nil {
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"token":    generateRandomToken(32),
@@ -391,6 +447,13 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Password != body.ConfirmPassword {
 		writeJSON(w, http.StatusOK, apiError("密码不匹配"))
+		return
+	}
+	// Outside the first-install onboarding flow (a random password was set and
+	// a change is required), the caller must prove knowledge of the current
+	// password so this endpoint cannot be used to hijack the account.
+	if !s.auth.PasswordChangeRequired() && !s.auth.VerifyPassword(body.OldPassword) {
+		writeJSON(w, http.StatusUnauthorized, apiError("旧密码错误"))
 		return
 	}
 	// Set credentials
@@ -589,8 +652,18 @@ func systemMemoryMB() int {
 }
 
 // processCPUPercent returns the process CPU usage percentage (Linux /proc).
-// It samples the process utime+stime vs total CPU over a 300ms window.
+// It samples the process utime+stime vs total CPU over a 300ms window and
+// caches the result for cpuPercentCacheTTL so concurrent /stats polls do not
+// each block for 300ms.
 func processCPUPercent() float64 {
+	cpuCacheMu.Lock()
+	if time.Since(cpuCacheAt) < cpuPercentCacheTTL {
+		v := cpuCacheVal
+		cpuCacheMu.Unlock()
+		return v
+	}
+	cpuCacheMu.Unlock()
+
 	pid := os.Getpid()
 	read := func(path string) (int64, int64, bool) {
 		data, err := os.ReadFile(path)
@@ -653,8 +726,22 @@ func processCPUPercent() float64 {
 	if percent > 100 {
 		percent = 100
 	}
-	return round1(percent)
+	result := round1(percent)
+	cpuCacheMu.Lock()
+	cpuCacheVal = result
+	cpuCacheAt = time.Now()
+	cpuCacheMu.Unlock()
+	return result
 }
+
+// cpuPercentCacheTTL bounds how often processCPUPercent re-samples /proc.
+const cpuPercentCacheTTL = 5 * time.Second
+
+var (
+	cpuCacheMu sync.Mutex
+	cpuCacheAt time.Time
+	cpuCacheVal float64
+)
 
 func round1(v float64) float64 {
 	return math.Round(v*10) / 10
@@ -948,7 +1035,7 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(data)
-	if apiLogDisabled {
+	if apiLogDisabled.Load() {
 		return
 	}
 	s := mustMarshal(data)
@@ -961,9 +1048,13 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 // apiLogDisabled gates the per-request "API response" log line (default true,
 // mirroring dashboard.disable_access_log). Logging every response floods the
 // console page and inflates the log history, freezing the WebUI.
-var apiLogDisabled = true
+var apiLogDisabled atomic.Bool
 
-func setAPILogDisabled(v bool) { apiLogDisabled = v }
+func init() {
+	apiLogDisabled.Store(true)
+}
+
+func setAPILogDisabled(v bool) { apiLogDisabled.Store(v) }
 
 // SetWebUIDir sets the external WebUI static files directory.
 // When set, serveWebUI reads from this directory first, falling back to the embedded dist.
@@ -981,7 +1072,13 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 
 	// Prefer external WebUI directory if configured
 	if s.webuiDir != "" {
+		// 防路径穿越：拼接后校验仍在 webuiDir 内（嵌入式 webFS 自身会拒绝
+		// `..`，但外部目录分支是 os.ReadFile，需显式防护）。
 		fsPath := filepath.Join(s.webuiDir, cleanPath)
+		if rel, err := filepath.Rel(s.webuiDir, fsPath); err != nil || strings.HasPrefix(rel, "..") {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
 		if data, err := os.ReadFile(fsPath); err == nil {
 			w.Header().Set("Content-Type", contentTypeFor(cleanPath))
 			if strings.HasPrefix(cleanPath, "assets/") {

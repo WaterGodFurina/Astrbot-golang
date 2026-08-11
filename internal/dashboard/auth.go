@@ -9,7 +9,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,6 +42,7 @@ type PasswordManager struct {
 	passwordChangeRequired bool
 	jwtSecret              string
 	tokens                 map[string]bool // active session tokens
+	revoked                map[string]bool // JWT jti blacklist (in-memory)
 }
 
 // NewPasswordManager creates a password manager, generating a random password
@@ -122,7 +126,9 @@ func (pm *PasswordManager) generateAndStorePassword() {
 	authLogger.Info("")
 }
 
-// saveToConfig writes the password hash to the config JSON file.
+// saveToConfig writes the password hash to the config JSON file. 明文密码不再
+// 落盘（仅保留 pbkdf2_password 哈希）；旧配置中的明文 password 字段由
+// NewPasswordManager 读取，用于向后兼容校验。
 func (pm *PasswordManager) saveToConfig(plaintextPassword string) {
 	cfg := make(map[string]interface{})
 
@@ -144,13 +150,8 @@ func (pm *PasswordManager) saveToConfig(plaintextPassword string) {
 	dash["password_storage_upgraded"] = true
 	pm.mu.RUnlock()
 
-	// Also store plaintext password for backward compat (Python stores it too)
-	if plaintextPassword != "" {
-		dash["password"] = plaintextPassword
-	}
-
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	_ = os.WriteFile(pm.configPath, data, 0644)
+	_ = writeConfigFile(pm.configPath, data)
 }
 
 // ensureJWTSecret generates a random JWT secret if none exists.
@@ -176,8 +177,41 @@ func (pm *PasswordManager) ensureJWTSecret() {
 	dash["jwt_secret"] = pm.jwtSecret
 
 	data, _ := json.MarshalIndent(cfg, "", "  ")
-	_ = os.WriteFile(pm.configPath, data, 0644)
+	_ = writeConfigFile(pm.configPath, data)
 	authLogger.Info("Initialized random JWT secret for dashboard.")
+}
+
+// writeConfigFile 将配置以 0600 权限原子写入（temp + rename），避免明文
+// 凭据/jwt_secret 以 0644 落盘被同机其他用户读取。参照 internal/config/config.go
+// 的 save 写法。
+func writeConfigFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // VerifyPassword checks if the given plaintext password matches the stored credential.
@@ -351,11 +385,14 @@ func (pm *PasswordManager) PrintStartupBanner(port int, ipAddrs []string) {
 	authLogger.Info("%s", sb.String())
 }
 
-// tokenTTL is how long an issued session token stays valid. The value mirrors
-// Python's JWT expiry and is long enough that a browser tab survives restarts.
-const tokenTTL = 30 * 24 * time.Hour
+// tokenTTL is how long an issued session token stays valid. Kept long enough
+// that a browser tab survives a few days of inactivity, short enough that a
+// leaked token's blast radius is bounded.
+const tokenTTL = 7 * 24 * time.Hour
 
-// jwtClaims are the custom claims carried by dashboard session tokens.
+// jwtClaims are the custom claims carried by dashboard session tokens. Each
+// token carries a random jti so Logout can revoke it server-side (blacklist)
+// instead of leaving it valid until expiry.
 type jwtClaims struct {
 	Username string `json:"username"`
 	jwt.RegisteredClaims
@@ -370,6 +407,7 @@ func (pm *PasswordManager) IssueToken(username string) (string, error) {
 	claims := jwtClaims{
 		Username: username,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        generateRandomToken(16),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(tokenTTL)),
 		},
@@ -378,8 +416,9 @@ func (pm *PasswordManager) IssueToken(username string) (string, error) {
 	return tok.SignedString([]byte(pm.JWTSecret()))
 }
 
-// verifyJWT validates a signed JWT and returns the embedded username.
-func (pm *PasswordManager) verifyJWT(token string) (string, bool) {
+// verifyJWT validates a signed JWT and returns the embedded username and jti
+// (empty when the token predates jti issuance).
+func (pm *PasswordManager) verifyJWT(token string) (string, string, bool) {
 	parsed, err := jwt.ParseWithClaims(token, &jwtClaims{}, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method %v", t.Header["alg"])
@@ -387,13 +426,13 @@ func (pm *PasswordManager) verifyJWT(token string) (string, bool) {
 		return []byte(pm.JWTSecret()), nil
 	})
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	claims, ok := parsed.Claims.(*jwtClaims)
 	if !ok || !parsed.Valid {
-		return "", false
+		return "", "", false
 	}
-	return claims.Username, true
+	return claims.Username, claims.ID, true
 }
 
 // Login verifies a password and returns a signed session token.
@@ -404,24 +443,38 @@ func (pm *PasswordManager) Login(password string) (string, error) {
 	return pm.IssueToken(pm.Username())
 }
 
-// Logout invalidates a token. JWT tokens are stateless, so logout is best
-// effort: any registered legacy token is dropped, JWT validity is left to its
-// expiry.
+// Logout invalidates a token. Signed JWTs are revoked by jti blacklist (kept
+// in memory, cleared on restart); legacy in-memory tokens are dropped.
 func (pm *PasswordManager) Logout(token string) {
+	// 解析 jti 需要读 JWTSecret（RLock），不能在持有写锁时调用（同一
+	// goroutine 写锁内再读锁会死锁），故先解析再上锁写黑名单。
+	_, jti, ok := pm.verifyJWT(token)
 	pm.mu.Lock()
+	defer pm.mu.Unlock()
 	delete(pm.tokens, token)
-	pm.mu.Unlock()
+	if ok && jti != "" {
+		if pm.revoked == nil {
+			pm.revoked = make(map[string]bool)
+		}
+		pm.revoked[jti] = true
+	}
 }
 
 // IsAuthenticated checks if a token is valid. It accepts both signed JWTs
-// (persistent across restarts) and legacy in-memory tokens registered via
-// RegisterToken (kept for backward compatibility with pre-JWT logins).
+// (persistent across restarts, minus those revoked by Logout) and legacy
+// in-memory tokens registered via RegisterToken (kept for backward
+// compatibility with pre-JWT logins).
 func (pm *PasswordManager) IsAuthenticated(token string) bool {
 	if token == "" {
 		return false
 	}
-	if _, ok := pm.verifyJWT(token); ok {
-		return true
+	if _, jti, ok := pm.verifyJWT(token); ok {
+		if jti == "" {
+			return true // 无 jti 的旧 token：未列入黑名单，直接放行
+		}
+		pm.mu.RLock()
+		defer pm.mu.RUnlock()
+		return !pm.revoked[jti]
 	}
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -461,4 +514,83 @@ func (pm *PasswordManager) SetPassword(password string) {
 	pm.mu.Unlock()
 	// Now persist to config file (uses pm.hashedPassword which is already updated)
 	pm.saveToConfig(password)
+}
+
+// loginRateLimiter is a per-IP token bucket used to slow down dashboard login
+// brute force. Config comes from dashboard.auth_rate_limit (enable /
+// average_interval / max_burst). Buckets idle longer than loginBucketIdleTTL
+// are pruned on access so the map cannot grow unboundedly.
+type loginRateLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*loginBucket
+	lastGC  time.Time
+}
+
+type loginBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+const loginBucketIdleTTL = 10 * time.Minute
+
+func newLoginRateLimiter() *loginRateLimiter {
+	return &loginRateLimiter{buckets: make(map[string]*loginBucket), lastGC: time.Now()}
+}
+
+// Allow reports whether the key may proceed. avgInterval is the token refill
+// interval in seconds (1 token per avgInterval), maxBurst the bucket capacity.
+func (l *loginRateLimiter) Allow(key string, avgInterval, maxBurst float64) bool {
+	if avgInterval <= 0 || maxBurst <= 0 {
+		return true
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if now.Sub(l.lastGC) > time.Minute {
+		for k, b := range l.buckets {
+			if now.Sub(b.last) > loginBucketIdleTTL {
+				delete(l.buckets, k)
+			}
+		}
+		l.lastGC = now
+	}
+
+	b, ok := l.buckets[key]
+	if !ok {
+		b = &loginBucket{tokens: maxBurst, last: now}
+		l.buckets[key] = b
+	}
+	refill := now.Sub(b.last).Seconds() / avgInterval
+	if refill > 0 {
+		b.tokens = b.tokens + refill
+		if b.tokens > maxBurst {
+			b.tokens = maxBurst
+		}
+		b.last = now
+	}
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
+}
+
+// clientIP extracts the client IP for rate limiting. Honors
+// dashboard.trust_proxy_headers for X-Forwarded-For; otherwise uses the remote
+// address host.
+func clientIP(r *http.Request, trustProxy bool) string {
+	if trustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if idx := strings.IndexByte(xff, ','); idx >= 0 {
+				return strings.TrimSpace(xff[:idx])
+			}
+			return strings.TrimSpace(xff)
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return host
 }

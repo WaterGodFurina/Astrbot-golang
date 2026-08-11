@@ -1,11 +1,13 @@
 package plugin
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	"golang.org/x/mod/modfile"
 )
@@ -47,6 +49,33 @@ func (m *PluginMetadata) RequiresCgo() bool {
 	return m != nil && m.Cgo != nil && *m.Cgo
 }
 
+// validatePluginName rejects plugin names that could escape the per-plugin
+// directory layout when joined into file paths. 允许字母数字与 - _，拒绝
+// /、\、.、.. 与空白等目录穿越/歧义字符。
+func validatePluginName(name string) error {
+	t := strings.TrimSpace(name)
+	if t == "" {
+		return fmt.Errorf("插件名不能为空")
+	}
+	if strings.ContainsAny(t, "/\\") || strings.Contains(t, ".") ||
+		strings.Contains(t, "..") || strings.ContainsFunc(t, unicode.IsSpace) {
+		return fmt.Errorf("插件名包含非法字符（不允许 /、\\、.、.. 及空白）: %q", name)
+	}
+	return nil
+}
+
+// sanitizePluginName returns a name safe to join into file paths: valid names
+// pass through unchanged; invalid ones (legacy manifests, tampered metadata,
+// attacker-controlled Register() output) are replaced with plugin-<hash> so no
+// path traversal or data-dir escape can occur.
+func sanitizePluginName(name string) string {
+	if validatePluginName(name) == nil {
+		return strings.TrimSpace(name)
+	}
+	sum := sha256.Sum256([]byte(name))
+	return fmt.Sprintf("plugin-%x", sum[:8])
+}
+
 // moduleName returns a safe Go module path derived from the plugin name.
 func (m *PluginMetadata) moduleName() string {
 	return "example.com/astrbot-plugin/" + sanitizeID(strings.ToLower(m.Name))
@@ -73,6 +102,11 @@ func ReadPluginMetadata(srcDir string) (*PluginMetadata, error) {
 		return nil, fmt.Errorf("metadata.json 缺少必填字段 name")
 	}
 	meta.Name = strings.TrimSpace(meta.Name)
+	// name 会被拼进 plugins_config/<name>/ 与 plugins/<name>/ 路径，必须是
+	// 安全的目录名，拒绝路径穿越（/、\、..、.、空白）。
+	if err := validatePluginName(meta.Name); err != nil {
+		return nil, err
+	}
 	if meta.Cgo == nil {
 		// 显式补齐：避免嵌套表示二义。为空则默认否。
 		no := false

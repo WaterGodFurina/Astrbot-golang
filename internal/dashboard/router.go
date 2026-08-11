@@ -10,6 +10,14 @@ import (
 // apiHandler dispatches API requests.
 // Supports both /api/xxx and /api/v1/xxx prefixes.
 func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
+	// Global auth gate: every endpoint except the public whitelist below
+	// requires a valid session token (JWT or legacy in-memory token). The
+	// WebUI attaches "Authorization: Bearer <token>" to all requests via its
+	// axios request interceptor.
+	if !s.apiAuthAllowed(r) {
+		writeJSON(w, http.StatusUnauthorized, apiError("未认证"))
+		return
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/api/")
 	if strings.HasPrefix(path, "v1/") {
 		path = strings.TrimPrefix(path, "v1/")
@@ -167,4 +175,46 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 			"message": "endpoint not yet implemented: " + category,
 		}))
 	}
+}
+
+// apiAuthAllowed reports whether the request may pass without a session token.
+// Public endpoints: auth login/check/setup-status, first-install auth/setup
+// (password change still required), and the WebSocket chat transports, which
+// authenticate themselves via their own ?token= query check (browsers cannot
+// set Authorization headers on WebSocket upgrades).
+func (s *Server) apiAuthAllowed(r *http.Request) bool {
+	if s.auth == nil {
+		return true
+	}
+	p := strings.TrimPrefix(r.URL.Path, "/api/")
+	if strings.HasPrefix(p, "v1/") {
+		p = strings.TrimPrefix(p, "v1/")
+	}
+	parts := strings.Split(p, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		return false
+	}
+	switch parts[0] {
+	case "auth":
+		if len(parts) < 2 {
+			return false
+		}
+		switch parts[1] {
+		case "login", "check", "setup-status", "logout":
+			return true
+		case "setup":
+			// The first-install onboarding flow may set credentials without a
+			// session token; after onboarding, an authenticated session is
+			// required and handleSetup still verifies the old password.
+			if s.auth.PasswordChangeRequired() {
+				return true
+			}
+			return s.auth.IsAuthenticated(extractToken(r))
+		}
+		return false
+	case "unified-chat", "live-chat":
+		// WebSocket transport validates its own token query parameter.
+		return true
+	}
+	return s.auth.IsAuthenticated(extractToken(r))
 }

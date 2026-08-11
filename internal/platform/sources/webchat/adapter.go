@@ -4,9 +4,12 @@ package webchat
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,19 +23,24 @@ var logger = log.GetDefault().WithComponent("WebChat")
 
 // Adapter provides a web-based chat interface.
 type Adapter struct {
-	Host     string
-	Port     int
-	server   *http.Server
-	EventBus *core.EventBus
-	mu       sync.Mutex
-	clients  map[string]chan *message.MessageChain
+	Host      string
+	Port      int
+	AuthToken string
+	server    *http.Server
+	EventBus  *core.EventBus
+	mu        sync.Mutex
+	clients   map[string]chan *message.MessageChain
+	// pollClients 是 /poll 长轮询专用通道（与 /chat 的同步回复通道分离），
+	// 避免同一 session 的回复被 /chat 与 /poll 两个消费者竞争抢走。
+	pollClients map[string]chan *message.MessageChain
 }
 
 // New creates a WebChat adapter.
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		EventBus: eventBus,
-		clients:  make(map[string]chan *message.MessageChain),
+		EventBus:    eventBus,
+		clients:     make(map[string]chan *message.MessageChain),
+		pollClients: make(map[string]chan *message.MessageChain),
 	}
 	a.Host, _ = config["host"].(string)
 	if a.Host == "" {
@@ -44,6 +52,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	if a.Port == 0 {
 		a.Port = 6185
 	}
+	a.AuthToken, _ = config["auth_token"].(string)
 	return a
 }
 
@@ -95,23 +104,62 @@ func (a *Adapter) Type() string { return "webchat" }
 // Send sends a message to a web chat client.
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	a.mu.Lock()
-	ch, ok := a.clients[sessionID]
+	ch, _ := a.clients[sessionID]
+	pch, _ := a.pollClients[sessionID]
 	a.mu.Unlock()
-	if !ok {
+	if ch == nil && pch == nil {
 		return fmt.Errorf("client %s not connected", sessionID)
 	}
-	select {
-	case ch <- chain:
-		return nil
-	case <-time.After(10 * time.Second):
-		return fmt.Errorf("send timeout")
+	// 优先投递给 /chat 的同步请求（该请求持有自己的专用回复通道，不会被
+	// /poll 抢走）；若 /chat 无人在等待则退化为投递给 /poll 长轮询端。
+	// 两个通道均为非阻塞写入：通道满/无人消费时丢弃，绝不阻塞回复链路。
+	if ch != nil {
+		select {
+		case ch <- chain:
+			return nil
+		default:
+		}
 	}
+	if pch != nil {
+		select {
+		case pch <- chain:
+			return nil
+		default:
+		}
+	}
+	return fmt.Errorf("send timeout")
+}
+
+// isAuthorized 校验 /chat 与 /poll 的访问身份。配置了 auth_token 时要求
+// `Authorization: Bearer <token>` 或 `?token=`；未配置时仅允许本机回环来源
+// 访问，避免 /chat 被任意来源盗刷 LLM 额度、/poll 窃取他人会话回复。
+func (a *Adapter) isAuthorized(r *http.Request) bool {
+	if token := strings.TrimSpace(a.AuthToken); token != "" {
+		provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if provided == "" {
+			provided = strings.TrimSpace(r.URL.Query().Get("token"))
+		}
+		return subtle.ConstantTimeCompare([]byte(provided), []byte(token)) == 1
+	}
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // handleChat handles incoming chat messages.
 func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !a.isAuthorized(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -136,6 +184,20 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 	chain := &message.MessageChain{
 		Chain: []message.Component{&message.Plain{Text: req.Message}},
 	}
+
+	// 每个 /chat 请求使用独立的回复通道（先注册再发布事件，避免回复在
+	// 注册前到达导致丢失），请求结束即移除，防止旧回复残留串扰后续请求。
+	replyCh := make(chan *message.MessageChain, 1)
+	a.mu.Lock()
+	a.clients[req.SessionID] = replyCh
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		if a.clients[req.SessionID] == replyCh {
+			delete(a.clients, req.SessionID)
+		}
+		a.mu.Unlock()
+	}()
 
 	// Publish event
 	event := &core.Event{
@@ -165,17 +227,9 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register client for response
-	a.mu.Lock()
-	if _, ok := a.clients[req.SessionID]; !ok {
-		a.clients[req.SessionID] = make(chan *message.MessageChain, 10)
-	}
-	ch := a.clients[req.SessionID]
-	a.mu.Unlock()
-
-	// Wait for response
+	// Wait for the reply on the request-owned channel.
 	select {
-	case resp := <-ch:
+	case resp := <-replyCh:
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"session_id": req.SessionID,
@@ -192,17 +246,23 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 
 // handlePoll handles long-polling for responses.
 func (a *Adapter) handlePoll(w http.ResponseWriter, r *http.Request) {
+	if !a.isAuthorized(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 	sessionID := r.URL.Query().Get("session_id")
 	if sessionID == "" {
 		http.Error(w, "Missing session_id", http.StatusBadRequest)
 		return
 	}
 
+	// /poll 使用独立的轮询通道（pollClients），与 /chat 的回复通道分离，
+	// 二者互不抢数据。
 	a.mu.Lock()
-	if _, ok := a.clients[sessionID]; !ok {
-		a.clients[sessionID] = make(chan *message.MessageChain, 10)
+	if _, ok := a.pollClients[sessionID]; !ok {
+		a.pollClients[sessionID] = make(chan *message.MessageChain, 10)
 	}
-	ch := a.clients[sessionID]
+	ch := a.pollClients[sessionID]
 	a.mu.Unlock()
 
 	select {

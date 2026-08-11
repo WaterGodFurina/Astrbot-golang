@@ -67,6 +67,7 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request, part
 			return
 		}
 		cfg := s.getConfigData("default")
+		redactDashboardSecrets(cfg)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"config":   cfg,
 			"metadata": s.getSystemMetadata(),
@@ -109,24 +110,39 @@ func (s *Server) getConfigSnapshot() map[string]interface{} {
 	if s.auth != nil {
 		// Preserve persisted dashboard auth fields (pbkdf2_password,
 		// jwt_secret, ...) so a WebUI save round-trip does not drop them.
+		// The password hash, plaintext password and JWT signing secret are
+		// intentionally excluded: the client never needs them, and they are
+		// re-asserted by injectAuthFields on save.
 		dash := map[string]interface{}{}
 		if pd, ok := persisted["dashboard"].(map[string]interface{}); ok {
 			for k, v := range pd {
+				switch k {
+				case "password", "pbkdf2_password", "jwt_secret":
+					continue
+				}
 				dash[k] = v
 			}
 		}
 		dash["username"] = s.auth.Username()
 		dash["host"] = "0.0.0.0"
 		dash["port"] = s.port
-		if h := s.auth.HashedPassword(); h != "" {
-			dash["pbkdf2_password"] = h
-		}
-		if sec := s.auth.JWTSecret(); sec != "" {
-			dash["jwt_secret"] = sec
-		}
 		cfg["dashboard"] = dash
 	}
 	return cfg
+}
+
+// redactDashboardSecrets strips the dashboard auth secrets (plaintext password,
+// PBKDF2 hash, JWT signing secret) from a config map before it is returned to
+// the client. The client never needs them; on save, injectAuthFields re-asserts
+// them from the password manager so round-trips are unaffected.
+func redactDashboardSecrets(cfg map[string]interface{}) {
+	dash, ok := cfg["dashboard"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	delete(dash, "password")
+	delete(dash, "pbkdf2_password")
+	delete(dash, "jwt_secret")
 }
 
 // deepMerge recursively overlays src values onto dst; dst keys win at leaf level.
@@ -2424,9 +2440,23 @@ func (s *Server) deleteKB(kbID string) error {
 	if s.database == nil {
 		return fmt.Errorf("数据库不可用")
 	}
+	// 级联清理 1：先删除该 KB 的全部分块行（knowledge_base_chunks），
+	// 避免只删 knowledge_bases 行后留下孤儿分块。
+	if err := s.database.DeleteKBChunks(kbID, ""); err != nil {
+		return fmt.Errorf("清理知识库分块失败: %w", err)
+	}
 	if err := s.database.DeleteKB(kbID); err != nil {
 		return err
 	}
+	// 级联清理 2：删除磁盘数据目录 data/knowledge_bases/<id>/，
+	// 其中 documents/ 与 nanovec 的 .store/.idx（.vec.db）文件一并移除。
+	kbDir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID))
+	if err := os.RemoveAll(kbDir); err != nil {
+		return fmt.Errorf("删除知识库数据目录失败: %w", err)
+	}
+	// 级联清理 3：释放该 KB 的向量写锁（kbVecMu 中的常驻 Mutex），
+	// 防止每 KB 一把锁随删除积累导致内存泄漏。
+	kbVecMu.Delete(kbID)
 	// Remove from in-memory manager too.
 	if km, ok := s.kbMgr.(interface {
 		DeleteKB(kbID string) bool
@@ -4580,6 +4610,12 @@ func skillFileEditable(name string) bool {
 // skillFilePath resolves a file path inside data/skills/<name>, guarding
 // against path traversal.
 func skillFilePath(skillName, relPath string) (string, error) {
+	// 校验 skillName：仅允许单段目录名，拒绝空名、"."、含路径分隔符或
+	// ".." 的名字，防止 skillName 携带 ../ 使 root 越出 data/skills/ 目录。
+	if skillName == "" || skillName == "." || skillName == ".." ||
+		strings.ContainsAny(skillName, `/\\`) || strings.Contains(skillName, "..") {
+		return "", fmt.Errorf("非法技能名")
+	}
 	root, err := filepath.Abs(filepath.Join("data", "skills", skillName))
 	if err != nil {
 		return "", err

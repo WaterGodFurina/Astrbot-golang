@@ -182,6 +182,7 @@ type EventBus struct {
 	schedulers map[string]*PipelineScheduler // keyed by config_id
 	queue      chan *Event
 	stopCh     chan struct{}
+	stopOnce   sync.Once // 保证 stopCh 只 close 一次（Stop 可被重复调用）
 }
 
 // NewEventBus creates a new event bus.
@@ -234,6 +235,16 @@ func (bus *EventBus) Publish(event *Event) error {
 	}
 }
 
+// isStopped 报告事件总线是否已停止（非阻塞检查 stopCh 是否已关闭）。
+func (bus *EventBus) isStopped() bool {
+	select {
+	case <-bus.stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
 // PublishDelayed re-enqueues an event after the given delay. Used by the
 // rate-limit stall strategy so an over-window message is processed once the
 // window frees up instead of being dropped. If the queue is still full when
@@ -246,6 +257,11 @@ func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 		return
 	}
 	time.AfterFunc(delay, func() {
+		// Stop 之后 bus 已无人消费：延迟闭包触发时若已停止则直接丢弃事件，
+		// 避免往无人消费的队列继续入队。
+		if bus.isStopped() {
+			return
+		}
 		if err := bus.Publish(event); err != nil {
 			logger.Warn("Delayed publish failed (queue full, event dropped): %v", err)
 		}
@@ -254,15 +270,23 @@ func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 
 // Stop shuts down the event bus.
 func (bus *EventBus) Stop() {
-	close(bus.stopCh)
+	bus.stopOnce.Do(func() { close(bus.stopCh) })
 }
 
+// dispatch runs the event through every registered scheduler. The scheduler
+// set is snapshotted under a read lock, then Process is invoked outside the
+// lock so a slow pipeline (up to minutes) can never stall RegisterScheduler /
+// ReloadPipelineScheduler (which need the write lock).
 func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
-	logger.Info("EventBus: dispatching message %q (schedulers=%d)", event.MessageStr, len(bus.schedulers))
 	bus.mu.RLock()
-	defer bus.mu.RUnlock()
-
+	schedulers := make([]*PipelineScheduler, 0, len(bus.schedulers))
 	for _, scheduler := range bus.schedulers {
+		schedulers = append(schedulers, scheduler)
+	}
+	bus.mu.RUnlock()
+	logger.Info("EventBus: dispatching message %q (schedulers=%d)", event.MessageStr, len(schedulers))
+
+	for _, scheduler := range schedulers {
 		result, err := scheduler.Process(ctx, event)
 		if err != nil {
 			logger.Error("Pipeline task failed: %v", err)
@@ -271,7 +295,41 @@ func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
 			break
 		}
 	}
+	// Signal completion so publishers that enqueued the event (e.g. dashboard
+	// chat) can observe that the pipeline run finished.
+	if event.Metadata != nil {
+		if done, ok := event.Metadata[MetadataPipelineDone].(*PipelineDone); ok {
+			done.Signal()
+		}
+	}
 }
+
+// PipelineDone is a completion signal closed exactly once when an event
+// finishes dispatching. Publishers stash a *PipelineDone in Event.Metadata
+// under MetadataPipelineDone to observe pipeline completion (e.g. dashboard
+// chat streaming). It is idempotent so a rate-limit re-publish of the same
+// event cannot double-close the channel.
+type PipelineDone struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+// NewPipelineDone creates a fresh completion signal.
+func NewPipelineDone() *PipelineDone {
+	return &PipelineDone{ch: make(chan struct{})}
+}
+
+// Done returns the channel closed when the pipeline finishes processing.
+func (d *PipelineDone) Done() <-chan struct{} { return d.ch }
+
+// Signal marks the event as fully processed (safe to call more than once).
+func (d *PipelineDone) Signal() {
+	d.once.Do(func() { close(d.ch) })
+}
+
+// MetadataPipelineDone is the Event.Metadata key under which a *PipelineDone
+// completion signal is stored.
+const MetadataPipelineDone = "__pipeline_done"
 
 // PipelineScheduler runs events through a chain of stages.
 type PipelineScheduler struct {

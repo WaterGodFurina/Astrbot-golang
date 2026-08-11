@@ -142,7 +142,7 @@ func (s *Server) fetchProviderSourceModels(sourceID string) ([]string, map[strin
 		}
 		models = list
 	case "gemini":
-		list, err := s.fetchOpenAICompatModels(client, strings.TrimSuffix(apiBase, "/")+"/models?key="+apiKey, "Authorization", "", "", "")
+		list, err := s.fetchOpenAICompatModels(client, strings.TrimSuffix(apiBase, "/")+"/models", "x-goog-api-key", apiKey, "", "")
 		if err != nil {
 			return nil, nil, err
 		}
@@ -160,7 +160,11 @@ func (s *Server) fetchProviderSourceModels(sourceID string) ([]string, map[strin
 }
 
 // fetchOpenAICompatModels lists models via an OpenAI-compatible /models endpoint.
+// URL 出站前过 SSRF 校验（拒绝内网/回环地址）。
 func (s *Server) fetchOpenAICompatModels(client *http.Client, url, authHeader, authValue, extraHeader, extraValue string) ([]string, error) {
+	if err := validateOutboundURL(url); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -200,8 +204,12 @@ func (s *Server) fetchOpenAICompatModels(client *http.Client, url, authHeader, a
 }
 
 // fetchOllamaModels lists models via the Ollama /api/tags endpoint.
+// URL 出站前过 SSRF 校验（拒绝内网/回环地址）。
 func (s *Server) fetchOllamaModels(client *http.Client, apiBase string) ([]string, error) {
 	url := strings.TrimSuffix(apiBase, "/") + "/api/tags"
+	if err := validateOutboundURL(url); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

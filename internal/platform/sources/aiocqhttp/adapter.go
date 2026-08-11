@@ -180,13 +180,9 @@ func (a *Adapter) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify access token
-	if a.Token != "" {
-		auth := r.Header.Get("Authorization")
-		if auth != "Bearer "+a.Token && auth != a.Token {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if !a.authValid(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
 
 	var event map[string]interface{}
@@ -200,16 +196,25 @@ func (a *Adapter) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// authValid verifies the OneBot access token. 未配置 token 时一律拒绝：默认模板
+// ws_reverse_token 为空，若放行则任何能访问本端口的人都能连入 /ws 伪造消息
+// 事件、窃听 send_msg 回复。
+func (a *Adapter) authValid(r *http.Request) bool {
+	if a.Token == "" {
+		logger.Warn("aiocqhttp: 未配置 ws_reverse_token，拒绝事件入口请求（%s %s）。请在平台配置中设置访问令牌", r.Method, r.URL.Path)
+		return false
+	}
+	auth := r.Header.Get("Authorization")
+	queryToken := r.URL.Query().Get("access_token")
+	return strings.HasPrefix(auth, "Bearer "+a.Token) || auth == a.Token || queryToken == a.Token
+}
+
 // handleWebSocket serves the reverse WebSocket endpoint. OneBot
 // implementations connect here and both push events and receive API calls.
 func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	if a.Token != "" {
-		auth := r.Header.Get("Authorization")
-		queryToken := r.URL.Query().Get("access_token")
-		if !strings.HasPrefix(auth, "Bearer "+a.Token) && auth != a.Token && queryToken != a.Token {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if !a.authValid(r) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
 
 	conn, err := a.upgrader.Upgrade(w, r, nil)
@@ -638,9 +643,11 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 	for _, comp := range mc.Chain {
 		switch c := comp.(type) {
 		case *message.Plain:
+			// 文本段必须转义 CQ 码特殊字符，否则含 [CQ:...] 的原文会被对端
+			// 解析为 CQ 码指令（图片/at 等非 text 段不转义）。
 			segments = append(segments, map[string]interface{}{
 				"type": "text",
-				"data": map[string]interface{}{"text": c.Text},
+				"data": map[string]interface{}{"text": escapeCQText(c.Text)},
 			})
 		case *message.At:
 			segments = append(segments, map[string]interface{}{
@@ -690,6 +697,14 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 		}
 	}
 	return segments
+}
+
+// escapeCQText 转义 OneBot v11 CQ 码特殊字符（参照 OneBot 规范）：
+// [ → &#91;、] → &#93;、, → &#44;。用于文本段输出，防止原文中的
+// [CQ:xxx] 被对端当作 CQ 码执行。
+func escapeCQText(s string) string {
+	replacer := strings.NewReplacer("[", "&#91;", "]", "&#93;", ",", "&#44;")
+	return replacer.Replace(s)
 }
 
 // extractPlainText extracts plain text from a message chain.

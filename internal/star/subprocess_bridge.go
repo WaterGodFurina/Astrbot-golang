@@ -7,12 +7,17 @@ package star
 import (
 	"context"
 	"strings"
+	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	"github.com/AstrBotDevs/AstrBot/internal/core"
 	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 	"github.com/AstrBotDevs/AstrBot/pkg/message"
 )
+
+// pluginRPCTimeout bounds every gRPC call into a plugin's subprocess so a hung
+// plugin handler (infinite loop, deadlock) cannot freeze the pipeline forever.
+const pluginRPCTimeout = 30 * time.Second
 
 // RegisterSubprocessPlugins bridges a batch of running subprocess plugins.
 func RegisterSubprocessPlugins(starMgr *Manager, insts []*plugin.PluginInstance) {
@@ -49,7 +54,9 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if len(parts) > 1 {
 					args = parts[1:]
 				}
-				text, chain, err := client.HandleCommand(context.Background(), cmd.Name, args, CoreEventToSDK(e))
+				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+				text, chain, err := client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDK(e))
+				rpcCancel()
 				if err != nil {
 					text = "插件执行失败: " + err.Error()
 					chain = nil
@@ -88,7 +95,9 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if !ok {
 					return nil
 				}
-				allow, err := client.HandleFilter(context.Background(), f.Name, CoreEventToSDK(e))
+				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+				allow, err := client.HandleFilter(rpcCtx, f.Name, CoreEventToSDK(e))
+				rpcCancel()
 				if err != nil {
 					return nil
 				}
@@ -130,7 +139,9 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if !ok {
 					return nil
 				}
-				_, _, err := client.HandleHook(context.Background(), h.Name, CoreEventToSDK(e), nil)
+				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+				_, _, err := client.HandleHook(rpcCtx, h.Name, CoreEventToSDK(e), nil)
+				rpcCancel()
 				return err
 			},
 			EventType:    et,

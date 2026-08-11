@@ -287,11 +287,14 @@ func (c *AstrBotConfig) All() map[string]interface{} {
 // Path returns the config file path.
 func (c *AstrBotConfig) Path() string { return c.configPath }
 
-// save writes the config to a temp file then renames atomically.
+// save writes the config to a temp file then renames atomically. orderedWrite
+// deep-traverses c.data, so it is serialized inside the critical section to
+// avoid a concurrent Set/Update racing the map read.
 func (c *AstrBotConfig) save(indent int) error {
 	c.mu.Lock()
 	c.saveRevision++
 	rev := c.saveRevision
+	ordered := c.orderedWrite()
 	c.mu.Unlock()
 
 	dir := filepath.Dir(c.configPath)
@@ -313,7 +316,6 @@ func (c *AstrBotConfig) save(indent int) error {
 	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", repeatSpace(indent))
 	enc.SetEscapeHTML(false)
-	ordered := c.orderedWrite()
 	if err := enc.Encode(ordered); err != nil {
 		tmp.Close()
 		return fmt.Errorf("encode: %w", err)

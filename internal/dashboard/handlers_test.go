@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,19 @@ import (
 	"github.com/AstrBotDevs/AstrBot/internal/config"
 	"github.com/AstrBotDevs/AstrBot/internal/plugin"
 )
+
+// authedRequest builds an HTTP request carrying a valid session token so it
+// passes the global /api auth gate added to apiHandler.
+func authedRequest(t *testing.T, s *Server, method, path string, body io.Reader) *http.Request {
+	t.Helper()
+	tok, err := s.auth.IssueToken(s.auth.Username())
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+	req := httptest.NewRequest(method, path, body)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	return req
+}
 
 func TestHandlersReturnNamedObjects(t *testing.T) {
 	s := NewServer(0, "/tmp/test_pw.json")
@@ -153,7 +167,7 @@ func TestHandlersReturnNamedObjects(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
-			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req := authedRequest(t, s, tt.method, tt.path, nil)
 			w := httptest.NewRecorder()
 			s.mux.ServeHTTP(w, req)
 			tt.check(t, w.Body.String())
@@ -190,7 +204,7 @@ func TestPluginSourceRoutes(t *testing.T) {
 
 	// Bind-source on a non-existent subprocess plugin: must NOT uninstall, and
 	// must return an error rather than silently succeeding.
-	req := httptest.NewRequest(http.MethodPost,
+	req := authedRequest(t, s, http.MethodPost,
 		"/api/v1/plugins/nonexistent/source",
 		strings.NewReader(`{"install_method":"market","market_plugin_id":"a/b"}`))
 	w := httptest.NewRecorder()
@@ -204,7 +218,7 @@ func TestPluginSourceRoutes(t *testing.T) {
 	}
 
 	// Single-plugin update route must not uninstall.
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/plugins/nonexistent/update", nil)
+	req = authedRequest(t, s, http.MethodPost, "/api/v1/plugins/nonexistent/update", nil)
 	w = httptest.NewRecorder()
 	s.mux.ServeHTTP(w, req)
 	v = map[string]interface{}{}
@@ -216,7 +230,7 @@ func TestPluginSourceRoutes(t *testing.T) {
 	}
 
 	// Batch update route with empty body.
-	req = httptest.NewRequest(http.MethodPost, "/api/v1/plugins/update", nil)
+	req = authedRequest(t, s, http.MethodPost, "/api/v1/plugins/update", nil)
 	w = httptest.NewRecorder()
 	s.mux.ServeHTTP(w, req)
 	v = map[string]interface{}{}
@@ -235,7 +249,7 @@ func TestMetadataOrderPreserved(t *testing.T) {
 	defer s.Stop()
 
 	for _, path := range []string{"/api/system-config/schema", "/api/system-config/runtime"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req := authedRequest(t, s, http.MethodGet, path, nil)
 		w := httptest.NewRecorder()
 		s.mux.ServeHTTP(w, req)
 		var v map[string]interface{}
@@ -322,4 +336,130 @@ func rawKeys(t *testing.T, body []byte, obj map[string]interface{}, key string) 
 		return nil
 	}
 	return mdOM.Keys()
+}
+
+// TestAPIAuthGate guards the global /api authentication: unauthenticated
+// requests are rejected with 401, and the auth/setup endpoint cannot be used to
+// hijack an account whose password change is no longer required.
+func TestAPIAuthGate(t *testing.T) {
+	s := NewServer(0, "/tmp/test_pw.json")
+	defer s.Stop()
+
+	// An unauthenticated request to a sensitive endpoint must be rejected.
+	req := httptest.NewRequest(http.MethodGet, "/api/system-config", nil)
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /api/system-config: want 401, got %d", w.Code)
+	}
+
+	// Public auth endpoints remain reachable without a token (rejected by the
+	// credential check, not the auth gate).
+	req = httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"astrbot","password":"wrong"}`))
+	w = httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), "未认证") {
+		t.Fatalf("login should be reachable without a token, got %d (%s)", w.Code, w.Body.String())
+	}
+
+	// Once a password is set (change no longer required), auth/setup must not
+	// reset credentials without the old password.
+	s.auth.SetPassword("CurrentPw123")
+	req = httptest.NewRequest(http.MethodPost, "/api/auth/setup",
+		strings.NewReader(`{"password":"evil","confirm_password":"evil"}`))
+	w = httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("setup without old password after onboarding: want 401, got %d (%s)", w.Code, w.Body.String())
+	}
+	if s.auth.VerifyPassword("evil") {
+		t.Fatal("setup must not change the password without the old password")
+	}
+
+	// With the correct old password (and an authenticated session) it is allowed.
+	req = authedRequest(t, s, http.MethodPost, "/api/auth/setup",
+		strings.NewReader(`{"password":"NewPw123","confirm_password":"NewPw123","old_password":"CurrentPw123"}`))
+	w = httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("setup with correct old password: want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	if !s.auth.VerifyPassword("NewPw123") {
+		t.Fatal("setup with correct old password should update the password")
+	}
+}
+
+// TestConfigSnapshotRedactsSecrets verifies getConfigSnapshot never leaks the
+// plaintext dashboard password, password hash or JWT signing secret.
+func TestConfigSnapshotRedactsSecrets(t *testing.T) {
+	s := NewServer(0, "/tmp/test_pw.json")
+	defer s.Stop()
+	s.auth.SetPassword("SuperSecret123")
+
+	cfg := s.getConfigSnapshot()
+	dash, ok := cfg["dashboard"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing dashboard section")
+	}
+	for _, key := range []string{"password", "pbkdf2_password", "jwt_secret"} {
+		if v, present := dash[key]; present {
+			t.Errorf("config snapshot must not expose %q, got %v", key, v)
+		}
+	}
+	if s.auth.JWTSecret() == "" {
+		t.Fatal("JWT secret must still exist server-side")
+	}
+}
+
+// TestJWTLogoutRevokesToken verifies that logging out blacklists the JWT so
+// the same token is rejected afterwards (server-side revocation), while the
+// logout endpoint itself stays reachable.
+func TestJWTLogoutRevokesToken(t *testing.T) {
+	s := NewServer(0, "/tmp/test_pw.json")
+	defer s.Stop()
+
+	// A valid token passes the auth gate.
+	tok, err := s.auth.IssueToken(s.auth.Username())
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+	if !s.auth.IsAuthenticated(tok) {
+		t.Fatal("token should be authenticated before logout")
+	}
+
+	// Logout endpoint is reachable (public whitelist) and revokes the token.
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("logout should be allowed, got %d", w.Code)
+	}
+	if s.auth.IsAuthenticated(tok) {
+		t.Fatal("token must be rejected after logout (jti blacklist)")
+	}
+}
+
+// TestLoginRateLimit verifies the token-bucket login throttle rejects rapid
+// attempts after the burst is exhausted.
+func TestLoginRateLimit(t *testing.T) {
+	s := NewServer(0, "/tmp/test_pw.json")
+	defer s.Stop()
+	s.auth.SetPassword("CorrectPw123")
+
+	limiter := s.loginLimiter
+	if limiter == nil {
+		t.Fatal("login limiter not initialized")
+	}
+	// burst=3: first three attempts pass, the fourth is throttled.
+	if !limiter.Allow("1.2.3.4", 1.0, 3.0) || !limiter.Allow("1.2.3.4", 1.0, 3.0) || !limiter.Allow("1.2.3.4", 1.0, 3.0) {
+		t.Fatal("first three attempts within burst should be allowed")
+	}
+	if limiter.Allow("1.2.3.4", 1.0, 3.0) {
+		t.Fatal("fourth attempt beyond burst should be throttled")
+	}
+	// A different IP is unaffected.
+	if !limiter.Allow("5.6.7.8", 1.0, 3.0) {
+		t.Fatal("a different client should not be throttled")
+	}
 }

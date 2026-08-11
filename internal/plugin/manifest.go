@@ -2,7 +2,9 @@ package plugin
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // Manifest persists installed plugins across restarts (source URL, enabled
@@ -55,13 +57,44 @@ func LoadManifest(path string) (*Manifest, error) {
 	return &m, nil
 }
 
-// Save writes the manifest atomically.
+// Save writes the manifest atomically: 先写临时文件并 fsync，再 os.Rename 原子
+// 替换，避免并发覆盖/崩溃截断导致条目丢失（参照 internal/config 的 save 写法）。
 func (m *Manifest) Save(path string) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // Get returns the entry for a plugin ID, or nil.

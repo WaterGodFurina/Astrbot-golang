@@ -22,12 +22,13 @@ import (
 
 // MCPClient represents a connection to an MCP server.
 type MCPClient struct {
-	mu     sync.Mutex
-	name   string
-	active bool
-	config map[string]interface{}
-	cl     *client.Client
-	tools  []MCPToolInfo
+	mu          sync.Mutex
+	reconnectMu sync.Mutex // 串行化 Reconnect 的 Cleanup+Connect 整段，防并发重入
+	name        string
+	active      bool
+	config      map[string]interface{}
+	cl          *client.Client
+	tools       []MCPToolInfo
 }
 
 // MCPToolInfo describes a tool available on an MCP server.
@@ -240,6 +241,11 @@ func (c *MCPClient) Cleanup() {
 // Reconnect tears down the current connection and establishes a fresh one.
 // Used by callers after a transport failure (e.g. SSE connection lost).
 func (c *MCPClient) Reconnect(ctx context.Context) error {
+	// Cleanup 会关闭并清空 cl，与并发的 Connect/CallTool 交错时可能重入破坏状态。
+	// 用独立的 reconnectMu 串行化整段操作；内部 Connect 自行持 c.mu，二者不同
+	// 锁序，不会死锁。
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
 	c.Cleanup()
 	c.mu.Lock()
 	c.active = true

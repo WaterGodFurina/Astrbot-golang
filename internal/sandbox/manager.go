@@ -119,9 +119,15 @@ func (b *LocalBooter) IsRunning() bool {
 
 // mapPath maps a sandbox path (/workspace/... or a relative path) onto the
 // host backing directory. Absolute paths outside /workspace are shadowed under
-// the root so the booter cannot touch the real host filesystem.
-func (b *LocalBooter) mapPath(path string) string {
-	p := filepath.Clean(filepath.FromSlash(strings.TrimSpace(path)))
+// the root so the booter cannot touch the real host filesystem. 路径先做
+// filepath.Clean，再拼接到 root 下并用 filepath.Rel 校验，防止 `../../x`
+// 一类相对路径逃出沙盒根目录。
+func (b *LocalBooter) mapPath(path string) (string, error) {
+	raw := strings.TrimSpace(path)
+	if raw == "" {
+		return "", fmt.Errorf("沙盒路径为空")
+	}
+	p := filepath.Clean(filepath.FromSlash(raw))
 	p = strings.TrimPrefix(p, SandboxWorkdir)
 	p = strings.TrimPrefix(p, string(filepath.Separator))
 	b.mu.Lock()
@@ -130,7 +136,15 @@ func (b *LocalBooter) mapPath(path string) string {
 	if root == "" {
 		root = filepath.Join("data", "sandbox", "workspace")
 	}
-	return filepath.Join(root, p)
+	joined := filepath.Join(root, p)
+	rel, err := filepath.Rel(root, joined)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("沙盒路径越界：%q 逃出沙盒根目录 %s", path, root)
+	}
+	return joined, nil
 }
 
 func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workdir string) (string, string, int, error) {
@@ -140,7 +154,13 @@ func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workd
 	if !running {
 		return "", "", -1, fmt.Errorf("local sandbox not running")
 	}
-	dir := b.mapPath(workdir)
+	if strings.TrimSpace(workdir) == "" {
+		workdir = SandboxWorkdir
+	}
+	dir, err := b.mapPath(workdir)
+	if err != nil {
+		return "", "", -1, err
+	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", "", -1, err
 	}
@@ -149,7 +169,7 @@ func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workd
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr
-	err := c.Run()
+	err = c.Run()
 	if err == nil {
 		return stdout.String(), stderr.String(), 0, nil
 	}
@@ -166,7 +186,11 @@ func (b *LocalBooter) ListSkills(ctx context.Context) ([]skills.SandboxCacheEntr
 	if !running {
 		return nil, fmt.Errorf("local sandbox not running")
 	}
-	skillsRoot := filepath.Join(b.mapPath(SandboxWorkdir), "skills")
+	root, err := b.mapPath(SandboxWorkdir)
+	if err != nil {
+		return nil, err
+	}
+	skillsRoot := filepath.Join(root, "skills")
 	var entries []skills.SandboxCacheEntry
 	_ = filepath.WalkDir(skillsRoot, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -197,7 +221,10 @@ func (b *LocalBooter) ReadFile(ctx context.Context, path string) (string, error)
 	if !running {
 		return "", fmt.Errorf("local sandbox not running")
 	}
-	host := b.mapPath(path)
+	host, err := b.mapPath(path)
+	if err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile(host)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -215,7 +242,10 @@ func (b *LocalBooter) WriteFile(ctx context.Context, path, content string) error
 	if !running {
 		return fmt.Errorf("local sandbox not running")
 	}
-	host := b.mapPath(path)
+	host, err := b.mapPath(path)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(host), 0755); err != nil {
 		return err
 	}
@@ -469,11 +499,14 @@ func NewManager(skillMgr *skills.SkillManager) *Manager {
 // SetBooter switches the sandbox backend.
 func (m *Manager) SetBooter(b Booter) {
 	m.mu.Lock()
-	if m.booter != nil {
-		m.booter.Stop()
-	}
+	old := m.booter
 	m.booter = b
 	m.mu.Unlock()
+	// 旧 booter 的 Stop 可能阻塞较久（docker rm 最长 30s），必须在锁外执行，
+	// 否则期间所有 Exec/读写操作都会被写锁卡住。
+	if old != nil {
+		old.Stop()
+	}
 }
 
 // Start launches the sandbox.

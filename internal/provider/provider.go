@@ -163,6 +163,9 @@ func NewProviderManager() *ProviderManager {
 }
 
 // Register adds a provider.
+//
+// 保留待用：当前生产代码无调用点（运行时 provider 初始化走 sources/ 的
+// RegisterProvider 工厂注册），仅测试与未来注册路径使用，勿删除。
 func (pm *ProviderManager) Register(id string, p AbstractProvider) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -178,6 +181,8 @@ func (pm *ProviderManager) Unregister(id string) {
 }
 
 // Get returns a provider by ID.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) Get(id string) AbstractProvider {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -185,6 +190,8 @@ func (pm *ProviderManager) Get(id string) AbstractProvider {
 }
 
 // GetChatProvider returns the default chat provider.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) GetChatProvider() ChatProvider {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -203,6 +210,8 @@ func (pm *ProviderManager) GetChatProvider() ChatProvider {
 }
 
 // GetSTTProvider returns the default STT provider.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) GetSTTProvider() STTProvider {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -220,6 +229,8 @@ func (pm *ProviderManager) GetSTTProvider() STTProvider {
 }
 
 // GetTTSProvider returns the default TTS provider.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) GetTTSProvider() TTSProvider {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -237,6 +248,8 @@ func (pm *ProviderManager) GetTTSProvider() TTSProvider {
 }
 
 // GetEmbeddingProvider returns the default embedding provider.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) GetEmbeddingProvider() EmbeddingProvider {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -254,6 +267,8 @@ func (pm *ProviderManager) GetEmbeddingProvider() EmbeddingProvider {
 }
 
 // GetRerankProvider returns the default rerank provider.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) GetRerankProvider() RerankProvider {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
@@ -271,6 +286,8 @@ func (pm *ProviderManager) GetRerankProvider() RerankProvider {
 }
 
 // SetDefaultChatProvider sets the default chat provider ID.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) SetDefaultChatProvider(id string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -278,6 +295,8 @@ func (pm *ProviderManager) SetDefaultChatProvider(id string) {
 }
 
 // SetDefaultSTTProvider sets the default STT provider ID.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) SetDefaultSTTProvider(id string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -285,6 +304,8 @@ func (pm *ProviderManager) SetDefaultSTTProvider(id string) {
 }
 
 // SetDefaultTTSProvider sets the default TTS provider ID.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) SetDefaultTTSProvider(id string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -292,6 +313,8 @@ func (pm *ProviderManager) SetDefaultTTSProvider(id string) {
 }
 
 // SetDefaultEmbeddingProvider sets the default embedding provider ID.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) SetDefaultEmbeddingProvider(id string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -299,6 +322,8 @@ func (pm *ProviderManager) SetDefaultEmbeddingProvider(id string) {
 }
 
 // SetDefaultRerankProvider sets the default rerank provider ID.
+//
+// 保留待用：当前生产代码无调用点，仅测试使用，勿删除。
 func (pm *ProviderManager) SetDefaultRerankProvider(id string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()

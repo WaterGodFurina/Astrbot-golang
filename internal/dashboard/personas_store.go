@@ -76,7 +76,7 @@ func (ps *personaStore) listPersonas(folderID *string) []map[string]interface{} 
 				continue
 			}
 		}
-		result = append(result, p)
+		result = append(result, copyPersonaMap(p))
 	}
 	sort.SliceStable(result, func(i, j int) bool {
 		a, _ := result[i]["sort_order"].(float64)
@@ -91,10 +91,20 @@ func (ps *personaStore) getPersona(id string) map[string]interface{} {
 	defer ps.mu.Unlock()
 	for _, p := range ps.data.Personas {
 		if pid, _ := p["persona_id"].(string); pid == id {
-			return p
+			return copyPersonaMap(p)
 		}
 	}
 	return nil
+}
+
+// copyPersonaMap returns a shallow copy so callers cannot race upsertPersona's
+// in-place writes on the stored map.
+func copyPersonaMap(p map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(p))
+	for k, v := range p {
+		out[k] = v
+	}
+	return out
 }
 
 func (ps *personaStore) upsertPersona(p map[string]interface{}) error {

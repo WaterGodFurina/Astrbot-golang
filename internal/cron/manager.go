@@ -32,6 +32,7 @@ type Job struct {
 	Handler        JobFunc
 	NextRun        time.Time
 	Enabled        bool
+	running        bool // 执行中标志（在 m.mu 保护下读写），防止同 job 重叠执行
 }
 
 // IsDue reports whether the job should fire at `now`.
@@ -53,6 +54,9 @@ type CronJobManager struct {
 	stop      chan struct{}
 	handlers  map[string]JobHandler
 	nextRunFn func(j *Job) (time.Time, error)
+	// ctx 记录 Start 传入的运行上下文，RunNow 派生的任务随其取消，不再用
+	// context.Background()（Start 内加锁写入/读取，避免数据竞争）。
+	ctx context.Context
 }
 
 // NewCronJobManager creates a manager.
@@ -127,7 +131,9 @@ func (m *CronJobManager) SetEnabled(id string, enabled bool) bool {
 	}
 	m.mu.Unlock()
 	if m.db != nil {
-		_ = m.db.UpdateCronJob(id, map[string]interface{}{"enabled": enabled})
+		if err := m.db.UpdateCronJob(id, map[string]interface{}{"enabled": enabled}); err != nil {
+			logger.Error("Failed to persist cron job %s enabled=%v: %v", id, enabled, err)
+		}
 	}
 	logger.Info("Cron job %s enabled=%v", id, enabled)
 	return true
@@ -173,7 +179,9 @@ func (m *CronJobManager) Remove(id string) {
 	delete(m.jobs, id)
 	m.mu.Unlock()
 	if m.db != nil {
-		_ = m.db.DeleteCronJob(id)
+		if err := m.db.DeleteCronJob(id); err != nil {
+			logger.Error("Failed to delete cron job %s: %v", id, err)
+		}
 	}
 }
 
@@ -188,6 +196,7 @@ func (m *CronJobManager) Get(id string) *Job {
 func (m *CronJobManager) RunNow(id string) error {
 	m.mu.Lock()
 	job := m.jobs[id]
+	runCtx := m.ctx
 	m.mu.Unlock()
 	if job == nil {
 		return fmt.Errorf("job not found: %s", id)
@@ -195,8 +204,13 @@ func (m *CronJobManager) RunNow(id string) error {
 	if job.Handler == nil {
 		return fmt.Errorf("job %s has no handler", id)
 	}
+	// 任务挂到 manager 的运行上下文：Start 传入的 ctx 被取消（或 Stop）时，
+	// 在途的 run-now 任务也能随之停止，而不是用无法取消的 Background。
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
 	go func(j *Job) {
-		if err := j.Handler(context.Background()); err != nil {
+		if err := j.Handler(runCtx); err != nil {
 			logger.Error("Cron job %s run-now failed: %v", j.ID, err)
 		}
 	}(job)
@@ -205,6 +219,9 @@ func (m *CronJobManager) RunNow(id string) error {
 
 // Start begins the cron loop.
 func (m *CronJobManager) Start(ctx context.Context) {
+	m.mu.Lock()
+	m.ctx = ctx
+	m.mu.Unlock()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -239,12 +256,20 @@ func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 		if !job.IsDue(now) {
 			continue
 		}
+		// 上次触发尚未执行完（长任务/超时），跳过本次，避免同 job 重叠执行。
+		if job.running {
+			logger.Warn("Cron job %s still running, skipping this tick", job.ID)
+			continue
+		}
 		due = append(due, job)
+		job.running = true
 		// Advance next run.
 		if job.RunOnce {
 			delete(m.jobs, job.ID)
 			if m.db != nil {
-				_ = m.db.DeleteCronJob(job.ID)
+				if err := m.db.DeleteCronJob(job.ID); err != nil {
+					logger.Error("Failed to delete one-shot cron job %s: %v", job.ID, err)
+				}
 			}
 			continue
 		}
@@ -254,6 +279,12 @@ func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 
 	for _, job := range due {
 		go func(j *Job) {
+			// 无论成败都清掉 running 标志，让下一次到点能再次触发。
+			defer func() {
+				m.mu.Lock()
+				j.running = false
+				m.mu.Unlock()
+			}()
 			if err := j.Handler(ctx); err != nil {
 				logger.Error("Cron job %s failed: %v", j.ID, err)
 			}
@@ -324,7 +355,7 @@ func (m *CronJobManager) persist(job *Job) {
 	}
 	payloadJSON, _ := json.Marshal(job.Payload)
 	if _, found, err := m.db.GetCronJob(job.ID); err == nil && found {
-		_ = m.db.UpdateCronJob(job.ID, map[string]interface{}{
+		if err := m.db.UpdateCronJob(job.ID, map[string]interface{}{
 			"name":            job.Name,
 			"description":     job.Description,
 			"job_type":        job.JobType,
@@ -333,15 +364,22 @@ func (m *CronJobManager) persist(job *Job) {
 			"payload":         string(payloadJSON),
 			"run_once":        job.RunOnce,
 			"enabled":         job.Enabled,
-		})
+		}); err != nil {
+			logger.Error("Failed to persist cron job %s: %v", job.ID, err)
+		}
 	} else {
-		_ = m.db.CreateCronJob(job.ID, job.Name, job.Description, job.JobType, job.CronExpression, job.Timezone, string(payloadJSON), job.RunOnce)
-		if !job.Enabled {
-			_ = m.db.UpdateCronJob(job.ID, map[string]interface{}{"enabled": false})
+		if err := m.db.CreateCronJob(job.ID, job.Name, job.Description, job.JobType, job.CronExpression, job.Timezone, string(payloadJSON), job.RunOnce); err != nil {
+			logger.Error("Failed to create cron job %s: %v", job.ID, err)
+		} else if !job.Enabled {
+			if err := m.db.UpdateCronJob(job.ID, map[string]interface{}{"enabled": false}); err != nil {
+				logger.Error("Failed to persist cron job %s enabled=false: %v", job.ID, err)
+			}
 		}
 	}
 	if !job.NextRun.IsZero() {
-		_ = m.db.SetCronJobNextRun(job.ID, job.NextRun.Format(time.RFC3339))
+		if err := m.db.SetCronJobNextRun(job.ID, job.NextRun.Format(time.RFC3339)); err != nil {
+			logger.Error("Failed to persist cron job %s next_run: %v", job.ID, err)
+		}
 	}
 }
 

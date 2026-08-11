@@ -44,12 +44,12 @@ func (ms *mcpStore) load() {
 }
 
 func (ms *mcpStore) save() error {
-	os.MkdirAll(filepath.Dir(ms.path), 0755)
 	data, err := json.MarshalIndent(ms.config, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(ms.path, data, 0644)
+	// 原子写：临时文件 + fsync + rename，避免非原子 WriteFile 崩溃丢数据。
+	return writeFileAtomic(ms.path, data, 0644)
 }
 
 // list returns all servers in the dashboard list format:

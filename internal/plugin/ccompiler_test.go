@@ -201,7 +201,19 @@ func main() { sdk.Serve(&sdk.Plugin{Name: "cgoplugin"}) }
 		t.Fatal(err)
 	}
 
+	// #cgo CFLAGS 触发静态扫描风险门（编译期可执行任意命令）：未确认风险时
+	// 返回 *RiskError，即使插件声明了 cgo。
 	_, err := m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{})
+	var riskErr *RiskError
+	if !errors.As(err, &riskErr) {
+		t.Fatalf("expected *RiskError for cgo plugin before IgnoreRisk, got %T: %v", err, err)
+	}
+	if m.Get("cgoplugin") != nil {
+		t.Fatal("cgo plugin must not be installed before risks are confirmed")
+	}
+
+	// 用户确认风险（IgnoreRisk）后，进入 C 编译器选择流程。
+	_, err = m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{IgnoreRisk: true})
 	var promptErr *CCompilerPromptError
 	if !errors.As(err, &promptErr) {
 		t.Fatalf("expected *CCompilerPromptError for cgo plugin, got %T: %v", err, err)
@@ -211,7 +223,7 @@ func main() { sdk.Serve(&sdk.Plugin{Name: "cgoplugin"}) }
 	}
 
 	// A cancelled choice terminates install with a clear error.
-	_, err = m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{CCChoice: string(CCChoiceCancel)})
+	_, err = m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{IgnoreRisk: true, CCChoice: string(CCChoiceCancel)})
 	if err == nil || !strings.Contains(err.Error(), "取消") {
 		t.Fatalf("expected cancel error, got %v", err)
 	}
