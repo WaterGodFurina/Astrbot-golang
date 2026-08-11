@@ -1,0 +1,8 @@
+{
+  "name": "testplugin",
+  "desc": "test plugin for SubprocessManager integration tests",
+  "author": "AstrBot Devs",
+  "version": "1.0.0",
+  "repo": "",
+  "cgo": false
+}

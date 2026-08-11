@@ -88,7 +88,7 @@ func main() {
 			Name:  "decorate",
 			Event: "on_decorating_result",
 			Handler: func(e *sdk.Event, chain []sdk.Component) ([]sdk.Component, error) {
-				return append(chain, sdk.Plain("[decorated]")), nil
+				return append(chain, sdk.Text("[decorated]")), nil
 			},
 		}},
 	})

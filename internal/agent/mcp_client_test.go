@@ -2,10 +2,13 @@ package agent
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeStdioServer is a tiny JSON-RPC MCP server that echoes the request id so
@@ -67,7 +70,11 @@ func TestMCPStdioConnectAndCall(t *testing.T) {
 	if len(tools) != 2 {
 		t.Fatalf("expected 2 tools, got %d", len(tools))
 	}
-	if tools[0].Name != "hello" || tools[1].Name != "echo" {
+	names := map[string]bool{}
+	for _, tool := range tools {
+		names[tool.Name] = true
+	}
+	if !names["hello"] || !names["echo"] {
 		t.Errorf("unexpected tools: %+v", tools)
 	}
 
@@ -94,4 +101,28 @@ func mcpContentTextForTest(content []map[string]interface{}) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// TestMCPSSEHandshakeRequiresEndpoint verifies that connecting to an SSE URL
+// that never sends an endpoint event fails instead of hanging.
+func TestMCPSSEHandshakeRequiresEndpoint(t *testing.T) {
+	// A server that returns 200 + a text/event-stream header but immediately
+	// closes the body without ever sending an endpoint event. The client must
+	// fail (EOF on the stream) instead of hanging.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewMCPClient("sse-noep", map[string]interface{}{
+		"url":       srv.URL,
+		"transport": "sse",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err == nil {
+		t.Fatal("expected error when no endpoint event is sent")
+	}
+	client.Cleanup()
 }

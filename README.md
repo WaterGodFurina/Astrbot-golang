@@ -52,7 +52,7 @@ astrbot-go/
 
 ## 插件 SDK
 
-SDK 是独立 module `github.com/WaterGodFurina/Astrbot-go-plugin-sdk`（本地 `~/astrbot-go-plugin-sdk`）。插件作者只需写一个 `main`，实现命令/过滤器/钩子：
+SDK 是独立 module `github.com/WaterGodFurina/Astrbot-go-plugin-sdk`（本地 `~/astrbot-go-plugin-sdk`）。插件作者只需写一个 `main`，实现命令/过滤器/钩子。插件身份信息（名称/版本/描述/作者/仓库/是否 cgo）统一放在包根目录的 `metadata.json`，`main.go` 只保留代码逻辑：
 
 ```go
 package main
@@ -63,13 +63,23 @@ import (
 
 func main() {
     sdk.Serve(&sdk.Plugin{
-        Name:        "echo",
-        Version:     "1.0.0",
-        Description: "Echoes your message back",
-        OnLoad:      setup, // 启动钩子，可在里面动态注册
+        OnLoad: setup, // 启动钩子，可在里面动态注册
     })
 }
 ```
+
+```json
+{
+  "name": "echo",
+  "desc": "Echoes your message back",
+  "author": "AstrBot Devs",
+  "version": "1.0.0",
+  "repo": "https://github.com/AstrBotDevs/AstrBot",
+  "cgo": false
+}
+```
+
+插件包（zip/Git 仓库）根目录**必须**包含 `metadata.json` 与 `main.go`，缺任一即安装失败。`cgo` 字段声明该插件是否需要 C 编译器：为空/缺省视为 `false`（纯 Go，`CGO_ENABLED=0`）。
 
 命令处理函数可以拆到独立文件，通过 `setup()`（OnLoad 钩子）或 `init()` 注册：
 
@@ -96,13 +106,25 @@ SDK 也支持声明式写法（直接在 `sdk.Plugin{Commands: []sdk.Command{...
 - `ASTRBOT_GO_VERSION`：指定要下载的 Go 版本（默认 1.24.3）
 - `ASTRBOT_GO_MIRROR`：下载镜像
 
+cgo 插件的 C 编译器（zig/clang/GCC）也存放在同一私有目录下（`clang-download/` 缓存归档、`clang/` 解压产物）：
+
+- `ASTRBOT_CLANG_BIN`：直接指向已装好的 clang 可执行文件
+- `ASTRBOT_CLANG_VERSION`：指定要下载的 zig 版本（默认 0.16.0）
+- `ASTRBOT_CLANG_MIRROR`：C 编译器下载镜像（如 gh-proxy 加速地址）
+- `ASTRBOT_CC`：系统 GCC 覆盖（检测优先级 `ASTRBOT_CC` > `CC` > PATH `gcc`）
+
 ## 静态扫描 + 风险提示
 
 安装插件前会静态扫描源码，发现 `os/exec`、`syscall`、`unsafe` 等危险包时，**WebUI 弹出风险对话框并列出具体代码行**，由用户选择"无视风险，继续安装"或"取消安装"。
 
 ## 已知局限与注意事项
 
-1. **cgo 支持（自适应）**：用户机器若装有 C 编译器（`cc`/`gcc`/`clang`），插件编译自动启用 `CGO_ENABLED=1`，因此依赖 cgo 的库（如 `github.com/mattn/go-sqlite3`）在**有 C 工具链的机器上可编译**；无 C 编译器时回退纯 Go（`CGO_ENABLED=0`）。可用 `ASTRBOT_PLUGIN_CGO=0/1` 强制。注意：自带的 Go 工具链不含 C 编译器，cgo 构建依赖系统已有的 C 环境；纯 Go 替代库（如 `modernc.org/sqlite`）则任何机器都能编。
+1. **cgo 支持（声明式 + 自动选择 C 编译器）**：插件在 `metadata.json` 里显式声明 `"cgo": true` 才启用 cgo（缺省为 false，纯 Go 编译）。声明 cgo 后，宿主自动检测/选择 C 编译器：
+   - 系统已有 GCC（按 `ASTRBOT_CC` > `CC` 环境变量 > PATH 中的 `gcc` 检测）→ WebUI 询问"使用系统 GCC 还是 Clang"
+   - 系统已有 Clang → 直接使用
+   - 都没有 → WebUI 询问是否自动下载 Clang；确认后下载 **zig**（`zig cc` 内置 clang，约 50MB，解压数秒，远快于 ~1GB 的 LLVM 完整包），或以 `zig cc`/`zig c++` 作为 CC/CXX 编译
+   - 可手动取消，或设 `ASTRBOT_CC`/`ASTRBOT_CLANG_BIN` 指定编译器
+   - 依赖 cgo 的库（如 `github.com/mattn/go-sqlite3`）因此在 Windows / macOS / Linux（含 Termux）上都能编译
 2. **首次安装需下载 Go 工具链（约 150–200MB）**：WebUI 安装对话框会显示实时下载进度，日志每 10% 一报。可设置 `ASTRBOT_GO_BIN` 指向本机已有的 Go 以跳过下载。
 3. **静态扫描的检测范围与盲区**：
    - 已检测：插件自身源码直接 `import` 的 `os/exec`、`syscall`、`unsafe`、`reflect`，以及 `//go:linkname`、`//go:generate` 指令（均有文件/行号/代码行，可人工判断）
@@ -111,12 +133,15 @@ SDK 也支持声明式写法（直接在 `sdk.Plugin{Commands: []sdk.Command{...
      - **误报**：`os/exec` 执行 `ls` 等无害命令也会被标记
    - 结论：风险提示仅供人工判断，不构成安全保证。
 4. **编译需要网络**：`go mod download` 会拉取依赖，离线环境安装插件会失败。
-5. **Termux（Android）**：官方没有 Android 的 Go 包，需先 `pkg install golang` 再设 `ASTRBOT_GO_BIN` 指向它，或手动安装 Go。
+5. **Termux（Android）**：官方没有 Android 的 Go 包，需先 `pkg install golang` 再设 `ASTRBOT_GO_BIN` 指向它，或手动安装 Go；cgo 插件需 `pkg install clang`（Termux 无官方 zig 包）。
+6. **cgo 编译器下载中断安全**：下载缓存于 `~/.local/share/astrbot-go/clang-download/`，支持断点续传（HTTP Range）；解压前写 `.install-lock`，若上次安装被中断，下次会自动丢弃半成品并重新下载。
 
 ## 安装与热重载
 
 - WebUI「安装插件」支持上传 `.zip` 归档或填 Git/归档 URL
-- 安装 = 下载源码 → 静态扫描 → 编译 → 启动子进程 → 桥接进管线
+- 插件包根目录须含 `metadata.json`（身份/cgo 声明）与 `main.go`（入口），缺任一安装失败
+- 安装 = 下载源码 → 校验 metadata.json + main.go → 静态扫描 → （如需 cgo 则选择/下载 C 编译器）→ 编译 → 启动子进程 → 桥接进管线
+- 安装后把 metadata.json 内容写入 `data/plugins_config/<name>/config.json` 开头，供 WebUI 展示插件信息
 - 崩溃自动重启（带退避与次数上限）；重载零停机（先起新进程再杀旧进程）
 
 ## 插件方案

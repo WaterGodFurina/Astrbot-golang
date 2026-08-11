@@ -17,6 +17,7 @@ import (
 	"time"
 
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	"github.com/AstrBotDevs/AstrBot/internal/config"
 )
 
 // ListInfo returns dashboard-compatible plugin info: running subprocess
@@ -263,6 +264,7 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 
 	carry := InstallOptions{
 		IgnoreRisk:     opts.IgnoreRisk,
+		CCChoice:       opts.CCChoice,
 		Progress:       opts.Progress,
 		InstallMethod:  entry.InstallMethod,
 		RegistryURL:    entry.RegistryURL,
@@ -439,6 +441,56 @@ func (m *SubprocessManager) Components(name string) map[string]interface{} {
 // 分开，方便用户直接编辑配置文件。
 func (m *SubprocessManager) configPath(name string) string {
 	return filepath.Join(m.dataDir, "plugins_config", name, "config.json")
+}
+
+// writeMetadataConfig writes the plugin's metadata.json content to the top of
+// its plugins_config/<name>/config.json so the WebUI/config editor can display
+// the packaged plugin info (name/desc/author/version/repo/cgo) alongside the
+// runtime config. Existing config keys (if any) are preserved underneath.
+func (m *SubprocessManager) writeMetadataConfig(name string, meta *PluginMetadata) {
+	if meta == nil {
+		return
+	}
+	path := m.configPath(name)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+
+	od := config.NewOrderedJSON()
+	cgo := "no"
+	if meta.RequiresCgo() {
+		cgo = "yes"
+	}
+	od.Set("name", meta.Name)
+	od.Set("desc", meta.Description)
+	od.Set("author", meta.Author)
+	od.Set("version", meta.Version)
+	od.Set("repo", meta.Repo)
+	if meta.Homepage != "" {
+		od.Set("homepage", meta.Homepage)
+	}
+	od.Set("cgo", cgo)
+
+	// Preserve any pre-existing config (e.g. from a previous install) after the
+	// metadata block.
+	if data, err := os.ReadFile(path); err == nil {
+		if existing, err := config.ParseOrderedJSON(data); err == nil {
+			for _, k := range existing.Keys() {
+				if od.Has(k) {
+					continue
+				}
+				if v, ok := existing.Get(k); ok {
+					od.Set(k, v)
+				}
+			}
+		}
+	}
+	out, err := json.MarshalIndent(od, "", "  ")
+	if err != nil {
+		logger.Warn("writeMetadataConfig(%s): %v", name, err)
+		return
+	}
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		logger.Warn("writeMetadataConfig(%s): %v", name, err)
+	}
 }
 
 // LoadConfig reads the plugin config from plugins_config/<name>/config.json.

@@ -13,8 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"crypto/sha256"
+
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/AstrBotDevs/AstrBot/internal/log"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -348,40 +351,84 @@ func (pm *PasswordManager) PrintStartupBanner(port int, ipAddrs []string) {
 	authLogger.Info("%s", sb.String())
 }
 
-// Login verifies a password and returns a JWT token.
+// tokenTTL is how long an issued session token stays valid. The value mirrors
+// Python's JWT expiry and is long enough that a browser tab survives restarts.
+const tokenTTL = 30 * 24 * time.Hour
+
+// jwtClaims are the custom claims carried by dashboard session tokens.
+type jwtClaims struct {
+	Username string `json:"username"`
+	jwt.RegisteredClaims
+}
+
+// IssueToken returns a signed JWT for the given username. Unlike the old
+// in-memory random tokens, this token stays valid across restarts (the signing
+// secret is persisted in the dashboard config), so the WebUI's WebSocket chat
+// transport keeps working after the server is restarted.
+func (pm *PasswordManager) IssueToken(username string) (string, error) {
+	now := time.Now()
+	claims := jwtClaims{
+		Username: username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(tokenTTL)),
+		},
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return tok.SignedString([]byte(pm.JWTSecret()))
+}
+
+// verifyJWT validates a signed JWT and returns the embedded username.
+func (pm *PasswordManager) verifyJWT(token string) (string, bool) {
+	parsed, err := jwt.ParseWithClaims(token, &jwtClaims{}, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method %v", t.Header["alg"])
+		}
+		return []byte(pm.JWTSecret()), nil
+	})
+	if err != nil {
+		return "", false
+	}
+	claims, ok := parsed.Claims.(*jwtClaims)
+	if !ok || !parsed.Valid {
+		return "", false
+	}
+	return claims.Username, true
+}
+
+// Login verifies a password and returns a signed session token.
 func (pm *PasswordManager) Login(password string) (string, error) {
 	if !pm.VerifyPassword(password) {
 		return "", fmt.Errorf("invalid password")
 	}
-	// Simple token generation (in production, use proper JWT)
-	token := generateRandomToken(32)
-	pm.mu.Lock()
-	if pm.tokens == nil {
-		pm.tokens = make(map[string]bool)
-	}
-	pm.tokens[token] = true
-	pm.mu.Unlock()
-	return token, nil
+	return pm.IssueToken(pm.Username())
 }
 
-// Logout invalidates a token.
+// Logout invalidates a token. JWT tokens are stateless, so logout is best
+// effort: any registered legacy token is dropped, JWT validity is left to its
+// expiry.
 func (pm *PasswordManager) Logout(token string) {
 	pm.mu.Lock()
 	delete(pm.tokens, token)
 	pm.mu.Unlock()
 }
 
-// IsAuthenticated checks if a token is valid.
+// IsAuthenticated checks if a token is valid. It accepts both signed JWTs
+// (persistent across restarts) and legacy in-memory tokens registered via
+// RegisterToken (kept for backward compatibility with pre-JWT logins).
 func (pm *PasswordManager) IsAuthenticated(token string) bool {
 	if token == "" {
 		return false
+	}
+	if _, ok := pm.verifyJWT(token); ok {
+		return true
 	}
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.tokens[token]
 }
 
-// RegisterToken registers a session token.
+// RegisterToken registers a legacy (in-memory) session token.
 func (pm *PasswordManager) RegisterToken(token string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()

@@ -168,21 +168,6 @@ func (m *Manager) ListKBs() []*KnowledgeBase {
 	return result
 }
 
-// ListKBsInfo returns knowledge base info as serializable maps.
-func (m *Manager) ListKBsInfo() []map[string]interface{} {
-	kbs := m.ListKBs()
-	result := make([]map[string]interface{}, 0, len(kbs))
-	for _, kb := range kbs {
-		result = append(result, map[string]interface{}{
-			"id":          kb.KBID,
-			"name":        kb.KBName,
-			"description": kb.Description,
-			"emoji":       kb.Emoji,
-		})
-	}
-	return result
-}
-
 // CreateKB creates a new knowledge base.
 func (m *Manager) CreateKB(kb *KnowledgeBase) (*KBHelper, error) {
 	m.mu.Lock()
@@ -258,20 +243,6 @@ func (m *Manager) UploadFromURL(kbNameOrID, url string, chunkSize, chunkOverlap,
 		return fmt.Errorf("knowledge base '%s' not found", kbNameOrID)
 	}
 	return helper.UploadFromURL(url, chunkSize, chunkOverlap, batchSize, tasksLimit, maxRetries, progressCB)
-}
-
-// FormatContext produces a text summary of retrieval results for the LLM.
-func FormatContext(results []*RetrievalResult) string {
-	var lines []string
-	lines = append(lines, "以下是相关的知识库内容,请参考这些信息回答用户的问题:\n")
-	for i, r := range results {
-		lines = append(lines, fmt.Sprintf("【知识 %d】", i+1))
-		lines = append(lines, fmt.Sprintf("来源: %s / %s", r.KBName, r.DocName))
-		lines = append(lines, fmt.Sprintf("内容: %s", r.Content))
-		lines = append(lines, fmt.Sprintf("相关度: %.2f", r.Score))
-		lines = append(lines, "")
-	}
-	return strings.Join(lines, "\n")
 }
 
 // generateID creates a simple unique ID.

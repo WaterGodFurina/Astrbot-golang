@@ -939,7 +939,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 
-	llmCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
+	llmCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 
 	// Inject active tools (built-in + MCP servers) so the model can call them.
@@ -994,7 +994,6 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 	s.recordProviderCall(providerCfg, event.UnifiedMsgOrigin(), resp)
-
 	for round := 0; round < 5 && len(resp.ToolsCallName) > 0; round++ {
 		// Append the assistant tool-call message
 		assistantMsg := map[string]interface{}{
@@ -1022,9 +1021,12 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 			})
 		}
 
-		// Follow-up request with tool results
+		// Follow-up request with tool results. Each round gets its own timeout
+		// so one slow round does not exhaust the whole tool-loop budget.
 		req.Contexts = messages
-		resp, err = s.chatRound(llmCtx, chatInst, req, streamingEnabled, streamer)
+		roundCtx, roundCancel := context.WithTimeout(llmCtx, 120*time.Second)
+		resp, err = s.chatRound(roundCtx, chatInst, req, streamingEnabled, streamer)
+		roundCancel()
 		if err != nil {
 			logger.Error("LLM tool-loop call failed: %v", err)
 			event.Result = &message.MessageEventResult{}
@@ -1559,8 +1561,9 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 		tools = append(tools, futureTaskToolSchema())
 	}
 
-	// MCP server tools (enabled servers from data/mcp_server.json)
-	s.loadMCPTools()
+	// MCP server tools (enabled servers from data/mcp_server.json). Loading is
+	// async so a slow MCP server never blocks the LLM call.
+	s.ensureMCPTools()
 	for _, schema := range s.mcpSchemas {
 		tools = append(tools, schema)
 	}
@@ -1571,6 +1574,22 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 
 // loadMCPTools (re)loads enabled MCP servers from data/mcp_server.json and
 // caches their tool schemas under "<sanitized_server>.<tool_name>".
+// ensureMCPTools loads MCP server tools on first use. The first call blocks
+// until the connection succeeds or fails (bounded), so a tool call never races
+// a not-yet-connected client; subsequent calls are no-ops.
+func (s *ProcessStage) ensureMCPTools() {
+	s.mcpMu.Lock()
+	if s.mcpLoaded {
+		s.mcpMu.Unlock()
+		return
+	}
+	s.mcpMu.Unlock()
+	s.loadMCPTools()
+}
+
+// loadMCPTools connects to enabled MCP servers and caches their tools. It runs
+// in a goroutine (see ensureMCPTools) so connecting to slow servers does not
+// stall the pipeline.
 func (s *ProcessStage) loadMCPTools() {
 	s.mcpMu.Lock()
 	defer s.mcpMu.Unlock()
@@ -1579,7 +1598,6 @@ func (s *ProcessStage) loadMCPTools() {
 	if err != nil {
 		s.mcpClients = nil
 		s.mcpSchemas = nil
-		s.mcpLoaded = true
 		return
 	}
 	var mcpCfg struct {
@@ -1589,21 +1607,12 @@ func (s *ProcessStage) loadMCPTools() {
 		logger.Warn("Failed to parse data/mcp_server.json: %v", err)
 		s.mcpClients = nil
 		s.mcpSchemas = nil
-		s.mcpLoaded = true
-		return
-	}
-
-	// Skip reloading when the file is unchanged since the last load.
-	sig, _ := json.Marshal(mcpCfg)
-	if s.mcpLoaded && s.mcpSig == string(sig) {
 		return
 	}
 
 	// Clean up previously connected clients.
-	if s.mcpLoaded {
-		for _, cl := range s.mcpClients {
-			cl.Cleanup()
-		}
+	for _, cl := range s.mcpClients {
+		cl.Cleanup()
 	}
 	s.mcpClients = make(map[string]*agent.MCPClient)
 	s.mcpSchemas = make(map[string]map[string]interface{})
@@ -1614,6 +1623,8 @@ func (s *ProcessStage) loadMCPTools() {
 		}
 		safeName := sanitizeToolName(name)
 		client := agent.NewMCPClient(name, cfg)
+		// Use a fresh context for the connection; do NOT cancel it afterwards,
+		// because the underlying SSE transport may share it for its read loop.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err := client.Connect(ctx)
 		cancel()
@@ -1636,7 +1647,6 @@ func (s *ProcessStage) loadMCPTools() {
 		}
 		logger.Info("MCP server %q connected (%d tools)", name, len(client.Tools()))
 	}
-	s.mcpSig = string(sig)
 	s.mcpLoaded = true
 }
 
@@ -1657,7 +1667,29 @@ func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map
 	if client == nil {
 		return fmt.Sprintf("MCP 工具 %s 执行失败: 服务器 %q 未连接", name, serverName), true
 	}
-	result, err := client.CallTool(ctx, toolName, args)
+	logger.Info("executeMCPTool: server=%s tool=%s", serverName, toolName)
+	// Bound the tool call: the SSE transport waits for a response event. A
+	// short first-attempt timeout lets a stale connection fail fast so the
+	// reconnect path (below) kicks in instead of hanging the pipeline.
+	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	result, err := client.CallTool(callCtx, toolName, args)
+	if err != nil {
+		// A transport failure (e.g. SSE connection lost) can leave the client
+		// unable to receive responses; reconnect once and retry with a fresh
+		// timeout.
+		logger.Warn("MCP tool %s call failed (%v), reconnecting and retrying...", name, err)
+		if rc := client.Reconnect(context.Background()); rc != nil {
+			logger.Warn("MCP server %q reconnect failed: %v", serverName, rc)
+		} else {
+			retryCtx, retryCancel := context.WithTimeout(ctx, 60*time.Second)
+			result, err = client.CallTool(retryCtx, toolName, args)
+			retryCancel()
+			if err != nil {
+				return fmt.Sprintf("MCP 工具 %s 执行失败: %v", name, err), true
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Sprintf("MCP 工具 %s 执行失败: %v", name, err), true
 	}

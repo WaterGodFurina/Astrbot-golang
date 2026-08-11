@@ -246,6 +246,12 @@ func gitClone(ctx context.Context, url, dest string) error {
 }
 
 func downloadFile(ctx context.Context, url, dest string) error {
+	return downloadFileWithProgress(ctx, url, dest, nil)
+}
+
+// downloadFileWithProgress streams a URL to dest, invoking progress(downloaded,
+// total) as bytes are written (when non-nil) so callers can show a live bar.
+func downloadFileWithProgress(ctx context.Context, url, dest string, progress func(downloaded, total int64)) error {
 	client := &http.Client{Timeout: 30 * time.Minute}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -264,8 +270,29 @@ func downloadFile(ctx context.Context, url, dest string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	if progress == nil {
+		_, err = io.Copy(f, resp.Body)
+		return err
+	}
+	buf := make([]byte, 64*1024)
+	var written int64
+	total := resp.ContentLength
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := f.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			written += int64(n)
+			progress(written, total)
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
 }
 
 // extractArchive unpacks a .zip/.tar.gz archive into dest, stripping a single

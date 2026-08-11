@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -104,6 +105,11 @@ type InstallOptions struct {
 	// plugin build, when the bundled Go has to be downloaded (~150-200MB).
 	Progress func(downloaded, total int64)
 
+	// Stage receives human-readable phase changes during install (e.g. "下载
+	// C 编译器 (Clang)…" / "下载 Go 工具链…" / "编译插件…") so the WebUI can
+	// show what the install is doing while progress bytes are 0.
+	Stage func(text string)
+
 	// Install source metadata persisted into the manifest so the WebUI can
 	// offer reinstall / change-source. installMethod is one of "market",
 	// "repository", "url" or "upload"; registryURL/marketPluginID describe a
@@ -114,6 +120,12 @@ type InstallOptions struct {
 	MarketPluginID string
 	Repo           string
 	DownloadURL    string
+
+	// CCChoice carries the user's answer to a cgo C-compiler prompt (one of
+	// "gcc" / "clang" / "download" / "cancel"). It is only meaningful when the
+	// plugin declares cgo and the host needs to pick a compiler; empty means no
+	// decision has been made yet (→ a CCompilerPromptError is returned).
+	CCChoice string
 }
 
 // RiskError is returned by InstallFromSource when the static scan found risky
@@ -134,7 +146,9 @@ func (e *RiskError) Error() string {
 // source may be a git URL, an archive URL (.zip/.tar.gz/.tgz), or a local
 // directory. When the static scan finds risky imports and IgnoreRisk is not
 // set, a *RiskError with the offending code locations is returned and nothing
-// is installed.
+// is installed. When the plugin declares cgo and the host must pick a C
+// compiler, a *CCompilerPromptError is returned so the caller can ask the user
+// and retry with opts.CCChoice set.
 func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source string, opts InstallOptions) (*PluginInstance, error) {
 	if id == "" {
 		return nil, fmt.Errorf("plugin id cannot be empty")
@@ -149,6 +163,16 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	}
 	defer os.RemoveAll(srcDir)
 
+	// Plugin packages must ship metadata.json (identity/source/cgo) and main.go
+	// (entrypoint) at their root.
+	meta, err := ReadPluginMetadata(srcDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureMainGo(srcDir); err != nil {
+		return nil, err
+	}
+
 	findings, err := StaticScan(srcDir)
 	if err != nil {
 		return nil, fmt.Errorf("static scan: %w", err)
@@ -156,15 +180,39 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if len(findings) > 0 && !opts.IgnoreRisk {
 		return nil, &RiskError{Findings: findings}
 	}
-	if err := m.compiler.Prepare(srcDir, moduleNameFromID(id)); err != nil {
+
+	// cgo plugin → resolve the C compiler first (may surface a user prompt).
+	var cc, cxx string
+	if meta.RequiresCgo() {
+		cc, cxx, err = ensureCCompiler(ctx, opts)
+		if err != nil {
+			var promptErr *CCompilerPromptError
+			if errors.As(err, &promptErr) {
+				return nil, promptErr
+			}
+			return nil, fmt.Errorf("cgo 插件需要 C 编译器: %w", err)
+		}
+	}
+
+	if opts.Stage != nil {
+		opts.Stage("准备编译插件…")
+	}
+	if err := m.compiler.Prepare(srcDir, goModuleNameOf(srcDir, meta)); err != nil {
 		return nil, fmt.Errorf("prepare module: %w", err)
 	}
 	if err := m.compiler.Vet(ctx, srcDir); err != nil {
 		return nil, fmt.Errorf("go vet: %w", err)
 	}
 
+	if opts.Stage != nil {
+		if cc != "" {
+			opts.Stage("使用 C 编译器 (cgo) 编译插件…")
+		} else {
+			opts.Stage("编译插件…")
+		}
+	}
 	artifact := filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id), artifactName(id))
-	if err := m.compiler.BuildWithProgress(ctx, srcDir, artifact, opts.Progress); err != nil {
+	if err := m.compiler.BuildWithProgressC(ctx, srcDir, artifact, opts.Progress, cc, cxx); err != nil {
 		return nil, fmt.Errorf("build plugin %s: %w", id, err)
 	}
 
@@ -172,10 +220,19 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if err != nil {
 		return nil, err
 	}
+	// metadata.json is the canonical identity: override the runtime-reported
+	// name/version so the WebUI shows the packaged metadata.
+	if meta.Name != "" {
+		inst.Name = meta.Name
+	}
+	if meta.Version != "" {
+		inst.Version = meta.Version
+	}
 	if err := m.recordInstall(inst, source, artifact, opts); err != nil {
 		logger.Warn("Plugin %s installed but manifest persist failed: %v", id, err)
 	}
 	m.cachePluginDocs(inst.Name, srcDir)
+	m.writeMetadataConfig(inst.Name, meta)
 	return inst, nil
 }
 

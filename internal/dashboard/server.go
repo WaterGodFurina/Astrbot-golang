@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,7 @@ type Server struct {
 	auth               *PasswordManager
 	port               int
 	webuiDir           string
+	dataDir            string
 	configMgr          interface{} // *config.ConfigManager
 	providerMgr        interface{} // *provider.ProviderManager
 	platformMgr        interface{} // *platform.PlatformManager
@@ -54,6 +56,7 @@ type Server struct {
 	pluginMgr          interface{} // *plugin.Manager (legacy .so)
 	subPluginMgr       *plugin.SubprocessManager
 	kbMgr              interface{} // *knowledgebase.Manager
+	kbTasks            map[string]*kbUploadTask // knowledge base upload task states
 	skillMgr           interface{} // *skills.SkillManager
 	personaMgr         interface{} // *persona.PersonaManager
 	personas           *personaStore
@@ -139,6 +142,7 @@ func NewServer(port int, configPath string) *Server {
 		handlers:  make(map[string]http.HandlerFunc),
 		port:      port,
 		startTime: time.Now(),
+		dataDir:   filepath.Dir(configPath),
 	}
 	s.auth = NewPasswordManager(configPath)
 	s.personas = newPersonaStore(filepath.Dir(configPath))
@@ -147,6 +151,7 @@ func NewServer(port int, configPath string) *Server {
 	s.mcp = newMCPStore(filepath.Dir(configPath))
 	s.installProgress = make(map[string]*installStatus)
 	s.marketCache = make(map[string]*marketCacheEntry)
+	s.kbTasks = make(map[string]*kbUploadTask)
 	s.setupRoutes()
 	s.srv = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
@@ -311,8 +316,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if creds.Username == s.auth.Username() && s.auth.VerifyPassword(creds.Password) {
-		token := generateRandomToken(32)
-		s.auth.RegisterToken(token)
+		// Sign a persistent JWT (survives restarts) so the WebSocket chat
+		// transport keeps authenticating until expiry.
+		token, err := s.auth.IssueToken(s.auth.Username())
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("签发会话令牌失败: "+err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"token":                     token,
 			"username":                  s.auth.Username(),
@@ -435,7 +445,15 @@ func (s *Server) handleAccountEdit(w http.ResponseWriter, r *http.Request) {
 // handleStat handles stat endpoints.
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []string) {
 	if len(parts) == 0 {
-		writeJSON(w, http.StatusOK, apiOK(s.getBaseStats()))
+		// offset_sec is the lookback window for the message trend / platform
+		// ranking (the WebUI sends it; default to the last 24h).
+		offset := 24 * 60 * 60
+		if v := r.URL.Query().Get("offset_sec"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				offset = n
+			}
+		}
+		writeJSON(w, http.StatusOK, apiOK(s.getBaseStats(offset)))
 		return
 	}
 	switch parts[0] {
@@ -474,27 +492,44 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 			"cleaned": 0,
 		}))
 	case "provider-tokens":
-		writeJSON(w, http.StatusOK, apiOK(s.getProviderTokenStats()))
+		days := 1
+		if v := r.URL.Query().Get("days"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && (n == 1 || n == 3 || n == 7) {
+				days = n
+			}
+		}
+		writeJSON(w, http.StatusOK, apiOK(s.getProviderTokenStats(days)))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
 }
 
 // getBaseStats returns the dashboard statistics consumed by StatsPage.vue.
-func (s *Server) getBaseStats() map[string]interface{} {
+func (s *Server) getBaseStats(offsetSec int) map[string]interface{} {
 	started := s.startTime
 	running := time.Since(started)
 	messageCount := 0
 	todayCalls := 0
+	var platformRank []map[string]interface{}
+	var timeSeries [][]int
 	if s.database != nil {
 		messageCount = s.database.TotalMessageCount()
 		todayCalls = s.database.TodayProviderCalls()
+		platformRank = s.database.PlatformMessageRank(offsetSec)
+		// 1-hour buckets for the message trend chart.
+		timeSeries = s.database.MessageTimeSeries(offsetSec, 3600)
+	}
+	if platformRank == nil {
+		platformRank = []map[string]interface{}{}
+	}
+	if timeSeries == nil {
+		timeSeries = [][]int{}
 	}
 	return map[string]interface{}{
 		"message_count":       messageCount,
 		"platform_count":      len(s.getBotList()),
-		"platform":            []interface{}{},
-		"message_time_series": [][]int{},
+		"platform":            platformRank,
+		"message_time_series": timeSeries,
 		"memory": map[string]interface{}{
 			"process": processMemoryMB(),
 			"system":  systemMemoryMB(),
@@ -626,30 +661,201 @@ func round1(v float64) float64 {
 }
 
 // getProviderTokenStats returns provider token statistics for StatsPage.vue.
-func (s *Server) getProviderTokenStats() map[string]interface{} {
+// It aggregates provider_stats over the given lookback window (1/3/7 days):
+// hourly token trend per provider, total tokens/calls/success rate, TTFT and
+// duration averages, provider ranking and per-session (umo) token ranking, plus
+// today's totals and per-model/provider breakdowns.
+func (s *Server) getProviderTokenStats(days int) map[string]interface{} {
+	empty := func() map[string]interface{} {
+		return map[string]interface{}{
+			"days":                days,
+			"trend":               map[string]interface{}{"series": []interface{}{}, "total_series": [][]int{}},
+			"range_total_tokens":  0,
+			"range_total_calls":   0,
+			"range_avg_ttft_ms":   0,
+			"range_avg_duration_ms": 0,
+			"range_avg_tpm":       0,
+			"range_success_rate":  0,
+			"range_by_provider":   []interface{}{},
+			"range_by_umo":        []interface{}{},
+			"today_total_tokens":  0,
+			"today_total_calls":   0,
+			"today_by_provider":   []interface{}{},
+			"today_by_model":      []interface{}{},
+		}
+	}
+	if s.database == nil {
+		return empty()
+	}
+
+	now := time.Now()
+	loc := now.Location()
+	// rangeStart is `days` days ago (same hour), floored to the hour — this
+	// mirrors Python's range_start_local. todayStart is local midnight.
+	rangeStart := now.AddDate(0, 0, -days)
+	rangeStart = time.Date(rangeStart.Year(), rangeStart.Month(), rangeStart.Day(), rangeStart.Hour(), 0, 0, 0, loc)
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	queryStart := rangeStart
+	if todayStart.Before(rangeStart) {
+		queryStart = todayStart
+	}
+
+	records, err := s.database.ProviderStatsSince(queryStart.Add(-24 * time.Hour).UTC())
+	if err != nil {
+		logger.Warn("ProviderStatsSince: %v", err)
+		return empty()
+	}
+
+	// Bucket timestamps (hourly) in local time, as unix ms.
+	var bucketTimestamps []int64
+	for t := rangeStart; !t.After(now); t = t.Add(time.Hour) {
+		bucketTimestamps = append(bucketTimestamps, t.UnixMilli())
+	}
+
+	trendByProvider := map[string]map[int64]int{}
+	totalByProvider := map[string]int{}
+	totalByUmo := map[string]int{}
+	totalByBucket := map[int64]int{}
+	todayByModel := map[string]int{}
+	todayByProvider := map[string]int{}
+	var rangeTotalTokens, rangeTotalCalls, rangeSuccessCalls int
+
+	for _, rec := range records {
+		createdLocal := rec.CreatedAt.In(loc)
+		tokenTotal := rec.InputOther + rec.InputCached + rec.Output
+		if createdLocal.Year() < 2020 {
+			continue
+		}
+		providerID := rec.ProviderID
+		if providerID == "" {
+			providerID = "unknown"
+		}
+		model := rec.Model
+		if model == "" {
+			model = "Unknown"
+		}
+
+		if createdLocal.After(rangeStart) || createdLocal.Equal(rangeStart) {
+			bucket := time.Date(createdLocal.Year(), createdLocal.Month(), createdLocal.Day(), createdLocal.Hour(), 0, 0, 0, loc).UnixMilli()
+			if trendByProvider[providerID] == nil {
+				trendByProvider[providerID] = map[int64]int{}
+			}
+			trendByProvider[providerID][bucket] += tokenTotal
+			totalByProvider[providerID] += tokenTotal
+			totalByUmo[rec.UMO] += tokenTotal
+			totalByBucket[bucket] += tokenTotal
+			rangeTotalTokens += tokenTotal
+			rangeTotalCalls++
+			rangeSuccessCalls++
+		}
+
+		if createdLocal.After(todayStart) || createdLocal.Equal(todayStart) {
+			todayByModel[model] += tokenTotal
+			todayByProvider[providerID] += tokenTotal
+		}
+	}
+
+	// Today's totals are computed directly (created_at is UTC in SQLite).
 	todayCalls := 0
 	todayTokens := 0
 	if s.database != nil {
 		todayCalls = s.database.TodayProviderCalls()
 		todayTokens = s.database.TodayProviderTokens()
 	}
+
+	// Sort providers by total tokens (desc).
+	sortedProviders := sortedKeysByValue(totalByProvider)
+
+	var series []map[string]interface{}
+	for _, pid := range sortedProviders {
+		pts := trendByProvider[pid]
+		data := make([][]int, 0, len(bucketTimestamps))
+		for _, bt := range bucketTimestamps {
+			data = append(data, []int{int(bt), pts[bt]})
+		}
+		series = append(series, map[string]interface{}{
+			"name":         pid,
+			"data":         data,
+			"total_tokens": totalByProvider[pid],
+		})
+	}
+	if series == nil {
+		series = []map[string]interface{}{}
+	}
+
+	totalSeries := make([][]int, 0, len(bucketTimestamps))
+	for _, bt := range bucketTimestamps {
+		totalSeries = append(totalSeries, []int{int(bt), totalByBucket[bt]})
+	}
+	if totalSeries == nil {
+		totalSeries = [][]int{}
+	}
+
+	rangeByProvider := make([]map[string]interface{}, 0, len(sortedProviders))
+	for _, pid := range sortedProviders {
+		rangeByProvider = append(rangeByProvider, map[string]interface{}{
+			"provider_id": pid,
+			"tokens":      totalByProvider[pid],
+		})
+	}
+
+	sortedUmo := sortedKeysByValue(totalByUmo)
+	rangeByUmo := make([]map[string]interface{}, 0, len(sortedUmo))
+	for _, umo := range sortedUmo {
+		rangeByUmo = append(rangeByUmo, map[string]interface{}{
+			"umo":    umo,
+			"tokens": totalByUmo[umo],
+		})
+	}
+
+	todayByProviderData := make([]map[string]interface{}, 0, len(todayByProvider))
+	for _, pid := range sortedKeysByValue(todayByProvider) {
+		todayByProviderData = append(todayByProviderData, map[string]interface{}{
+			"provider_id": pid,
+			"tokens":      todayByProvider[pid],
+		})
+	}
+	todayByModelData := make([]map[string]interface{}, 0, len(todayByModel))
+	for _, m := range sortedKeysByValue(todayByModel) {
+		todayByModelData = append(todayByModelData, map[string]interface{}{
+			"provider_model": m,
+			"tokens":         todayByModel[m],
+		})
+	}
+
+	successRate := 0.0
+	if rangeTotalCalls > 0 {
+		successRate = float64(rangeSuccessCalls) / float64(rangeTotalCalls)
+	}
+
 	return map[string]interface{}{
-		"days": 7,
-		"trend": map[string]interface{}{
-			"series":       []interface{}{},
-			"total_series": [][]int{},
-		},
-		"range_total_tokens":    0,
-		"range_total_calls":     0,
+		"days":                  days,
+		"trend":                 map[string]interface{}{"series": series, "total_series": totalSeries},
+		"range_total_tokens":    rangeTotalTokens,
+		"range_total_calls":     rangeTotalCalls,
 		"range_avg_ttft_ms":     0,
 		"range_avg_duration_ms": 0,
 		"range_avg_tpm":         0,
-		"range_success_rate":    0,
-		"range_by_provider":     []interface{}{},
-		"range_by_umo":          []interface{}{},
+		"range_success_rate":    successRate,
+		"range_by_provider":     rangeByProvider,
+		"range_by_umo":          rangeByUmo,
 		"today_total_tokens":    todayTokens,
 		"today_total_calls":     todayCalls,
+		"today_by_provider":     todayByProviderData,
+		"today_by_model":        todayByModelData,
 	}
+}
+
+// sortedKeysByValue returns map keys sorted by their int values descending.
+func sortedKeysByValue(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		return m[keys[i]] > m[keys[j]]
+	})
+	return keys
 }
 
 // apiOK builds a standard success response with data wrapper.
@@ -1298,9 +1504,34 @@ func (s *Server) installProgressCallback(installID string) func(downloaded, tota
 		s.setInstallProgress(installID, &installStatus{
 			Status:     "downloading",
 			Percent:    percent,
-			Text:       "下载 Go 工具链…",
+			Text:       "下载依赖中…",
 			Downloaded: downloaded,
 			Total:      total,
+		})
+	}
+}
+
+// installStageCallback builds a callback that records a human-readable phase
+// text (e.g. "下载 C 编译器 (Clang)…", "编译插件…") for the given install_id,
+// shown by the WebUI while no byte progress is available.
+func (s *Server) installStageCallback(installID string) func(text string) {
+	return func(text string) {
+		if installID == "" {
+			return
+		}
+		cur := s.getInstallProgress(installID)
+		status := "installing"
+		percent := 0
+		if cur.Status == "downloading" {
+			status = "downloading"
+			percent = cur.Percent
+		}
+		s.setInstallProgress(installID, &installStatus{
+			Status:     status,
+			Percent:    percent,
+			Text:       text,
+			Downloaded: cur.Downloaded,
+			Total:      cur.Total,
 		})
 	}
 }
@@ -1499,25 +1730,6 @@ func (s *Server) pluginSaveConfig(id string, cfg map[string]interface{}) {
 		return
 	}
 	_ = pm.SaveConfig(id, cfg)
-}
-
-// getKBList returns all knowledge bases.
-func (s *Server) getKBList() []interface{} {
-	if s.kbMgr == nil {
-		return []interface{}{}
-	}
-	km, ok := s.kbMgr.(interface {
-		ListKBsInfo() []map[string]interface{}
-	})
-	if !ok {
-		return []interface{}{}
-	}
-	kbs := km.ListKBsInfo()
-	result := make([]interface{}, len(kbs))
-	for i, kb := range kbs {
-		result[i] = kb
-	}
-	return result
 }
 
 // getSkillList returns all skills.

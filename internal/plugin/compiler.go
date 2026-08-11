@@ -98,14 +98,21 @@ func (c *Compiler) Vet(ctx context.Context, srcDir string) error {
 }
 
 // Build compiles the Go module at srcDir into outputPath. The environment is
-// derived from the toolchain (CGO_ENABLED=0, isolated GOPATH).
+// derived from the toolchain (isolated GOPATH; CGO_ENABLED from the host).
 func (c *Compiler) Build(ctx context.Context, srcDir, outputPath string) error {
-	return c.BuildWithProgress(ctx, srcDir, outputPath, nil)
+	return c.BuildWithProgressC(ctx, srcDir, outputPath, nil, "", "")
 }
 
 // BuildWithProgress is like Build but reports toolchain download progress via
 // the callback when the bundled Go toolchain has to be provisioned first.
 func (c *Compiler) BuildWithProgress(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc) error {
+	return c.BuildWithProgressC(ctx, srcDir, outputPath, progress, "", "")
+}
+
+// BuildWithProgressC is BuildWithProgress with an explicit C compiler override.
+// cc/cxx are the CC/CXX compiler paths (e.g. from ensureCCompiler); when empty
+// the toolchain decides CGO_ENABLED from the host environment (CGOEnabled()).
+func (c *Compiler) BuildWithProgressC(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc, cc, cxx string) error {
 	goBin, err := c.tc.EnsureWithProgress(progress)
 	if err != nil {
 		return fmt.Errorf("ensure toolchain: %w", err)
@@ -122,9 +129,15 @@ func (c *Compiler) BuildWithProgress(ctx context.Context, srcDir, outputPath str
 	}
 	cmd := exec.CommandContext(ctx, goBin, "build", "-o", absOut, "-ldflags=-s -w", "./...")
 	cmd.Dir = srcDir
-	cmd.Env = c.tc.BuildEnv(map[string]string{
+	extra := map[string]string{
 		"GOPROXY": "https://goproxy.cn,direct",
-	})
+	}
+	if cc != "" {
+		extra["CC"] = cc
+		extra["CXX"] = cxx
+		extra["CGO_ENABLED"] = "1"
+	}
+	cmd.Env = c.tc.BuildEnv(extra)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("go build: %w\n%s", err, out)

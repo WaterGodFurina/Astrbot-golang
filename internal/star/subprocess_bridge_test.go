@@ -19,17 +19,37 @@ func newTestSubprocessManager(t *testing.T) *plugin.SubprocessManager {
 
 func bridgeTestEvent(msg string, admin bool) *core.Event {
 	return &core.Event{
-		Type:       core.EventMessage,
-		Source:     core.EventSource{Platform: "test", ConvID: "c1", SenderID: "u1", SenderName: "alice", IsAdmin: admin},
-		Message:    message.PlainChain(msg),
-		MessageStr: msg,
-		PlainText:  msg,
+		Type:              core.EventMessage,
+		Source:            core.EventSource{Platform: "test", ConvID: "c1", SenderID: "u1", SenderName: "alice", IsAdmin: admin, IsAtBot: true},
+		Message:           message.PlainChain(msg),
+		MessageStr:        msg,
+		PlainText:         msg,
+		IsAtOrWakeCommand: true,
 	}
 }
 
 func runFilterHandlers(starMgr *Manager, ev *core.Event) {
 	for _, h := range starMgr.Handlers().GetFilterHandlers() {
-		_ = h.Handler(ev)
+		if !h.Enabled {
+			continue
+		}
+		fctx := &FilterContext{
+			MessageStr:    ev.MessageStr,
+			IsAtOrWake:    ev.IsAtOrWakeCommand,
+			EventSenderID: ev.Source.SenderID,
+			EventPlatform: ev.Source.Platform,
+			EventRole:     ev.Role,
+		}
+		matched := false
+		for _, filter := range h.EventFilters {
+			if filter.Match(fctx) {
+				matched = true
+				break
+			}
+		}
+		if matched {
+			_ = h.Handler(ev)
+		}
 	}
 }
 
@@ -123,7 +143,8 @@ func TestRegisterSubprocessPluginsBatch(t *testing.T) {
 	}
 
 	RegisterSubprocessPlugins(starMgr, []*plugin.PluginInstance{inst})
-	if n := len(starMgr.Handlers().GetFilterHandlers()); n != 2 {
-		t.Fatalf("expected 2 filter handlers (command+filter) after re-bridge, got %d", n)
+	// test plugin registers 2 commands + 1 explicit filter → 3 filter handlers.
+	if n := len(starMgr.Handlers().GetFilterHandlers()); n != 3 {
+		t.Fatalf("expected 3 filter handlers (2 commands+1 filter) after re-bridge, got %d", n)
 	}
 }

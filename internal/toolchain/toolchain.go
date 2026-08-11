@@ -324,6 +324,13 @@ func supportsBundledGo() bool {
 //	macOS:   ~/Library/Application Support/AstrBot-Go
 //	other:   ~/.local/share/astrbot-go  (Linux / Termux)
 func userStateDir() string {
+	return UserStateDir()
+}
+
+// UserStateDir is the exported per-OS private data dir for AstrBot Go state
+// (same layout as userStateDir). Exposed so other packages (e.g. the plugin
+// C-compiler provisioning) can place sibling artifacts next to the toolchain.
+func UserStateDir() string {
 	switch runtime.GOOS {
 	case "windows":
 		if base := os.Getenv("LOCALAPPDATA"); base != "" {

@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -398,6 +399,20 @@ func TestInstallFromLocalDir(t *testing.T) {
 		t.Error("manifest entry missing binary path")
 	}
 
+	// metadata.json content must be written to the top of
+	// plugins_config/<name>/config.json for display.
+	cfgData, err := os.ReadFile(filepath.Join(m.dataDir, "plugins_config", "testplugin", "config.json"))
+	if err != nil {
+		t.Fatalf("read config.json with metadata: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(cfgData, &cfg); err != nil {
+		t.Fatalf("parse config.json: %v", err)
+	}
+	if cfg["name"] != "testplugin" || cfg["cgo"] != "no" {
+		t.Errorf("config.json missing metadata at top: %+v", cfg)
+	}
+
 	if err := m.Unload("installed"); err != nil {
 		t.Fatal(err)
 	}
@@ -423,6 +438,9 @@ var _ = exec.Command
 var _ = syscall.Syscall
 `
 	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(srcFile), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "metadata.json"), []byte(`{"name":"evil","version":"1.0.0","cgo":false}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -612,6 +630,9 @@ import (
 func main() { sdk.Serve(&sdk.Plugin{Name: "docplugin"}) }
 `
 	if err := os.WriteFile(filepath.Join(src, "main.go"), []byte(srcMain), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "metadata.json"), []byte(`{"name":"docplugin","desc":"doc","version":"1.0.0","cgo":false}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	readme := "# Doc Plugin\n\nDocumentation here.\n"

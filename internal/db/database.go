@@ -184,6 +184,36 @@ func (d *Database) initSchema() error {
 		`CREATE INDEX IF NOT EXISTS ix_pmh_platform_user ON platform_message_history(platform_id, user_id, id)`,
 		`CREATE INDEX IF NOT EXISTS ix_pmh_checkpoint ON platform_message_history(llm_checkpoint_id)`,
 
+		`CREATE TABLE IF NOT EXISTS knowledge_bases (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			kb_id TEXT NOT NULL UNIQUE,
+			kb_name TEXT NOT NULL,
+			description TEXT,
+			emoji TEXT,
+			embedding_provider_id TEXT,
+			rerank_provider_id TEXT,
+			chunk_size INTEGER NOT NULL DEFAULT 512,
+			chunk_overlap INTEGER NOT NULL DEFAULT 50,
+			top_k_dense INTEGER NOT NULL DEFAULT 50,
+			top_k_sparse INTEGER NOT NULL DEFAULT 50,
+			top_m_final INTEGER NOT NULL DEFAULT 5,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS ix_kb_name ON knowledge_bases(kb_name)`,
+
+		`CREATE TABLE IF NOT EXISTS knowledge_base_chunks (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			chunk_id TEXT NOT NULL UNIQUE,
+			kb_id TEXT NOT NULL,
+			doc_id TEXT NOT NULL,
+			doc_name TEXT,
+			content TEXT NOT NULL,
+			chunk_index INTEGER NOT NULL DEFAULT 0,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS ix_kb_chunks_kb ON knowledge_base_chunks(kb_id, doc_id)`,
+
 		`CREATE TABLE IF NOT EXISTS platform_sessions (
 			inner_id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL UNIQUE,
@@ -592,4 +622,299 @@ func (d *Database) TodayProviderTokens() int {
 		 WHERE date(created_at) = date('now', 'localtime')`,
 	).Scan(&n)
 	return n
+}
+
+// MessageBucket is one point in a message/time series.
+type MessageBucket struct {
+	Timestamp int64 // unix seconds (bucket start)
+	Count     int
+}
+
+// PlatformMessageRank returns messages grouped by platform within the given
+// lookback window (offsetSec seconds). Ordered by count descending.
+func (d *Database) PlatformMessageRank(offsetSec int) []map[string]interface{} {
+	rows, err := d.db.Query(
+		`SELECT platform_id, COUNT(*) FROM platform_message_history
+		 WHERE created_at >= datetime('now', '-' || ? || ' seconds')
+		 GROUP BY platform_id ORDER BY COUNT(*) DESC`,
+		offsetSec,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []map[string]interface{}
+	for rows.Next() {
+		var name string
+		var count int
+		if err := rows.Scan(&name, &count); err != nil {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"name":  name,
+			"count": count,
+		})
+	}
+	return out
+}
+
+// MessageTimeSeries buckets message history into `bucketSec`-wide windows over
+// the last offsetSec seconds, returning [timestamp_seconds, count] pairs.
+func (d *Database) MessageTimeSeries(offsetSec, bucketSec int) [][]int {
+	rows, err := d.db.Query(
+		`SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM platform_message_history
+		 WHERE created_at >= datetime('now', '-' || ? || ' seconds')`,
+		offsetSec,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	now := time.Now().Unix()
+	start := now - int64(offsetSec)
+	counts := map[int64]int{}
+	for rows.Next() {
+		var ts int64
+		if err := rows.Scan(&ts); err != nil {
+			continue
+		}
+		bucket := (ts / int64(bucketSec)) * int64(bucketSec)
+		if bucket < start {
+			continue
+		}
+		counts[bucket]++
+	}
+
+	var out [][]int
+	for t := start - start%int64(bucketSec); t <= now; t += int64(bucketSec) {
+		out = append(out, []int{int(t), counts[t]})
+	}
+	return out
+}
+
+// ProviderStatRow is a single provider_stats record used for token statistics.
+type ProviderStatRow struct {
+	UMO         string
+	ProviderID  string
+	Model       string
+	InputOther  int
+	InputCached int
+	Output      int
+	CreatedAt   time.Time
+}
+
+// ProviderStatsSince returns provider_stats records with created_at >= the
+// given time, ordered ascending.
+func (d *Database) ProviderStatsSince(since time.Time) ([]ProviderStatRow, error) {
+	rows, err := d.db.Query(
+		`SELECT umo, provider_id, provider_model, token_input_other, token_input_cached,
+		        token_output, created_at FROM provider_stats WHERE created_at >= ?
+		 ORDER BY created_at ASC`,
+		since.UTC().Format("2006-01-02 15:04:05"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProviderStatRow
+	for rows.Next() {
+		var r ProviderStatRow
+		var created string
+		if err := rows.Scan(&r.UMO, &r.ProviderID, &r.Model, &r.InputOther, &r.InputCached, &r.Output, &created); err != nil {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, created); err == nil {
+			r.CreatedAt = t
+		} else if t, err := time.ParseInLocation("2006-01-02 15:04:05", created, time.UTC); err == nil {
+			r.CreatedAt = t
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// KBRow is a knowledge base record persisted in SQLite.
+type KBRow struct {
+	KBID                string
+	KBName              string
+	Description         string
+	Emoji               string
+	EmbeddingProviderID string
+	RerankProviderID    string
+	ChunkSize           int
+	ChunkOverlap        int
+	TopKDense           int
+	TopKSparse          int
+	TopMFinal           int
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// CreateKB persists a new knowledge base row.
+func (d *Database) CreateKB(r KBRow) error {
+	_, err := d.db.Exec(
+		`INSERT INTO knowledge_bases (kb_id, kb_name, description, emoji, embedding_provider_id,
+			rerank_provider_id, chunk_size, chunk_overlap, top_k_dense, top_k_sparse, top_m_final)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.KBID, r.KBName, r.Description, r.Emoji, r.EmbeddingProviderID,
+		r.RerankProviderID, r.ChunkSize, r.ChunkOverlap, r.TopKDense, r.TopKSparse, r.TopMFinal,
+	)
+	return err
+}
+
+// UpdateKB updates an existing knowledge base row by kb_id.
+func (d *Database) UpdateKB(kbID string, r KBRow) error {
+	_, err := d.db.Exec(
+		`UPDATE knowledge_bases SET kb_name=?, description=?, emoji=?, embedding_provider_id=?,
+			rerank_provider_id=?, chunk_size=?, chunk_overlap=?, top_k_dense=?, top_k_sparse=?,
+			top_m_final=?, updated_at=CURRENT_TIMESTAMP WHERE kb_id=?`,
+		r.KBName, r.Description, r.Emoji, r.EmbeddingProviderID,
+		r.RerankProviderID, r.ChunkSize, r.ChunkOverlap, r.TopKDense, r.TopKSparse, r.TopMFinal,
+		kbID,
+	)
+	return err
+}
+
+// DeleteKB removes a knowledge base row by kb_id.
+func (d *Database) DeleteKB(kbID string) error {
+	_, err := d.db.Exec(`DELETE FROM knowledge_bases WHERE kb_id=?`, kbID)
+	return err
+}
+
+// GetKB returns a knowledge base row by kb_id.
+func (d *Database) GetKB(kbID string) (*KBRow, error) {
+	rows, err := d.db.Query(
+		`SELECT kb_id, kb_name, COALESCE(description,''), COALESCE(emoji,''),
+			COALESCE(embedding_provider_id,''), COALESCE(rerank_provider_id,''),
+			chunk_size, chunk_overlap, top_k_dense, top_k_sparse, top_m_final,
+			COALESCE(created_at,''), COALESCE(updated_at,'')
+		 FROM knowledge_bases WHERE kb_id=?`, kbID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, fmt.Errorf("knowledge base %s not found", kbID)
+	}
+	return scanKBRow(rows)
+}
+
+// ListKBs returns all persisted knowledge base rows.
+func (d *Database) ListKBs() ([]KBRow, error) {
+	rows, err := d.db.Query(
+		`SELECT kb_id, kb_name, COALESCE(description,''), COALESCE(emoji,''),
+			COALESCE(embedding_provider_id,''), COALESCE(rerank_provider_id,''),
+			chunk_size, chunk_overlap, top_k_dense, top_k_sparse, top_m_final,
+			COALESCE(created_at,''), COALESCE(updated_at,'')
+		 FROM knowledge_bases ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []KBRow
+	for rows.Next() {
+		r, err := scanKBRow(rows)
+		if err != nil {
+			continue
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
+}
+
+func scanKBRow(rows *sql.Rows) (*KBRow, error) {
+	var r KBRow
+	var created, updated string
+	if err := rows.Scan(&r.KBID, &r.KBName, &r.Description, &r.Emoji, &r.EmbeddingProviderID,
+		&r.RerankProviderID, &r.ChunkSize, &r.ChunkOverlap, &r.TopKDense, &r.TopKSparse, &r.TopMFinal,
+		&created, &updated); err != nil {
+		return nil, err
+	}
+	// SQLite CURRENT_TIMESTAMP stores UTC; parse as UTC so timezone conversion
+	// happens at render time (kbRowToMap outputs local time).
+	if t, err := time.Parse("2006-01-02 15:04:05", created); err == nil {
+		r.CreatedAt = t
+	}
+	if t, err := time.Parse("2006-01-02 15:04:05", updated); err == nil {
+		r.UpdatedAt = t
+	}
+	return &r, nil
+}
+
+// KBChunk is a persisted knowledge-base chunk record.
+type KBChunk struct {
+	ChunkID   string
+	KBID      string
+	DocID     string
+	DocName   string
+	Content   string
+	ChunkIdx  int
+}
+
+// InsertKBChunk persists one chunk record.
+func (d *Database) InsertKBChunk(c KBChunk) error {
+	_, err := d.db.Exec(
+		`INSERT INTO knowledge_base_chunks (chunk_id, kb_id, doc_id, doc_name, content, chunk_index)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		c.ChunkID, c.KBID, c.DocID, c.DocName, c.Content, c.ChunkIdx,
+	)
+	return err
+}
+
+// ListKBChunks returns chunk records for a KB, optionally filtered by doc_id.
+func (d *Database) ListKBChunks(kbID, docID string) ([]KBChunk, error) {
+	query := `SELECT chunk_id, kb_id, doc_id, COALESCE(doc_name,''), content, chunk_index
+		FROM knowledge_base_chunks WHERE kb_id=?`
+	args := []any{kbID}
+	if docID != "" {
+		query += ` AND doc_id=?`
+		args = append(args, docID)
+	}
+	query += ` ORDER BY chunk_index ASC`
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []KBChunk
+	for rows.Next() {
+		var c KBChunk
+		if err := rows.Scan(&c.ChunkID, &c.KBID, &c.DocID, &c.DocName, &c.Content, &c.ChunkIdx); err != nil {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CountKBChunks returns the number of chunks for a KB (optionally per doc).
+func (d *Database) CountKBChunks(kbID, docID string) (int, error) {
+	query := `SELECT COUNT(*) FROM knowledge_base_chunks WHERE kb_id=?`
+	args := []any{kbID}
+	if docID != "" {
+		query += ` AND doc_id=?`
+		args = append(args, docID)
+	}
+	var n int
+	err := d.db.QueryRow(query, args...).Scan(&n)
+	return n, err
+}
+
+// DeleteKBChunks removes all chunks for a KB (optionally per doc).
+func (d *Database) DeleteKBChunks(kbID, docID string) error {
+	query := `DELETE FROM knowledge_base_chunks WHERE kb_id=?`
+	args := []any{kbID}
+	if docID != "" {
+		query += ` AND doc_id=?`
+		args = append(args, docID)
+	}
+	_, err := d.db.Exec(query, args...)
+	return err
+}
+
+// DeleteKBDoc removes a document's file records. Documents are stored on disk;
+// this clears their chunk records.
+func (d *Database) DeleteKBDoc(kbID, docID string) error {
+	return d.DeleteKBChunks(kbID, docID)
 }

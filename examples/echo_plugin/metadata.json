@@ -1,0 +1,8 @@
+{
+  "name": "echo",
+  "desc": "Echoes your message back",
+  "author": "AstrBot Devs",
+  "version": "2.0.0",
+  "repo": "https://github.com/AstrBotDevs/AstrBot",
+  "cgo": false
+}
