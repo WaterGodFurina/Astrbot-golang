@@ -130,14 +130,14 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 	// Persist the user message into the chat session store (WebUI history).
 	savedUserID := fmt.Sprintf("u_%d", time.Now().UnixNano())
 	userRecord := map[string]interface{}{
-		"id":         savedUserID,
-		"session_id": sessionID,
-		"sender_id":  "dashboard",
+		"id":          savedUserID,
+		"session_id":  sessionID,
+		"sender_id":   "dashboard",
 		"sender_name": "dashboard",
-		"role":       "user",
-		"type":       "user",
-		"content":    map[string]interface{}{"type": "user", "message": parts},
-		"created_at": time.Now().Format(time.RFC3339Nano),
+		"role":        "user",
+		"type":        "user",
+		"content":     map[string]interface{}{"type": "user", "message": parts},
+		"created_at":  time.Now().Format(time.RFC3339Nano),
 	}
 	s.chat.appendMessage(sessionID, userRecord)
 
@@ -160,8 +160,8 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 	sendSSE(w, flusher, map[string]interface{}{
 		"type": "user_message_saved",
 		"data": map[string]interface{}{
-			"id":               savedUserID,
-			"created_at":       time.Now().Format(time.RFC3339Nano),
+			"id":                savedUserID,
+			"created_at":        time.Now().Format(time.RFC3339Nano),
 			"llm_checkpoint_id": fmt.Sprintf("c_%d", time.Now().UnixNano()),
 		},
 	})
@@ -211,12 +211,12 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 				// Persist the bot reply into the chat session store.
 				botID := fmt.Sprintf("b_%d", time.Now().UnixNano())
 				botRecord := map[string]interface{}{
-					"id":         botID,
-					"session_id": sessionID,
-					"sender_id":  "bot",
+					"id":          botID,
+					"session_id":  sessionID,
+					"sender_id":   "bot",
 					"sender_name": "bot",
-					"role":       "assistant",
-					"type":       "bot",
+					"role":        "assistant",
+					"type":        "bot",
 					"content": map[string]interface{}{
 						"type":    "bot",
 						"message": []map[string]interface{}{{"type": "plain", "text": full.String()}},
@@ -267,10 +267,10 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, text, provider
 			ConvID:     sessionID,
 			IsGroup:    false,
 		},
-		Message:           chain,
-		MessageStr:        text,
-		PlainText:         text,
-		Timestamp:         time.Now(),
+		Message:    chain,
+		MessageStr: text,
+		PlainText:  text,
+		Timestamp:  time.Now(),
 		// 不要预置 IsAtOrWakeCommand=true：WakingCheckStage 对已置位的
 		// 事件直接跳过前缀剥离，导致 "/am_status" 的 "/" 不被剥掉、命令
 		// handler 匹配失败（走向 LLM 闲聊）。置 false 让 WakingCheck 正常
@@ -409,7 +409,7 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 	}
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		logger.Warn("websocket upgrade failed: %v", err)
+		logger.I18nWarn("WebSocket 升级失败: %v", err)
 		return
 	}
 	wsCtx, wsCancel := context.WithCancel(context.Background())
@@ -464,7 +464,7 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 			// Best-effort: cancel the current pipeline run for the session.
 			s.wsSend(client, map[string]interface{}{
 				"ct": "chat", "t": "error", "data": "INTERRUPTED",
-				"code": "INTERRUPTED",
+				"code":       "INTERRUPTED",
 				"message_id": msg.MessageID,
 			})
 
@@ -521,14 +521,14 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 
 	// Persist the user message.
 	userRecord := map[string]interface{}{
-		"id":         fmt.Sprintf("u_%d", time.Now().UnixNano()),
-		"session_id": sessionID,
-		"sender_id":  "dashboard",
+		"id":          fmt.Sprintf("u_%d", time.Now().UnixNano()),
+		"session_id":  sessionID,
+		"sender_id":   "dashboard",
 		"sender_name": "dashboard",
-		"role":       "user",
-		"type":       "user",
-		"content":    map[string]interface{}{"type": "user", "message": msg.Message},
-		"created_at": time.Now().Format(time.RFC3339Nano),
+		"role":        "user",
+		"type":        "user",
+		"content":     map[string]interface{}{"type": "user", "message": msg.Message},
+		"created_at":  time.Now().Format(time.RFC3339Nano),
 	}
 	s.chat.appendMessage(sessionID, userRecord)
 
@@ -578,12 +578,12 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 		done:
 			if full.Len() > 0 {
 				botRecord := map[string]interface{}{
-					"id":         fmt.Sprintf("b_%d", time.Now().UnixNano()),
-					"session_id": sessionID,
-					"sender_id":  "bot",
+					"id":          fmt.Sprintf("b_%d", time.Now().UnixNano()),
+					"session_id":  sessionID,
+					"sender_id":   "bot",
 					"sender_name": "bot",
-					"role":       "assistant",
-					"type":       "bot",
+					"role":        "assistant",
+					"type":        "bot",
 					"content": map[string]interface{}{
 						"type":    "bot",
 						"message": []map[string]interface{}{{"type": "plain", "text": full.String()}},

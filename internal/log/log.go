@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
 )
 
 // Level represents log severity.
@@ -30,24 +32,24 @@ var levelNames = map[Level]string{
 }
 
 var levelColors = map[Level]string{
-	LevelDebug:    "\033[37m",
-	LevelInfo:     "\033[36m",
-	LevelWarn:     "\033[33m",
-	LevelError:    "\033[31m",
-	LevelCritical: "\033[35m",
+	LevelDebug:    "\033[1;36m", // bright cyan bold (loguru DEBUG)
+	LevelInfo:     "\033[1;34m", // bright blue bold (loguru INFO)
+	LevelWarn:     "\033[1;33m", // bright yellow bold (loguru WARNING)
+	LevelError:    "\033[31m",   // red (loguru ERROR)
+	LevelCritical: "\033[1;31m", // bright red bold (loguru CRITICAL)
 }
 
 const colorReset = "\033[0m"
 
 // Logger is a structured logger that supports multiple subscribers (LogBroker pattern).
 type Logger struct {
-	mu          sync.RWMutex
-	level       Level
-	out         io.Writer
-	fileOut     io.Writer
-	subscribers []chan LogEntry
-	useColor    bool
-	history     []LogEntry
+	mu           sync.RWMutex
+	level        Level
+	out          io.Writer
+	fileOut      io.Writer
+	subscribers  []chan LogEntry
+	useColor     bool
+	history      []LogEntry
 	historyBytes int
 }
 
@@ -333,6 +335,21 @@ func (c *ComponentLogger) Warn(format string, args ...interface{}) {
 }
 func (c *ComponentLogger) Error(format string, args ...interface{}) {
 	c.parent.log(LevelError, c.component, format, args...)
+}
+
+// I18nInfo 记录一条按当前语言翻译的 INFO 日志（key 经 i18n.Get 格式化）。
+func (c *ComponentLogger) I18nInfo(key string, args ...interface{}) {
+	c.parent.log(LevelInfo, c.component, "%s", i18n.Get(key, args...))
+}
+
+// I18nWarn 记录一条按当前语言翻译的 WARN 日志。
+func (c *ComponentLogger) I18nWarn(key string, args ...interface{}) {
+	c.parent.log(LevelWarn, c.component, "%s", i18n.Get(key, args...))
+}
+
+// I18nError 记录一条按当前语言翻译的 ERROR 日志。
+func (c *ComponentLogger) I18nError(key string, args ...interface{}) {
+	c.parent.log(LevelError, c.component, "%s", i18n.Get(key, args...))
 }
 
 // ParseLevel converts a string to a Level.

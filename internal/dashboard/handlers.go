@@ -595,7 +595,30 @@ func capabilityToProviderType(capability string) string {
 	return capability
 }
 
-func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts []string) {	sub := ""
+// providerNameToProviderType derives a capability type from a provider name
+// (e.g. "openai_chat_completion" -> "chat_completion"). Used to backfill
+// provider_type on legacy providers that lack the field.
+func providerNameToProviderType(providerName string) string {
+	name := strings.ToLower(strings.TrimSpace(providerName))
+	switch {
+	case strings.Contains(name, "speech_to_text"), strings.Contains(name, "stt"), strings.Contains(name, "whisper"):
+		return "speech_to_text"
+	case strings.Contains(name, "text_to_speech"), strings.Contains(name, "tts"):
+		return "text_to_speech"
+	case strings.Contains(name, "embedding"):
+		return "embedding"
+	case strings.Contains(name, "rerank"):
+		return "rerank"
+	case strings.Contains(name, "dify"), strings.Contains(name, "coze"), strings.Contains(name, "deerflow"), strings.Contains(name, "dashscope"), strings.Contains(name, "agent_runner"), strings.Contains(name, "agent"):
+		return "agent_runner"
+	case strings.Contains(name, "chat_completion"), strings.Contains(name, "chat"):
+		return "chat_completion"
+	}
+	return ""
+}
+
+func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts []string) {
+	sub := ""
 	if len(parts) > 0 {
 		sub = parts[0]
 	}
@@ -619,6 +642,40 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 		}
 		cfg := s.getConfigSnapshot()
 		providers, _ := cfg["provider"].([]interface{})
+		// Backfill provider_type for providers created before the field was
+		// stored (or via flows that omit it), so the capability filter and the
+		// WebUI provider selector work. Derive from the linked source first,
+		// then from the provider name.
+		sources := s.getProviderSources()
+		sourceTypeByID := map[string]string{}
+		for _, src := range sources {
+			if sm, ok := src.(map[string]interface{}); ok {
+				if sid, _ := sm["id"].(string); sid != "" {
+					if pt, _ := sm["provider_type"].(string); pt != "" {
+						sourceTypeByID[sid] = pt
+					}
+				}
+			}
+		}
+		for _, p := range providers {
+			pm, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if pt, _ := pm["provider_type"].(string); pt == "" {
+				derived := ""
+				if sid, _ := pm["provider_source_id"].(string); sid != "" {
+					derived = sourceTypeByID[sid]
+				}
+				if derived == "" {
+					providerName, _ := pm["provider"].(string)
+					derived = providerNameToProviderType(providerName)
+				}
+				if derived != "" {
+					pm["provider_type"] = derived
+				}
+			}
+		}
 		// The WebUI requests providers by capability (e.g. capability=embedding
 		// for the knowledge-base vector model selector). Filter by provider_type
 		// so the same provider is not returned for every capability.
@@ -927,7 +984,7 @@ func (s *Server) cleanProviderSettingsRefs(id string) {
 	}
 	if changed {
 		if err := s.setConfigData("provider_settings", ps); err != nil {
-			logger.Warn("cleanProviderSettingsRefs(%s): %v", id, err)
+			logger.I18nWarn("清理插件 %s 的提供商引用失败: %v", id, err)
 		}
 	}
 }
@@ -1263,12 +1320,52 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"supported": true,
 		}))
+	case "log-level":
+		if r.Method != http.MethodPut {
+			writeJSON(w, http.StatusOK, apiError("仅支持 PUT 请求"))
+			return
+		}
+		var body struct {
+			Level string `json:"level"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		level := strings.ToUpper(strings.TrimSpace(body.Level))
+		switch level {
+		case "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL":
+		default:
+			writeJSON(w, http.StatusOK, apiError("无效的日志级别: "+body.Level))
+			return
+		}
+		log.GetDefault().SetLevel(log.ParseLevel(level))
+		_ = s.setConfigData("log_level", level)
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"log_level": level}))
 	default:
 		// /api/v1/plugins/{plugin_id}, /{plugin_id}/config, /{plugin_id}/source,
 		// /{plugin_id}/update and /{plugin_id}/reload
 		pluginID := sub
 		if len(parts) > 1 {
 			switch parts[1] {
+			case "log-level":
+				// 前端将 plugin_id 作为占位，实际设置全局日志级别
+				if r.Method != http.MethodPut {
+					writeJSON(w, http.StatusOK, apiError("仅支持 PUT 请求"))
+					return
+				}
+				var body struct {
+					Level string `json:"level"`
+				}
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				level := strings.ToUpper(strings.TrimSpace(body.Level))
+				switch level {
+				case "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL":
+				default:
+					writeJSON(w, http.StatusOK, apiError("无效的日志级别: "+body.Level))
+					return
+				}
+				log.GetDefault().SetLevel(log.ParseLevel(level))
+				_ = s.setConfigData("log_level", level)
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"log_level": level}))
+				return
 			case "config":
 				if r.Method == http.MethodPost || r.Method == http.MethodPut {
 					var body struct {
@@ -1346,16 +1443,16 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	switch method {
 	case "url", "git", "github":
 		var body struct {
-			URL             string `json:"url"`
-			IgnoreRisk      bool   `json:"ignore_risk"`
-			CCChoice        string `json:"cc_choice"`
-			InstallID       string `json:"install_id"`
-			InstallMethod   string `json:"install_method"`
-			RegistryURL     string `json:"registry_url"`
-			RegistryName    string `json:"registry_name"`
-			MarketPluginID  string `json:"market_plugin_id"`
-			Repo            string `json:"repo"`
-			DownloadURL     string `json:"download_url"`
+			URL            string `json:"url"`
+			IgnoreRisk     bool   `json:"ignore_risk"`
+			CCChoice       string `json:"cc_choice"`
+			InstallID      string `json:"install_id"`
+			InstallMethod  string `json:"install_method"`
+			RegistryURL    string `json:"registry_url"`
+			RegistryName   string `json:"registry_name"`
+			MarketPluginID string `json:"market_plugin_id"`
+			Repo           string `json:"repo"`
+			DownloadURL    string `json:"download_url"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		source = strings.TrimSpace(body.URL)
@@ -1484,6 +1581,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			return
 		}
 		s.setInstallProgress(installID, &installStatus{Status: "error", Text: err.Error()})
+		done = false
 		writeJSON(w, http.StatusOK, apiError("插件安装失败: "+err.Error()))
 		return
 	}
@@ -1597,12 +1695,12 @@ func (s *Server) handlePluginBindSource(w http.ResponseWriter, r *http.Request, 
 	}
 
 	var body struct {
-		InstallMethod   string `json:"install_method"`
-		RegistryURL     string `json:"registry_url"`
-		RegistryName    string `json:"registry_name"`
-		MarketPluginID  string `json:"market_plugin_id"`
-		Repo            string `json:"repo"`
-		DownloadURL     string `json:"download_url"`
+		InstallMethod  string `json:"install_method"`
+		RegistryURL    string `json:"registry_url"`
+		RegistryName   string `json:"registry_name"`
+		MarketPluginID string `json:"market_plugin_id"`
+		Repo           string `json:"repo"`
+		DownloadURL    string `json:"download_url"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
@@ -1706,10 +1804,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 					"error":         task.Error,
 				},
 				"progress": map[string]interface{}{
-					"stage":       task.Stage,
-					"file_index":  task.FileIndex,
-					"current":     task.Current,
-					"total":       task.Total,
+					"stage":      task.Stage,
+					"file_index": task.FileIndex,
+					"current":    task.Current,
+					"total":      task.Total,
 				},
 			}))
 			return
@@ -2133,9 +2231,14 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 		saved := make([]map[string]interface{}, 0, len(docs))
 		for _, d := range docs {
 			saved = append(saved, map[string]interface{}{
-				"doc_id":    d.DocID,
-				"doc_name":  d.Name,
-				"file_size": func() int64 { if fi, err := os.Stat(d.Path); err == nil { return fi.Size() }; return 0 }(),
+				"doc_id":   d.DocID,
+				"doc_name": d.Name,
+				"file_size": func() int64 {
+					if fi, err := os.Stat(d.Path); err == nil {
+						return fi.Size()
+					}
+					return 0
+				}(),
 			})
 		}
 
@@ -2486,21 +2589,21 @@ func (s *Server) kbRowToMap(row *db.KBRow) map[string]interface{} {
 	}
 	docCount, chunkCount := s.kbDocCounts(row.KBID)
 	return map[string]interface{}{
-		"kb_id":                  row.KBID,
-		"kb_name":                row.KBName,
-		"description":            row.Description,
-		"emoji":                  row.Emoji,
-		"embedding_provider_id":  row.EmbeddingProviderID,
-		"rerank_provider_id":     row.RerankProviderID,
-		"chunk_size":             row.ChunkSize,
-		"chunk_overlap":          row.ChunkOverlap,
-		"top_k_dense":            row.TopKDense,
-		"top_k_sparse":           row.TopKSparse,
-		"top_m_final":            row.TopMFinal,
-		"doc_count":              docCount,
-		"chunk_count":            chunkCount,
-		"created_at":             row.CreatedAt.In(time.Local).Format(time.RFC3339),
-		"updated_at":             row.UpdatedAt.In(time.Local).Format(time.RFC3339),
+		"kb_id":                 row.KBID,
+		"kb_name":               row.KBName,
+		"description":           row.Description,
+		"emoji":                 row.Emoji,
+		"embedding_provider_id": row.EmbeddingProviderID,
+		"rerank_provider_id":    row.RerankProviderID,
+		"chunk_size":            row.ChunkSize,
+		"chunk_overlap":         row.ChunkOverlap,
+		"top_k_dense":           row.TopKDense,
+		"top_k_sparse":          row.TopKSparse,
+		"top_m_final":           row.TopMFinal,
+		"doc_count":             docCount,
+		"chunk_count":           chunkCount,
+		"created_at":            row.CreatedAt.In(time.Local).Format(time.RFC3339),
+		"updated_at":            row.UpdatedAt.In(time.Local).Format(time.RFC3339),
 	}
 }
 
@@ -3164,7 +3267,7 @@ func (s *Server) syncModelScopeMCPServers(accessToken string) (int, error) {
 	if synced == 0 {
 		return 0, nil
 	}
-	logger.Info("Synced %d MCP server(s) from ModelScope", synced)
+	logger.I18nInfo("已从 ModelScope 同步 %d 个 MCP 服务器", synced)
 	return synced, nil
 }
 
@@ -3228,7 +3331,7 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request, parts []stri
 			logs = append(logs, map[string]interface{}{
 				"level":    sseLogLevel(entry.Level),
 				"time":     float64(entry.Timestamp.UnixMilli()) / 1000.0,
-				"data":     fmt.Sprintf("[%s] [%s] %s", entry.Timestamp.Format("2006-01-02 15:04:05.000"), sseLogLevel(entry.Level), entry.Message),
+				"data":     sseLogLine(entry),
 				"category": "system",
 			})
 		}
@@ -3270,7 +3373,7 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 				"type":     "log",
 				"level":    sseLogLevel(entry.Level),
 				"time":     float64(entry.Timestamp.UnixMilli()) / 1000.0,
-				"data":     fmt.Sprintf("[%s] [%s] %s", entry.Timestamp.Format("2006-01-02 15:04:05.000"), sseLogLevel(entry.Level), entry.Message),
+				"data":     sseLogLine(entry),
 				"category": "system",
 			}
 			data, _ := json.Marshal(payload)
@@ -3296,6 +3399,37 @@ func sseLogLevel(level log.Level) string {
 	default:
 		return "INFO"
 	}
+}
+
+// sseLogAnsi returns the ANSI color prefix that opens a console log line,
+// matching the WebUI's logColorAnsiMap (the loguru palette the frontend maps
+// to highlight colors). The frontend's printLog matches a log line's leading
+// ANSI code and applies the corresponding color.
+func sseLogAnsi(level log.Level) string {
+	switch level {
+	case log.LevelDebug:
+		return "\x1b[1;36m"
+	case log.LevelInfo:
+		return "\x1b[1;34m"
+	case log.LevelWarn:
+		return "\x1b[1;33m"
+	case log.LevelError:
+		return "\x1b[31m"
+	case log.LevelCritical:
+		return "\x1b[1;31m"
+	default:
+		return "\x1b[1;34m"
+	}
+}
+
+// sseLogLine builds a console log line with the level ANSI prefix so the
+// WebUI console highlights it (mirrors the Python loguru output format).
+func sseLogLine(entry log.LogEntry) string {
+	return fmt.Sprintf("%s[%s] [%s] %s",
+		sseLogAnsi(entry.Level),
+		entry.Timestamp.Format("2006-01-02 15:04:05.000"),
+		sseLogLevel(entry.Level),
+		entry.Message)
 }
 
 // ── Backups handlers ─────────────────────────────────────────
@@ -4094,6 +4228,16 @@ func (s *Server) handleProviderSources(w http.ResponseWriter, r *http.Request, p
 				if _, ok := body.Config["provider"]; !ok || body.Config["provider"] == "" {
 					if p, ok := source["provider"].(string); ok && p != "" {
 						body.Config["provider"] = p
+					}
+				}
+				// Inherit the capability type from the source so the WebUI's
+				// capability filter (e.g. capability=chat -> chat_completion)
+				// can find the provider. Without this, providers created via
+				// "add model" show up with no provider_type and the config
+				// page reports "暂无可用的提供商".
+				if _, ok := body.Config["provider_type"]; !ok || body.Config["provider_type"] == "" {
+					if pt, ok := source["provider_type"].(string); ok && pt != "" {
+						body.Config["provider_type"] = pt
 					}
 				}
 			}
@@ -5074,9 +5218,17 @@ func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request, parts []st
 	}
 	switch sub {
 	case "restart":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "restart not supported in Go version",
-		}))
+		if s.restartFunc != nil {
+			// 异步触发重启，先返回成功响应，避免阻塞当前请求
+			go s.restartFunc()
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"message": "重启中...",
+			}))
+		} else {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"message": "重启功能不可用",
+			}))
+		}
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}

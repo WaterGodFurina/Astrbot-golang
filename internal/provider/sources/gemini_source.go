@@ -64,6 +64,8 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	contents, _ := body["contents"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, model, len(contents))
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -99,6 +101,7 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 			text += part.Text
 		}
 	}
+	logger.Debug("LLM response: text_len=%d", len(text))
 	return &provider.LLMResponse{
 		Role:           "assistant",
 		CompletionText: text,
@@ -126,6 +129,8 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	contents, _ := body["contents"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, model, len(contents))
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -182,7 +187,11 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 				Usage:          usage,
 			}
 		}
+		if usage != nil {
+			logger.Debug("LLM stream done, usage=%v", usage)
+		}
 	}()
+	logger.Debug("LLM stream started: model=%s", model)
 	return ch, nil
 }
 

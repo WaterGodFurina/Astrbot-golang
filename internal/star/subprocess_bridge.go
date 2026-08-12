@@ -95,6 +95,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if len(parts) > 1 {
 					args = parts[1:]
 				}
+				logger.Debug("plugin RPC HandleCommand: name=%s args=%v", cmd.Name, args)
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 				text, chain, err := client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDK(e))
 				rpcCancel()
@@ -194,7 +195,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 	}
 
 	if len(meta.Commands)+len(meta.Filters)+len(meta.Hooks) > 0 {
-		logger.Info("Registered subprocess plugin %s into the pipeline (%d commands, %d filters, %d hooks)",
+		logger.I18nInfo("子进程插件 %s 已注册到流水线（%d 个命令，%d 个过滤器，%d 个钩子）",
 			inst.Name, len(meta.Commands), len(meta.Filters), len(meta.Hooks))
 	}
 }

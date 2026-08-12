@@ -11,8 +11,10 @@ require (
 	github.com/mark3labs/mcp-go v0.57.0
 	github.com/mholt/archives v0.1.5
 	github.com/mitchellh/mapstructure v1.5.0
+	github.com/pquerna/otp v1.5.0
 	golang.org/x/crypto v0.27.0
 	golang.org/x/mod v0.37.0
+	golang.org/x/net v0.26.0
 	modernc.org/sqlite v1.56.0
 )
 
@@ -22,6 +24,7 @@ require (
 	github.com/bodgit/plumbing v1.3.0 // indirect
 	github.com/bodgit/sevenzip v1.6.1 // indirect
 	github.com/bodgit/windows v1.0.1 // indirect
+	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fatih/color v1.7.0 // indirect
@@ -50,7 +53,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
 	go4.org v0.0.0-20230225012048-214862532bf5 // indirect
-	golang.org/x/net v0.26.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240318140521-94a12d6c2237 // indirect

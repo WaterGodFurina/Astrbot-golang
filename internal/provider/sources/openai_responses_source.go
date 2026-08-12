@@ -171,7 +171,11 @@ func (s *OpenAIResponsesSource) TextChat(ctx context.Context, req *provider.Prov
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
-	return s.parseResponse(&result, len(req.Tools) > 0)
+	llmResp, err := s.parseResponse(&result, len(req.Tools) > 0)
+	if err == nil && llmResp != nil {
+		logger.Debug("LLM response: text_len=%d", len(llmResp.CompletionText))
+	}
+	return llmResp, err
 }
 
 // TextChatStream sends a streaming Responses API request (SSE events).
@@ -328,8 +332,12 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 				}
 			}
 		}
+		if final.Usage != nil {
+			logger.Debug("LLM stream done, usage=%v", final.Usage)
+		}
 		ch <- final
 	}()
+	logger.Debug("LLM stream started: model=%s", s.GetModel())
 	return ch, nil
 }
 
@@ -722,6 +730,8 @@ func (s *OpenAIResponsesSource) doRequest(ctx context.Context, body map[string]i
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
 	url := fmt.Sprintf("%s/responses", s.apiBase)
+	input, _ := body["input"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(input))
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err

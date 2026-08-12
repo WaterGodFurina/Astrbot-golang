@@ -611,7 +611,7 @@ func (pm *PlatformManager) StartAll(ctx context.Context) error {
 		if err := adapter.Start(ctx); err != nil {
 			return fmt.Errorf("platform %s: %w", adapter.ID(), err)
 		}
-		logger.Info("Platform adapter %s (%s) started", adapter.ID(), adapter.Type())
+		logger.I18nInfo("平台适配器 %s (%s) 已启动", adapter.ID(), adapter.Type())
 	}
 	return nil
 }

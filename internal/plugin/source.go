@@ -225,8 +225,10 @@ func (m *SubprocessManager) fetchSource(ctx context.Context, id, source string) 
 		if err := validateSourceURL(source); err != nil {
 			return cleanup(fmt.Errorf("invalid source %q: %w", source, err))
 		}
-		if err := gitClone(ctx, source, dst); err != nil {
-			return cleanup(fmt.Errorf("git clone %s: %w", source, err))
+		// GitHub 加速：配置了 github_proxy 时重写 github.com 仓库 URL
+		gitSource := m.applyGitHubProxy(source)
+		if err := gitClone(ctx, gitSource, dst); err != nil {
+			return cleanup(fmt.Errorf("git clone %s: %w", gitSource, err))
 		}
 		return dst, nil
 

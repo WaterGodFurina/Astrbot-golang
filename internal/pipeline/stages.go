@@ -27,8 +27,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/WaterGodFurina/Astrbot-golang/internal/contentsafety"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/agent"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/contentsafety"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
@@ -42,7 +43,6 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 )
 
 var logger = log.GetDefault().WithComponent("Pipeline")
@@ -172,7 +172,7 @@ func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
 		s.aiWakePrefix = strings.TrimSpace(psAI.WakePrefix)
 	}
 
-	logger.Info("WakingCheck initialized: prefixes=%v, nicknames=%v, wakeByAt=%v, wakeByPrefix=%v, wakeByFriend=%v, aiWakePrefix=%q",
+	logger.Debug("WakingCheck initialized: prefixes=%v, nicknames=%v, wakeByAt=%v, wakeByPrefix=%v, wakeByFriend=%v, aiWakePrefix=%q",
 		s.wakePrefixes, s.nickname, s.wakeByAt, s.wakeByPrefix, s.wakeByFriend, s.aiWakePrefix)
 	return nil
 }
@@ -192,7 +192,7 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 	if text == "" {
 		text = extractPlainText(event.Message)
 	}
-	logger.Info("WakingCheck: text=%q plaintext=%q prefixes=%v wakeByPrefix=%v wakeByFriend=%v isGroup=%v",
+	logger.Debug("WakingCheck: text=%q plaintext=%q prefixes=%v wakeByPrefix=%v wakeByFriend=%v isGroup=%v",
 		text, event.PlainText, s.wakePrefixes, s.wakeByPrefix, s.wakeByFriend, event.Source.IsGroup)
 
 	// Check wake prefixes
@@ -301,7 +301,7 @@ func (s *WakingCheckStage) applyPrefixWake(event *core.Event, text, prefix strin
 	// (mirrors astrbot/core/pipeline/waking_check/stage.py).
 	event.MessageStr = trimmed
 	event.PlainText = trimmed
-	logger.Info("Woken by prefix '%s', stripped to %q (llm_wake=%v)",
+	logger.Debug("Woken by prefix '%s', stripped to %q (llm_wake=%v)",
 		prefix, event.MessageStr, event.GetExtra("llm_wake"))
 }
 
@@ -347,7 +347,7 @@ func (s *WhitelistCheckStage) Initialize(ctx *PipelineContext) error {
 		s.wlIgnoreAdminOnFriend = ps.WLIgnoreAdmin
 	}
 	s.wlLog = ps.WLLog
-	logger.Info("WhitelistCheck initialized: enable=%v, whitelist_size=%d", s.enableWhitelist, len(s.whitelist))
+	logger.Debug("WhitelistCheck initialized: enable=%v, whitelist_size=%d", s.enableWhitelist, len(s.whitelist))
 	return nil
 }
 
@@ -377,7 +377,7 @@ func (s *WhitelistCheckStage) Process(ctx context.Context, event *core.Event) (*
 
 	if !s.whitelist[unifiedOrigin] && !s.whitelist[strings.TrimSpace(groupID)] {
 		if s.wlLog {
-			logger.Info("Session %s not in allowlist, stopping event", unifiedOrigin)
+			logger.Debug("Session %s not in allowlist, stopping event", unifiedOrigin)
 		}
 		event.Stop()
 		return &StageResult{Continue: false}, nil
@@ -475,7 +475,7 @@ func (s *RateLimitStage) Initialize(ctx *PipelineContext) error {
 	}
 
 	s.limiter = ratelimit.NewRateLimiter(maxReq, DurationFromSeconds(windowSeconds), strategy)
-	logger.Info("RateLimit initialized: max=%d, window=%ds, strategy=%v", maxReq, windowSeconds, strategy)
+	logger.Debug("RateLimit initialized: max=%d, window=%ds, strategy=%v", maxReq, windowSeconds, strategy)
 	return nil
 }
 
@@ -484,7 +484,7 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 	allowed, stall := s.limiter.Allow(sessionID)
 	if !allowed {
 		if stall > 0 {
-			logger.Info("Session %s rate-limited, stalling for %.2fs", sessionID, stall.Seconds())
+			logger.Debug("Session %s rate-limited, stalling for %.2fs", sessionID, stall.Seconds())
 			// Stall strategy: re-publish the event once the window frees up,
 			// matching Python's async sleep + resume. This must not block the
 			// single-goroutine event bus, so we schedule a delayed re-queue.
@@ -496,7 +496,7 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 			}
 			return &StageResult{Continue: false}, nil
 		}
-		logger.Info("Session %s rate-limited, discarded", sessionID)
+		logger.Debug("Session %s rate-limited, discarded", sessionID)
 		event.Stop()
 		return &StageResult{Continue: false}, nil
 	}
@@ -525,7 +525,7 @@ func (s *ContentSafetyCheckStage) Initialize(ctx *PipelineContext) error {
 		config = cs
 	}
 	s.selector = contentsafety.NewStrategySelector(config)
-	logger.Info("ContentSafetyCheck initialized: enabled=%v", s.selector.IsEnabled())
+	logger.Debug("ContentSafetyCheck initialized: enabled=%v", s.selector.IsEnabled())
 	return nil
 }
 
@@ -561,7 +561,7 @@ func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event
 			event.Result.Chain = []message.Component{&message.Plain{Text: "Your message or the model response contains inappropriate content and has been blocked."}}
 		}
 		event.Stop()
-		logger.Info("Content safety check failed: %s", info)
+		logger.Debug("Content safety check failed: %s", info)
 		return &StageResult{Continue: false}, nil
 	}
 	return &StageResult{Continue: true}, nil
@@ -779,7 +779,7 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) []*star.StarHandl
 			}
 		}
 		if matched {
-			logger.Info("ProcessStage: handler %s matched for message %q", handler.HandlerFullName, event.MessageStr)
+			logger.Debug("ProcessStage: handler %s matched for message %q", handler.HandlerFullName, event.MessageStr)
 			result = append(result, handler)
 		}
 	}
@@ -834,7 +834,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	if prompt == "" {
 		prompt = extractPlainText(event.Message)
 	}
-	logger.Info("callLLMAgent: prompt=%q plaintext=%q messagestr=%q", prompt, event.PlainText, event.MessageStr)
+	logger.Debug("callLLMAgent: prompt=%q plaintext=%q messagestr=%q", prompt, event.PlainText, event.MessageStr)
 	if prompt == "" {
 		return nil
 	}
@@ -885,11 +885,11 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	if s.subPlugins != nil {
 		sp, stop, err := s.applyLLMRequestHooks(event, systemPrompt, prompt)
 		if err != nil {
-			logger.Warn("plugin on_llm_request hook failed: %v", err)
+			logger.I18nWarn("插件 on_llm_request 钩子执行失败: %v", err)
 		} else {
 			systemPrompt = sp
 			if stop {
-				logger.Info("plugin on_llm_request hook stopped the LLM call")
+				logger.Debug("plugin on_llm_request hook stopped the LLM call")
 				event.Stop()
 				return nil
 			}
@@ -956,7 +956,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 			}
 		}
 	}
-	logger.Info("callLLMAgent: injecting %d tool(s): %v", len(toolNames), toolNames)
+	logger.Debug("callLLMAgent: injecting %d tool(s): %v", len(toolNames), toolNames)
 
 	// Computer Use "local" runtime: announce host access in the system prompt.
 	switch computerUseRuntime {
@@ -976,7 +976,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// System context reminder (identifier / group name / datetime), appended as
 	// an extra user-content part like Python's astr_main_agent.
 	if reminder := s.buildSystemReminder(event); reminder != "" {
-		logger.Info("callLLMAgent: system_reminder=%q", reminder)
+		logger.Debug("callLLMAgent: system_reminder=%q", reminder)
 		req.ExtraUserContentParts = append(req.ExtraUserContentParts, map[string]interface{}{
 			"type": "text",
 			"text": reminder,
@@ -1074,8 +1074,14 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 // the stream channel, forwards content deltas to the platform incrementally,
 // and consolidates content + tool calls into a single response.
 func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider, req *provider.ProviderRequest, streaming bool, streamer *streamSender) (*provider.LLMResponse, error) {
+	start := time.Now()
 	if !streaming {
-		return inst.TextChat(ctx, req)
+		resp, err := inst.TextChat(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		logger.Debug("LLM call completed in %v, text_len=%d", time.Since(start), len(resp.CompletionText))
+		return resp, nil
 	}
 	streamCh, err := inst.TextChatStream(ctx, req)
 	if err != nil {
@@ -1119,6 +1125,7 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 	}
 	full.CompletionText = content.String()
 	full.ReasoningContent = reasoning.String()
+	logger.Debug("LLM call completed in %v, text_len=%d", time.Since(start), len(full.CompletionText))
 	return full, nil
 }
 
@@ -1196,7 +1203,7 @@ func (ss *streamSender) flushFragment(final bool) {
 	ss.sent = true
 	if final {
 		if err := ss.frag.StreamEnd(ss.event.Source.ConvID, ss.msgID, text); err != nil {
-			logger.Warn("stream end failed: %v", err)
+			logger.I18nWarn("流式结束发送失败: %v", err)
 		}
 	}
 }
@@ -1205,7 +1212,7 @@ func (ss *streamSender) flushFragment(final bool) {
 // the user still gets progressive output when the platform rejects streaming.
 func (ss *streamSender) onFragFailure(err error) {
 	if !ss.fragWarn {
-		logger.Warn("native streaming unavailable (%v); falling back to sentence segmentation", err)
+		logger.I18nWarn("原生流式不可用 (%v)，回退到按句子切分输出", err)
 		ss.fragWarn = true
 	}
 	ss.frag = nil
@@ -1246,7 +1253,7 @@ func (ss *streamSender) sendSegment(text string) {
 	}
 	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: text}}}
 	if err := ss.stage.platformMgr.Send(ss.event.Source.Platform, ss.event.Source.ConvID, chain); err != nil {
-		logger.Warn("stream segment send failed: %v", err)
+		logger.I18nWarn("流式片段发送失败: %v", err)
 		return
 	}
 	ss.sent = true
@@ -1409,7 +1416,7 @@ func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[str
 		return systemPrompt
 	}
 
-	logger.Info("callLLMAgent: injecting %d skill(s) into system prompt", len(active))
+	logger.Debug("callLLMAgent: injecting %d skill(s) into system prompt", len(active))
 	systemPrompt += "\n" + skills.BuildSkillsPrompt(active) + "\n"
 	if runtime == "none" {
 		systemPrompt += "User has not enabled the Computer Use feature. " +
@@ -1466,7 +1473,7 @@ func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, h
 			_, _, err := inst.Client.HandleHook(rpcCtx, h.Name, sdkEvent, nil)
 			rpcCancel()
 			if err != nil {
-				logger.Warn("Plugin %s hook %s (%s) failed: %v", inst.Name, h.Name, hookEvent, err)
+				logger.I18nWarn("插件 %s 钩子 %s (%s) 执行失败: %v", inst.Name, h.Name, hookEvent, err)
 			}
 		}
 	}
@@ -1474,7 +1481,8 @@ func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, h
 
 // applyLLMRequestHooks runs every loaded subprocess plugin's on_llm_request
 // hooks, letting them modify the system prompt or stop the LLM call.
-func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, userPrompt string) (string, bool, error) {	if s.subPlugins == nil {
+func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, userPrompt string) (string, bool, error) {
+	if s.subPlugins == nil {
 		return systemPrompt, false, nil
 	}
 	sdkEvent := star.CoreEventToSDK(event)
@@ -1490,7 +1498,7 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 			sp, stop, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
 			rpcCancel()
 			if err != nil {
-				logger.Warn("Plugin %s on_llm_request hook %s failed: %v", inst.Name, h.Name, err)
+				logger.I18nWarn("插件 %s 的 on_llm_request 钩子 %s 执行失败: %v", inst.Name, h.Name, err)
 				continue
 			}
 			systemPrompt = sp
@@ -1639,7 +1647,7 @@ func (s *ProcessStage) loadMCPTools() {
 		McpServers map[string]map[string]interface{} `json:"mcpServers"`
 	}
 	if err := json.Unmarshal(data, &mcpCfg); err != nil {
-		logger.Warn("Failed to parse data/mcp_server.json: %v", err)
+		logger.I18nWarn("解析 data/mcp_server.json 失败: %v", err)
 		s.mcpClients = nil
 		s.mcpSchemas = nil
 		return
@@ -1664,7 +1672,7 @@ func (s *ProcessStage) loadMCPTools() {
 		err := client.Connect(ctx)
 		cancel()
 		if err != nil {
-			logger.Warn("MCP server %q connect failed: %v", name, err)
+			logger.I18nWarn("MCP 服务器 %q 连接失败: %v", name, err)
 			continue
 		}
 		s.mcpClients[safeName] = client
@@ -1680,7 +1688,7 @@ func (s *ProcessStage) loadMCPTools() {
 			}
 			s.mcpSchemas[fullName] = schema
 		}
-		logger.Info("MCP server %q connected (%d tools)", name, len(client.Tools()))
+		logger.Debug("MCP server %q connected (%d tools)", name, len(client.Tools()))
 	}
 	s.mcpLoaded = true
 }
@@ -1702,7 +1710,7 @@ func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map
 	if client == nil {
 		return fmt.Sprintf("MCP 工具 %s 执行失败: 服务器 %q 未连接", name, serverName), true
 	}
-	logger.Info("executeMCPTool: server=%s tool=%s", serverName, toolName)
+	logger.Debug("executeMCPTool: server=%s tool=%s", serverName, toolName)
 	// Bound the tool call: the SSE transport waits for a response event. A
 	// short first-attempt timeout lets a stale connection fail fast so the
 	// reconnect path (below) kicks in instead of hanging the pipeline.
@@ -1713,12 +1721,12 @@ func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map
 		// A transport failure (e.g. SSE connection lost) can leave the client
 		// unable to receive responses; reconnect once and retry with a fresh
 		// timeout.
-		logger.Warn("MCP tool %s call failed (%v), reconnecting and retrying...", name, err)
+		logger.I18nWarn("MCP 工具 %s 调用失败 (%v)，正在重连并重试…", name, err)
 		reconnCtx, reconnCancel := context.WithTimeout(ctx, 30*time.Second)
 		rc := client.Reconnect(reconnCtx)
 		reconnCancel()
 		if rc != nil {
-			logger.Warn("MCP server %q reconnect failed: %v", serverName, rc)
+			logger.I18nWarn("MCP 服务器 %q 重连失败: %v", serverName, rc)
 		} else {
 			retryCtx, retryCancel := context.WithTimeout(ctx, 60*time.Second)
 			result, err = client.CallTool(retryCtx, toolName, args)
@@ -1738,6 +1746,7 @@ func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map
 	if text == "" {
 		return fmt.Sprintf("MCP 工具 %s 执行成功（无文本内容）", name), true
 	}
+	logger.Debug("executeMCPTool: tool %s returned text_len=%d", name, len(text))
 	return text, true
 }
 
@@ -1907,39 +1916,54 @@ func htmlToText(body []byte) string {
 // sandbox executors.
 func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args map[string]interface{}) string {
 	umo := event.UnifiedMsgOrigin()
+	logger.Debug("executeTool: name=%s args=%v", name, args)
+
+	result := ""
+	handled := false
 	if runtime == "sandbox" {
-		if result, handled := s.executeSandboxTool(name, args); handled {
-			return result
+		if r, h := s.executeSandboxTool(name, args); h {
+			result, handled = r, true
 		}
 	}
-	if result, handled := executeBuiltinTool(name, args); handled {
-		return result
+	if !handled {
+		if r, h := executeBuiltinTool(name, args); h {
+			result, handled = r, true
+		}
 	}
-	if result, handled := s.executeMCPTool(context.Background(), name, args); handled {
-		return result
+	if !handled {
+		if r, h := s.executeMCPTool(context.Background(), name, args); h {
+			result, handled = r, true
+		}
 	}
-	if result, handled := s.executePluginTool(event, name, args); handled {
-		return result
+	if !handled {
+		if r, h := s.executePluginTool(event, name, args); h {
+			result, handled = r, true
+		}
 	}
-	switch name {
-	case "astrbot_execute_shell":
-		return executeLocalShell(umo, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
-	case "astrbot_shell_session":
-		return executeShellSession(umo, argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
-	case "astrbot_execute_python":
-		return executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
-	case "astrbot_file_read_tool":
-		return executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0))
-	case "astrbot_file_write_tool":
-		return executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
-	case "astrbot_file_edit_tool":
-		return executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
-	case "astrbot_grep_tool":
-		return executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
-	case "future_task":
-		return executeFutureTask(s.cronMgr, umo, event.GetSenderID(), args)
+	if !handled {
+		switch name {
+		case "astrbot_execute_shell":
+			result = executeLocalShell(umo, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
+		case "astrbot_shell_session":
+			result = executeShellSession(umo, argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
+		case "astrbot_execute_python":
+			result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
+		case "astrbot_file_read_tool":
+			result = executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0))
+		case "astrbot_file_write_tool":
+			result = executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
+		case "astrbot_file_edit_tool":
+			result = executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
+		case "astrbot_grep_tool":
+			result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
+		case "future_task":
+			result = executeFutureTask(s.cronMgr, umo, event.GetSenderID(), args)
+		default:
+			result = fmt.Sprintf("工具 %s 执行失败: 该工具尚未实现 Go 端执行器", name)
+		}
 	}
-	return fmt.Sprintf("工具 %s 执行失败: 该工具尚未实现 Go 端执行器", name)
+	logger.Debug("tool %s result: %.200s", name, result)
+	return result
 }
 
 // addCronTools reports whether the proactive future_task tool should be
@@ -2204,7 +2228,7 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		sdkChain := chainToSDK(event.Result.Chain)
 		stop, err := s.applyResultHooks(event, &sdkChain)
 		if err != nil {
-			logger.Warn("plugin on_decorating_result hook failed: %v", err)
+			logger.I18nWarn("插件 on_decorating_result 钩子执行失败: %v", err)
 		}
 		if len(sdkChain) > 0 {
 			event.Result.Chain = plugin.ComponentsFromSDK(sdkChain)
@@ -2235,7 +2259,7 @@ func (s *ResultDecorateStage) applyResultHooks(event *core.Event, chain *[]plugi
 			newChain, stop, err := inst.Client.HandleHook(rpcCtx, hookName, sdkEvent, cur)
 			rpcCancel()
 			if err != nil {
-				logger.Warn("Plugin %s result hook %s failed: %v", inst.Name, hookName, err)
+				logger.I18nWarn("插件 %s 的结果钩子 %s 执行失败: %v", inst.Name, hookName, err)
 				continue
 			}
 			cur = newChain

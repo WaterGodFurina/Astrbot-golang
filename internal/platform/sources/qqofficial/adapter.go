@@ -325,7 +325,7 @@ func (a *Adapter) connectOnce(ctx context.Context) error {
 		case wsHeartbeatAck:
 			// ok
 		case wsReconnect:
-			logger.Info("[QQOfficial] server requested reconnect")
+			logger.I18nInfo("[QQOfficial] 服务器请求重连")
 			return fmt.Errorf("reconnect requested")
 		case wsInvalidSession:
 			a.mu.Lock()
@@ -390,9 +390,9 @@ func (a *Adapter) handleDispatch(frame map[string]interface{}) {
 			}
 		}
 		a.mu.Unlock()
-		logger.Info("[QQOfficial] 机器人 %s 启动成功！", a.SelfID)
+		logger.I18nInfo("[QQOfficial] 机器人 %s 启动成功！", a.SelfID)
 	case "RESUMED":
-		logger.Info("[QQOfficial] 机器人重连成功")
+		logger.I18nInfo("[QQOfficial] 机器人重连成功")
 	case "C2C_MESSAGE_CREATE":
 		a.handleMessage(d, "friend")
 	case "GROUP_AT_MESSAGE_CREATE":
@@ -670,7 +670,7 @@ func (a *Adapter) remember(scene, convID, msgID string) {
 }
 
 func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}) {
-	logger.Info("[QQOfficial] received message from %s (group=%v): %q", convID, isGroup, msgStr)
+	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q", convID, isGroup, msgStr)
 	msgObj := platform.NewAstrBotMessage()
 	if isGroup {
 		msgObj.Type = platform.GroupMessage

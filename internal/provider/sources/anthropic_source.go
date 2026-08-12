@@ -62,6 +62,8 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", s.apiKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	msgs, _ := body["messages"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -94,6 +96,7 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 			text += c.Text
 		}
 	}
+	logger.Debug("LLM response: text_len=%d", len(text))
 	return &provider.LLMResponse{
 		Role:           "assistant",
 		CompletionText: text,
@@ -119,6 +122,8 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", s.apiKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	msgs, _ := body["messages"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -186,7 +191,11 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 			return false
 		})
 		_ = reader.scan()
+		if usage != nil {
+			logger.Debug("LLM stream done, usage=%v", usage)
+		}
 	}()
+	logger.Debug("LLM stream started: model=%s", s.GetModel())
 	return ch, nil
 }
 

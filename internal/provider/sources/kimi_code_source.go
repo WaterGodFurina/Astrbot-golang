@@ -181,6 +181,7 @@ func (s *KimiCodeSource) TextChat(ctx context.Context, req *provider.ProviderReq
 		InputCached: result.Usage.CacheReadInputTokens,
 		Output:      result.Usage.OutputTokens,
 	}
+	logger.Debug("LLM response: text_len=%d", len(llmResp.CompletionText))
 	return llmResp, nil
 }
 
@@ -331,8 +332,10 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 		if len(final.ToolsCallArgs) > 0 {
 			final.Role = "tool"
 		}
+		logger.Debug("LLM stream done, usage=%v", usage)
 		ch <- final
 	}()
+	logger.Debug("LLM stream started: model=%s", s.GetModel())
 	return ch, nil
 }
 
@@ -450,5 +453,7 @@ func (s *KimiCodeSource) doRequest(ctx context.Context, body map[string]interfac
 	for k, v := range s.customHeaders {
 		httpReq.Header.Set(k, v)
 	}
+	msgs, _ := body["messages"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	return s.client.Do(httpReq)
 }

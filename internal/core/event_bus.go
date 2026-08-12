@@ -5,11 +5,10 @@ package core
 import (
 	"context"
 	"fmt"
-	"sync"
-	"time"
-
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	"sync"
+	"time"
 )
 
 var logger = log.GetDefault().WithComponent("EventBus")
@@ -255,7 +254,7 @@ func (bus *EventBus) isStopped() bool {
 func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 	if delay <= 0 {
 		if err := bus.Publish(event); err != nil {
-			logger.Warn("Delayed publish (immediate) failed: %v", err)
+			logger.I18nWarn("延迟发布（立即）失败: %v", err)
 		}
 		return
 	}
@@ -266,7 +265,7 @@ func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 			return
 		}
 		if err := bus.Publish(event); err != nil {
-			logger.Warn("Delayed publish failed (queue full, event dropped): %v", err)
+			logger.I18nWarn("延迟发布失败（队列已满，事件被丢弃）: %v", err)
 		}
 	})
 }
@@ -279,7 +278,7 @@ func (bus *EventBus) Stop() {
 	select {
 	case <-bus.done:
 	case <-time.After(eventBusStopTimeout):
-		logger.Warn("EventBus dispatch loop did not exit within %v during shutdown", eventBusStopTimeout)
+		logger.I18nWarn("EventBus 调度循环在关闭时未在 %v 内退出", eventBusStopTimeout)
 	}
 }
 
@@ -300,7 +299,7 @@ func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
 		schedulers = append(schedulers, scheduler)
 	}
 	bus.mu.RUnlock()
-	logger.Info("EventBus: dispatching message %q (schedulers=%d)", event.MessageStr, len(schedulers))
+	logger.I18nInfo("EventBus: 正在分发消息 %q（调度器=%d）", event.MessageStr, len(schedulers))
 
 	for _, scheduler := range schedulers {
 		result, err := scheduler.Process(ctx, event)
@@ -378,10 +377,10 @@ func (s *PipelineScheduler) Process(ctx context.Context, event *Event) (result *
 			return nil, fmt.Errorf("stage %s: %w", stage.Name(), err)
 		}
 		if result != nil && !result.Continue {
-			logger.Info("Pipeline: stage %s stopped event %q", stage.Name(), event.MessageStr)
+			logger.I18nInfo("流水线: 阶段 %s 拦截了事件 %q", stage.Name(), event.MessageStr)
 			return result, nil
 		}
 	}
-	logger.Info("Pipeline: all stages passed for %q", event.MessageStr)
+	logger.I18nInfo("流水线: 事件 %q 已通过所有阶段", event.MessageStr)
 	return &StageResult{Continue: false}, nil
 }

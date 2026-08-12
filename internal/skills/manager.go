@@ -22,7 +22,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
+
+var logger = log.GetDefault().WithComponent("Skills")
 
 const (
 	SkillsConfigFilename         = "skills.json"
@@ -319,6 +323,7 @@ func (sm *SkillManager) ListSkills(activeOnly bool, runtime string) []*SkillInfo
 	for _, name := range sortedKeys(skillsByName) {
 		result = append(result, skillsByName[name])
 	}
+	logger.Debug("Discovered %d skills (runtime=%s)", len(result), runtime)
 	return result
 }
 
@@ -415,6 +420,7 @@ func (sm *SkillManager) SetSandboxSkillsCache(skills []SandboxCacheEntry) {
 	}
 	cache.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	sm.saveSandboxCache(cache)
+	logger.Debug("Updated sandbox skills cache: %d entries", len(cache.Skills))
 }
 
 // GetSandboxSkillsCacheStatus returns cache stats.

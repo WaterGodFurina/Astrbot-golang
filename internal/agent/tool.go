@@ -7,7 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
+
+var logger = log.GetDefault().WithComponent("Agent")
 
 // FunctionTool represents a callable tool that LLMs can invoke.
 type FunctionTool struct {
@@ -34,6 +38,7 @@ func (t *FunctionTool) Call(ctx context.Context, args map[string]interface{}) (i
 	if t.Handler == nil {
 		return nil, fmt.Errorf("tool %s has no handler", t.Name)
 	}
+	logger.Debug("Tool call: %s", t.Name)
 	return t.Handler(ctx, args)
 }
 

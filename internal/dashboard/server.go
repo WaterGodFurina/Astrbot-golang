@@ -24,6 +24,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
@@ -55,10 +56,10 @@ type Server struct {
 	conversationMgr    interface{} // *conversation.Manager
 	cronMgr            interface{} // *cron.CronJobManager
 	subPluginMgr       *plugin.SubprocessManager
-	kbMgr              interface{} // *knowledgebase.Manager
+	kbMgr              interface{}              // *knowledgebase.Manager
 	kbTasks            map[string]*kbUploadTask // knowledge base upload task states
-	skillMgr           interface{} // *skills.SkillManager
-	personaMgr         interface{} // *persona.PersonaManager
+	skillMgr           interface{}              // *skills.SkillManager
+	personaMgr         interface{}              // *persona.PersonaManager
 	personas           *personaStore
 	chat               *chatStore
 	mcp                *mcpStore
@@ -74,9 +75,12 @@ type Server struct {
 	installProgress   map[string]*installStatus
 	// marketCache caches fetched plugin market registry data (keyed by registry
 	// URL) so repeated WebUI requests don't hammer the remote.
-	marketMu    sync.Mutex
-	marketCache map[string]*marketCacheEntry
+	marketMu     sync.Mutex
+	marketCache  map[string]*marketCacheEntry
 	loginLimiter *loginRateLimiter
+	// restartFunc 由 lifecycle 注入，供 WebUI"重启"按钮触发进程自重启
+	//（spawn 新进程 → 优雅停机 → 退出）。
+	restartFunc func()
 }
 
 // defaultPluginMarketURL is the default plugin marketplace registry served by
@@ -156,9 +160,9 @@ func NewServer(port int, configPath string) *Server {
 	s.loginLimiter = newLoginRateLimiter()
 	s.setupRoutes()
 	s.srv = &http.Server{
-		Addr:         fmt.Sprintf(":%d", port),
-		Handler:      s.mux,
-		ReadTimeout:  30 * time.Second,
+		Addr:              fmt.Sprintf(":%d", port),
+		Handler:           s.mux,
+		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		// 注意：不设置 WriteTimeout —— 它会在请求开始时设定绝对截止，
 		// 掐断最长 300s 的 SSE 聊天流（/chat 与 /unified-chat）。慢连接/长流
@@ -295,22 +299,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, parts []stri
 	case "setup":
 		s.handleSetup(w, r)
 	case "totp":
-		if len(parts) > 1 {
-			switch parts[1] {
-			case "setup":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"enable": false,
-				}))
-			case "recovery":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"recovery_codes": []string{},
-				}))
-			default:
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown totp action"})
-			}
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"enable": false}))
-		}
+		s.handleTOTP(w, r, parts[1:])
 	case "account":
 		if len(parts) > 1 && parts[1] == "edit" {
 			s.handleAccountEdit(w, r)
@@ -364,6 +353,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if creds.Username == s.auth.Username() && s.auth.VerifyPassword(creds.Password) {
+		// TOTP 双因素：启用后登录必须携带验证码（或恢复码）。
+		// 使用恢复码登录会一次性禁用双因素（对齐 Python 语义）。
+		if s.auth.TOTPEnabled() {
+			ok, usedRecovery := s.auth.VerifyTOTPEx(creds.Code)
+			if !ok {
+				writeJSON(w, http.StatusUnauthorized, apiError("TOTP 验证码错误"))
+				return
+			}
+			if usedRecovery {
+				logger.I18nWarn("TOTP 恢复码登录，双因素认证已禁用")
+				s.auth.DisableTOTP()
+			}
+		}
 		// Sign a persistent JWT (survives restarts) so the WebSocket chat
 		// transport keeps authenticating until expiry.
 		token, err := s.auth.IssueToken(s.auth.Username())
@@ -416,6 +418,73 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		"skip_default_password_auth": false,
 		"password_upgrade_required":  false,
 	}))
+}
+
+// handleTOTP 处理 TOTP 双因素：setup（两步：生成密钥→验证码启用）、recovery
+// （重新生成恢复码并返回明文）、disable、status。
+func (s *Server) handleTOTP(w http.ResponseWriter, r *http.Request, parts []string) {
+	action := "status"
+	if len(parts) > 0 {
+		action = parts[0]
+	}
+	switch action {
+	case "setup":
+		if s.auth == nil {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"enable": false}))
+			return
+		}
+		var body struct {
+			Secret string `json:"secret"`
+			Code   string `json:"code"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Code == "" {
+			// 第一步：生成密钥与恢复码（不启用），前端扫码
+			secret, otpauth, codes, err := s.auth.GenerateTOTP()
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"secret":         secret,
+				"otpauth_url":    otpauth,
+				"recovery_codes": codes,
+			}))
+			return
+		}
+		// 第二步：验证码启用
+		if !s.auth.EnableTOTP(body.Code) {
+			writeJSON(w, http.StatusOK, apiError("验证码错误"))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"enable": true}))
+	case "recovery":
+		if s.auth == nil || !s.auth.TOTPEnabled() {
+			writeJSON(w, http.StatusOK, apiError("TOTP 未启用"))
+			return
+		}
+		// 恢复码以哈希存储无法回显，重新生成一批并返回明文（旧恢复码作废）
+		_, _, codes, err := s.auth.GenerateTOTP()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError(err.Error()))
+			return
+		}
+		if !s.auth.TOTPEnabled() {
+			// GenerateTOTP 会把 enabled 置 false，这里恢复已启用状态
+			s.auth.EnableTOTPNoop()
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"recovery_codes": codes}))
+	case "disable":
+		if s.auth != nil {
+			s.auth.DisableTOTP()
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"enable": false}))
+	case "status", "":
+		enabled := s.auth != nil && s.auth.TOTPEnabled()
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"enable": enabled}))
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown totp action"})
+	}
 }
 
 // handleSetup handles POST /api/auth/setup.
@@ -734,8 +803,8 @@ func processCPUPercent() float64 {
 const cpuPercentCacheTTL = 5 * time.Second
 
 var (
-	cpuCacheMu sync.Mutex
-	cpuCacheAt time.Time
+	cpuCacheMu  sync.Mutex
+	cpuCacheAt  time.Time
 	cpuCacheVal float64
 )
 
@@ -751,20 +820,20 @@ func round1(v float64) float64 {
 func (s *Server) getProviderTokenStats(days int) map[string]interface{} {
 	empty := func() map[string]interface{} {
 		return map[string]interface{}{
-			"days":                days,
-			"trend":               map[string]interface{}{"series": []interface{}{}, "total_series": [][]int{}},
-			"range_total_tokens":  0,
-			"range_total_calls":   0,
-			"range_avg_ttft_ms":   0,
+			"days":                  days,
+			"trend":                 map[string]interface{}{"series": []interface{}{}, "total_series": [][]int{}},
+			"range_total_tokens":    0,
+			"range_total_calls":     0,
+			"range_avg_ttft_ms":     0,
 			"range_avg_duration_ms": 0,
-			"range_avg_tpm":       0,
-			"range_success_rate":  0,
-			"range_by_provider":   []interface{}{},
-			"range_by_umo":        []interface{}{},
-			"today_total_tokens":  0,
-			"today_total_calls":   0,
-			"today_by_provider":   []interface{}{},
-			"today_by_model":      []interface{}{},
+			"range_avg_tpm":         0,
+			"range_success_rate":    0,
+			"range_by_provider":     []interface{}{},
+			"range_by_umo":          []interface{}{},
+			"today_total_tokens":    0,
+			"today_total_calls":     0,
+			"today_by_provider":     []interface{}{},
+			"today_by_model":        []interface{}{},
 		}
 	}
 	if s.database == nil {
@@ -785,7 +854,7 @@ func (s *Server) getProviderTokenStats(days int) map[string]interface{} {
 
 	records, err := s.database.ProviderStatsSince(queryStart.Add(-24 * time.Hour).UTC())
 	if err != nil {
-		logger.Warn("ProviderStatsSince: %v", err)
+		logger.I18nWarn("ProviderStatsSince: %v", err)
 		return empty()
 	}
 
@@ -1003,15 +1072,42 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.auth != nil {
 		s.auth.PrintStartupBanner(s.port, getLocalIPs())
 	}
-	logger.Info("Dashboard API server starting on :%d", s.port)
+	logger.I18nInfo("仪表盘 API 服务器正在 :%d 端口启动", s.port)
 	go func() {
 		<-ctx.Done()
 		s.Stop()
 	}()
-	if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if enable, cert, key := s.sslConfig(); enable && cert != "" && key != "" {
+		logger.I18nInfo("仪表盘 HTTPS 已启用（证书=%s）", cert)
+		if err := s.srv.ListenAndServeTLS(cert, key); err != nil && err != http.ErrServerClosed {
+			return err
+		}
+	} else if enable {
+		logger.I18nWarn("dashboard.ssl.enable=true 但未配置 cert_file/key_file，回退到 HTTP")
+		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			return err
+		}
+	} else if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
+}
+
+// sslConfig 读取 dashboard.ssl 配置（enable/cert_file/key_file）。
+func (s *Server) sslConfig() (bool, string, string) {
+	cfg := s.getConfigData("default")
+	dash, ok := cfg["dashboard"].(map[string]interface{})
+	if !ok {
+		return false, "", ""
+	}
+	ssl, ok := dash["ssl"].(map[string]interface{})
+	if !ok {
+		return false, "", ""
+	}
+	enable, _ := ssl["enable"].(bool)
+	cert, _ := ssl["cert_file"].(string)
+	key, _ := ssl["key_file"].(string)
+	return enable, cert, key
 }
 
 // Stop shuts down the server.
@@ -1019,7 +1115,7 @@ func (s *Server) Stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = s.srv.Shutdown(ctx)
-	logger.Info("Dashboard API server stopped")
+	logger.I18nInfo("仪表盘 API 服务器已停止")
 }
 
 func mustMarshal(v interface{}) string {
@@ -1056,6 +1152,11 @@ func setAPILogDisabled(v bool) { apiLogDisabled.Store(v) }
 // When set, serveWebUI reads from this directory first, falling back to the embedded dist.
 func (s *Server) SetWebUIDir(dir string) {
 	s.webuiDir = dir
+}
+
+// SetRestartFunc 注入进程自重启回调（由 lifecycle 提供），供 WebUI 重启按钮触发。
+func (s *Server) SetRestartFunc(fn func()) {
+	s.restartFunc = fn
 }
 
 // serveWebUI serves the Vue dashboard (AstrBot original WebUI).
@@ -1183,6 +1284,12 @@ func (s *Server) setConfigData(key string, value interface{}) error {
 	if err := cfg.Save(); err != nil {
 		return err
 	}
+	// 运行时语言切换钩子：单 key 保存 language 时立即生效
+	if key == "language" {
+		if lang, ok := value.(string); ok && lang != "" {
+			i18n.SetLocale(lang)
+		}
+	}
 	s.notifyConfigChanged()
 	return nil
 }
@@ -1208,6 +1315,11 @@ func (s *Server) setConfigDataAll(updates map[string]interface{}) error {
 	}
 	if err := cfg.Save(); err != nil {
 		return err
+	}
+	// 运行时语言切换钩子：config 的 language 变化后立即生效（无需重启），
+	// 之后的日志/指令文案按新语言输出（之前的日志不追溯）。
+	if lang := cfg.GetString("language"); lang != "" {
+		i18n.SetLocale(lang)
 	}
 	s.notifyConfigChanged()
 	return nil
@@ -1573,6 +1685,7 @@ func (s *Server) getInstallProgress(id string) *installStatus {
 func (s *Server) installProgressCallback(installID string) func(downloaded, total int64) {
 	return func(downloaded, total int64) {
 		if installID == "" {
+			logger.Debug("installStage: skip (empty id)")
 			return
 		}
 		percent := 0
@@ -1595,13 +1708,24 @@ func (s *Server) installProgressCallback(installID string) func(downloaded, tota
 func (s *Server) installStageCallback(installID string) func(text string) {
 	return func(text string) {
 		if installID == "" {
+			logger.Debug("installStage: skip (empty id)")
 			return
 		}
+		logger.Debug("installStage[%s]: %s", installID, text)
 		cur := s.getInstallProgress(installID)
 		status := "installing"
 		percent := 0
 		if cur.Status == "downloading" {
 			status = "downloading"
+			percent = cur.Percent
+		}
+		// 编译阶段没有字节级进度，给一个中间进度值让 WebUI 进度条推进，
+		// 否则停留在 0% 看起来像卡住（cgo 编译可达数分钟）。
+		if strings.Contains(text, "编译") {
+			percent = 60
+		} else if cur.Percent >= 60 {
+			// `go build -v` 的实时输出行（下载依赖/编译包名）继续更新 text，
+			// 但保持编译阶段的中间进度不回落。
 			percent = cur.Percent
 		}
 		s.setInstallProgress(installID, &installStatus{
@@ -1665,7 +1789,7 @@ func (s *Server) resolveSubprocessPlugin(id string) (string, string, bool) {
 func (s *Server) pluginSetEnabled(id string, enabled bool) {
 	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
 		if err := s.subPluginMgr.SetEnabled(pid, enabled); err != nil {
-			logger.Warn("SetEnabled(%s): %v", id, err)
+			logger.I18nWarn("设置插件 %s 启用状态失败: %v", id, err)
 		}
 		s.notifyPluginsChanged()
 	}
@@ -1681,7 +1805,7 @@ func (s *Server) pluginReload(id string) {
 	}
 	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
 		if err := s.subPluginMgr.Reload(context.Background(), pid); err != nil {
-			logger.Warn("Reload(%s): %v", id, err)
+			logger.I18nWarn("重载插件 %s 失败: %v", id, err)
 		}
 		s.notifyPluginsChanged()
 	}
@@ -1690,7 +1814,7 @@ func (s *Server) pluginReload(id string) {
 func (s *Server) pluginUninstall(id string, deleteConfig, deleteData bool) {
 	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
 		if err := s.subPluginMgr.Uninstall(pid, deleteConfig, deleteData); err != nil {
-			logger.Warn("Uninstall(%s): %v", id, err)
+			logger.I18nWarn("卸载插件 %s 失败: %v", id, err)
 		}
 		s.notifyPluginsChanged()
 	}
@@ -1753,7 +1877,7 @@ func (s *Server) pluginSaveConfig(id string, cfg map[string]interface{}) {
 	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
 		if cfg != nil {
 			if err := s.subPluginMgr.SaveConfig(name, cfg); err != nil {
-				logger.Warn("SaveConfig(%s): %v", id, err)
+				logger.I18nWarn("保存插件 %s 配置失败: %v", id, err)
 			}
 		}
 	}

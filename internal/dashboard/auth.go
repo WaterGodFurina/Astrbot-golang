@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,8 +21,9 @@ import (
 
 	"crypto/sha256"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/pbkdf2"
 )
 
@@ -43,6 +45,9 @@ type PasswordManager struct {
 	jwtSecret              string
 	tokens                 map[string]bool // active session tokens
 	revoked                map[string]bool // JWT jti blacklist (in-memory)
+	totpSecret             string          // TOTP 密钥（base32）
+	totpEnabled            bool            // 是否启用 TOTP 双重认证
+	totpRecoveryCodes      []string        // 恢复码的 SHA-256 哈希列表（不落明文）
 }
 
 // NewPasswordManager creates a password manager, generating a random password
@@ -80,8 +85,22 @@ func NewPasswordManager(configPath string) *PasswordManager {
 					// No PBKDF2 password set, need to generate
 					needGenerate = true
 				}
-			} else {
-				needGenerate = true
+				// 读取 TOTP 配置：dashboard.totp.{enable,secret,recovery_code_hash}
+				if totpCfg, ok := dash["totp"].(map[string]interface{}); ok {
+					if enable, ok := totpCfg["enable"].(bool); ok {
+						pm.totpEnabled = enable
+					}
+					if secret, ok := totpCfg["secret"].(string); ok && secret != "" {
+						pm.totpSecret = secret
+						// 存在 secret 但未显式开启时按已启用处理，保证两者一致。
+						if !pm.totpEnabled {
+							pm.totpEnabled = true
+						}
+					}
+					if rh, ok := totpCfg["recovery_code_hash"].(string); ok && rh != "" {
+						pm.totpRecoveryCodes = parseRecoveryCodeHashes(rh)
+					}
+				}
 			}
 		} else {
 			needGenerate = true
@@ -593,4 +612,258 @@ func clientIP(r *http.Request, trustProxy bool) string {
 		host = r.RemoteAddr
 	}
 	return host
+}
+
+// ---------------------------------------------------------------------------
+// TOTP 双重认证
+// ---------------------------------------------------------------------------
+
+// recoveryCodeAlphabet 是恢复码的字符集（大写字母 + 数字 2-7，与前端
+// AuthStageRecovery 期望的 base32 风格 [A-Z2-7] 一致）。
+const recoveryCodeAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+// recoveryCodeLength 是单个恢复码的长度。
+const recoveryCodeLength = 32
+
+// TOTPEnabled 返回是否已启用 TOTP 双重认证。
+func (pm *PasswordManager) TOTPEnabled() bool {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.totpEnabled && pm.totpSecret != ""
+}
+
+// TOTPSecret 返回 TOTP 密钥（base32），调用方可用它拼出 otpauth:// URL
+// 并生成二维码。
+func (pm *PasswordManager) TOTPSecret() string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.totpSecret
+}
+
+// TOTPOtpauthURL 生成 otpauth:// 二维码链接（未启用 TOTP 时返回空串）。
+func (pm *PasswordManager) TOTPOtpauthURL() string {
+	pm.mu.RLock()
+	secret := pm.totpSecret
+	username := pm.username
+	pm.mu.RUnlock()
+	if secret == "" {
+		return ""
+	}
+	return otpauthURL(username, secret)
+}
+
+// otpauthURL 组装 otpauth://totp/<Issuer>:<AccountName>?secret=...&issuer=...
+func otpauthURL(username, secret string) string {
+	label := url.PathEscape("AstrBot:" + username)
+	return fmt.Sprintf("otpauth://totp/%s?secret=%s&issuer=AstrBot", label, secret)
+}
+
+// SetupTOTP 生成并启用 TOTP：返回 base32 密钥、otpauth 二维码链接、恢复码列表，
+// 并持久化到 config 的 dashboard.totp 段。调用方应把恢复码一次性展示给用户妥善保存。
+func (pm *PasswordManager) SetupTOTP() (secret string, otpauthURLStr string, recoveryCodes []string, err error) {
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "AstrBot",
+		AccountName: pm.Username(),
+	})
+	if err != nil {
+		return "", "", nil, fmt.Errorf("生成 TOTP 密钥失败: %w", err)
+	}
+
+	codes := generateRecoveryCodes(10)
+	hashes := make([]string, 0, len(codes))
+	for _, c := range codes {
+		hashes = append(hashes, hashRecoveryCode(c))
+	}
+
+	pm.mu.Lock()
+	pm.totpSecret = key.Secret()
+	pm.totpEnabled = true
+	pm.totpRecoveryCodes = hashes
+	pm.mu.Unlock()
+
+	pm.saveTOTPToConfig()
+	authLogger.Info("Dashboard TOTP 双重认证已启用。")
+	return key.Secret(), key.URL(), codes, nil
+}
+
+// GenerateTOTP 生成 TOTP 密钥与恢复码但**不启用**，供前端两步流程：
+// 先扫码展示二维码，用户输入验证码后再 EnableTOTP 启用。
+func (pm *PasswordManager) GenerateTOTP() (secret string, otpauthURLStr string, recoveryCodes []string, err error) {
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "AstrBot",
+		AccountName: pm.Username(),
+	})
+	if err != nil {
+		return "", "", nil, fmt.Errorf("生成 TOTP 密钥失败: %w", err)
+	}
+	codes := generateRecoveryCodes(10)
+	hashes := make([]string, 0, len(codes))
+	for _, c := range codes {
+		hashes = append(hashes, hashRecoveryCode(c))
+	}
+
+	pm.mu.Lock()
+	pm.totpSecret = key.Secret()
+	pm.totpEnabled = false // 待验证码启用
+	pm.totpRecoveryCodes = hashes
+	pm.mu.Unlock()
+	pm.saveTOTPToConfig()
+	return key.Secret(), key.URL(), codes, nil
+}
+
+// EnableTOTP 用认证器验证码启用 TOTP（需先 GenerateTOTP 生成密钥）。
+func (pm *PasswordManager) EnableTOTP(code string) bool {
+	pm.mu.RLock()
+	secret := pm.totpSecret
+	pm.mu.RUnlock()
+	if secret == "" {
+		return false
+	}
+	if !totp.Validate(code, secret) {
+		return false
+	}
+	pm.mu.Lock()
+	pm.totpEnabled = true
+	pm.mu.Unlock()
+	pm.saveTOTPToConfig()
+	authLogger.Info("Dashboard TOTP 双重认证已启用。")
+	return true
+}
+
+// EnableTOTPNoop 在已有密钥的前提下恢复启用状态（recovery 重新生成恢复码
+// 时 GenerateTOTP 会暂时置为未启用，本方法把它恢复为已启用）。
+func (pm *PasswordManager) EnableTOTPNoop() {
+	pm.mu.Lock()
+	if pm.totpSecret != "" {
+		pm.totpEnabled = true
+	}
+	pm.mu.Unlock()
+	pm.saveTOTPToConfig()
+}
+
+// VerifyTOTP 校验 TOTP 验证码；验证码错误时回退校验恢复码（哈希比对）。
+func (pm *PasswordManager) VerifyTOTP(code string) bool {
+	ok, _ := pm.VerifyTOTPEx(code)
+	return ok
+}
+
+// VerifyTOTPEx 校验 TOTP 验证码，返回是否通过以及是否用的是恢复码。
+// usedRecovery=true 表示本次登录消耗了一个恢复码（一次性语义：调用方应
+// DisableTOTP 关闭双重认证，对齐"使用恢复码登录将禁用双因素认证"）。
+func (pm *PasswordManager) VerifyTOTPEx(code string) (ok, usedRecovery bool) {
+	if code == "" {
+		return false, false
+	}
+	pm.mu.RLock()
+	secret := pm.totpSecret
+	enabled := pm.totpEnabled
+	hashes := append([]string(nil), pm.totpRecoveryCodes...)
+	pm.mu.RUnlock()
+
+	if !enabled || secret == "" {
+		return false, false
+	}
+	if totp.Validate(code, secret) {
+		return true, false
+	}
+	if verifyRecoveryCode(code, hashes) {
+		return true, true
+	}
+	return false, false
+}
+
+// DisableTOTP 清除 TOTP 密钥与恢复码并关闭双重认证，同步更新 config。
+func (pm *PasswordManager) DisableTOTP() {
+	pm.mu.Lock()
+	pm.totpSecret = ""
+	pm.totpEnabled = false
+	pm.totpRecoveryCodes = nil
+	pm.mu.Unlock()
+
+	pm.saveTOTPToConfig()
+	authLogger.Info("Dashboard TOTP 双重认证已禁用。")
+}
+
+// saveTOTPToConfig 把 TOTP 相关字段写入 config 的 dashboard.totp 段，
+// 恢复码仅以 SHA-256 哈希落盘，不保存明文。
+func (pm *PasswordManager) saveTOTPToConfig() {
+	cfg := make(map[string]interface{})
+	if data, err := os.ReadFile(pm.configPath); err == nil {
+		json.Unmarshal(data, &cfg)
+	}
+
+	dash, ok := cfg["dashboard"].(map[string]interface{})
+	if !ok {
+		dash = make(map[string]interface{})
+		cfg["dashboard"] = dash
+	}
+	totpCfg, ok := dash["totp"].(map[string]interface{})
+	if !ok {
+		totpCfg = make(map[string]interface{})
+		dash["totp"] = totpCfg
+	}
+
+	pm.mu.RLock()
+	totpCfg["enable"] = pm.totpEnabled
+	totpCfg["secret"] = pm.totpSecret
+	recoveryJSON, _ := json.Marshal(pm.totpRecoveryCodes)
+	totpCfg["recovery_code_hash"] = string(recoveryJSON)
+	pm.mu.RUnlock()
+
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	_ = writeConfigFile(pm.configPath, data)
+}
+
+// generateRecoveryCodes 生成 count 个恢复码，每个为 32 位 [A-Z2-7] 随机串，
+// 风格与 generateRandomToken 一致，可安全展示给用户。
+func generateRecoveryCodes(count int) []string {
+	codes := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		b := make([]byte, recoveryCodeLength)
+		rand.Read(b)
+		var sb strings.Builder
+		sb.Grow(recoveryCodeLength)
+		for _, x := range b {
+			sb.WriteByte(recoveryCodeAlphabet[int(x)%len(recoveryCodeAlphabet)])
+		}
+		codes = append(codes, sb.String())
+	}
+	return codes
+}
+
+// hashRecoveryCode 计算恢复码的 SHA-256 十六进制摘要，用于落盘存储。
+func hashRecoveryCode(code string) string {
+	h := sha256.Sum256([]byte(code))
+	return hex.EncodeToString(h[:])
+}
+
+// verifyRecoveryCode 模糊校验恢复码：忽略大小写、空格与连字符（前端输入的
+// 恢复码为 4 位一组并用连字符分隔），比对 SHA-256 哈希是否命中任一已存哈希。
+func verifyRecoveryCode(code string, hashes []string) bool {
+	if code == "" || len(hashes) == 0 {
+		return false
+	}
+	normalized := strings.ToUpper(strings.TrimSpace(code))
+	normalized = strings.ReplaceAll(normalized, "-", "")
+	normalized = strings.ReplaceAll(normalized, " ", "")
+	candidate := hashRecoveryCode(normalized)
+	for _, h := range hashes {
+		if subtle.ConstantTimeCompare([]byte(candidate), []byte(h)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// parseRecoveryCodeHashes 解析 config 中保存的恢复码哈希：优先当作 JSON
+// 字符串数组；解析失败时若为单个哈希值则按单元素列表返回。
+func parseRecoveryCodeHashes(raw string) []string {
+	var hashes []string
+	if err := json.Unmarshal([]byte(raw), &hashes); err == nil {
+		return hashes
+	}
+	if strings.TrimSpace(raw) != "" {
+		return []string{raw}
+	}
+	return nil
 }

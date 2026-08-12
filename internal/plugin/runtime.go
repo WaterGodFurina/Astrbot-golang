@@ -9,14 +9,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
-	goplugin "github.com/hashicorp/go-plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
+	goplugin "github.com/hashicorp/go-plugin"
 )
 
 // logger 供插件运行时与编译相关路径记录日志。
@@ -84,6 +85,9 @@ type SubprocessManager struct {
 	// BindSource/ReinstallSource/Uninstall），防止并发修改丢条目。与 m.mu 职责
 	// 分离：m.mu 保护内存 map，manifestMu 保护磁盘文件的一致性。
 	manifestMu sync.Mutex
+	// githubProxy 是插件 git clone 的 GitHub 加速地址（如 https://ghfast.top/），
+	// 配置后克隆 https://github.com/... 仓库时在 URL 前加该前缀。
+	githubProxy string
 
 	// AutoRestart enables automatic restart of crashed plugins.
 	AutoRestart bool
@@ -126,6 +130,30 @@ func (m *SubprocessManager) lockOp(id string) func() {
 	mu := l.(*sync.Mutex)
 	mu.Lock()
 	return mu.Unlock
+}
+
+// SetGitHubProxy 设置插件 git clone 的 GitHub 加速地址（config github_proxy）。
+func (m *SubprocessManager) SetGitHubProxy(url string) {
+	m.githubProxy = url
+}
+
+// SetGoConfig 注入插件编译的 Go 包仓库地址（goproxy）与额外构建参数（goflags），
+// 转发给内部的 Compiler。
+func (m *SubprocessManager) SetGoConfig(goproxy, goflags string) {
+	if m.compiler != nil {
+		m.compiler.SetGoConfig(goproxy, goflags)
+	}
+}
+
+// applyGitHubProxy 对 github.com 的 git 源 URL 应用加速前缀（如 ghfast.top）。
+func (m *SubprocessManager) applyGitHubProxy(source string) string {
+	if m.githubProxy == "" {
+		return source
+	}
+	if strings.HasPrefix(source, "https://github.com/") {
+		return strings.TrimRight(m.githubProxy, "/") + "/" + source
+	}
+	return source
 }
 
 // InstallOptions configures InstallFromSource.
@@ -244,7 +272,16 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		}
 	}
 	artifact := filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id), artifactName(id))
-	if err := m.compiler.BuildWithProgressC(ctx, srcDir, artifact, opts.Progress, cc, cxx); err != nil {
+	lineCb := func(line string) {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			return
+		}
+		if opts.Stage != nil {
+			opts.Stage(line)
+		}
+	}
+	if err := m.compiler.BuildWithProgressOut(ctx, srcDir, artifact, opts.Progress, cc, cxx, lineCb); err != nil {
 		return nil, fmt.Errorf("build plugin %s: %w", id, err)
 	}
 
@@ -261,7 +298,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		inst.Version = meta.Version
 	}
 	if err := m.recordInstall(inst, source, artifact, opts); err != nil {
-		logger.Warn("Plugin %s installed but manifest persist failed: %v", id, err)
+		logger.I18nWarn("插件 %s 已安装但 manifest 持久化失败: %v", id, err)
 	}
 	m.cachePluginDocs(inst.Name, srcDir)
 	m.writeMetadataConfig(inst.Name, meta)
@@ -282,7 +319,7 @@ func (m *SubprocessManager) cachePluginDocs(name, srcDir string) {
 		}
 		dst := filepath.Join(dir, src)
 		if err := os.WriteFile(dst, content, 0o644); err != nil {
-			logger.Warn("Cache docs %s for plugin %s: %v", src, name, err)
+			logger.I18nWarn("缓存插件 %s 的文档 %s 失败: %v", name, src, err)
 		}
 	}
 }
@@ -356,7 +393,7 @@ func (m *SubprocessManager) Load(ctx context.Context, id, binary string) (*Plugi
 	m.mu.Unlock()
 
 	m.startWatch(inst)
-	logger.Info("Plugin %s loaded from %s (v%s)", id, inst.Binary, inst.Version)
+	logger.I18nInfo("插件 %s 已从 %s 加载 (v%s)", id, inst.Binary, inst.Version)
 	return inst, nil
 }
 
@@ -396,7 +433,7 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 	go m.teardownInstance(old)
 
 	m.startWatch(newInst)
-	logger.Info("Plugin %s reloaded (v%s)", id, newInst.Version)
+	logger.I18nInfo("插件 %s 已重载 (v%s)", id, newInst.Version)
 	return nil
 }
 
@@ -420,7 +457,7 @@ func (m *SubprocessManager) Unload(id string) error {
 	inst.stopped = true
 	inst.mu.Unlock()
 	m.teardownInstance(inst)
-	logger.Info("Plugin %s unloaded", id)
+	logger.I18nInfo("插件 %s 已卸载", id)
 	m.notifyChanged()
 	return nil
 }
@@ -486,7 +523,7 @@ func (m *SubprocessManager) Shutdown() {
 		inst.mu.Unlock()
 		m.teardownInstance(inst)
 	}
-	logger.Info("Subprocess plugin manager shut down (%d plugin(s) stopped)", len(insts))
+	logger.I18nInfo("子进程插件管理器已关闭 (%d 个插件已停止)", len(insts))
 }
 
 // SetAutoRestart enables/disables automatic crash restarts.
@@ -614,6 +651,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 		StartedAt: time.Now(),
 	}, nil
 }
+
 // startWatch polls the child process for exit and triggers crash handling.
 func (m *SubprocessManager) startWatch(inst *PluginInstance) {
 	go func() {
@@ -682,7 +720,7 @@ func (m *SubprocessManager) handleExit(inst *PluginInstance) {
 	}
 
 	delay := m.RestartBaseDelay * time.Duration(count)
-	logger.Warn("Plugin %s exited unexpectedly, restarting in %v (attempt %d/%d)",
+	logger.I18nWarn("插件 %s 意外退出，将在 %v 后重启 (尝试 %d/%d)",
 		inst.ID, delay, count, maxRestarts)
 	select {
 	case <-time.After(delay):
@@ -758,7 +796,7 @@ func (m *SubprocessManager) restart(inst *PluginInstance) {
 	go m.teardownInstance(inst)
 
 	m.startWatch(newInst)
-	logger.Info("Plugin %s restarted (v%s)", inst.ID, newInst.Version)
+	logger.I18nInfo("插件 %s 已重启 (v%s)", inst.ID, newInst.Version)
 	m.notifyChanged()
 }
 
@@ -767,7 +805,7 @@ func (m *SubprocessManager) restart(inst *PluginInstance) {
 func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
-		logger.Warn("LoadInstalled: %v", err)
+		logger.I18nWarn("LoadInstalled: %v", err)
 		return
 	}
 	loaded := 0
@@ -776,13 +814,13 @@ func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 			continue
 		}
 		if _, err := m.Load(ctx, e.ID, e.Binary); err != nil {
-			logger.Warn("Failed to load installed plugin %s: %v", e.ID, err)
+			logger.I18nWarn("加载已安装插件 %s 失败: %v", e.ID, err)
 			continue
 		}
 		loaded++
 	}
 	if len(man.Plugins) > 0 {
-		logger.Info("Loaded %d of %d installed subprocess plugin(s) from manifest", loaded, len(man.Plugins))
+		logger.I18nInfo("已从 manifest 加载 %d/%d 个已安装子进程插件", loaded, len(man.Plugins))
 	}
 }
 
@@ -798,7 +836,7 @@ func (m *SubprocessManager) TriggerHook(ctx context.Context, event string) {
 				continue
 			}
 			if _, _, err := inst.Client.HandleHook(ctx, h.Name, &pluginsdk.Event{}, nil); err != nil {
-				logger.Warn("Hook %s (%s) on plugin %s failed: %v", h.Name, h.Event, inst.ID, err)
+				logger.I18nWarn("钩子 %s (%s) 在插件 %s 上执行失败: %v", h.Name, h.Event, inst.ID, err)
 			}
 		}
 	}

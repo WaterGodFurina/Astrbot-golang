@@ -143,7 +143,7 @@ func (b *ShipyardNeoBooter) Start(ctx context.Context) error {
 				}
 			}
 			b.running = true
-			neoLogger.Info("Shipyard Neo sandbox ready: id=%s profile=%s capabilities=%v", id, profile, b.caps)
+			neoLogger.Debug("Shipyard Neo sandbox ready: id=%s profile=%s capabilities=%v", id, profile, b.caps)
 			return nil
 		}
 		if status == "failed" || status == "expired" {
@@ -171,7 +171,7 @@ func (b *ShipyardNeoBooter) resolveProfile(ctx context.Context, ep string) (stri
 	}
 	resp, err := b.get(ctx, ep, "/v1/profiles", map[string]string{"detail": "true"})
 	if err != nil {
-		neoLogger.Warn("failed to query Bay profiles, falling back to python-default: %v", err)
+		neoLogger.I18nWarn("查询 Bay 配置档失败，回退到 python-default: %v", err)
 		return "python-default", nil
 	}
 	items, _ := resp["items"].([]interface{})
@@ -216,7 +216,7 @@ func (b *ShipyardNeoBooter) Stop() error {
 	// Python does not delete the sandbox on normal shutdown; it stays until the
 	// Bay TTL cleans it up. Just drop the local reference.
 	b.running = false
-	neoLogger.Info("Shipyard Neo sandbox client shut down: id=%s", b.sandboxID)
+	neoLogger.Debug("Shipyard Neo sandbox client shut down: id=%s", b.sandboxID)
 	return nil
 }
 

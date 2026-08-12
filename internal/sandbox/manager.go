@@ -16,6 +16,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"io"
 	"os"
 	"os/exec"
@@ -23,9 +25,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
-	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 )
 
 var logger = log.GetDefault().WithComponent("Sandbox")
@@ -93,7 +92,7 @@ func (b *LocalBooter) Start(ctx context.Context) error {
 		return err
 	}
 	b.running = true
-	logger.Info("Local sandbox booter started (root=%s)", b.root)
+	logger.Debug("Local sandbox booter started (root=%s)", b.root)
 	return nil
 }
 
@@ -107,7 +106,7 @@ func (b *LocalBooter) Stop() error {
 	if b.cancel != nil {
 		b.cancel()
 	}
-	logger.Info("Local sandbox booter stopped")
+	logger.Debug("Local sandbox booter stopped")
 	return nil
 }
 
@@ -299,7 +298,7 @@ func (b *DockerBooter) Start(ctx context.Context) error {
 			if _, err := dockerOutput(ctx, "inspect", "-f", "{{.State.Running}}", line); err == nil {
 				b.containerID = line
 				b.running = true
-				logger.Info("Docker sandbox booter reusing container %s", line)
+				logger.Debug("Docker sandbox booter reusing container %s", line)
 				return nil
 			}
 		}
@@ -309,12 +308,12 @@ func (b *DockerBooter) Start(ctx context.Context) error {
 		"--label", "astrbot.sandbox=managed",
 		"--workdir", "/workspace", b.image, "tail", "-f", "/dev/null"}
 	if out, err := dockerOutput(ctx, args...); err != nil {
-		logger.Warn("docker run failed: %v (%s)", err, strings.TrimSpace(out))
+		logger.I18nWarn("docker run 失败: %v (%s)", err, strings.TrimSpace(out))
 		return fmt.Errorf("start docker sandbox: %w", err)
 	} else {
 		b.containerID = strings.TrimSpace(out)
 	}
-	logger.Info("Docker sandbox booter started (image=%s, container=%s)", b.image, b.containerID)
+	logger.Debug("Docker sandbox booter started (image=%s, container=%s)", b.image, b.containerID)
 	b.running = true
 	return nil
 }
@@ -329,7 +328,7 @@ func (b *DockerBooter) Stop() error {
 	defer cancel()
 	_, _ = dockerOutput(ctx, "rm", "-f", b.containerID)
 	b.running = false
-	logger.Info("Docker sandbox booter stopped (container=%s)", b.containerID)
+	logger.Debug("Docker sandbox booter stopped (container=%s)", b.containerID)
 	return nil
 }
 
@@ -543,7 +542,7 @@ func (m *Manager) SyncSkills(ctx context.Context) error {
 	if m.skillMgr != nil {
 		m.skillMgr.SetSandboxSkillsCache(entries)
 	}
-	logger.Info("Synced %d skills from sandbox", len(entries))
+	logger.Debug("Synced %d skills from sandbox", len(entries))
 	return nil
 }
 

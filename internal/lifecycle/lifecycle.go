@@ -24,6 +24,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/dashboard"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pipeline"
@@ -37,6 +38,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star/builtin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -44,27 +46,27 @@ var logger = log.GetDefault().WithComponent("Core")
 
 // Lifecycle orchestrates all AstrBot components.
 type Lifecycle struct {
-	mu               sync.Mutex
-	configMgr        *config.ConfigManager
-	database         *db.Database
-	providerMgr      *provider.ProviderManager
-	starMgr          *star.Manager
-	kbMgr            *knowledgebase.Manager
-	platformMgr      *platform.PlatformManager
-	cronMgr          *cron.CronJobManager
-	dashboard        *dashboard.Server
-	backupExporter   *backup.Exporter
-	subPluginMgr     *plugin.SubprocessManager
-	toolchain        *toolchain.Toolchain
-	skillMgr         *skills.SkillManager
-	sandboxMgr       *sandbox.Manager
-	sandboxSig       string // last booter-selection signature (avoids needless rebuilds)
-	eventBus         *core.EventBus
-	conversationMgr  *conversation.Manager
-	pipelineMapping  map[string]*core.PipelineScheduler
-	webuiDir         string
-	cancel           context.CancelFunc
-	startedAt        time.Time
+	mu              sync.Mutex
+	configMgr       *config.ConfigManager
+	database        *db.Database
+	providerMgr     *provider.ProviderManager
+	starMgr         *star.Manager
+	kbMgr           *knowledgebase.Manager
+	platformMgr     *platform.PlatformManager
+	cronMgr         *cron.CronJobManager
+	dashboard       *dashboard.Server
+	backupExporter  *backup.Exporter
+	subPluginMgr    *plugin.SubprocessManager
+	toolchain       *toolchain.Toolchain
+	skillMgr        *skills.SkillManager
+	sandboxMgr      *sandbox.Manager
+	sandboxSig      string // last booter-selection signature (avoids needless rebuilds)
+	eventBus        *core.EventBus
+	conversationMgr *conversation.Manager
+	pipelineMapping map[string]*core.PipelineScheduler
+	webuiDir        string
+	cancel          context.CancelFunc
+	startedAt       time.Time
 }
 
 // New creates a Lifecycle.
@@ -91,7 +93,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// 新实例与旧孤儿并存。
 	cleanupOrphanPlugins()
 
-	logger.Info("AstrBot Go - starting initialization")
+	logger.I18nInfo("AstrBot Go - 正在初始化")
 	l.startedAt = time.Now()
 
 	// 1. Open database
@@ -100,15 +102,40 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		return fmt.Errorf("open database: %w", err)
 	}
 	l.database = database
-	logger.Info("Database opened (pool: 5 conns, WAL mode)")
+	logger.I18nInfo("数据库已打开（连接池 5，WAL 模式）")
 
 	// 2. Load config
 	cfg := config.NewConfig("data/cmd_config.json", config.DefaultConfig())
 	if err := cfg.Load(); err != nil {
-		logger.Warn("Failed to load config, using defaults: %v", err)
+		logger.I18nWarn("加载配置失败，使用默认值: %v", err)
 	}
 	l.configMgr.Register("default", cfg)
-	logger.Info("Config loaded (integrity check passed)")
+	logger.I18nInfo("配置已加载（完整性校验通过）")
+
+	// 加载内置 i18n locale 并应用 config 指定的语言（默认 zh_CN）。
+	// 之后所有 i18n.Get(...) 的日志/指令文案按当前语言输出。
+	_ = i18n.LoadEmbeddedLocales()
+	if lang := cfg.GetString("language"); lang != "" {
+		i18n.SetLocale(lang)
+	} else {
+		i18n.SetLocale("zh_CN")
+	}
+
+	// 应用全局 HTTP 代理（http_proxy / no_proxy）：provider、平台、工具等所有
+	// 使用 `&http.Client{}`（Transport=nil 走 http.DefaultTransport）的请求
+	// 都会走配置的代理。
+	{
+		noProxy := []string{}
+		if np, ok := cfg.Get("no_proxy").([]interface{}); ok {
+			for _, s := range np {
+				noProxy = append(noProxy, fmt.Sprint(s))
+			}
+		}
+		utils.ConfigureGlobalProxy(cfg.GetString("http_proxy"), noProxy)
+		if cfg.GetString("http_proxy") != "" {
+			logger.Debug("Global HTTP proxy enabled: %s", cfg.GetString("http_proxy"))
+		}
+	}
 
 	// 插件方案：全面采用子进程插件运行时（go-plugin + gRPC），
 	// 已舍弃 legacy .so 方案（不再加载/桥接 .so 插件）。
@@ -118,7 +145,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	if os.Getenv("ASTRBOT_LOG_LEVEL") == "" {
 		if lvl := cfg.GetString("log_level"); lvl != "" {
 			log.GetDefault().SetLevel(log.ParseLevel(lvl))
-			logger.Info("Log level set from config: %s", lvl)
+			logger.I18nInfo("已按配置设置日志级别: %s", lvl)
 		}
 	}
 
@@ -134,23 +161,23 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			maxMB = 5
 		}
 		if err := log.GetDefault().EnableFileLog(path, int64(maxMB)<<20, 3); err != nil {
-			logger.Warn("启用分段日志文件失败: %v", err)
+			logger.I18nWarn("启用分段日志文件失败: %v", err)
 		} else {
-			logger.Info("分段日志已启用: %s (每段 %d MB)", path, maxMB)
+			logger.Debug("分段日志已启用: %s (每段 %d MB)", path, maxMB)
 		}
 	}
 
 	// 3. Initialize conversation manager
 	l.conversationMgr = conversation.NewManager(database)
-	logger.Info("Conversation manager initialized")
+	logger.I18nInfo("会话管理器已初始化")
 
 	// 4. Initialize knowledge base manager
 	l.kbMgr = knowledgebase.NewManager()
-	logger.Info("Knowledge base manager initialized")
+	logger.I18nInfo("知识库管理器已初始化")
 
 	// 5. Initialize star/plugin manager
 	l.starMgr = star.NewManager(database)
-	logger.Info("Plugin manager initialized")
+	logger.I18nInfo("插件管理器已初始化")
 
 	// 5.5. Register built-in commands
 	builtin.RegisterBuiltin(builtin.Deps{
@@ -161,20 +188,20 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 
 	// 6. Initialize event bus
 	l.eventBus = core.NewEventBus(1000)
-	logger.Info("Event bus initialized (buffer: 1000)")
+	logger.I18nInfo("事件总线已初始化（缓冲 1000）")
 
 	// 7. Initialize platform manager (must precede pipeline build so
 	// RespondStage gets a valid reference).
 	l.platformMgr = platform.NewPlatformManager()
-	logger.Info("Platform manager initialized")
+	logger.I18nInfo("平台管理器已初始化")
 
 	// 7.2. Initialize skill manager + sandbox manager (must precede pipeline
 	// build so ProcessStage can inject skills into the LLM system prompt).
 	l.skillMgr = skills.NewSkillManager("data/skills", "data/plugins", "data")
-	logger.Info("Skill manager initialized (%d skills)", len(l.skillMgr.ListSkills(false, "local")))
+	logger.I18nInfo("技能管理器已初始化（%d 个技能）", len(l.skillMgr.ListSkills(false, "local")))
 	l.sandboxMgr = sandbox.NewManager(l.skillMgr)
 	l.syncSandboxBooter()
-	logger.Info("Sandbox manager initialized")
+	logger.I18nInfo("沙盒管理器已初始化")
 
 	// 7.5. Build pipeline schedulers
 	for _, confID := range l.configMgr.IDs() {
@@ -182,7 +209,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			logger.Error("Failed to build pipeline for %s: %v", confID, err)
 		}
 	}
-	logger.Info("Pipeline schedulers built (%d configs)", len(l.pipelineMapping))
+	logger.I18nInfo("管线调度器已构建（%d 个配置）", len(l.pipelineMapping))
 
 	// 8. Cron manager
 	l.cronMgr = cron.NewCronJobManager(database)
@@ -220,20 +247,20 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.cronMgr.SetNextRunFn(cronNextRun)
 	l.cronMgr.Load()
 	go l.cronMgr.Start(ctx)
-	logger.Info("Cron job manager started")
+	logger.I18nInfo("计划任务管理器已启动")
 
 	// 10. Initialize backup exporter
 	l.backupExporter = backup.NewExporter("data")
-	logger.Info("Backup exporter initialized")
+	logger.I18nInfo("备份导出器已初始化")
 
 	// 9.5. Resolve the plugin build toolchain (bundled Go). This only locates
 	// an existing toolchain — no network download happens at startup; the
 	// compiler provisions it lazily on first plugin build.
 	l.toolchain = toolchain.New()
 	if bin, err := l.toolchain.GoBin(); err != nil {
-		logger.Warn("Go build toolchain not available (plugin compile disabled): %v", err)
+		logger.I18nWarn("Go 构建工具链不可用（插件编译已禁用）: %v", err)
 	} else {
-		logger.Info("Plugin build toolchain: %s (GOROOT=%s, GOPATH=%s)", bin, l.toolchain.GOROOT(), l.toolchain.GOPATH())
+		logger.I18nInfo("插件构建工具链: %s (GOROOT=%s, GOPATH=%s)", bin, l.toolchain.GOROOT(), l.toolchain.GOPATH())
 	}
 
 	// 9.6. Subprocess plugin runtime (go-plugin child processes). Loads
@@ -241,6 +268,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// star pipeline, and re-bridges after a crash-restart swaps an instance.
 	l.subPluginMgr = plugin.NewSubprocessManager(l.toolchain, "data")
 	l.subPluginMgr.OnInstancesChanged = func() { l.RebridgePlugins() }
+	l.subPluginMgr.SetGitHubProxy(cfg.GetString("github_proxy"))
+	l.subPluginMgr.SetGoConfig(cfg.GetString("goproxy"), cfg.GetString("goflags"))
 	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
 	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
 	// back into the host.
@@ -273,6 +302,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	if l.webuiDir != "" {
 		l.dashboard.SetWebUIDir(l.webuiDir)
 	}
+	// WebUI"重启"按钮：spawn 新实例 → 优雅停机 → 退出当前进程。
+	l.dashboard.SetRestartFunc(l.Restart)
 	l.dashboard.SetOnPlatformsChanged(func() {
 		go l.ReloadPlatforms(ctx)
 	})
@@ -320,7 +351,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// Trigger startup hooks
 	l.subPluginMgr.TriggerHook(ctx, "startup")
 
-	logger.Info("AstrBot Go started - API on :6185")
+	logger.I18nInfo("AstrBot Go 已启动 - API 端口 :6185")
 	return nil
 }
 
@@ -364,7 +395,7 @@ func (l *Lifecycle) syncSandboxBooter() {
 	booterType, _ := sandboxCfg["booter"].(string)
 	if runtime != "sandbox" {
 		l.sandboxMgr.SetBooter(nil)
-		logger.Info("Sandbox booter cleared (computer_use_runtime=%q)", runtime)
+		logger.I18nInfo("沙盒启动器已清除（computer_use_runtime=%q）", runtime)
 		return
 	}
 
@@ -379,14 +410,14 @@ func (l *Lifecycle) syncSandboxBooter() {
 			ttl = int(v)
 		}
 		l.sandboxMgr.SetBooter(sandbox.NewShipyardNeoBooter(ep, token, profile, ttl))
-		logger.Info("Sandbox booter set (shipyard_neo endpoint=%q profile=%q ttl=%d)", ep, profile, ttl)
+		logger.I18nInfo("沙盒启动器已设置（shipyard_neo endpoint=%q profile=%q ttl=%d）", ep, profile, ttl)
 	case "boxlite":
 		// Boxlite = Docker-backed containers.
 		l.setDockerOrLocalBooter(sandboxCfg)
 	default:
 		// shipyard (legacy), cua, and unknown types are not implemented in Go;
 		// fall back to a docker/local backend.
-		logger.Warn("Sandbox booter type %q not implemented in Go; falling back to docker/local", booterType)
+		logger.I18nWarn("沙盒启动器类型 %q 未在 Go 实现；回退到 docker/local", booterType)
 		l.setDockerOrLocalBooter(sandboxCfg)
 	}
 }
@@ -400,11 +431,11 @@ func (l *Lifecycle) setDockerOrLocalBooter(sandboxCfg map[string]interface{}) {
 	}
 	if dockerAvailable() {
 		l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
-		logger.Info("Sandbox booter set (docker, image=%s)", image)
+		logger.I18nInfo("沙盒启动器已设置（docker, image=%s）", image)
 		return
 	}
 	l.sandboxMgr.SetBooter(sandbox.NewLocalBooter())
-	logger.Info("Sandbox booter set (local, docker unavailable)")
+	logger.I18nInfo("沙盒启动器已设置（local，docker 不可用）")
 }
 
 // floatValue converts a JSON numeric (float64/int) to float64, returning 0 on
@@ -494,7 +525,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 
 	l.pipelineMapping[confID] = scheduler
 	l.eventBus.RegisterScheduler(confID, scheduler)
-	logger.Info("Pipeline scheduler built for %s (9 stages)", confID)
+	logger.I18nInfo("已为 %s 构建管线调度器（9 个阶段）", confID)
 	return nil
 }
 
@@ -527,12 +558,37 @@ func (l *Lifecycle) Stop() {
 	if l.database != nil {
 		_ = l.database.Close()
 	}
-	logger.Info("AstrBot Go stopped")
+	logger.I18nInfo("AstrBot Go 已停止")
 }
 
 // Uptime returns time since start.
 func (l *Lifecycle) Uptime() time.Duration {
 	return time.Since(l.startedAt)
+}
+
+// Restart 实现 WebUI"重启"：spawn 当前可执行文件的新实例（独立会话、继承
+// stdout/stderr 到原日志文件），随后优雅停机（Stop 会 kill 插件、关闭 DB）
+// 并退出当前进程。新实例启动时 cleanupOrphanPlugins 会清理本进程遗留的
+// 孤儿插件子进程。在 dashboard handler 的 goroutine 中调用（不持有 l.mu）。
+func (l *Lifecycle) Restart() {
+	exe, err := os.Executable()
+	if err != nil {
+		logger.Error("Restart: resolve executable: %v", err)
+		return
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Stdin = nil
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		logger.Error("Restart: spawn new instance failed: %v", err)
+		return
+	}
+	logger.I18nInfo("重启：已启动新实例（pid %d），正在关闭当前进程", cmd.Process.Pid)
+	l.Stop()
+	os.Exit(0)
 }
 
 // ReloadPlatforms stops all platform adapters and re-instantiates them from config.
@@ -541,7 +597,7 @@ func (l *Lifecycle) ReloadPlatforms(ctx context.Context) {
 	if l.platformMgr == nil {
 		return
 	}
-	logger.Info("Reloading platform adapters...")
+	logger.I18nInfo("正在重载平台适配器...")
 	l.platformMgr.StopAll()
 	l.platformMgr.Clear()
 	if err := l.loadPlatforms(ctx); err != nil {
@@ -734,6 +790,14 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 		if ptype == "" {
 			continue
 		}
+		// Skip disabled platforms (config `enable: false`). Without this, a
+		// disabled bot is still instantiated and its adapter keeps retrying
+		// (e.g. QQ official access_token errors) even though the user turned
+		// it off.
+		if enabled, ok := config["enable"].(bool); ok && !enabled {
+			logger.I18nInfo("平台 %s (%s) 在配置中已禁用，跳过", config["id"], ptype)
+			continue
+		}
 		adapter, err := platform.CreatePlatform(ptype, config, settings)
 		if err != nil {
 			logger.Error("Failed to create platform %s: %v", ptype, err)
@@ -747,7 +811,7 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 			logger.Error("Failed to start platform %s: %v", ptype, err)
 			continue
 		}
-		logger.Info("Platform %s (%s) started", adapter.ID(), adapter.Type())
+		logger.I18nInfo("平台 %s (%s) 已启动", adapter.ID(), adapter.Type())
 	}
 	return nil
 }
@@ -820,7 +884,7 @@ func cleanupOrphanPlugins() {
 	if len(orphans) == 0 {
 		return
 	}
-	logger.Warn("Found %d orphan plugin process(es) from a previous unclean shutdown, cleaning up...", len(orphans))
+	logger.I18nWarn("发现 %d 个上次异常退出遗留的孤儿插件进程，正在清理...", len(orphans))
 	for _, pid := range orphans {
 		_ = syscall.Kill(pid, syscall.SIGTERM)
 	}
@@ -828,5 +892,5 @@ func cleanupOrphanPlugins() {
 	for _, pid := range orphans {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
-	logger.Info("Cleaned up %d orphan plugin process(es)", len(orphans))
+	logger.I18nInfo("已清理 %d 个孤儿插件进程", len(orphans))
 }

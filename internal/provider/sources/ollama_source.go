@@ -51,6 +51,8 @@ func (s *OllamaSource) TextChat(ctx context.Context, req *provider.ProviderReque
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	msgs, _ := body["messages"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -74,6 +76,7 @@ func (s *OllamaSource) TextChat(ctx context.Context, req *provider.ProviderReque
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
+	logger.Debug("LLM response: text_len=%d", len(result.Message.Content))
 	return &provider.LLMResponse{
 		Role:           result.Message.Role,
 		CompletionText: result.Message.Content,
@@ -97,6 +100,8 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	msgs, _ := body["messages"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	resp, err := s.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -147,7 +152,11 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 				}
 			}
 		}
+		if usage != nil {
+			logger.Debug("LLM stream done, usage=%v", usage)
+		}
 	}()
+	logger.Debug("LLM stream started: model=%s", s.GetModel())
 	return ch, nil
 }
 

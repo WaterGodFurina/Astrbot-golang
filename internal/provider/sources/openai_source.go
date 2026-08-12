@@ -171,6 +171,7 @@ func (s *OpenAISource) TextChat(ctx context.Context, req *provider.ProviderReque
 		llmResp.ToolsCallArgs = append(llmResp.ToolsCallArgs, argsMap)
 		llmResp.ToolsCallIDs = append(llmResp.ToolsCallIDs, tc.ID)
 	}
+	logger.Debug("LLM response: text_len=%d", len(llmResp.CompletionText))
 	return llmResp, nil
 }
 
@@ -277,8 +278,12 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 				final.ToolsCallArgs = append(final.ToolsCallArgs, argsMap)
 			}
 		}
+		if usage != nil {
+			logger.Debug("LLM stream done, usage=%v", usage)
+		}
 		ch <- final
 	}()
+	logger.Debug("LLM stream started: model=%s", s.GetModel())
 	return ch, nil
 }
 
@@ -344,6 +349,8 @@ func (s *OpenAISource) doRequest(ctx context.Context, body map[string]interface{
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
 	url := fmt.Sprintf("%s/chat/completions", s.apiBase)
+	msgs, _ := body["messages"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, err

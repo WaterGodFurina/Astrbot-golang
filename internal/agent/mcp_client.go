@@ -18,7 +18,11 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
+
+var mcpLogger = log.GetDefault().WithComponent("MCP")
 
 // MCPClient represents a connection to an MCP server.
 type MCPClient struct {
@@ -101,16 +105,23 @@ func (c *MCPClient) Connect(ctx context.Context) error {
 	c.cl = cl
 
 	if err := cl.Start(ctx); err != nil {
+		mcpLogger.Error("MCP server %s start failed: %v", c.name, err)
 		return fmt.Errorf("MCP start failed: %w", err)
 	}
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{Name: "astrbot-go", Version: "1.0.0"}
 	if _, err := cl.Initialize(ctx, initReq); err != nil {
+		mcpLogger.Error("MCP server %s initialize failed: %v", c.name, err)
 		return fmt.Errorf("MCP initialize failed: %w", err)
 	}
 
-	return c.listTools(ctx)
+	if err := c.listTools(ctx); err != nil {
+		mcpLogger.Error("MCP server %s list tools failed: %v", c.name, err)
+		return err
+	}
+	mcpLogger.Debug("MCP server %s connected: %d tools", c.name, len(c.tools))
+	return nil
 }
 
 // isStdio reports whether the configured transport is stdio.
@@ -170,6 +181,7 @@ func (c *MCPClient) CallTool(ctx context.Context, toolName string, args map[stri
 	req := mcp.CallToolRequest{}
 	req.Params.Name = toolName
 	req.Params.Arguments = args
+	mcpLogger.Debug("MCP tool call: server=%s tool=%s", c.name, toolName)
 	resp, err := cl.CallTool(ctx, req)
 	if err != nil {
 		return nil, err

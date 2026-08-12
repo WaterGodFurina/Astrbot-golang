@@ -20,12 +20,12 @@ func BuildTestPlugin() string {
 		return testPluginBinCache
 	}
 	if _, err := exec.LookPath("go"); err != nil {
-		logger.Warn("BuildTestPlugin: go not on PATH")
+		logger.I18nWarn("BuildTestPlugin: PATH 中未找到 go")
 		return ""
 	}
 	sdkDir, err := findSDKDir()
 	if err != nil {
-		logger.Warn("BuildTestPlugin: %v", err)
+		logger.I18nWarn("BuildTestPlugin: %v", err)
 		return ""
 	}
 
@@ -40,17 +40,17 @@ func BuildTestPlugin() string {
 		}
 	}
 	if src == nil {
-		logger.Warn("BuildTestPlugin: read test plugin source failed")
+		logger.I18nWarn("BuildTestPlugin: 读取测试插件源码失败")
 		return ""
 	}
 	tmp, err := os.MkdirTemp("", "astrbot-test-plugin-src-*")
 	if err != nil {
-		logger.Warn("BuildTestPlugin: %v", err)
+		logger.I18nWarn("BuildTestPlugin: %v", err)
 		return ""
 	}
 	defer os.RemoveAll(tmp)
 	if err := os.WriteFile(filepath.Join(tmp, "main.go"), src, 0o644); err != nil {
-		logger.Warn("BuildTestPlugin: %v", err)
+		logger.I18nWarn("BuildTestPlugin: %v", err)
 		return ""
 	}
 	goMod := fmt.Sprintf(`module example.com/astrbot-test-plugin
@@ -62,7 +62,7 @@ require github.com/WaterGodFurina/Astrbot-go-plugin-sdk v0.0.0
 replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => %s
 `, sdkDir)
 	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte(goMod), 0o644); err != nil {
-		logger.Warn("BuildTestPlugin: %v", err)
+		logger.I18nWarn("BuildTestPlugin: %v", err)
 		return ""
 	}
 
@@ -74,7 +74,7 @@ replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => %s
 		"GOPROXY=https://goproxy.cn,direct",
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		logger.Warn("BuildTestPlugin: go build: %v\n%s", err, out)
+		logger.I18nWarn("BuildTestPlugin: go build: %v\n%s", err, out)
 		return ""
 	}
 	testPluginBinCache = bin

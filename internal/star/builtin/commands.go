@@ -10,6 +10,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
@@ -72,18 +73,18 @@ func RegisterBuiltin(deps Deps) {
 		deps.StarMgr.Handlers().Append(handler)
 	}
 
-	reg("help", star.PermissionEveryone, "显示帮助", func(e *core.Event) { helpCmd(deps, e) })
-	reg("sid", star.PermissionEveryone, "获取会话 ID 信息", func(e *core.Event) { sidCmd(e) })
-	reg("name", star.PermissionAdmin, "设置当前 UMO 的显示名称", func(e *core.Event) { nameCmd(deps, e) })
-	reg("reset", star.PermissionEveryone, "重置当前会话的 LLM 上下文", func(e *core.Event) { resetCmd(deps, e) })
-	reg("new", star.PermissionEveryone, "创建新对话", func(e *core.Event) { newCmd(deps, e) })
-	reg("stop", star.PermissionEveryone, "停止当前会话正在运行的任务", func(e *core.Event) { stopCmd(e) })
-	reg("stats", star.PermissionEveryone, "查看当前对话 Token 用量统计", func(e *core.Event) { statsCmd(e) })
-	reg("provider", star.PermissionAdmin, "查看或切换 LLM Provider", func(e *core.Event) { providerCmd(deps, e) })
-	reg("set", star.PermissionEveryone, "设置会话变量", func(e *core.Event) { setCmd(e) })
-	reg("unset", star.PermissionEveryone, "移除会话变量", func(e *core.Event) { unsetCmd(e) })
-	reg("dashboard_update", star.PermissionAdmin, "更新 AstrBot WebUI", func(e *core.Event) {
-		reply(e, "❌ Go 版暂不支持在线更新 WebUI。")
+	reg("help", star.PermissionEveryone, i18n.Get("显示帮助"), func(e *core.Event) { helpCmd(deps, e) })
+	reg("sid", star.PermissionEveryone, i18n.Get("获取会话 ID 信息"), func(e *core.Event) { sidCmd(e) })
+	reg("name", star.PermissionAdmin, i18n.Get("设置当前 UMO 的显示名称"), func(e *core.Event) { nameCmd(deps, e) })
+	reg("reset", star.PermissionEveryone, i18n.Get("重置当前会话的 LLM 上下文"), func(e *core.Event) { resetCmd(deps, e) })
+	reg("new", star.PermissionEveryone, i18n.Get("创建新对话"), func(e *core.Event) { newCmd(deps, e) })
+	reg("stop", star.PermissionEveryone, i18n.Get("停止当前会话正在运行的任务"), func(e *core.Event) { stopCmd(e) })
+	reg("stats", star.PermissionEveryone, i18n.Get("查看当前对话 Token 用量统计"), func(e *core.Event) { statsCmd(e) })
+	reg("provider", star.PermissionAdmin, i18n.Get("查看或切换 LLM Provider"), func(e *core.Event) { providerCmd(deps, e) })
+	reg("set", star.PermissionEveryone, i18n.Get("设置会话变量"), func(e *core.Event) { setCmd(e) })
+	reg("unset", star.PermissionEveryone, i18n.Get("移除会话变量"), func(e *core.Event) { unsetCmd(e) })
+	reg("dashboard_update", star.PermissionAdmin, i18n.Get("更新 AstrBot WebUI"), func(e *core.Event) {
+		reply(e, i18n.Get("❌ Go 版暂不支持在线更新 WebUI。"))
 	})
 
 	logger.Info("Built-in commands registered (help, sid, name, reset, new, stop, stats, provider, set, unset)")
@@ -109,17 +110,17 @@ func reply(e *core.Event, text string) {
 
 func helpCmd(deps Deps, e *core.Event) {
 	lines := []string{
-		fmt.Sprintf("AstrBot v%s(WebUI: 0.1.0-go)", version),
-		"/help - 显示帮助",
-		"/sid - 获取会话 ID 信息",
-		"/reset - 重置 LLM 会话",
-		"/stop - 停止当前会话正在运行的任务",
-		"/new - 创建新对话",
-		"/stats - 查看当前对话 Token 用量",
-		"/provider [idx] - 查看或切换 LLM Provider",
-		"/name <name> - 设置当前 UMO 的显示名称",
-		"/set <key> <value> - 设置会话变量",
-		"/unset <key> - 移除会话变量",
+		i18n.Get("AstrBot v%s(WebUI: 0.1.0-go)", version),
+		i18n.Get("/help - 显示帮助"),
+		i18n.Get("/sid - 获取会话 ID 信息"),
+		i18n.Get("/reset - 重置 LLM 会话"),
+		i18n.Get("/stop - 停止当前会话正在运行的任务"),
+		i18n.Get("/new - 创建新对话"),
+		i18n.Get("/stats - 查看当前对话 Token 用量"),
+		i18n.Get("/provider [idx] - 查看或切换 LLM Provider"),
+		i18n.Get("/name <name> - 设置当前 UMO 的显示名称"),
+		i18n.Get("/set <key> <value> - 设置会话变量"),
+		i18n.Get("/unset <key> - 移除会话变量"),
 	}
 	reply(e, strings.Join(lines, "\n"))
 }
@@ -155,22 +156,22 @@ func nameCmd(deps Deps, e *core.Event) {
 		cur := state.umoAliases[umo]
 		if manualNeeded {
 			if cur == "" {
-				reply(e, fmt.Sprintf(
+				reply(e, i18n.Get(
 					"当前平台「%s」无法自动获取昵称（QQ 官方私聊消息不携带用户名）。\n请使用 /name <你的名字> 设置，之后 LLM 才能识别你。\nUMO: %s",
 					e.Source.Platform, umo,
 				))
 			} else {
-				reply(e, fmt.Sprintf("当前昵称: %s\nUMO: %s", cur, umo))
+				reply(e, i18n.Get("当前昵称: %s\nUMO: %s", cur, umo))
 			}
 			return
 		}
 		if autoName != "" {
-			reply(e, fmt.Sprintf(
+			reply(e, i18n.Get(
 				"当前平台「%s」会自动获取昵称：\n昵称: %s\nUMO: %s\n（无需手动设置；如需自定义可用 /name <名字> 覆盖）",
 				e.Source.Platform, autoName, umo,
 			))
 		} else {
-			reply(e, "Usage: /name <name>\nUMO: "+umo+"\nAlias: "+cur)
+			reply(e, i18n.Get("Usage: /name <name>\nUMO: %s\nAlias: %s", umo, cur))
 		}
 		return
 	}
@@ -179,7 +180,7 @@ func nameCmd(deps Deps, e *core.Event) {
 	state.umoAliases[umo] = alias
 	state.mu.Unlock()
 	persistUmoAlias(deps, umo, alias)
-	reply(e, fmt.Sprintf("UMO name set to: %s\nUMO: %s", alias, umo))
+	reply(e, i18n.Get("UMO name set to: %s\nUMO: %s", alias, umo))
 }
 
 // platformNeedsManualName reports whether the platform's messages carry a
@@ -220,23 +221,23 @@ func resetCmd(deps Deps, e *core.Event) {
 	umo := e.UnifiedMsgOrigin()
 	// Admin requirement for group reset (mirrors Python's RstScene default)
 	if e.Source.IsGroup && e.Role != "admin" {
-		reply(e, fmt.Sprintf(
+		reply(e, i18n.Get(
 			"Reset command requires admin permission in group scenario, you (ID %s) are not admin, cannot perform this action.",
 			e.Source.SenderID,
 		))
 		return
 	}
 	if deps.ConversationMgr == nil {
-		reply(e, "😕 会话管理器不可用。")
+		reply(e, i18n.Get("😕 会话管理器不可用。"))
 		return
 	}
 	cid := deps.ConversationMgr.GetCurrConversationID(umo)
 	if cid == "" {
-		reply(e, "😕 You are not in a conversation. Use /new to create one.")
+		reply(e, i18n.Get("😕 You are not in a conversation. Use /new to create one."))
 		return
 	}
 	deps.ConversationMgr.ClearHistory(umo)
-	reply(e, "✅ Conversation reset successfully.")
+	reply(e, i18n.Get("✅ Conversation reset successfully."))
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +247,7 @@ func resetCmd(deps Deps, e *core.Event) {
 func newCmd(deps Deps, e *core.Event) {
 	umo := e.UnifiedMsgOrigin()
 	if deps.ConversationMgr == nil {
-		reply(e, "😕 会话管理器不可用。")
+		reply(e, i18n.Get("😕 会话管理器不可用。"))
 		return
 	}
 	conv := deps.ConversationMgr.NewConversation(umo, e.Source.Platform)
@@ -254,7 +255,7 @@ func newCmd(deps Deps, e *core.Event) {
 	if len(cid) > 4 {
 		cid = cid[:4]
 	}
-	reply(e, fmt.Sprintf("✅ Switched to new conversation: %s。", cid))
+	reply(e, i18n.Get("✅ Switched to new conversation: %s。", cid))
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +264,7 @@ func newCmd(deps Deps, e *core.Event) {
 
 func stopCmd(e *core.Event) {
 	// Go pipeline has no long-running agent registry yet; report idle.
-	reply(e, "✅ No running tasks in the current session.")
+	reply(e, i18n.Get("✅ No running tasks in the current session."))
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +272,7 @@ func stopCmd(e *core.Event) {
 // ---------------------------------------------------------------------------
 
 func statsCmd(e *core.Event) {
-	reply(e, "📊 No stats available for this conversation yet.")
+	reply(e, i18n.Get("📊 No stats available for this conversation yet."))
 }
 
 // ---------------------------------------------------------------------------
@@ -284,27 +285,27 @@ func providerCmd(deps Deps, e *core.Event) {
 
 	providers := listProviders(deps)
 	if len(al) == 0 {
-		lines := []string{"## LLM Providers\n"}
+		lines := []string{i18n.Get("## LLM Providers\n")}
 		for i, p := range providers {
-			line := fmt.Sprintf("%d. %s (%s)", i+1, p.ID, p.Model)
+			line := i18n.Get("%d. %s (%s)", i+1, p.ID, p.Model)
 			if state.selectedLLM[umo] == p.ID {
-				line += " 👈"
+				line += i18n.Get(" 👈")
 			}
 			lines = append(lines, line)
 		}
-		lines = append(lines, "\nUse /provider <idx> to switch LLM providers.")
+		lines = append(lines, i18n.Get("\nUse /provider <idx> to switch LLM providers."))
 		reply(e, strings.Join(lines, "\n"))
 		return
 	}
 
 	if al[0] == "tts" || al[0] == "stt" {
-		reply(e, "❌ Go 版暂不支持 TTS/STT Provider 切换。")
+		reply(e, i18n.Get("❌ Go 版暂不支持 TTS/STT Provider 切换。"))
 		return
 	}
 	idx := 0
 	fmt.Sscanf(al[0], "%d", &idx)
 	if idx < 1 || idx > len(providers) {
-		reply(e, "❌ Invalid provider index.")
+		reply(e, i18n.Get("❌ Invalid provider index."))
 		return
 	}
 	p := providers[idx-1]
@@ -312,7 +313,7 @@ func providerCmd(deps Deps, e *core.Event) {
 	state.selectedLLM[umo] = p.ID
 	state.mu.Unlock()
 	persistSelectedProvider(deps, umo, p.ID)
-	reply(e, fmt.Sprintf("✅ Successfully switched to %s.", p.ID))
+	reply(e, i18n.Get("✅ Successfully switched to %s.", p.ID))
 }
 
 type providerInfo struct {
@@ -374,7 +375,7 @@ func setCmd(e *core.Event) {
 	umo := e.UnifiedMsgOrigin()
 	al := args(e)
 	if len(al) < 2 {
-		reply(e, "格式: /set 变量名 值")
+		reply(e, i18n.Get("格式: /set 变量名 值"))
 		return
 	}
 	state.mu.Lock()
@@ -383,25 +384,25 @@ func setCmd(e *core.Event) {
 	}
 	state.sessionVars[umo][al[0]] = strings.Join(al[1:], " ")
 	state.mu.Unlock()
-	reply(e, fmt.Sprintf("会话 %s 变量 %s 存储成功。使用 /unset 移除。", umo, al[0]))
+	reply(e, i18n.Get("会话 %s 变量 %s 存储成功。使用 /unset 移除。", umo, al[0]))
 }
 
 func unsetCmd(e *core.Event) {
 	umo := e.UnifiedMsgOrigin()
 	al := args(e)
 	if len(al) == 0 {
-		reply(e, "没有那个变量名。格式 /unset 变量名。")
+		reply(e, i18n.Get("没有那个变量名。格式 /unset 变量名。"))
 		return
 	}
 	state.mu.Lock()
 	if vars, ok := state.sessionVars[umo]; ok {
 		if _, exists := vars[al[0]]; !exists {
 			state.mu.Unlock()
-			reply(e, "没有那个变量名。格式 /unset 变量名。")
+			reply(e, i18n.Get("没有那个变量名。格式 /unset 变量名。"))
 			return
 		}
 		delete(vars, al[0])
 	}
 	state.mu.Unlock()
-	reply(e, fmt.Sprintf("会话 %s 变量 %s 移除成功。", umo, al[0]))
+	reply(e, i18n.Get("会话 %s 变量 %s 移除成功。", umo, al[0]))
 }

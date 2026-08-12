@@ -935,12 +935,12 @@ func scanKBRow(rows *sql.Rows) (*KBRow, error) {
 
 // KBChunk is a persisted knowledge-base chunk record.
 type KBChunk struct {
-	ChunkID   string
-	KBID      string
-	DocID     string
-	DocName   string
-	Content   string
-	ChunkIdx  int
+	ChunkID  string
+	KBID     string
+	DocID    string
+	DocName  string
+	Content  string
+	ChunkIdx int
 }
 
 // InsertKBChunk persists one chunk record.

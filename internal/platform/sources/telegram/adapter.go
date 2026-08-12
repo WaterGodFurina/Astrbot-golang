@@ -58,7 +58,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 		}
 	}
 
-	logger.Info("Telegram bot connected, self_id=%s", a.SelfID)
+	logger.I18nInfo("Telegram 机器人已连接, self_id=%s", a.SelfID)
 
 	go a.pollLoop(ctx)
 

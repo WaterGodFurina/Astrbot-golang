@@ -3,12 +3,17 @@
 package i18n
 
 import (
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
 )
+
+//go:embed locales/*.json
+var localeFS embed.FS
 
 // Translator manages translations for multiple locales.
 type Translator struct {
@@ -33,6 +38,29 @@ func (t *Translator) LoadLocale(locale, path string) error {
 	if err != nil {
 		return err
 	}
+	return t.LoadLocaleData(locale, data)
+}
+
+// LoadLocaleFromDir loads all locale JSON files from a directory.
+func (t *Translator) LoadLocaleFromDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		locale := entry.Name()[:len(entry.Name())-5]
+		if err := t.LoadLocale(locale, filepath.Join(dir, entry.Name())); err != nil {
+			return fmt.Errorf("load locale %s: %w", locale, err)
+		}
+	}
+	return nil
+}
+
+// LoadLocaleData loads translations for a locale from raw JSON bytes.
+func (t *Translator) LoadLocaleData(locale string, data []byte) error {
 	var translations map[string]string
 	if err := json.Unmarshal(data, &translations); err != nil {
 		return err
@@ -48,9 +76,9 @@ func (t *Translator) LoadLocale(locale, path string) error {
 	return nil
 }
 
-// LoadLocaleFromDir loads all locale JSON files from a directory.
-func (t *Translator) LoadLocaleFromDir(dir string) error {
-	entries, err := os.ReadDir(dir)
+// LoadEmbeddedLocales loads all embedded locale JSON files (locales/*.json).
+func (t *Translator) LoadEmbeddedLocales() error {
+	entries, err := fs.ReadDir(localeFS, "locales")
 	if err != nil {
 		return err
 	}
@@ -59,7 +87,11 @@ func (t *Translator) LoadLocaleFromDir(dir string) error {
 			continue
 		}
 		locale := entry.Name()[:len(entry.Name())-5]
-		if err := t.LoadLocale(locale, filepath.Join(dir, entry.Name())); err != nil {
+		data, err := localeFS.ReadFile("locales/" + entry.Name())
+		if err != nil {
+			return err
+		}
+		if err := t.LoadLocaleData(locale, data); err != nil {
 			return fmt.Errorf("load locale %s: %w", locale, err)
 		}
 	}
@@ -95,6 +127,10 @@ func (t *Translator) Get(key string, args ...interface{}) string {
 			}
 		}
 	}
+	// 未找到翻译：key 即中文原文（zh 场景直接输出），有参数则格式化
+	if len(args) > 0 {
+		return fmt.Sprintf(key, args...)
+	}
 	return key
 }
 
@@ -119,4 +155,8 @@ func Get(key string, args ...interface{}) string {
 
 func SetLocale(locale string) {
 	defaultTranslator.SetLocale(locale)
+}
+
+func LoadEmbeddedLocales() error {
+	return defaultTranslator.LoadEmbeddedLocales()
 }

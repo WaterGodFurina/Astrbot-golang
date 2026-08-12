@@ -97,7 +97,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 	}
 
 	go func() {
-		logger.Info("aiocqhttp(OneBot v11) adapter listening on %s:%d", a.Host, a.Port)
+		logger.I18nInfo("aiocqhttp(OneBot v11) 适配器正在监听 %s:%d", a.Host, a.Port)
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("aiocqhttp server error: %v", err)
 		}
@@ -201,7 +201,7 @@ func (a *Adapter) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // 事件、窃听 send_msg 回复。
 func (a *Adapter) authValid(r *http.Request) bool {
 	if a.Token == "" {
-		logger.Warn("aiocqhttp: 未配置 ws_reverse_token，拒绝事件入口请求（%s %s）。请在平台配置中设置访问令牌", r.Method, r.URL.Path)
+		logger.I18nWarn("aiocqhttp: 未配置 ws_reverse_token，拒绝事件入口请求（%s %s）。请在平台配置中设置访问令牌", r.Method, r.URL.Path)
 		return false
 	}
 	auth := r.Header.Get("Authorization")
@@ -223,12 +223,12 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.addConn(conn)
-	logger.Info("Reverse WebSocket client connected (%s)", conn.RemoteAddr())
+	logger.I18nInfo("反向 WebSocket 客户端已连接 (%s)", conn.RemoteAddr())
 
 	defer func() {
 		a.removeConn(conn)
 		conn.Close()
-		logger.Info("Reverse WebSocket client disconnected")
+		logger.I18nInfo("反向 WebSocket 客户端已断开")
 	}()
 
 	// Heartbeat: respond to ping, and respect the peer's close/ping timeouts.
@@ -242,7 +242,7 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				logger.Warn("WebSocket read error: %v", err)
+				logger.I18nWarn("WebSocket 读取错误: %v", err)
 			}
 			return
 		}
@@ -253,7 +253,7 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		// (echo) to our send_msg calls.
 		var msg map[string]interface{}
 		if err := json.Unmarshal(data, &msg); err != nil {
-			logger.Warn("WebSocket message not JSON: %v", err)
+			logger.I18nWarn("WebSocket 消息不是 JSON: %v", err)
 			continue
 		}
 		if _, hasPost := msg["post_type"]; hasPost {
@@ -382,6 +382,11 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 	postType, _ := raw["post_type"].(string)
 	if postType == "" {
 		postType = "message"
+	}
+	if messageType, ok := raw["message_type"].(string); ok {
+		logger.Debug("aiocqhttp event: post_type=%s message_type=%s", postType, messageType)
+	} else {
+		logger.Debug("aiocqhttp event: post_type=%s", postType)
 	}
 
 	// Track the bot's own ID from the event's self field so @-mentions of the
@@ -530,11 +535,11 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 	event := &core.Event{
 		Type: core.EventNotice,
 		Source: core.EventSource{
-			Platform:   "aiocqhttp",
-			SelfID:     a.SelfID,
-			SenderID:   senderID,
-			ConvID:     convID,
-			IsGroup:    isGroup,
+			Platform: "aiocqhttp",
+			SelfID:   a.SelfID,
+			SenderID: senderID,
+			ConvID:   convID,
+			IsGroup:  isGroup,
 		},
 		MessageStr: "",
 		RawMessage: rawJSON(raw),

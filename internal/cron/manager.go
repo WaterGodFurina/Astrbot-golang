@@ -116,7 +116,7 @@ func (m *CronJobManager) Add(job *Job) {
 	m.computeNextRunLocked(job, time.Now())
 	m.mu.Unlock()
 	m.persist(job)
-	logger.Info("Scheduled job %s (%s) type=%s next=%v", job.ID, job.Name, job.JobType, job.NextRun)
+	logger.Debug("Scheduled job %s (%s) type=%s next=%v", job.ID, job.Name, job.JobType, job.NextRun)
 }
 
 // SetEnabled enables or disables a job (persisted). Disabled jobs remain in
@@ -138,7 +138,7 @@ func (m *CronJobManager) SetEnabled(id string, enabled bool) bool {
 			logger.Error("Failed to persist cron job %s enabled=%v: %v", id, enabled, err)
 		}
 	}
-	logger.Info("Cron job %s enabled=%v", id, enabled)
+	logger.Debug("Cron job %s enabled=%v", id, enabled)
 	return true
 }
 
@@ -258,7 +258,7 @@ func (m *CronJobManager) Stop() {
 	select {
 	case <-done:
 	case <-time.After(cronStopTimeout):
-		logger.Warn("Cron jobs did not finish within %v during shutdown", cronStopTimeout)
+		logger.I18nWarn("关闭时定时任务在 %v 内未完成", cronStopTimeout)
 	}
 }
 
@@ -277,7 +277,7 @@ func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 		}
 		// 上次触发尚未执行完（长任务/超时），跳过本次，避免同 job 重叠执行。
 		if job.running {
-			logger.Warn("Cron job %s still running, skipping this tick", job.ID)
+			logger.Debug("Cron job %s still running, skipping this tick", job.ID)
 			continue
 		}
 		due = append(due, job)
@@ -341,7 +341,7 @@ func (m *CronJobManager) Load() {
 	}
 	rows, err := m.db.ListCronJobs()
 	if err != nil {
-		logger.Warn("Failed to load cron jobs: %v", err)
+		logger.I18nWarn("加载定时任务失败: %v", err)
 		return
 	}
 	m.mu.Lock()
@@ -367,7 +367,7 @@ func (m *CronJobManager) Load() {
 		m.armJobLocked(job)
 		m.computeNextRunLocked(job, time.Now())
 	}
-	logger.Info("Loaded %d cron job(s) from database", len(m.jobs))
+	logger.Debug("Loaded %d cron job(s) from database", len(m.jobs))
 }
 
 func (m *CronJobManager) persist(job *Job) {

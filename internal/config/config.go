@@ -13,13 +13,12 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
-
-	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
 var logger = log.GetDefault().WithComponent("Config")
@@ -162,7 +161,7 @@ func New(configPath string, defaults map[string]interface{}, schema map[string]i
 		if err := cfg.save(4); err != nil {
 			return nil, fmt.Errorf("create default config: %w", err)
 		}
-		logger.Info("Config file not found, created with defaults: %s", configPath)
+		logger.I18nInfo("未找到配置文件，已使用默认配置创建: %s", configPath)
 	}
 
 	raw, err := os.ReadFile(configPath)
@@ -358,7 +357,7 @@ func checkConfigIntegrity(refer, conf map[string]interface{}, path string) bool 
 		userVal, exists := conf[key]
 
 		if !exists {
-			logger.Info("Config key missing; added default: %s", fullPath)
+			logger.Debug("Config key missing; added default: %s", fullPath)
 			newConf[key] = refVal
 			hasNew = true
 			continue
@@ -408,7 +407,7 @@ func checkConfigIntegrity(refer, conf map[string]interface{}, path string) bool 
 			}
 		} else if refIsMap && !userIsMap {
 			// Type mismatch: user has non-map but reference expects map
-			logger.Warn("Config type mismatch at %s, using default", fullPath)
+			logger.I18nWarn("配置类型在 %s 处不匹配，使用默认值", fullPath)
 			newConf[key] = refVal
 			hasNew = true
 		} else {

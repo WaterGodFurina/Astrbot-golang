@@ -44,20 +44,20 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			desc = inst.Meta.Description
 		}
 		info := map[string]interface{}{
-			"name":           inst.Name,
-			"marketplace_name": strings.ReplaceAll(inst.Name, "_", "-"),
-			"version":        inst.Version,
-			"description":    desc,
-			"path":           inst.Binary,
-			"id":             inst.ID,
-			"loaded":         true,
-			"enabled":        true,
-			"activated":      true,
-			"reserved":       false,
-			"author":         "",
-			"repo":           "",
-			"install_source": nil,
-			"updates_enabled": true,
+			"name":                   inst.Name,
+			"marketplace_name":       strings.ReplaceAll(inst.Name, "_", "-"),
+			"version":                inst.Version,
+			"description":            desc,
+			"path":                   inst.Binary,
+			"id":                     inst.ID,
+			"loaded":                 true,
+			"enabled":                true,
+			"activated":              true,
+			"reserved":               false,
+			"author":                 "",
+			"repo":                   "",
+			"install_source":         nil,
+			"updates_enabled":        true,
 			"update_disabled_reason": "",
 		}
 		if e := entryByID[inst.ID]; e != nil {
@@ -85,20 +85,20 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			repo = e.Source
 		}
 		result = append(result, map[string]interface{}{
-			"name":           e.Name,
-			"marketplace_name": strings.ReplaceAll(e.Name, "_", "-"),
-			"version":        e.Version,
-			"description":    "插件已禁用",
-			"path":           e.Binary,
-			"id":             e.ID,
-			"loaded":         false,
-			"enabled":        false,
-			"activated":      false,
-			"reserved":       false,
-			"author":         "",
-			"repo":           repo,
-			"install_source": e.installSourceMap(),
-			"updates_enabled": updatesEnabled(e.InstallMethod),
+			"name":                   e.Name,
+			"marketplace_name":       strings.ReplaceAll(e.Name, "_", "-"),
+			"version":                e.Version,
+			"description":            "插件已禁用",
+			"path":                   e.Binary,
+			"id":                     e.ID,
+			"loaded":                 false,
+			"enabled":                false,
+			"activated":              false,
+			"reserved":               false,
+			"author":                 "",
+			"repo":                   repo,
+			"install_source":         e.installSourceMap(),
+			"updates_enabled":        updatesEnabled(e.InstallMethod),
 			"update_disabled_reason": "",
 		})
 	}
@@ -365,7 +365,7 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 		_ = os.RemoveAll(cfgDir)
 	}
 
-	logger.Info("Plugin %s uninstalled (deleteConfig=%v deleteData=%v)", id, deleteConfig, deleteData)
+	logger.I18nInfo("插件 %s 已卸载 (deleteConfig=%v deleteData=%v)", id, deleteConfig, deleteData)
 	return nil
 }
 
@@ -404,7 +404,7 @@ func (m *SubprocessManager) ConfigSchema(name string) map[string]interface{} {
 	if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
 		var schema map[string]interface{}
 		if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
-			logger.Warn("ConfigSchema(%s): %v", name, err)
+			logger.I18nWarn("ConfigSchema(%s): %v", name, err)
 		} else {
 			return schema
 		}
@@ -530,11 +530,11 @@ func (m *SubprocessManager) writeMetadataConfig(name string, meta *PluginMetadat
 	}
 	out, err := json.MarshalIndent(od, "", "  ")
 	if err != nil {
-		logger.Warn("writeMetadataConfig(%s): %v", name, err)
+		logger.I18nWarn("writeMetadataConfig(%s): %v", name, err)
 		return
 	}
 	if err := os.WriteFile(path, out, 0o644); err != nil {
-		logger.Warn("writeMetadataConfig(%s): %v", name, err)
+		logger.I18nWarn("writeMetadataConfig(%s): %v", name, err)
 	}
 }
 

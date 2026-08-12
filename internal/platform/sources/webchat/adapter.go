@@ -76,7 +76,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 	}
 
 	go func() {
-		logger.Info("WebChat adapter listening on %s:%d", a.Host, a.Port)
+		logger.I18nInfo("WebChat 适配器正在监听 %s:%d", a.Host, a.Port)
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("WebChat server error: %v", err)
 		}

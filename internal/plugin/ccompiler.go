@@ -13,9 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mholt/archives"
-
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
+	"github.com/mholt/archives"
 )
 
 // CCompilerPromptKind identifies which prompt the user must answer before a
@@ -51,7 +50,7 @@ type CCompilerPromptError struct {
 	// for PromptChooseCompiler).
 	HasGCC bool `json:"has_gcc"`
 	// GCCPath / GCCXXPath are the detected system compiler paths.
-	GCCPath  string `json:"gcc_path,omitempty"`
+	GCCPath   string `json:"gcc_path,omitempty"`
 	GCCXXPath string `json:"gcc_xx_path,omitempty"`
 	// GCCVersion is a short version string of the detected GCC (for display).
 	GCCVersion string `json:"gcc_version,omitempty"`
@@ -120,11 +119,11 @@ func resolveCCChoice(ctx context.Context, choice CCompilerChoice, options Instal
 		if !ok {
 			return "", "", fmt.Errorf("未找到系统 GCC（ASTRBOT_CC/CC 环境变量或 PATH 中的 gcc）")
 		}
-		logger.Info("Using system GCC for cgo plugin: %s (v%s)", gcc, ver)
+		logger.I18nInfo("为 cgo 插件使用系统 GCC: %s (v%s)", gcc, ver)
 		return gcc, cxx, nil
 	case CCChoiceClang:
 		if clang, cxx, ok := detectSystemClang(); ok {
-			logger.Info("Using system Clang for cgo plugin: %s", clang)
+			logger.I18nInfo("为 cgo 插件使用系统 Clang: %s", clang)
 			return clang, cxx, nil
 		}
 		return downloadAndSetupClang(ctx, options)
@@ -248,7 +247,7 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 	// A previously downloaded Clang (zig) at the private root — but only trust
 	// it if no lock file is left behind from an interrupted install.
 	if _, err := os.Stat(filepath.Join(root, clangLockFile)); err == nil {
-		logger.Warn("Clang install was interrupted previously, removing %s and re-downloading", root)
+		logger.I18nWarn("Clang 安装此前被中断，正在删除 %s 并重新下载", root)
 		if err := os.RemoveAll(root); err != nil {
 			return "", "", fmt.Errorf("清理未完成的 Clang 安装目录失败: %w", err)
 		}
@@ -282,7 +281,7 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 		return "", "", err
 	}
 	if hadPartial {
-		logger.Info("Clang (zig) archive %s resumed and completed", info.archive)
+		logger.I18nInfo("Clang (zig) 压缩包 %s 已断点续传并完成", info.archive)
 	}
 
 	if options.Stage != nil {
@@ -375,8 +374,8 @@ func zigUnsupportedHint() error {
 		if prefix == "" {
 			prefix = "/data/data/com.termux/files/usr"
 		}
-		return fmt.Errorf("Termux (Android) 没有官方 Zig 包。请在 Termux 中执行：\n" +
-			"  pkg update && pkg install clang\n" +
+		return fmt.Errorf("Termux (Android) 没有官方 Zig 包。请在 Termux 中执行：\n"+
+			"  pkg update && pkg install clang\n"+
 			"安装后即可自动检测到（或设置环境变量 ASTRBOT_CC=%s/bin/clang），然后重新安装插件。", prefix)
 	}
 	return fmt.Errorf("当前平台 %s/%s 没有可用的 C 编译器预编译包，请手动安装 Clang/GCC 后再安装插件",
@@ -389,7 +388,7 @@ func zigUnsupportedHint() error {
 func downloadClangArchive(ctx context.Context, archive, dest string, progress func(downloaded, total int64)) error {
 	// Already fully cached?
 	if info, err := os.Stat(dest); err == nil && !info.IsDir() && info.Size() > 0 {
-		logger.Info("Clang archive already cached: %s", dest)
+		logger.I18nInfo("Clang 压缩包已缓存: %s", dest)
 		return nil
 	}
 	client := &http.Client{Timeout: 30 * time.Minute}
@@ -398,10 +397,10 @@ func downloadClangArchive(ctx context.Context, archive, dest string, progress fu
 		url := base + "/" + archive
 		if err := resumeDownload(ctx, client, url, dest, progress); err != nil {
 			lastErr = err
-			logger.Warn("Clang download from %s failed: %v", url, err)
+			logger.I18nWarn("从 %s 下载 Clang 失败: %v", url, err)
 			continue
 		}
-		logger.Info("Clang archive downloaded from %s", url)
+		logger.I18nInfo("Clang 压缩包已从 %s 下载", url)
 		return nil
 	}
 	if lastErr == nil {
@@ -437,13 +436,13 @@ func resumeDownload(ctx context.Context, client *http.Client, url, dest string, 
 	case http.StatusOK:
 		// Server ignored the Range header (or offset==0): start over.
 		if offset > 0 {
-			logger.Info("Resume not supported by %s, restarting download", url)
+			logger.I18nInfo("%s 不支持断点续传，重新开始下载", url)
 		}
 		offset = 0
 	case http.StatusPartialContent:
 		// Resuming: verify the range actually starts where we expect.
 		if offset > 0 {
-			logger.Info("Resuming %s from byte %d", url, offset)
+			logger.I18nInfo("续传 %s，从第 %d 字节开始", url, offset)
 		}
 	default:
 		return fmt.Errorf("HTTP %d", resp.StatusCode)

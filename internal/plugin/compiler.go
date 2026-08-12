@@ -1,8 +1,11 @@
 package plugin
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,11 +25,43 @@ const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 // blacklist) and `go vet` before compiling.
 type Compiler struct {
 	tc *toolchain.Toolchain
+	// GoProxy 是 Go 包仓库地址（GOPROXY），空则默认 goproxy.cn。
+	GoProxy string
+	// GoFlags 是附加到 go build 的额外参数（如 "-tags xxx"），空则无。
+	GoFlags string
 }
+
+// defaultGoProxy 是未配置 goproxy 时使用的 Go 模块代理。
+const defaultGoProxy = "https://goproxy.cn,direct"
 
 // NewCompiler creates a compiler backed by the given toolchain.
 func NewCompiler(tc *toolchain.Toolchain) *Compiler {
-	return &Compiler{tc: tc}
+	return &Compiler{tc: tc, GoProxy: defaultGoProxy}
+}
+
+// SetGoConfig 注入插件编译的 Go 包仓库地址与额外构建参数（来自 config goproxy/goflags）。
+func (c *Compiler) SetGoConfig(goproxy, goflags string) {
+	if goproxy != "" {
+		c.GoProxy = goproxy
+	}
+	c.GoFlags = goflags
+}
+
+// goproxyEnv 返回编译时使用的 GOPROXY。
+func (c *Compiler) goproxyEnv() string {
+	if c.GoProxy != "" {
+		return c.GoProxy
+	}
+	return defaultGoProxy
+}
+
+// goflagsEnv 返回编译时使用的 GOFLAGS（附加用户 goflags）。
+func (c *Compiler) goflagsEnv() string {
+	base := "-mod=mod"
+	if c.GoFlags != "" {
+		return base + " " + c.GoFlags
+	}
+	return base
 }
 
 // Prepare ensures the plugin module builds against the local SDK: it writes a
@@ -89,7 +124,7 @@ func (c *Compiler) Vet(ctx context.Context, srcDir string) error {
 	}
 	cmd := exec.CommandContext(ctx, goBin, "vet", "./...")
 	cmd.Dir = srcDir
-	cmd.Env = c.tc.BuildEnv(map[string]string{"GOPROXY": "https://goproxy.cn,direct"})
+	cmd.Env = c.tc.BuildEnv(map[string]string{"GOPROXY": c.goproxyEnv(), "GOFLAGS": c.goflagsEnv()})
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("go vet: %w\n%s", err, out)
@@ -113,6 +148,18 @@ func (c *Compiler) BuildWithProgress(ctx context.Context, srcDir, outputPath str
 // cc/cxx are the CC/CXX compiler paths (e.g. from ensureCCompiler); when empty
 // the toolchain decides CGO_ENABLED from the host environment (CGOEnabled()).
 func (c *Compiler) BuildWithProgressC(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc, cc, cxx string) error {
+	return c.build(ctx, srcDir, outputPath, progress, cc, cxx, nil)
+}
+
+// BuildWithProgressOut is BuildWithProgressC plus a callback invoked with each
+// line of `go build -v` output as it is produced (dependency downloads like
+// "go: downloading github.com/mattn/go-sqlite3 v1.14.49" and the module path of
+// each package being compiled), so the WebUI can surface live build progress.
+func (c *Compiler) BuildWithProgressOut(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc, cc, cxx string, outputCb func(line string)) error {
+	return c.build(ctx, srcDir, outputPath, progress, cc, cxx, outputCb)
+}
+
+func (c *Compiler) build(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc, cc, cxx string, outputCb func(line string)) error {
 	goBin, err := c.tc.EnsureWithProgress(progress)
 	if err != nil {
 		return fmt.Errorf("ensure toolchain: %w", err)
@@ -127,10 +174,16 @@ func (c *Compiler) BuildWithProgressC(ctx context.Context, srcDir, outputPath st
 	if err := os.MkdirAll(filepath.Dir(absOut), 0o755); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, goBin, "build", "-o", absOut, "-ldflags=-s -w", "./...")
+	args := []string{"build"}
+	if outputCb != nil {
+		args = append(args, "-v")
+	}
+	args = append(args, "-o", absOut, "-ldflags=-s -w", "./...")
+	cmd := exec.CommandContext(ctx, goBin, args...)
 	cmd.Dir = srcDir
 	extra := map[string]string{
-		"GOPROXY": "https://goproxy.cn,direct",
+		"GOPROXY": c.goproxyEnv(),
+		"GOFLAGS": c.goflagsEnv(),
 	}
 	if cc != "" {
 		extra["CC"] = cc
@@ -138,9 +191,33 @@ func (c *Compiler) BuildWithProgressC(ctx context.Context, srcDir, outputPath st
 		extra["CGO_ENABLED"] = "1"
 	}
 	cmd.Env = c.tc.BuildEnv(extra)
-	out, err := cmd.CombinedOutput()
+
+	if outputCb == nil {
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("go build: %w\n%s", err, out)
+		}
+		return nil
+	}
+
+	// Stream `go build -v` output line by line so the WebUI can show live
+	// dependency downloads and the packages currently being compiled.
+	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return fmt.Errorf("go build: %w\n%s", err, out)
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+	var outBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("go build start: %w", err)
+	}
+	scanner := bufio.NewScanner(io.TeeReader(stderr, &outBuf))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1*1024*1024)
+	for scanner.Scan() {
+		outputCb(scanner.Text())
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("go build: %w\n%s", err, outBuf.String())
 	}
 	return nil
 }
@@ -183,7 +260,8 @@ func findSDKDir() (string, error) {
 				if p, err := sdkInModCache(version); err == nil {
 					return p, nil
 				}
-			}		}
+			}
+		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			break

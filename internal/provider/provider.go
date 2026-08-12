@@ -5,9 +5,8 @@ package provider
 import (
 	"context"
 	"fmt"
-	"sync"
-
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"sync"
 )
 
 var logger = log.GetDefault().WithComponent("Provider")
@@ -170,7 +169,7 @@ func (pm *ProviderManager) Register(id string, p AbstractProvider) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.providers[id] = p
-	logger.Info("Registered provider: %s (type=%s, model=%s)", id, p.Meta().Type, p.GetModel())
+	logger.I18nInfo("已注册 provider: %s (类型=%s, 模型=%s)", id, p.Meta().Type, p.GetModel())
 }
 
 // Unregister removes a provider.

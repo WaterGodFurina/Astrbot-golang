@@ -211,7 +211,8 @@ func (s *Server) apiAuthAllowed(r *http.Request) bool {
 			}
 			return s.auth.IsAuthenticated(extractToken(r))
 		}
-		return false
+		// totp / account 等子端点：需已认证会话。
+		return s.auth.IsAuthenticated(extractToken(r))
 	case "unified-chat", "live-chat":
 		// WebSocket transport validates its own token query parameter.
 		return true
