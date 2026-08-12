@@ -2,7 +2,7 @@
 package sources
 
 import (
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 func init() {

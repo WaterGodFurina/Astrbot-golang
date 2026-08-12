@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/log"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 var logger = log.GetDefault().WithComponent("EventBus")
@@ -182,7 +182,8 @@ type EventBus struct {
 	schedulers map[string]*PipelineScheduler // keyed by config_id
 	queue      chan *Event
 	stopCh     chan struct{}
-	stopOnce   sync.Once // 保证 stopCh 只 close 一次（Stop 可被重复调用）
+	done       chan struct{} // closed when the dispatch loop exits
+	stopOnce   sync.Once     // 保证 stopCh 只 close 一次（Stop 可被重复调用）
 }
 
 // NewEventBus creates a new event bus.
@@ -194,6 +195,7 @@ func NewEventBus(bufferSize int) *EventBus {
 		schedulers: make(map[string]*PipelineScheduler),
 		queue:      make(chan *Event, bufferSize),
 		stopCh:     make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 }
 
@@ -213,6 +215,7 @@ func (bus *EventBus) GetScheduler(confID string) *PipelineScheduler {
 
 // Start begins dispatching events.
 func (bus *EventBus) Start(ctx context.Context) error {
+	defer close(bus.done)
 	for {
 		select {
 		case event := <-bus.queue:
@@ -268,10 +271,23 @@ func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 	})
 }
 
-// Stop shuts down the event bus.
+// Stop shuts down the event bus and waits for the dispatch loop to exit (with
+// a bounded timeout). Callers must stop the bus before closing the database so
+// no in-flight event can touch storage after it is closed.
 func (bus *EventBus) Stop() {
 	bus.stopOnce.Do(func() { close(bus.stopCh) })
+	select {
+	case <-bus.done:
+	case <-time.After(eventBusStopTimeout):
+		logger.Warn("EventBus dispatch loop did not exit within %v during shutdown", eventBusStopTimeout)
+	}
 }
+
+// eventBusStopTimeout bounds how long Stop waits for the dispatch loop. The
+// loop normally exits promptly once its context is cancelled (LLM calls carry
+// the context; plugin RPCs fail fast after the plugin processes are killed);
+// the timeout guards against a permanently stuck stage.
+const eventBusStopTimeout = 30 * time.Second
 
 // dispatch runs the event through every registered scheduler. The scheduler
 // set is snapshotted under a read lock, then Process is invoked outside the

@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/db"
-	"github.com/AstrBotDevs/AstrBot/internal/knowledgebase"
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // kbVecMu serializes vector writes per knowledge base (nanovec is not safe for

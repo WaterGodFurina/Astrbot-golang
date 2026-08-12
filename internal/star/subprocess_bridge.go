@@ -10,14 +10,55 @@ import (
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	"github.com/AstrBotDevs/AstrBot/internal/core"
-	"github.com/AstrBotDevs/AstrBot/internal/plugin"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
+
+// logger 供 star 包记录日志。
+var logger = log.GetDefault().WithComponent("Star")
 
 // pluginRPCTimeout bounds every gRPC call into a plugin's subprocess so a hung
 // plugin handler (infinite loop, deadlock) cannot freeze the pipeline forever.
 const pluginRPCTimeout = 30 * time.Second
+
+// AlwaysMatchFilter matches every event (used for hooks that observe all
+// pipeline events regardless of type).
+type AlwaysMatchFilter struct{}
+
+// Match implements HandlerFilter.
+func (f *AlwaysMatchFilter) Match(ctx *FilterContext) bool { return true }
+
+// FilterType implements HandlerFilter.
+func (f *AlwaysMatchFilter) FilterType() string { return "always" }
+
+// hookEventType maps a hook event name to a star event type.
+func hookEventType(name string) (EventType, bool) {
+	switch name {
+	case "on_message", "message":
+		return EventTypeOnAstrMessageEvent, true
+	case "on_message_received":
+		return EventTypeOnMessageReceivedEvent, true
+	case "on_pre_process":
+		return EventTypeOnPreProcessEvent, true
+	case "on_result_handling":
+		return EventTypeOnResultHandlingEvent, true
+	case "on_decorating_result":
+		return EventTypeOnDecoratingResultEvent, true
+	case "on_after_message_sent":
+		return EventTypeOnAfterMessageSentEvent, true
+	case "on_llm_request":
+		return EventTypeOnLLMRequestEvent, true
+	case "on_llm_response":
+		return EventTypeOnLLMResponseEvent, true
+	case "on_tool_call":
+		return EventTypeOnToolCallEvent, true
+	default:
+		// lifecycle hooks (startup/shutdown) are not pipeline events
+		return 0, false
+	}
+}
 
 // RegisterSubprocessPlugins bridges a batch of running subprocess plugins.
 func RegisterSubprocessPlugins(starMgr *Manager, insts []*plugin.PluginInstance) {
@@ -252,4 +293,44 @@ func componentToSDK(c message.Component) pluginsdk.Component {
 		out.Text = v.MessageStr
 	}
 	return out
+}
+
+// RemovePluginCommands removes all subprocess-plugin command handlers from the
+// star registry (prefix "plugin_"). Used when re-bridging after install,
+// unload, reload or crash-restart.
+func RemovePluginCommands(starMgr *Manager) {
+	if starMgr == nil || starMgr.Handlers() == nil {
+		return
+	}
+	for _, h := range starMgr.Handlers().All() {
+		if strings.HasPrefix(h.HandlerFullName, "plugin_") {
+			starMgr.Handlers().Remove(h.HandlerFullName)
+		}
+	}
+}
+
+// RemovePluginFilters removes all subprocess-plugin filter handlers from the
+// star registry (prefix "plugin_filter_").
+func RemovePluginFilters(starMgr *Manager) {
+	if starMgr == nil || starMgr.Handlers() == nil {
+		return
+	}
+	for _, h := range starMgr.Handlers().All() {
+		if strings.HasPrefix(h.HandlerFullName, "plugin_filter_") {
+			starMgr.Handlers().Remove(h.HandlerFullName)
+		}
+	}
+}
+
+// RemovePluginHooks removes all subprocess-plugin hook handlers from the star
+// registry (prefix "plugin_hook_").
+func RemovePluginHooks(starMgr *Manager) {
+	if starMgr == nil || starMgr.Handlers() == nil {
+		return
+	}
+	for _, h := range starMgr.Handlers().All() {
+		if strings.HasPrefix(h.HandlerFullName, "plugin_hook_") {
+			starMgr.Handlers().Remove(h.HandlerFullName)
+		}
+	}
 }

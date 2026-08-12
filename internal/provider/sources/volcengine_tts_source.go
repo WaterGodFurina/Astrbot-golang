@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // VolcengineTTSSource synthesizes speech via the Volcengine (火山引擎)

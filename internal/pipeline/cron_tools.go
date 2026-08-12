@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/cron"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
 )
 
 // futureTaskToolSchema mirrors Python's FutureTaskTool schema

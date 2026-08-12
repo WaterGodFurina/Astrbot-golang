@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // ChatLLMFromConfig calls the default chat LLM provider selected in the given

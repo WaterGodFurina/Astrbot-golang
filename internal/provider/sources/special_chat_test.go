@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 func TestOpenAIResponsesSourceTextChat(t *testing.T) {

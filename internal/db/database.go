@@ -20,9 +20,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mattn/go-sqlite3"
+	"modernc.org/sqlite"
+	lib "modernc.org/sqlite/lib"
 
-	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
 // logger 供统计查询等路径记录错误。
@@ -38,10 +39,14 @@ type Database struct {
 }
 
 // New opens (or creates) a SQLite database at the given path.
+//
+// 使用纯 Go 驱动 modernc.org/sqlite（注册名 "sqlite"），消除对 mattn/
+// go-sqlite3 的 CGO 依赖，使主程序能在 CGO_ENABLED=0、无 C 编译器的
+// 环境下构建和运行。DSN 参数写法与 mattn 不同（_pragma=...）。
 func New(dbPath string) (*Database, error) {
 	// WAL mode enables concurrent readers + one writer without "database is locked"
-	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=30000&_foreign_keys=on", dbPath)
-	db, err := sql.Open("sqlite3", dsn)
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -82,11 +87,12 @@ func (d *Database) quickCheck() error {
 }
 
 // isBusyErr 判断错误是否为 SQLite 的写锁冲突（SQLITE_BUSY / SQLITE_LOCKED），
-// 供 withRetry 决定是否需要重试。
+// 供 withRetry 决定是否需要重试。modernc.org/sqlite 的错误是 *sqlite.Error，
+// 用 errors.As 提取后比对 lib.SQLITE_BUSY / lib.SQLITE_LOCKED 错误码。
 func isBusyErr(err error) bool {
-	var se *sqlite3.Error
+	var se *sqlite.Error
 	if errors.As(err, &se) {
-		return se.Code == sqlite3.ErrBusy || se.Code == sqlite3.ErrLocked
+		return se.Code() == lib.SQLITE_BUSY || se.Code() == lib.SQLITE_LOCKED
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "busy") || strings.Contains(msg, "locked")

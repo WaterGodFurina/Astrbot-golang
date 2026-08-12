@@ -28,15 +28,6 @@ func DefaultConfig() *SchemaNode {
 					Type: SchemaObject,
 				},
 			},
-			// legacy_plugin_mode: false (default) disables the legacy .so
-			// runtime and uses the subprocess plugin runtime (go-plugin child
-			// processes compiled from source). Set to true to load plugins as
-			// .so shared libraries (Linux-only, the pre-refactor behavior).
-			"legacy_plugin_mode": {
-				Type:         SchemaBool,
-				DefaultValue: false,
-				Optional:     true,
-			},
 			"wake_prefix": {
 				Type:         SchemaString,
 				DefaultValue: "",

@@ -10,8 +10,8 @@ import (
         "os/signal"
         "syscall"
 
-        "github.com/AstrBotDevs/AstrBot/internal/lifecycle"
-        "github.com/AstrBotDevs/AstrBot/internal/log"
+        "github.com/WaterGodFurina/Astrbot-golang/internal/lifecycle"
+        "github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
 const logo = `

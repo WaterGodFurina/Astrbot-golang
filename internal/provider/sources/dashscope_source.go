@@ -8,7 +8,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // DashScopeSource is an Aliyun DashScope (Qwen) chat provider.

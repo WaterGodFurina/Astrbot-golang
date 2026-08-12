@@ -18,12 +18,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/config"
-	"github.com/AstrBotDevs/AstrBot/internal/db"
-	"github.com/AstrBotDevs/AstrBot/internal/log"
-	"github.com/AstrBotDevs/AstrBot/internal/plugin"
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
-	"github.com/AstrBotDevs/AstrBot/internal/star"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 )
 
 // ── Auth handlers ────────────────────────────────────────────
@@ -1626,9 +1626,8 @@ func (s *Server) handlePluginBindSource(w http.ResponseWriter, r *http.Request, 
 }
 
 // handlePluginDocs serves plugin README/CHANGELOG content
-// (GET /api/v1/plugins/{id}/readme, /changelog and the query variants). When
-// the subprocess runtime is unavailable it falls back to the legacy .so
-// manager's local README lookup.
+// (GET /api/v1/plugins/{id}/readme, /changelog and the query variants) from
+// the subprocess runtime's cached plugin docs.
 func (s *Server) handlePluginDocs(w http.ResponseWriter, r *http.Request, subprocess func(string) string) {
 	pluginID := r.URL.Query().Get("plugin_id")
 	if pluginID == "" {
@@ -1653,21 +1652,8 @@ func (s *Server) handlePluginDocs(w http.ResponseWriter, r *http.Request, subpro
 		return
 	}
 
-	// Legacy .so manager fallback: read the local README from the plugin dir.
-	content := ""
-	if pm := s.pluginManager(); pm != nil {
-		if dir := pm.PluginDataDir(pluginID); dir != "" {
-			base := filepath.Dir(dir)
-			for _, file := range []string{"README.md", "readme.md"} {
-				if b, err := os.ReadFile(filepath.Join(base, file)); err == nil {
-					content = string(b)
-					break
-				}
-			}
-		}
-	}
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-		"content": content,
+		"content": "",
 	}))
 }
 

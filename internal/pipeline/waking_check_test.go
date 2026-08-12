@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/internal/core"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 // wakeEvent builds a message event for waking-check tests.

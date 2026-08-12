@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // OpenAISource is an OpenAI-compatible chat provider.

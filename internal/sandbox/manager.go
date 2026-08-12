@@ -24,8 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/log"
-	"github.com/AstrBotDevs/AstrBot/internal/skills"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 )
 
 var logger = log.GetDefault().WithComponent("Sandbox")

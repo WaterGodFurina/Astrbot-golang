@@ -2,7 +2,7 @@
 package star
 
 import (
-	"github.com/AstrBotDevs/AstrBot/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
 )
 
 // Manager manages plugins, handlers, and commands.

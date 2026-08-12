@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 func TestBailianRerankSource(t *testing.T) {

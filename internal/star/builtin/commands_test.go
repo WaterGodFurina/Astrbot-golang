@@ -3,11 +3,11 @@ package builtin
 import (
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/internal/config"
-	"github.com/AstrBotDevs/AstrBot/internal/conversation"
-	"github.com/AstrBotDevs/AstrBot/internal/core"
-	"github.com/AstrBotDevs/AstrBot/internal/star"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 func newTestDeps(t *testing.T) (Deps, *star.Manager) {

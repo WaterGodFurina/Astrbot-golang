@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
 var logger = log.GetDefault().WithComponent("Backup")

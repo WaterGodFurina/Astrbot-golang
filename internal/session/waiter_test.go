@@ -3,7 +3,7 @@ package session
 import (
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 type mockEvent struct {

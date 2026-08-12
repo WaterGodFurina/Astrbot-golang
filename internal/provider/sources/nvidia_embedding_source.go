@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // NvidiaEmbeddingSource produces text embeddings via NVIDIA's OpenAI

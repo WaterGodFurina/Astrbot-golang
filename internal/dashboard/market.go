@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
 // marketCacheTTL controls how long a fetched registry snapshot is served from

@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/core"
-	"github.com/AstrBotDevs/AstrBot/internal/log"
-	"github.com/AstrBotDevs/AstrBot/internal/platform"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 var logger = log.GetDefault().WithComponent("WebChat")

@@ -52,7 +52,7 @@ astrbot-go/
 
 ## 插件 SDK
 
-SDK 是独立 module `github.com/WaterGodFurina/Astrbot-go-plugin-sdk`（本地 `~/astrbot-go-plugin-sdk`）。插件作者只需写一个 `main`，实现命令/过滤器/钩子。插件身份信息（名称/版本/描述/作者/仓库/是否 cgo）统一放在包根目录的 `metadata.json`，`main.go` 只保留代码逻辑：
+SDK 是独立 module `github.com/WaterGodFurina/Astrbot-go-plugin-sdk`（作为依赖从 GitHub 拉取；开发时本地 clone 到 `~/astrbot-go-plugin-sdk`）。插件作者只需写一个 `main`，实现命令/过滤器/钩子。插件身份信息（名称/版本/描述/作者/仓库/是否 cgo）统一放在包根目录的 `metadata.json`，`main.go` 只保留代码逻辑：
 
 ```go
 package main
@@ -161,9 +161,18 @@ cgo 插件的 C 编译器（zig/clang/GCC）也存放在同一私有目录下（
 ## 构建
 
 ```bash
-# 主程序
+# 主程序（纯 Go，无需 C 编译器，CGO_ENABLED=0 亦可构建）
 go build -o bin/astrbot ./cmd/astrbot
 ```
+
+> **CGO 说明**：主程序数据库使用纯 Go 驱动 `modernc.org/sqlite`，**不依赖 CGO**，
+> 可用 `CGO_ENABLED=0 go build` 产出静态二进制，交叉编译 / 无 GCC 的 Docker
+> 镜像 / Windows / Termux 均无需 C 工具链。仅**插件**在 `metadata.json` 声明
+> `"cgo": true` 时才需要 C 编译器（宿主自动选择 zig/clang/GCC，见上文"cgo 支持"）。
+>
+> **模块路径**：`module github.com/WaterGodFurina/Astrbot-golang`，与仓库 URL 一致；
+> 插件 SDK 作为普通依赖从 GitHub 拉取（`github.com/WaterGodFurina/Astrbot-go-plugin-sdk`），
+> 无本地 `replace`，clone 后直接 `go build` 即可（需联网拉依赖）。
 
 ## 测试
 

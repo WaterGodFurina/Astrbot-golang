@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // NvidiaRerankSource reranks documents via the NVIDIA NIM retrieval /reranking

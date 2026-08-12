@@ -21,7 +21,7 @@ import (
 	"crypto/sha256"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"golang.org/x/crypto/pbkdf2"
 )
 

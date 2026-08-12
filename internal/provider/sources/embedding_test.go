@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 func TestGeminiEmbeddingSource(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // OllamaEmbeddingSource produces text embeddings via Ollama's /api/embed

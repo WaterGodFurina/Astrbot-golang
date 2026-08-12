@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/internal/core"
-	"github.com/AstrBotDevs/AstrBot/internal/plugin"
-	"github.com/AstrBotDevs/AstrBot/internal/toolchain"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 // newTestSubprocessManager builds a subprocess manager with fast polling for

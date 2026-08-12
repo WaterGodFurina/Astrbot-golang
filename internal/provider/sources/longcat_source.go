@@ -5,7 +5,7 @@ package sources
 import (
 	"strings"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // LongcatSource is an OpenAI-compatible chat provider for LongCat.

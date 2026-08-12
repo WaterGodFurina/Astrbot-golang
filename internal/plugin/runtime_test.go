@@ -11,7 +11,7 @@ import (
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	"github.com/AstrBotDevs/AstrBot/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 )
 
 // testPluginBin is built once in TestMain by compiling testdata/plugin with

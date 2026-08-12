@@ -2,11 +2,11 @@
 package sources
 
 import (
-	"github.com/AstrBotDevs/AstrBot/internal/platform"
-	"github.com/AstrBotDevs/AstrBot/internal/platform/sources/aiocqhttp"
-	"github.com/AstrBotDevs/AstrBot/internal/platform/sources/qqofficial"
-	"github.com/AstrBotDevs/AstrBot/internal/platform/sources/telegram"
-	"github.com/AstrBotDevs/AstrBot/internal/platform/sources/webchat"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform/sources/aiocqhttp"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform/sources/qqofficial"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform/sources/telegram"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform/sources/webchat"
 )
 
 // Note: This file uses init() to register all built-in platform adapters.

@@ -5,7 +5,7 @@ package dashboard
 import (
 	"encoding/json"
 
-	"github.com/AstrBotDevs/AstrBot/internal/config"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 )
 
 func defaultConfigFromJSON() map[string]interface{} {

@@ -8,32 +8,36 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/backup"
-	"github.com/AstrBotDevs/AstrBot/internal/config"
-	"github.com/AstrBotDevs/AstrBot/internal/conversation"
-	"github.com/AstrBotDevs/AstrBot/internal/core"
-	"github.com/AstrBotDevs/AstrBot/internal/cron"
-	"github.com/AstrBotDevs/AstrBot/internal/dashboard"
-	"github.com/AstrBotDevs/AstrBot/internal/db"
-	"github.com/AstrBotDevs/AstrBot/internal/knowledgebase"
-	"github.com/AstrBotDevs/AstrBot/internal/log"
-	"github.com/AstrBotDevs/AstrBot/internal/pipeline"
-	"github.com/AstrBotDevs/AstrBot/internal/platform"
-	_ "github.com/AstrBotDevs/AstrBot/internal/platform/sources"
-	"github.com/AstrBotDevs/AstrBot/internal/plugin"
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
-	_ "github.com/AstrBotDevs/AstrBot/internal/provider/sources"
-	"github.com/AstrBotDevs/AstrBot/internal/sandbox"
-	"github.com/AstrBotDevs/AstrBot/internal/skills"
-	"github.com/AstrBotDevs/AstrBot/internal/star"
-	"github.com/AstrBotDevs/AstrBot/internal/star/builtin"
-	"github.com/AstrBotDevs/AstrBot/internal/toolchain"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/backup"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/dashboard"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/pipeline"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	_ "github.com/WaterGodFurina/Astrbot-golang/internal/platform/sources"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	_ "github.com/WaterGodFurina/Astrbot-golang/internal/provider/sources"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/star/builtin"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 var logger = log.GetDefault().WithComponent("Core")
@@ -81,6 +85,11 @@ func (l *Lifecycle) SetWebUIDir(dir string) {
 func (l *Lifecycle) Start(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// 启动前清扫历史孤儿插件子进程：主进程被 SIGKILL/崩溃时 go-plugin 的
+	// autoKill 未生效，插件进程会以 PPID=1 继续存活。先清理再启动，避免
+	// 新实例与旧孤儿并存。
+	cleanupOrphanPlugins()
 
 	logger.Info("AstrBot Go - starting initialization")
 	l.startedAt = time.Now()
@@ -757,4 +766,67 @@ func dockerAvailable() bool {
 		dockerOK = err == nil
 	})
 	return dockerOK
+}
+
+// orphanCleanupGrace is how long cleanupOrphanPlugins waits after SIGTERM
+// before force-killing surviving orphans.
+const orphanCleanupGrace = 1 * time.Second
+
+// cleanupOrphanPlugins 清理上一轮异常退出遗留的孤儿插件子进程（PPID=1、
+// 命令行指向 plugins-bin 目录的 go-plugin 子进程）。主进程被 SIGKILL/崩溃
+// 时这些进程不会被回收，会一直占用资源；启动时清扫一次防止与后续新实例
+// 并存。仅 Linux（依赖 /proc）；其他平台直接跳过。
+func cleanupOrphanPlugins() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	var orphans []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 1 {
+			continue
+		}
+		stat, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		// stat 格式: pid (comm) state ppid ...（comm 含空格时仍在括号内）
+		s := string(stat)
+		idx := strings.LastIndex(s, ")")
+		if idx < 0 {
+			continue
+		}
+		fields := strings.Fields(s[idx+1:])
+		if len(fields) < 2 {
+			continue
+		}
+		ppid, err := strconv.Atoi(fields[1])
+		if err != nil || ppid != 1 {
+			continue
+		}
+		cmdline, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		// 插件子进程可执行文件位于 <dataDir>/plugins-bin/<id>/ 下
+		if strings.Contains(string(cmdline), "plugins-bin") {
+			orphans = append(orphans, pid)
+		}
+	}
+	if len(orphans) == 0 {
+		return
+	}
+	logger.Warn("Found %d orphan plugin process(es) from a previous unclean shutdown, cleaning up...", len(orphans))
+	for _, pid := range orphans {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+	time.Sleep(orphanCleanupGrace)
+	for _, pid := range orphans {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	logger.Info("Cleaned up %d orphan plugin process(es)", len(orphans))
 }

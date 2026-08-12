@@ -4,8 +4,8 @@ import (
 	"fmt"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	"github.com/AstrBotDevs/AstrBot/internal/platform"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 // ComponentsFromSDK converts SDK components (received from a plugin over RPC)

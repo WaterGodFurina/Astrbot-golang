@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 // Event is the minimal interface a session waiter needs from an incoming event.

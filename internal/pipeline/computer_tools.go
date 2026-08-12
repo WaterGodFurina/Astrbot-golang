@@ -16,7 +16,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/sandbox"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 )
 
 // errStopGrep stops a directory walk once the result limit is reached.

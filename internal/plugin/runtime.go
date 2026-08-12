@@ -15,8 +15,12 @@ import (
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 	goplugin "github.com/hashicorp/go-plugin"
-	"github.com/AstrBotDevs/AstrBot/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 )
+
+// logger 供插件运行时与编译相关路径记录日志。
+var logger = log.GetDefault().WithComponent("Plugin")
 
 // startTimeout bounds the go-plugin handshake + first Register call. go-plugin
 // itself does not time out the handshake, so Load enforces one.
@@ -29,42 +33,6 @@ const cleanupTimeout = 5 * time.Second
 // 使低频偶发崩溃不会被永久停用（预算只惩罚"连续/近期"崩溃）。
 const restartBudgetResetWindow = 10 * time.Minute
 
-// opLock is a refcounted per-plugin lifecycle lock. It serializes Reload /
-// handleExit-restart / Unload so a crashed plugin being restarted cannot be
-// concurrently reloaded/unloaded (which would orphan a process or resurrect a
-// disabled plugin). The refcount lets the entry be removed from the map only
-// when the last waiter is done, so a blocked waiter always shares the mutex
-// that the current holder locked.
-type opLock struct {
-	mu   sync.Mutex
-	refs int
-}
-
-// lockOp acquires the per-plugin lifecycle lock for id and returns a release
-// function. Callers must release via defer.
-func (m *SubprocessManager) lockOp(id string) func() {
-	m.mu.Lock()
-	l, ok := m.opMu[id]
-	if !ok {
-		l = &opLock{}
-		m.opMu[id] = l
-	}
-	l.refs++
-	m.mu.Unlock()
-
-	l.mu.Lock()
-	return func() {
-		l.mu.Unlock()
-		m.mu.Lock()
-		l.refs--
-		if l.refs == 0 {
-			delete(m.opMu, id)
-		}
-		m.mu.Unlock()
-	}
-}
-
-// PluginInstance is a running plugin subprocess.
 type PluginInstance struct {
 	ID        string
 	Name      string
@@ -89,26 +57,32 @@ type PluginInstance struct {
 
 // SubprocessManager manages plugins running as isolated child processes
 // (go-plugin, gRPC). This is the NEW plugin runtime that replaces the legacy
-// .so loader (manager.go, kept behind the `legacy_plugin_mode` config flag).
+// .so loader (fully removed; only this subprocess runtime remains).
 //
 // Unlike .so plugins, child processes can be fully terminated (memory, file
 // handles and goroutines are reclaimed by the OS) and a crash cannot take the
 // host down; crashed plugins are automatically restarted with backoff.
 type SubprocessManager struct {
-	mu          sync.RWMutex
-	instances   map[string]*PluginInstance
-	failures    map[string]error
-	opMu        map[string]*opLock // per-plugin lifecycle mutex (Reload/restart/Unload)
-	toolchain   *toolchain.Toolchain
-	compiler    *Compiler
-	dataDir     string
-	ctx         context.Context
-	cancel      context.CancelFunc
+	mu        sync.RWMutex
+	instances map[string]*PluginInstance
+	failures  map[string]error
+	// opMu 是每个插件的生命周期互斥（Reload/Unload/崩溃 restart 串行化），
+	// 防止并发 reload/unload 导致孤儿进程或"禁用后复活"。用 sync.Map 常驻
+	// 条目（数量 = 曾加载过的插件数，几十个级别），避免引用计数复杂度；
+	// 条目创建后不再删除，插件卸载后的空互斥占几个字节，可接受。
+	opMu sync.Map // map[string]*sync.Mutex
+
+	toolchain *toolchain.Toolchain
+	compiler  *Compiler
+	dataDir   string
+	ctx       context.Context
+	cancel    context.CancelFunc
 	// gen 是"实例表代际"标记：Shutdown 换新表时自增。restart 在 startInstance
 	// 成功后写回 map 前对比 gen，代际不一致说明表已被换掉，需丢弃新实例并回收。
 	gen uint64
 	// manifestMu 串行化 manifest 的"读→改→写"整段（recordInstall/SetEnabled/
-	// BindSource/ReinstallSource/Uninstall），防止并发修改丢条目。
+	// BindSource/ReinstallSource/Uninstall），防止并发修改丢条目。与 m.mu 职责
+	// 分离：m.mu 保护内存 map，manifestMu 保护磁盘文件的一致性。
 	manifestMu sync.Mutex
 
 	// AutoRestart enables automatic restart of crashed plugins.
@@ -132,7 +106,6 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 	return &SubprocessManager{
 		instances:        make(map[string]*PluginInstance),
 		failures:         make(map[string]error),
-		opMu:             make(map[string]*opLock),
 		toolchain:        tc,
 		compiler:         NewCompiler(tc),
 		dataDir:          dataDir,
@@ -143,6 +116,16 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 		RestartBaseDelay: time.Second,
 		PollInterval:     500 * time.Millisecond,
 	}
+}
+
+// lockOp acquires the per-plugin lifecycle lock for id and returns a release
+// function. Callers must release via defer. 同 id 的 Reload/Unload/崩溃重启
+// 通过该互斥串行化；不同 id 之间互不阻塞。
+func (m *SubprocessManager) lockOp(id string) func() {
+	l, _ := m.opMu.LoadOrStore(id, &sync.Mutex{})
+	mu := l.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // InstallOptions configures InstallFromSource.
@@ -549,6 +532,19 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 	}
 	resCh := make(chan dispenseResult, 1)
 	go func() {
+		// 绑定当前插件身份：go-plugin Dispense 时宿主 accept HostService，
+		// SDK 据此刻的当前 id 给 per-connection hostServiceServer 绑定插件名，
+		// 用于 HostService 反向调用（GetConfig/SetConfig）的身份隔离。
+		// 插件 GetConfig/SetConfig 传的是注册名（name），故这里用 manifest 的
+		// name（name 可能与 manifest id 不同，如 jm_cosmos vs astrbot_plugin_jm_cosmos）。
+		pluginName := id
+		if man, merr := LoadManifest(m.manifestPath()); merr == nil {
+			if e := man.Get(id); e != nil && e.Name != "" {
+				pluginName = e.Name
+			}
+		}
+		pluginsdk.SetCurrentHostPluginID(pluginName)
+		defer pluginsdk.SetCurrentHostPluginID("")
 		proto, err := raw.Client()
 		if err != nil {
 			resCh <- dispenseResult{err: err}
@@ -599,6 +595,12 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 		_ = pc.Close()
 		raw.Kill()
 		return nil, fmt.Errorf("plugin %s Register: %w", id, err)
+	}
+	// 用 Register 返回的注册名更新 HostService 连接身份（accept 时只绑定
+	// manifest id，name 与 id 可能不同）。之后插件 GetConfig/SetConfig 传的
+	// name 与连接身份一致，身份隔离校验才能通过。
+	if meta != nil && meta.Name != "" {
+		pluginsdk.BindHostServiceName(id, meta.Name)
 	}
 
 	return &PluginInstance{

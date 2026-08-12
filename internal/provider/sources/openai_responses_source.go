@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // reasoningStateType mirrors ProviderOpenAIResponses._REASONING_STATE_TYPE.

@@ -5,7 +5,7 @@ package sources
 import (
 	"context"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // xiaomiModels is the built-in fallback model list when the API is unreachable.

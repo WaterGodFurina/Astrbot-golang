@@ -17,7 +17,7 @@ import (
 	"time"
 
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
-	"github.com/AstrBotDevs/AstrBot/internal/config"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 )
 
 // ListInfo returns dashboard-compatible plugin info: running subprocess

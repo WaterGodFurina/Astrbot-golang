@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/db"
-	"github.com/AstrBotDevs/AstrBot/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
 var logger = log.GetDefault().WithComponent("Cron")
@@ -57,6 +57,9 @@ type CronJobManager struct {
 	// ctx 记录 Start 传入的运行上下文，RunNow 派生的任务随其取消，不再用
 	// context.Background()（Start 内加锁写入/读取，避免数据竞争）。
 	ctx context.Context
+	// wg 跟踪正在执行的 job goroutine，Stop 时等待它们退出（关闭数据库前
+	// 确保没有 job 仍在访问存储）。
+	wg sync.WaitGroup
 }
 
 // NewCronJobManager creates a manager.
@@ -237,14 +240,30 @@ func (m *CronJobManager) Start(ctx context.Context) {
 	}
 }
 
-// Stop halts the cron loop.
+// Stop halts the cron loop and waits for in-flight jobs to finish (bounded by
+// a timeout). Job contexts derive from the manager context (cancelled by the
+// lifecycle before Stop is called), so handlers should exit promptly; the
+// timeout guards against a stuck handler.
 func (m *CronJobManager) Stop() {
 	select {
 	case <-m.stop:
 	default:
 		close(m.stop)
 	}
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(cronStopTimeout):
+		logger.Warn("Cron jobs did not finish within %v during shutdown", cronStopTimeout)
+	}
 }
+
+// cronStopTimeout bounds how long Stop waits for in-flight cron jobs.
+const cronStopTimeout = 10 * time.Second
 
 func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 	m.mu.Lock()
@@ -278,7 +297,9 @@ func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 	m.mu.Unlock()
 
 	for _, job := range due {
+		m.wg.Add(1)
 		go func(j *Job) {
+			defer m.wg.Done()
 			// 无论成败都清掉 running 标志，让下一次到点能再次触发。
 			defer func() {
 				m.mu.Lock()

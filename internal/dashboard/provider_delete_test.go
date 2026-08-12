@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/internal/config"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 )
 
 // testServerWithConfig builds a Server backed by an isolated config manager

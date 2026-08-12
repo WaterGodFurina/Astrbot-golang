@@ -8,8 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/AstrBotDevs/AstrBot/internal/config"
-	"github.com/AstrBotDevs/AstrBot/internal/plugin"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 )
 
 // authedRequest builds an HTTP request carrying a valid session token so it
@@ -172,27 +171,6 @@ func TestHandlersReturnNamedObjects(t *testing.T) {
 			s.mux.ServeHTTP(w, req)
 			tt.check(t, w.Body.String())
 		})
-	}
-}
-
-// TestGetPluginListNilLegacyManager guards against a typed-nil *plugin.Manager
-// (legacy_plugin_mode=false) causing getPluginList to panic on a nil receiver.
-func TestGetPluginListNilLegacyManager(t *testing.T) {
-	s := NewServer(0, "/tmp/test_pw.json")
-	defer s.Stop()
-	var nilMgr *plugin.Manager
-	s.pluginMgr = nilMgr // typed-nil inside interface{}
-
-	list := s.getPluginList()
-	if list == nil {
-		t.Fatal("getPluginList should return a non-nil list even with a nil legacy manager")
-	}
-	byID := s.pluginByID("anything")
-	if byID == nil {
-		t.Fatal("pluginByID should return a non-nil map with a nil legacy manager")
-	}
-	if failed := s.pluginFailed(); failed == nil {
-		t.Fatal("pluginFailed should return a non-nil map with a nil legacy manager")
 	}
 }
 

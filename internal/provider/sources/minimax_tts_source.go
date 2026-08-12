@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // MiniMaxTTSSource synthesizes speech via the MiniMax /v1/t2a_v2 endpoint

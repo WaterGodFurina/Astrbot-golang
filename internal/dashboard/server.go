@@ -19,16 +19,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/config"
-	"github.com/AstrBotDevs/AstrBot/internal/conversation"
-	"github.com/AstrBotDevs/AstrBot/internal/core"
-	"github.com/AstrBotDevs/AstrBot/internal/cron"
-	"github.com/AstrBotDevs/AstrBot/internal/db"
-	"github.com/AstrBotDevs/AstrBot/internal/log"
-	"github.com/AstrBotDevs/AstrBot/internal/platform"
-	"github.com/AstrBotDevs/AstrBot/internal/plugin"
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
-	"github.com/AstrBotDevs/AstrBot/internal/skills"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 )
 
 //go:embed web/dist/*
@@ -54,7 +54,6 @@ type Server struct {
 	chatBus            *core.EventBus
 	conversationMgr    interface{} // *conversation.Manager
 	cronMgr            interface{} // *cron.CronJobManager
-	pluginMgr          interface{} // *plugin.Manager (legacy .so)
 	subPluginMgr       *plugin.SubprocessManager
 	kbMgr              interface{} // *knowledgebase.Manager
 	kbTasks            map[string]*kbUploadTask // knowledge base upload task states
@@ -198,9 +197,6 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		}
 		if v, ok := managers["cron"]; ok {
 			s.cronMgr = v
-		}
-		if v, ok := managers["plugin"]; ok {
-			s.pluginMgr = v
 		}
 		if v, ok := managers["plugin_subprocess"]; ok {
 			if pm, ok := v.(*plugin.SubprocessManager); ok {
@@ -1521,18 +1517,9 @@ func (s *Server) skillDelete(name string) error {
 	return sm.DeleteSkill(name)
 }
 
-// getPluginList returns all plugins: legacy .so plugins plus subprocess
-// plugins. Entries are keyed by name and the subprocess runtime wins on
-// collisions (a plugin id belongs to one runtime only).
+// getPluginList returns all subprocess plugins. Entries are keyed by name.
 func (s *Server) getPluginList() []interface{} {
 	byName := make(map[string]interface{})
-	if pm := s.pluginManager(); pm != nil {
-		for _, p := range pm.ListPluginsInfo() {
-			if name, _ := p["name"].(string); name != "" {
-				byName[name] = p
-			}
-		}
-	}
 	if s.subPluginMgr != nil {
 		for _, p := range s.subPluginMgr.ListInfo() {
 			if name, _ := p["name"].(string); name != "" {
@@ -1545,12 +1532,6 @@ func (s *Server) getPluginList() []interface{} {
 		result = append(result, p)
 	}
 	return result
-}
-
-// pluginManagerIface returns the plugin manager (*plugin.Manager).
-func (s *Server) pluginManager() *plugin.Manager {
-	pm, _ := s.pluginMgr.(*plugin.Manager)
-	return pm
 }
 
 // providerManager returns the runtime provider manager, or nil.
@@ -1653,11 +1634,6 @@ func (s *Server) pluginByID(id string) map[string]interface{} {
 
 func (s *Server) pluginFailed() map[string]interface{} {
 	result := map[string]interface{}{}
-	if pm := s.pluginManager(); pm != nil {
-		for k, v := range pm.ListFailedPlugins() {
-			result[k] = v
-		}
-	}
 	if s.subPluginMgr != nil {
 		for k, v := range s.subPluginMgr.ListFailedPlugins() {
 			result[k] = v
@@ -1692,29 +1668,11 @@ func (s *Server) pluginSetEnabled(id string, enabled bool) {
 			logger.Warn("SetEnabled(%s): %v", id, err)
 		}
 		s.notifyPluginsChanged()
-		return
 	}
-	pm := s.pluginManager()
-	if pm == nil {
-		return
-	}
-	if enabled {
-		if err := pm.EnablePlugin(id); err != nil {
-			logger.Warn("EnablePlugin(%s): %v", id, err)
-		}
-	} else {
-		if err := pm.DisablePlugin(id); err != nil {
-			logger.Warn("DisablePlugin(%s): %v", id, err)
-		}
-	}
-	s.notifyPluginsChanged()
 }
 
 func (s *Server) pluginReload(id string) {
 	if id == "" {
-		if pm := s.pluginManager(); pm != nil {
-			pm.ReloadAll()
-		}
 		if s.subPluginMgr != nil {
 			s.subPluginMgr.LoadInstalled(context.Background())
 		}
@@ -1726,14 +1684,7 @@ func (s *Server) pluginReload(id string) {
 			logger.Warn("Reload(%s): %v", id, err)
 		}
 		s.notifyPluginsChanged()
-		return
 	}
-	pm := s.pluginManager()
-	if pm == nil {
-		return
-	}
-	_ = pm.Reload(id)
-	s.notifyPluginsChanged()
 }
 
 func (s *Server) pluginUninstall(id string, deleteConfig, deleteData bool) {
@@ -1742,25 +1693,14 @@ func (s *Server) pluginUninstall(id string, deleteConfig, deleteData bool) {
 			logger.Warn("Uninstall(%s): %v", id, err)
 		}
 		s.notifyPluginsChanged()
-		return
 	}
-	pm := s.pluginManager()
-	if pm == nil {
-		return
-	}
-	_ = pm.Uninstall(id, deleteConfig)
-	s.notifyPluginsChanged()
 }
 
 func (s *Server) pluginConfigSchema(id string) map[string]interface{} {
 	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
 		return s.subPluginMgr.ConfigSchema(name)
 	}
-	pm := s.pluginManager()
-	if pm == nil {
-		return map[string]interface{}{}
-	}
-	return pm.ConfigSchema(id)
+	return map[string]interface{}{}
 }
 
 // pluginConfigPayload returns the plugin config dialog payload consumed by the
@@ -1806,11 +1746,7 @@ func (s *Server) pluginLoadConfig(id string) map[string]interface{} {
 	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
 		return s.subPluginMgr.LoadConfig(name)
 	}
-	pm := s.pluginManager()
-	if pm == nil {
-		return map[string]interface{}{}
-	}
-	return pm.LoadConfig(id)
+	return map[string]interface{}{}
 }
 
 func (s *Server) pluginSaveConfig(id string, cfg map[string]interface{}) {
@@ -1820,13 +1756,7 @@ func (s *Server) pluginSaveConfig(id string, cfg map[string]interface{}) {
 				logger.Warn("SaveConfig(%s): %v", id, err)
 			}
 		}
-		return
 	}
-	pm := s.pluginManager()
-	if pm == nil || cfg == nil {
-		return
-	}
-	_ = pm.SaveConfig(id, cfg)
 }
 
 // getSkillList returns all skills.

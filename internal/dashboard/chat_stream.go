@@ -22,9 +22,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/core"
-	"github.com/AstrBotDevs/AstrBot/internal/platform"
-	"github.com/AstrBotDevs/AstrBot/pkg/message"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 	"github.com/gorilla/websocket"
 )
 
@@ -271,7 +271,12 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, text, provider
 		MessageStr:        text,
 		PlainText:         text,
 		Timestamp:         time.Now(),
-		IsAtOrWakeCommand: true,
+		// 不要预置 IsAtOrWakeCommand=true：WakingCheckStage 对已置位的
+		// 事件直接跳过前缀剥离，导致 "/am_status" 的 "/" 不被剥掉、命令
+		// handler 匹配失败（走向 LLM 闲聊）。置 false 让 WakingCheck 正常
+		// 处理："/" 前缀剥离后命中命令；普通文本经好友自动唤醒（wakeByFriend）
+		// 触发 LLM（CallLLM=true 兜底）。
+		IsAtOrWakeCommand: false,
 		CallLLM:           true,
 		Metadata:          map[string]interface{}{},
 	}

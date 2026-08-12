@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 var fishReferenceIDPattern = regexp.MustCompile(`^[a-fA-F0-9]{32}$`)

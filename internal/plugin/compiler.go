@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/AstrBotDevs/AstrBot/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	"golang.org/x/mod/modfile"
 )
 
@@ -146,8 +146,8 @@ func (c *Compiler) BuildWithProgressC(ctx context.Context, srcDir, outputPath st
 }
 
 // findSDKDir locates the local SDK module directory, resolving it from
-// ASTRBOT_GO_SDK, the nearest go.mod `replace`, or the conventional sibling
-// directory.
+// ASTRBOT_GO_SDK, the nearest go.mod `replace`, the module cache (from the
+// go.mod `require` version), or the conventional sibling directory.
 func findSDKDir() (string, error) {
 	if p := os.Getenv("ASTRBOT_GO_SDK"); p != "" {
 		abs, err := filepath.Abs(p)
@@ -177,7 +177,13 @@ func findSDKDir() (string, error) {
 				}
 				return abs, nil
 			}
-		}
+			// 无本地 replace 时（SDK 已作为依赖从 GitHub 拉取），从 go.mod
+			// 的 require 版本在 GOMODCACHE 定位 SDK 源码目录。
+			if version := sdkRequireFromGoMod(data); version != "" {
+				if p, err := sdkInModCache(version); err == nil {
+					return p, nil
+				}
+			}		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
 			break
@@ -185,6 +191,41 @@ func findSDKDir() (string, error) {
 		dir = parent
 	}
 	return "", fmt.Errorf("no go.mod with the AstrBot SDK replace found (set %s)", "ASTRBOT_GO_SDK")
+}
+
+// sdkRequireFromGoMod extracts the SDK require version from go.mod contents
+// (single-line form: "github.com/WaterGodFurina/Astrbot-go-plugin-sdk vX.Y.Z").
+func sdkRequireFromGoMod(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, sdkModulePath+" ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
+// sdkInModCache resolves the SDK source directory in the Go module cache for a
+// given require version. `go list -m` returns the actual on-disk directory
+// (module cache escapes uppercase letters as !x, so manual path joining would
+// break).
+func sdkInModCache(version string) (string, error) {
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", sdkModulePath).Output()
+	if err != nil {
+		return "", fmt.Errorf("locate SDK %s@%s in module cache: %w", sdkModulePath, version, err)
+	}
+	dir := strings.TrimSpace(string(out))
+	if dir == "" {
+		return "", fmt.Errorf("cannot locate SDK source in module cache")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
+		return "", fmt.Errorf("SDK source %q missing go.mod: %w", dir, err)
+	}
+	return dir, nil
 }
 
 // sdkReplaceFromGoMod extracts the SDK replace target from go.mod contents

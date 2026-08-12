@@ -5,7 +5,7 @@ package sources
 import (
 	"context"
 
-	"github.com/AstrBotDevs/AstrBot/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
 // GroqSource is an OpenAI-compatible chat provider for Groq.

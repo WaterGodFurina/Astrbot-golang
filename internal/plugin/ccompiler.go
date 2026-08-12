@@ -15,7 +15,7 @@ import (
 
 	"github.com/mholt/archives"
 
-	"github.com/AstrBotDevs/AstrBot/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 )
 
 // CCompilerPromptKind identifies which prompt the user must answer before a

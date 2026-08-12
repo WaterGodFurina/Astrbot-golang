@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AstrBotDevs/AstrBot/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
 )
 
 // Conversation represents a chat conversation.
