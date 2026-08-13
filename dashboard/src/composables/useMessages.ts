@@ -1130,6 +1130,15 @@ export function useMessages(options: UseMessagesOptions) {
 
     if (["image", "record", "file", "video"].includes(msgType)) {
       markMessageStarted(botRecord);
+      // Data URLs (e.g. locally rendered text-to-image) are rendered directly
+      // and do not need the file service.
+      if (typeof data === "string" && data.startsWith("data:")) {
+        messageContent(botRecord).message.push({
+          type: msgType,
+          embedded_url: data,
+        });
+        return;
+      }
       const rawFilename = String(data)
         .replace("[IMAGE]", "")
         .replace("[RECORD]", "")

@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,7 +46,7 @@ type Database struct {
 // 环境下构建和运行。DSN 参数写法与 mattn 不同（_pragma=...）。
 func New(dbPath string) (*Database, error) {
 	// WAL mode enables concurrent readers + one writer without "database is locked"
-	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)", dbPath)
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -445,6 +446,51 @@ func (d *Database) CreateConversation(convID, userID, platformID, content, title
 	return err
 }
 
+// UpsertConversation atomically persists a conversation: it checks existence
+// and performs INSERT-or-UPDATE inside a single transaction, so concurrent
+// persists cannot both decide to INSERT (unique-violation) or clobber each
+// other's history. Callers that previously did GetConversationByID + Update/
+// Create (a classic TOCTOU race) should switch to this.
+func (d *Database) UpsertConversation(convID, userID, platformID, content, title, personaID string) error {
+	return d.withRetry(func() error {
+		tx, err := d.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		var exists int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM conversations WHERE conversation_id = ?`, convID,
+		).Scan(&exists); err != nil {
+			return err
+		}
+		if exists > 0 {
+			if _, err := tx.Exec(
+				`UPDATE conversations SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?`,
+				content, convID,
+			); err != nil {
+				return err
+			}
+			if title != "" {
+				if _, err := tx.Exec(
+					`UPDATE conversations SET title = ? WHERE conversation_id = ?`, title, convID,
+				); err != nil {
+					return err
+				}
+			}
+		} else {
+			if _, err := tx.Exec(
+				`INSERT INTO conversations (conversation_id, platform_id, user_id, content, title, persona_id)
+				 VALUES (?, ?, ?, ?, ?, ?)`,
+				convID, platformID, userID, content, title, personaID,
+			); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+}
+
 // GetConversationByUserID returns the most recent conversation for a user
 // (unified_msg_origin), or an empty row with found=false.
 func (d *Database) GetConversationByUserID(userID string) (ConversationRow, bool, error) {
@@ -551,12 +597,14 @@ type CronJobRow struct {
 
 // CreateCronJob inserts a new cron job.
 func (d *Database) CreateCronJob(jobID, name, description, jobType, cronExpr, timezone, payload string, runOnce bool) error {
-	_, err := d.db.Exec(
-		`INSERT INTO cron_jobs (job_id, name, description, job_type, cron_expression, timezone, payload, enabled, persistent, run_once, status)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'scheduled')`,
-		jobID, name, description, jobType, cronExpr, timezone, payload, boolInt(runOnce),
-	)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO cron_jobs (job_id, name, description, job_type, cron_expression, timezone, payload, enabled, persistent, run_once, status)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'scheduled')`,
+			jobID, name, description, jobType, cronExpr, timezone, payload, boolInt(runOnce),
+		)
+		return err
+	})
 }
 
 // ListCronJobs returns all cron jobs ordered by created_at.
@@ -603,6 +651,23 @@ func (d *Database) GetCronJob(jobID string) (CronJobRow, bool, error) {
 	return row, true, nil
 }
 
+// cronJobWritableFields is the allowlist of columns UpdateCronJob may touch.
+// Using a fixed allowlist (rather than interpolating map keys) prevents SQL
+// injection through arbitrary field names.
+var cronJobWritableFields = map[string]bool{
+	"name":             true,
+	"description":      true,
+	"job_type":         true,
+	"cron_expression":  true,
+	"timezone":         true,
+	"payload":          true,
+	"status":           true,
+	"persistent":       true,
+	"enabled":          true,
+	"run_once":         true,
+	"next_run_time":    true,
+}
+
 // UpdateCronJob patches a cron job's mutable fields.
 func (d *Database) UpdateCronJob(jobID string, fields map[string]interface{}) error {
 	if len(fields) == 0 {
@@ -611,16 +676,22 @@ func (d *Database) UpdateCronJob(jobID string, fields map[string]interface{}) er
 	set := ""
 	args := []interface{}{}
 	for k, v := range fields {
+		if !cronJobWritableFields[k] {
+			return fmt.Errorf("UpdateCronJob: unknown field %q", k)
+		}
 		if set != "" {
 			set += ", "
 		}
 		switch k {
-		case "enabled":
+		case "enabled", "run_once", "persistent":
+			// Accept bool or JSON-ish int; reject other types instead of
+			// panicking on an unsafe type assertion.
+			b, err := asBool(v)
+			if err != nil {
+				return fmt.Errorf("UpdateCronJob: field %q: %w", k, err)
+			}
 			set += k + " = ?"
-			args = append(args, boolInt(v.(bool)))
-		case "run_once":
-			set += k + " = ?"
-			args = append(args, boolInt(v.(bool)))
+			args = append(args, boolInt(b))
 		default:
 			set += k + " = ?"
 			args = append(args, v)
@@ -628,23 +699,52 @@ func (d *Database) UpdateCronJob(jobID string, fields map[string]interface{}) er
 	}
 	set += ", updated_at = CURRENT_TIMESTAMP"
 	args = append(args, jobID)
-	_, err := d.db.Exec(`UPDATE cron_jobs SET `+set+` WHERE job_id = ?`, args...)
-	return err
+	query := `UPDATE cron_jobs SET ` + set + ` WHERE job_id = ?`
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(query, args...)
+		return err
+	})
+}
+
+// asBool coerces a config value to bool without panicking on the wrong type.
+func asBool(v interface{}) (bool, error) {
+	switch t := v.(type) {
+	case bool:
+		return t, nil
+	case int:
+		return t != 0, nil
+	case int64:
+		return t != 0, nil
+	case float64:
+		return t != 0, nil
+	case string:
+		b, err := strconv.ParseBool(t)
+		if err != nil {
+			return false, fmt.Errorf("invalid bool value %q", t)
+		}
+		return b, nil
+	default:
+		return false, fmt.Errorf("unexpected type %T", v)
+	}
 }
 
 // SetCronJobNextRun updates next_run_time.
 func (d *Database) SetCronJobNextRun(jobID, nextRunTime string) error {
-	_, err := d.db.Exec(
-		`UPDATE cron_jobs SET next_run_time = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?`,
-		nextRunTime, jobID,
-	)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`UPDATE cron_jobs SET next_run_time = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?`,
+			nextRunTime, jobID,
+		)
+		return err
+	})
 }
 
 // DeleteCronJob removes a cron job.
 func (d *Database) DeleteCronJob(jobID string) error {
-	_, err := d.db.Exec(`DELETE FROM cron_jobs WHERE job_id = ?`, jobID)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(`DELETE FROM cron_jobs WHERE job_id = ?`, jobID)
+		return err
+	})
 }
 
 func boolInt(b bool) int {

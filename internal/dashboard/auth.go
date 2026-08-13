@@ -145,16 +145,13 @@ func (pm *PasswordManager) generateAndStorePassword() {
 	authLogger.Info("")
 }
 
-// saveToConfig writes the password hash to the config JSON file. 明文密码不再
-// 落盘（仅保留 pbkdf2_password 哈希）；旧配置中的明文 password 字段由
-// NewPasswordManager 读取，用于向后兼容校验。
+// saveToConfig writes the username/password to the config JSON file.
+// 与 Python AstrBot 一致，dashboard.username 与 dashboard.password（明文）都要
+// 落盘，保证首次登录改密后凭据持久化、重启后依然可登录；pbkdf2_password 为
+// 校验用的哈希（password_storage_upgraded=true 表示已启用哈希校验）。明文
+// 密码字段在用户通过 SetPassword 设置过时才写入，避免覆盖未知的旧值。
 func (pm *PasswordManager) saveToConfig(plaintextPassword string) {
-	cfg := make(map[string]interface{})
-
-	// Load existing config
-	if data, err := os.ReadFile(pm.configPath); err == nil {
-		json.Unmarshal(data, &cfg)
-	}
+	cfg := loadConfigOrNew(pm.configPath)
 
 	dash, ok := cfg["dashboard"].(map[string]interface{})
 	if !ok {
@@ -167,18 +164,25 @@ func (pm *PasswordManager) saveToConfig(plaintextPassword string) {
 	dash["pbkdf2_password"] = pm.hashedPassword
 	dash["password_change_required"] = pm.passwordChangeRequired
 	dash["password_storage_upgraded"] = true
+	plain := pm.plainPassword
 	pm.mu.RUnlock()
+	if plain != "" {
+		dash["password"] = plain
+	}
 
-	data, _ := json.MarshalIndent(cfg, "", "  ")
-	_ = writeConfigFile(pm.configPath, data)
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		authLogger.Error("saveToConfig: marshal config: %v", err)
+		return
+	}
+	if err := writeConfigFile(pm.configPath, data); err != nil {
+		authLogger.Error("saveToConfig: write config: %v", err)
+	}
 }
 
 // ensureJWTSecret generates a random JWT secret if none exists.
 func (pm *PasswordManager) ensureJWTSecret() {
-	cfg := make(map[string]interface{})
-	if data, err := os.ReadFile(pm.configPath); err == nil {
-		json.Unmarshal(data, &cfg)
-	}
+	cfg := loadConfigOrNew(pm.configPath)
 
 	dash, ok := cfg["dashboard"].(map[string]interface{})
 	if !ok {
@@ -195,9 +199,36 @@ func (pm *PasswordManager) ensureJWTSecret() {
 	pm.jwtSecret = generateRandomToken(32)
 	dash["jwt_secret"] = pm.jwtSecret
 
-	data, _ := json.MarshalIndent(cfg, "", "  ")
-	_ = writeConfigFile(pm.configPath, data)
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		authLogger.Error("ensureJWTSecret: marshal config: %v", err)
+		return
+	}
+	if err := writeConfigFile(pm.configPath, data); err != nil {
+		authLogger.Error("ensureJWTSecret: write config: %v", err)
+	}
 	authLogger.Info("Initialized random JWT secret for dashboard.")
+}
+
+// loadConfigOrNew reads a JSON config file into a map. If the file is missing
+// it returns an empty map; if it is corrupt it logs and backs the file up
+// before returning an empty map, so a later save never silently wipes other
+// configuration that it failed to parse.
+func loadConfigOrNew(path string) map[string]interface{} {
+	cfg := make(map[string]interface{})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			authLogger.Error("loadConfigOrNew: read %s: %v", path, err)
+		}
+		return cfg
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		backup := path + ".corrupt.bak"
+		authLogger.Error("loadConfigOrNew: %s has invalid JSON (%v); backing up to %s", path, err, backup)
+		_ = os.WriteFile(backup, data, 0o600)
+	}
+	return cfg
 }
 
 // writeConfigFile 将配置以 0600 权限原子写入（temp + rename），避免明文
@@ -300,6 +331,14 @@ func (pm *PasswordManager) HashedPassword() string {
 	return pm.hashedPassword
 }
 
+// PlainPassword returns the plaintext dashboard password (empty when only a
+// PBKDF2 hash was loaded and no plaintext was ever persisted).
+func (pm *PasswordManager) PlainPassword() string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.plainPassword
+}
+
 // PasswordChangeRequired returns whether the user must change their password.
 func (pm *PasswordManager) PasswordChangeRequired() bool {
 	pm.mu.RLock()
@@ -328,10 +367,20 @@ func generateRandomPassword() string {
 	return string(chars)
 }
 
+// mustRandRead fills b with cryptographically secure random bytes. crypto/rand
+// only fails when the OS entropy source is broken; on the auth/security paths
+// that would silently weaken tokens/salts, so failing hard is preferable to
+// continuing with predictable randomness.
+func mustRandRead(b []byte) {
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand: " + err.Error())
+	}
+}
+
 // generateRandomToken creates a random hex token of the given byte length.
 func generateRandomToken(byteLen int) string {
 	b := make([]byte, byteLen)
-	rand.Read(b)
+	mustRandRead(b)
 	return fmt.Sprintf("%x", b)
 }
 
@@ -340,7 +389,7 @@ func generateRandomToken(byteLen int) string {
 // Compatible with Python AstrBot's auth_password.py hash_dashboard_password().
 func hashPBKDF2(password string) string {
 	salt := make([]byte, 16)
-	rand.Read(salt)
+	mustRandRead(salt)
 	saltHex := hex.EncodeToString(salt)
 	iterations := 600000
 	dk := pbkdf2.Key([]byte(password), salt, iterations, 32, sha256.New)
@@ -374,7 +423,7 @@ func isPBKDF2Hash(stored string) bool {
 // randomChoice picks a random byte from the given charset.
 func randomChoice(charset string) byte {
 	b := make([]byte, 1)
-	rand.Read(b)
+	mustRandRead(b)
 	return charset[int(b[0])%len(charset)]
 }
 
@@ -382,7 +431,7 @@ func randomChoice(charset string) byte {
 func shuffleBytes(b []byte) {
 	for i := len(b) - 1; i > 0; i-- {
 		j := make([]byte, 1)
-		rand.Read(j)
+		mustRandRead(j)
 		idx := int(j[0]) % (i + 1)
 		b[i], b[idx] = b[idx], b[i]
 	}
@@ -511,12 +560,15 @@ func (pm *PasswordManager) RegisterToken(token string) {
 }
 
 // SetUsername updates the dashboard username.
+// SetUsername updates the dashboard username and persists it to config (so a
+// first-time account rename survives restarts).
 func (pm *PasswordManager) SetUsername(username string) {
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	if username != "" {
 		pm.username = username
 	}
+	pm.mu.Unlock()
+	pm.saveToConfig("")
 }
 
 // SetPassword updates the dashboard password (re-hashes).
@@ -820,7 +872,7 @@ func generateRecoveryCodes(count int) []string {
 	codes := make([]string, 0, count)
 	for i := 0; i < count; i++ {
 		b := make([]byte, recoveryCodeLength)
-		rand.Read(b)
+		mustRandRead(b)
 		var sb strings.Builder
 		sb.Grow(recoveryCodeLength)
 		for _, x := range b {

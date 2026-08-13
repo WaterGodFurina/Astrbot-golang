@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -125,7 +126,11 @@ func (a *Adapter) Stop() error {
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	segments := a.convertToCQFormat(chain)
 	params := map[string]interface{}{"message": segments}
+	// groupConvs is written by the WS read loop under a.mu; read it under the
+	// same lock so Send (running on pipeline/plugin goroutines) cannot race.
+	a.mu.Lock()
 	isGroup := a.groupConvs[sessionID]
+	a.mu.Unlock()
 	if isGroup {
 		params["group_id"] = sessionID
 	} else {
@@ -336,13 +341,15 @@ func (a *Adapter) CallAction(api string, params map[string]any) (map[string]any,
 // actionTimeout bounds how long CallAction waits for an echo response.
 const actionTimeout = 10 * time.Second
 
+// actionSeq is a process-wide monotonic counter producing unique echo strings
+// for OneBot actions. Concurrent plugin goroutines call CallAction, so the
+// counter must be updated atomically (a plain int read-modify-write races).
 var actionSeq = &actionCounter{}
 
 type actionCounter struct{ n int64 }
 
 func (c *actionCounter) Add(delta int64) int64 {
-	c.n += delta
-	return c.n
+	return atomic.AddInt64(&c.n, delta)
 }
 
 // parseActionResult unwraps the OneBot v11 response envelope, returning its
@@ -670,9 +677,21 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 				"data": map[string]interface{}{"id": c.MessageID},
 			})
 		case *message.Image:
+			imgData := map[string]interface{}{}
+			switch {
+			case c.Base64 != "":
+				imgData["file"] = "base64://" + c.Base64
+			case c.Path != "":
+				imgData["file"] = c.Path
+			case c.File != "":
+				imgData["file"] = c.File
+			case c.URL != "":
+				imgData["url"] = c.URL
+				imgData["file"] = c.URL
+			}
 			segments = append(segments, map[string]interface{}{
 				"type": "image",
-				"data": map[string]interface{}{"url": c.URL, "file": c.URL},
+				"data": imgData,
 			})
 		case *message.Record:
 			segments = append(segments, map[string]interface{}{

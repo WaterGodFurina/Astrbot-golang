@@ -15,6 +15,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -42,6 +43,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -693,6 +695,12 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 }
 
 func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	// Prefer the event's own execution context (e.g. a WebSocket session that
+	// can be cancelled by an interrupt) over the dispatch loop's process-level
+	// context, so cancelling one run does not affect the whole bus.
+	if event.Ctx != nil {
+		ctx = event.Ctx
+	}
 	// Run subprocess plugin on_message hooks (mirrors Python's
 	// @filter.on_message): plugins observe every incoming message.
 	dispatchSubprocessHooks(s.subPlugins, event, "on_message")
@@ -1454,8 +1462,8 @@ func buildToolCallsMessage(resp *provider.LLMResponse) []map[string]interface{} 
 
 // dispatchSubprocessHooks runs every loaded subprocess plugin's hooks whose
 // Event matches the given event name. These are pipeline-adjacent events
-// (on_message, on_llm_response, on_after_message_sent, on_waiting_llm_request)
-// that are not star filter handlers.
+// (on_message, on_llm_response, on_after_message_sent, on_waiting_llm_request,
+// on_tool_call) that are not star filter handlers.
 func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, hookEvent string) {
 	if sub == nil {
 		return
@@ -1918,6 +1926,17 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 	umo := event.UnifiedMsgOrigin()
 	logger.Debug("executeTool: name=%s args=%v", name, args)
 
+	// Dispatch registered plugins' on_tool_call hooks before executing the tool,
+	// stashing the tool name/args on the event metadata for them to read.
+	if s.subPlugins != nil {
+		if event.Metadata == nil {
+			event.Metadata = make(map[string]interface{})
+		}
+		event.Metadata["tool_name"] = name
+		event.Metadata["tool_args"] = args
+		dispatchSubprocessHooks(s.subPlugins, event, "on_tool_call")
+	}
+
 	result := ""
 	handled := false
 	if runtime == "sandbox" {
@@ -2165,6 +2184,14 @@ type ResultDecorateStage struct {
 	replyWithQuote   bool
 	maxSegmentLength int
 	subPlugins       *plugin.SubprocessManager
+
+	// t2i (text-to-image) settings from the top-level config.
+	t2iEnabled        bool
+	t2iWordThreshold  int
+	t2iStrategy       string // "local" | "remote"
+	t2iEndpoint       string
+	t2iTemplate       string
+	t2iUseFileService bool
 }
 
 func NewResultDecorateStage() *ResultDecorateStage {
@@ -2179,6 +2206,29 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 	s.replyWithMention = ps.ReplyWithMention
 	s.replyWithQuote = ps.ReplyWithQuote
 	s.subPlugins = ctx.SubPlugins
+
+	// t2i top-level keys: t2i (bool), t2i_word_threshold, t2i_strategy
+	// (local/remote), t2i_endpoint, t2i_active_template, t2i_use_file_service.
+	s.t2iEnabled, _ = ctx.AstrbotConfig["t2i"].(bool)
+	s.t2iWordThreshold = 150
+	switch v := ctx.AstrbotConfig["t2i_word_threshold"].(type) {
+	case float64:
+		if v > 0 {
+			s.t2iWordThreshold = int(v)
+		}
+	case int:
+		if v > 0 {
+			s.t2iWordThreshold = v
+		}
+	case int64:
+		if v > 0 {
+			s.t2iWordThreshold = int(v)
+		}
+	}
+	s.t2iStrategy, _ = ctx.AstrbotConfig["t2i_strategy"].(string)
+	s.t2iEndpoint, _ = ctx.AstrbotConfig["t2i_endpoint"].(string)
+	s.t2iTemplate, _ = ctx.AstrbotConfig["t2i_active_template"].(string)
+	s.t2iUseFileService, _ = ctx.AstrbotConfig["t2i_use_file_service"].(bool)
 	return nil
 }
 
@@ -2222,6 +2272,15 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		event.Result.Chain = newChain
 	}
 
+	// Text-to-image: when enabled and the reply is long enough, replace the
+	// plain text with a rendered image (local gg engine or remote t2i service).
+	if s.t2iEnabled {
+		if err := s.applyT2I(event); err != nil {
+			// On failure keep the original text reply.
+			logger.I18nWarn("t2i 转换失败，回退文本回复: %v", err)
+		}
+	}
+
 	// Run subprocess plugin on_decorating_result hooks (may rewrite the chain,
 	// e.g. message transforms) and stop the pipeline if requested.
 	if s.subPlugins != nil && len(event.Result.Chain) > 0 {
@@ -2239,6 +2298,80 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 	}
 
 	return &StageResult{Continue: true}, nil
+}
+
+// applyT2I converts a long plain-text reply into an image when the t2i option
+// is enabled and the text length reaches t2i_word_threshold. Non-text
+// components (at/quote/reply) are preserved; the plain text is replaced by an
+// Image component carrying the rendered bytes as base64.
+func (s *ResultDecorateStage) applyT2I(event *core.Event) error {
+	// Streaming replies already delivered the text incrementally (sentence by
+	// sentence); converting to an image would duplicate the content. Only
+	// convert when the reply was produced non-streamed.
+	if streamed, _ := event.GetExtra("streamed").(bool); streamed {
+		return nil
+	}
+	chain := event.Result.Chain
+	if len(chain) == 0 {
+		return nil
+	}
+	var text strings.Builder
+	for _, comp := range chain {
+		if p, ok := comp.(*message.Plain); ok {
+			text.WriteString(p.Text)
+		}
+	}
+	trimmed := strings.TrimSpace(text.String())
+	if trimmed == "" {
+		return nil
+	}
+	if len([]rune(trimmed)) < s.t2iWordThreshold {
+		return nil
+	}
+
+	var imgData []byte
+	var err error
+	switch s.t2iStrategy {
+	case "local":
+		imgData, err = renderLocalT2I(trimmed, s.t2iTemplate)
+	case "remote", "":
+		if s.t2iEndpoint == "" {
+			// No remote t2i service configured: fall back to the built-in
+			// local renderer so the feature works out of the box.
+			logger.I18nWarn("t2i_strategy=remote 但未配置 t2i_endpoint，已回退到本地渲染")
+			imgData, err = renderLocalT2I(trimmed, s.t2iTemplate)
+			break
+		}
+		imgData, err = t2i.RenderRemote(s.t2iEndpoint, trimmed, s.t2iTemplate)
+	default:
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	img := message.ImageFromBase64(base64.StdEncoding.EncodeToString(imgData))
+	newChain := make([]message.Component, 0, len(chain)+1)
+	for _, comp := range chain {
+		if _, ok := comp.(*message.Plain); ok {
+			continue // drop the text that has been rendered into the image
+		}
+		newChain = append(newChain, comp)
+	}
+	newChain = append(newChain, img)
+	event.Result.Chain = newChain
+	return nil
+}
+
+// renderLocalT2I renders text locally with the gg engine. A system CJK font is
+// used when no font path is configured (the renderer falls back automatically).
+func renderLocalT2I(text, templateName string) ([]byte, error) {
+	opts := t2i.ImageOptions{}
+	if templateName != "" && templateName != "base" {
+		// templateName only affects the (optional) title in future templates;
+		// it is accepted for forward compatibility.
+	}
+	return t2i.RenderTextToPNG(text, opts)
 }
 
 // applyResultHooks runs every loaded subprocess plugin's on_decorating_result
@@ -2349,6 +2482,20 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	// Content was already streamed to the platform incrementally by
 	// ProcessStage; skip the duplicate final send.
 	if streamed, _ := event.GetExtra("streamed").(bool); streamed {
+		// The plain text was already streamed out. However, the result chain
+		// may still carry media components produced after streaming (e.g. a
+		// t2i-rendered image that replaced the text). Those must still be
+		// delivered; only a pure-text chain is skipped to avoid duplication.
+		if s.platformMgr != nil {
+			media := mediaOnlyChain(event.Result)
+			if len(media) > 0 {
+				chain := event.Result.ToMessageChain()
+				chain.Chain = media
+				if err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain); err != nil {
+					logger.Error("Failed to send streamed media chain: %v", err)
+				}
+			}
+		}
 		return &StageResult{Continue: false}, nil
 	}
 
@@ -2394,6 +2541,25 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// mediaOnlyChain keeps only non-plain-text components (Image/File/Video/
+// Record) from a result, dropping At/Reply/Plain. Used to deliver media after
+// the text was already streamed out.
+func mediaOnlyChain(result *message.MessageEventResult) []message.Component {
+	if result == nil {
+		return nil
+	}
+	var media []message.Component
+	for _, comp := range result.Chain {
+		switch comp.(type) {
+		case *message.Plain, *message.At, *message.Reply:
+			continue
+		default:
+			media = append(media, comp)
+		}
+	}
+	return media
+}
 
 // extractPlainText extracts all plain text from a message chain.
 func extractPlainText(mc *message.MessageChain) string {

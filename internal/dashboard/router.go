@@ -171,9 +171,7 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		}))
 
 	default:
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "endpoint not yet implemented: " + category,
-		}))
+		writeJSON(w, http.StatusNotFound, apiError("unknown endpoint: /api/"+category))
 	}
 }
 

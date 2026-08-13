@@ -93,16 +93,17 @@ func TestHandlersReturnNamedObjects(t *testing.T) {
 			}
 		}},
 		{"GET", "/api/children", func(t *testing.T, body string) {
+			// Unknown endpoints must return an error (404 semantics) instead of
+			// a fake 200 success with an empty data object.
 			var v map[string]interface{}
 			if err := json.Unmarshal([]byte(body), &v); err != nil {
 				t.Fatalf("invalid json: %v", err)
 			}
-			data, ok := v["data"].(map[string]interface{})
-			if !ok {
-				t.Fatalf("expected data object, got: %T", v["data"])
+			if v["status"] != "error" {
+				t.Errorf("expected error status for unknown endpoint, got: %s", body)
 			}
-			if len(data) == 0 {
-				t.Errorf("expected non-empty data object, got: %s", body)
+			if _, ok := v["data"]; ok {
+				t.Errorf("unexpected data key for unknown endpoint: %s", body)
 			}
 		}},
 		{"GET", "/api/personas", func(t *testing.T, body string) {

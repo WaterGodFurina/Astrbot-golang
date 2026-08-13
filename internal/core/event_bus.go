@@ -60,6 +60,11 @@ type Event struct {
 	Reply      *Event // quoted reply target
 	Metadata   map[string]interface{}
 
+	// Ctx, when set, is the execution context for this event's pipeline run
+	// (e.g. a WebSocket chat session). Stages use it in place of the dispatch
+	// loop's context so a caller can cancel just this run (interrupt).
+	Ctx context.Context
+
 	// Pipeline state
 	MessageObj        *MessageObj
 	PlainText         string
@@ -179,23 +184,36 @@ type StageResult struct {
 type EventBus struct {
 	mu         sync.RWMutex
 	schedulers map[string]*PipelineScheduler // keyed by config_id
-	queue      chan *Event
-	stopCh     chan struct{}
-	done       chan struct{} // closed when the dispatch loop exits
-	stopOnce   sync.Once     // 保证 stopCh 只 close 一次（Stop 可被重复调用）
+	// queue is a growable slice guarded by queueMu. It replaces the previous
+	// fixed-capacity channel: Publish never drops events (it blocks once the
+	// queue reaches maxQueueCap) and the queue auto-grows under bursts.
+	queueMu   sync.Mutex
+	cond      *sync.Cond
+	queue     []*Event
+	queueCap  int
+	stopCh    chan struct{}
+	done      chan struct{} // closed when the dispatch loop exits
+	stopOnce  sync.Once     // 保证 stopCh 只 close 一次（Stop 可被重复调用）
 }
+
+// maxQueueCap bounds how large the event queue may grow before Publish blocks.
+// Events are pointers, so even 100k buffered events cost only a few MB — the
+// bound exists to avoid unbounded growth, not to save memory.
+const maxQueueCap = 100000
 
 // NewEventBus creates a new event bus.
 func NewEventBus(bufferSize int) *EventBus {
 	if bufferSize <= 0 {
 		bufferSize = 1000
 	}
-	return &EventBus{
+	bus := &EventBus{
 		schedulers: make(map[string]*PipelineScheduler),
-		queue:      make(chan *Event, bufferSize),
+		queueCap:   bufferSize,
 		stopCh:     make(chan struct{}),
 		done:       make(chan struct{}),
 	}
+	bus.cond = sync.NewCond(&bus.queueMu)
+	return bus
 }
 
 // RegisterScheduler adds a pipeline scheduler.
@@ -215,26 +233,64 @@ func (bus *EventBus) GetScheduler(confID string) *PipelineScheduler {
 // Start begins dispatching events.
 func (bus *EventBus) Start(ctx context.Context) error {
 	defer close(bus.done)
-	for {
+	// Wake a cond.Wait() blocked with an empty queue when the context is
+	// cancelled (shutdown); Stop() already broadcasts via stopCh.
+	go func() {
 		select {
-		case event := <-bus.queue:
-			bus.dispatch(ctx, event)
 		case <-ctx.Done():
-			return ctx.Err()
-		case <-bus.stopCh:
+			bus.queueMu.Lock()
+			bus.cond.Broadcast()
+			bus.queueMu.Unlock()
+		case <-bus.done:
+		}
+	}()
+	for {
+		bus.queueMu.Lock()
+		for len(bus.queue) == 0 && !bus.isStopped() {
+			bus.cond.Wait()
+			select {
+			case <-ctx.Done():
+				bus.queueMu.Unlock()
+				return ctx.Err()
+			default:
+			}
+		}
+		if len(bus.queue) == 0 {
+			// stopped and drained
+			bus.queueMu.Unlock()
 			return nil
 		}
+		event := bus.queue[0]
+		bus.queue = bus.queue[1:]
+		bus.cond.Broadcast() // wake blocked publishers
+		bus.queueMu.Unlock()
+		bus.dispatch(ctx, event)
 	}
 }
 
-// Publish enqueues an event for processing.
+// Publish enqueues an event for processing. It never drops events: the queue
+// auto-grows under bursts, and once it reaches maxQueueCap Publish blocks until
+// a slot frees (back-pressure) or the bus stops.
 func (bus *EventBus) Publish(event *Event) error {
-	select {
-	case bus.queue <- event:
-		return nil
-	default:
-		return fmt.Errorf("event bus queue full")
+	bus.queueMu.Lock()
+	defer bus.queueMu.Unlock()
+	for len(bus.queue) >= bus.queueCap && bus.queueCap >= maxQueueCap && !bus.isStopped() {
+		bus.cond.Wait()
 	}
+	if bus.isStopped() {
+		return fmt.Errorf("event bus stopped")
+	}
+	if len(bus.queue) >= bus.queueCap && bus.queueCap < maxQueueCap {
+		old := bus.queueCap
+		bus.queueCap *= 2
+		if bus.queueCap > maxQueueCap {
+			bus.queueCap = maxQueueCap
+		}
+		logger.I18nWarn("EventBus 队列已自动扩容: %d → %d（事件 %q）", old, bus.queueCap, event.MessageStr)
+	}
+	bus.queue = append(bus.queue, event)
+	bus.cond.Signal()
+	return nil
 }
 
 // isStopped 报告事件总线是否已停止（非阻塞检查 stopCh 是否已关闭）。
@@ -249,8 +305,7 @@ func (bus *EventBus) isStopped() bool {
 
 // PublishDelayed re-enqueues an event after the given delay. Used by the
 // rate-limit stall strategy so an over-window message is processed once the
-// window frees up instead of being dropped. If the queue is still full when
-// the timer fires, the event is dropped.
+// window frees up instead of being dropped.
 func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 	if delay <= 0 {
 		if err := bus.Publish(event); err != nil {
@@ -259,13 +314,11 @@ func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 		return
 	}
 	time.AfterFunc(delay, func() {
-		// Stop 之后 bus 已无人消费：延迟闭包触发时若已停止则直接丢弃事件，
-		// 避免往无人消费的队列继续入队。
 		if bus.isStopped() {
 			return
 		}
 		if err := bus.Publish(event); err != nil {
-			logger.I18nWarn("延迟发布失败（队列已满，事件被丢弃）: %v", err)
+			logger.I18nWarn("延迟发布失败（事件被丢弃）: %v", err)
 		}
 	})
 }
@@ -274,7 +327,12 @@ func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 // a bounded timeout). Callers must stop the bus before closing the database so
 // no in-flight event can touch storage after it is closed.
 func (bus *EventBus) Stop() {
-	bus.stopOnce.Do(func() { close(bus.stopCh) })
+	bus.stopOnce.Do(func() {
+		bus.queueMu.Lock()
+		close(bus.stopCh)
+		bus.cond.Broadcast()
+		bus.queueMu.Unlock()
+	})
 	select {
 	case <-bus.done:
 	case <-time.After(eventBusStopTimeout):

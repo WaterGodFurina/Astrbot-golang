@@ -374,8 +374,20 @@ func (m *CronJobManager) persist(job *Job) {
 	if m.db == nil {
 		return
 	}
-	payloadJSON, _ := json.Marshal(job.Payload)
-	if _, found, err := m.db.GetCronJob(job.ID); err == nil && found {
+	payloadJSON, err := json.Marshal(job.Payload)
+	if err != nil {
+		logger.Error("Failed to marshal cron job %s payload: %v", job.ID, err)
+		return
+	}
+	_, found, err := m.db.GetCronJob(job.ID)
+	if err != nil {
+		// Distinguish "not found" (normal first persist) from a real DB error
+		// (e.g. SQLITE_BUSY): the old code silently fell through to Create and
+		// could duplicate the job.
+		logger.Error("Failed to read cron job %s before persist: %v", job.ID, err)
+		return
+	}
+	if found {
 		if err := m.db.UpdateCronJob(job.ID, map[string]interface{}{
 			"name":            job.Name,
 			"description":     job.Description,

@@ -217,13 +217,20 @@ func (l *Logger) Subscribe(buf int) <-chan LogEntry {
 }
 
 // Unsubscribe removes a subscriber channel.
+//
+// It deliberately does NOT close the channel: log() snapshots the subscriber
+// list without holding the lock and may still send to an unsubscribed channel
+// in flight. Closing it there would race with those sends and panic with
+// "send on closed channel". Subscribers are expected to exit via their own
+// lifetime signal (the SSE handler uses r.Context().Done()); once removed from
+// the list the channel is no longer written to and is garbage collected when
+// the subscriber drops its reference.
 func (l *Logger) Unsubscribe(ch <-chan LogEntry) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for i, sub := range l.subscribers {
 		if sub == ch {
 			l.subscribers = append(l.subscribers[:i], l.subscribers[i+1:]...)
-			close(sub)
 			return
 		}
 	}

@@ -5,6 +5,7 @@ package platform
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -320,8 +321,11 @@ func (e *AstrMessageEvent) CleanupTemporaryFiles() {
 	e.TemporaryFiles = nil
 	e.mu.Unlock()
 	for _, path := range files {
-		// best-effort cleanup
-		_ = path // os.Remove would be called here
+		// best-effort cleanup: a removal failure (e.g. file already deleted by
+		// a plugin) must not abort the remaining files.
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			logger.Debug("CleanupTemporaryFiles: remove %s: %v", path, err)
+		}
 	}
 }
 

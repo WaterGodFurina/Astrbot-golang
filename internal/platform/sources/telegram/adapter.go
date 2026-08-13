@@ -3,11 +3,16 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -77,9 +82,41 @@ func (a *Adapter) ID() string { return "telegram" }
 // Type returns the platform type.
 func (a *Adapter) Type() string { return "telegram" }
 
-// Send sends a message chain to a Telegram chat.
+// Send sends a message chain to a Telegram chat. Supports text, images
+// (sendPhoto), voice (sendVoice), documents (sendDocument) and video
+// (sendVideo). FileID / public https URLs are passed through directly;
+// local paths and base64 payloads are uploaded as multipart/form-data.
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
-	text := extractPlainText(chain)
+	if chain == nil {
+		return nil
+	}
+	var textParts []string
+	for _, comp := range chain.Chain {
+		switch c := comp.(type) {
+		case *message.Plain:
+			textParts = append(textParts, c.Text)
+		case *message.Image:
+			if err := a.sendMedia(sessionID, "sendPhoto", "photo", c.FileID, c.URL, c.Path, c.File, c.Base64); err != nil {
+				return err
+			}
+		case *message.Record:
+			if err := a.sendMedia(sessionID, "sendVoice", "voice", c.FileID, c.URL, c.Path, c.File, c.Base64); err != nil {
+				return err
+			}
+		case *message.File:
+			if err := a.sendMedia(sessionID, "sendDocument", "document", c.FileID, c.URL, c.Path, "", ""); err != nil {
+				return err
+			}
+		case *message.Video:
+			if err := a.sendMedia(sessionID, "sendVideo", "video", c.FileID, c.URL, c.Path, "", ""); err != nil {
+				return err
+			}
+		}
+	}
+	text := strings.Join(textParts, "")
+	if text == "" {
+		return nil
+	}
 	params := map[string]interface{}{
 		"chat_id": sessionID,
 		"text":    text,
@@ -89,6 +126,103 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	defer cancel()
 	_, err := a.apiCall(ctx, "sendMessage", params)
 	return err
+}
+
+// sendMedia sends a single media component via the given Telegram method.
+func (a *Adapter) sendMedia(sessionID, method, field, fileID, url, path, file, b64 string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// 1. file_id: reuse an already-uploaded Telegram file.
+	if fileID != "" {
+		_, err := a.apiCall(ctx, method, map[string]interface{}{
+			"chat_id": sessionID, field: fileID,
+		})
+		return err
+	}
+	// 2. public https URL: Telegram fetches it server-side.
+	if url != "" {
+		_, err := a.apiCall(ctx, method, map[string]interface{}{
+			"chat_id": sessionID, field: url,
+		})
+		return err
+	}
+	// 3. base64 payload: decode to a temp file and upload.
+	if b64 != "" {
+		raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+		if err != nil {
+			return fmt.Errorf("decode base64 media: %w", err)
+		}
+		tmp, err := os.CreateTemp("", "astrbot-tg-*")
+		if err != nil {
+			return err
+		}
+		tmpName := tmp.Name()
+		defer os.Remove(tmpName)
+		if _, err := tmp.Write(raw); err != nil {
+			tmp.Close()
+			return err
+		}
+		tmp.Close()
+		return a.sendMediaUpload(ctx, sessionID, method, field, tmpName)
+	}
+	// 4. local path / file.
+	localPath := path
+	if localPath == "" {
+		localPath = file
+	}
+	if localPath == "" {
+		return fmt.Errorf("%s: media has no file_id/url/path", method)
+	}
+	return a.sendMediaUpload(ctx, sessionID, method, field, localPath)
+}
+
+// sendMediaUpload uploads a local file as multipart/form-data.
+func (a *Adapter) sendMediaUpload(ctx context.Context, sessionID, method, field, filePath string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("open media %s: %w", filePath, err)
+	}
+	defer f.Close()
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile(field, filepath.Base(filePath))
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		return err
+	}
+	if err := writer.WriteField("chat_id", sessionID); err != nil {
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", a.apiBase+"/"+method, body)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode %s response: %w", method, err)
+	}
+	if ok, _ := result["ok"].(bool); !ok {
+		if desc, _ := result["description"].(string); desc != "" {
+			return fmt.Errorf("%s failed: %s", method, desc)
+		}
+		return fmt.Errorf("%s failed: %v", method, result)
+	}
+	return nil
 }
 
 // pollLoop continuously polls Telegram for updates.

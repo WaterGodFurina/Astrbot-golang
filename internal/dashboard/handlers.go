@@ -2115,13 +2115,107 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 		var body map[string]interface{}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		url, _ := body["url"].(string)
-		if url == "" {
-			writeJSON(w, http.StatusOK, apiError("缺少参数 url"))
+		if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
+			writeJSON(w, http.StatusOK, apiError("缺少或无效的参数 url"))
 			return
 		}
+		chunkSize := 512
+		chunkOverlap := 50
+		if v, ok := body["chunk_size"].(float64); ok && v > 0 {
+			chunkSize = int(v)
+		}
+		if v, ok := body["chunk_overlap"].(float64); ok && v >= 0 {
+			chunkOverlap = int(v)
+		}
+
+		// Download the remote content with a bounded timeout and size limit.
+		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("创建下载请求失败: "+err.Error()))
+			return
+		}
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("下载文档失败: "+err.Error()))
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			writeJSON(w, http.StatusOK, apiError(fmt.Sprintf("下载文档失败: HTTP %d", resp.StatusCode)))
+			return
+		}
+		content, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("读取文档内容失败: "+err.Error()))
+			return
+		}
+		if len(content) == 0 {
+			writeJSON(w, http.StatusOK, apiError("下载的文档内容为空"))
+			return
+		}
+
+		// Save under the KB documents directory like the multipart upload path.
+		dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			writeJSON(w, http.StatusOK, apiError("创建知识库数据目录失败: "+err.Error()))
+			return
+		}
+		name := filepath.Base(strings.TrimRight(url, "/"))
+		if name == "" || name == "." || name == "/" {
+			name = "imported"
+		}
+		dst := filepath.Join(dir, sanitizePath(name))
+		if err := os.WriteFile(dst, content, 0o644); err != nil {
+			writeJSON(w, http.StatusOK, apiError("保存文档失败: "+err.Error()))
+			return
+		}
+		mod := time.Now().UnixNano()
+		docID := fmt.Sprintf("doc_%d_%s", mod, name)
+		taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
+		s.recordKBTask(&kbUploadTask{
+			TaskID: taskID,
+			Status: "processing",
+			Stage:  "chunking",
+			Total:  100,
+		})
+
+		// Index asynchronously (chunk → embed → dual write), same as uploads.
+		go func() {
+			if _, err := s.indexKBFile(kbID, docID, name, content, chunkSize, chunkOverlap); err != nil {
+				s.recordKBTask(&kbUploadTask{
+					TaskID:       taskID,
+					Status:       "completed",
+					Stage:        "embedding_failed",
+					Current:      100,
+					Total:        100,
+					SuccessCount: 0,
+					FailedCount:  1,
+					Error:        err.Error(),
+				})
+				return
+			}
+			s.recordKBTask(&kbUploadTask{
+				TaskID:       taskID,
+				Status:       "completed",
+				Stage:        "completed",
+				Current:      100,
+				Total:        100,
+				SuccessCount: 1,
+				FailedCount:  0,
+			})
+		}()
+
 		writeJSON(w, http.StatusOK, apiOKMsg("文档导入任务已创建", map[string]interface{}{
-			"task_id":    fmt.Sprintf("task_%d", time.Now().UnixNano()),
+			"task_id":    taskID,
 			"file_count": 1,
+			"documents": []map[string]interface{}{{
+				"doc_id":    docID,
+				"doc_name":  name,
+				"file_size": len(content),
+			}},
 		}))
 		return
 	}

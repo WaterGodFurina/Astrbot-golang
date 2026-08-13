@@ -380,22 +380,22 @@ func (l *Lifecycle) syncSandboxBooter() {
 	}
 	all := cfg.All()
 	ps, _ := all["provider_settings"].(map[string]interface{})
-	runtime, _ := ps["computer_use_runtime"].(string)
+	computerUseRuntime, _ := ps["computer_use_runtime"].(string)
 	sandboxCfg, _ := ps["sandbox"].(map[string]interface{})
 	if sandboxCfg == nil {
 		sandboxCfg = map[string]interface{}{}
 	}
 
-	sig := runtime + "|" + string(mustJSON(sandboxCfg))
+	sig := computerUseRuntime + "|" + string(mustJSON(sandboxCfg))
 	if sig == l.sandboxSig {
 		return
 	}
 	l.sandboxSig = sig
 
 	booterType, _ := sandboxCfg["booter"].(string)
-	if runtime != "sandbox" {
+	if computerUseRuntime != "sandbox" {
 		l.sandboxMgr.SetBooter(nil)
-		logger.I18nInfo("沙盒启动器已清除（computer_use_runtime=%q）", runtime)
+		logger.I18nInfo("沙盒启动器已清除（computer_use_runtime=%q）", computerUseRuntime)
 		return
 	}
 
@@ -769,11 +769,11 @@ func (l *Lifecycle) RebridgePlugins() {
 // loadPlatforms reads the platform configs and instantiates adapters.
 func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 	if l.configMgr == nil || l.platformMgr == nil {
-		return nil
+		return fmt.Errorf("loadPlatforms: config manager or platform manager not initialized")
 	}
 	cfg := l.configMgr.Get("default")
 	if cfg == nil {
-		return nil
+		return fmt.Errorf("loadPlatforms: default config missing")
 	}
 	all := cfg.All()
 	platforms, _ := all["platform"].([]interface{})
@@ -781,6 +781,7 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 	if ps, ok := all["platform_settings"].(map[string]interface{}); ok {
 		settings = ps
 	}
+	loaded, skipped, failed := 0, 0, 0
 	for _, p := range platforms {
 		config, ok := p.(map[string]interface{})
 		if !ok {
@@ -796,11 +797,13 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 		// it off.
 		if enabled, ok := config["enable"].(bool); ok && !enabled {
 			logger.I18nInfo("平台 %s (%s) 在配置中已禁用，跳过", config["id"], ptype)
+			skipped++
 			continue
 		}
 		adapter, err := platform.CreatePlatform(ptype, config, settings)
 		if err != nil {
 			logger.Error("Failed to create platform %s: %v", ptype, err)
+			failed++
 			continue
 		}
 		if bus, ok := adapter.(platform.EventBusSetter); ok {
@@ -809,9 +812,14 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 		l.platformMgr.Register(adapter)
 		if err := adapter.Start(ctx); err != nil {
 			logger.Error("Failed to start platform %s: %v", ptype, err)
+			failed++
 			continue
 		}
 		logger.I18nInfo("平台 %s (%s) 已启动", adapter.ID(), adapter.Type())
+		loaded++
+	}
+	if loaded == 0 && (failed > 0 || skipped == 0) {
+		return fmt.Errorf("loadPlatforms: no platform started (created %d, failed %d, skipped %d)", loaded, failed, skipped)
 	}
 	return nil
 }

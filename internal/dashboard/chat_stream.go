@@ -198,10 +198,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 			for {
 				select {
 				case chain := <-ch:
-					if t := chainPlainText(chain); t != "" {
-						full.WriteString(t)
-						sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": t, "chain_type": "text"})
-					}
+					emitChainSSE(w, flusher, &full, chain)
 				default:
 					goto done
 				}
@@ -233,11 +230,20 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 			sendSSE(w, flusher, map[string]interface{}{"type": "end", "data": nil})
 			return
 		case chain := <-ch:
-			if t := chainPlainText(chain); t != "" {
-				full.WriteString(t)
-				sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": t, "chain_type": "text"})
-			}
+			emitChainSSE(w, flusher, &full, chain)
 		}
+	}
+}
+
+// emitChainSSE sends SSE frames for a reply chain: media components first
+// (images as data URLs), then the plain text.
+func emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full *strings.Builder, chain *message.MessageChain) {
+	for _, data := range chainImageDataURLs(chain) {
+		sendSSE(w, flusher, map[string]interface{}{"type": "image", "data": data})
+	}
+	if t := chainPlainText(chain); t != "" {
+		full.WriteString(t)
+		sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": t, "chain_type": "text"})
 	}
 }
 
@@ -279,6 +285,7 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, text, provider
 		IsAtOrWakeCommand: false,
 		CallLLM:           true,
 		Metadata:          map[string]interface{}{},
+		Ctx:               ctx,
 	}
 	if providerID != "" {
 		event.Metadata["selected_provider"] = providerID
@@ -330,6 +337,28 @@ func chainPlainText(chain *message.MessageChain) string {
 		}
 	}
 	return b.String()
+}
+
+// chainImageDataURLs returns the displayable image sources in a chain: base64
+// payloads become data URLs (no file service needed), https URLs pass through.
+func chainImageDataURLs(chain *message.MessageChain) []string {
+	if chain == nil {
+		return nil
+	}
+	var out []string
+	for _, comp := range chain.Chain {
+		img, ok := comp.(*message.Image)
+		if !ok {
+			continue
+		}
+		switch {
+		case img.Base64 != "":
+			out = append(out, "data:image/png;base64,"+img.Base64)
+		case img.URL != "":
+			out = append(out, img.URL)
+		}
+	}
+	return out
 }
 
 // plainTextFromParts joins the plain text of message parts.
@@ -393,6 +422,11 @@ type wsClient struct {
 	writeMu sync.Mutex
 	ctx     context.Context
 	cancel  context.CancelFunc
+
+	// runs tracks the cancel function of each in-flight chat run keyed by
+	// message_id, so an interrupt frame can cancel a specific (or all) run.
+	runMu sync.Mutex
+	runs  map[string]context.CancelFunc
 }
 
 // handleUnifiedChatWS serves the WebUI's websocket chat transport
@@ -413,7 +447,7 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wsCtx, wsCancel := context.WithCancel(context.Background())
-	client := &wsClient{conn: conn, ctx: wsCtx, cancel: wsCancel}
+	client := &wsClient{conn: conn, ctx: wsCtx, cancel: wsCancel, runs: make(map[string]context.CancelFunc)}
 	defer wsCancel()
 	defer conn.Close()
 
@@ -461,7 +495,21 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 			})
 
 		case "interrupt":
-			// Best-effort: cancel the current pipeline run for the session.
+			// Cancel the in-flight pipeline run(s) for this connection: the
+			// matching message_id run if provided, otherwise every active run.
+			// The run's context is derived from this connection, so cancelling
+			// it propagates to the LLM provider call and stops it early.
+			client.runMu.Lock()
+			if msg.MessageID != "" {
+				if fn, ok := client.runs[msg.MessageID]; ok {
+					fn()
+				}
+			} else {
+				for _, fn := range client.runs {
+					fn()
+				}
+			}
+			client.runMu.Unlock()
 			s.wsSend(client, map[string]interface{}{
 				"ct": "chat", "t": "error", "data": "INTERRUPTED",
 				"code":       "INTERRUPTED",
@@ -547,7 +595,21 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 	ch := s.chatAdapter.subscribe(sessionID)
 	defer s.chatAdapter.unsubscribe(sessionID, ch)
 
-	done := s.processChatEvent(c.ctx, sessionID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags)
+	// Derive a per-run context from the connection so an interrupt can cancel
+	// this specific run (registered by message_id) without tearing down the
+	// whole connection.
+	runCtx, runCancel := context.WithCancel(c.ctx)
+	c.runMu.Lock()
+	c.runs[messageID] = runCancel
+	c.runMu.Unlock()
+	defer func() {
+		c.runMu.Lock()
+		delete(c.runs, messageID)
+		c.runMu.Unlock()
+		runCancel()
+	}()
+
+	done := s.processChatEvent(runCtx, sessionID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags)
 	if done == nil {
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "error", "data": "对话管道不可用", "message_id": messageID})
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
@@ -567,10 +629,7 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 			for {
 				select {
 				case chain := <-ch:
-					if t := chainPlainText(chain); t != "" {
-						full.WriteString(t)
-						s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": t, "message_id": messageID})
-					}
+					s.emitChainWS(c, &full, chain, messageID)
 				default:
 					goto done
 				}
@@ -597,10 +656,19 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 			s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
 			return
 		case chain := <-ch:
-			if t := chainPlainText(chain); t != "" {
-				full.WriteString(t)
-				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": t, "message_id": messageID})
-			}
+			s.emitChainWS(c, &full, chain, messageID)
 		}
+	}
+}
+
+// emitChainWS sends WebSocket frames for a reply chain: media components first
+// (images as data URLs), then the plain text.
+func (s *Server) emitChainWS(c *wsClient, full *strings.Builder, chain *message.MessageChain, messageID string) {
+	for _, data := range chainImageDataURLs(chain) {
+		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "image", "data": data, "message_id": messageID})
+	}
+	if t := chainPlainText(chain); t != "" {
+		full.WriteString(t)
+		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": t, "message_id": messageID})
 	}
 }

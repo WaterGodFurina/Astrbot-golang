@@ -12,7 +12,10 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
+
+var logger = log.GetDefault().WithComponent("Conversation")
 
 // Conversation represents a chat conversation.
 type Conversation struct {
@@ -511,20 +514,21 @@ func (m *Manager) SetPersona(unifiedMsgOrigin, personaID string) {
 	}
 }
 
-// persist writes a conversation to the database.
+// persist writes a conversation to the database. Uses UpsertConversation
+// (single transaction) to avoid the TOCTOU race between the existence check
+// and INSERT/UPDATE that the previous Get+Create/Update sequence had.
 func (m *Manager) persist(conv *Conversation) {
 	if m.db == nil {
 		return
 	}
-	historyJSON, _ := json.Marshal(conv.History)
-	if _, found, err := m.db.GetConversationByID(conv.CID); err == nil && found {
-		_ = m.db.UpdateConversationContent(conv.CID, string(historyJSON))
-		if conv.Title != "" {
-			_ = m.db.UpdateConversationTitle(conv.CID, conv.Title)
-		}
+	historyJSON, err := json.Marshal(conv.History)
+	if err != nil {
+		logger.Error("persist conversation %s: marshal history: %v", conv.CID, err)
 		return
 	}
-	_ = m.db.CreateConversation(conv.CID, conv.UserID, conv.PlatformID, string(historyJSON), conv.Title, conv.Persona)
+	if err := m.db.UpsertConversation(conv.CID, conv.UserID, conv.PlatformID, string(historyJSON), conv.Title, conv.Persona); err != nil {
+		logger.Error("persist conversation %s: %v", conv.CID, err)
+	}
 }
 
 // splitPlatform extracts the platform id from a unified_msg_origin

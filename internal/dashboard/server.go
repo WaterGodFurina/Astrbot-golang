@@ -6,8 +6,10 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
@@ -1077,20 +1080,70 @@ func (s *Server) Start(ctx context.Context) error {
 		<-ctx.Done()
 		s.Stop()
 	}()
+
+	// Bind with retry: after a WebUI "restart" the new instance is spawned while
+	// the old process is still shutting down, so the port may briefly be in use.
+	// Retry binding (bounded by ctx) instead of dying with EADDRINUSE.
+	addr := fmt.Sprintf(":%d", s.port)
+	ln, bindErr := listenWithRetry(ctx, addr, s.port)
+	if bindErr != nil {
+		return bindErr
+	}
+	defer ln.Close()
 	if enable, cert, key := s.sslConfig(); enable && cert != "" && key != "" {
 		logger.I18nInfo("仪表盘 HTTPS 已启用（证书=%s）", cert)
-		if err := s.srv.ListenAndServeTLS(cert, key); err != nil && err != http.ErrServerClosed {
+		if err := s.srv.ServeTLS(ln, cert, key); err != nil && err != http.ErrServerClosed {
 			return err
 		}
 	} else if enable {
 		logger.I18nWarn("dashboard.ssl.enable=true 但未配置 cert_file/key_file，回退到 HTTP")
-		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			return err
 		}
-	} else if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	} else if err := s.srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
+}
+
+// listenWithRetry binds addr, retrying when the port is briefly still held by
+// a shutting-down predecessor (EADDRINUSE). Bounded by ctx so cancellation
+// (shutdown) aborts the wait immediately.
+func listenWithRetry(ctx context.Context, addr string, port int) (net.Listener, error) {
+	const (
+		maxAttempts  = 40
+		retryBackoff = 500 * time.Millisecond
+	)
+	for attempt := 1; ; attempt++ {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		if !isAddrInUse(err) {
+			return nil, fmt.Errorf("bind dashboard %s: %w", addr, err)
+		}
+		if attempt >= maxAttempts {
+			return nil, fmt.Errorf("bind dashboard %s: port still in use after %d attempts: %w", addr, maxAttempts, err)
+		}
+		logger.I18nWarn("仪表盘端口 :%d 仍被占用，等待释放后重试（%d/%d）", port, attempt, maxAttempts)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryBackoff):
+		}
+	}
+}
+
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return errors.Is(opErr.Err, syscall.EADDRINUSE) ||
+			errors.Is(opErr.Err, syscall.EADDRNOTAVAIL)
+	}
+	return false
 }
 
 // sslConfig 读取 dashboard.ssl 配置（enable/cert_file/key_file）。
@@ -1334,6 +1387,11 @@ func (s *Server) injectAuthFields(dash map[string]interface{}) {
 	dash["username"] = s.auth.Username()
 	if h := s.auth.HashedPassword(); h != "" {
 		dash["pbkdf2_password"] = h
+	}
+	// The plaintext password mirrors the hash so a config save round-trip
+	// (which strips "password") does not drop the persisted credential.
+	if p := s.auth.PlainPassword(); p != "" {
+		dash["password"] = p
 	}
 	if sec := s.auth.JWTSecret(); sec != "" {
 		dash["jwt_secret"] = sec

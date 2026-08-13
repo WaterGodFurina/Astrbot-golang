@@ -544,7 +544,9 @@ func argInt(args map[string]interface{}, key string, def int) int {
 
 func randHex(n int) string {
 	b := make([]byte, n)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return strings.Repeat("0", n*2)
+	}
 	return hex.EncodeToString(b)
 }
 
