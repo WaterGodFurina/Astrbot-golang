@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
@@ -35,6 +36,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
@@ -96,6 +98,16 @@ type PipelineContext struct {
 	// EventBus allows stages to re-publish events (e.g. rate-limit stall).
 	// Optional.
 	EventBus *core.EventBus
+	// KBManager provides knowledge-base retrieval for context injection.
+	// Optional.
+	KBManager *knowledgebase.Manager
+	// KBRetriever resolves KB context text for a prompt (umo, query) -> formatted
+	// reference text. When set it overrides KBManager for injection.
+	// Optional.
+	KBRetriever func(umo, query string) (string, error)
+	// ProviderManager resolves chat/STT/TTS/embedding providers.
+	// Optional.
+	ProviderManager *provider.ProviderManager
 	// SubPlugins is the subprocess plugin runtime. When set, ProcessStage and
 	// ResultDecorateStage use it to collect LLM tools, apply on_llm_request
 	// hooks, and run result-decoration hooks. Optional.
@@ -576,7 +588,9 @@ func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event
 // PreProcessStage normalizes media components, maps paths, and runs STT.
 // Ported from astrbot/core/pipeline/preprocess_stage/stage.py
 type PreProcessStage struct {
-	config map[string]interface{}
+	config      map[string]interface{}
+	providerMgr *provider.ProviderManager
+	convMgr     *conversation.Manager
 }
 
 func NewPreProcessStage() *PreProcessStage {
@@ -587,6 +601,8 @@ func (s *PreProcessStage) Name() string { return "preprocess" }
 
 func (s *PreProcessStage) Initialize(ctx *PipelineContext) error {
 	s.config = ctx.AstrbotConfig
+	s.providerMgr = ctx.ProviderManager
+	s.convMgr = ctx.ConvManager
 	return nil
 }
 
@@ -605,12 +621,83 @@ func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*Stag
 			normalizeImagePath(img)
 			event.Message.Chain[i] = img
 		}
-		// Convert Record components to plain text via STT would happen here
-		// (requires actual STT service, skip for now)
+	}
+
+	// Speech-to-text: convert Record (voice) components to plain text when a
+	// STT provider is enabled (mirrors Python preprocess_stage).
+	if s.sttEnabled(event.UnifiedMsgOrigin()) {
+		for i, comp := range event.Message.Chain {
+			rec, ok := comp.(*message.Record)
+			if !ok {
+				continue
+			}
+			text, err := s.sttRecord(rec, event.UnifiedMsgOrigin())
+			if err != nil {
+				logger.I18nWarn("STT 转写失败: %v", err)
+				continue
+			}
+			if text == "" {
+				continue
+			}
+			event.Message.Chain[i] = &message.Plain{Text: text}
+			event.PlainText += text
+			event.MessageStr += text
+		}
 	}
 
 	logger.Debug("PreProcess: plain_text='%s', components=%d", plainText, len(event.Message.Chain))
 	return &StageResult{Continue: true}, nil
+}
+
+// sttEnabled reports whether STT should run (global provider_stt_settings.enable).
+func (s *PreProcessStage) sttEnabled(umo string) bool {
+	if s.providerMgr == nil {
+		return false
+	}
+	cfg, _ := s.config["provider_stt_settings"].(map[string]interface{})
+	if cfg == nil {
+		return false
+	}
+	enabled, _ := cfg["enable"].(bool)
+	return enabled
+}
+
+// sttRecord transcribes a voice component using the session/global STT provider
+// (provider_perf_speech_to_text rule wins).
+func (s *PreProcessStage) sttRecord(rec *message.Record, umo string) (string, error) {
+	var stt provider.STTProvider
+	providerID := ""
+	if s.convMgr != nil {
+		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
+			providerID, _ = rules[conversation.RuleProviderSpeechToText].(string)
+		}
+	}
+	if providerID != "" {
+		if p := s.providerMgr.Get(providerID); p != nil {
+			if sp, ok := p.(provider.STTProvider); ok {
+				stt = sp
+			}
+		}
+	}
+	if stt == nil {
+		stt = s.providerMgr.GetSTTProvider()
+	}
+	if stt == nil {
+		return "", fmt.Errorf("未配置 STT 提供商")
+	}
+	audioURL := rec.URL
+	if audioURL == "" {
+		audioURL = rec.Path
+	}
+	if audioURL == "" {
+		audioURL = rec.File
+	}
+	if audioURL == "" {
+		return "", fmt.Errorf("语音消息缺少音频路径/URL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return stt.GetText(ctx, audioURL)
 }
 
 // ---------------------------------------------------------------------------
@@ -643,6 +730,25 @@ type ProcessStage struct {
 	mcpSig     string
 	mcpClients map[string]*agent.MCPClient       // sanitized server name -> client
 	mcpSchemas map[string]map[string]interface{} // full tool name -> OpenAI tool schema
+
+	// Subagents (subagent_orchestrator): handoff tools injected into the main
+	// LLM and executed as a fresh persona round.
+	subAgentEnabled bool
+	subAgents       []*SubAgent
+
+	// Knowledge-base context retrieval for prompt injection. Provided by the
+	// lifecycle (reuses the dashboard retrieval pipeline); nil = no KB.
+	kbRetriever func(umo, query string) (string, error)
+
+	// toolSchemaMode: "full" (default) sends complete tool schemas; "skills_like"
+	// sends light schemas and re-queries the LLM for arguments when a tool is
+	// chosen (saves tokens on large tool sets).
+	toolSchemaMode string
+
+	// doom loop protection: track consecutive same-tool calls per session and
+	// pause the tool after a threshold, asking the session owner to confirm.
+	doomMu       sync.Mutex
+	doomTrackers map[string]*doomTracker // key: unified msg origin
 }
 
 func NewProcessStage() *ProcessStage {
@@ -682,6 +788,15 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.database = ctx.Database
 	s.subPlugins = ctx.SubPlugins
 	s.providerConf = bindProviderSettings(ctx.AstrbotConfig)
+	s.subAgents, s.subAgentEnabled = loadSubAgents(ctx.AstrbotConfig)
+	s.kbRetriever = ctx.KBRetriever
+	s.toolSchemaMode = "full"
+	if ps, ok := ctx.AstrbotConfig["provider_settings"].(map[string]interface{}); ok {
+		if m, ok := ps["tool_schema_mode"].(string); ok && m != "" {
+			s.toolSchemaMode = m
+		}
+	}
+	s.doomTrackers = make(map[string]*doomTracker)
 	if ctx.PersonaResolver != nil {
 		s.personaPrompt = ctx.PersonaResolver
 	}
@@ -701,6 +816,18 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	if event.Ctx != nil {
 		ctx = event.Ctx
 	}
+	// Doom-loop confirmation: if a tool was paused for this session, only the
+	// original asker may confirm. A confirmation resumes the original request
+	// (message is rewritten to it); a decline stops.
+	switch s.maybeHandleDoomConfirm(event) {
+	case doomDeclined:
+		event.Stop()
+		return &StageResult{Continue: false}, nil
+	case doomResumed:
+		// fall through: re-run the original request through the pipeline
+	case doomNotConsumed:
+		// normal message
+	}
 	// Run subprocess plugin on_message hooks (mirrors Python's
 	// @filter.on_message): plugins observe every incoming message.
 	dispatchSubprocessHooks(s.subPlugins, event, "on_message")
@@ -718,6 +845,9 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 
 	// Try plugin handlers first
 	activated := s.findMatchingHandlers(event)
+	// Session custom rules (session_plugin_config) can disable/enable plugins
+	// for this session.
+	activated = s.filterHandlersBySession(event, activated)
 	if len(activated) > 0 {
 		// Execute handlers in priority order
 		for _, handler := range activated {
@@ -803,6 +933,54 @@ func (s *ProcessStage) executeHandler(ctx context.Context, event *core.Event, ha
 	return handler.Handler(event)
 }
 
+// filterHandlersBySession applies the session_plugin_config rule
+// (disabled_plugins / enabled_plugins) to the matched plugin handlers,
+// mirroring Python SessionPluginManager.filter_handlers_by_session.
+func (s *ProcessStage) filterHandlersBySession(event *core.Event, handlers []*star.StarHandlerMetadata) []*star.StarHandlerMetadata {
+	if s.convMgr == nil || len(handlers) == 0 {
+		return handlers
+	}
+	rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin())
+	pc, ok := rules[conversation.RulePluginConfig].(map[string]interface{})
+	if !ok {
+		return handlers
+	}
+	disabledRaw, _ := pc["disabled_plugins"].([]interface{})
+	enabledRaw, _ := pc["enabled_plugins"].([]interface{})
+	disabled := make(map[string]bool, len(disabledRaw))
+	for _, d := range disabledRaw {
+		if s, ok := d.(string); ok {
+			disabled[s] = true
+		}
+	}
+	enabled := make(map[string]bool, len(enabledRaw))
+	for _, e := range enabledRaw {
+		if s, ok := e.(string); ok {
+			enabled[s] = true
+		}
+	}
+	if len(disabled) == 0 && len(enabled) == 0 {
+		return handlers
+	}
+	out := make([]*star.StarHandlerMetadata, 0, len(handlers))
+	for _, h := range handlers {
+		name := h.PluginName
+		if name == "" {
+			// Built-in/system handlers are never filtered.
+			out = append(out, h)
+			continue
+		}
+		if disabled[name] {
+			continue
+		}
+		if len(enabled) > 0 && !enabled[name] {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 // shouldCallLLM returns true if the LLM agent should be invoked.
 func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
 	// Check if provider is enabled (absent key -> allowed, matching the
@@ -854,6 +1032,19 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 
+	// Session-level provider override (custom rules / /provider command):
+	// when the session has a provider_perf_chat_completion rule, use that
+	// provider instead of the global default.
+	if s.convMgr != nil {
+		if rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin()); rules != nil {
+			if pid, _ := rules[conversation.RuleProviderChatCompletion].(string); pid != "" {
+				if pc := findProviderByID(s.config, pid); pc != nil {
+					providerCfg = pc
+				}
+			}
+		}
+	}
+
 	// Resolve the conversation. Mirrors Python's `_get_session_conv`: the
 	// conversation is lazily created if it does not exist yet. The current
 	// user message is appended to history only after the LLM round finishes
@@ -872,6 +1063,19 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		personaID = s.providerConf.DefaultPersonality
 		if personaID != "" {
 			providerSettings["persona"] = personaID
+		}
+	}
+
+	// Session custom-rule persona overrides everything (highest priority):
+	// session_service_config.persona_id from the WebUI rules editor.
+	if s.convMgr != nil {
+		if rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin()); rules != nil {
+			if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
+				if pid, ok := sc["persona_id"].(string); ok && pid != "" {
+					personaID = pid
+					providerSettings["persona"] = pid
+				}
+			}
 		}
 	}
 
@@ -907,6 +1111,10 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// on_waiting_llm_request fires right before the provider call (e.g. a
 	// plugin may show a "processing" indicator).
 	dispatchSubprocessHooks(s.subPlugins, event, "on_waiting_llm_request")
+
+	// Knowledge-base retrieval: inject related KB content into the prompt
+	// (non-agentic mode), using the session kb_config rule when set.
+	prompt = s.applyKnowledgeBase(event, prompt)
 
 	// computer_use_runtime drives whether local/sandbox tools are exposed and
 	// whether the local-mode hint is appended to the system prompt.
@@ -954,8 +1162,18 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	llmCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 
+	// Context-limit handling: llm_compress / truncate_by_turns based on
+	// provider_settings.max_context_length (token estimate).
+	req.Contexts = s.maybeCompressContext(llmCtx, chatInst, systemPrompt, req.Contexts)
+
 	// Inject active tools (built-in + MCP servers) so the model can call them.
-	req.Tools = s.collectTools(computerUseRuntime)
+	// skills_like mode sends light schemas (name/description only) to save
+	// tokens; arguments are re-queried once a tool is selected.
+	if s.toolSchemaMode == "skills_like" {
+		req.Tools = s.collectLightTools(computerUseRuntime)
+	} else {
+		req.Tools = s.collectTools(computerUseRuntime)
+	}
 	toolNames := make([]string, 0, len(req.Tools))
 	for _, t := range req.Tools {
 		if fn, ok := t["function"].(map[string]interface{}); ok {
@@ -1006,7 +1224,20 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 	s.recordProviderCall(providerCfg, event.UnifiedMsgOrigin(), resp)
-	for round := 0; round < 5 && len(resp.ToolsCallName) > 0; round++ {
+	// skills_like: the main request carried no tool parameters. When the model
+	// chose tools, re-query once with the chosen tools' full parameter schemas
+	// (minimal context) so the LLM produces proper arguments.
+	if s.toolSchemaMode == "skills_like" && len(resp.ToolsCallName) > 0 {
+		if requery, ok := s.requeryToolArgs(llmCtx, chatInst, req, resp, computerUseRuntime); ok {
+			resp = requery
+		}
+	}
+	// Max agent steps: config provider_settings.max_agent_step (default 5).
+	maxSteps := 5
+	if s.providerConf != nil && s.providerConf.MaxAgentStep > 0 {
+		maxSteps = s.providerConf.MaxAgentStep
+	}
+	for round := 0; round < maxSteps && len(resp.ToolsCallName) > 0; round++ {
 		// Append the assistant tool-call message
 		assistantMsg := map[string]interface{}{
 			"role":       "assistant",
@@ -1016,6 +1247,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		messages = append(messages, assistantMsg)
 
 		// Execute each requested tool and append tool results
+		doomed := false
 		for i, name := range resp.ToolsCallName {
 			args := map[string]interface{}{}
 			if i < len(resp.ToolsCallArgs) {
@@ -1025,12 +1257,23 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 			if i < len(resp.ToolsCallIDs) {
 				toolID = resp.ToolsCallIDs[i]
 			}
+			if !s.checkDoomLoop(event, name) {
+				// Tool paused by doom-loop detection; stop the whole tool loop.
+				doomed = true
+				break
+			}
 			result := s.executeTool(event, computerUseRuntime, name, args)
+			// Oversized tool output is spilled to a file with a read hint so the
+			// model does not re-run the tool just to see the full result.
+			result = materializeToolResult(result, toolID)
 			messages = append(messages, map[string]interface{}{
 				"role":         "tool",
 				"tool_call_id": toolID,
 				"content":      result,
 			})
+		}
+		if doomed {
+			break
 		}
 
 		// Follow-up request with tool results. Each round gets its own timeout
@@ -1088,6 +1331,7 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 		if err != nil {
 			return nil, err
 		}
+		resp.CompletionText = stripToolCallXML(resp.CompletionText)
 		logger.Debug("LLM call completed in %v, text_len=%d", time.Since(start), len(resp.CompletionText))
 		return resp, nil
 	}
@@ -1113,7 +1357,11 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 		if chunk.IsChunk {
 			content.WriteString(chunk.CompletionText)
 			reasoning.WriteString(chunk.ReasoningContent)
-			streamer.push(chunk.CompletionText)
+			// Suppress model control markup (XML tool calls, advisor/reasoning
+			// tags) from the user-facing stream; parsed/handled at completion.
+			if !containsControlText(chunk.CompletionText) {
+				streamer.push(chunk.CompletionText)
+			}
 			continue
 		}
 		if len(chunk.ToolsCallName) > 0 {
@@ -1133,6 +1381,17 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 	}
 	full.CompletionText = content.String()
 	full.ReasoningContent = reasoning.String()
+	// Anthropic-style XML tool calls (<function_calls>) are parsed into real
+	// tool calls so they execute instead of leaking into the reply.
+	if calls, ok := parseXMLToolCalls(full.CompletionText); ok {
+		for i, c := range calls {
+			full.ToolsCallName = append(full.ToolsCallName, c.name)
+			full.ToolsCallArgs = append(full.ToolsCallArgs, c.args)
+			full.ToolsCallIDs = append(full.ToolsCallIDs, fmt.Sprintf("xml_%d", i))
+		}
+		full.CompletionText = stripToolCallXML(full.CompletionText)
+		logger.I18nInfo("解析到 %d 个 XML 工具调用并转为标准工具调用", len(calls))
+	}
 	logger.Debug("LLM call completed in %v, text_len=%d", time.Since(start), len(full.CompletionText))
 	return full, nil
 }
@@ -1259,6 +1518,7 @@ func (ss *streamSender) sendSegment(text string) {
 	if text == "" || ss.stage.platformMgr == nil {
 		return
 	}
+	logger.Debug("stream segment send: %.300s", text)
 	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: text}}}
 	if err := ss.stage.platformMgr.Send(ss.event.Source.Platform, ss.event.Source.ConvID, chain); err != nil {
 		logger.I18nWarn("流式片段发送失败: %v", err)
@@ -1534,10 +1794,14 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 			if len(t.ParamsJson) > 0 {
 				_ = json.Unmarshal(t.ParamsJson, &params)
 			}
+			safeName := pluginToolSafeName(t.Name)
+			if safeName == "" {
+				continue
+			}
 			out = append(out, map[string]interface{}{
 				"type": "function",
 				"function": map[string]interface{}{
-					"name":        t.Name,
+					"name":        safeName,
 					"description": t.Description,
 					"parameters":  params,
 				},
@@ -1559,11 +1823,12 @@ func (s *ProcessStage) executePluginTool(event *core.Event, name string, args ma
 			continue
 		}
 		for _, t := range inst.Meta.Tools {
-			if t.Name != name {
+			// LLM calls use the sanitized name; the plugin RPC uses the original.
+			if pluginToolSafeName(t.Name) != name {
 				continue
 			}
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-			text, isErr, err := inst.Client.HandleTool(rpcCtx, name, args, sdkEvent)
+			text, isErr, err := inst.Client.HandleTool(rpcCtx, t.Name, args, sdkEvent)
 			rpcCancel()
 			if err != nil {
 				return fmt.Sprintf("插件工具 %s 执行失败: %v", name, err), true
@@ -1605,7 +1870,138 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	}
 	// Subprocess plugin LLM function tools.
 	tools = append(tools, s.collectPluginTools()...)
+
+	// Subagent handoff tools (transfer_to_<name>).
+	if s.subAgentEnabled {
+		tools = append(tools, subAgentToolSchemas(s.subAgents)...)
+	}
+
+	// Web search + extract tools — injected only when the matching provider is
+	// enabled AND its API key is configured (per provider_settings).
+	provider, webOn := webSearchProviderInfo(s.config)
+	if webOn {
+		switch provider {
+		case "tavily":
+			if len(tavilyKeys(s.config)) > 0 {
+				tools = append(tools, tavilySearchToolSchema(), tavilyExtractToolSchema())
+			}
+		case "bocha":
+			if len(bochaKeys(s.config)) > 0 {
+				tools = append(tools, bochaSearchToolSchema())
+			}
+		case "brave":
+			if len(braveKeys(s.config)) > 0 {
+				tools = append(tools, braveSearchToolSchema())
+			}
+		case "firecrawl":
+			if len(firecrawlKeys(s.config)) > 0 {
+				tools = append(tools, firecrawlSearchToolSchema(), firecrawlExtractToolSchema())
+			}
+		case "baidu_ai_search":
+			if providerString(s.config, "websearch_baidu_app_builder_key") != "" {
+				tools = append(tools, baiduSearchToolSchema())
+			}
+		case "exa":
+			if len(exaKeys(s.config)) > 0 {
+				tools = append(tools, exaSearchToolSchema(), exaContentsToolSchema())
+			}
+		}
+	}
+
+	// send_message_to_user: proactive messaging (always available when a
+	// platform manager exists).
+	if s.platformMgr != nil {
+		tools = append(tools, sendMessageToolSchema())
+	}
+
+	// get_group_message_history: enabled via provider_ltm_settings.
+	if providerLTMBool(s.config, "group_message_history_enable") {
+		tools = append(tools, groupHistoryToolSchema())
+	}
+
+	// astr_kb_search: agentic knowledge-base mode.
+	if kbAgenticMode(s.config) {
+		tools = append(tools, kbSearchToolSchema())
+	}
 	return tools
+}
+
+// collectLightTools returns the tool schemas with empty parameters (only name +
+// description). Used by skills_like mode to reduce token usage; the arguments
+// are filled in by a follow-up re-query when the LLM chooses a tool.
+func (s *ProcessStage) collectLightTools(computerUseRuntime string) []map[string]interface{} {
+	all := s.collectTools(computerUseRuntime)
+	for _, tool := range all {
+		fn, ok := tool["function"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		fn["parameters"] = map[string]interface{}{
+			"type":       "object",
+			"properties": map[string]interface{}{},
+		}
+	}
+	return all
+}
+
+// collectParamToolsFor returns the full-parameters schemas of the named tools
+// (description kept minimal). Used by the skills_like re-query.
+func (s *ProcessStage) collectParamToolsFor(computerUseRuntime string, names []string) []map[string]interface{} {
+	all := s.collectTools(computerUseRuntime)
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var out []map[string]interface{}
+	for _, tool := range all {
+		fn, ok := tool["function"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := fn["name"].(string)
+		if !want[name] {
+			continue
+		}
+		out = append(out, tool)
+	}
+	return out
+}
+
+// requeryToolArgs re-queries the LLM with the chosen tools' full parameter
+// schemas so it produces concrete arguments (skills_like mode). Unlike the
+// Python reference, the re-query context is minimal (original prompt + an
+// explicit instruction) instead of the full conversation history, which avoids
+// the model re-deciding the tool selection and saves tokens. Returns ok=false
+// when the re-query fails or returns no tool call, in which case the caller
+// keeps the original response.
+func (s *ProcessStage) requeryToolArgs(ctx context.Context, chatInst provider.ChatProvider, req *provider.ProviderRequest, resp *provider.LLMResponse, computerUseRuntime string) (*provider.LLMResponse, bool) {
+	paramTools := s.collectParamToolsFor(computerUseRuntime, resp.ToolsCallName)
+	if len(paramTools) == 0 {
+		return resp, false
+	}
+	instruction := "这是工具调用参数补全阶段。用户请求要求调用以下工具：" +
+		strings.Join(resp.ToolsCallName, "、") +
+		"。请根据原始用户请求，选择一个最合适的工具并调用它，提供完整、准确的参数。不要忽略工具调用，不要返回无关文本。"
+	req2 := &provider.ProviderRequest{
+		Prompt:                req.Prompt,
+		SessionID:             req.SessionID,
+		SystemPrompt:          req.SystemPrompt + "\n\n" + instruction,
+		Tools:                 paramTools,
+		Conversation:          req.Conversation,
+		ExtraUserContentParts: req.ExtraUserContentParts,
+	}
+	rctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	requery, err := chatInst.TextChat(rctx, req2)
+	if err != nil {
+		logger.I18nWarn("skills_like 工具参数补全失败: %v", err)
+		return resp, false
+	}
+	if len(requery.ToolsCallName) == 0 {
+		logger.I18nWarn("skills_like 工具参数补全未返回工具调用，使用原响应")
+		return resp, false
+	}
+	return requery, true
 }
 
 // loadMCPTools (re)loads enabled MCP servers from data/mcp_server.json and
@@ -1939,7 +2335,14 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 
 	result := ""
 	handled := false
-	if runtime == "sandbox" {
+	if strings.HasPrefix(name, "transfer_to_") {
+		// Subagent handoff: run the subagent's persona round and return its
+		// reply as the tool result.
+		if r, h := s.executeSubAgent(event, name, args); h {
+			result, handled = r, true
+		}
+	}
+	if !handled && runtime == "sandbox" {
 		if r, h := s.executeSandboxTool(name, args); h {
 			result, handled = r, true
 		}
@@ -1970,13 +2373,39 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 		case "astrbot_file_read_tool":
 			result = executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0))
 		case "astrbot_file_write_tool":
-			result = executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
+			r := executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
+			result = snapshotFileMutation(workspaceRoot(umo), name, r)
 		case "astrbot_file_edit_tool":
-			result = executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
+			r := executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
+			result = snapshotFileMutation(workspaceRoot(umo), name, r)
 		case "astrbot_grep_tool":
 			result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
 		case "future_task":
 			result = executeFutureTask(s.cronMgr, umo, event.GetSenderID(), args)
+		case "web_search_tavily":
+			result = executeWebSearchTavily(s.config, args)
+		case "web_search_bocha":
+			result = executeWebSearchBocha(s.config, args)
+		case "web_search_brave":
+			result = executeWebSearchBrave(s.config, args)
+		case "web_search_firecrawl":
+			result = executeWebSearchFirecrawl(s.config, args)
+		case "web_search_baidu":
+			result = executeWebSearchBaidu(s.config, args)
+		case "web_search_exa":
+			result = executeWebSearchExa(s.config, args)
+		case "tavily_extract_web_page":
+			result = executeTavilyExtract(s.config, args)
+		case "firecrawl_extract_web_page":
+			result = executeFirecrawlExtract(s.config, args)
+		case "exa_get_contents":
+			result = executeExaGetContents(s.config, args)
+		case "send_message_to_user":
+			result = s.executeSendMessage(event, args)
+		case "get_group_message_history":
+			result = s.executeGroupHistory(event, args)
+		case "astr_kb_search":
+			result = s.executeKBSearch(event, args)
 		default:
 			result = fmt.Sprintf("工具 %s 执行失败: 该工具尚未实现 Go 端执行器", name)
 		}
@@ -2109,6 +2538,176 @@ func personaPrompt(settings map[string]interface{}) string {
 // history is truncated to the most recent 2*max_context_length entries,
 // keeping user/assistant message pairs together, and a short system hint notes
 // that older history was dropped.
+// maybeCompressContext applies context-limit handling: token-based detection
+// with either llm_compress (LLM summary + keep-recent) or truncate_by_turns.
+// Mirrors Python's context manager (astr_main_agent + agent/context/compressor).
+func (s *ProcessStage) maybeCompressContext(ctx context.Context, chatInst provider.ChatProvider, systemPrompt string, contexts []map[string]interface{}) []map[string]interface{} {
+	if s.providerConf == nil || len(contexts) == 0 {
+		return contexts
+	}
+	maxCtx := s.providerConf.MaxContextLength
+	if maxCtx <= 0 {
+		return contexts // unlimited
+	}
+	curTokens := estimateContextTokens(contexts)
+	if curTokens <= 0 {
+		return contexts
+	}
+	// Compression threshold 0.82 (Python default).
+	if curTokens <= int(float64(maxCtx)*0.82) {
+		return contexts
+	}
+	if s.providerConf.ContextLimitStrategy == "llm_compress" {
+		if compressed, ok := s.llmCompressContext(ctx, chatInst, systemPrompt, contexts); ok {
+			return compressed
+		}
+	}
+	// Fallback: keep the most recent 2*max_context_length entries on even
+	// boundaries (user/assistant pair intact).
+	return truncateContextEntries(contexts, maxCtx)
+}
+
+// estimateContextTokens is a rough token estimate (chars/2 for CJK-heavy text,
+// ~4 chars per token for others) used for overflow detection.
+func estimateContextTokens(contexts []map[string]interface{}) int {
+	total := 0
+	for _, m := range contexts {
+		content, _ := m["content"].(string)
+		total += len([]rune(content))
+	}
+	// ~1 token per 2 runes (approximation).
+	return total / 2
+}
+
+// truncateContextEntries keeps the recent 2*maxCtx entries aligned to a pair
+// boundary, appending a truncation notice.
+func truncateContextEntries(contexts []map[string]interface{}, maxCtx int) []map[string]interface{} {
+	history := append([]map[string]interface{}{}, contexts...)
+	if maxCtx > 0 && len(history) > maxCtx*2 {
+		start := len(history) - maxCtx*2
+		if start%2 != 0 {
+			start++
+		}
+		history = append([]map[string]interface{}{}, history[start:]...)
+		history = append(history, map[string]interface{}{
+			"role":    "system",
+			"content": "注意：由于对话上下文长度限制，更早的历史消息已被截断。",
+		})
+	}
+	return history
+}
+
+// llmCompressContext summarizes the older rounds via the LLM and keeps the
+// recent rounds exact (mirrors Python LLMSummaryCompressor).
+func (s *ProcessStage) llmCompressContext(ctx context.Context, chatInst provider.ChatProvider, systemPrompt string, contexts []map[string]interface{}) ([]map[string]interface{}, bool) {
+	keepRatio := s.providerConf.LLMCompressKeepRecentRatio
+	if keepRatio < 0 {
+		keepRatio = 0
+	}
+	if keepRatio > 0.3 {
+		keepRatio = 0.3
+	}
+	rounds := splitContextRounds(contexts)
+	totalTokens := estimateContextTokens(contexts)
+	oldRounds, recentRounds := splitRoundsByRatio(rounds, totalTokens, keepRatio)
+	if len(oldRounds) == 0 {
+		return contexts, false
+	}
+	var summaryContexts []map[string]interface{}
+	for _, rnd := range oldRounds {
+		summaryContexts = append(summaryContexts, rnd...)
+	}
+	if len(summaryContexts) == 0 || summaryContexts[len(summaryContexts)-1]["role"] != "assistant" {
+		summaryContexts = append(summaryContexts, map[string]interface{}{
+			"role": "assistant", "content": "Acknowledged.",
+		})
+	}
+	instruction := s.providerConf.LLMCompressInstruction
+	if instruction == "" {
+		instruction = "Based on our full conversation history, produce a concise summary of key takeaways and/or project progress. The primary goal of this summary is to enable seamless continuation of the work that follows."
+	}
+	summaryPrompt := "Generate a summary of our previous conversation history.\n" +
+		"<extra_instruction>\n" + instruction + "\n\n" +
+		"If a task appears to be in progress, end the summary with the latest known result and the concrete next step to continue the task.</extra_instruction>\n" +
+		"Respond ONLY with the summary content, without any additional text or formatting."
+	summaryContexts = append(summaryContexts, map[string]interface{}{"role": "user", "content": summaryPrompt})
+
+	req := &provider.ProviderRequest{
+		Prompt:   summaryPrompt,
+		Contexts: summaryContexts[:len(summaryContexts)-1],
+	}
+	cctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	resp, err := chatInst.TextChat(cctx, req)
+	if err != nil || strings.TrimSpace(resp.CompletionText) == "" {
+		return contexts, false
+	}
+	summary := strings.TrimSpace(resp.CompletionText)
+
+	// Rebuild: leading system messages + summary pair + recent rounds.
+	var result []map[string]interface{}
+	for _, m := range contexts {
+		if role, _ := m["role"].(string); role == "system" {
+			result = append(result, m)
+		} else {
+			break
+		}
+	}
+	result = append(result, map[string]interface{}{
+		"role": "user", "content": "Our previous history conversation summary: " + summary,
+	})
+	result = append(result, map[string]interface{}{
+		"role": "assistant", "content": "Acknowledged the summary of our previous conversation history.",
+	})
+	for _, rnd := range recentRounds {
+		result = append(result, rnd...)
+	}
+	return result, true
+}
+
+// splitContextRounds splits a message list into user/assistant rounds.
+func splitContextRounds(contexts []map[string]interface{}) [][]map[string]interface{} {
+	var rounds [][]map[string]interface{}
+	var cur []map[string]interface{}
+	for _, m := range contexts {
+		role, _ := m["role"].(string)
+		if role == "system" {
+			continue
+		}
+		if role == "user" && len(cur) > 0 {
+			rounds = append(rounds, cur)
+			cur = nil
+		}
+		cur = append(cur, m)
+	}
+	if len(cur) > 0 {
+		rounds = append(rounds, cur)
+	}
+	return rounds
+}
+
+// splitRoundsByRatio keeps the latest rounds within a token budget.
+func splitRoundsByRatio(rounds [][]map[string]interface{}, totalTokens int, keepRatio float64) (oldRounds, recentRounds [][]map[string]interface{}) {
+	if len(rounds) == 0 || keepRatio <= 0 || totalTokens <= 0 {
+		return rounds, nil
+	}
+	budget := int(float64(totalTokens) * keepRatio)
+	if budget < 1 {
+		budget = 1
+	}
+	used := 0
+	recentStart := len(rounds)
+	for i := len(rounds) - 1; i >= 0; i-- {
+		rndTokens := estimateContextTokens(rounds[i])
+		if used > 0 && used+rndTokens > budget {
+			break
+		}
+		used += rndTokens
+		recentStart = i
+	}
+	return rounds[:recentStart], rounds[recentStart:]
+}
+
 func (s *ProcessStage) conversationHistory(umo string) []map[string]interface{} {
 	if s.convMgr == nil {
 		return nil
@@ -2192,6 +2791,13 @@ type ResultDecorateStage struct {
 	t2iEndpoint       string
 	t2iTemplate       string
 	t2iUseFileService bool
+
+	// TTS settings (provider_tts_settings) + provider manager.
+	providerMgr     *provider.ProviderManager
+	convMgr         *conversation.Manager
+	ttsEnabled      bool
+	ttsTriggerProb  float64
+	ttsDualOutput   bool
 }
 
 func NewResultDecorateStage() *ResultDecorateStage {
@@ -2229,6 +2835,20 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 	s.t2iEndpoint, _ = ctx.AstrbotConfig["t2i_endpoint"].(string)
 	s.t2iTemplate, _ = ctx.AstrbotConfig["t2i_active_template"].(string)
 	s.t2iUseFileService, _ = ctx.AstrbotConfig["t2i_use_file_service"].(bool)
+
+	// TTS settings from provider_tts_settings.
+	s.providerMgr = ctx.ProviderManager
+	s.convMgr = ctx.ConvManager
+	if ttsCfg, ok := ctx.AstrbotConfig["provider_tts_settings"].(map[string]interface{}); ok {
+		s.ttsEnabled, _ = ttsCfg["enable"].(bool)
+		if v, ok := ttsCfg["trigger_probability"].(float64); ok {
+			s.ttsTriggerProb = v
+		}
+		s.ttsDualOutput, _ = ttsCfg["dual_output"].(bool)
+	}
+	if s.ttsTriggerProb <= 0 {
+		s.ttsTriggerProb = 1.0
+	}
 	return nil
 }
 
@@ -2279,6 +2899,12 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 			// On failure keep the original text reply.
 			logger.I18nWarn("t2i 转换失败，回退文本回复: %v", err)
 		}
+	}
+
+	// TTS: convert the reply to voice when enabled (global switch + session
+	// tts_enabled + trigger probability + a usable TTS provider).
+	if err := s.applyTTS(event); err != nil {
+		logger.I18nWarn("TTS 转换失败，回退文本回复: %v", err)
 	}
 
 	// Run subprocess plugin on_decorating_result hooks (may rewrite the chain,
@@ -2372,6 +2998,86 @@ func renderLocalT2I(text, templateName string) ([]byte, error) {
 		// it is accepted for forward compatibility.
 	}
 	return t2i.RenderTextToPNG(text, opts)
+}
+
+// applyTTS converts the reply plain text to a voice Record component when TTS
+// is enabled (mirrors Python result_decorate stage TTS block).
+func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
+	if !s.ttsEnabled || s.providerMgr == nil {
+		return nil
+	}
+	if event.Result == nil || len(event.Result.Chain) == 0 {
+		return nil
+	}
+	umo := event.UnifiedMsgOrigin()
+
+	// Session tts_enabled rule (session_service_config), default true.
+	if s.convMgr != nil {
+		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
+			if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
+				if enabled, ok := sc["tts_enabled"].(bool); ok && !enabled {
+					return nil
+				}
+			}
+		}
+	}
+
+	// Trigger probability.
+	if s.ttsTriggerProb < 1.0 && rand.Float64() > s.ttsTriggerProb {
+		return nil
+	}
+
+	// Resolve TTS provider: session rule provider_perf_text_to_speech wins.
+	var tts provider.TTSProvider
+	providerID := ""
+	if s.convMgr != nil {
+		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
+			providerID, _ = rules[conversation.RuleProviderTextToSpeech].(string)
+		}
+	}
+	if providerID != "" {
+		if p := s.providerMgr.Get(providerID); p != nil {
+			if tp, ok := p.(provider.TTSProvider); ok {
+				tts = tp
+			}
+		}
+	}
+	if tts == nil {
+		tts = s.providerMgr.GetTTSProvider()
+	}
+	if tts == nil {
+		return fmt.Errorf("未配置 TTS 提供商")
+	}
+
+	newChain := make([]message.Component, 0, len(event.Result.Chain))
+	for _, comp := range event.Result.Chain {
+		plain, ok := comp.(*message.Plain)
+		if !ok {
+			newChain = append(newChain, comp)
+			continue
+		}
+		if len([]rune(plain.Text)) <= 1 {
+			newChain = append(newChain, comp)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		audio, err := tts.GetAudio(ctx, plain.Text)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("TTS 合成失败: %w", err)
+		}
+		if audio == "" {
+			newChain = append(newChain, comp)
+			continue
+		}
+		rec := &message.Record{URL: audio, File: audio, Text: plain.Text}
+		if s.ttsDualOutput {
+			newChain = append(newChain, comp)
+		}
+		newChain = append(newChain, rec)
+	}
+	event.Result.Chain = newChain
+	return nil
 }
 
 // applyResultHooks runs every loaded subprocess plugin's on_decorating_result

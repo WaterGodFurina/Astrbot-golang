@@ -573,3 +573,117 @@ func (s *SessionServiceManager) EnableSession(unifiedMsgOrigin string) {
 	defer s.mu.Unlock()
 	delete(s.disabled, unifiedMsgOrigin)
 }
+
+// Session rule keys (mirrors Python AVAILABLE_SESSION_RULE_KEYS). Stored in the
+// preferences table with scope="umo", scope_id=umo.
+const (
+	RuleServiceConfig         = "session_service_config"
+	RulePluginConfig          = "session_plugin_config"
+	RuleKBConfig              = "kb_config"
+	RuleProviderChatCompletion = "provider_perf_chat_completion"
+	RuleProviderSpeechToText   = "provider_perf_speech_to_text"
+	RuleProviderTextToSpeech   = "provider_perf_text_to_speech"
+)
+
+// AvailableSessionRuleKeys is the allow-list of session rule keys.
+var AvailableSessionRuleKeys = []string{
+	RuleServiceConfig,
+	RulePluginConfig,
+	RuleKBConfig,
+	RuleProviderChatCompletion,
+	RuleProviderSpeechToText,
+	RuleProviderTextToSpeech,
+}
+
+func isSessionRuleKey(key string) bool {
+	for _, k := range AvailableSessionRuleKeys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// GetSessionRules returns all rules for a session (umo). Missing rules are
+// omitted so the WebUI only shows configured rules.
+func (m *Manager) GetSessionRules(umo string) map[string]interface{} {
+	out := map[string]interface{}{}
+	if m.db == nil {
+		return out
+	}
+	rows, err := m.db.ListPreferencesByScope("umo")
+	if err != nil {
+		return out
+	}
+	for _, row := range rows {
+		if row.ScopeID != umo {
+			continue
+		}
+		if !isSessionRuleKey(row.Key) {
+			continue
+		}
+		var val interface{}
+		if json.Unmarshal([]byte(row.Value), &val) == nil {
+			out[row.Key] = val
+		} else {
+			out[row.Key] = row.Value
+		}
+	}
+	return out
+}
+
+// SetSessionRule upserts one rule for a session.
+func (m *Manager) SetSessionRule(umo, key string, value interface{}) error {
+	if m.db == nil || !isSessionRuleKey(key) {
+		return fmt.Errorf("invalid session rule key %q", key)
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return m.db.SetPreference("umo", umo, key, string(data))
+}
+
+// DeleteSessionRule removes one rule for a session. An empty key deletes all
+// rules of the session.
+func (m *Manager) DeleteSessionRule(umo, key string) error {
+	if m.db == nil {
+		return nil
+	}
+	if key == "" {
+		return m.db.DeletePreferencesByScopeID("umo", umo)
+	}
+	if !isSessionRuleKey(key) {
+		return fmt.Errorf("invalid session rule key %q", key)
+	}
+	return m.db.DeletePreference("umo", umo, key)
+}
+
+// ListAllSessionRules returns umo -> rules for every session that has any rule.
+func (m *Manager) ListAllSessionRules() (map[string]map[string]interface{}, error) {
+	out := map[string]map[string]interface{}{}
+	if m.db == nil {
+		return out, nil
+	}
+	rows, err := m.db.ListPreferencesByScope("umo")
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		if !isSessionRuleKey(row.Key) {
+			continue
+		}
+		rules := out[row.ScopeID]
+		if rules == nil {
+			rules = map[string]interface{}{}
+			out[row.ScopeID] = rules
+		}
+		var val interface{}
+		if json.Unmarshal([]byte(row.Value), &val) == nil {
+			rules[row.Key] = val
+		} else {
+			rules[row.Key] = row.Value
+		}
+	}
+	return out, nil
+}

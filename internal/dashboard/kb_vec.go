@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"strings"
 	"context"
 	"fmt"
 	"os"
@@ -263,6 +264,7 @@ func (s *Server) kbRetrieve(kbID, query string, topK int) ([]knowledgebase.Searc
 }
 
 // kbDeleteDoc removes a document: delete its nanovec vectors first (soft
+// kbDeleteDoc removes a document: delete its nanovec vectors first (soft
 // delete), then its SQLite chunk rows (list source of truth).
 func (s *Server) kbDeleteDoc(kbID, docID string) error {
 	if s.database == nil {
@@ -284,4 +286,95 @@ func (s *Server) kbDeleteDoc(kbID, docID string) error {
 		}
 	}
 	return s.database.DeleteKBDoc(kbID, docID)
+}
+
+// kbNamesForSession resolves the knowledge bases for a session: the session
+// kb_config rule (kb_ids) wins; an explicit empty kb_ids disables KB. Falls
+// back to the global kb_names config. Returns (kbIDs, topK, enabled).
+func (s *Server) kbNamesForSession(umo string) ([]string, int, bool) {
+	if cm, ok := s.conversationMgr.(interface {
+		GetSessionRules(umo string) map[string]interface{}
+	}); ok {
+		if rules := cm.GetSessionRules(umo); rules != nil {
+			if kc, ok := rules["kb_config"].(map[string]interface{}); ok {
+				rawIDs, has := kc["kb_ids"].([]interface{})
+				if has && len(rawIDs) == 0 {
+					return nil, 0, false
+				}
+				var ids []string
+				for _, id := range rawIDs {
+					if s, ok := id.(string); ok && s != "" {
+						ids = append(ids, s)
+					}
+				}
+				if len(ids) > 0 || has {
+					topK := 5
+					if v, ok := kc["top_k"].(float64); ok && v > 0 {
+						topK = int(v)
+					}
+					return ids, topK, true
+				}
+			}
+		}
+	}
+	cfg := s.getConfigData("default")
+	raw, _ := cfg["kb_names"].([]interface{})
+	if len(raw) == 0 {
+		return nil, 0, false
+	}
+	var ids []string
+	for _, n := range raw {
+		if str, ok := n.(string); ok && str != "" {
+			ids = append(ids, str)
+		}
+	}
+	topK := 5
+	if v, ok := cfg["kb_final_top_k"].(float64); ok && v > 0 {
+		topK = int(v)
+	}
+	return ids, topK, len(ids) > 0
+}
+
+// RetrieveKBContext resolves KB context text for a session+prompt, respecting
+// the session kb_config rule. Returns formatted reference text ("" when no KB
+// applies). Exported for the pipeline KB retriever.
+func (s *Server) RetrieveKBContext(umo, query string) (string, error) {
+	kbIDs, topK, ok := s.kbNamesForSession(umo)
+	if !ok || len(kbIDs) == 0 || s.database == nil {
+		return "", nil
+	}
+	// kbNamesForSession may return names (global kb_names) or ids (session
+	// kb_config.kb_ids); resolve both to kb_id before vector retrieval.
+	lookup := map[string]string{}
+	if rows, err := s.database.ListKBs(); err == nil {
+		for i := range rows {
+			lookup[rows[i].KBID] = rows[i].KBID
+			if rows[i].KBName != "" {
+				lookup[rows[i].KBName] = rows[i].KBID
+			}
+		}
+	}
+	var resolved []string
+	for _, ref := range kbIDs {
+		if id, ok := lookup[ref]; ok {
+			resolved = append(resolved, id)
+		} else {
+			logger.I18nWarn("知识库 %q 不存在，已跳过", ref)
+		}
+	}
+	if len(resolved) == 0 {
+		return "", nil
+	}
+	var sb strings.Builder
+	for _, kbID := range resolved {
+		results, err := s.kbRetrieve(kbID, query, topK)
+		if err != nil {
+			logger.I18nWarn("知识库 %s 检索失败: %v", kbID, err)
+			continue
+		}
+		for i, hit := range results {
+			sb.WriteString(fmt.Sprintf("【知识 %d】\n%s\n", i+1, hit.Content))
+		}
+	}
+	return sb.String(), nil
 }

@@ -74,8 +74,12 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		s.handleKB(w, r, rest)
 
 	// ── Sessions / Conversations / Session Groups ────────
-	case "sessions", "session-groups":
+	case "sessions":
 		s.handleSessions(w, r, rest)
+	case "session-groups":
+		// Needs the full parts (parts[1] is the group id) rather than rest,
+		// which apiHandler strips the leading category from.
+		s.handleSessionGroups(w, r, parts)
 	case "conversations":
 		s.handleConversations(w, r, rest)
 

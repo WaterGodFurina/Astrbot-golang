@@ -183,6 +183,47 @@
               </v-select>
             </v-col>
           </v-row>
+          <v-row dense v-if="batchScope === 'selected'" class="mt-3">
+            <v-col cols="12">
+              <v-card variant="outlined" class="pa-3">
+                <div class="d-flex align-center mb-2">
+                  <span class="text-subtitle-2">
+                    {{ tm('batchOperations.selectSessions') }}
+                    ({{ batchSelectedUmos.length }}/{{ allSessions.length }})
+                  </span>
+                  <v-spacer></v-spacer>
+                  <v-btn size="small" variant="text" class="mr-1" @click="batchSelectedUmos = allSessions.map((s) => s)">
+                    {{ tm('batchOperations.selectAll') }}
+                  </v-btn>
+                  <v-btn size="small" variant="text" @click="batchSelectedUmos = []">
+                    {{ tm('batchOperations.clearAll') }}
+                  </v-btn>
+                </div>
+                <v-text-field
+                  v-model="batchSessionSearch"
+                  :placeholder="tm('batchOperations.searchSessions')"
+                  variant="outlined"
+                  density="compact"
+                  hide-details
+                  clearable
+                  prepend-inner-icon="mdi-magnify"
+                  class="mb-2"
+                ></v-text-field>
+                <div class="session-checkbox-list">
+                  <v-checkbox
+                    v-for="s in filteredAllSessions"
+                    :key="s"
+                    :label="getUmoDisplayText(s)"
+                    :value="s"
+                    v-model="batchSelectedUmos"
+                    density="compact"
+                    hide-details
+                    class="session-checkbox"
+                  ></v-checkbox>
+                </div>
+              </v-card>
+            </v-col>
+          </v-row>
           <v-row dense class="mt-3">
             <v-col cols="12" class="d-flex justify-end">
               <v-btn color="primary" variant="tonal" size="large" @click="applyBatchChanges" :disabled="!canApplyBatch" :loading="batchUpdating" prepend-icon="mdi-check-all">
@@ -781,6 +822,9 @@ export default {
       batchChatProvider: null,
       batchTtsProvider: null,
       batchUpdating: false,
+      batchSelectedUmos: [],
+      allSessions: [],
+      batchSessionSearch: '',
 
       // 分组管理
       groups: [],
@@ -953,9 +997,20 @@ export default {
     canApplyBatch() {
       const hasChanges = this.batchLlmStatus !== null || this.batchTtsStatus !== null || this.batchChatProvider !== null || this.batchTtsProvider !== null
       if (this.batchScope === 'selected') {
-        return hasChanges && this.selectedItems.length > 0
+        return hasChanges && this.batchSelectedUmos.length > 0
       }
       return hasChanges
+    },
+
+    filteredAllSessions() {
+      if (!this.batchSessionSearch) return this.allSessions
+      const search = this.batchSessionSearch.toLowerCase()
+      return this.allSessions.filter((umo) => {
+        if (umo.toLowerCase().includes(search)) return true
+        const info = this.getAvailableUmoInfo(umo)
+        const name = info.user_alias || info.auto_name || info.display_name || ''
+        return name.toLowerCase().includes(search)
+      })
     },
 
     // 穿梭框：未选中的UMO列表
@@ -996,6 +1051,7 @@ export default {
   mounted() {
     this.loadData()
     this.loadGroups()
+    this.loadAllSessions()
   },
 
   beforeUnmount() {
@@ -1583,7 +1639,7 @@ export default {
         }
 
         if (scope === 'selected') {
-          umos = this.selectedItems.map((item) => item.umo)
+          umos = this.batchSelectedUmos
           if (umos.length === 0) {
             this.showError(this.tm('messages.selectSessionsFirst'))
             this.batchUpdating = false
@@ -1703,6 +1759,18 @@ export default {
         console.error('加载会话列表失败:', error)
       }
       this.loadingUmos = false
+    },
+
+    async loadAllSessions() {
+      try {
+        const response = await sessionApi.activeUmos()
+        if (response.data.status === 'ok') {
+          this.mergeUmoInfos(response.data.data.umo_infos || [])
+          this.allSessions = response.data.data.umos || []
+        }
+      } catch (error) {
+        console.error('加载全部会话失败:', error)
+      }
     },
 
     openCreateGroupDialog() {
@@ -1833,6 +1901,18 @@ export default {
 .v-data-table :deep(.v-data-table__td) {
   padding: 8px 16px !important;
   vertical-align: middle !important;
+}
+
+.session-checkbox-list {
+  max-height: 240px;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 2px;
+}
+
+.session-checkbox {
+  margin: 0;
 }
 
 code {

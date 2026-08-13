@@ -16,6 +16,19 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 		if h.EventType != EventTypeFilter {
 			continue
 		}
+		// Only handlers carrying a command filter are commands. Plugin message
+		// filters (e.g. "plugin_filter_<id>_<name>") match EventTypeFilter too
+		// but have no CommandFilter and must not appear in the command list.
+		hasCommandFilter := false
+		for _, f := range h.EventFilters {
+			if _, ok := f.(*CommandFilter); ok {
+				hasCommandFilter = true
+				break
+			}
+		}
+		if !hasCommandFilter {
+			continue
+		}
 		desc := BuildDescriptor(registry, h)
 		if desc == nil {
 			continue

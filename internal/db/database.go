@@ -579,6 +579,89 @@ func (d *Database) DeleteConversationByID(convID string) error {
 	return err
 }
 
+// PreferenceRow is one row from the preferences table.
+type PreferenceRow struct {
+	Scope   string
+	ScopeID string
+	Key     string
+	Value   string
+}
+
+// GetPreference returns the value for (scope, scope_id, key) and whether it
+// exists. Mirrors the Python session preference read (`sp.session_get`).
+func (d *Database) GetPreference(scope, scopeID, key string) (string, bool, error) {
+	var val string
+	err := d.db.QueryRow(
+		`SELECT value FROM preferences WHERE scope = ? AND scope_id = ? AND key = ?`,
+		scope, scopeID, key,
+	).Scan(&val)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return val, true, nil
+}
+
+// SetPreference upserts a preference value (`sp.session_put`).
+func (d *Database) SetPreference(scope, scopeID, key, value string) error {
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO preferences (scope, scope_id, key, value)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(scope, scope_id, key)
+			 DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
+			scope, scopeID, key, value,
+		)
+		return err
+	})
+}
+
+// DeletePreference removes a preference row.
+func (d *Database) DeletePreference(scope, scopeID, key string) error {
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`DELETE FROM preferences WHERE scope = ? AND scope_id = ? AND key = ?`,
+			scope, scopeID, key,
+		)
+		return err
+	})
+}
+
+// ListPreferencesByScope returns every row for a scope.
+func (d *Database) ListPreferencesByScope(scope string) ([]PreferenceRow, error) {
+	rows, err := d.db.Query(
+		`SELECT scope, scope_id, key, value FROM preferences WHERE scope = ? ORDER BY scope_id, key`,
+		scope,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PreferenceRow
+	for rows.Next() {
+		var r PreferenceRow
+		if err := rows.Scan(&r.Scope, &r.ScopeID, &r.Key, &r.Value); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DeletePreferencesByScopeID removes every preference row for a scope + id
+// (e.g. all rules of a session when deleting "all rules").
+func (d *Database) DeletePreferencesByScopeID(scope, scopeID string) error {
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`DELETE FROM preferences WHERE scope = ? AND scope_id = ?`,
+			scope, scopeID,
+		)
+		return err
+	})
+}
+
 // CronJobRow is one row from the cron_jobs table.
 type CronJobRow struct {
 	JobID          string
@@ -755,7 +838,6 @@ func boolInt(b bool) int {
 }
 
 // RecordPlatformMessage inserts a received platform message for statistics.
-// 高频写点：经 withRetry 处理 SQLITE_BUSY，避免偶发 "database is locked" 丢消息。
 func (d *Database) RecordPlatformMessage(platformID, userID, senderID, content string) error {
 	return d.withRetry(func() error {
 		_, err := d.db.Exec(
@@ -765,6 +847,38 @@ func (d *Database) RecordPlatformMessage(platformID, userID, senderID, content s
 		)
 		return err
 	})
+}
+
+// PlatformMessageRow is one row from platform_message_history.
+type PlatformMessageRow struct {
+	ID         int64
+	SenderID   string
+	SenderName string
+	Content    string
+	CreatedAt  string
+}
+
+// GetPlatformMessageHistory returns the most recent messages for a platform
+// session (used by the get_group_message_history tool).
+func (d *Database) GetPlatformMessageHistory(platformID, userID string, limit int) ([]PlatformMessageRow, error) {
+	rows, err := d.db.Query(
+		`SELECT id, COALESCE(sender_id,''), COALESCE(sender_name,''), content, COALESCE(created_at,'')
+		 FROM platform_message_history WHERE platform_id=? AND user_id=? ORDER BY id DESC LIMIT ?`,
+		platformID, userID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PlatformMessageRow
+	for rows.Next() {
+		var r PlatformMessageRow
+		if err := rows.Scan(&r.ID, &r.SenderID, &r.SenderName, &r.Content, &r.CreatedAt); err != nil {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // TotalMessageCount returns the total number of recorded platform messages.

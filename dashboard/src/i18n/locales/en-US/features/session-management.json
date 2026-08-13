@@ -1,4 +1,4 @@
-﻿{
+{
   "title": "Custom Rules",
   "subtitle": "Set custom rules for specific sessions, which take priority over global settings",
   "buttons": {
@@ -106,6 +106,10 @@
     "ttsStatus": "TTS Status",
     "chatProvider": "Chat Model",
     "ttsProvider": "TTS Model",
+    "selectSessions": "Select sessions",
+    "searchSessions": "Search sessions...",
+    "selectAll": "Select all",
+    "clearAll": "Clear",
     "apply": "Apply Changes"
   },
   "groups": {

@@ -85,6 +85,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 			HandlerFullName:   "plugin_" + inst.ID + "_" + cmd.Name,
 			HandlerName:       cmd.Name,
 			HandlerModulePath: "data.plugins",
+			PluginName:        inst.ID,
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -132,6 +133,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 			HandlerFullName:   "plugin_filter_" + inst.ID + "_" + f.Name,
 			HandlerName:       f.Name,
 			HandlerModulePath: "data.plugins",
+			PluginName:        inst.ID,
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -176,6 +178,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 			HandlerFullName:   "plugin_hook_" + inst.ID + "_" + h.Name,
 			HandlerName:       h.Name,
 			HandlerModulePath: "data.plugins",
+			PluginName:        inst.ID,
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {

@@ -21,6 +21,14 @@ type ProviderSettings struct {
 	Identifier           bool   `mapstructure:"identifier"`
 	GroupNameDisplay     bool   `mapstructure:"group_name_display"`
 	DatetimeSystemPrompt bool   `mapstructure:"datetime_system_prompt"`
+	MaxAgentStep         int    `mapstructure:"max_agent_step"`
+	ToolSchemaMode       string `mapstructure:"tool_schema_mode"`
+	MaxContextLength     int    `mapstructure:"max_context_length"`
+	DequeueContextLength int    `mapstructure:"dequeue_context_length"`
+	ContextLimitStrategy string `mapstructure:"context_limit_reached_strategy"`
+	LLMCompressInstruction string `mapstructure:"llm_compress_instruction"`
+	LLMCompressKeepRecentRatio float64 `mapstructure:"llm_compress_keep_recent_ratio"`
+	LLMCompressProviderID string  `mapstructure:"llm_compress_provider_id"`
 	Proactive            struct {
 		AddCronTools *bool `mapstructure:"add_cron_tools"`
 	} `mapstructure:"proactive_capability"`

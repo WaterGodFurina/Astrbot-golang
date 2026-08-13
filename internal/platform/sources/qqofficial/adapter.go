@@ -72,6 +72,7 @@ type Adapter struct {
 	wsSessionID    string
 	lastSeq        int
 	sessionScene   map[string]string // convID -> "group"/"friend"/"channel"
+	recentMsg      map[string]time.Time // msgID -> received at (dedupe)
 	sessionLastMsg map[string]string // convID -> last message id
 	stopCh         chan struct{}
 	stopped        bool
@@ -670,7 +671,28 @@ func (a *Adapter) remember(scene, convID, msgID string) {
 }
 
 func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}) {
-	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q", convID, isGroup, msgStr)
+	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q (msg_id=%s)", convID, isGroup, msgStr, msgID)
+	// Deduplicate identical msg_id re-deliveries within a short window (the QQ
+	// official WS may redeliver the same event after a reconnect/retry).
+	if msgID != "" {
+		a.mu.Lock()
+		if a.recentMsg == nil {
+			a.recentMsg = make(map[string]time.Time)
+		}
+		if _, seen := a.recentMsg[msgID]; seen {
+			a.mu.Unlock()
+			logger.I18nWarn("QQ 消息 %s 已处理过，跳过重复推送", msgID)
+			return
+		}
+		a.recentMsg[msgID] = time.Now()
+		// Prune entries older than 60s.
+		for id, t := range a.recentMsg {
+			if time.Since(t) > 60*time.Second {
+				delete(a.recentMsg, id)
+			}
+		}
+		a.mu.Unlock()
+	}
 	msgObj := platform.NewAstrBotMessage()
 	if isGroup {
 		msgObj.Type = platform.GroupMessage

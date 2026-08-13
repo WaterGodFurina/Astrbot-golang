@@ -497,6 +497,14 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 		CronManager:           l.cronMgr,
 		Database:              l.database,
 		EventBus:              l.eventBus,
+		KBManager:             l.kbMgr,
+		KBRetriever: func(umo, query string) (string, error) {
+			if l.dashboard == nil {
+				return "", nil
+			}
+			return l.dashboard.RetrieveKBContext(umo, query)
+		},
+		ProviderManager:       l.providerMgr,
 		SubPlugins:            l.subPluginMgr,
 	}
 

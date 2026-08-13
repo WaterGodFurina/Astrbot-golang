@@ -1,4 +1,4 @@
-﻿{
+{
   "title": "自定义规则",
   "subtitle": "为特定会话设置自定义规则，优先级高于全局配置",
   "buttons": {
@@ -106,6 +106,10 @@
     "ttsStatus": "TTS 状态",
     "chatProvider": "聊天模型",
     "ttsProvider": "TTS 模型",
+    "selectSessions": "选择会话",
+    "searchSessions": "搜索会话...",
+    "selectAll": "全选",
+    "clearAll": "清空",
     "apply": "应用更改"
   },
   "groups": {

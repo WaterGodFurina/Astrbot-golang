@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
@@ -2755,39 +2757,24 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request, parts []
 		writeJSON(w, http.StatusOK, apiOK(s.getActiveUMOs()))
 	case "provider":
 		if r.Method == http.MethodPatch {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			s.batchUpdateSessionProvider(w, r)
+			return
 		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "rules":
-		if r.Method == http.MethodPost {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-		} else if len(parts) > 1 && parts[1] == "delete" {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"deleted": 0,
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"rules":                    []interface{}{},
-				"total":                    0,
-				"available_personas":       []interface{}{},
-				"available_chat_providers": s.getProviderList(),
-				"available_stt_providers":  []interface{}{},
-				"available_tts_providers":  []interface{}{},
-				"available_plugins":        []interface{}{},
-				"available_kbs":            []interface{}{},
-			}))
-		}
+		s.handleSessionRules(w, r, parts)
 	case "service":
 		if r.Method == http.MethodPatch {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			s.batchUpdateSessionService(w, r)
+			return
 		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "batch-delete":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"deleted": 0,
 		}))
+	case "session-groups":
+		s.handleSessionGroups(w, r, parts)
 	case "export":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"data": []interface{}{},
@@ -2801,6 +2788,553 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request, parts []
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// conversationManager returns the conversation manager or nil.
+func (s *Server) conversationManager() *conversation.Manager {
+	if cm, ok := s.conversationMgr.(*conversation.Manager); ok {
+		return cm
+	}
+	return nil
+}
+
+// sessionGroupsPreference is where the session-group map is stored in the
+// preferences table (mirrors Python sp.get_async("unknown","unknown",
+// "session_groups")).
+const sessionGroupsPreference = "session_groups"
+
+// getSessionGroups loads the {group_id: {name, umos}} map.
+func (s *Server) getSessionGroups() map[string]map[string]interface{} {
+	if s.database == nil {
+		return map[string]map[string]interface{}{}
+	}
+	val, found, _ := s.database.GetPreference("unknown", "unknown", sessionGroupsPreference)
+	if !found || val == "" {
+		return map[string]map[string]interface{}{}
+	}
+	var groups map[string]map[string]interface{}
+	if json.Unmarshal([]byte(val), &groups) != nil || groups == nil {
+		return map[string]map[string]interface{}{}
+	}
+	return groups
+}
+
+func (s *Server) saveSessionGroups(groups map[string]map[string]interface{}) error {
+	if s.database == nil {
+		return errors.New("数据库不可用")
+	}
+	data, err := json.Marshal(groups)
+	if err != nil {
+		return err
+	}
+	return s.database.SetPreference("unknown", "unknown", sessionGroupsPreference, string(data))
+}
+
+func (s *Server) sessionGroupMap(g map[string]interface{}, id string) map[string]interface{} {
+	name, _ := g["name"].(string)
+	umos, _ := g["umos"].([]interface{})
+	return map[string]interface{}{
+		"id":         id,
+		"name":       name,
+		"umos":       umos,
+		"umo_count":  len(umos),
+	}
+}
+
+// handleSessionGroups implements session-group CRUD:
+// GET /session-groups, POST /session-groups, PUT/DELETE /session-groups/{id}.
+func (s *Server) handleSessionGroups(w http.ResponseWriter, r *http.Request, parts []string) {
+	groupID := ""
+	if len(parts) > 1 {
+		groupID = parts[1]
+	}
+	switch r.Method {
+	case http.MethodGet:
+		groups := s.getSessionGroups()
+		list := make([]interface{}, 0, len(groups))
+		for id, g := range groups {
+			list = append(list, s.sessionGroupMap(g, id))
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"groups": list}))
+	case http.MethodPost:
+		var body struct {
+			Name string   `json:"name"`
+			Umos []string `json:"umos"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if strings.TrimSpace(body.Name) == "" {
+			writeJSON(w, http.StatusOK, apiError("分组名称不能为空"))
+			return
+		}
+		groups := s.getSessionGroups()
+		id := strings.ToLower(generateRandomToken(4))
+		umos := make([]interface{}, 0, len(body.Umos))
+		for _, u := range body.Umos {
+			umos = append(umos, u)
+		}
+		groups[id] = map[string]interface{}{"name": body.Name, "umos": umos}
+		if err := s.saveSessionGroups(groups); err != nil {
+			writeJSON(w, http.StatusOK, apiError("保存分组失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"message": fmt.Sprintf("分组 '%s' 创建成功", body.Name),
+			"group":   s.sessionGroupMap(groups[id], id),
+		}))
+	case http.MethodPut:
+		if groupID == "" {
+			writeJSON(w, http.StatusOK, apiError("分组 ID 不能为空"))
+			return
+		}
+		var body struct {
+			Name string   `json:"name"`
+			Umos []string `json:"umos"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		groups := s.getSessionGroups()
+		g, ok := groups[groupID]
+		if !ok {
+			writeJSON(w, http.StatusOK, apiError(fmt.Sprintf("分组 '%s' 不存在", groupID)))
+			return
+		}
+		if strings.TrimSpace(body.Name) != "" {
+			g["name"] = body.Name
+		}
+		if body.Umos != nil {
+			umos := make([]interface{}, 0, len(body.Umos))
+			for _, u := range body.Umos {
+				umos = append(umos, u)
+			}
+			g["umos"] = umos
+		}
+		if err := s.saveSessionGroups(groups); err != nil {
+			writeJSON(w, http.StatusOK, apiError("保存分组失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"message": fmt.Sprintf("分组 '%s' 更新成功", g["name"]),
+			"group":   s.sessionGroupMap(g, groupID),
+		}))
+	case http.MethodDelete:
+		if groupID == "" {
+			writeJSON(w, http.StatusOK, apiError("分组 ID 不能为空"))
+			return
+		}
+		groups := s.getSessionGroups()
+		if _, ok := groups[groupID]; !ok {
+			writeJSON(w, http.StatusOK, apiError(fmt.Sprintf("分组 '%s' 不存在", groupID)))
+			return
+		}
+		delete(groups, groupID)
+		if err := s.saveSessionGroups(groups); err != nil {
+			writeJSON(w, http.StatusOK, apiError("删除分组失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "分组已删除"}))
+	default:
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	}
+}
+
+// handleSessionRules implements GET/POST /sessions/rules and
+// POST /sessions/rules/delete (list / upsert / delete).
+func (s *Server) handleSessionRules(w http.ResponseWriter, r *http.Request, parts []string) {
+	cm := s.conversationManager()
+	if cm == nil {
+		writeJSON(w, http.StatusOK, apiError("会话管理不可用"))
+		return
+	}
+	if len(parts) > 1 && parts[1] == "delete" {
+		var body struct {
+			UMO     string   `json:"umo"`
+			UMOs    []string `json:"umos"`
+			RuleKey string   `json:"rule_key"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		umos := body.UMOs
+		if body.UMO != "" {
+			umos = append(umos, body.UMO)
+		}
+		deleted := 0
+		for _, umo := range umos {
+			if err := cm.DeleteSessionRule(umo, body.RuleKey); err == nil {
+				deleted++
+			}
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"deleted": deleted}))
+		return
+	}
+	if r.Method == http.MethodPost {
+		var body struct {
+			UMO      string      `json:"umo"`
+			RuleKey  string      `json:"rule_key"`
+			RuleValue interface{} `json:"rule_value"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusOK, apiError("无效的请求体"))
+			return
+		}
+		if body.UMO == "" || body.RuleKey == "" {
+			writeJSON(w, http.StatusOK, apiError("缺少必要参数: umo / rule_key"))
+			return
+		}
+		if err := cm.SetSessionRule(body.UMO, body.RuleKey, body.RuleValue); err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"message": "规则 " + body.RuleKey + " 已更新",
+			"umo":     body.UMO,
+		}))
+		return
+	}
+	// GET list.
+	page := 1
+	pageSize := 10
+	search := r.URL.Query().Get("search")
+	if v := r.URL.Query().Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	if v := r.URL.Query().Get("page_size"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageSize = n
+		}
+	}
+	all, err := cm.ListAllSessionRules()
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError("读取规则失败: "+err.Error()))
+		return
+	}
+	// The main table lists sessions that have at least one rule; all sessions
+	// are available in the batch-operations area via /sessions/active-umos.
+	umos := make([]string, 0, len(all))
+	for umo := range all {
+		umos = append(umos, umo)
+	}
+	sort.Strings(umos)
+	infos := make(map[string]map[string]interface{}, len(umos))
+	for _, umo := range umos {
+		infos[umo] = conversation.BuildUMOInfo(umo)
+	}
+	// Search by umo, custom_name, or auto display name.
+	if search != "" {
+		sl := strings.ToLower(search)
+		var filtered []string
+		for _, umo := range umos {
+			if strings.Contains(strings.ToLower(umo), sl) {
+				filtered = append(filtered, umo)
+				continue
+			}
+			if rules, ok := all[umo]; ok {
+				if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
+					if name, ok := sc["custom_name"].(string); ok && strings.Contains(strings.ToLower(name), sl) {
+						filtered = append(filtered, umo)
+						continue
+					}
+				}
+			}
+			if info, ok := infos[umo]; ok {
+				for _, k := range []string{"auto_name", "user_alias", "display_name"} {
+					if v, ok := info[k].(string); ok && v != "" && strings.Contains(strings.ToLower(v), sl) {
+						filtered = append(filtered, umo)
+						break
+					}
+				}
+			}
+		}
+		umos = filtered
+	}
+	total := len(umos)
+	start := (page - 1) * pageSize
+	end := start + pageSize
+	if start > total {
+		start = total
+	}
+	if end > total {
+		end = total
+	}
+	rulesList := make([]interface{}, 0, len(umos))
+	for _, umo := range umos[start:end] {
+		item := conversation.BuildUMOInfo(umo)
+		rules, has := all[umo]
+		if !has {
+			rules = map[string]interface{}{}
+		}
+		item["rules"] = rules
+		rulesList = append(rulesList, item)
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"rules":                    rulesList,
+		"total":                    total,
+		"page":                     page,
+		"page_size":                pageSize,
+		"available_personas":       s.getAvailablePersonas(),
+		"available_chat_providers": s.getAvailableChatProviders(),
+		"available_stt_providers":  []interface{}{},
+		"available_tts_providers":  []interface{}{},
+		"available_plugins":        s.getAvailablePlugins(),
+		"available_kbs":            s.getAvailableKBs(),
+		"available_rule_keys":      conversation.AvailableSessionRuleKeys,
+	}))
+}
+
+// followConfigValue matches the WebUI sentinel "__astrbot_follow_config__".
+const followConfigValue = "__astrbot_follow_config__"
+
+// resolveScopeUMOs resolves a batch-operation scope into concrete umos.
+func (s *Server) resolveScopeUMOs(scope string, umos []string, groupID string) []string {
+	cm := s.conversationManager()
+	if cm == nil {
+		return umos
+	}
+	all := cm.ActiveUMOs()
+	switch scope {
+	case "all":
+		return all
+	case "selected", "":
+		if len(umos) > 0 {
+			return umos
+		}
+		return all
+	case "private":
+		var out []string
+		for _, umo := range all {
+			if !strings.Contains(umo, ":group:") {
+				out = append(out, umo)
+			}
+		}
+		return out
+	case "group":
+		var out []string
+		for _, umo := range all {
+			if strings.Contains(umo, ":group:") {
+				out = append(out, umo)
+			}
+		}
+		return out
+	case "custom_group":
+		// Resolve members from the stored session group.
+		groups := s.getSessionGroups()
+		if groupID == "" {
+			return nil
+		}
+		g, ok := groups[groupID]
+		if !ok {
+			return nil
+		}
+		raw, _ := g["umos"].([]interface{})
+		out := make([]string, 0, len(raw))
+		for _, u := range raw {
+			if su, ok := u.(string); ok && su != "" {
+				out = append(out, su)
+			}
+		}
+		return out
+	}
+	return umos
+}
+
+// batchUpdateSessionProvider implements PATCH /sessions/provider.
+func (s *Server) batchUpdateSessionProvider(w http.ResponseWriter, r *http.Request) {
+	cm := s.conversationManager()
+	if cm == nil {
+		writeJSON(w, http.StatusOK, apiError("会话管理不可用"))
+		return
+	}
+	var body struct {
+		UMOs         []string `json:"umos"`
+		Scope        string   `json:"scope"`
+		GroupID      string   `json:"group_id"`
+		ProviderID   string   `json:"provider_id"`
+		ProviderType string   `json:"provider_type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusOK, apiError("无效的请求体"))
+		return
+	}
+	key := conversation.RuleProviderChatCompletion
+	switch body.ProviderType {
+	case "speech_to_text":
+		key = conversation.RuleProviderSpeechToText
+	case "text_to_speech":
+		key = conversation.RuleProviderTextToSpeech
+	}
+	umos := s.resolveScopeUMOs(body.Scope, body.UMOs, body.GroupID)
+	updated := 0
+	for _, umo := range umos {
+		if body.ProviderID == "" || body.ProviderID == followConfigValue {
+			if err := cm.DeleteSessionRule(umo, key); err == nil {
+				updated++
+			}
+		} else if err := cm.SetSessionRule(umo, key, body.ProviderID); err == nil {
+			updated++
+		}
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"updated": updated}))
+}
+
+// batchUpdateSessionService implements PATCH /sessions/service.
+func (s *Server) batchUpdateSessionService(w http.ResponseWriter, r *http.Request) {
+	cm := s.conversationManager()
+	if cm == nil {
+		writeJSON(w, http.StatusOK, apiError("会话管理不可用"))
+		return
+	}
+	var body struct {
+		UMOs           []string `json:"umos"`
+		Scope          string   `json:"scope"`
+		GroupID        string   `json:"group_id"`
+		SessionEnabled *bool    `json:"session_enabled"`
+		LLMEnabled     *bool    `json:"llm_enabled"`
+		TTSEnabled     *bool    `json:"tts_enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusOK, apiError("无效的请求体"))
+		return
+	}
+	umos := s.resolveScopeUMOs(body.Scope, body.UMOs, body.GroupID)
+	updated := 0
+	for _, umo := range umos {
+		cur := cm.GetSessionRules(umo)
+		cfg, _ := cur[conversation.RuleServiceConfig].(map[string]interface{})
+		if cfg == nil {
+			cfg = map[string]interface{}{}
+		}
+		changed := false
+		if body.SessionEnabled != nil {
+			cfg["session_enabled"] = *body.SessionEnabled
+			changed = true
+		}
+		if body.LLMEnabled != nil {
+			cfg["llm_enabled"] = *body.LLMEnabled
+			changed = true
+		}
+		if body.TTSEnabled != nil {
+			cfg["tts_enabled"] = *body.TTSEnabled
+			changed = true
+		}
+		if !changed {
+			continue
+		}
+		if err := cm.SetSessionRule(umo, conversation.RuleServiceConfig, cfg); err == nil {
+			updated++
+		}
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"updated": updated}))
+}
+
+// getAvailableChatProviders serializes configured chat providers as
+// {id, name, model} for the rules editor (name mirrors Python: id).
+// Embedding / rerank / other non-chat provider entries are excluded.
+func (s *Server) getAvailableChatProviders() []interface{} {
+	cfg := s.getConfigData("default")
+	providers, ok := cfg["provider"].([]interface{})
+	if !ok {
+		return []interface{}{}
+	}
+	out := make([]interface{}, 0, len(providers))
+	for _, p := range providers {
+		pm, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		id, _ := pm["id"].(string)
+		model, _ := pm["model"].(string)
+		enabled, _ := pm["enable"].(bool)
+		if id == "" || !enabled {
+			continue
+		}
+		// Skip embedding / rerank / TTS / STT provider entries.
+		providerType, _ := pm["provider_type"].(string)
+		ptype, _ := pm["type"].(string)
+		kind := strings.ToLower(providerType + " " + ptype)
+		if strings.Contains(kind, "embedding") || strings.Contains(kind, "rerank") ||
+			strings.Contains(kind, "tts") || strings.Contains(kind, "stt") {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"id":    id,
+			"name":  id,
+			"model": model,
+		})
+	}
+	return out
+}
+
+// getAvailablePersonas returns the persona list for the rules editor.
+func (s *Server) getAvailablePersonas() []interface{} {
+	out := []interface{}{}
+	if s.personas == nil {
+		return out
+	}
+	for _, p := range s.personas.listPersonas(nil) {
+		name, _ := p["name"].(string)
+		if name == "" {
+			name, _ = p["persona_id"].(string)
+		}
+		if name == "" {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"name":   name,
+			"prompt": p["prompt"],
+		})
+	}
+	return out
+}
+
+// getAvailablePlugins returns plugin display metadata for the rules editor.
+func (s *Server) getAvailablePlugins() []interface{} {
+	out := []interface{}{}
+	spm := s.subPluginMgr
+	if spm == nil {
+		return out
+	}
+	for _, inst := range spm.List() {
+		if inst.Meta == nil {
+			continue
+		}
+		name := inst.Meta.Name
+		out = append(out, map[string]interface{}{
+			"name":         name,
+			"display_name": name,
+			"desc":         inst.Meta.Description,
+		})
+	}
+	return out
+}
+
+// getAvailableKBs returns the knowledge-base list for the rules editor. The
+// SQLite `knowledge_bases` table is the authoritative store (the in-memory
+// kbMgr only holds runtime instances, which are empty at boot).
+func (s *Server) getAvailableKBs() []interface{} {
+	out := []interface{}{}
+	if s.database != nil {
+		if rows, err := s.database.ListKBs(); err == nil {
+			for i := range rows {
+				out = append(out, map[string]interface{}{
+					"kb_id":   rows[i].KBID,
+					"kb_name": rows[i].KBName,
+					"emoji":   rows[i].Emoji,
+				})
+			}
+			return out
+		}
+	}
+	kb, ok := s.kbMgr.(*knowledgebase.Manager)
+	if !ok {
+		return out
+	}
+	for _, item := range kb.ListKBs() {
+		out = append(out, map[string]interface{}{
+			"kb_id":   item.KBID,
+			"kb_name": item.KBName,
+			"emoji":   item.Emoji,
+		})
+	}
+	return out
 }
 
 // ── Persona handlers ─────────────────────────────────────────
@@ -3080,6 +3614,35 @@ func (s *Server) listTools() []interface{} {
 				"permission":            perm,
 				"permission_configured": configured,
 			})
+		}
+	}
+
+	// Plugin LLM function tools (subprocess plugins' registered tools).
+	if s.subPluginMgr != nil {
+		for _, inst := range s.subPluginMgr.List() {
+			if inst.Meta == nil {
+				continue
+			}
+			for _, t := range inst.Meta.Tools {
+				params := map[string]interface{}{}
+				if len(t.ParamsJson) > 0 {
+					_ = json.Unmarshal(t.ParamsJson, &params)
+				}
+				display := inst.Name
+				if display == "" {
+					display = "plugin"
+				}
+				result = append(result, map[string]interface{}{
+					"name":                t.Name,
+					"description":         t.Description,
+					"parameters":          params,
+					"active":              true,
+					"origin":              "plugin",
+					"origin_name":         display,
+					"origin_display_name": display,
+					"readonly":            false,
+				})
+			}
 		}
 	}
 	return result
@@ -3981,9 +4544,56 @@ func (s *Server) handleSubagents(w http.ResponseWriter, r *http.Request, parts [
 	}
 	switch sub {
 	case "", "config":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		cm, ok := s.configMgr.(*config.ConfigManager)
+		if !ok || cm == nil {
+			writeJSON(w, http.StatusOK, apiError("配置管理器不可用"))
+			return
+		}
+		cfg := cm.Get("default")
+		if cfg == nil {
+			writeJSON(w, http.StatusOK, apiError("默认配置不存在"))
+			return
+		}
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
+			var body map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body == nil {
+				writeJSON(w, http.StatusOK, apiError("无效的请求体"))
+				return
+			}
+			// Preserve router_system_prompt when the client omits it.
+			if _, has := body["router_system_prompt"]; !has {
+				if all := cfg.All(); all != nil {
+					if cur, ok := all["subagent_orchestrator"].(map[string]interface{}); ok {
+						if sp, ok := cur["router_system_prompt"].(string); ok {
+							body["router_system_prompt"] = sp
+						}
+					}
+				}
+			}
+			if err := cfg.Set("subagent_orchestrator", body); err != nil {
+				writeJSON(w, http.StatusOK, apiError("保存子代理配置失败: "+err.Error()))
+				return
+			}
+			if err := cfg.Save(); err != nil {
+				writeJSON(w, http.StatusOK, apiError("保存子代理配置失败: "+err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("子代理配置已保存", body))
+			return
+		}
+		all := cfg.All()
+		subCfg, _ := all["subagent_orchestrator"].(map[string]interface{})
+		if subCfg == nil {
+			subCfg = map[string]interface{}{
+				"main_enable":                 false,
+				"remove_main_duplicate_tools": false,
+				"router_system_prompt":        "You are a task router...",
+				"agents":                      []interface{}{},
+			}
+		}
+		writeJSON(w, http.StatusOK, apiOK(subCfg))
 	case "available-tools":
-		writeJSON(w, http.StatusOK, apiOK([]interface{}{}))
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"tools": []interface{}{}}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}

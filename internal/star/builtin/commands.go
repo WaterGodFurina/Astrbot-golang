@@ -313,6 +313,11 @@ func providerCmd(deps Deps, e *core.Event) {
 	state.selectedLLM[umo] = p.ID
 	state.mu.Unlock()
 	persistSelectedProvider(deps, umo, p.ID)
+	// Record the per-session provider selection as a session rule so the
+	// WebUI "自定义规则" page shows this session's provider override.
+	if deps.ConversationMgr != nil {
+		_ = deps.ConversationMgr.SetSessionRule(umo, conversation.RuleProviderChatCompletion, p.ID)
+	}
 	reply(e, i18n.Get("✅ Successfully switched to %s.", p.ID))
 }
 
