@@ -14,12 +14,16 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
+
+// maxWebhookBodySize 限制 Slack 回调请求体大小上限（1MB）。
+const maxWebhookBodySize = 1 << 20
 
 // randRead 读取随机字节（对应 Python 的 uuid4 随机源）。
 func randRead(b []byte) (int, error) { return rand.Read(b) }
@@ -113,7 +117,14 @@ func (s *SlackWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reque
 	}()
 
 	// 读取请求体
-	bodyBytes := readRequestBody(r)
+	bodyBytes, readErr := readRequestBody(r)
+	if readErr != nil {
+		webhookServerLogger.I18nWarn("读取 Slack 事件请求体失败: %v", readErr)
+		writeJSONError(w, http.StatusBadRequest, map[string]interface{}{
+			"error": "request body too large",
+		})
+		return
+	}
 	eventData := map[string]interface{}{}
 	if err := json.Unmarshal(bodyBytes, &eventData); err != nil {
 		webhookServerLogger.I18nWarn("解析 Slack 事件 JSON 失败: %v", err)
@@ -129,6 +140,14 @@ func (s *SlackWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reque
 	if timestamp == "" || signature == "" {
 		writeJSONError(w, http.StatusBadRequest, map[string]interface{}{
 			"error": "Missing headers",
+		})
+		return
+	}
+	// 时间戳新鲜度校验：拒绝时间戳与当前时间偏差超过 5 分钟的请求（防重放）。
+	if !isFreshTimestamp(timestamp, slackTimestampSkew) {
+		webhookServerLogger.I18nWarn("Slack request timestamp is invalid or stale")
+		writeJSONError(w, http.StatusBadRequest, map[string]interface{}{
+			"error": "Invalid timestamp",
 		})
 		return
 	}
@@ -158,19 +177,15 @@ func (s *SlackWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reque
 	_, _ = w.Write([]byte(""))
 }
 
-// readRequestBody 读取请求体（读取失败时返回空）。
-func readRequestBody(r *http.Request) []byte {
+// readRequestBody 读取请求体（上限 maxWebhookBodySize，超限或读取失败时返回错误）。
+func readRequestBody(r *http.Request) ([]byte, error) {
 	defer r.Body.Close()
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 32*1024)
-	for {
-		n, err := r.Body.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-		}
-		if err != nil {
-			break
-		}
+	data, err := io.ReadAll(io.LimitReader(r.Body, maxWebhookBodySize+1))
+	if err != nil {
+		return nil, err
 	}
-	return buf
+	if len(data) > maxWebhookBodySize {
+		return nil, fmt.Errorf("请求体超过大小上限 %d 字节", maxWebhookBodySize)
+	}
+	return data, nil
 }

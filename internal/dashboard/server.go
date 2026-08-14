@@ -171,6 +171,12 @@ type installStatus struct {
 	Total      int64  `json:"total"`
 }
 
+// 状态 map（kbTasks / installProgress）的终态条目在 TTL 后自动清除，防止只增不删。
+const (
+	kbTaskCleanupTTL = 10 * time.Minute
+	installStatusTTL = 10 * time.Minute
+)
+
 // ChatAdapter returns the dashboard-chat reply sink adapter (nil when not
 // created). Used by the lifecycle to re-register it after platform reloads.
 func (s *Server) ChatAdapter() *chatStreamAdapter {
@@ -247,6 +253,7 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 	if managers != nil {
 		if v, ok := managers["config"]; ok {
 			s.configMgr = v
+			s.auth.SetConfigManager(v)
 		}
 		if v, ok := managers["provider"]; ok {
 			s.providerMgr = v
@@ -411,14 +418,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.auth == nil {
-		// No auth configured — return a guest session
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"token":                     generateRandomToken(32),
-			"username":                  "astrbot",
-			"password_upgrade_required": false,
-			"md5_pwd_hint":              false,
-			"change_pwd_hint":           false,
-		}))
+		writeJSON(w, http.StatusInternalServerError, apiError("认证服务未初始化"))
 		return
 	}
 	if creds.Username == s.auth.Username() && s.auth.VerifyPassword(creds.Password) {
@@ -467,12 +467,14 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	token := extractToken(r)
 	loggedIn := false
+	username := ""
 	if s.auth != nil {
 		loggedIn = s.auth.IsAuthenticated(token)
+		username = s.auth.Username()
 	}
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 		"loggedin": loggedIn,
-		"username": s.auth.Username(),
+		"username": username,
 	}))
 }
 
@@ -508,6 +510,12 @@ func (s *Server) handleTOTP(w http.ResponseWriter, r *http.Request, parts []stri
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.Code == "" {
+			if s.auth.TOTPEnabled() {
+				// 已启用时拒绝重新生成，避免 GenerateTOTP 覆盖现有密钥
+				// 导致用户验证器失配（M-07）；需先禁用再重新设置。
+				writeJSON(w, http.StatusOK, apiError("TOTP 已启用，如需重新设置请先禁用"))
+				return
+			}
 			// 第一步：生成密钥与恢复码（不启用），前端扫码
 			secret, otpauth, codes, err := s.auth.GenerateTOTP()
 			if err != nil {
@@ -532,15 +540,12 @@ func (s *Server) handleTOTP(w http.ResponseWriter, r *http.Request, parts []stri
 			writeJSON(w, http.StatusOK, apiError("TOTP 未启用"))
 			return
 		}
-		// 恢复码以哈希存储无法回显，重新生成一批并返回明文（旧恢复码作废）
-		_, _, codes, err := s.auth.GenerateTOTP()
+		// 恢复码以哈希存储无法回显，重新生成一批并返回明文（保留原密钥，
+		// 旧恢复码作废，避免 GenerateTOTP 覆盖 secret 导致验证器失配）
+		codes, err := s.auth.RegenerateRecoveryCodes()
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError(err.Error()))
 			return
-		}
-		if !s.auth.TOTPEnabled() {
-			// GenerateTOTP 会把 enabled 置 false，这里恢复已启用状态
-			s.auth.EnableTOTPNoop()
 		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"recovery_codes": codes}))
 	case "disable":
@@ -666,7 +671,7 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 		}))
 	case "start-time":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"start_time": time.Now().Unix(),
+			"start_time": s.startTime.Unix(),
 		}))
 	case "restart-core":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -1462,6 +1467,10 @@ func (s *Server) injectAuthFields(dash map[string]interface{}) {
 	if sec := s.auth.JWTSecret(); sec != "" {
 		dash["jwt_secret"] = sec
 	}
+	// 保留 TOTP 段：EnableTOTP/DisableTOTP 直写配置文件，ConfigManager 内存
+	// 快照看不到 dashboard.totp；保存 dashboard 是整体替换，必须从
+	// PasswordManager 回填，否则任意一次配置保存都会清掉双因素认证。
+	dash["totp"] = s.auth.TOTPConfig()
 }
 
 // getProviderList returns the provider list from config.
@@ -1672,59 +1681,52 @@ func (s *Server) cronRunJob(jobID string) error {
 	return cm.RunNow(jobID)
 }
 
-// cronUpdateJob patches an existing cron job in place (enabled toggle and/or// schedule fields), keeping it in the list even when disabled.
+// cronUpdateJob patches an existing cron job (enabled toggle and/or schedule
+// fields), keeping it in the list even when disabled. All field mutations run
+// inside UpdateJob so they are serialized with the cron tick goroutine.
 func (s *Server) cronUpdateJob(jobID string, body map[string]interface{}) (map[string]interface{}, string) {
 	cm, ok := s.cronMgr.(interface {
 		Get(id string) *cron.Job
 		SetEnabled(id string, enabled bool) bool
-		UpdateJob(job *cron.Job)
+		UpdateJob(id string, mutate func(*cron.Job)) bool
 	})
 	if !ok || cm == nil {
 		return nil, "cron manager not available"
 	}
-	job := cm.Get(jobID)
-	if job == nil {
-		return nil, "job not found"
-	}
-	changed := false
 	if v, ok := body["enabled"].(bool); ok {
 		cm.SetEnabled(jobID, v)
 	}
-	if v, ok := body["name"].(string); ok && v != "" {
-		job.Name = v
-		changed = true
-	}
-	if v, ok := body["note"].(string); ok && v != "" {
-		job.Payload["note"] = v
-		job.Description = v
-		changed = true
-	} else if v, ok := body["description"].(string); ok && v != "" {
-		job.Description = v
-		changed = true
-	}
-	if v, ok := body["cron_expression"].(string); ok {
-		job.CronExpression = v
-		job.RunOnce = false
-		changed = true
-	}
-	if v, ok := body["run_at"].(string); ok && strings.TrimSpace(v) != "" {
-		if t, err := cron.ParseRunAt(v); err == nil {
-			job.RunAt = t
-			job.RunOnce = true
-			job.Payload["run_at"] = v
-			changed = true
+	cm.UpdateJob(jobID, func(job *cron.Job) {
+		if v, ok := body["name"].(string); ok && v != "" {
+			job.Name = v
 		}
-	}
-	if v, ok := body["timezone"].(string); ok {
-		job.Timezone = v
-		changed = true
-	}
-	if v, ok := body["session"].(string); ok && v != "" {
-		job.Payload["session"] = v
-		changed = true
-	}
-	if changed {
-		cm.UpdateJob(job)
+		if v, ok := body["note"].(string); ok && v != "" {
+			job.Payload["note"] = v
+			job.Description = v
+		} else if v, ok := body["description"].(string); ok && v != "" {
+			job.Description = v
+		}
+		if v, ok := body["cron_expression"].(string); ok {
+			job.CronExpression = v
+			job.RunOnce = false
+		}
+		if v, ok := body["run_at"].(string); ok && strings.TrimSpace(v) != "" {
+			if t, err := cron.ParseRunAt(v); err == nil {
+				job.RunAt = t
+				job.RunOnce = true
+				job.Payload["run_at"] = v
+			}
+		}
+		if v, ok := body["timezone"].(string); ok {
+			job.Timezone = v
+		}
+		if v, ok := body["session"].(string); ok && v != "" {
+			job.Payload["session"] = v
+		}
+	})
+	job := cm.Get(jobID)
+	if job == nil {
+		return nil, "job not found"
 	}
 	return cron.SerializeJob(job), ""
 }
@@ -1790,8 +1792,18 @@ func (s *Server) setInstallProgress(id string, st *installStatus) {
 		return
 	}
 	s.installProgressMu.Lock()
-	defer s.installProgressMu.Unlock()
 	s.installProgress[id] = st
+	s.installProgressMu.Unlock()
+	if st != nil && (st.Status == "done" || st.Status == "error") {
+		// 终态在 TTL 后自动清除（仅当仍是本条记录时），避免 map 只增不删。
+		time.AfterFunc(installStatusTTL, func() {
+			s.installProgressMu.Lock()
+			if s.installProgress[id] == st {
+				delete(s.installProgress, id)
+			}
+			s.installProgressMu.Unlock()
+		})
+	}
 }
 
 // getInstallProgress returns the current progress state for an install_id.

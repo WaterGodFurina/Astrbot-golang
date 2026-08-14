@@ -1,14 +1,17 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack"
 
@@ -263,7 +266,7 @@ func TestWebhookCallbackURLVerification(t *testing.T) {
 	secret := "hook-secret"
 	server := NewSlackWebhookServer(secret, "/slack/events", nil)
 	body := `{"type":"url_verification","challenge":"3eZbrw1aBBa2OEYoErbO2g"}`
-	ts := "1700000000"
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
 
 	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(body))
 	req.Header.Set("X-Slack-Request-Timestamp", ts)
@@ -283,7 +286,7 @@ func TestWebhookCallbackInvalidSignature(t *testing.T) {
 	secret := "hook-secret"
 	server := NewSlackWebhookServer(secret, "/slack/events", nil)
 	body := `{"type":"event_callback","event":{}}`
-	ts := "1700000000"
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
 
 	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(body))
 	req.Header.Set("X-Slack-Request-Timestamp", ts)
@@ -303,6 +306,41 @@ func TestWebhookCallbackInvalidSignature(t *testing.T) {
 	}
 }
 
+func TestWebhookCallbackStaleTimestamp(t *testing.T) {
+	secret := "hook-secret"
+	server := NewSlackWebhookServer(secret, "/slack/events", nil)
+	body := `{"type":"event_callback","event":{"type":"message","text":"replay"}}`
+
+	// 过旧时间戳的合法签名回调应被拒绝（防重放）。
+	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(body))
+	stale := "1700000000"
+	req.Header.Set("X-Slack-Request-Timestamp", stale)
+	req.Header.Set("X-Slack-Signature", slackTestSignature(secret, stale, body))
+	w := httptest.NewRecorder()
+	server.HandleCallback(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("过期时间戳应返回 400，实际 %d", w.Code)
+	}
+}
+
+func TestWebhookCallbackBodyTooLarge(t *testing.T) {
+	secret := "hook-secret"
+	server := NewSlackWebhookServer(secret, "/slack/events", nil)
+	big := strings.Repeat("a", maxWebhookBodySize+1024)
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(big))
+	req.Header.Set("X-Slack-Request-Timestamp", ts)
+	req.Header.Set("X-Slack-Signature", slackTestSignature(secret, ts, big))
+	w := httptest.NewRecorder()
+	server.HandleCallback(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("超限请求体应返回 400，实际 %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "too large") {
+		t.Errorf("超限请求体应返回大小超限错误，实际 %s", w.Body.String())
+	}
+}
+
 func TestWebhookCallbackEventDispatch(t *testing.T) {
 	secret := "hook-secret"
 	got := ""
@@ -312,7 +350,7 @@ func TestWebhookCallbackEventDispatch(t *testing.T) {
 		}
 	})
 	body := `{"type":"event_callback","event":{"type":"message","text":"hello slack","user":"U1","channel":"C1","client_msg_id":"CM9"}}`
-	ts := "1700000000"
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(body))
 	req.Header.Set("X-Slack-Request-Timestamp", ts)
 	req.Header.Set("X-Slack-Signature", slackTestSignature(secret, ts, body))
@@ -323,6 +361,31 @@ func TestWebhookCallbackEventDispatch(t *testing.T) {
 	}
 	if got != "hello slack" {
 		t.Errorf("事件处理函数应收到消息，实际 %q", got)
+	}
+}
+
+// ── Start 非阻塞（统一 webhook 模式）──────────────────────────────
+
+func TestStartUnifiedWebhookModeNonBlocking(t *testing.T) {
+	a := &Adapter{
+		connectionMode:     "webhook",
+		unifiedWebhookMode: true,
+		webhookUUID:        "uuid-1",
+		stopCh:             make(chan struct{}),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- a.startWebhookMode(ctx)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("统一 webhook 模式 Start 应返回 nil，实际 %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("统一 webhook 模式 Start 不应阻塞")
 	}
 }
 
@@ -343,4 +406,34 @@ func channelIDFromSession(sessionID string) string {
 		return sessionID[strings.LastIndex(sessionID, "_")+1:]
 	}
 	return sessionID
+}
+
+// ── 文件下载大小上限（M-50 回归）────────────────────────────────
+
+func TestLimitedWriter(t *testing.T) {
+	var buf bytes.Buffer
+	lw := &limitedWriter{w: &buf, remaining: 4}
+	if n, err := lw.Write([]byte("1234")); err != nil || n != 4 {
+		t.Fatalf("未超限写入应成功: n=%d err=%v", n, err)
+	}
+	if _, err := lw.Write([]byte("5")); err == nil {
+		t.Error("超过上限的写入应报错")
+	}
+	if buf.String() != "1234" {
+		t.Errorf("期望仅写入 1234，实际 %q", buf.String())
+	}
+}
+
+func TestGetFileBase64RejectsOversize(t *testing.T) {
+	// 服务端返回超过上限大小的文件内容，下载应失败而非无界读取。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, maxFileDownloadSize+1))
+	}))
+	defer srv.Close()
+
+	a := New(map[string]interface{}{"id": "slack-test"}, nil, nil)
+	a.client = slack.New("x", slack.OptionHTTPClient(&http.Client{}))
+	if _, err := a.getFileBase64(context.Background(), srv.URL); err == nil {
+		t.Error("超过大小上限的 Slack 文件下载应报错")
+	}
 }

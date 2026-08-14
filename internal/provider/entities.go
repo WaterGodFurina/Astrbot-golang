@@ -86,10 +86,19 @@ func NewLLMResponse(role string, completionText string) *LLMResponse {
 }
 
 // ToOpenAIToolCalls converts tool calls to OpenAI format.
+// The three parallel slices may have inconsistent lengths; the conversion only
+// iterates over their shared prefix to avoid an out-of-range access.
 func (r *LLMResponse) ToOpenAIToolCalls() []map[string]interface{} {
-	ret := make([]map[string]interface{}, 0, len(r.ToolsCallArgs))
-	for idx, arg := range r.ToolsCallArgs {
-		argBytes, _ := json.Marshal(arg)
+	n := len(r.ToolsCallArgs)
+	if m := len(r.ToolsCallIDs); m < n {
+		n = m
+	}
+	if m := len(r.ToolsCallName); m < n {
+		n = m
+	}
+	ret := make([]map[string]interface{}, 0, n)
+	for idx := 0; idx < n; idx++ {
+		argBytes, _ := json.Marshal(r.ToolsCallArgs[idx])
 		entry := map[string]interface{}{
 			"id":   r.ToolsCallIDs[idx],
 			"type": "function",

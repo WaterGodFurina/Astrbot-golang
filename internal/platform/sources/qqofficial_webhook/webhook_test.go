@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
@@ -212,6 +214,57 @@ func TestParseC2CMessage(t *testing.T) {
 	}
 }
 
+func TestParseChannelMessage(t *testing.T) {
+	// 频道消息：消息链应包含 At + Plain 文本组件（M-54 回归）。
+	d := map[string]interface{}{
+		"id":         "msg-c1",
+		"channel_id": "ch1",
+		"content":    "频道消息",
+		"author":     map[string]interface{}{"id": "u1", "username": "小明"},
+		"mentions": []interface{}{
+			map[string]interface{}{"id": "bot1"},
+		},
+	}
+	abm := parseFromQQOfficial(d, platform.GroupMessage, kindChannel, false)
+
+	if abm.MessageStr != "频道消息" {
+		t.Errorf("期望文本，实际: %q", abm.MessageStr)
+	}
+	// 组件：At(qq_official) + Plain
+	if len(abm.Message) != 2 {
+		t.Fatalf("期望 2 个组件，实际 %d: %+v", len(abm.Message), abm.Message)
+	}
+	if at, ok := abm.Message[0].(*message.At); !ok || at.TargetID != "qq_official" {
+		t.Errorf("组件0 期望 At(qq_official)，实际: %+v", abm.Message[0])
+	}
+	if p, ok := abm.Message[1].(*message.Plain); !ok || p.Text != "频道消息" {
+		t.Errorf("组件1 期望 Plain(频道消息)，实际: %+v", abm.Message[1])
+	}
+}
+
+func TestParseDirectMessage(t *testing.T) {
+	// 频道私聊消息：消息链应包含 At + Plain 文本组件（M-54 回归）。
+	d := map[string]interface{}{
+		"id":      "msg-d1",
+		"content": "私聊内容",
+		"author":  map[string]interface{}{"id": "u2", "username": "张三"},
+	}
+	abm := parseFromQQOfficial(d, platform.FriendMessage, kindDirect, false)
+
+	if abm.MessageStr != "私聊内容" {
+		t.Errorf("期望文本，实际: %q", abm.MessageStr)
+	}
+	if len(abm.Message) != 2 {
+		t.Fatalf("期望 2 个组件，实际 %d: %+v", len(abm.Message), abm.Message)
+	}
+	if at, ok := abm.Message[0].(*message.At); !ok || at.TargetID != "qq_official" {
+		t.Errorf("组件0 期望 At(qq_official)，实际: %+v", abm.Message[0])
+	}
+	if p, ok := abm.Message[1].(*message.Plain); !ok || p.Text != "私聊内容" {
+		t.Errorf("组件1 期望 Plain(私聊内容)，实际: %+v", abm.Message[1])
+	}
+}
+
 func TestParseFaceMessage(t *testing.T) {
 	// ext 为 base64 编码的 {"text":"[大笑]"}
 	ext := base64.StdEncoding.EncodeToString([]byte(`{"text":"[大笑]"}`))
@@ -265,7 +318,7 @@ func doWebhookRequest(t *testing.T, a *Adapter, payload map[string]interface{}, 
 	body, _ := json.Marshal(payload)
 	req := httptest.NewRequest(http.MethodPost, webhookPath, bytes.NewReader(body))
 	if sign {
-		timestamp := "1700000000"
+		timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 		sig, err := signQQWebhookPayload(a.secret, timestamp, body)
 		if err != nil {
 			t.Fatalf("签名失败: %v", err)
@@ -280,10 +333,11 @@ func doWebhookRequest(t *testing.T, a *Adapter, payload map[string]interface{}, 
 
 func TestWebhookValidation(t *testing.T) {
 	a := newWebhookAdapter(nil)
+	eventTS := strconv.FormatInt(time.Now().Unix(), 10)
 	w := doWebhookRequest(t, a, map[string]interface{}{
 		"op": float64(13),
 		"d": map[string]interface{}{
-			"event_ts":    "1700000000",
+			"event_ts":    eventTS,
 			"plain_token": "abc123",
 		},
 	}, false)
@@ -300,12 +354,48 @@ func TestWebhookValidation(t *testing.T) {
 	}
 	signature, _ := resp["signature"].(string)
 	// 验证响应签名：sign(secret, event_ts + plain_token)
-	expected, err := signQQWebhookPayload(a.secret, "", []byte("1700000000abc123"))
+	expected, err := signQQWebhookPayload(a.secret, "", []byte(eventTS+"abc123"))
 	if err != nil {
 		t.Fatalf("期望签名失败: %v", err)
 	}
 	if signature != expected {
 		t.Errorf("验证签名不匹配: %s vs %s", signature, expected)
+	}
+}
+
+func TestWebhookValidationStaleEventTS(t *testing.T) {
+	a := newWebhookAdapter(nil)
+	// 过期 event_ts 应被拒绝
+	w := doWebhookRequest(t, a, map[string]interface{}{
+		"op": float64(13),
+		"d": map[string]interface{}{
+			"event_ts":    "1700000000",
+			"plain_token": "abc123",
+		},
+	}, false)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("期望过期 event_ts 返回 401，实际 %d", w.Code)
+	}
+}
+
+func TestWebhookValidationRateLimit(t *testing.T) {
+	a := newWebhookAdapter(nil)
+	// 短时间内连续请求触发限速
+	for i := 0; i <= validationMaxRatePerMin; i++ {
+		w := doWebhookRequest(t, a, map[string]interface{}{
+			"op": float64(13),
+			"d": map[string]interface{}{
+				"event_ts":    strconv.FormatInt(time.Now().Unix(), 10),
+				"plain_token": "abc123",
+			},
+		}, false)
+		if i < validationMaxRatePerMin {
+			if w.Code != http.StatusOK {
+				t.Fatalf("第 %d 次请求期望 200，实际 %d", i, w.Code)
+			}
+		} else if w.Code != http.StatusUnauthorized {
+			t.Fatalf("超限请求期望 401，实际 %d", w.Code)
+		}
 	}
 }
 
@@ -329,6 +419,40 @@ func TestWebhookBadSignature(t *testing.T) {
 	}, false)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("期望 401，实际 %d", w.Code)
+	}
+}
+
+func TestWebhookStaleTimestampRejected(t *testing.T) {
+	a := newWebhookAdapter(nil)
+	payload := map[string]interface{}{
+		"id": "event-stale",
+		"op": float64(0),
+		"t":  "group_message_create",
+		"d":  map[string]interface{}{"id": "m-stale"},
+	}
+	// 时间戳过旧的合法签名回调应被拒绝（防重放）。
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, webhookPath, bytes.NewReader(body))
+	timestamp := "1700000000"
+	sig, _ := signQQWebhookPayload(a.secret, timestamp, body)
+	req.Header.Set(signatureTimestampHeader, timestamp)
+	req.Header.Set(signatureHeader, sig)
+	w := httptest.NewRecorder()
+	a.WebhookCallback(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("期望过期时间戳返回 401，实际 %d", w.Code)
+	}
+
+	// 非数字时间戳同样应被拒绝。
+	req2 := httptest.NewRequest(http.MethodPost, webhookPath, bytes.NewReader(body))
+	timestamp2 := "not-a-number"
+	sig2, _ := signQQWebhookPayload(a.secret, timestamp2, body)
+	req2.Header.Set(signatureTimestampHeader, timestamp2)
+	req2.Header.Set(signatureHeader, sig2)
+	w2 := httptest.NewRecorder()
+	a.WebhookCallback(w2, req2)
+	if w2.Code != http.StatusUnauthorized {
+		t.Errorf("期望非法时间戳返回 401，实际 %d", w2.Code)
 	}
 }
 
@@ -466,7 +590,7 @@ func TestWebhookFullHTTPServer(t *testing.T) {
 		},
 	}
 	body, _ := json.Marshal(payload)
-	timestamp := "1700000000"
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	sig, _ := signQQWebhookPayload(a.secret, timestamp, body)
 
 	req, _ := http.NewRequest(http.MethodPost, srv.URL+webhookPath, bytes.NewReader(body))

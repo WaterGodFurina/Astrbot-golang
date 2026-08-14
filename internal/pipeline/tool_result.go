@@ -4,8 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 )
+
+// toolResultIDRe strips characters that would let a provider-supplied tool call
+// id escape the tool_results directory (path traversal via "../" or absolute
+// paths).
+var toolResultIDRe = regexp.MustCompile(`[^A-Za-z0-9_-]`)
 
 // Tool-result inline limits (mirrors Python ToolLoopAgentRunner): oversized
 // results are spilled to a file and only a preview is returned to the model,
@@ -28,7 +34,7 @@ func materializeToolResult(result, toolCallID string) string {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return preview + "\n\n[工具结果过长，且无法写入溢出文件]"
 	}
-	safeID := toolCallID
+	safeID := toolResultIDRe.ReplaceAllString(toolCallID, "_")
 	if safeID == "" {
 		safeID = fmt.Sprintf("tool_%d", time.Now().UnixNano())
 	}

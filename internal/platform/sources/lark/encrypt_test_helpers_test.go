@@ -6,6 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"testing"
 )
 
@@ -25,4 +26,12 @@ func encryptForTest(t *testing.T, key, plain string) string {
 	ct := make([]byte, len(pt))
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, pt)
 	return base64.StdEncoding.EncodeToString(append(iv, ct...))
+}
+
+// signatureForTest computes the X-Lark-Signature header value:
+// sha256(timestamp + nonce + encrypt_key + body) hex-encoded.
+func signatureForTest(t *testing.T, key, timestamp, nonce, body string) string {
+	t.Helper()
+	sum := sha256.Sum256([]byte(timestamp + nonce + key + body))
+	return hex.EncodeToString(sum[:])
 }

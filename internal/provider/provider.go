@@ -118,7 +118,9 @@ func (b *BaseProvider) Meta() ProviderMeta {
 		id = "default"
 	}
 	typeName, _ := b.providerConfig["type"].(string)
+	b.mu.RLock()
 	capability := b.capability
+	b.mu.RUnlock()
 	if capability == "" {
 		capability = CapChatCompletion
 	}

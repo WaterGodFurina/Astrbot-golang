@@ -27,8 +27,19 @@ var logger = log.GetDefault().WithComponent("Plugin")
 // itself does not time out the handshake, so Load enforces one.
 const startTimeout = 15 * time.Second
 
+// startInstanceMu 串行化 startInstance 的 Set/Dispense 窗口：SDK 侧
+// hostPluginID 是进程级全局变量，并发装载不同插件时 A 在握手 accept 前设置
+// 的身份会被 B 覆盖，导致 A 的 HostService 连接被绑定为 B 的身份（身份隔离
+// 可被破坏）。全局互斥保证同一时刻只有一个 startInstance 在跑。
+var startInstanceMu sync.Mutex
+
 // cleanupTimeout bounds the graceful Cleanup RPC before force-killing.
 const cleanupTimeout = 5 * time.Second
+
+// pluginHookRPCTimeout bounds each lifecycle-hook RPC so a hung plugin (dead
+// loop/deadlock) cannot block Unload/SetEnabled forever and cascade-freeze all
+// manifest operations.
+const pluginHookRPCTimeout = 30 * time.Second
 
 // restartBudgetResetWindow: 超过该间隔没有崩溃，则 restarts 预算清零，
 // 使低频偶发崩溃不会被永久停用（预算只惩罚"连续/近期"崩溃）。
@@ -313,7 +324,12 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		return nil, fmt.Errorf("build plugin %s: %w", id, err)
 	}
 
-	inst, err := m.Load(ctx, id, artifact)
+	// 尾段持 per-plugin 生命周期锁：与 Uninstall 互斥，防止并发"安装+卸载"
+	// 时 Uninstall 清理完成后这里又重建 manifest 条目（插件"复活"）。
+	unlock := m.lockOp(id)
+	defer unlock()
+
+	inst, err := m.loadLocked(ctx, id, artifact)
 	if err != nil {
 		return nil, err
 	}
@@ -388,12 +404,21 @@ func (m *SubprocessManager) manifestPath() string {
 }
 
 // Load launches a compiled plugin binary as a child process and registers it
-// under id. Already-loaded ids return the existing instance.
+// under id. Already-loaded ids return the existing instance. It holds the
+// per-plugin lifecycle lock so a concurrent Uninstall cannot unload/remove the
+// plugin in the middle of its registration window.
 func (m *SubprocessManager) Load(ctx context.Context, id, binary string) (*PluginInstance, error) {
 	if id == "" {
 		return nil, fmt.Errorf("plugin id cannot be empty")
 	}
+	unlock := m.lockOp(id)
+	defer unlock()
+	return m.loadLocked(ctx, id, binary)
+}
 
+// loadLocked is Load's body; the caller must hold the per-plugin lifecycle lock
+// for id (m.lockOp).
+func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary string) (*PluginInstance, error) {
 	m.mu.RLock()
 	if inst, ok := m.instances[id]; ok {
 		m.mu.RUnlock()
@@ -473,7 +498,12 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 func (m *SubprocessManager) Unload(id string) error {
 	unlock := m.lockOp(id)
 	defer unlock()
+	return m.unloadLocked(id)
+}
 
+// unloadLocked is Unload's body; the caller must hold the per-plugin lifecycle
+// lock for id (m.lockOp).
+func (m *SubprocessManager) unloadLocked(id string) error {
 	m.mu.Lock()
 	inst, ok := m.instances[id]
 	if !ok {
@@ -571,7 +601,12 @@ func (m *SubprocessManager) SetAutoRestart(enabled bool) {
 
 // startInstance launches one plugin binary and performs the handshake + first
 // Register call. On any failure the process is killed and resources released.
+// It holds startInstanceMu for its whole lifetime so the SDK-side process-global
+// hostPluginID cannot be clobbered by a concurrently loading plugin.
 func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string) (*PluginInstance, error) {
+	startInstanceMu.Lock()
+	defer startInstanceMu.Unlock()
+
 	abs, err := filepath.Abs(binary)
 	if err != nil {
 		return nil, fmt.Errorf("resolve binary: %w", err)
@@ -605,16 +640,12 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 	go func() {
 		// 绑定当前插件身份：go-plugin Dispense 时宿主 accept HostService，
 		// SDK 据此刻的当前 id 给 per-connection hostServiceServer 绑定插件名，
-		// 用于 HostService 反向调用（GetConfig/SetConfig）的身份隔离。
-		// 插件 GetConfig/SetConfig 传的是注册名（name），故这里用 manifest 的
-		// name（name 可能与 manifest id 不同，如 jm_cosmos vs astrbot_plugin_jm_cosmos）。
-		pluginName := id
-		if man, merr := LoadManifest(m.manifestPath()); merr == nil {
-			if e := man.Get(id); e != nil && e.Name != "" {
-				pluginName = e.Name
-			}
-		}
-		pluginsdk.SetCurrentHostPluginID(pluginName)
+		// 用于 HostService 反向调用（GetConfig/SetConfig）的身份隔离。这里以
+		// manifest id 为 key（与 acceptHostService 的 hostServers 记录、以及
+		// Register 后的 BindHostServiceName(id, name) 查找 key 一致）；插件
+		// GetConfig/SetConfig 传的是注册名（name），Register 成功后由
+		// BindHostServiceName 把身份更新为注册名，二者对齐后隔离校验才能通过。
+		pluginsdk.SetCurrentHostPluginID(id)
 		defer pluginsdk.SetCurrentHostPluginID("")
 		proto, err := raw.Client()
 		if err != nil {
@@ -867,7 +898,8 @@ func (m *SubprocessManager) TriggerHook(ctx context.Context, event string) {
 // TriggerHookPayload fires lifecycle hooks (e.g. "startup"/"shutdown",
 // "on_astrbot_loaded", "on_plugin_loaded", "on_plugin_unloaded",
 // "on_platform_loaded") on all running plugins via RPC, attaching a JSON
-// payload for payload-carrying events (nil for event-only hooks).
+// payload for payload-carrying events (nil for event-only hooks). Each RPC runs
+// under a bounded timeout so one hung plugin cannot block the whole broadcast.
 func (m *SubprocessManager) TriggerHookPayload(ctx context.Context, event string, payload any) {
 	for _, inst := range m.List() {
 		if inst.Client == nil || inst.Meta == nil {
@@ -877,7 +909,14 @@ func (m *SubprocessManager) TriggerHookPayload(ctx context.Context, event string
 			if h.Event != event {
 				continue
 			}
-			if _, _, err := inst.Client.HandleHookWithPayload(ctx, h.Name, &pluginsdk.Event{}, nil, payload); err != nil {
+			hookCtx := ctx
+			if hookCtx == nil {
+				hookCtx = context.Background()
+			}
+			rpcCtx, cancel := context.WithTimeout(hookCtx, pluginHookRPCTimeout)
+			_, _, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, &pluginsdk.Event{}, nil, payload)
+			cancel()
+			if err != nil {
 				logger.I18nWarn("钩子 %s (%s) 在插件 %s 上执行失败: %v", h.Name, h.Event, inst.ID, err)
 			}
 		}

@@ -90,7 +90,10 @@ func larkPostRegistration(ctx context.Context, endpoint string, form url.Values)
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	if err := validateOutboundURL(endpoint); err != nil {
+		return 0, nil, err
+	}
+	resp, err := newOutboundClient(15 * time.Second).Do(req)
 	if err != nil {
 		return 0, nil, err
 	}

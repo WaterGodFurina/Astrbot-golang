@@ -61,7 +61,8 @@ func loadSubAgents(cfg map[string]interface{}) ([]*SubAgent, bool) {
 }
 
 // subAgentToolSchemas builds OpenAI transfer_to_<name> tool schemas for the
-// enabled subagents (mirrors Python HandoffTool).
+// enabled subagents (mirrors Python HandoffTool). Non-legal names are rewritten
+// with pluginToolSafeName so the provider does not reject the whole request.
 func subAgentToolSchemas(agents []*SubAgent) []map[string]interface{} {
 	var out []map[string]interface{}
 	for _, a := range agents {
@@ -75,7 +76,7 @@ func subAgentToolSchemas(agents []*SubAgent) []map[string]interface{} {
 		out = append(out, map[string]interface{}{
 			"type": "function",
 			"function": map[string]interface{}{
-				"name":        "transfer_to_" + a.Name,
+				"name":        subAgentToolName(a.Name),
 				"description": desc,
 				"parameters": map[string]interface{}{
 					"type": "object",
@@ -97,9 +98,24 @@ func subAgentToolSchemas(agents []*SubAgent) []map[string]interface{} {
 	return out
 }
 
-func findSubAgent(agents []*SubAgent, name string) *SubAgent {
-	for _, a := range agents {
-		if a.Name == name {
+// subAgentToolName returns the provider-safe tool name for a subagent. Legal
+// names keep their "transfer_to_" form; illegal ones are sanitized via
+// pluginToolSafeName so the OpenAI schema (^[a-zA-Z0-9_-]+$) stays valid.
+func subAgentToolName(name string) string {
+	return "transfer_to_" + pluginToolSafeName(name)
+}
+
+// findSubAgentByName resolves a tool name (possibly sanitized) back to the
+// original subagent. Exact match wins; otherwise the sanitized form is matched.
+func (s *ProcessStage) findSubAgentByName(toolName string) *SubAgent {
+	agentName := strings.TrimPrefix(toolName, "transfer_to_")
+	for _, a := range s.subAgents {
+		if a.Name == agentName {
+			return a
+		}
+	}
+	for _, a := range s.subAgents {
+		if pluginToolSafeName(a.Name) == agentName {
 			return a
 		}
 	}
@@ -143,11 +159,11 @@ func (s *ProcessStage) applyKnowledgeBase(event *core.Event, prompt string) stri
 // with the subagent's persona (and optional provider override) and returns the
 // subagent's reply as the tool result.
 func (s *ProcessStage) executeSubAgent(event *core.Event, name string, args map[string]interface{}) (string, bool) {
-	agentName := strings.TrimPrefix(name, "transfer_to_")
-	agent := findSubAgent(s.subAgents, agentName)
+	agent := s.findSubAgentByName(name)
 	if agent == nil {
 		return "", false
 	}
+	agentName := agent.Name
 	input, _ := args["input"].(string)
 	if input == "" {
 		if v, ok := args["request"].(string); ok {

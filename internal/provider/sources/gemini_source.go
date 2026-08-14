@@ -18,9 +18,10 @@ import (
 // GeminiSource is a Google Gemini chat provider.
 type GeminiSource struct {
 	provider.BaseProvider
-	apiBase string
-	apiKey  string
-	client  *http.Client
+	apiBase      string
+	apiKey       string
+	client       *http.Client
+	streamClient *http.Client
 }
 
 // NewGeminiSource creates a Gemini provider.
@@ -31,6 +32,7 @@ func NewGeminiSource(config, settings map[string]interface{}) *GeminiSource {
 		client: &http.Client{
 			Timeout: 120 * time.Second,
 		},
+		streamClient: newStreamClient(),
 	}
 	s.apiBase, _ = config["api_base"].(string)
 	if s.apiBase == "" {
@@ -47,13 +49,18 @@ func NewGeminiSource(config, settings map[string]interface{}) *GeminiSource {
 	return s
 }
 
-// doRequest sends an HTTP request with retry logic.
-func (s *GeminiSource) doRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
+// doRequest sends an HTTP request with retry logic. jsonBody is re-serialized
+// into a fresh bytes.Reader per retry attempt so retries carry a full body.
+func (s *GeminiSource) doRequest(ctx context.Context, client *http.Client, url string, jsonBody []byte) (*http.Response, error) {
 	cfg := RetryConfigFromSettings(s.Settings())
-	return DoWithRetry(ctx, s.client, func() (*http.Request, error) {
-		// Clone the request to get a fresh body for each retry attempt.
-		clone := req.Clone(ctx)
-		return clone, nil
+	return DoWithRetry(ctx, client, func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-goog-api-key", s.apiKey)
+		return httpReq, nil
 	}, cfg, "Gemini")
 }
 
@@ -63,20 +70,15 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 	if model == "" {
 		model = "gemini-pro"
 	}
-	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", s.apiBase, model, s.apiKey)
+	url := fmt.Sprintf("%s/models/%s:generateContent", s.apiBase, model)
 	body := s.buildRequestBody(req, false)
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
 	contents, _ := body["contents"].([]map[string]interface{})
-	logger.Debug("LLM request: url=%s model=%s messages=%d", url, model, len(contents))
-	resp, err := s.doRequest(ctx, httpReq)
+	logger.Debug("LLM request: url=%s model=%s messages=%d", stripURLQuery(url), model, len(contents))
+	resp, err := s.doRequest(ctx, s.client, url, jsonBody)
 	if err != nil {
 		return nil, err
 	}
@@ -128,20 +130,15 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 	if model == "" {
 		model = "gemini-pro"
 	}
-	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?key=%s&alt=sse", s.apiBase, model, s.apiKey)
+	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", s.apiBase, model)
 	body := s.buildRequestBody(req, true)
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
 	contents, _ := body["contents"].([]map[string]interface{})
-	logger.Debug("LLM request: url=%s model=%s messages=%d", url, model, len(contents))
-	resp, err := s.doRequest(ctx, httpReq)
+	logger.Debug("LLM request: url=%s model=%s messages=%d", stripURLQuery(url), model, len(contents))
+	resp, err := s.doRequest(ctx, s.streamClient, url, jsonBody)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +190,11 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 			}
 			return false
 		})
-		_ = reader.scan()
+		if err := reader.scan(); err != nil {
+			logger.Warn("Gemini stream read error: %v", err)
+			ch <- &provider.LLMResponse{Role: "err", CompletionText: fmt.Sprintf("Gemini stream read error: %v", err)}
+			return
+		}
 		// Emit a final consolidated chunk so token usage reaches the pipeline.
 		if usage != nil || content.Len() > 0 {
 			ch <- &provider.LLMResponse{
@@ -234,20 +235,32 @@ func (s *GeminiSource) buildRequestBody(req *provider.ProviderRequest, stream bo
 		if role == "assistant" {
 			geminiRole = "model"
 		}
-		content, _ := msg["content"].(string)
+		// Convert array content blocks (text / image_url / audio_url) into
+		// Gemini parts; string content becomes a single text part.
+		parts := geminiPartsFromContent(msg["content"])
+		if len(parts) == 0 {
+			continue
+		}
 		contents = append(contents, map[string]interface{}{
-			"role": geminiRole,
-			"parts": []map[string]interface{}{
-				{"text": content},
-			},
+			"role":  geminiRole,
+			"parts": parts,
 		})
 	}
-	// Add current user message
+	// Add current user message with its inline media parts.
+	parts := geminiPartsFromContent(req.Prompt)
+	for _, imgURL := range req.ImageURLs {
+		if part := imageToGeminiPart(imgURL); part != nil {
+			parts = append(parts, part)
+		}
+	}
+	for _, audioURL := range req.AudioURLs {
+		if part := geminiMediaPart(audioURL); part != nil {
+			parts = append(parts, part)
+		}
+	}
 	contents = append(contents, map[string]interface{}{
-		"role": "user",
-		"parts": []map[string]interface{}{
-			{"text": req.Prompt},
-		},
+		"role":  "user",
+		"parts": parts,
 	})
 	body := map[string]interface{}{
 		"contents": contents,

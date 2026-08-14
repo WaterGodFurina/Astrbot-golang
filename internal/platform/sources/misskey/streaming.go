@@ -31,7 +31,6 @@ type StreamingClient struct {
 	running         bool
 	messageHandlers map[string]StreamHandler
 	channels        map[string]string // channel_id -> channel_type
-	desiredChannels map[string]map[string]interface{}
 }
 
 // NewStreamingClient 创建 streaming 客户端。
@@ -41,7 +40,6 @@ func NewStreamingClient(instanceURL, accessToken string) *StreamingClient {
 		accessToken:     accessToken,
 		messageHandlers: make(map[string]StreamHandler),
 		channels:        make(map[string]string),
-		desiredChannels: make(map[string]map[string]interface{}),
 	}
 }
 
@@ -53,7 +51,8 @@ func streamURL(instanceURL, token string) string {
 }
 
 // Connect 建立 WebSocket 连接；成功返回 true（对应 connect）。
-// 重连时会重新订阅 desired_channels。
+// 订阅由调用方在每次连接成功后显式进行（Connect 不做自动重订阅，
+// 避免重连时与调用方的 SubscribeChannel 重复订阅导致事件重复分发）。
 func (s *StreamingClient) Connect() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -67,16 +66,9 @@ func (s *StreamingClient) Connect() bool {
 	s.conn = conn
 	s.isConnected = true
 	s.running = true
+	// 清空旧连接的 channel_id 映射，避免跨重连残留陈旧订阅
+	s.channels = make(map[string]string)
 	streamingLogger.Info("Misskey WebSocket 已连接")
-
-	// 重新订阅之前期望的频道（对应 Python connect 中的 desired_channels 重订阅）
-	if len(s.desiredChannels) > 0 {
-		for channelType, params := range s.desiredChannels {
-			if _, err := s.subscribeChannelLocked(channelType, params); err != nil {
-				streamingLogger.Warn("Misskey WebSocket 重新订阅 %s 失败: %v", channelType, err)
-			}
-		}
-	}
 	return true
 }
 
@@ -101,7 +93,6 @@ func (s *StreamingClient) SubscribeChannel(channelType string, params map[string
 	if !s.isConnected || s.conn == nil {
 		return "", fmt.Errorf("WebSocket 未连接")
 	}
-	s.desiredChannels[channelType] = params
 	return s.subscribeChannelLocked(channelType, params)
 }
 
@@ -136,7 +127,7 @@ func (s *StreamingClient) UnsubscribeChannel(channelID string) {
 	if !s.isConnected || s.conn == nil {
 		return
 	}
-	channelType, ok := s.channels[channelID]
+	_, ok := s.channels[channelID]
 	if !ok {
 		return
 	}
@@ -145,17 +136,6 @@ func (s *StreamingClient) UnsubscribeChannel(channelID string) {
 		"body": map[string]interface{}{"id": channelID},
 	})
 	delete(s.channels, channelID)
-	// 若该频道类型不再被任何 channel_id 引用，则从期望频道中移除
-	stillUsed := false
-	for _, ct := range s.channels {
-		if ct == channelType {
-			stillUsed = true
-			break
-		}
-	}
-	if !stillUsed {
-		delete(s.desiredChannels, channelType)
-	}
 }
 
 // AddMessageHandler 注册事件处理器（对应 add_message_handler）。
@@ -163,6 +143,18 @@ func (s *StreamingClient) AddMessageHandler(eventType string, handler StreamHand
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.messageHandlers[eventType] = handler
+}
+
+// websocketReadDeadline 单次读超时；每次收到 pong 都会续期，空闲但存活的连接不会被误判失联。
+const websocketReadDeadline = 90 * time.Second
+
+// keepalivePongHandler 返回用于续期读超时的 pong 处理器。
+// gorilla 的读 deadline 是绝对时间，仅在收到数据帧时于循环内重置；
+// 控制帧（pong）不会自动刷新，必须在此续期，否则空闲连接会被误判失联。
+func keepalivePongHandler(conn *websocket.Conn) func(string) error {
+	return func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(websocketReadDeadline))
+	}
 }
 
 // Listen 阻塞监听消息直到连接关闭（对应 listen）。
@@ -176,8 +168,9 @@ func (s *StreamingClient) Listen() {
 		return
 	}
 
-	// 心跳：每 30s 发送 ping（对应 websockets 库的 ping_interval=30, ping_timeout=10）。
-	// 收到 pong 会重置读超时。
+	// 心跳：每 30s 发送 ping（对应 websockets 库的 ping_interval=30, ping_timeout=10），
+	// 收到 pong 会续期读超时。
+	conn.SetPongHandler(keepalivePongHandler(conn))
 	pingStop := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -200,8 +193,8 @@ func (s *StreamingClient) Listen() {
 	defer close(pingStop)
 
 	for {
-		// 读超时由 pong 重置；若 90s 无任何数据则视为失联
-		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		// 读超时由 pong 续期；若超时时间窗内既无数据帧也无 pong 则视为失联
+		_ = conn.SetReadDeadline(time.Now().Add(websocketReadDeadline))
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			break

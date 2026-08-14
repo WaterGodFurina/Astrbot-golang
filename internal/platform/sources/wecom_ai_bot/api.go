@@ -64,9 +64,12 @@ func NewWecomAIBotAPIClient(token, encodingAESKey string) *WecomAIBotAPIClient {
 		token:          token,
 		encodingAESKey: encodingAESKey,
 	}
-	if crypt, err := NewWXBizJsonMsgCrypt(token, encodingAESKey, ""); err == nil {
-		c.wxcpt = crypt
+	crypt, err := NewWXBizJsonMsgCrypt(token, encodingAESKey, "")
+	if err != nil {
+		logger.I18nError("EncodingAESKey 无效: %v", err)
+		return c
 	}
+	c.wxcpt = crypt
 	return c
 }
 
@@ -163,7 +166,8 @@ func processEncryptedImage(imageURL, aesKeyBase64 string) (bool, string) {
 	if aesKeyBase64 == "" {
 		return false, "参数错误: AES 密钥不能为空"
 	}
-	aesKey, err := base64.StdEncoding.DecodeString(aesKeyBase64 + strings.Repeat("=", (-len(aesKeyBase64))%4))
+	pad := (4 - len(aesKeyBase64)%4) % 4
+	aesKey, err := base64.StdEncoding.DecodeString(aesKeyBase64 + strings.Repeat("=", pad))
 	if err != nil {
 		return false, fmt.Sprintf("参数错误: %v", err)
 	}

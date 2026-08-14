@@ -108,7 +108,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// 2. Load config
 	cfg := config.NewConfig("data/cmd_config.json", config.DefaultConfig())
 	if err := cfg.Load(); err != nil {
-		logger.I18nWarn("加载配置失败，使用默认值: %v", err)
+		logger.I18nWarn("加载配置失败（文件损坏？），已回退到默认配置继续运行: %v", err)
+		cfg.ResetToDefaults()
 	}
 	l.configMgr.Register("default", cfg)
 	logger.I18nInfo("配置已加载（完整性校验通过）")
@@ -247,7 +248,12 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	})
 	l.cronMgr.SetNextRunFn(cronNextRun)
 	l.cronMgr.Load()
-	go l.cronMgr.Start(ctx)
+	// 派生子上下文供所有后台组件使用（cron/dashboard/eventBus/内存回收等）。
+	// 必须用新变量名 runCtx：不能对 ctx 再做 WithCancel 重赋值，否则会与已
+	// 启动 goroutine 闭包捕获的 ctx 变量产生数据竞争。
+	runCtx, cancel := context.WithCancel(ctx)
+	l.cancel = cancel
+	go l.cronMgr.Start(runCtx)
 	logger.I18nInfo("计划任务管理器已启动")
 
 	// 10. Initialize backup exporter
@@ -275,13 +281,13 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
 	// back into the host.
 	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins)
-	l.subPluginMgr.LoadInstalled(ctx)
+	l.subPluginMgr.LoadInstalled(runCtx)
 	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr.List())
 
 	// (已舍弃 legacy .so 方案：不再加载/桥接 .so 插件)
 
 	// 11. Load platform adapters from config
-	if err := l.loadPlatforms(ctx); err != nil {
+	if err := l.loadPlatforms(runCtx); err != nil {
 		logger.Error("Failed to load platforms: %v", err)
 	}
 
@@ -299,14 +305,25 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		"skills":            l.skillMgr,
 		"database":          l.database,
 	}
-	l.dashboard = dashboard.NewServerWithManagers(6185, "data/cmd_config.json", managers)
+	dashboardPort := 6185
+	if dm, ok := cfg.Get("dashboard").(map[string]interface{}); ok {
+		if p, ok := dm["port"]; ok {
+			switch v := p.(type) {
+			case float64:
+				dashboardPort = int(v)
+			case int:
+				dashboardPort = v
+			}
+		}
+	}
+	l.dashboard = dashboard.NewServerWithManagers(dashboardPort, "data/cmd_config.json", managers)
 	if l.webuiDir != "" {
 		l.dashboard.SetWebUIDir(l.webuiDir)
 	}
 	// WebUI"重启"按钮：spawn 新实例 → 优雅停机 → 退出当前进程。
 	l.dashboard.SetRestartFunc(l.Restart)
 	l.dashboard.SetOnPlatformsChanged(func() {
-		go l.ReloadPlatforms(ctx)
+		go l.ReloadPlatforms(runCtx)
 	})
 	l.dashboard.SetOnPluginsChanged(func() {
 		l.RebridgePlugins()
@@ -319,16 +336,14 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		}
 	})
 	go func() {
-		if err := l.dashboard.Start(ctx); err != nil {
+		if err := l.dashboard.Start(runCtx); err != nil {
 			logger.Error("Dashboard server error: %v", err)
 		}
 	}()
 
 	// 12. Start event bus
-	ctx, cancel := context.WithCancel(ctx)
-	l.cancel = cancel
 	go func() {
-		if err := l.eventBus.Start(ctx); err != nil {
+		if err := l.eventBus.Start(runCtx); err != nil {
 			logger.Error("Event bus stopped: %v", err)
 		}
 	}()
@@ -343,16 +358,16 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			case <-ticker.C:
 				runtime.GC()
 				debug.FreeOSMemory()
-			case <-ctx.Done():
+			case <-runCtx.Done():
 				return
 			}
 		}
 	}()
 
 	// Trigger startup hooks
-	l.subPluginMgr.TriggerHook(ctx, "startup")
+	l.subPluginMgr.TriggerHook(runCtx, "startup")
 	// Python SDK 的 on_astrbot_loaded：宿主加载完成后通知所有插件。
-	l.subPluginMgr.TriggerHook(ctx, pluginsdk.EventOnAstrbotLoaded)
+	l.subPluginMgr.TriggerHook(runCtx, pluginsdk.EventOnAstrbotLoaded)
 
 	logger.I18nInfo("AstrBot Go 已启动 - API 端口 :6185")
 	return nil
@@ -875,11 +890,15 @@ func dockerAvailable() bool {
 const orphanCleanupGrace = 1 * time.Second
 
 // cleanupOrphanPlugins 清理上一轮异常退出遗留的孤儿插件子进程（PPID=1、
-// 命令行指向 plugins-bin 目录的 go-plugin 子进程）。主进程被 SIGKILL/崩溃
-// 时这些进程不会被回收，会一直占用资源；启动时清扫一次防止与后续新实例
-// 并存。仅 Linux（依赖 /proc）；其他平台直接跳过。
+// 可执行路径位于 <dataDir>/plugins-bin/ 下的 go-plugin 子进程）。主进程被
+// SIGKILL/崩溃时这些进程不会被回收，会一直占用资源；启动时清扫一次防止与
+// 后续新实例并存。仅 Linux（依赖 /proc）；其他平台直接跳过。
 func cleanupOrphanPlugins() {
 	if runtime.GOOS != "linux" {
+		return
+	}
+	pluginBinPrefix := pluginBinaryPrefix()
+	if pluginBinPrefix == "" {
 		return
 	}
 	entries, err := os.ReadDir("/proc")
@@ -914,8 +933,7 @@ func cleanupOrphanPlugins() {
 		if err != nil {
 			continue
 		}
-		// 插件子进程可执行文件位于 <dataDir>/plugins-bin/<id>/ 下
-		if strings.Contains(string(cmdline), "plugins-bin") {
+		if isOrphanPluginCmdline(cmdline, pluginBinPrefix) {
 			orphans = append(orphans, pid)
 		}
 	}
@@ -931,4 +949,31 @@ func cleanupOrphanPlugins() {
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
 	logger.I18nInfo("已清理 %d 个孤儿插件进程", len(orphans))
+}
+
+// pluginBinaryPrefix returns the resolved absolute prefix of the plugins-bin
+// directory under the data dir (e.g. /abs/path/data/plugins-bin/), or "" when
+// the data dir cannot be resolved to an absolute path.
+func pluginBinaryPrefix() string {
+	abs, err := filepath.Abs("data")
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(abs, "plugins-bin") + string(os.PathSeparator)
+}
+
+// isOrphanPluginCmdline reports whether a /proc/<pid>/cmdline blob belongs to
+// a plugin child process: its executable path (argv[0]) must fall under the
+// plugins-bin directory. Matching the resolved absolute path prefix (instead
+// of a bare "plugins-bin" substring) avoids killing unrelated processes whose
+// command line merely mentions plugins-bin.
+func isOrphanPluginCmdline(cmdline []byte, pluginBinPrefix string) bool {
+	if pluginBinPrefix == "" {
+		return false
+	}
+	args := strings.Split(strings.TrimSuffix(string(cmdline), "\x00"), "\x00")
+	if len(args) == 0 || args[0] == "" {
+		return false
+	}
+	return strings.HasPrefix(args[0], pluginBinPrefix)
 }

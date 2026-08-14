@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -275,9 +276,12 @@ func TestExtractSessionID(t *testing.T) {
 // TestQueueMgr 队列管理器：入队、监听回调、待处理响应、清理。
 func TestQueueMgr(t *testing.T) {
 	mgr := NewWecomAIQueueMgr()
+	var mu sync.Mutex
 	var received *QueueItem
 	cb := func(item *QueueItem) {
+		mu.Lock()
 		received = item
+		mu.Unlock()
 	}
 	mgr.SetListener(cb)
 
@@ -285,11 +289,20 @@ func TestQueueMgr(t *testing.T) {
 	q := mgr.GetOrCreateQueue("stream_1")
 	q <- &QueueItem{Type: "plain", Data: "hello", SessionID: "stream_1"}
 	deadline := time.Now().Add(2 * time.Second)
-	for received == nil && time.Now().Before(deadline) {
+	for {
+		mu.Lock()
+		r := received
+		mu.Unlock()
+		if r != nil || time.Now().After(deadline) {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if received == nil || received.Data != "hello" {
-		t.Fatalf("监听器未收到消息: %+v", received)
+	mu.Lock()
+	gotReceived := received
+	mu.Unlock()
+	if gotReceived == nil || gotReceived.Data != "hello" {
+		t.Fatalf("监听器未收到消息: %+v", gotReceived)
 	}
 
 	// 输出队列与待处理响应
@@ -311,6 +324,127 @@ func TestQueueMgr(t *testing.T) {
 	}
 	if !mgr.IsStreamFinished("stream_1", 60) {
 		t.Error("流应标记为完成")
+	}
+}
+
+// TestHandleTextMessageDoesNotBlockReadLoop 回归 H-29：回调消息投递到独立 handler
+// goroutine，即使 handler 阻塞（如 SendCommand 等待响应），读循环也不会被卡住。
+func TestHandleTextMessageDoesNotBlockReadLoop(t *testing.T) {
+	blocker := make(chan struct{})
+	handlerCalled := make(chan struct{}, 1)
+	c := NewWecomAIBotLongConnectionClient("bot1", "sec1", "wss://example.com", 30, nil)
+	c.messageHandler = func(payload map[string]interface{}) {
+		handlerCalled <- struct{}{}
+		<-blocker
+	}
+	handlerCh := make(chan map[string]interface{}, 4)
+	handlerDone := make(chan struct{})
+	go c.handlerLoop(handlerCh, handlerDone)
+	defer func() {
+		close(handlerCh)
+		<-handlerDone
+	}()
+
+	cb := map[string]interface{}{
+		"cmd":     "aibot_msg_callback",
+		"headers": map[string]interface{}{"req_id": "r1"},
+		"body":    map[string]interface{}{"msgtype": "text"},
+	}
+	data, err := json.Marshal(cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.handleTextMessage(string(data), handlerCh)
+	select {
+	case <-handlerCalled:
+	case <-time.After(time.Second):
+		t.Fatal("handler 未被调用")
+	}
+	done := make(chan struct{})
+	go func() {
+		c.handleTextMessage(string(data), handlerCh)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("读循环不应被阻塞")
+	}
+	close(blocker)
+}
+
+// TestStreamPollImageInNonFinish 非 finish 轮询也携带图片增量，finish 轮询不重复发送（回归 M-47）。
+func TestStreamPollImageInNonFinish(t *testing.T) {
+	a := newTestAIBotAdapter(t, &fakeEventBus{}, nil)
+	crypt := a.apiClient.wxcpt
+
+	imgData := []byte("fake-image-bytes")
+	imgB64 := base64.StdEncoding.EncodeToString(imgData)
+	bq := a.queueMgr.GetOrCreateBackQueue("sid_stream")
+	bq <- &QueueItem{Type: "image", ImageData: imgB64}
+
+	nonce := "nonce_poll"
+	timestamp := "1700000100"
+	// 先图后文：图片已入队，文本与结束尚未入队 → 非 finish 轮询必须返回图片增量
+	resp, err := a.processMessage(map[string]interface{}{
+		"msgtype": "stream",
+		"stream":  map[string]interface{}{"id": "sid_stream"},
+	}, map[string]string{"nonce": nonce, "timestamp": timestamp})
+	if err != nil {
+		t.Fatalf("非 finish 轮询失败: %v", err)
+	}
+	if resp == "" {
+		t.Fatal("非 finish 轮询应返回图片增量")
+	}
+	_, sig := crypt.GetSHA1(timestamp, nonce, extractEncryptField(t, resp))
+	_, decrypted := crypt.DecryptMsg([]byte(resp), sig, timestamp, nonce)
+	var out map[string]interface{}
+	if err := json.Unmarshal([]byte(decrypted), &out); err != nil {
+		t.Fatalf("解密响应解析失败: %v", err)
+	}
+	stream, _ := out["stream"].(map[string]interface{})
+	if stream["finish"] != false {
+		t.Errorf("非 finish 轮询 finish 应为 false: %v", stream["finish"])
+	}
+	items, _ := stream["msg_item"].([]interface{})
+	if len(items) != 1 {
+		t.Fatalf("msg_item 应包含 1 个图片，got %d: %v", len(items), stream)
+	}
+	item, _ := items[0].(map[string]interface{})
+	img, _ := item["image"].(map[string]interface{})
+	if item["msgtype"] != MSGTypeImage || img["base64"] != imgB64 {
+		t.Errorf("图片增量异常: %v", item)
+	}
+
+	// 文本 + 结束入队，finish 轮询：返回文本且不重复发送图片
+	bq <- &QueueItem{Type: "plain", Data: "你好", Streaming: true}
+	bq <- &QueueItem{Type: "end", Data: "", Streaming: false}
+	resp2, err := a.processMessage(map[string]interface{}{
+		"msgtype": "stream",
+		"stream":  map[string]interface{}{"id": "sid_stream"},
+	}, map[string]string{"nonce": nonce, "timestamp": timestamp})
+	if err != nil {
+		t.Fatalf("finish 轮询失败: %v", err)
+	}
+	if resp2 == "" {
+		t.Fatal("finish 轮询应返回文本")
+	}
+	_, sig2 := crypt.GetSHA1(timestamp, nonce, extractEncryptField(t, resp2))
+	_, decrypted2 := crypt.DecryptMsg([]byte(resp2), sig2, timestamp, nonce)
+	var out2 map[string]interface{}
+	if err := json.Unmarshal([]byte(decrypted2), &out2); err != nil {
+		t.Fatalf("解密 finish 响应解析失败: %v", err)
+	}
+	stream2, _ := out2["stream"].(map[string]interface{})
+	if stream2["finish"] != true {
+		t.Errorf("finish 轮询 finish 应为 true: %v", stream2["finish"])
+	}
+	if stream2["content"] != "你好" {
+		t.Errorf("finish 轮询 content: %v", stream2["content"])
+	}
+	items2, _ := stream2["msg_item"].([]interface{})
+	if len(items2) != 0 {
+		t.Errorf("finish 轮询不应重复发送图片: %v", items2)
 	}
 }
 
@@ -488,5 +622,86 @@ func TestWebhookPlatformInterface(t *testing.T) {
 	longConn.WebhookCallback(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("长连接模式回调应返回 400，got %d", w.Code)
+	}
+}
+
+// TestCleanupOrphanedBackQueue 回归 L-45.2：无 pendingResponse 且长时间未使用的
+// 输出队列应被清理，避免满 512 条后 Send 永久阻塞。
+func TestCleanupOrphanedBackQueue(t *testing.T) {
+	mgr := NewWecomAIQueueMgr()
+	bq := mgr.GetOrCreateBackQueue("orphan_stream")
+	bq <- &QueueItem{Type: "plain", Data: "x"}
+	mgr.mu.Lock()
+	mgr.backQueueLastUsed["orphan_stream"] = time.Now().Add(-time.Hour)
+	mgr.mu.Unlock()
+	mgr.CleanupExpiredResponses(300)
+	if mgr.HasBackQueue("orphan_stream") {
+		t.Error("孤立输出队列应被清理")
+	}
+}
+
+// TestCleanupKeepsActiveBackQueue 有 pendingResponse 的输出队列不应被清理。
+func TestCleanupKeepsActiveBackQueue(t *testing.T) {
+	mgr := NewWecomAIQueueMgr()
+	mgr.GetOrCreateBackQueue("active_stream")
+	mgr.SetPendingResponse("active_stream", map[string]string{"nonce": "n"})
+	mgr.mu.Lock()
+	mgr.backQueueLastUsed["active_stream"] = time.Now().Add(-time.Hour)
+	mgr.mu.Unlock()
+	mgr.CleanupExpiredResponses(300)
+	if !mgr.HasBackQueue("active_stream") {
+		t.Error("有 pendingResponse 的输出队列不应被清理")
+	}
+}
+
+// TestBackQueueWriteTimeoutOnFullQueue 回归 L-45.2：满队列写入应在超时后返回
+// false 而不是永久阻塞。
+func TestBackQueueWriteTimeoutOnFullQueue(t *testing.T) {
+	old := queueWriteTimeout
+	queueWriteTimeout = 50 * time.Millisecond
+	defer func() { queueWriteTimeout = old }()
+
+	q := make(chan *QueueItem, 1)
+	q <- &QueueItem{Type: "plain", Data: "x"}
+	start := time.Now()
+	if trySendBackQueueItem(q, &QueueItem{Type: "end"}) {
+		t.Error("满队列写入应超时返回 false")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("满队列写入不应永久阻塞，耗时 %v", elapsed)
+	}
+}
+
+// TestStreamPlainCacheCleanup 回归 L-45.2：已无输出队列的 streamPlainCache 条目应被清理。
+func TestStreamPlainCacheCleanup(t *testing.T) {
+	a := newTestAIBotAdapter(t, &fakeEventBus{}, nil)
+	a.queueMgr.GetOrCreateBackQueue("s1")
+	a.streamCacheMu.Lock()
+	a.streamPlainCache["s1"] = "content"
+	a.streamPlainCache["s2"] = "content"
+	a.streamCacheMu.Unlock()
+	a.cleanupStreamPlainCache()
+	a.streamCacheMu.Lock()
+	defer a.streamCacheMu.Unlock()
+	if _, ok := a.streamPlainCache["s1"]; !ok {
+		t.Error("有输出队列的缓存不应被清理")
+	}
+	if _, ok := a.streamPlainCache["s2"]; ok {
+		t.Error("无输出队列的缓存应被清理")
+	}
+}
+
+// TestAIBotServerStartBindFailure 回归 L-45.4：端口占用时 Start 应返回错误而不是仅记日志。
+func TestAIBotServerStartBindFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	srv := NewWecomAIBotServer("127.0.0.1", port, nil, nil)
+	if err := srv.Start(); err == nil {
+		t.Error("端口占用时 Start 应返回错误")
 	}
 }

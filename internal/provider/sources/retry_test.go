@@ -72,6 +72,16 @@ func TestBackoffDelay(t *testing.T) {
 	}
 }
 
+// TestBackoffDelayNoOverflow 验证极大 attempt 下退避不溢出为 0/负数 (对应 L-26)。
+func TestBackoffDelayNoOverflow(t *testing.T) {
+	cfg := RetryConfig{MinDelay: 200 * time.Millisecond, MaxDelay: 30 * time.Second}
+	for _, attempt := range []int{32, 64, 100, 1000} {
+		if d := backoffDelay(attempt, cfg); d != 30*time.Second {
+			t.Errorf("attempt %d: got %v, want 30s (saturated, no overflow)", attempt, d)
+		}
+	}
+}
+
 func TestRetryConfigFromSettings(t *testing.T) {
 	cfg := RetryConfigFromSettings(nil)
 	if cfg.MaxAttempts != 5 {
@@ -185,7 +195,7 @@ func TestDoWithRetryMaxRetriesExceeded(t *testing.T) {
 	defer server.Close()
 
 	cfg := RetryConfig{MaxAttempts: 3, MinDelay: 1 * time.Millisecond, MaxDelay: 2 * time.Millisecond}
-	_, err := DoWithRetry(context.Background(), server.Client(), func() (*http.Request, error) {
+	resp, err := DoWithRetry(context.Background(), server.Client(), func() (*http.Request, error) {
 		return http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
 	}, cfg, "Test")
 	if err == nil {
@@ -193,6 +203,12 @@ func TestDoWithRetryMaxRetriesExceeded(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "max retries") {
 		t.Errorf("error message = %q, want 'max retries'", err.Error())
+	}
+	if resp != nil {
+		t.Errorf("exhausted path must return a nil response, got %v (closed body)", resp)
+	}
+	if !strings.Contains(err.Error(), "503") {
+		t.Errorf("error message = %q, want last status folded in", err.Error())
 	}
 }
 

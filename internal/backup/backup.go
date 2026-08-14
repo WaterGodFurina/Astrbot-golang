@@ -4,12 +4,15 @@ package backup
 
 import (
 	"archive/zip"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
@@ -37,6 +40,17 @@ func (e *Exporter) Export(destPath string) error {
 	zw := zip.NewWriter(zipFile)
 	defer zw.Close()
 
+	// Snapshot the live SQLite database into a consistent file before walking,
+	// so a WAL-mode database is never copied while being written to. The raw
+	// astrbot.db/-wal/-shm files are skipped and the snapshot is zipped instead.
+	snapshot, err := e.snapshotDB()
+	if err != nil {
+		return err
+	}
+	if snapshot != "" {
+		defer os.Remove(snapshot)
+	}
+
 	err = filepath.Walk(e.dataDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -54,27 +68,85 @@ func (e *Exporter) Export(destPath string) error {
 		if strings.HasSuffix(relPath, ".lock") || strings.HasPrefix(relPath, "tmp/") {
 			return nil
 		}
+		// Skip the live database and its WAL sidecar files; the snapshot above
+		// is zipped in their place (avoids a torn copy of a live WAL database).
+		if strings.HasSuffix(relPath, ".db-wal") || strings.HasSuffix(relPath, ".db-shm") ||
+			(relPath == "astrbot.db" && snapshot != "") {
+			return nil
+		}
 
 		file, err := os.Open(path)
 		if err != nil {
 			return err
 		}
-		defer file.Close()
 
 		writer, err := zw.Create(relPath)
 		if err != nil {
+			file.Close()
 			return err
 		}
 
 		_, err = io.Copy(writer, file)
+		file.Close()
 		return err
 	})
 	if err != nil {
 		return fmt.Errorf("walk data dir: %w", err)
 	}
 
+	// Zip the consistent DB snapshot (only present when a live database was
+	// found under the data dir).
+	if snapshot != "" {
+		snap, err := os.Open(snapshot)
+		if err != nil {
+			return err
+		}
+		writer, err := zw.Create("astrbot.db")
+		if err != nil {
+			snap.Close()
+			return err
+		}
+		_, err = io.Copy(writer, snap)
+		snap.Close()
+		if err != nil {
+			return err
+		}
+	}
+
 	logger.Info("Backup exported to %s", destPath)
 	return nil
+}
+
+// snapshotDB produces a consistent copy of dataDir/astrbot.db via
+// `VACUUM INTO`, which reads the live WAL database and writes a self-contained
+// snapshot file without requiring exclusive access. It returns "" when no
+// database exists at the expected location.
+func (e *Exporter) snapshotDB() (string, error) {
+	dbPath := filepath.Join(e.dataDir, "astrbot.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return "", nil
+	}
+	tmp, err := os.CreateTemp("", "astrbot_db_snapshot_*.db")
+	if err != nil {
+		return "", fmt.Errorf("create db snapshot temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	tmp.Close()
+
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(30000)", dbPath)
+	conn, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		os.Remove(tmpName)
+		return "", fmt.Errorf("open db for snapshot: %w", err)
+	}
+	defer conn.Close()
+
+	sql := fmt.Sprintf("VACUUM INTO '%s'", strings.ReplaceAll(tmpName, "'", "''"))
+	if _, err := conn.Exec(sql); err != nil {
+		os.Remove(tmpName)
+		return "", fmt.Errorf("snapshot db: %w", err)
+	}
+	return tmpName, nil
 }
 
 // Importer restores from backup archives.

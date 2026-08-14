@@ -133,8 +133,13 @@ func (c *WXBizJsonMsgCrypt) decrypt(text string) (int, string) {
 
 	// 去除填充（Python: pad = ord(decrypted[-1]); if pad < 1 or pad > 32: pad = 0）
 	pad := int(pt[len(pt)-1])
-	if pad < 1 || pad > 32 {
-		pad = 0
+	if pad < 1 || pad > 32 || pad > len(pt) {
+		return MsgCryptIllegalBuffer, ""
+	}
+	for i := len(pt) - pad; i < len(pt); i++ {
+		if pt[i] != byte(pad) {
+			return MsgCryptIllegalBuffer, ""
+		}
 	}
 	if len(pt) < 16+pad {
 		return MsgCryptIllegalBuffer, ""
@@ -144,10 +149,11 @@ func (c *WXBizJsonMsgCrypt) decrypt(text string) (int, string) {
 	if len(content) < 4 {
 		return MsgCryptIllegalBuffer, ""
 	}
-	msgLen := int(binary.BigEndian.Uint32(content[:4]))
-	if msgLen < 0 || msgLen > len(content)-4 {
+	msgLenUint := binary.BigEndian.Uint32(content[:4])
+	if msgLenUint > uint32(len(content)-4) {
 		return MsgCryptIllegalBuffer, ""
 	}
+	msgLen := int(msgLenUint)
 	jsonContent := string(content[4 : 4+msgLen])
 	fromReceiveID := string(content[4+msgLen:])
 	if fromReceiveID != c.receiveID {

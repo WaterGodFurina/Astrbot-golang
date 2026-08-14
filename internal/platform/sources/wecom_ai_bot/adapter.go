@@ -213,6 +213,7 @@ func (a *Adapter) startQueueListener() {
 			select {
 			case <-ticker.C:
 				a.queueMgr.CleanupExpiredResponses(300)
+				a.cleanupStreamPlainCache()
 			case <-a.stopCh:
 				return
 			}
@@ -248,6 +249,17 @@ func (a *Adapter) WebhookCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.server.handleCallback(w, r)
+}
+
+// cleanupStreamPlainCache 清理已无输出队列的流式文本缓存（配合队列清理，避免泄漏）。
+func (a *Adapter) cleanupStreamPlainCache() {
+	a.streamCacheMu.Lock()
+	defer a.streamCacheMu.Unlock()
+	for streamID := range a.streamPlainCache {
+		if !a.queueMgr.HasBackQueue(streamID) {
+			delete(a.streamPlainCache, streamID)
+		}
+	}
 }
 
 // handleQueuedMessage 处理队列中的消息（对应 _handle_queued_message）。
@@ -369,7 +381,7 @@ func (a *Adapter) processMessage(messageData map[string]interface{}, callbackPar
 		}
 		if latestPlainContent != "" || len(imageBase64) > 0 {
 			var msgItems []interface{}
-			if finish && len(imageBase64) > 0 {
+			if len(imageBase64) > 0 {
 				for _, imgB64 := range imageBase64 {
 					imgData, err := base64Decode(imgB64)
 					if err != nil {
@@ -566,6 +578,11 @@ func (a *Adapter) convertMessage(payload *QueueItem) *platform.AstrBotMessage {
 			wg.Add(1)
 			go func(i int, imageURL, aesKey string) {
 				defer wg.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						logger.I18nError("处理加密图片时发生异常: %v", r)
+					}
+				}()
 				if aesKey == "" {
 					aesKey = a.encodingAESKey
 				}

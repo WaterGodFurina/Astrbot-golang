@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
@@ -143,7 +145,7 @@ func resolveMessageVisibility(userID string, userCache map[string]map[string]int
 
 	// 优先从 user_cache 解析
 	if userID != "" && userCache != nil {
-		if userInfo, ok := userCache[userID]; ok {
+		if userInfo, ok := getUserCacheEntry(userCache, userID); ok {
 			originalVisibility, _ := userInfo["visibility"].(string)
 			if originalVisibility == "" {
 				originalVisibility = defaultVisibility
@@ -430,7 +432,25 @@ func CreateBaseMessage(rawData map[string]interface{}, senderInfo SenderInfo, bo
 	m.SessionID = sessionID
 	m.MessageID, _ = rawData["id"].(string)
 	m.SelfID = botSelfID
+	if ts, ok := parseMisskeyCreatedAt(rawData["createdAt"]); ok {
+		m.Timestamp = ts
+	}
 	return m
+}
+
+// parseMisskeyCreatedAt 解析 Misskey 的 createdAt（ISO8601 字符串），
+// 返回 Unix 秒级时间戳；解析失败返回 (0, false)。
+func parseMisskeyCreatedAt(v interface{}) (int64, bool) {
+	s, ok := v.(string)
+	if !ok || s == "" {
+		return 0, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Unix(), true
+		}
+	}
+	return 0, false
 }
 
 // ProcessAtMention 处理 @提及逻辑（对应 process_at_mention）。
@@ -453,6 +473,34 @@ func ProcessAtMention(messageObj *platform.AstrBotMessage, rawText, botUsername,
 	messageObj.Message = append(messageObj.Message, &message.Plain{Text: rawText})
 	messageParts = append(messageParts, rawText)
 	return messageParts, rawText
+}
+
+// userCacheMu 保护 userCache 的全部读写（WebSocket 监听 goroutine 写、
+// 回复管道 goroutine 读，无锁会导致 concurrent map read and map write）。
+var userCacheMu sync.RWMutex
+
+// maxUserCacheEntries 限制 userCache 最大条目数，超出时淘汰一个任意条目。
+const maxUserCacheEntries = 1024
+
+// setUserCacheEntry 在写锁内写入缓存条目。
+func setUserCacheEntry(userCache map[string]map[string]interface{}, key string, value map[string]interface{}) {
+	userCacheMu.Lock()
+	defer userCacheMu.Unlock()
+	if len(userCache) >= maxUserCacheEntries {
+		for k := range userCache {
+			delete(userCache, k)
+			break
+		}
+	}
+	userCache[key] = value
+}
+
+// getUserCacheEntry 在读锁内读取缓存条目。
+func getUserCacheEntry(userCache map[string]map[string]interface{}, key string) (map[string]interface{}, bool) {
+	userCacheMu.RLock()
+	defer userCacheMu.RUnlock()
+	v, ok := userCache[key]
+	return v, ok
 }
 
 // CacheUserInfo 缓存用户信息（对应 cache_user_info）。
@@ -489,7 +537,7 @@ func CacheUserInfo(userCache map[string]map[string]interface{}, senderInfo Sende
 			"reply_to_note_id": replyToNoteID,
 		}
 	}
-	userCache[senderInfo.SenderID] = cacheData
+	setUserCacheEntry(userCache, senderInfo.SenderID, cacheData)
 }
 
 // CacheRoomInfo 缓存房间信息（对应 cache_room_info）。
@@ -501,14 +549,14 @@ func CacheRoomInfo(userCache map[string]map[string]interface{}, rawData map[stri
 		roomName, _ := roomData["name"].(string)
 		roomDescription, _ := roomData["description"].(string)
 		ownerID, _ := roomData["ownerId"].(string)
-		userCache[roomCacheKey] = map[string]interface{}{
+		setUserCacheEntry(userCache, roomCacheKey, map[string]interface{}{
 			"room_id":          roomID,
 			"room_name":        roomName,
 			"room_description": roomDescription,
 			"owner_id":         ownerID,
 			"visibility":       "specified",
 			"visible_user_ids": []string{botSelfID},
-		}
+		})
 	}
 }
 
@@ -605,4 +653,13 @@ func isComponentFileLike(comp message.Component) bool {
 func isFileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// truncateRunes 按 Unicode 码点截断字符串，避免按字节截断产生 UTF-8 乱码。
+func truncateRunes(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
 }

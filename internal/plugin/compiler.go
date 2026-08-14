@@ -68,7 +68,7 @@ func (c *Compiler) goflagsEnv() string {
 // go.mod (when missing) or patches the existing one to require the SDK module
 // and replace it with the local SDK directory.
 func (c *Compiler) Prepare(srcDir, moduleName string) error {
-	sdkDir, err := findSDKDir()
+	sdkDir, err := c.sdkDir()
 	if err != nil {
 		return fmt.Errorf("resolve SDK dir: %w", err)
 	}
@@ -202,22 +202,26 @@ func (c *Compiler) build(ctx context.Context, srcDir, outputPath string, progres
 
 	// Stream `go build -v` output line by line so the WebUI can show live
 	// dependency downloads and the packages currently being compiled.
+	// stdout and stderr must be buffered separately: cmd.Stdout is written by
+	// exec's internal copy goroutine, while the scanner below reads stderr
+	// through a TeeReader — sharing one buffer would race both writers.
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
-	var outBuf bytes.Buffer
-	cmd.Stdout = &outBuf
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("go build start: %w", err)
 	}
-	scanner := bufio.NewScanner(io.TeeReader(stderr, &outBuf))
+	scanner := bufio.NewScanner(io.TeeReader(stderr, &stderrBuf))
 	scanner.Buffer(make([]byte, 0, 64*1024), 1*1024*1024)
 	for scanner.Scan() {
 		outputCb(scanner.Text())
 	}
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("go build: %w\n%s", err, outBuf.String())
+		return fmt.Errorf("go build: %w\n%s", err, stderrBuf.String())
 	}
 	return nil
 }
@@ -225,7 +229,19 @@ func (c *Compiler) build(ctx context.Context, srcDir, outputPath string, progres
 // findSDKDir locates the local SDK module directory, resolving it from
 // ASTRBOT_GO_SDK, the nearest go.mod `replace`, the module cache (from the
 // go.mod `require` version), or the conventional sibling directory.
+//
+// It has no toolchain context (test-support helper, e.g. BuildTestPlugin), so
+// the module-cache fallback uses the system `go` from PATH. Compilation paths
+// go through findSDKDirWithGo instead, which uses the bundled toolchain.
 func findSDKDir() (string, error) {
+	return findSDKDirWithGo("")
+}
+
+// findSDKDirWithGo is findSDKDir using an explicit go binary for the module
+// cache lookup (the bundled toolchain, consistent with plugin builds). When
+// goBin is empty the system `go` on PATH is used. The work directory is pinned
+// to the nearest go.mod so resolution does not depend on the process CWD.
+func findSDKDirWithGo(goBin string) (string, error) {
 	if p := os.Getenv("ASTRBOT_GO_SDK"); p != "" {
 		abs, err := filepath.Abs(p)
 		if err != nil {
@@ -257,7 +273,7 @@ func findSDKDir() (string, error) {
 			// 无本地 replace 时（SDK 已作为依赖从 GitHub 拉取），从 go.mod
 			// 的 require 版本在 GOMODCACHE 定位 SDK 源码目录。
 			if version := sdkRequireFromGoMod(data); version != "" {
-				if p, err := sdkInModCache(version); err == nil {
+				if p, err := sdkInModCache(goBin, dir, version); err == nil {
 					return p, nil
 				}
 			}
@@ -269,6 +285,18 @@ func findSDKDir() (string, error) {
 		dir = parent
 	}
 	return "", fmt.Errorf("no go.mod with the AstrBot SDK replace found (set %s)", "ASTRBOT_GO_SDK")
+}
+
+// sdkDir resolves the local SDK module directory using the bundled toolchain's
+// go binary, falling back to the system `go` when the toolchain cannot be
+// provisioned.
+func (c *Compiler) sdkDir() (string, error) {
+	if c.tc != nil {
+		if goBin, err := c.tc.Ensure(); err == nil {
+			return findSDKDirWithGo(goBin)
+		}
+	}
+	return findSDKDirWithGo("")
 }
 
 // sdkRequireFromGoMod extracts the SDK require version from go.mod contents
@@ -290,9 +318,17 @@ func sdkRequireFromGoMod(data []byte) string {
 // sdkInModCache resolves the SDK source directory in the Go module cache for a
 // given require version. `go list -m` returns the actual on-disk directory
 // (module cache escapes uppercase letters as !x, so manual path joining would
-// break).
-func sdkInModCache(version string) (string, error) {
-	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", sdkModulePath).Output()
+// break). goBin is the `go` binary to run (empty → the system `go` from PATH,
+// only used by toolchain-less test helpers); workDir pins the command's working
+// directory to the go.mod location instead of the process CWD.
+func sdkInModCache(goBin, workDir, version string) (string, error) {
+	if goBin == "" {
+		goBin = "go"
+	}
+	cmd := exec.Command(goBin, "list", "-m", "-f", "{{.Dir}}", sdkModulePath)
+	cmd.Dir = workDir
+	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("locate SDK %s@%s in module cache: %w", sdkModulePath, version, err)
 	}

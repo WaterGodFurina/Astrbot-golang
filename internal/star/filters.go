@@ -46,9 +46,10 @@ func NewEventMessageTypeFilter(msgType string) *EventMessageTypeFilter {
 
 // Match returns true if the event message type matches.
 func (f *EventMessageTypeFilter) Match(ctx *FilterContext) bool {
-	// In Go, we check via FilterContext if available
-	// For now, we check platform context if available
-	return true // pass-through; actual filtering done at event level
+	if ctx == nil {
+		return false
+	}
+	return strings.EqualFold(ctx.EventMessageType, f.messageType)
 }
 
 // FilterType returns the filter type name.

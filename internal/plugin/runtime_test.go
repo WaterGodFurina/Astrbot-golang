@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	// Give managed child processes a moment to be reaped by go-plugin.
 	time.Sleep(300 * time.Millisecond)
+	CleanupTestPlugin()
 	os.Exit(code)
 }
 
@@ -667,6 +669,97 @@ func TestRawRepoDocURLs(t *testing.T) {
 	}
 }
 
+// TestRawRepoDocURLsNoPanic guards the git@ shorthand parser against inputs
+// where the colon is missing: the previous slicing panicked with an
+// out-of-range slice on "git@host/owner/repo".
+func TestRawRepoDocURLsNoPanic(t *testing.T) {
+	for _, repo := range []string{
+		"git@example.com/Owner/Repo", // no ':' separator
+		"git@github.com",             // host only
+		"git@github.com:",            // empty path
+		"git@github.com:/Owner/Repo", // leading ':' trimmed, still no owner
+		"git@github.com:Owner",       // no '/'
+	} {
+		if got := rawRepoDocURLs(repo, []string{"README.md"}); got != nil {
+			t.Errorf("rawRepoDocURLs(%q) should return nil, got %v", repo, got)
+		}
+	}
+}
+
+// TestBuildTestPluginConcurrentCalls verifies the test-plugin cache is safe
+// under concurrent access (previously a bare global written without a lock,
+// which the race detector flags when tests build the plugin in parallel).
+func TestBuildTestPluginConcurrentCalls(t *testing.T) {
+	if testPluginBin == "" {
+		t.Skip("test plugin not built in this run")
+	}
+	var wg sync.WaitGroup
+	results := make([]string, 8)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = BuildTestPlugin()
+		}(i)
+	}
+	wg.Wait()
+	for i, r := range results {
+		if r != testPluginBin {
+			t.Errorf("result %d = %q, want %q", i, r, testPluginBin)
+		}
+	}
+}
+
+// TestUninstallSerializesWithInstallTail verifies Uninstall participates in the
+// per-plugin lifecycle lock: while an in-flight InstallFromSource tail (or any
+// other op) holds lockOp(id), Uninstall must block, so a concurrent
+// "install + uninstall" cannot interleave and resurrect the plugin.
+func TestUninstallSerializesWithInstallTail(t *testing.T) {
+	requirePlugin(t)
+	m := newTestManager(t)
+	ctx := context.Background()
+	src := filepath.Join("testdata", "plugin")
+
+	if _, err := m.InstallFromSource(ctx, "racey", src, InstallOptions{}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	defer m.Unload("racey")
+
+	// Hold the lifecycle lock as an in-flight install tail would.
+	release := m.lockOp("racey")
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Uninstall("racey", false, false)
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Uninstall should block while the lifecycle lock is held, got %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	release()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Uninstall after lock release: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Uninstall did not complete after the lock was released")
+	}
+
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if man.Get("racey") != nil {
+		t.Error("manifest entry should be gone after Uninstall")
+	}
+	if m.Get("racey") != nil {
+		t.Error("instance should be gone after Uninstall")
+	}
+}
+
 func TestBindSourceAndReinstall(t *testing.T) {
 	requirePlugin(t)
 	m := newTestManager(t)
@@ -706,5 +799,61 @@ func TestBindSourceAndReinstall(t *testing.T) {
 	}
 	if err := m.Unload("reinst"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSafeDataDirPathRejectsEmptyAndRoot(t *testing.T) {
+	m := newTestManager(t)
+	for _, sub := range []string{"", ".", ".."} {
+		if p, err := m.safeDataDirPath(sub); err == nil {
+			t.Fatalf("safeDataDirPath(%q) = %q, want error", sub, p)
+		}
+	}
+	if _, err := m.safeDataDirPath("../evil"); err == nil {
+		t.Fatal("safeDataDirPath(\"../evil\") accepted, want error")
+	}
+	p, err := m.safeDataDirPath("plugins_config/test")
+	if err != nil {
+		t.Fatalf("safeDataDirPath(valid sub): %v", err)
+	}
+	if p != filepath.Join(m.dataDir, "plugins_config", "test") {
+		t.Fatalf("safeDataDirPath resolved to %q, want %q", p, filepath.Join(m.dataDir, "plugins_config", "test"))
+	}
+}
+
+func TestUninstallLegacyEntryDoesNotWipeDataDir(t *testing.T) {
+	m := newTestManager(t)
+	man := &Manifest{Version: 1, Plugins: []ManifestEntry{
+		{ID: "legacy_plugin", Name: "legacy_plugin", Binary: "unused", Enabled: false},
+	}}
+	if err := man.Save(m.manifestPath()); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+
+	// Unrelated data that must survive the uninstall.
+	keepFile := filepath.Join(m.dataDir, "skills", "keep.txt")
+	if err := os.MkdirAll(filepath.Dir(keepFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keepFile, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The plugin's own config dir that must be removed.
+	cfgFile := filepath.Join(m.dataDir, "plugins_config", "legacy_plugin", "config.json")
+	if err := os.MkdirAll(filepath.Dir(cfgFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgFile, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Uninstall("legacy_plugin", true, true); err != nil {
+		t.Fatalf("Uninstall: %v", err)
+	}
+	if _, err := os.Stat(keepFile); err != nil {
+		t.Fatalf("unrelated data under dataDir was deleted: %v", err)
+	}
+	if _, err := os.Stat(cfgFile); !os.IsNotExist(err) {
+		t.Fatalf("plugin config dir should have been removed, stat err=%v", err)
 	}
 }

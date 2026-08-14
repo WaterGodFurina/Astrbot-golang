@@ -82,12 +82,13 @@ func (s *GeminiTTSSource) GetAudio(ctx context.Context, text string) (string, er
 		return "", err
 	}
 
-	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s", s.apiBase, s.model, s.apiKey)
+	url := fmt.Sprintf("%s/models/%s:generateContent", s.apiBase, s.model)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", s.apiKey)
 
 	resp, err := s.client.Do(req)
 	if err != nil {

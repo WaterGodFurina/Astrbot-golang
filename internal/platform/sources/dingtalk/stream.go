@@ -27,7 +27,16 @@ func dingtalkReconnectDelay(retryCount int) time.Duration {
 	if safeRetryCount < 1 {
 		safeRetryCount = 1
 	}
-	delay := dingtalkReconnectInitialDelay * (1 << (safeRetryCount - 1))
+	// 饱和退避: 钳制移位指数, 防止连续失败过多后 1<<(safeRetryCount-1)
+	// 溢出为 0/负数, 使退避延迟归零退化为热循环。
+	exp := safeRetryCount - 1
+	if exp > 30 {
+		exp = 30
+	}
+	delay := int64(dingtalkReconnectInitialDelay) << exp
+	if delay <= 0 {
+		return time.Duration(dingtalkReconnectMaxDelay) * time.Second
+	}
 	if delay > dingtalkReconnectMaxDelay {
 		delay = dingtalkReconnectMaxDelay
 	}
@@ -256,11 +265,29 @@ func (a *Adapter) handleCallback(ctx context.Context, conn *websocket.Conn, fram
 		a.sendAck(conn, frame, 400, "BAD_REQUEST")
 		return
 	}
-	msg := parseChatbotMessage(data)
-	logger.Debug("钉钉收到消息: %+v", msg)
-	abm := a.convertMsg(msg)
-	if abm != nil {
-		a.handleMsg(abm)
-	}
+	// 先 ack 再异步处理: 图片/语音/文件下载可能耗时数十秒, 若同步执行完再
+	// ack 会超过钉钉 stream 的 ack 时限, 触发消息重投/断连。
 	a.sendAck(conn, frame, 200, "OK")
+	select {
+	case a.msgCh <- data:
+	default:
+		logger.I18nWarn("钉钉回调处理队列已满, 丢弃一条消息")
+	}
+}
+
+// msgLoop 串行处理回调消息, 保证处理顺序与下载/转码等耗时操作不阻塞 WS 读循环。
+func (a *Adapter) msgLoop() {
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case data := <-a.msgCh:
+			msg := parseChatbotMessage(data)
+			logger.Debug("钉钉收到消息: %+v", msg)
+			abm := a.convertMsg(msg)
+			if abm != nil {
+				a.handleMsg(abm)
+			}
+		}
+	}
 }

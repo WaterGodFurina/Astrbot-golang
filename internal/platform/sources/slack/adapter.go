@@ -17,6 +17,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -34,6 +35,32 @@ import (
 )
 
 var logger = log.GetDefault().WithComponent("Slack")
+
+const (
+	// eventAPITimeout 是处理单条事件时 Slack API/文件下载的超时上限，
+	// 防止 Slack/CDN 挂起时事件处理 goroutine 无限阻塞。
+	eventAPITimeout = 30 * time.Second
+	// maxFileDownloadSize 限制 Slack 文件下载的大小上限。
+	maxFileDownloadSize = 20 << 20
+	// slackTimestampSkew X-Slack-Request-Timestamp 与当前时间允许的最大偏差（防重放）。
+	slackTimestampSkew = 5 * time.Minute
+)
+
+// limitedWriter 限制写入总量不超过 limit 字节（用于下载大小上限）。
+type limitedWriter struct {
+	w         io.Writer
+	remaining int64
+}
+
+// Write 实现 io.Writer，超过上限时报错。
+func (l *limitedWriter) Write(p []byte) (int, error) {
+	if int64(len(p)) > l.remaining {
+		return 0, fmt.Errorf("文件超过大小上限 %d 字节", maxFileDownloadSize)
+	}
+	n, err := l.w.Write(p)
+	l.remaining -= int64(n)
+	return n, err
+}
 
 // Adapter 实现 Slack 平台适配器。
 type Adapter struct {
@@ -269,10 +296,13 @@ func (a *Adapter) processIncomingEvent(event map[string]interface{}) {
 func (a *Adapter) startWebhookMode(ctx context.Context) error {
 	a.webhook = NewSlackWebhookServer(a.signingSecret, a.webhookPath, a.handleWebhookEvent)
 
-	// 统一 webhook 模式：不启动独立服务器，等待 dashboard 回调注入
-	if a.unifiedWebhookMode && a.webhookUUID != "" {
-		logger.I18nInfo("%s(Slack) 统一 Webhook 已启用, webhook_uuid=%s", a.ID(), a.webhookUUID)
-		<-ctx.Done()
+	// 统一 webhook 模式：不启动独立服务器，等待 dashboard 回调注入 (非阻塞)
+	if a.unifiedWebhookMode {
+		if a.webhookUUID != "" {
+			logger.I18nInfo("%s(Slack) 统一 Webhook 已启用, webhook_uuid=%s", a.ID(), a.webhookUUID)
+		} else {
+			logger.I18nWarn("Slack 已启用统一 Webhook 模式，但未配置 webhook_uuid")
+		}
 		return nil
 	}
 	logger.I18nInfo("Slack 适配器 (Webhook Mode) 启动中，监听 %s:%d%s...", a.webhookHost, a.webhookPort, a.webhookPath)
@@ -325,19 +355,22 @@ func (a *Adapter) WebhookCallback(w http.ResponseWriter, r *http.Request) {
 func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBotMessage {
 	logger.Debug("[slack] RawMessage %v", event)
 
+	ctx, cancel := context.WithTimeout(context.Background(), eventAPITimeout)
+	defer cancel()
+
 	abm := platform.NewAstrBotMessage()
 	abm.SelfID = a.botSelfID
 	abm.Message = []message.Component{}
 
 	// 获取用户信息
 	userID, _ := event["user"].(string)
-	userName := a.fetchUserName(context.Background(), userID)
+	userName := a.fetchUserName(ctx, userID)
 	abm.Sender = platform.MessageMember{UserID: userID, Nickname: userName}
 
 	// 判断消息类型（群组/私聊）
 	channelID, _ := event["channel"].(string)
 	abm.Type = platform.GroupMessage
-	if !a.isIMChannel(context.Background(), channelID) {
+	if !a.isIMChannel(ctx, channelID) {
 		abm.Group = &platform.Group{GroupID: channelID, GroupName: channelID}
 		abm.SessionID = channelID
 	} else {
@@ -382,7 +415,7 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 					continue
 				}
 				seen[mid] = true
-				name := a.fetchUserName(context.Background(), mid)
+				name := a.fetchUserName(ctx, mid)
 				abm.Message = append(abm.Message, &message.At{TargetID: mid, Name: name})
 			}
 			// 清理消息文本中的 @ 标记
@@ -408,7 +441,7 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 			fileURL, _ := fileInfo["url_private"].(string)
 			mimetype, _ := fileInfo["mimetype"].(string)
 			if strings.HasPrefix(mimetype, "image/") {
-				if b64, err := a.getFileBase64(context.Background(), fileURL); err == nil {
+				if b64, err := a.getFileBase64(ctx, fileURL); err == nil {
 					abm.Message = append(abm.Message, &message.Image{Base64: b64})
 				}
 			} else {
@@ -470,7 +503,7 @@ func (a *Adapter) getFileBase64(ctx context.Context, url string) (string, error)
 		return "", fmt.Errorf("文件 URL 为空")
 	}
 	var buf bytes.Buffer
-	if err := a.client.GetFileContext(ctx, url, &buf); err != nil {
+	if err := a.client.GetFileContext(ctx, url, &limitedWriter{w: &buf, remaining: maxFileDownloadSize}); err != nil {
 		logger.I18nError("下载 Slack 文件失败: %v", err)
 		return "", fmt.Errorf("下载文件失败: %w", err)
 	}
@@ -712,6 +745,15 @@ func writeJSONError(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+// isFreshTimestamp 判断回调时间戳是否为 Unix 秒且与当前时间偏差不超过 maxSkew。
+func isFreshTimestamp(timestamp string, maxSkew time.Duration) bool {
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || ts <= 0 {
+		return false
+	}
+	return time.Since(time.Unix(ts, 0)).Abs() <= maxSkew
 }
 
 // verifySlackSignature 校验 Slack 请求签名（v0 HMAC-SHA256）。

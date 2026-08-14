@@ -9,6 +9,7 @@ package dashboard
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -107,7 +108,10 @@ func weixinOCRequestJSON(ctx context.Context, baseURL, endpoint string, params u
 	if endpoint == "ilink/bot/get_qrcode_status" {
 		req.Header.Set("iLink-App-ClientVersion", "1")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	if err := validateOutboundURL(u); err != nil {
+		return nil, err
+	}
+	resp, err := newOutboundClient(timeout).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -224,5 +228,5 @@ func randomPlatformIDSuffix() string {
 func base64URLSafe(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+	return base64.URLEncoding.EncodeToString(b)
 }

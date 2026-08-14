@@ -111,10 +111,29 @@ func (s *EdgeTTSSource) GetAudio(ctx context.Context, text string) (string, erro
 		return "", fmt.Errorf("edge_tts 发送ssml失败: %w", err)
 	}
 
+	// 服务端挂起时 ReadMessage 会永久阻塞：一是 ctx 取消后由 goroutine 关闭
+	// 连接解除阻塞，二是每条消息后续期 SetReadDeadline 兜底，防止无 ctx 取消
+	// 的调用方被无限挂住。
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-stop:
+		}
+	}()
+
 	var audio bytes.Buffer
 	for {
+		if err := conn.SetReadDeadline(time.Now().Add(s.timeout)); err != nil {
+			return "", fmt.Errorf("edge_tts 设置读超时失败: %w", err)
+		}
 		mt, msg, rerr := conn.ReadMessage()
 		if rerr != nil {
+			if ctx.Err() != nil {
+				return "", fmt.Errorf("edge_tts 读取失败: %w", ctx.Err())
+			}
 			return "", fmt.Errorf("edge_tts 读取失败: %w", rerr)
 		}
 		if mt == websocket.BinaryMessage {

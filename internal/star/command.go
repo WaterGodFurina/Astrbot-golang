@@ -37,6 +37,9 @@ type FilterContext struct {
 	EventSenderID string
 	EventPlatform string
 	EventRole     string
+	// EventMessageType is the platform message type ("GroupMessage" /
+	// "FriendMessage"), used by EventMessageTypeFilter.
+	EventMessageType string
 }
 
 // CommandFilter matches a single command name.

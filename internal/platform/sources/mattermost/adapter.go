@@ -37,10 +37,11 @@ type Adapter struct {
 	botSelfID   string
 	botUsername string
 
-	mu      sync.Mutex
-	running bool
-	wsConn  *websocket.Conn
-	stopCh  chan struct{}
+	mu       sync.Mutex
+	running  bool
+	wsConn   *websocket.Conn
+	stopCh   chan struct{}
+	stopOnce sync.Once
 
 	// 最近一次消息转换产生的附件临时文件路径（随事件发布，对应 Python 的 temporary_file_paths）
 	lastTempPaths []string
@@ -137,7 +138,7 @@ func (a *Adapter) Stop() error {
 	if conn != nil {
 		_ = conn.Close()
 	}
-	close(a.stopCh)
+	a.stopOnce.Do(func() { close(a.stopCh) })
 	a.client.Close()
 	return nil
 }
@@ -205,16 +206,53 @@ func (a *Adapter) wsConnectAndListen(ctx context.Context) error {
 		conn.Close()
 	}()
 
-	// 发送认证挑战（对应 send_json authentication_challenge）
+	// 收到 pong 时刷新读超时（gorilla 的读超时是绝对时间，控制帧不会自动重置）
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	})
+
+	// 认证：等待服务端 hello 事件，回送 authentication_challenge（对应 mattermostdriver 的 _init_connection）
+	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	_, raw, err := conn.ReadMessage()
+	if err != nil {
+		return fmt.Errorf("等待 Mattermost hello 事件失败: %w", err)
+	}
+	var hello map[string]interface{}
+	if err := json.Unmarshal(raw, &hello); err != nil {
+		logger.Debug("Mattermost websocket 收到非 JSON 文本帧: %q", string(raw))
+		hello = map[string]interface{}{}
+	}
+	seq := 0.0
+	if v, ok := hello["seq"].(float64); ok {
+		seq = v
+	}
 	if err := conn.WriteJSON(map[string]interface{}{
-		"seq":    1,
+		"seq":    seq + 1,
 		"action": "authentication_challenge",
 		"data":   map[string]interface{}{"token": a.token},
 	}); err != nil {
 		return err
 	}
 
-	// 读取循环：接收 hello / posted 等事件
+	// 心跳：每 30s 发送 ping 保活（对应 Python websockets 的 ping_interval=30）
+	pingStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingStop:
+				return
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	defer close(pingStop)
+
+	// 读取循环：接收 posted 等事件
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		_, raw, err := conn.ReadMessage()
@@ -391,12 +429,25 @@ func (a *Adapter) parseTextComponents(messageText string) []message.Component {
 // Python 使用 lookbehind/lookahead 正则，Go 的 RE2 不支持环视，
 // 因此改为手动边界扫描：匹配 @username（大小写不敏感），
 // 且前后不能是用户名组成字符（[A-Za-z0-9_.-]）。
+// asciiLower 仅对 ASCII 大写字母做小写转换，其余字符（含多字节 UTF-8）原样保留，
+// 保证转换前后字节长度一致。strings.ToLower 对个别 Unicode 字符（如 İ）小写后
+// 字节长度会变化，导致在 lowerText 上取的提及下标与原文切片错位。
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
 func findMentionSpans(text, botUsername string) [][]int {
 	if botUsername == "" || text == "" {
 		return nil
 	}
-	lowerText := strings.ToLower(text)
-	lowerUser := strings.ToLower(botUsername)
+	lowerText := asciiLower(text)
+	lowerUser := asciiLower(botUsername)
 	needle := "@" + lowerUser
 	var spans [][]int
 	idx := 0
@@ -521,6 +572,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 		return
 	}
 	chain := &message.MessageChain{Chain: abm.Message}
+	ts := time.Unix(abm.Timestamp, 0)
 	event := &core.Event{
 		Type:       core.EventMessage,
 		Message:    chain,
@@ -533,7 +585,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 			Platform:    a.Type(),
 			MessageStr:  abm.MessageStr,
 			RawMessage:  abm.RawMessage,
-			Timestamp:   time.Now(),
+			Timestamp:   ts,
 		},
 		Source: core.EventSource{
 			Platform:   a.Type(),
@@ -543,7 +595,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 			ConvID:     abm.SessionID,
 			IsGroup:    abm.Type == platform.GroupMessage,
 		},
-		Timestamp: time.Now(),
+		Timestamp: ts,
 		Metadata:  make(map[string]interface{}),
 	}
 	// 附件临时文件路径（对应 Python 的 temporary_file_paths 属性）

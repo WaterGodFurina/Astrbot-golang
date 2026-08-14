@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 )
@@ -126,13 +127,17 @@ func (s *WecomAIBotServer) handleCallback(w http.ResponseWriter, r *http.Request
 
 // Start 启动回调服务器（非阻塞）。
 func (s *WecomAIBotServer) Start() error {
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", s.host, s.port))
+	if err != nil {
+		return fmt.Errorf("企业微信智能机器人服务器监听 %s:%d 失败: %w", s.host, s.port, err)
+	}
 	s.httpSrv = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", s.host, s.port),
 		Handler: s.Handler(),
 	}
 	logger.I18nInfo("启动企业微信智能机器人服务器，监听 %s:%d", s.host, s.port)
 	go func() {
-		if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logger.I18nError("服务器运行异常: %v", err)
 		}
 	}()

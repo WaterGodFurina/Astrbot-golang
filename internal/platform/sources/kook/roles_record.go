@@ -175,8 +175,8 @@ func (r *RolesRecord) HasRoleInChannel(ctx context.Context, roleID, guildID int6
 
 	r.mu.Lock()
 	delete(r.pending, guildID)
-	close(p.done)
 	p.roles = roles
+	close(p.done)
 	r.mu.Unlock()
 	if roles == nil {
 		return false

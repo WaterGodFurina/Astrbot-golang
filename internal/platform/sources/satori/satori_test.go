@@ -4,14 +4,18 @@ package satori
 // 网络调用仅通过 httptest 覆盖。
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	satorilib "github.com/FloatTech/satori-go"
+	"github.com/gorilla/websocket"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
@@ -563,4 +567,139 @@ func TestHandleEventPublishAndSelfFilter(t *testing.T) {
 	if len(bus.events) != 1 {
 		t.Errorf("非消息事件不应发布，实际 %d 条", len(bus.events))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 发送时外部媒体下载（M-51 回归）
+// ---------------------------------------------------------------------------
+
+func TestFetchMediaHTTPStatusAndLimit(t *testing.T) {
+	// 非 2xx 状态码应报错
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+	if _, _, err := fetchMedia(bad.URL); err == nil {
+		t.Error("非 2xx 响应应报错")
+	}
+
+	// 超过大小上限应报错而非无界读取
+	big := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, maxMediaDownloadSize+1))
+	}))
+	defer big.Close()
+	if _, _, err := fetchMedia(big.URL); err == nil {
+		t.Error("超过大小上限的媒体应报错")
+	}
+
+	// 正常下载返回内容与最终路径
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer ok.Close()
+	data, path, err := fetchMedia(ok.URL + "/media/pic.png")
+	if err != nil {
+		t.Fatalf("正常下载失败: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("期望内容 hello，实际 %q", data)
+	}
+	if path != "/media/pic.png" {
+		t.Errorf("期望返回最终 URL 路径 /media/pic.png，实际 %q", path)
+	}
+}
+
+func TestImageToDataURLFromURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("\x89PNG\r\n\x1a\n" + "fake"))
+	}))
+	defer srv.Close()
+	img := &message.Image{URL: srv.URL + "/pic.png"}
+	got, err := imageToDataURL(img)
+	if err != nil {
+		t.Fatalf("imageToDataURL 失败: %v", err)
+	}
+	if !strings.HasPrefix(got, "data:image/png;base64,") {
+		t.Errorf("期望 PNG data URL，实际前缀: %s", got[:40])
+	}
+}
+
+func TestRecordToBase64FromURL(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("audio-bytes"))
+	}))
+	defer srv.Close()
+	rec := &message.Record{URL: srv.URL + "/voice.wav"}
+	got, err := recordToBase64(rec)
+	if err != nil {
+		t.Fatalf("recordToBase64 失败: %v", err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(got)
+	if err != nil || string(decoded) != "audio-bytes" {
+		t.Errorf("语音 base64 解码不符: %v %q", err, decoded)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 重连计数（M-55 回归）：成功连接（收到 READY）后断连不累计失败次数，
+// 连续断开超过 10 次不应永久停机。
+// ---------------------------------------------------------------------------
+
+func TestRunLoopKeepsReconnectingAfterReady(t *testing.T) {
+	var mu sync.Mutex
+	connCount := 0
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		mu.Lock()
+		connCount++
+		mu.Unlock()
+		// 等待 IDENTIFY 后回复 READY（对齐 connectWebsocket 流程）
+		if _, _, err := c.ReadMessage(); err != nil {
+			return
+		}
+		_ = c.WriteMessage(websocket.TextMessage, []byte(`{"op":4,"body":{"sn":1,"logins":[]}}`))
+		// 短暂维持后正常断开
+		time.Sleep(30 * time.Millisecond)
+	}))
+	defer srv.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/events"
+	a := New(map[string]interface{}{
+		"id":                        "retry_test",
+		"satori_endpoint":           wsURL,
+		"satori_auto_reconnect":     true,
+		"satori_heartbeat_interval": float64(3600),
+	}, nil, nil)
+	a.reconnectDelay = 1
+	a.mu.Lock()
+	a.running = true
+	a.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go a.runLoop(ctx)
+
+	deadline := time.After(20 * time.Second)
+	for {
+		mu.Lock()
+		n := connCount
+		mu.Unlock()
+		if n >= 11 {
+			break
+		}
+		select {
+		case <-deadline:
+			mu.Lock()
+			got := connCount
+			mu.Unlock()
+			t.Fatalf("已收到 READY 的连接断连后应继续重连（旧行为 10 次后永久停机），当前连接数 %d", got)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	_ = a.Stop()
 }

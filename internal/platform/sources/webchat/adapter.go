@@ -33,6 +33,9 @@ type Adapter struct {
 	// pollClients 是 /poll 长轮询专用通道（与 /chat 的同步回复通道分离），
 	// 避免同一 session 的回复被 /chat 与 /poll 两个消费者竞争抢走。
 	pollClients map[string]chan *message.MessageChain
+	// pollRefs 记录每个会话当前在等待的 /poll 长轮询数量，用于轮询结束后
+	// 引用计数归零时清理 pollClients 通道，防止通道永久泄漏。
+	pollRefs map[string]int
 }
 
 // New creates a WebChat adapter.
@@ -41,6 +44,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		EventBus:    eventBus,
 		clients:     make(map[string]chan *message.MessageChain),
 		pollClients: make(map[string]chan *message.MessageChain),
+		pollRefs:    make(map[string]int),
 	}
 	a.Host, _ = config["host"].(string)
 	if a.Host == "" {
@@ -50,7 +54,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		a.Port = int(port)
 	}
 	if a.Port == 0 {
-		a.Port = 6185
+		a.Port = 6195
 	}
 	a.AuthToken, _ = config["auth_token"].(string)
 	return a
@@ -262,8 +266,20 @@ func (a *Adapter) handlePoll(w http.ResponseWriter, r *http.Request) {
 	if _, ok := a.pollClients[sessionID]; !ok {
 		a.pollClients[sessionID] = make(chan *message.MessageChain, 10)
 	}
+	a.pollRefs[sessionID]++
 	ch := a.pollClients[sessionID]
 	a.mu.Unlock()
+	// 轮询结束（收到回复、超时或客户端断开）后引用计数归零时清理通道，
+	// 防止 pollClients 随任意 session_id 无限增长。
+	defer func() {
+		a.mu.Lock()
+		a.pollRefs[sessionID]--
+		if a.pollRefs[sessionID] <= 0 {
+			delete(a.pollRefs, sessionID)
+			delete(a.pollClients, sessionID)
+		}
+		a.mu.Unlock()
+	}()
 
 	select {
 	case resp := <-ch:
@@ -271,6 +287,8 @@ func (a *Adapter) handlePoll(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"reply": extractPlainText(resp),
 		})
+	case <-r.Context().Done():
+		// 客户端断开连接：直接返回，由 defer 清理轮询通道。
 	case <-time.After(30 * time.Second):
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{

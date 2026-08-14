@@ -48,6 +48,9 @@ type KookClient struct {
 	runningMu sync.RWMutex
 	running   bool
 
+	// sessionID/lastSN/lastHeartbeatTime/heartbeatFailedCount 由 listen goroutine
+	// 写入, 心跳 goroutine 与主循环读取, 统一用 stateMu 保护
+	stateMu              sync.Mutex
 	sessionID            string // 当前会话 id
 	lastSN               int64  // 记录最后处理的消息序号
 	lastHeartbeatTime    time.Time
@@ -93,6 +96,55 @@ func (c *KookClient) setRunning(running bool) {
 	c.runningMu.Lock()
 	c.running = running
 	c.runningMu.Unlock()
+}
+
+func (c *KookClient) sessionIDValue() string {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.sessionID
+}
+
+func (c *KookClient) setSessionID(id string) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.sessionID = id
+}
+
+func (c *KookClient) lastSNValue() int64 {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.lastSN
+}
+
+func (c *KookClient) setLastSN(sn int64) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.lastSN = sn
+}
+
+func (c *KookClient) lastHeartbeatTimeValue() time.Time {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.lastHeartbeatTime
+}
+
+func (c *KookClient) setLastHeartbeatTime(t time.Time) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.lastHeartbeatTime = t
+}
+
+func (c *KookClient) incHeartbeatFailedCount() int {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.heartbeatFailedCount++
+	return c.heartbeatFailedCount
+}
+
+func (c *KookClient) setHeartbeatFailedCount(n int) {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.heartbeatFailedCount = n
 }
 
 // newRequest 构造带鉴权头的 HTTP 请求。
@@ -207,7 +259,7 @@ func (c *KookClient) closeWS() {
 // 返回 true 表示成功建立过连接 (对应 Python connect)。
 func (c *KookClient) Connect(ctx context.Context) bool {
 	c.closeWS()
-	gatewayURL, err := c.GetGatewayURL(ctx, false, c.lastSN, c.sessionID)
+	gatewayURL, err := c.GetGatewayURL(ctx, false, c.lastSNValue(), c.sessionIDValue())
 	if err != nil || gatewayURL == "" {
 		return false
 	}
@@ -300,7 +352,7 @@ func (c *KookClient) handleSignal(ctx context.Context, frame *kookWSFrame) {
 	switch frame.Signal {
 	case signalMessage:
 		if frame.SN != nil {
-			c.lastSN = *frame.SN
+			c.setLastSN(*frame.SN)
 		}
 		if len(frame.Data) == 0 {
 			return
@@ -339,8 +391,8 @@ func (c *KookClient) handleSignal(ctx context.Context, frame *kookWSFrame) {
 // handleHello 处理 HELLO 握手 (对应 Python _handle_hello)。
 func (c *KookClient) handleHello(data *kookHelloEventData) {
 	if data.Code == 0 {
-		c.sessionID = data.SessionID
-		logger.I18nInfo("[KOOK] 握手成功，session_id: %s", c.sessionID)
+		c.setSessionID(data.SessionID)
+		logger.I18nInfo("[KOOK] 握手成功，session_id: %s", c.sessionIDValue())
 	} else {
 		logger.I18nError("[KOOK] 握手失败，错误码: %d", data.Code)
 		if data.Code == 40103 { // token过期
@@ -352,23 +404,23 @@ func (c *KookClient) handleHello(data *kookHelloEventData) {
 
 // handlePong 处理 PONG 心跳响应 (对应 Python _handle_pong)。
 func (c *KookClient) handlePong() {
-	c.lastHeartbeatTime = time.Now()
-	c.heartbeatFailedCount = 0
+	c.setLastHeartbeatTime(time.Now())
+	c.setHeartbeatFailedCount(0)
 }
 
 // handleReconnect 处理重连指令 (对应 Python _handle_reconnect)。
 func (c *KookClient) handleReconnect() {
 	logger.I18nWarn("[KOOK] 收到重连指令")
 	// 清空本地状态
-	c.lastSN = 0
-	c.sessionID = ""
+	c.setLastSN(0)
+	c.setSessionID("")
 	c.setRunning(false)
 }
 
 // handleResumeAck 处理 RESUME 确认 (对应 Python _handle_resume_ack)。
 func (c *KookClient) handleResumeAck(data *kookResumeAckEventData) {
-	c.sessionID = data.SessionID
-	logger.I18nInfo("[KOOK] Resume成功，session_id: %s", c.sessionID)
+	c.setSessionID(data.SessionID)
+	logger.I18nInfo("[KOOK] Resume成功，session_id: %s", c.sessionIDValue())
 }
 
 // heartbeatLoop 心跳循环 (对应 Python _heartbeat_loop)。
@@ -398,10 +450,10 @@ func (c *KookClient) heartbeatLoop(ctx context.Context) {
 		}
 
 		// 检查是否收到 PONG 响应
-		if time.Since(c.lastHeartbeatTime) > time.Duration(c.config.HeartbeatTimeout)*time.Second {
-			c.heartbeatFailedCount++
-			logger.I18nWarn("[KOOK] 心跳超时，失败次数: %d", c.heartbeatFailedCount)
-			if c.heartbeatFailedCount >= c.config.MaxHeartbeatFailures {
+		if time.Since(c.lastHeartbeatTimeValue()) > time.Duration(c.config.HeartbeatTimeout)*time.Second {
+			failedCount := c.incHeartbeatFailedCount()
+			logger.I18nWarn("[KOOK] 心跳超时，失败次数: %d", failedCount)
+			if failedCount >= c.config.MaxHeartbeatFailures {
 				logger.I18nError("[KOOK] 心跳失败次数过多，准备重连")
 				c.setRunning(false)
 				c.closeWS()
@@ -422,7 +474,7 @@ func (c *KookClient) sendPing() {
 	// data 为 None 时被 exclude, 因此这里不发送 "d" 字段
 	payload, _ := json.Marshal(map[string]interface{}{
 		"s":  signalPing,
-		"sn": c.lastSN,
+		"sn": c.lastSNValue(),
 	})
 	if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 		logger.I18nError("[KOOK] 发送心跳失败: %v", err)

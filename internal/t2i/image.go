@@ -32,6 +32,9 @@ var logger = log.GetDefault().WithComponent("T2I")
 // of the twitter/twemoji artwork). Files are cached locally after first fetch.
 const twemojiBase = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/"
 
+// maxDownloadBytes bounds the downloaded Twemoji asset size.
+const maxDownloadBytes = 64 << 20
+
 var (
 	emojiDirOnce     sync.Once
 	emojiDir         string
@@ -139,21 +142,16 @@ type imageLine struct {
 	imgH     int
 }
 
-// fontFaceCache caches parsed font faces keyed by path+size (parsing a TTF on
-// every render is expensive).
-var fontFaceCache sync.Map // "path|size" -> font.Face
-
+// cachedFontFace returns a font.Face for the given path and size. The parsed
+// *truetype.Font is cached (concurrency-safe) via glyphFontCache; the face
+// itself is created fresh on every call because truetype faces mutate internal
+// buffers during Glyph/GlyphAdvance and are not safe for concurrent use.
 func cachedFontFace(path string, size float64) (font.Face, error) {
-	key := fmt.Sprintf("%s|%.2f", path, size)
-	if v, ok := fontFaceCache.Load(key); ok {
-		return v.(font.Face), nil
-	}
-	face, err := gg.LoadFontFace(path, size)
+	f, err := glyphFont(path)
 	if err != nil {
 		return nil, err
 	}
-	fontFaceCache.Store(key, face)
-	return face, nil
+	return truetype.NewFace(f, &truetype.Options{Size: size}), nil
 }
 
 // systemCJKFont returns a usable CJK-capable font file, preferring an explicit
@@ -733,7 +731,12 @@ func emojiImage(cluster string) (image.Image, bool) {
 			logger.Debug("twemoji %s: %v", cp, err)
 			return nil, false
 		}
-		_ = os.WriteFile(path, data, 0o644)
+		// Write to a temp file then rename so a concurrent download never
+		// exposes a partially-written cache file (which would be permanently
+		// negative-cached as corrupt).
+		if err := writeCacheFile(path, data); err != nil {
+			return nil, false
+		}
 	}
 	img, err := png.Decode(bytes.NewReader(data))
 	if err != nil {
@@ -754,7 +757,32 @@ func downloadTwemoji(cp string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	return io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes))
+}
+
+// writeCacheFile atomically writes data to path via a temp file + rename, so a
+// concurrent writer never leaves a partially-written cache file behind.
+func writeCacheFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err = tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 // RenderTextToPNG renders text to a PNG image with the given options

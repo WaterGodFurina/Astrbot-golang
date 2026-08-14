@@ -151,10 +151,10 @@ func parseFromQQOfficial(d map[string]interface{}, msgType platform.MessageType,
 		plainContent := parseFaceMessage(strings.TrimSpace(strings.ReplaceAll(content, "<@!"+abm.SelfID+">", "")))
 
 		msg = append(msg, appendAttachments(mapList(d["attachments"]))...)
-		abm.Message = msg
 		abm.MessageStr = plainContent
 		msg = append(msg, &message.At{TargetID: "qq_official"})
 		msg = append(msg, &message.Plain{Text: plainContent})
+		abm.Message = msg
 		channelID, _ := d["channel_id"].(string)
 		abm.Group = &platform.Group{GroupID: channelID}
 
@@ -169,10 +169,10 @@ func parseFromQQOfficial(d map[string]interface{}, msgType platform.MessageType,
 		plainContent := parseFaceMessage(strings.TrimSpace(content))
 
 		msg = append(msg, appendAttachments(mapList(d["attachments"]))...)
-		abm.Message = msg
 		abm.MessageStr = plainContent
 		msg = append(msg, &message.At{TargetID: "qq_official"})
 		msg = append(msg, &message.Plain{Text: plainContent})
+		abm.Message = msg
 
 	default:
 		return abm

@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,15 @@ const (
 	webhookPath = "/astrbot-qo-webhook/callback"
 	// defaultPort 默认回调端口（对齐 Python port = 6196）
 	defaultPort = 6196
+	// validationWindow 平台 URL 验证窗口：适配器启动后仅在该时长内接受 op=13
+	// 验证请求（平台完成 URL 验证后不会再发送 op=13）。
+	validationWindow = 10 * time.Minute
+	// validationEventTSSkew op=13 验证请求 event_ts 与当前时间允许的最大偏差
+	validationEventTSSkew = 5 * time.Minute
+	// validationMaxRatePerMin op=13 验证端点每分钟允许的最大请求数（限速）
+	validationMaxRatePerMin = 5
+	// signatureTimestampSkew 正常事件回调 X-Signature-Timestamp 与当前时间允许的最大偏差
+	signatureTimestampSkew = 5 * time.Minute
 )
 
 // Adapter 是 QQ 官方 webhook 平台适配器。
@@ -82,6 +92,8 @@ type Adapter struct {
 	httpClient     *http.Client
 	stopCh         chan struct{}
 	started        bool
+	startedAt      time.Time   // 适配器启动时间（op=13 验证窗口起点）
+	validationTS   []time.Time // op=13 请求时间戳（滑动窗口限速）
 }
 
 // New 根据平台配置创建 QQ 官方 webhook 适配器。
@@ -96,6 +108,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		seenEventIDs:       make(map[string]time.Time),
 		httpClient:         &http.Client{Timeout: 30 * time.Second},
 		stopCh:             make(chan struct{}),
+		startedAt:          time.Now(),
 		port:               defaultPort,
 		callbackServerHost: "0.0.0.0",
 	}
@@ -163,6 +176,7 @@ func (a *Adapter) Type() string { return "qq_official_webhook" }
 func (a *Adapter) Start(ctx context.Context) error {
 	a.mu.Lock()
 	a.started = true
+	a.startedAt = time.Now()
 	a.mu.Unlock()
 
 	if a.unifiedWebhookMode {
@@ -246,11 +260,31 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 	opcode, _ := msg["op"].(float64)
 	data, _ := msg["d"].(map[string]interface{})
 
-	// URL 验证请求（opcode == 13）：返回对 plain_token 的签名
+	// URL 验证请求（opcode == 13）：返回对 plain_token 的签名。
+	// 官方协议中该验证请求不携带 X-Signature-* 签名头，无法像事件回调那样
+	// 验签，故仅在平台"尚未完成验证"的窗口期内接受，并对 event_ts 做新鲜度
+	// 校验与端点限速，防止验证端点被用作签名预言机。
 	if int(opcode) == wsValidation {
-		signed := a.webhookValidation(data)
+		if !a.allowValidation() {
+			logger.I18nWarn("qq_official_webhook validation request rejected (outside window or rate limited).")
+			writeWebhookResponse(w, http.StatusUnauthorized, map[string]interface{}{"error": "Invalid validation request"})
+			return
+		}
+		signed, ok := a.webhookValidation(data)
+		if !ok {
+			logger.I18nWarn("qq_official_webhook validation request rejected (invalid event_ts).")
+			writeWebhookResponse(w, http.StatusUnauthorized, map[string]interface{}{"error": "Invalid validation request"})
+			return
+		}
 		logger.Debug("webhook validation response: %s", toJSON(signed))
 		writeWebhookResponse(w, http.StatusOK, signed)
+		return
+	}
+
+	// 时间戳新鲜度校验：拒绝时间戳与当前时间偏差超过 5 分钟的请求（防重放）。
+	if !isFreshTimestamp(r.Header.Get(signatureTimestampHeader), signatureTimestampSkew) {
+		logger.I18nWarn("qq_official_webhook callback timestamp is invalid or stale.")
+		writeWebhookResponse(w, http.StatusUnauthorized, map[string]interface{}{"error": "Invalid timestamp"})
 		return
 	}
 
@@ -324,21 +358,60 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 	writeWebhookResponse(w, http.StatusOK, map[string]interface{}{"opcode": 12})
 }
 
+// isFreshTimestamp 判断回调时间戳是否为 Unix 秒且与当前时间偏差不超过 maxSkew。
+func isFreshTimestamp(timestamp string, maxSkew time.Duration) bool {
+	ts, err := strconv.ParseInt(timestamp, 10, 64)
+	if err != nil || ts <= 0 {
+		return false
+	}
+	return time.Since(time.Unix(ts, 0)).Abs() <= maxSkew
+}
+
 // webhookValidation 处理 QQ 官方的 URL 验证请求
 // （对齐 Python webhook_validation：签名 event_ts + plain_token）。
-func (a *Adapter) webhookValidation(validationPayload map[string]interface{}) map[string]interface{} {
-	msg := strOf(validationPayload["event_ts"]) + strOf(validationPayload["plain_token"])
+// event_ts 必须为近期数字时间戳（±validationEventTSSkew 内），否则返回失败。
+func (a *Adapter) webhookValidation(validationPayload map[string]interface{}) (map[string]interface{}, bool) {
+	eventTS := strOf(validationPayload["event_ts"])
+	ts, err := strconv.ParseInt(eventTS, 10, 64)
+	if err != nil || ts <= 0 || time.Since(time.Unix(ts, 0)).Abs() > validationEventTSSkew {
+		return nil, false
+	}
+	msg := eventTS + strOf(validationPayload["plain_token"])
 	seed, err := buildEd25519Seed(a.secret)
 	if err != nil {
 		logger.I18nError("webhook 验证签名失败: %v", err)
-		return map[string]interface{}{}
+		return nil, false
 	}
 	privateKey := ed25519.NewKeyFromSeed(seed)
 	signature := hex.EncodeToString(ed25519.Sign(privateKey, []byte(msg)))
 	return map[string]interface{}{
 		"plain_token": validationPayload["plain_token"],
 		"signature":   signature,
+	}, true
+}
+
+// allowValidation 判断当前是否允许接受 op=13 URL 验证请求：
+// 仅当适配器处于启动后的验证窗口期内，且请求频率未超过限速阈值。
+func (a *Adapter) allowValidation() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.startedAt.IsZero() || time.Since(a.startedAt) > validationWindow {
+		return false
 	}
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+	kept := a.validationTS[:0]
+	for _, t := range a.validationTS {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	a.validationTS = kept
+	if len(a.validationTS) >= validationMaxRatePerMin {
+		return false
+	}
+	a.validationTS = append(a.validationTS, now)
+	return true
 }
 
 // markSeenEvent 记录并检查事件 id（60 秒 TTL，惰性淘汰）。
@@ -506,23 +579,26 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	lastMsgID := a.sessionLastMsg[sessionID]
 	a.mu.Unlock()
 
-	plainText, imageRef, fileRef, fileName := extractSendParts(chain)
+	plainText, imageRef, fileRef, fileName, fileType := extractSendParts(chain)
 
 	switch scene {
 	case "friend":
-		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, lastMsgID)
+		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
 	case "group":
-		return a.sendGroup(sessionID, plainText, imageRef, fileRef, fileName, lastMsgID)
+		return a.sendGroup(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
 	case "channel":
 		return a.sendChannel(sessionID, plainText, imageRef)
 	default:
 		// 兜底：按 C2C（单聊）发送
-		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, lastMsgID)
+		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
 	}
 }
 
 // extractSendParts 从消息链中提取文本与媒体引用（对齐 qqofficial）。
-func extractSendParts(chain *message.MessageChain) (plain string, imageRef string, fileRef string, fileName string) {
+// fileType 保留媒体组件类型（Record→语音、Video→视频、File→文件），
+// 避免仅凭 fileName 区分而把语音误判为视频。
+func extractSendParts(chain *message.MessageChain) (plain string, imageRef string, fileRef string, fileName string, fileType int) {
+	fileType = fileTypeFile
 	for _, c := range chain.Chain {
 		switch comp := c.(type) {
 		case *message.Plain:
@@ -545,6 +621,7 @@ func extractSendParts(chain *message.MessageChain) (plain string, imageRef strin
 					fileRef = comp.URL
 				}
 				fileName = comp.Name
+				fileType = fileTypeFile
 			}
 		case *message.Video:
 			if fileRef == "" {
@@ -553,6 +630,7 @@ func extractSendParts(chain *message.MessageChain) (plain string, imageRef strin
 				} else {
 					fileRef = comp.URL
 				}
+				fileType = fileTypeVideo
 			}
 		case *message.Record:
 			if fileRef == "" {
@@ -561,10 +639,11 @@ func extractSendParts(chain *message.MessageChain) (plain string, imageRef strin
 				} else {
 					fileRef = comp.URL
 				}
+				fileType = fileTypeVoice
 			}
 		}
 	}
-	return plain, imageRef, fileRef, fileName
+	return plain, imageRef, fileRef, fileName, fileType
 }
 
 func readFileBase64(path string) string {
@@ -663,7 +742,11 @@ func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType in
 		payload["file_name"] = fileName
 	}
 	if strings.HasPrefix(fileData, "data:") {
-		fileData = strings.SplitN(fileData, ",", 2)[1]
+		parts := strings.SplitN(fileData, ",", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("无效的 data: URI 文件数据")
+		}
+		fileData = parts[1]
 	}
 	if kind == "friend" {
 		payload["openid"] = targetID
@@ -681,7 +764,7 @@ func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType in
 }
 
 // sendC2C 向 C2C 用户发送消息。
-func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName, msgID string) error {
+func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string) error {
 	payload := map[string]interface{}{"content": plainText}
 	payload["msg_seq"] = rand.Intn(10000) + 1
 	if msgID != "" {
@@ -695,10 +778,6 @@ func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName, msgID 
 		payload["media"] = media
 		payload["msg_type"] = 7
 	} else if fileRef != "" {
-		fileType := fileTypeFile
-		if fileName == "" {
-			fileType = fileTypeVideo
-		}
 		media, err := a.uploadFile("friend", openID, fileRef, fileType, fileName)
 		if err != nil {
 			return err
@@ -710,7 +789,7 @@ func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName, msgID 
 }
 
 // sendGroup 向群发送消息。
-func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName, msgID string) error {
+func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string) error {
 	payload := map[string]interface{}{"content": plainText}
 	if msgID != "" {
 		payload["msg_id"] = msgID
@@ -724,10 +803,6 @@ func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName,
 		payload["media"] = media
 		payload["msg_type"] = 7
 	} else if fileRef != "" {
-		fileType := fileTypeFile
-		if fileName == "" {
-			fileType = fileTypeVideo
-		}
 		media, err := a.uploadFile("group", groupOpenID, fileRef, fileType, fileName)
 		if err != nil {
 			return err

@@ -192,7 +192,16 @@ func (a *Adapter) runLoop(ctx context.Context) {
 			} else {
 				logger.I18nError("Satori WebSocket 连接失败: %v", err)
 			}
-			retryCount++
+			// 连接成功（收到 READY）后再断开属于正常运行中断连，不累计失败次数，
+			// retryCount 语义为"连续失败次数"，避免运行期间累计断连 10 次后永久停机。
+			a.mu.Lock()
+			ready := a.readyReceived
+			a.mu.Unlock()
+			if ready {
+				retryCount = 0
+			} else {
+				retryCount++
+			}
 		} else {
 			retryCount = 0
 		}
@@ -207,8 +216,12 @@ func (a *Adapter) runLoop(ctx context.Context) {
 		if !a.autoReconnect {
 			break
 		}
-		// 指数退避：delay * 2^(retry_count-1)，上限 60 秒（对齐 Python）
-		delay := a.reconnectDelay << (retryCount - 1)
+		// 指数退避：delay * 2^(retry_count-1)，上限 60 秒（对齐 Python）。
+		// retryCount 可能为 0（成功连接后正常断连），此时使用基础延迟。
+		delay := a.reconnectDelay
+		if retryCount > 1 {
+			delay = a.reconnectDelay << (retryCount - 1)
+		}
 		if delay > maxReconnectDelay {
 			delay = maxReconnectDelay
 		}
@@ -240,6 +253,8 @@ func (a *Adapter) connectWebsocket(ctx context.Context) error {
 	ws.SetReadLimit(maxWSMessageSize)
 	a.mu.Lock()
 	a.ws = ws
+	// 每次连接尝试重置 READY 标记，供 runLoop 判断本次连接是否成功建立。
+	a.readyReceived = false
 	a.mu.Unlock()
 
 	// 对齐 Python 的 await asyncio.sleep(0.1)

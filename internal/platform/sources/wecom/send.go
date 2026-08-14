@@ -88,7 +88,7 @@ func (a *Adapter) sendChain(chain *message.MessageChain, selfID, touser string) 
 				return err
 			}
 		case *message.File:
-			path, err := resolveComponentFile(c.Path, c.URL, "", "", ".bin")
+			path, err := resolveComponentFile(c.Path, "", c.URL, "", ".bin")
 			if err != nil {
 				logger.I18nError("准备文件失败: %v", err)
 				return err
@@ -107,7 +107,7 @@ func (a *Adapter) sendChain(chain *message.MessageChain, selfID, touser string) 
 				return err
 			}
 		case *message.Video:
-			path, err := resolveComponentFile(c.Path, c.URL, "", "", ".mp4")
+			path, err := resolveComponentFile(c.Path, "", c.URL, "", ".mp4")
 			if err != nil {
 				logger.I18nError("准备视频失败: %v", err)
 				return err

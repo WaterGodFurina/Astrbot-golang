@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -15,10 +16,31 @@ import (
 // It is a test-support helper for cross-package integration tests (e.g. the
 // star pipeline bridge test). Returns "" (after logging) when the Go toolchain
 // or SDK module is unavailable.
+//
+// The cached artifact is built exactly once per process (parallel test
+// packages share the safe cache); callers should arrange for CleanupTestPlugin
+// to run at the end of their test run so the /tmp binary is not left behind.
 func BuildTestPlugin() string {
-	if testPluginBinCache != "" {
-		return testPluginBinCache
+	testPluginBinOnce.Do(func() {
+		testPluginBinCache = buildTestPlugin()
+	})
+	return testPluginBinCache
+}
+
+// CleanupTestPlugin removes the cached test plugin binary (idempotent, safe to
+// call from TestMain or t.Cleanup).
+func CleanupTestPlugin() {
+	if testPluginBinCache == "" {
+		return
 	}
+	_ = os.Remove(testPluginBinCache)
+	testPluginBinCache = ""
+}
+
+var testPluginBinOnce sync.Once
+var testPluginBinCache string
+
+func buildTestPlugin() string {
 	if _, err := exec.LookPath("go"); err != nil {
 		logger.I18nWarn("BuildTestPlugin: PATH 中未找到 go")
 		return ""
@@ -77,8 +99,5 @@ replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => %s
 		logger.I18nWarn("BuildTestPlugin: go build: %v\n%s", err, out)
 		return ""
 	}
-	testPluginBinCache = bin
 	return bin
 }
-
-var testPluginBinCache string

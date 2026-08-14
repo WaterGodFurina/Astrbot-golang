@@ -5,10 +5,13 @@ package core
 import (
 	"context"
 	"fmt"
-	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
-	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	"hash/fnv"
+	"runtime"
 	"sync"
 	"time"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 var logger = log.GetDefault().WithComponent("EventBus")
@@ -197,6 +200,18 @@ type EventBus struct {
 	stopCh   chan struct{}
 	done     chan struct{} // closed when the dispatch loop exits
 	stopOnce sync.Once     // 保证 stopCh 只 close 一次（Stop 可被重复调用）
+
+	// workerChans is a fixed set of per-worker buffered channels. The dispatch
+	// loop hashes each event to a worker so events from the same session (UMO)
+	// are processed in order while different sessions run concurrently. A
+	// worker drains its channel before exiting on shutdown.
+	workerChans []chan *Event
+	// workerStop is closed after the dispatch loop exits to tell workers to
+	// drain their remaining events and finish.
+	workerStop chan struct{}
+	// workerWG tracks in-flight worker dispatch so Stop can wait for every
+	// event already routed to a worker to finish.
+	workerWG sync.WaitGroup
 }
 
 // maxQueueCap bounds how large the event queue may grow before Publish blocks.
@@ -204,16 +219,28 @@ type EventBus struct {
 // bound exists to avoid unbounded growth, not to save memory.
 const maxQueueCap = 100000
 
+// minWorkers / maxWorkers clamp the per-session worker pool size.
+const (
+	minWorkers = 4
+	maxWorkers = 8
+)
+
+// workerBufferSize is the per-worker channel capacity. The main queue provides
+// global back-pressure; the worker buffers only smooth the pop-and-route step.
+const workerBufferSize = 64
+
 // NewEventBus creates a new event bus.
 func NewEventBus(bufferSize int) *EventBus {
 	if bufferSize <= 0 {
 		bufferSize = 1000
 	}
 	bus := &EventBus{
-		schedulers: make(map[string]*PipelineScheduler),
-		queueCap:   bufferSize,
-		stopCh:     make(chan struct{}),
-		done:       make(chan struct{}),
+		schedulers:  make(map[string]*PipelineScheduler),
+		queueCap:    bufferSize,
+		stopCh:      make(chan struct{}),
+		done:        make(chan struct{}),
+		workerStop:  make(chan struct{}),
+		workerChans: make([]chan *Event, 0, workerCount()),
 	}
 	bus.cond = sync.NewCond(&bus.queueMu)
 	return bus
@@ -233,9 +260,15 @@ func (bus *EventBus) GetScheduler(confID string) *PipelineScheduler {
 	return bus.schedulers[confID]
 }
 
-// Start begins dispatching events.
+// Start begins dispatching events. Events are routed to per-session workers
+// so one slow pipeline (up to minutes) cannot block other sessions' events.
 func (bus *EventBus) Start(ctx context.Context) error {
 	defer close(bus.done)
+	// Workers must only drain-and-exit after the dispatch loop (their only
+	// producer) has exited, otherwise they would miss events still being
+	// routed during shutdown.
+	defer close(bus.workerStop)
+	bus.startWorkers(ctx, workerCount())
 	// Wake a cond.Wait() blocked with an empty queue when the context is
 	// cancelled (shutdown); Stop() already broadcasts via stopCh.
 	go func() {
@@ -267,8 +300,81 @@ func (bus *EventBus) Start(ctx context.Context) error {
 		bus.queue = bus.queue[1:]
 		bus.cond.Broadcast() // wake blocked publishers
 		bus.queueMu.Unlock()
-		bus.dispatch(ctx, event)
+		if !bus.enqueueToWorker(ctx, event) {
+			// Context cancelled: remaining queued events are dropped, matching
+			// the pre-worker behaviour of the dispatch loop returning on ctx.
+			return ctx.Err()
+		}
 	}
+}
+
+// workerCount returns the number of dispatch workers, clamped to a sane range.
+func workerCount() int {
+	n := runtime.NumCPU()
+	if n < minWorkers {
+		n = minWorkers
+	}
+	if n > maxWorkers {
+		n = maxWorkers
+	}
+	return n
+}
+
+// startWorkers launches the worker goroutines. Each worker consumes events
+// from its shard channel sequentially, preserving per-session ordering. On
+// workerStop it drains any events still buffered before returning.
+func (bus *EventBus) startWorkers(ctx context.Context, n int) {
+	if len(bus.workerChans) == 0 {
+		bus.workerChans = make([]chan *Event, n)
+		for i := range bus.workerChans {
+			bus.workerChans[i] = make(chan *Event, workerBufferSize)
+		}
+	}
+	for _, ch := range bus.workerChans {
+		bus.workerWG.Add(1)
+		go func(ch chan *Event) {
+			defer bus.workerWG.Done()
+			for {
+				select {
+				case event := <-ch:
+					bus.dispatch(ctx, event)
+				case <-bus.workerStop:
+					// Producer (dispatch loop) has exited; process whatever is
+					// still buffered for this worker, then finish.
+					for {
+						select {
+						case event := <-ch:
+							bus.dispatch(ctx, event)
+						default:
+							return
+						}
+					}
+				}
+			}
+		}(ch)
+	}
+}
+
+// enqueueToWorker routes an event to the worker owning its session shard,
+// blocking until a slot frees up (per-shard back-pressure). It returns false
+// only when the context is cancelled, in which case the caller abandons the
+// remaining queue.
+func (bus *EventBus) enqueueToWorker(ctx context.Context, event *Event) bool {
+	shard := eventShardKey(event) % len(bus.workerChans)
+	select {
+	case bus.workerChans[shard] <- event:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// eventShardKey derives a stable shard key for an event from its session
+// origin so all events of one session land on the same worker.
+func eventShardKey(event *Event) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(event.UnifiedMsgOrigin()))
+	return int(h.Sum32())
 }
 
 // Publish enqueues an event for processing. It never drops events: the queue
@@ -326,9 +432,10 @@ func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 	})
 }
 
-// Stop shuts down the event bus and waits for the dispatch loop to exit (with
-// a bounded timeout). Callers must stop the bus before closing the database so
-// no in-flight event can touch storage after it is closed.
+// Stop shuts down the event bus and waits for the dispatch loop and all
+// dispatch workers to exit (with a bounded timeout). Callers must stop the
+// bus before closing the database so no in-flight event can touch storage
+// after it is closed.
 func (bus *EventBus) Stop() {
 	bus.stopOnce.Do(func() {
 		bus.queueMu.Lock()
@@ -340,6 +447,17 @@ func (bus *EventBus) Stop() {
 	case <-bus.done:
 	case <-time.After(eventBusStopTimeout):
 		logger.I18nWarn("EventBus 调度循环在关闭时未在 %v 内退出", eventBusStopTimeout)
+	}
+	// Wait for workers to finish events already routed to them.
+	done := make(chan struct{})
+	go func() {
+		bus.workerWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(eventBusStopTimeout):
+		logger.I18nWarn("EventBus 分发 worker 在关闭时未在 %v 内退出", eventBusStopTimeout)
 	}
 }
 

@@ -39,9 +39,10 @@ const DefaultGoVersion = "1.24.3"
 
 // envOverrides the values honored by the toolchain.
 const (
-	EnvGoBin    = "ASTRBOT_GO_BIN"     // path to an existing `go` binary
-	EnvGoVer    = "ASTRBOT_GO_VERSION" // e.g. "1.24.3"
-	EnvGoMirror = "ASTRBOT_GO_MIRROR"  // base URL of an official Go archive mirror
+	EnvGoBin        = "ASTRBOT_GO_BIN"         // path to an existing `go` binary
+	EnvGoVer        = "ASTRBOT_GO_VERSION"     // e.g. "1.24.3"
+	EnvGoMirror     = "ASTRBOT_GO_MIRROR"      // base URL of an official Go archive mirror
+	EnvGoSkipVerify = "ASTRBOT_GO_SKIP_VERIFY" // set to bypass the sha256 checksum gate
 )
 
 // Toolchain locates (and if needed provisions) a Go toolchain for building
@@ -190,8 +191,12 @@ func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	if err := downloadFile(url, dest, progress); err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
 	}
+	// 校验失败即中止安装（供应链防护）：删除已下载文件并报错，避免被篡改的
+	// 工具链被解压使用。verifyChecksum 在设置 ASTRBOT_GO_SKIP_VERIFY 时直接
+	// 返回 nil，显式跳过校验的调用方不受影响。
 	if err := tc.verifyChecksum(dest, archive); err != nil {
-		logger.Warn("Checksum verification failed for %s: %v (proceeding anyway)", archive, err)
+		_ = os.Remove(dest)
+		return "", fmt.Errorf("checksum verification failed for %s (set %s to bypass): %w", archive, EnvGoSkipVerify, err)
 	}
 
 	logger.Info("Extracting Go toolchain %s", archive)
@@ -226,9 +231,10 @@ func (tc *Toolchain) unsupportedHint() string {
 }
 
 // verifyChecksum fetches "<file>.sha256" from the mirror and compares it.
-// Returns an error on any mismatch/failure.
+// Returns an error on any mismatch/failure. When ASTRBOT_GO_SKIP_VERIFY is set
+// the check is skipped entirely (caller's explicit opt-out).
 func (tc *Toolchain) verifyChecksum(dest, archive string) error {
-	if os.Getenv("ASTRBOT_GO_SKIP_VERIFY") != "" {
+	if os.Getenv(EnvGoSkipVerify) != "" {
 		return nil
 	}
 	sumURL := checksumURL(archive)

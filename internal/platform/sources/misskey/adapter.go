@@ -4,6 +4,7 @@ package misskey
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 	"github.com/yitsushi/go-misskey/services/notes/reactions"
+
+	"sync/atomic"
 )
 
 var logger = log.GetDefault().WithComponent("Misskey")
@@ -26,6 +29,30 @@ const (
 	defaultUploadConcurrency = 3  // 默认并发上传数
 	maxUploadConcurrency     = 10 // 并发上传上限
 )
+
+// intVal 从配置中读取整数，兼容 JSON 反序列化产生的 float64 以及 int/json.Number；
+// 未设置或类型非法时返回 def。
+func intVal(config map[string]interface{}, key string, def int) int {
+	v, ok := config[key]
+	if !ok {
+		return def
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case float32:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return def
+}
 
 // Adapter 是 Misskey 平台适配器。
 // 通过 WebSocket streaming 接收 note（提及/回复/引用）、私聊与群聊消息；
@@ -52,13 +79,14 @@ type Adapter struct {
 
 	api         *MisskeyAPI
 	instanceID  string
-	running     bool
+	running     atomic.Bool
 	botSelfID   string
 	botUsername string
 	userCache   map[string]map[string]interface{}
 
-	mu     sync.Mutex
-	stopCh chan struct{}
+	mu       sync.Mutex
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // New 创建 Misskey 适配器。
@@ -73,10 +101,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	if instanceID == "" {
 		instanceID = "misskey"
 	}
-	maxMessageLength := 3000
-	if v, ok := config["max_message_length"].(int); ok {
-		maxMessageLength = v
-	}
+	maxMessageLength := intVal(config, "max_message_length", 3000)
 	defaultVisibility, _ := config["misskey_default_visibility"].(string)
 	if defaultVisibility == "" {
 		defaultVisibility = "public"
@@ -95,18 +120,9 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	uploadFolder, _ := config["misskey_upload_folder"].(string)
 
 	allowInsecure, _ := config["misskey_allow_insecure_downloads"].(bool)
-	downloadTimeout := 15
-	if v, ok := config["misskey_download_timeout"].(int); ok {
-		downloadTimeout = v
-	}
-	downloadChunkSize := 64 * 1024
-	if v, ok := config["misskey_download_chunk_size"].(int); ok {
-		downloadChunkSize = v
-	}
-	var maxDownloadBytes int64
-	if v, ok := config["misskey_max_download_bytes"].(int); ok {
-		maxDownloadBytes = int64(v)
-	}
+	downloadTimeout := intVal(config, "misskey_download_timeout", 15)
+	downloadChunkSize := intVal(config, "misskey_download_chunk_size", 64*1024)
+	maxDownloadBytes := int64(intVal(config, "misskey_max_download_bytes", 0))
 
 	return &Adapter{
 		config:                 config,
@@ -146,18 +162,16 @@ func (a *Adapter) Type() string { return "misskey" }
 // Start 启动适配器：初始化 API 客户端、获取当前用户信息，随后启动 WebSocket 连接循环。
 func (a *Adapter) Start(ctx context.Context) error {
 	if a.instanceURL == "" || a.accessToken == "" {
-		logger.Error("Misskey 配置不完整，无法启动")
-		return nil
+		return fmt.Errorf("Misskey 配置不完整，无法启动")
 	}
 	a.api = NewMisskeyAPI(a.instanceURL, a.accessToken, a.allowInsecureDownloads, a.downloadTimeout, a.downloadChunkSize, a.maxDownloadBytes)
-	a.running = true
+	a.running.Store(true)
 
 	// 获取当前用户信息（对应 run() 中的 get_current_user）
 	userInfo, err := a.api.GetCurrentUser(ctx)
 	if err != nil {
-		logger.Error("Misskey 获取用户信息失败: %v", err)
-		a.running = false
-		return nil
+		a.running.Store(false)
+		return fmt.Errorf("Misskey 获取用户信息失败: %w", err)
 	}
 	a.botSelfID = userInfo.ID
 	a.botUsername = userInfo.Username
@@ -169,8 +183,8 @@ func (a *Adapter) Start(ctx context.Context) error {
 
 // Stop 停止适配器。
 func (a *Adapter) Stop() error {
-	a.running = false
-	close(a.stopCh)
+	a.running.Store(false)
+	a.stopOnce.Do(func() { close(a.stopCh) })
 	if a.api != nil {
 		a.api.Close()
 	}
@@ -196,7 +210,7 @@ func (a *Adapter) startWebSocketConnection(ctx context.Context) {
 	const backoffMultiplier = 1.5
 	connectionAttempts := 0
 
-	for a.running {
+	for a.running.Load() {
 		select {
 		case <-a.stopCh:
 			return
@@ -235,7 +249,7 @@ func (a *Adapter) startWebSocketConnection(ctx context.Context) {
 			logger.Error("Misskey WebSocket 连接失败 (尝试 #%d)", connectionAttempts)
 		}
 
-		if a.running {
+		if a.running.Load() {
 			jitter := rand.Float64()
 			sleepTime := backoffDelay + jitter
 			logger.I18nInfo("Misskey %.1f秒后重连 (下次尝试 #%d)", sleepTime, connectionAttempts+1)
@@ -277,8 +291,8 @@ func (a *Adapter) handleNotification(data map[string]interface{}) {
 		note, _ := data["note"].(map[string]interface{})
 		if note != nil && a.isBotMentioned(note) {
 			text, _ := note["text"].(string)
-			if len(text) > 50 {
-				text = text[:50]
+			if len([]rune(text)) > 50 {
+				text = truncateRunes(text, 50)
 			}
 			logger.I18nInfo("Misskey 处理贴文提及: %s...", text)
 			abm := a.convertMessage(note)
@@ -307,8 +321,8 @@ func (a *Adapter) handleChatMessage(data map[string]interface{}) {
 		logger.Debug("Misskey 检查群聊消息: %q, 机器人用户名: %q", rawText, a.botUsername)
 		abm := a.convertRoomMessage(data)
 		msgStr := abm.MessageStr
-		if len(msgStr) > 50 {
-			msgStr = msgStr[:50]
+		if len([]rune(msgStr)) > 50 {
+			msgStr = truncateRunes(msgStr, 50)
 		}
 		logger.I18nInfo("Misskey 处理群聊消息: %s...", msgStr)
 		a.publishMessage(abm)
@@ -316,8 +330,8 @@ func (a *Adapter) handleChatMessage(data map[string]interface{}) {
 	}
 	abm := a.convertChatMessage(data)
 	msgStr := abm.MessageStr
-	if len(msgStr) > 50 {
-		msgStr = msgStr[:50]
+	if len([]rune(msgStr)) > 50 {
+		msgStr = truncateRunes(msgStr, 50)
 	}
 	logger.I18nInfo("Misskey 处理私聊消息: %s...", msgStr)
 	a.publishMessage(abm)
@@ -387,7 +401,7 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		}
 		var userInfo map[string]interface{}
 		if userIDForCache != "" {
-			userInfo = a.userCache[userIDForCache]
+			userInfo, _ = getUserCacheEntry(a.userCache, userIDForCache)
 		}
 		text = AddAtMentionIfNeeded(text, userInfo, hasAt)
 	}
@@ -405,8 +419,8 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		logger.Warn("Misskey 消息内容为空且无文件组件，跳过发送")
 		return nil
 	}
-	if len(text) > a.maxMessageLength {
-		text = text[:a.maxMessageLength] + "..."
+	if len([]rune(text)) > a.maxMessageLength {
+		text = truncateRunes(text, a.maxMessageLength) + "..."
 	}
 
 	var fileIDs []string
@@ -422,10 +436,7 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	}
 
 	// 并发上传（对应 Python 的 semaphore 逻辑）
-	uploadConcurrency := defaultUploadConcurrency
-	if v, ok := a.config["misskey_upload_concurrency"].(int); ok {
-		uploadConcurrency = v
-	}
+	uploadConcurrency := intVal(a.config, "misskey_upload_concurrency", defaultUploadConcurrency)
 	if uploadConcurrency > maxUploadConcurrency {
 		uploadConcurrency = maxUploadConcurrency
 	}
@@ -489,6 +500,9 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 			defer mu.Unlock()
 			if fileID != "" {
 				fileIDs = append(fileIDs, fileID)
+			} else if urlCandidate != "" {
+				// 上传失败时把 URL 追加进 fallbackURLs，避免文件组件静默丢失
+				fallbackURLs = append(fallbackURLs, urlCandidate)
 			}
 
 			// 清理临时文件（对应 Python 的 finally 清理逻辑）
@@ -545,7 +559,7 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	if strings.Contains(sessionID, "%") {
 		userIDForCache = strings.SplitN(sessionID, "%", 2)[1]
 	}
-	userInfoForReply := a.userCache[userIDForCache]
+	userInfoForReply, _ := getUserCacheEntry(a.userCache, userIDForCache)
 
 	visibility, visibleUserIDs := resolveMessageVisibility(userIDForCache, a.userCache, a.botSelfID, nil, a.defaultVisibility)
 	logger.Debug("Misskey 解析可见性: visibility=%s, visible_user_ids=%v, session_id=%s, user_id_for_cache=%s", visibility, visibleUserIDs, sessionID, userIDForCache)
@@ -714,6 +728,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 		return
 	}
 	chain := &message.MessageChain{Chain: abm.Message}
+	ts := time.Unix(abm.Timestamp, 0)
 	event := &core.Event{
 		Type:       core.EventMessage,
 		Message:    chain,
@@ -726,7 +741,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 			Platform:    a.Type(),
 			MessageStr:  abm.MessageStr,
 			RawMessage:  abm.RawMessage,
-			Timestamp:   time.Now(),
+			Timestamp:   ts,
 		},
 		Source: core.EventSource{
 			Platform:   a.Type(),
@@ -736,7 +751,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 			ConvID:     abm.SessionID,
 			IsGroup:    abm.Type == platform.GroupMessage,
 		},
-		Timestamp: time.Now(),
+		Timestamp: ts,
 		Metadata:  make(map[string]interface{}),
 	}
 	if err := a.EventBus.Publish(event); err != nil {

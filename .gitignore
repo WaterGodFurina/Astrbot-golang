@@ -7,3 +7,4 @@ data/
 # 忽略开发文件
 memory.md
 tmp/
+bug.md

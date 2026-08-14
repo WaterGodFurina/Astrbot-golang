@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -62,6 +63,7 @@ type Adapter struct {
 	mu         sync.Mutex
 	agentID    string // 最近一次收到的消息的 AgentID（用于回复）
 	seenKFText map[string]time.Time
+	seenAppMsg map[string]time.Time
 	stopCh     chan struct{}
 }
 
@@ -72,6 +74,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		settings:   settings,
 		EventBus:   eventBus,
 		seenKFText: make(map[string]time.Time),
+		seenAppMsg: make(map[string]time.Time),
 		stopCh:     make(chan struct{}),
 	}
 	a.id, _ = config["id"].(string)
@@ -264,24 +267,30 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.I18nInfo("解析成功: type=%s msgid=%s agent=%s", msg.Type, msg.ID, msg.Agent)
 
-	if msg.IsKFMsgOrEvent() {
-		a.handleKFMsgOrEvent(msg)
-	} else {
-		a.convertMessage(msg)
-	}
+	// 先回包 success（微信要求 5 秒内响应），耗时操作异步执行，避免媒体下载等超时被重推
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = io.WriteString(w, "success")
+
+	if msg.IsKFMsgOrEvent() {
+		go a.handleKFMsgOrEvent(msg)
+	} else if !a.isDuplicateAppMessage(msg) {
+		go a.convertMessage(msg)
+	}
 }
 
 // handleKFMsgOrEvent 处理 kf_msg_or_event 回调：通过 kf/sync_msg 拉取最新客服消息。
 func (a *Adapter) handleKFMsgOrEvent(msg *WecomMessage) {
-	var latest map[string]interface{}
+	ctx := context.Background()
+	cursor := ""
 	hasMore := true
 	for hasMore {
-		ret, err := a.client.KFSyncMsg(context.Background(), msg.Token, msg.OpenKfID, "", 1000)
+		ret, err := a.client.KFSyncMsg(ctx, msg.Token, msg.OpenKfID, cursor, 1000)
 		if err != nil {
 			logger.I18nError("同步微信客服消息失败: %v", err)
 			return
+		}
+		if nc, ok := ret["next_cursor"].(string); ok && nc != "" {
+			cursor = nc
 		}
 		if hm, ok := ret["has_more"].(float64); ok {
 			hasMore = int(hm) != 0
@@ -289,14 +298,11 @@ func (a *Adapter) handleKFMsgOrEvent(msg *WecomMessage) {
 			hasMore = false
 		}
 		msgList, _ := ret["msg_list"].([]interface{})
-		if len(msgList) > 0 {
-			if m, ok := msgList[len(msgList)-1].(map[string]interface{}); ok {
-				latest = m
+		for _, item := range msgList {
+			if m, ok := item.(map[string]interface{}); ok {
+				a.convertKFMessage(m)
 			}
 		}
-	}
-	if latest != nil {
-		a.convertKFMessage(latest)
 	}
 }
 
@@ -467,6 +473,27 @@ func (a *Adapter) isDuplicateKFText(sessionID, text string) bool {
 	return false
 }
 
+// isDuplicateAppMessage 判断是否为短时间窗口内重复推送的应用消息（按 MsgId 去重，
+// 微信在回调超时或异常时会重推同一条消息）。
+func (a *Adapter) isDuplicateAppMessage(msg *WecomMessage) bool {
+	if msg == nil || msg.ID == "" {
+		return false
+	}
+	now := time.Now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for key, expiresAt := range a.seenAppMsg {
+		if expiresAt.Before(now) {
+			delete(a.seenAppMsg, key)
+		}
+	}
+	if _, ok := a.seenAppMsg[msg.ID]; ok {
+		return true
+	}
+	a.seenAppMsg[msg.ID] = now.Add(kfTextDedupTTL)
+	return false
+}
+
 // setAgentID 记录最近一次消息对应的 AgentID（发送回复时使用）。
 func (a *Adapter) setAgentID(agentID string) {
 	a.mu.Lock()
@@ -551,12 +578,17 @@ func (s *WecomServer) Start(ctx context.Context, host string, port int) error {
 		}
 		s.adapter.handleCallback(w, r)
 	})
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, port))
+	if err != nil {
+		return fmt.Errorf("企业微信回调服务器监听 %s:%d 失败: %w", host, port, err)
+	}
 	s.httpSrv = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", host, port),
 		Handler: mux,
 	}
+	logger.I18nInfo("企业微信回调服务器开始监听 %s:%d", host, port)
 	go func() {
-		if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logger.I18nError("企业微信回调服务器运行异常: %v", err)
 		}
 	}()

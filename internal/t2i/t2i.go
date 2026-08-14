@@ -56,12 +56,12 @@ func (r *Renderer) LoadTemplate(name, filename string) error {
 func (r *Renderer) Render(text, templateName string) (string, error) {
 	r.mu.RLock()
 	tmpl, ok := r.templates[templateName]
-	r.mu.RUnlock()
 	if !ok {
 		tmpl, ok = r.templates["default"]
-		if !ok {
-			return "", fmt.Errorf("template %s not found and no default template", templateName)
-		}
+	}
+	r.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("template %s not found and no default template", templateName)
 	}
 
 	var buf bytes.Buffer

@@ -79,9 +79,14 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 	return descriptors
 }
 
-// pluginNameFor derives the plugin name from a handler's module path.
+// pluginNameFor derives the owning plugin name for a handler.
 func pluginNameFor(h *StarHandlerMetadata) string {
-	// Bridged .so plugin commands use HandlerFullName "plugin_<name>".
+	// 优先返回 handler 上的现成归属字段：子进程插件注册时写入 inst.ID，
+	// 而 "plugin_" 前缀剥离会得到 "<id>_<cmdName>" 导致 WebUI 归属错误。
+	if h.PluginName != "" {
+		return h.PluginName
+	}
+	// Legacy .so plugin commands use HandlerFullName "plugin_<name>".
 	if h.HandlerFullName != "" {
 		if len(h.HandlerFullName) > 7 && h.HandlerFullName[:7] == "plugin_" {
 			return h.HandlerFullName[7:]

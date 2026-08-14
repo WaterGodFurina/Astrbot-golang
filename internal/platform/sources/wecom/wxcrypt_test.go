@@ -207,3 +207,23 @@ func TestPKCS7Layout(t *testing.T) {
 		t.Errorf("布局异常: content=%q", pt[20:20+contentLen])
 	}
 }
+
+// TestDecryptRejectsInconsistentPadding 回归 L-45.3：篡改内部 padding 字节（保持末字节不变）
+// 时，旧的"只校验末字节"实现会解密成功，加固后必须拒绝。
+func TestDecryptRejectsInconsistentPadding(t *testing.T) {
+	c := makeTestCrypto(t)
+	enc, err := c.Encrypt("hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 篡改倒数第 2 个字节（属于 padding 区域），末字节（pad 值）保持不变
+	raw[len(raw)-2] ^= 0xff
+	tampered := base64.StdEncoding.EncodeToString(raw)
+	if _, err := c.Decrypt(tampered); err != ErrBadPadding {
+		t.Errorf("内部 padding 字节不一致时应返回 ErrBadPadding，got %v", err)
+	}
+}

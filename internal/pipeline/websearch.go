@@ -7,16 +7,32 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider/sources"
 )
 
-// httpJSON performs a JSON HTTP request and returns the body bytes.
+// httpJSON performs a JSON HTTP request and returns the body bytes. For GET
+// requests the payload (a string map) is appended to the URL as query
+// parameters; for other methods it is serialized as the JSON body.
 func httpJSON(method, url string, headers map[string]string, payload interface{}) ([]byte, int, error) {
 	var bodyReader io.Reader
-	if payload != nil {
+	if method == http.MethodGet {
+		if m, ok := payload.(map[string]interface{}); ok && len(m) > 0 {
+			u, err := neturl.Parse(url)
+			if err != nil {
+				return nil, 0, err
+			}
+			q := u.Query()
+			for k, v := range m {
+				q.Set(k, fmt.Sprint(v))
+			}
+			u.RawQuery = q.Encode()
+			url = u.String()
+		}
+	} else if payload != nil {
 		data, err := json.Marshal(payload)
 		if err != nil {
 			return nil, 0, err

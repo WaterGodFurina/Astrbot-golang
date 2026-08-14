@@ -23,11 +23,14 @@ func gitTreeHash(dir string) string {
 }
 
 // gitDiffTree returns the patch between a previously captured tree hash and the
-// current working tree ("" when identical or on failure).
+// current working tree ("" when identical or on failure). The working tree is
+// staged first so mutations made after the `before` hash was captured (which
+// are not in the index yet) are included in the diff.
 func gitDiffTree(dir, oldHash string) string {
 	if dir == "" || oldHash == "" {
 		return ""
 	}
+	_ = gitRun(dir, "add", "-A")
 	out, err := gitRunOut(dir, "diff", oldHash)
 	if err != nil {
 		return ""
@@ -65,18 +68,16 @@ func gitInitIfNeeded(dir string) {
 	_ = gitRun(dir, "config", "user.name", "astrbot")
 }
 
-// snapshotFileMutation captures a git snapshot before a file-mutating tool and
-// records the resulting patch on the returned result. Returns the result text
-// with an appended patch note when the snapshot system is available.
-func snapshotFileMutation(ws, toolName, result string) string {
-	if ws == "" {
+// snapshotFileMutation records the patch produced by a file-mutating tool on
+// the returned result. `before` must be the git tree hash captured BEFORE the
+// tool ran (see gitTreeHash); the patch is the diff between that tree and the
+// current working tree. Returns the result text with an appended patch note
+// when the snapshot system is available.
+func snapshotFileMutation(ws, before, toolName, result string) string {
+	if ws == "" || before == "" {
 		return result
 	}
-	before := gitTreeHash(ws)
-	if before == "" {
-		return result
-	}
-	// After the tool ran, capture the patch.
+	// The tool already ran; capture the patch against the pre-execution tree.
 	patch := gitDiffTree(ws, before)
 	if patch == "" {
 		return result

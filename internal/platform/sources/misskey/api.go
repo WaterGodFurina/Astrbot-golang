@@ -11,7 +11,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -29,10 +32,11 @@ var apiLogger = log.GetDefault().WithComponent("Misskey-API")
 // MisskeyAPI 封装 Misskey REST API 与 WebSocket streaming。
 // 对应 Python 的 MisskeyAPI 类。
 type MisskeyAPI struct {
-	instanceURL string
-	accessToken string
-	client      *misskey.Client
-	httpClient  *http.Client
+	instanceURL  string
+	instanceHost string
+	accessToken  string
+	client       *misskey.Client
+	httpClient   *http.Client
 
 	// 下载/安全相关选项
 	allowInsecureDownloads bool
@@ -46,8 +50,13 @@ type MisskeyAPI struct {
 // NewMisskeyAPI 创建 Misskey API 客户端。
 func NewMisskeyAPI(instanceURL, accessToken string, allowInsecureDownloads bool, downloadTimeout, chunkSize int, maxDownloadBytes int64) *MisskeyAPI {
 	baseURL := strings.TrimRight(instanceURL, "/")
+	instanceHost := ""
+	if u, err := url.Parse(baseURL); err == nil {
+		instanceHost = strings.ToLower(u.Hostname())
+	}
 	return &MisskeyAPI{
 		instanceURL:            baseURL,
+		instanceHost:           instanceHost,
 		accessToken:            accessToken,
 		client:                 misskey.NewClient(baseURL, accessToken),
 		allowInsecureDownloads: allowInsecureDownloads,
@@ -116,6 +125,11 @@ func (a *MisskeyAPI) uploadAndFindFile(ctx context.Context, urlStr, name, folder
 	if urlStr == "" {
 		return "", fmt.Errorf("URL不能为空")
 	}
+	// SSRF 防护：拒绝下载到内网/环回/链路本地等非公网地址
+	if err := a.validateDownloadURL(urlStr); err != nil {
+		apiLogger.Warn("Misskey API 拒绝下载 URL %s: %v", urlStr, err)
+		return "", err
+	}
 
 	// SSL 验证下载，失败则重试不验证 SSL（对应 Python 的下载回退逻辑）
 	tmpBytes, err := a.downloadWithSSL(ctx, urlStr, true)
@@ -124,6 +138,7 @@ func (a *MisskeyAPI) uploadAndFindFile(ctx context.Context, urlStr, name, folder
 		if !a.allowInsecureDownloads {
 			return "", err
 		}
+		apiLogger.Warn("Misskey API SSL 验证失败，allow_insecure_downloads 已开启，将关闭 SSL 验证重试: %v", err)
 		tmpBytes, err = a.downloadWithSSL(ctx, urlStr, false)
 		if err != nil {
 			return "", err
@@ -151,19 +166,94 @@ func (a *MisskeyAPI) uploadAndFindFile(ctx context.Context, urlStr, name, folder
 	return fileID, nil
 }
 
+// maxDownloadRedirects 限制下载重定向次数，防止 SSRF 通过跳转逃逸主机校验。
+const maxDownloadRedirects = 10
+
+// blockedDownloadPrefixes 是禁止下载的内网/环回/链路本地/保留地址段
+// （含云元数据 169.254.169.254），防止服务端请求伪造（SSRF）。
+var blockedDownloadPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+}
+
+// downloadClient 构造带下载超时与 SSRF 重定向校验的下载客户端。
+func (a *MisskeyAPI) downloadClient(verify bool) *http.Client {
+	client := &http.Client{
+		Timeout: time.Duration(a.downloadTimeout) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxDownloadRedirects {
+				return fmt.Errorf("下载重定向次数过多")
+			}
+			if req.URL == nil {
+				return fmt.Errorf("下载重定向目标缺少 URL")
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("下载重定向目标必须为 http(s)")
+			}
+			return a.validateDownloadHost(req.URL.Hostname())
+		},
+	}
+	if !verify {
+		client.Transport = &http.Transport{
+			TLSClientConfig: insecureTLSConfig(),
+		}
+	}
+	return client
+}
+
+// validateDownloadURL 校验下载目标：仅允许 http(s)，且主机不得为内网/保留地址。
+func (a *MisskeyAPI) validateDownloadURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("无法解析下载 URL: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("下载 URL 必须为 http(s): %s", rawURL)
+	}
+	return a.validateDownloadHost(u.Hostname())
+}
+
+// validateDownloadHost 解析主机并拒绝环回/私网/链路本地（含云元数据）等非公网地址。
+// 本机 misskey 实例域名始终放行（自建内网实例仍需下载本站文件）。
+func (a *MisskeyAPI) validateDownloadHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("下载 URL 缺少主机名")
+	}
+	if a.instanceHost != "" && strings.EqualFold(host, a.instanceHost) {
+		return nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("下载主机解析失败 %q: %v", host, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("下载主机 %q 无解析结果", host)
+	}
+	for _, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		for _, p := range blockedDownloadPrefixes {
+			if p.Contains(addr) {
+				return fmt.Errorf("拒绝下载内网/保留地址 %s", addr)
+			}
+		}
+	}
+	return nil
+}
+
 // downloadWithSSL 下载文件内容，可按需关闭 SSL 验证。
 func (a *MisskeyAPI) downloadWithSSL(ctx context.Context, urlStr string, verify bool) ([]byte, error) {
-	client := a.httpClient
-	if !verify {
-		// 关闭 SSL 验证的专用客户端（对应 aiohttp 的 ssl=False）
-		client = &http.Client{
-			Timeout: time.Duration(a.downloadTimeout) * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: insecureTLSConfig(),
-			},
-		}
-		defer client.CloseIdleConnections()
-	}
+	client := a.downloadClient(verify)
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 	if err != nil {
 		return nil, err
@@ -258,7 +348,7 @@ func buildPoll(poll map[string]interface{}) *notes.Poll {
 // SendMessage 发送聊天消息（对应 send_message，POST /api/chat/messages/create-to-user）。
 // payload 由调用方构造（toUserId/text/fileId）。
 func (a *MisskeyAPI) SendMessage(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, error) {
-	result, err := a.apiRequest(ctx, "chat/messages/create-to-user", payload)
+	result, err := a.apiRequest(ctx, "chat/messages/create-to-user", payload, false)
 	if err != nil {
 		return nil, err
 	}
@@ -269,7 +359,7 @@ func (a *MisskeyAPI) SendMessage(ctx context.Context, payload map[string]interfa
 
 // SendRoomMessage 发送房间消息（对应 send_room_message，POST /api/chat/messages/create-to-room）。
 func (a *MisskeyAPI) SendRoomMessage(ctx context.Context, payload map[string]interface{}) (map[string]interface{}, error) {
-	result, err := a.apiRequest(ctx, "chat/messages/create-to-room", payload)
+	result, err := a.apiRequest(ctx, "chat/messages/create-to-room", payload, false)
 	if err != nil {
 		return nil, err
 	}
@@ -279,8 +369,9 @@ func (a *MisskeyAPI) SendRoomMessage(ctx context.Context, payload map[string]int
 }
 
 // apiRequest 通用 API 请求（对应 _make_request + _process_response + _handle_response_status）。
-// payload 会自动带上 i（token）字段。
-func (a *MisskeyAPI) apiRequest(ctx context.Context, endpoint string, data map[string]interface{}) (map[string]interface{}, error) {
+// payload 会自动带上 i（token）字段。retry=true 时对网络错误/429/5xx 最多重试 3 次；
+// 发消息类端点（create 类）非幂等，重复请求会导致重复发送，必须传 false 禁止重试。
+func (a *MisskeyAPI) apiRequest(ctx context.Context, endpoint string, data map[string]interface{}, retry bool) (map[string]interface{}, error) {
 	urlStr := a.instanceURL + "/api/" + endpoint
 	payload := map[string]interface{}{"i": a.accessToken}
 	for k, v := range data {
@@ -291,9 +382,13 @@ func (a *MisskeyAPI) apiRequest(ctx context.Context, endpoint string, data map[s
 		return nil, err
 	}
 
-	// 网络错误/429/5xx 最多重试 3 次（对应 retry_async 的指数退避）
+	attempts := 1
+	if retry {
+		attempts = 3
+	}
+	// 网络错误/429/5xx 在 retry=true 时最多重试 3 次（对应 retry_async 的指数退避）
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlStr, bytes.NewReader(raw))
 		if err != nil {
 			return nil, err
@@ -313,7 +408,7 @@ func (a *MisskeyAPI) apiRequest(ctx context.Context, endpoint string, data map[s
 			}
 		}
 		// 仅在可重试错误（连接错误/429/5xx）时重试
-		if !isRetryableError(lastErr) || attempt == 3 {
+		if !retry || !isRetryableError(lastErr) || attempt == attempts {
 			break
 		}
 		apiLogger.Warn("Misskey API %s 第 %d 次重试失败: %v", endpoint, attempt, lastErr)

@@ -38,9 +38,10 @@ type Adapter struct {
 	SelfID   string
 	upgrader websocket.Upgrader
 
-	mu         sync.Mutex
-	conns      map[*websocket.Conn]struct{} // active reverse-WS connections
-	groupConvs map[string]bool              // convID -> is group (from received events)
+	mu          sync.Mutex
+	conns       map[*websocket.Conn]struct{}    // active reverse-WS connections
+	connWriteMu map[*websocket.Conn]*sync.Mutex // per-connection write serialization
+	groupConvs  map[string]bool                 // convID -> is group (from received events)
 
 	pendingMu sync.Mutex
 	pending   map[string]chan map[string]interface{} // echo -> response channel
@@ -53,10 +54,11 @@ type Adapter struct {
 // New creates an aiocqhttp adapter from config.
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		EventBus:   eventBus,
-		conns:      make(map[*websocket.Conn]struct{}),
-		groupConvs: make(map[string]bool),
-		pending:    make(map[string]chan map[string]interface{}),
+		EventBus:    eventBus,
+		conns:       make(map[*websocket.Conn]struct{}),
+		connWriteMu: make(map[*websocket.Conn]*sync.Mutex),
+		groupConvs:  make(map[string]bool),
+		pending:     make(map[string]chan map[string]interface{}),
 		upgrader: websocket.Upgrader{
 			// OneBot implementations connect from arbitrary origins.
 			CheckOrigin: func(r *http.Request) bool { return true },
@@ -112,14 +114,26 @@ func (a *Adapter) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops the adapter.
+// Stop stops the adapter, shutting down the HTTP server and closing all
+// reverse-WS connections so their read-loop goroutines exit.
 func (a *Adapter) Stop() error {
+	var shutdownErr error
 	if a.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return a.server.Shutdown(ctx)
+		shutdownErr = a.server.Shutdown(ctx)
 	}
-	return nil
+	a.mu.Lock()
+	conns := make([]*websocket.Conn, 0, len(a.conns))
+	for c := range a.conns {
+		conns = append(conns, c)
+	}
+	a.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+		a.removeConn(c)
+	}
+	return shutdownErr
 }
 
 // Send sends a message chain to a session.
@@ -233,8 +247,15 @@ func (a *Adapter) sendAction(action string, params map[string]interface{}) error
 	// Try each connection; drop ones that fail so future sends pick a healthy peer.
 	var lastErr error
 	for _, c := range conns {
+		mu := a.connWriteLock(c)
+		if mu == nil {
+			continue
+		}
+		mu.Lock()
 		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := c.WriteMessage(websocket.TextMessage, payload); err != nil {
+		err := c.WriteMessage(websocket.TextMessage, payload)
+		mu.Unlock()
+		if err != nil {
 			a.removeConn(c)
 			lastErr = err
 			continue
@@ -270,13 +291,14 @@ func (a *Adapter) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// authValid verifies the OneBot access token. 未配置 token 时一律拒绝：默认模板
-// ws_reverse_token 为空，若放行则任何能访问本端口的人都能连入 /ws 伪造消息
-// 事件、窃听 send_msg 回复。
+// authValid verifies the OneBot access token. Per the OneBot v11 spec the
+// token is optional: when ws_reverse_token is not configured, any peer may
+// connect (logged as a warning so the risk is visible); when it is configured,
+// it is enforced on both the HTTP event endpoint and the reverse-WS endpoint.
 func (a *Adapter) authValid(r *http.Request) bool {
 	if a.Token == "" {
-		logger.I18nWarn("aiocqhttp: 未配置 ws_reverse_token，拒绝事件入口请求（%s %s）。请在平台配置中设置访问令牌", r.Method, r.URL.Path)
-		return false
+		logger.Warn("aiocqhttp: 未配置 ws_reverse_token，事件入口（%s %s）未做访问鉴权。若本端口可被公网访问，请配置访问令牌", r.Method, r.URL.Path)
+		return true
 	}
 	auth := r.Header.Get("Authorization")
 	queryToken := r.URL.Query().Get("access_token")
@@ -312,6 +334,17 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 
+	// Events are handled on a single per-connection goroutine so a slow
+	// handleEvent (quoted-message fetching via CallAction) never blocks this
+	// read loop from consuming the echo frames it waits for.
+	events := make(chan map[string]interface{}, 64)
+	defer close(events)
+	go func() {
+		for ev := range events {
+			a.handleEvent(ev)
+		}
+	}()
+
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -331,7 +364,7 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if _, hasPost := msg["post_type"]; hasPost {
-			a.handleEvent(msg)
+			events <- msg
 			continue
 		}
 		if echo, hasEcho := msg["echo"].(string); hasEcho {
@@ -407,8 +440,17 @@ func (a *Adapter) CallAction(api string, params map[string]any) (map[string]any,
 	// Try each connection; drop ones that fail so future calls pick a healthy peer.
 	var lastErr error
 	for _, c := range conns {
+		mu := a.connWriteLock(c)
+		if mu == nil {
+			continue
+		}
+		// The write lock is released before waiting for the echo so a slow
+		// action never blocks other writers on the same connection.
+		mu.Lock()
 		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := c.WriteMessage(websocket.TextMessage, payload); err != nil {
+		err := c.WriteMessage(websocket.TextMessage, payload)
+		mu.Unlock()
+		if err != nil {
 			a.removeConn(c)
 			lastErr = err
 			continue
@@ -448,6 +490,7 @@ func parseActionResult(resp map[string]interface{}) (map[string]interface{}, err
 		if msg, _ := resp["msg"].(string); msg != "" {
 			return nil, fmt.Errorf("aiocqhttp: action failed: %s", msg)
 		}
+		return nil, fmt.Errorf("aiocqhttp: action failed: status=%s", status)
 	}
 	switch data := resp["data"].(type) {
 	case map[string]interface{}:
@@ -459,16 +502,40 @@ func parseActionResult(resp map[string]interface{}) (map[string]interface{}, err
 	}
 }
 
+// getSelfID returns the bot's own id (mutex-protected snapshot).
+func (a *Adapter) getSelfID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.SelfID
+}
+
+// setSelfID records the bot's own id (mutex-protected).
+func (a *Adapter) setSelfID(id string) {
+	a.mu.Lock()
+	a.SelfID = id
+	a.mu.Unlock()
+}
+
 func (a *Adapter) addConn(c *websocket.Conn) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.conns[c] = struct{}{}
+	a.connWriteMu[c] = &sync.Mutex{}
 }
 
 func (a *Adapter) removeConn(c *websocket.Conn) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.conns, c)
+	delete(a.connWriteMu, c)
+}
+
+// connWriteLock returns the per-connection write mutex, or nil when the
+// connection is no longer registered.
+func (a *Adapter) connWriteLock(c *websocket.Conn) *sync.Mutex {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.connWriteMu[c]
 }
 
 // handleEvent processes a OneBot v11 event, dispatching to message or notice
@@ -486,10 +553,10 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 
 	// Track the bot's own ID from the event's self field so @-mentions of the
 	// bot can be detected by WakingCheckStage.
-	if a.SelfID == "" {
+	if a.getSelfID() == "" {
 		if self, ok := raw["self"].(map[string]interface{}); ok {
 			if id, ok := self["user_id"]; ok {
-				a.SelfID = fmt.Sprintf("%v", id)
+				a.setSelfID(fmt.Sprintf("%v", id))
 			}
 		}
 	}
@@ -564,13 +631,14 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 			msgID = fmt.Sprintf("%v", int64(id))
 		}
 	}
+	selfID := a.getSelfID()
 
 	// Publish event
 	event := &core.Event{
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "aiocqhttp",
-			SelfID:     a.SelfID,
+			SelfID:     selfID,
 			SenderID:   senderID,
 			SenderName: senderName,
 			ConvID:     convID,
@@ -583,7 +651,7 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 		Metadata:   make(map[string]interface{}),
 		MessageObj: &core.MessageObj{
 			MessageID:   msgID,
-			SelfID:      a.SelfID,
+			SelfID:      selfID,
 			SessionID:   convID,
 			MessageType: messageType,
 			Platform:    "aiocqhttp",
@@ -623,6 +691,7 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 			msgID = fmt.Sprintf("%v", int64(id))
 		}
 	}
+	selfID := a.getSelfID()
 
 	a.mu.Lock()
 	if convID != "" {
@@ -634,7 +703,7 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 		Type: core.EventNotice,
 		Source: core.EventSource{
 			Platform: "aiocqhttp",
-			SelfID:   a.SelfID,
+			SelfID:   selfID,
 			SenderID: senderID,
 			ConvID:   convID,
 			IsGroup:  isGroup,
@@ -645,7 +714,7 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 		Metadata:   make(map[string]interface{}),
 		MessageObj: &core.MessageObj{
 			MessageID:   msgID,
-			SelfID:      a.SelfID,
+			SelfID:      selfID,
 			SessionID:   convID,
 			MessageType: "notice_" + noticeType,
 			Platform:    "aiocqhttp",
@@ -667,12 +736,69 @@ func (a *Adapter) convertFromCQFormat(raw map[string]interface{}) *message.Messa
 
 	segments, ok := raw["message"].([]interface{})
 	if !ok {
+		if msg, isStr := raw["message"].(string); isStr {
+			logger.Warn("aiocqhttp: OneBot 实现返回了 CQ 字符串格式 message，请配置为 array 格式: %q", msg)
+		}
 		return chain
 	}
 
 	parsed, _ := a.parseOneBotSegments(segments, 0)
 	chain.Chain = parsed
+	a.enrichFileURLs(chain, raw)
 	return chain
+}
+
+// enrichFileURLs resolves NapCat file segments that carry no URL by calling
+// get_group_file_url / get_private_file_url. Requires the group/user context
+// from the event; segments lacking one are left as-is.
+func (a *Adapter) enrichFileURLs(chain *message.MessageChain, raw map[string]interface{}) {
+	if chain == nil || len(chain.Chain) == 0 {
+		return
+	}
+	groupID := toString(raw["group_id"])
+	userID := toString(raw["user_id"])
+	if groupID == "" && userID == "" {
+		return
+	}
+	for _, comp := range chain.Chain {
+		f, ok := comp.(*message.File)
+		if !ok || f.URL != "" || f.FileID == "" {
+			continue
+		}
+		if url := a.fetchFileURL(f.FileID, groupID, userID); url != "" {
+			f.URL = url
+		}
+	}
+}
+
+// fetchFileURL resolves a file segment's download URL via the OneBot
+// get_group_file_url / get_private_file_url actions.
+func (a *Adapter) fetchFileURL(fileID, groupID, userID string) string {
+	var action string
+	var params map[string]interface{}
+	switch {
+	case groupID != "":
+		action = "get_group_file_url"
+		params = map[string]interface{}{"group_id": groupID, "file_id": fileID}
+	case userID != "":
+		action = "get_private_file_url"
+		params = map[string]interface{}{"user_id": userID, "file_id": fileID}
+	default:
+		logger.Warn("aiocqhttp: 文件消息缺少群/用户上下文，无法获取下载 URL (file_id=%s)", fileID)
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ret, err := a.CallActionCtx(ctx, action, params)
+	if err != nil {
+		logger.Warn("aiocqhttp: %s 失败 file_id=%s: %v", action, fileID, err)
+		return ""
+	}
+	url, _ := ret["url"].(string)
+	if url == "" {
+		logger.Warn("aiocqhttp: %s 未返回 URL file_id=%s", action, fileID)
+	}
+	return url
 }
 
 // enrichForwardAndQuoted resolves remote content referenced by the chain:
@@ -684,46 +810,58 @@ func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain) {
 		return
 	}
 	var replyIDs []string
-	var forwardIDs []string
 	for _, comp := range chain.Chain {
-		switch c := comp.(type) {
-		case *message.Reply:
-			if c.MessageID != "" {
-				replyIDs = append(replyIDs, c.MessageID)
-			}
-		case *message.Nodes:
-			// A Nodes component with no node list means "to be fetched".
-			if len(c.Nodes) == 0 {
-				forwardIDs = append(forwardIDs, c.IDs()...)
-			}
+		if reply, ok := comp.(*message.Reply); ok && reply.MessageID != "" {
+			replyIDs = append(replyIDs, reply.MessageID)
 		}
 	}
 
 	// Fetch quoted reply content (get_msg) — build Reply.Chain.
 	for _, rid := range replyIDs {
-		quotedChain, nestedForwardIDs := a.fetchQuotedContent(rid)
+		quotedChain, _ := a.fetchQuotedContent(rid)
 		for _, comp := range chain.Chain {
 			if reply, ok := comp.(*message.Reply); ok && reply.MessageID == rid {
 				reply.Chain = quotedChain
 				reply.SenderNick = ""
 			}
 		}
-		forwardIDs = append(forwardIDs, nestedForwardIDs...)
 	}
 
-	// Fetch combined-forward messages (get_forward_msg BFS).
-	if len(forwardIDs) > 0 {
-		nodes := a.resolveNestedForwards(forwardIDs)
-		if len(nodes) > 0 {
-			// Replace placeholder Nodes components with the fetched nodes.
-			for i, comp := range chain.Chain {
-				if n, ok := comp.(*message.Nodes); ok && len(n.Nodes) == 0 {
-					chain.Chain[i] = &message.Nodes{Nodes: nodes}
-					break
+	// Fetch combined-forward messages (get_forward_msg BFS), replacing every
+	// placeholder Nodes component (top-level and inside quoted replies).
+	a.resolveForwardPlaceholders(chain)
+}
+
+// resolveForwardPlaceholders walks a chain (including quoted reply content and
+// inline node content) and replaces every placeholder Nodes component (forward
+// ids present, nodes not yet fetched) with the nodes resolved via
+// get_forward_msg BFS.
+func (a *Adapter) resolveForwardPlaceholders(chain *message.MessageChain) {
+	if chain == nil {
+		return
+	}
+	var walk func(comps []message.Component)
+	walk = func(comps []message.Component) {
+		for i, comp := range comps {
+			switch c := comp.(type) {
+			case *message.Nodes:
+				if len(c.Nodes) == 0 {
+					if nodes := a.resolveNestedForwards(c.ForwardIDs); len(nodes) > 0 {
+						comps[i] = &message.Nodes{Nodes: nodes}
+					}
+					continue
 				}
+				for _, n := range c.Nodes {
+					if n != nil {
+						walk(n.Content)
+					}
+				}
+			case *message.Reply:
+				walk(c.Chain)
 			}
 		}
 	}
+	walk(chain.Chain)
 }
 
 // convertToCQFormat converts a MessageChain to OneBot v11 message segments.
@@ -735,11 +873,12 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 	for _, comp := range mc.Chain {
 		switch c := comp.(type) {
 		case *message.Plain:
-			// 文本段必须转义 CQ 码特殊字符，否则含 [CQ:...] 的原文会被对端
-			// 解析为 CQ 码指令（图片/at 等非 text 段不转义）。
+			// 发送走 array 段格式，OneBot 实现（NapCat/Lagrange/go-cqhttp）不会对
+			// array 格式的 text 段做 CQ 反转义，转义反而会让 [、]、, 以实体原样显示，
+			// 因此这里直接下发原始文本。
 			segments = append(segments, map[string]interface{}{
 				"type": "text",
-				"data": map[string]interface{}{"text": escapeCQText(c.Text)},
+				"data": map[string]interface{}{"text": c.Text},
 			})
 		case *message.At:
 			segments = append(segments, map[string]interface{}{
@@ -801,14 +940,6 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 		}
 	}
 	return segments
-}
-
-// escapeCQText 转义 OneBot v11 CQ 码特殊字符（参照 OneBot 规范）：
-// [ → &#91;、] → &#93;、, → &#44;。用于文本段输出，防止原文中的
-// [CQ:xxx] 被对端当作 CQ 码执行。
-func escapeCQText(s string) string {
-	replacer := strings.NewReplacer("[", "&#91;", "]", "&#93;", ",", "&#44;")
-	return replacer.Replace(s)
 }
 
 // extractPlainText extracts plain text from a message chain.

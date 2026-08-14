@@ -51,7 +51,7 @@ func NewGeminiEmbeddingSource(config, settings map[string]interface{}) *GeminiEm
 // GetEmbedding returns the embedding vector for a single text.
 func (s *GeminiEmbeddingSource) GetEmbedding(ctx context.Context, text string) ([]float32, error) {
 	model := s.GetModel()
-	url := fmt.Sprintf("%s/v1beta/models/%s:embedContent?key=%s", s.apiBase, model, s.apiKey)
+	url := fmt.Sprintf("%s/v1beta/models/%s:embedContent", s.apiBase, model)
 	body := map[string]interface{}{
 		"model":   model,
 		"content": map[string]interface{}{"parts": []map[string]interface{}{{"text": text}}},
@@ -68,6 +68,7 @@ func (s *GeminiEmbeddingSource) GetEmbedding(ctx context.Context, text string) (
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", s.apiKey)
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -100,7 +101,7 @@ func (s *GeminiEmbeddingSource) GetEmbeddings(ctx context.Context, texts []strin
 		return nil, nil
 	}
 	model := s.GetModel()
-	url := fmt.Sprintf("%s/v1beta/models/%s:batchEmbedContents?key=%s", s.apiBase, model, s.apiKey)
+	url := fmt.Sprintf("%s/v1beta/models/%s:batchEmbedContents", s.apiBase, model)
 	requests := make([]map[string]interface{}, 0, len(texts))
 	for _, t := range texts {
 		r := map[string]interface{}{
@@ -121,6 +122,7 @@ func (s *GeminiEmbeddingSource) GetEmbeddings(ctx context.Context, texts []strin
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-goog-api-key", s.apiKey)
 
 	resp, err := s.client.Do(req)
 	if err != nil {

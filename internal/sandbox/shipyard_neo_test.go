@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newBayServer spins up a fake Bay (Shipyard Neo) API.
@@ -130,5 +131,18 @@ func TestNormalizeNeoCwd(t *testing.T) {
 		if got := normalizeNeoCwd(in); got != want {
 			t.Errorf("normalizeNeoCwd(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestShipyardNeoExecClientNoOverallTimeout verifies the exec client has no
+// overall timeout (command timeout is carried in the request body / ctx), while
+// the short client keeps its 60s bound for create/poll/file requests (M-60).
+func TestShipyardNeoExecClientNoOverallTimeout(t *testing.T) {
+	b := NewShipyardNeoBooter("http://example.com", "token", "", 0)
+	if b.client.Timeout != 60*time.Second {
+		t.Fatalf("short client timeout = %v, want 60s", b.client.Timeout)
+	}
+	if b.execClient.Timeout != 0 {
+		t.Fatalf("exec client must have no overall timeout, got %v", b.execClient.Timeout)
 	}
 }

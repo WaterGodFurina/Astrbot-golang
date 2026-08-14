@@ -2,6 +2,7 @@ package star
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
@@ -9,6 +10,14 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
+
+// TestMain cleans up the shared test-plugin binary (built on demand by
+// plugin.BuildTestPlugin) so it is not left behind in /tmp after the run.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	plugin.CleanupTestPlugin()
+	os.Exit(code)
+}
 
 // newTestSubprocessManager builds a subprocess manager with fast polling for
 // tests, using a temp data dir.

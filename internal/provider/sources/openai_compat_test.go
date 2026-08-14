@@ -197,3 +197,75 @@ func TestLongcatSourceAPIBaseNormalization(t *testing.T) {
 		t.Errorf("normalized api_base = %q, want .../openai/v1", src2.apiBase)
 	}
 }
+
+func TestOpenAISourceStreamToolCallMalformedIndex(t *testing.T) {
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		send := func(payload string) {
+			_, _ = io.WriteString(w, "data: "+payload+"\n\n")
+			flusher.Flush()
+		}
+		send(`{"choices":[{"delta":{"tool_calls":[{"index":-1,"id":"c1","function":{"name":"bad","arguments":"{}"}}]}}]}`)
+		send(`{"choices":[{"delta":{"tool_calls":[{"index":1000,"id":"c2","function":{"name":"huge","arguments":"{}"}}]}}]}`)
+		send(`{"choices":[{"delta":{"content":"hi"}}]}`)
+		send(`{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+		send(`[DONE]`)
+	})
+
+	src := NewOpenAISource(map[string]interface{}{
+		"api_base": srv.URL, "key": "sk-test", "model": "gpt-4o",
+	}, map[string]interface{}{})
+
+	ch, err := src.TextChatStream(context.Background(), &provider.ProviderRequest{Prompt: "hi"})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	var final *provider.LLMResponse
+	for item := range ch {
+		if !item.IsChunk {
+			final = item
+		}
+	}
+	if final == nil {
+		t.Fatal("expected a final consolidated chunk")
+	}
+	if final.CompletionText != "hi" {
+		t.Errorf("final text = %q, want %q", final.CompletionText, "hi")
+	}
+	if len(final.ToolsCallName) != 0 {
+		t.Errorf("malformed tool calls should be skipped, got %v", final.ToolsCallName)
+	}
+}
+
+func TestOpenAISourceStreamReadErrorPropagates(t *testing.T) {
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+		flusher.Flush()
+		// Drop the connection mid-stream so the reader hits a hard error.
+		if hj, ok := w.(http.Hijacker); ok {
+			conn, _, _ := hj.Hijack()
+			_ = conn.Close()
+		}
+	})
+
+	src := NewOpenAISource(map[string]interface{}{
+		"api_base": srv.URL, "key": "sk-test", "model": "gpt-4o",
+	}, map[string]interface{}{})
+
+	ch, err := src.TextChatStream(context.Background(), &provider.ProviderRequest{Prompt: "hi"})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	var gotErr bool
+	for item := range ch {
+		if item.Role == "err" {
+			gotErr = true
+		}
+	}
+	if !gotErr {
+		t.Fatal("expected an err chunk when the stream is interrupted")
+	}
+}

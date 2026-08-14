@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
@@ -98,6 +100,60 @@ func TestAzureTTSNativeGetAudio(t *testing.T) {
 	_ = os.Remove(path)
 	if src.SupportStream() {
 		t.Errorf("expected no streaming support")
+	}
+}
+
+// TestAzureTTSNativeConcurrentGetAudio runs concurrent synthesis so the
+// token/timeOffset shared state fields are exercised under the race detector
+// (M-40b).
+func TestAzureTTSNativeConcurrentGetAudio(t *testing.T) {
+	chdirTemp(t)
+	var tokenCalls, synthCalls int32
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			atomic.AddInt32(&tokenCalls, 1)
+			_, _ = io.WriteString(w, "faketoken-"+r.URL.Query().Get("n"))
+		case "/synthesize":
+			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer faketoken-") {
+				t.Errorf("unexpected auth: %q", r.Header.Get("Authorization"))
+			}
+			atomic.AddInt32(&synthCalls, 1)
+			w.Header().Set("Content-Type", "audio/wav")
+			_, _ = w.Write([]byte("RIFFconcurrent"))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+
+	src := NewAzureTTSSource(map[string]interface{}{
+		"azure_tts_subscription_key": "0123456789abcdef0123456789abcdef",
+	}, map[string]interface{}{})
+	src.endpoint = srv.URL + "/synthesize"
+	src.tokenURL = srv.URL + "/token?n=x"
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			path, err := src.GetAudio(context.Background(), "并发测试")
+			if err != nil {
+				t.Errorf("GetAudio: %v", err)
+				return
+			}
+			if data, err := os.ReadFile(path); err != nil || !bytes.HasPrefix(data, []byte("RIFF")) {
+				t.Errorf("unexpected audio output: %q err=%v", data, err)
+			}
+			_ = os.Remove(path)
+		}()
+	}
+	wg.Wait()
+	if atomic.LoadInt32(&synthCalls) == 0 {
+		t.Errorf("expected at least one synthesize call")
+	}
+	if atomic.LoadInt32(&tokenCalls) == 0 {
+		t.Errorf("expected at least one token refresh")
 	}
 }
 

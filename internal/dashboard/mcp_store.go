@@ -66,7 +66,7 @@ func (ms *mcpStore) list() []map[string]interface{} {
 		}
 		for k, v := range cfg {
 			if k != "active" {
-				info[k] = v
+				info[k] = deepCopyValue(v)
 			}
 		}
 		result = append(result, info)
@@ -123,7 +123,7 @@ func (ms *mcpStore) get(name string) map[string]interface{} {
 	if !ok {
 		return map[string]interface{}{}
 	}
-	return cfg
+	return copyPersonaMap(cfg)
 }
 
 var (

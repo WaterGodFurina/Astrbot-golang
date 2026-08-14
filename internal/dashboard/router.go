@@ -214,6 +214,15 @@ func (s *Server) apiAuthAllowed(r *http.Request) bool {
 	case "unified-chat", "live-chat":
 		// WebSocket transport validates its own token query parameter.
 		return true
+	case "webhooks":
+		// 统一 webhook 回调入口 /api/v1/webhooks/platforms/{uuid}：外部平台
+		// 服务器回调不携带 dashboard token。uuid 本身不可猜测且各平台回调
+		// 内部另有签名校验，因此放行带具体 uuid 的路径；仅 webhooks 段的
+		// uuid 列表枚举（GET /api/v1/webhooks）仍要求认证。
+		if len(parts) >= 3 && parts[1] == "platforms" && parts[2] != "" {
+			return true
+		}
+		return s.auth.IsAuthenticated(extractToken(r))
 	}
 	return s.auth.IsAuthenticated(extractToken(r))
 }

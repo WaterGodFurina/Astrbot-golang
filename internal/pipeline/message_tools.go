@@ -113,13 +113,15 @@ func (s *ProcessStage) executeSendMessage(event *core.Event, args map[string]int
 	}
 	platform := event.Source.Platform
 	sessionID := event.Source.ConvID
-	if sess, ok := args["session"].(string); ok {
+	if sess, ok := args["session"].(string); ok && strings.TrimSpace(sess) != "" {
 		parts := strings.SplitN(sess, ":", 3)
-		if parts[0] != "" {
-			platform = parts[0]
+		// Only the current event's platform and session may be targeted; the
+		// middle message_type segment is not authoritative for routing.
+		if parts[0] != "" && parts[0] != event.Source.Platform {
+			return fmt.Sprintf("Error: send_message_to_user cannot target platform %q; only the current session (%s) is allowed.", parts[0], event.UnifiedMsgOrigin())
 		}
-		if len(parts) >= 3 {
-			sessionID = parts[2]
+		if len(parts) >= 3 && parts[2] != event.Source.ConvID {
+			return fmt.Sprintf("Error: send_message_to_user cannot target session %q; only the current session (%s) is allowed.", parts[2], event.UnifiedMsgOrigin())
 		}
 	}
 	chain := &message.MessageChain{}

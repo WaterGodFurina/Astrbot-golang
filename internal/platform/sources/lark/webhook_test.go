@@ -49,6 +49,10 @@ func TestWebhookEncryptedEvent(t *testing.T) {
 	enc := encryptForTest(t, encryptKey, plain)
 	body := `{"encrypt":"` + enc + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	// encrypt_key 配置后签名头缺失必须被拒绝 (M-27)。
+	req.Header.Set("X-Lark-Request-Timestamp", "1700000000")
+	req.Header.Set("X-Lark-Request-Nonce", "nonce_1")
+	req.Header.Set("X-Lark-Signature", signatureForTest(t, encryptKey, "1700000000", "nonce_1", body))
 	w := httptest.NewRecorder()
 
 	got := ""
@@ -63,6 +67,62 @@ func TestWebhookEncryptedEvent(t *testing.T) {
 	}
 	if got != "im.message.receive_v1" {
 		t.Errorf("decrypted event_type: %q", got)
+	}
+}
+
+// TestWebhookEncryptedEventMissingSignature: encrypt_key 配置后省略签名头必须 401。
+func TestWebhookEncryptedEventMissingSignature(t *testing.T) {
+	encryptKey := "test_encrypt_key_123"
+	srv := NewLarkWebhookServer("app", "secret", encryptKey, "")
+	enc := encryptForTest(t, encryptKey, `{"header":{"event_type":"im.message.receive_v1"},"event":{}}`)
+	body := `{"encrypt":"` + enc + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	srv.HandleCallback(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("签名头缺失应 401, got %d body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestWebhookEncryptedEventWrongSignature: encrypt_key 配置后错误签名必须 401。
+func TestWebhookEncryptedEventWrongSignature(t *testing.T) {
+	encryptKey := "test_encrypt_key_123"
+	srv := NewLarkWebhookServer("app", "secret", encryptKey, "")
+	enc := encryptForTest(t, encryptKey, `{"header":{"event_type":"im.message.receive_v1"},"event":{}}`)
+	body := `{"encrypt":"` + enc + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("X-Lark-Request-Timestamp", "1700000000")
+	req.Header.Set("X-Lark-Request-Nonce", "nonce_1")
+	req.Header.Set("X-Lark-Signature", "00"+signatureForTest(t, encryptKey, "1700000000", "nonce_1", body)[2:])
+	w := httptest.NewRecorder()
+	srv.HandleCallback(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("错误签名应 401, got %d body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestWebhookDecryptInvalidLength: 畸形密文长度不得 panic (M-28)。
+func TestWebhookDecryptInvalidLength(t *testing.T) {
+	encryptKey := "test_encrypt_key_123"
+	srv := NewLarkWebhookServer("app", "secret", encryptKey, "")
+
+	cases := []string{
+		// len(enc)==16: ct 为空, 旧代码 pt[len(pt)-1] 越界
+		"AAAAAAAAAAAAAAAAAAAAAA==",
+		// len(enc) 不是 16 的倍数: 旧代码 CryptBlocks panic
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+	}
+	for _, enc := range cases {
+		body := `{"encrypt":"` + enc + `"}`
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		req.Header.Set("X-Lark-Request-Timestamp", "1700000000")
+		req.Header.Set("X-Lark-Request-Nonce", "nonce_1")
+		req.Header.Set("X-Lark-Signature", signatureForTest(t, encryptKey, "1700000000", "nonce_1", body))
+		w := httptest.NewRecorder()
+		srv.HandleCallback(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("畸形密文应 400, got %d body: %s", w.Code, w.Body.String())
+		}
 	}
 }
 

@@ -94,7 +94,11 @@ func (r *RateLimiter) removeExpired(sessionID string, now time.Time) {
 	for idx < len(timestamps) && timestamps[idx].Before(threshold) {
 		idx++
 	}
-	if idx > 0 {
+	if idx >= len(timestamps) {
+		// Every timestamp expired: drop the map slot entirely so an idle
+		// session does not leave an empty-slice entry behind.
+		delete(r.timestamps, sessionID)
+	} else if idx > 0 {
 		r.timestamps[sessionID] = timestamps[idx:]
 	}
 }

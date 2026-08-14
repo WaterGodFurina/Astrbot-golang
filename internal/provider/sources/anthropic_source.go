@@ -18,9 +18,10 @@ import (
 // AnthropicSource is a Claude/Anthropic chat provider.
 type AnthropicSource struct {
 	provider.BaseProvider
-	apiBase string
-	apiKey  string
-	client  *http.Client
+	apiBase      string
+	apiKey       string
+	client       *http.Client
+	streamClient *http.Client
 }
 
 // NewAnthropicSource creates an Anthropic provider.
@@ -31,6 +32,7 @@ func NewAnthropicSource(config, settings map[string]interface{}) *AnthropicSourc
 		client: &http.Client{
 			Timeout: 120 * time.Second,
 		},
+		streamClient: newStreamClient(),
 	}
 	s.apiBase, _ = config["api_base"].(string)
 	if s.apiBase == "" {
@@ -48,7 +50,7 @@ func NewAnthropicSource(config, settings map[string]interface{}) *AnthropicSourc
 }
 
 // doRequest sends an HTTP request with retry logic.
-func (s *AnthropicSource) doRequest(ctx context.Context, body map[string]interface{}) (*http.Response, error) {
+func (s *AnthropicSource) doRequest(ctx context.Context, body map[string]interface{}, client *http.Client) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
@@ -57,7 +59,7 @@ func (s *AnthropicSource) doRequest(ctx context.Context, body map[string]interfa
 	msgs, _ := body["messages"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	cfg := RetryConfigFromSettings(s.Settings())
-	return DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+	return DoWithRetry(ctx, client, func() (*http.Request, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
 		if err != nil {
 			return nil, err
@@ -72,7 +74,7 @@ func (s *AnthropicSource) doRequest(ctx context.Context, body map[string]interfa
 // TextChat sends a non-streaming chat request.
 func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRequest) (*provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, false)
-	resp, err := s.doRequest(ctx, body)
+	resp, err := s.doRequest(ctx, body, s.client)
 	if err != nil {
 		return nil, err
 	}
@@ -86,8 +88,11 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 	}
 	var result struct {
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type  string                 `json:"type"`
+			Text  string                 `json:"text"`
+			ID    string                 `json:"id"`
+			Name  string                 `json:"name"`
+			Input map[string]interface{} `json:"input"`
 		} `json:"content"`
 		Role  string `json:"role"`
 		Usage struct {
@@ -98,27 +103,42 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
-	var text string
-	for _, c := range result.Content {
-		if c.Type == "text" {
-			text += c.Text
-		}
-	}
-	logger.Debug("LLM response: text_len=%d", len(text))
-	return &provider.LLMResponse{
-		Role:           "assistant",
-		CompletionText: text,
+	llmResp := &provider.LLMResponse{
+		Role:          "assistant",
+		ToolsCallArgs: []map[string]interface{}{},
+		ToolsCallName: []string{},
+		ToolsCallIDs:  []string{},
 		Usage: &provider.TokenUsage{
 			InputOther: result.Usage.InputTokens,
 			Output:     result.Usage.OutputTokens,
 		},
-	}, nil
+	}
+	var text strings.Builder
+	for _, c := range result.Content {
+		switch c.Type {
+		case "text":
+			text.WriteString(c.Text)
+		case "tool_use":
+			if c.Input == nil {
+				c.Input = map[string]interface{}{}
+			}
+			llmResp.ToolsCallName = append(llmResp.ToolsCallName, c.Name)
+			llmResp.ToolsCallIDs = append(llmResp.ToolsCallIDs, c.ID)
+			llmResp.ToolsCallArgs = append(llmResp.ToolsCallArgs, c.Input)
+		}
+	}
+	llmResp.CompletionText = text.String()
+	if len(llmResp.ToolsCallArgs) > 0 {
+		llmResp.Role = "tool"
+	}
+	logger.Debug("LLM response: text_len=%d", len(llmResp.CompletionText))
+	return llmResp, nil
 }
 
 // TextChatStream sends a streaming chat request (SSE).
 func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.ProviderRequest) (<-chan *provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, true)
-	resp, err := s.doRequest(ctx, body)
+	resp, err := s.doRequest(ctx, body, s.streamClient)
 	if err != nil {
 		return nil, err
 	}
@@ -132,59 +152,131 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 	go func() {
 		defer close(ch)
 		defer resp.Body.Close()
-		var usage *provider.TokenUsage
-		var content strings.Builder
+
+		type toolAcc struct {
+			id, name, inputJSON string
+		}
+		toolBuf := map[int]*toolAcc{}
+		var finalToolCalls []*toolAcc
+		content := new(strings.Builder)
+		usage := &provider.TokenUsage{}
+		var responseID string
+
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var event struct {
-				Type  string `json:"type"`
-				Delta struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"delta"`
-				MessageStop *struct {
+				Type    string `json:"type"`
+				Index   int    `json:"index"`
+				Message *struct {
+					ID    string `json:"id"`
 					Usage struct {
 						InputTokens  int `json:"input_tokens"`
 						OutputTokens int `json:"output_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
+				ContentBlock *struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"content_block"`
+				Delta *struct {
+					Type        string `json:"type"`
+					Text        string `json:"text"`
+					PartialJSON string `json:"partial_json"`
+				} `json:"delta"`
 				Usage *struct {
 					InputTokens  int `json:"input_tokens"`
 					OutputTokens int `json:"output_tokens"`
 				} `json:"usage"`
+				Error *struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
 			}
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
 				return false
 			}
 			switch event.Type {
-			case "content_block_delta":
-				if event.Delta.Type == "text_delta" && event.Delta.Text != "" {
-					content.WriteString(event.Delta.Text)
-					ch <- &provider.LLMResponse{
-						Role:           "assistant",
-						IsChunk:        true,
-						CompletionText: event.Delta.Text,
+			case "message_start":
+				if event.Message != nil {
+					responseID = event.Message.ID
+					usage.InputOther = event.Message.Usage.InputTokens
+					usage.Output = event.Message.Usage.OutputTokens
+				}
+			case "content_block_start":
+				if event.ContentBlock != nil && event.ContentBlock.Type == "tool_use" {
+					toolBuf[event.Index] = &toolAcc{
+						id:   event.ContentBlock.ID,
+						name: event.ContentBlock.Name,
 					}
+				}
+			case "content_block_delta":
+				if event.Delta == nil {
+					return false
+				}
+				switch event.Delta.Type {
+				case "text_delta":
+					if event.Delta.Text != "" {
+						content.WriteString(event.Delta.Text)
+						ch <- &provider.LLMResponse{
+							Role:           "assistant",
+							IsChunk:        true,
+							CompletionText: event.Delta.Text,
+							ID:             responseID,
+						}
+					}
+				case "input_json_delta":
+					if acc := toolBuf[event.Index]; acc != nil {
+						acc.inputJSON += event.Delta.PartialJSON
+					}
+				}
+			case "content_block_stop":
+				if acc := toolBuf[event.Index]; acc != nil {
+					finalToolCalls = append(finalToolCalls, acc)
+					delete(toolBuf, event.Index)
 				}
 			case "message_delta":
-				// Final cumulative usage arrives on the message_delta event.
 				if event.Usage != nil {
-					usage = &provider.TokenUsage{
-						InputOther: event.Usage.InputTokens,
-						Output:     event.Usage.OutputTokens,
-					}
+					usage.Output = event.Usage.OutputTokens
 				}
 			case "message_stop":
-				// Emit a final consolidated chunk with usage.
-				ch <- &provider.LLMResponse{
+				final := &provider.LLMResponse{
 					Role:           "assistant",
+					ID:             responseID,
 					CompletionText: content.String(),
 					Usage:          usage,
+					ToolsCallArgs:  []map[string]interface{}{},
+					ToolsCallName:  []string{},
+					ToolsCallIDs:   []string{},
 				}
+				for _, tc := range finalToolCalls {
+					argsMap := map[string]interface{}{}
+					if tc.inputJSON != "" {
+						_ = json.Unmarshal([]byte(tc.inputJSON), &argsMap)
+					}
+					final.ToolsCallName = append(final.ToolsCallName, tc.name)
+					final.ToolsCallIDs = append(final.ToolsCallIDs, tc.id)
+					final.ToolsCallArgs = append(final.ToolsCallArgs, argsMap)
+				}
+				if len(final.ToolsCallArgs) > 0 {
+					final.Role = "tool"
+				}
+				ch <- final
+				return true
+			case "error":
+				msg := "Anthropic stream error"
+				if event.Error != nil && event.Error.Message != "" {
+					msg = event.Error.Message
+				}
+				ch <- &provider.LLMResponse{Role: "err", CompletionText: msg}
 				return true
 			}
 			return false
 		})
-		_ = reader.scan()
+		if err := reader.scan(); err != nil {
+			logger.Warn("Anthropic stream read error: %v", err)
+			ch <- &provider.LLMResponse{Role: "err", CompletionText: fmt.Sprintf("Anthropic stream read error: %v", err)}
+			return
+		}
 		if usage != nil {
 			logger.Debug("LLM stream done, usage=%v", usage)
 		}
@@ -210,24 +302,37 @@ func (s *AnthropicSource) Test(ctx context.Context) error {
 }
 
 func (s *AnthropicSource) buildRequestBody(req *provider.ProviderRequest, stream bool) map[string]interface{} {
+	maxTokens := 4096
+	if v := configInt(s.Config(), "max_tokens", 0); v > 0 {
+		maxTokens = v
+	}
 	body := map[string]interface{}{
 		"model":      s.GetModel(),
-		"max_tokens": 4096,
+		"max_tokens": maxTokens,
 		"stream":     stream,
 	}
 	if req.SystemPrompt != "" {
 		body["system"] = req.SystemPrompt
 	}
-	// Build messages (Anthropic uses user/assistant roles)
+	// Convert OpenAI-style contexts (tool_calls / tool / image_url) into the
+	// Anthropic Messages protocol; plain user/assistant text passes through.
 	messages := []map[string]interface{}{}
 	for _, msg := range req.Contexts {
 		role, _ := msg["role"].(string)
 		if role == "system" {
 			continue
 		}
-		messages = append(messages, msg)
+		messages = append(messages, anthropicMessage(msg))
 	}
-	messages = append(messages, req.ToUserMessage())
+	messages = append(messages, anthropicMessage(req.ToUserMessage()))
 	body["messages"] = messages
+
+	// Convert OpenAI function schemas to Anthropic tool definitions.
+	if len(req.Tools) > 0 {
+		if tools := anthropicToolDefs(req.Tools); len(tools) > 0 {
+			body["tools"] = tools
+			body["tool_choice"] = map[string]interface{}{"type": "auto"}
+		}
+	}
 	return body
 }

@@ -49,12 +49,7 @@ func (ps *personaStore) load() {
 func (ps *personaStore) save() error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	os.MkdirAll(filepath.Dir(ps.path), 0755)
-	data, err := json.MarshalIndent(ps.data, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(ps.path, data, 0644)
+	return ps.saveLocked()
 }
 
 func nowStr() string {
@@ -97,19 +92,52 @@ func (ps *personaStore) getPersona(id string) map[string]interface{} {
 	return nil
 }
 
-// copyPersonaMap returns a shallow copy so callers cannot race upsertPersona's
+// copyPersonaMap returns a deep copy so callers cannot race upsertPersona's
 // in-place writes on the stored map.
 func copyPersonaMap(p map[string]interface{}) map[string]interface{} {
-	out := make(map[string]interface{}, len(p))
-	for k, v := range p {
-		out[k] = v
+	return deepCopyMap(p)
+}
+
+// deepCopyMap returns a deep copy of m so callers cannot race in-place writes
+// (upsert/reorder/setEnabled) on the stored maps while serializing outside the
+// store lock.
+func deepCopyMap(m map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = deepCopyValue(v)
 	}
 	return out
+}
+
+// deepCopyValue recursively copies maps and slices; scalars are returned as-is.
+func deepCopyValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		return deepCopyMap(t)
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, val := range t {
+			out[i] = deepCopyValue(val)
+		}
+		return out
+	case []map[string]interface{}:
+		out := make([]map[string]interface{}, len(t))
+		for i, val := range t {
+			out[i] = deepCopyMap(val)
+		}
+		return out
+	case []string:
+		return append([]string(nil), t...)
+	}
+	return v
 }
 
 func (ps *personaStore) upsertPersona(p map[string]interface{}) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+	if p == nil {
+		p = map[string]interface{}{}
+	}
 	id, _ := p["persona_id"].(string)
 	if id == "" {
 		id = "persona_" + nowStr()
@@ -163,7 +191,7 @@ func (ps *personaStore) listFolders(parentID *string) []map[string]interface{} {
 				continue
 			}
 		}
-		result = append(result, f)
+		result = append(result, copyPersonaMap(f))
 	}
 	sort.SliceStable(result, func(i, j int) bool {
 		a, _ := result[i]["sort_order"].(float64)
@@ -178,7 +206,7 @@ func (ps *personaStore) getFolder(id string) map[string]interface{} {
 	defer ps.mu.Unlock()
 	for _, f := range ps.data.Folders {
 		if fid, _ := f["folder_id"].(string); fid == id {
-			return f
+			return copyPersonaMap(f)
 		}
 	}
 	return nil
@@ -187,6 +215,9 @@ func (ps *personaStore) getFolder(id string) map[string]interface{} {
 func (ps *personaStore) upsertFolder(f map[string]interface{}) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+	if f == nil {
+		f = map[string]interface{}{}
+	}
 	id, _ := f["folder_id"].(string)
 	if id == "" {
 		id = "folder_" + nowStr()
@@ -282,7 +313,7 @@ func (ps *personaStore) tree() []map[string]interface{} {
 			}
 			node := map[string]interface{}{}
 			for k, v := range f {
-				node[k] = v
+				node[k] = deepCopyValue(v)
 			}
 			node["children"] = build(f["folder_id"].(string))
 			nodes = append(nodes, node)
@@ -294,10 +325,11 @@ func (ps *personaStore) tree() []map[string]interface{} {
 
 // saveLocked persists the store; caller must hold ps.mu.
 func (ps *personaStore) saveLocked() error {
-	os.MkdirAll(filepath.Dir(ps.path), 0755)
 	data, err := json.MarshalIndent(ps.data, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(ps.path, data, 0644)
+	// 原子写（临时文件 + rename），与 chat_store/mcp_store 保持一致，
+	// 崩溃时不留下截断的 JSON。
+	return writeFileAtomic(ps.path, data, 0644)
 }

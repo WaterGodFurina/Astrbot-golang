@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
@@ -32,6 +33,7 @@ type Adapter struct {
 	EventBus *core.EventBus
 	SelfID   string
 	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // New creates a Telegram adapter.
@@ -80,7 +82,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 
 // Stop stops the adapter.
 func (a *Adapter) Stop() error {
-	close(a.stopCh)
+	a.stopOnce.Do(func() { close(a.stopCh) })
 	return nil
 }
 

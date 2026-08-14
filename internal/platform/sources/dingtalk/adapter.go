@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
@@ -54,7 +55,7 @@ type Adapter struct {
 	wsConn *websocket.Conn
 
 	// 运行控制
-	running bool
+	running atomic.Bool
 	ctx     context.Context
 	cancel  context.CancelFunc
 
@@ -65,6 +66,18 @@ type Adapter struct {
 	// 私聊会话的 senderId -> staffId 映射 (对应 Python sp.put_async/sp.get_async)
 	staffMu    sync.Mutex
 	staffIDMap map[string]string
+
+	// 回调消息串行处理队列 (先 ack 再异步处理, 避免下载/转码阻塞 WS 读循环)
+	msgCh chan map[string]interface{}
+
+	// 会话映射持久化目录 (staffIDMap/knownGroups 落盘 JSON, 重启后恢复)
+	dataDir string
+}
+
+// dingtalkState 会话映射的持久化结构。
+type dingtalkState struct {
+	StaffIDMap  map[string]string `json:"staff_id_map"`
+	KnownGroups []string          `json:"known_groups"`
 }
 
 // New 创建钉钉适配器 (对应 Python __init__)。
@@ -80,6 +93,12 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	a.clientID, _ = config["client_id"].(string)
 	a.clientSecret, _ = config["client_secret"].(string)
 	a.cardTemplateID, _ = config["card_template_id"].(string)
+	a.dataDir, _ = config["dingtalk_data_dir"].(string)
+	if a.dataDir == "" {
+		wd, _ := os.Getwd()
+		a.dataDir = filepath.Join(wd, "data", "dingtalk")
+	}
+	a.loadState()
 	return a
 }
 
@@ -103,15 +122,17 @@ func (a *Adapter) Type() string { return "dingtalk" }
 
 // Start 启动适配器 (对应 Python run)。
 func (a *Adapter) Start(ctx context.Context) error {
-	a.running = true
+	a.running.Store(true)
 	a.ctx, a.cancel = context.WithCancel(ctx)
+	a.msgCh = make(chan map[string]interface{}, 64)
+	go a.msgLoop()
 	go a.runStream()
 	return nil
 }
 
 // Stop 停止适配器。
 func (a *Adapter) Stop() error {
-	a.running = false
+	a.running.Store(false)
 	if a.cancel != nil {
 		a.cancel()
 	}
@@ -319,8 +340,13 @@ func (a *Adapter) rememberGroup(convID string) {
 		return
 	}
 	a.convMu.Lock()
+	if a.knownGroups[convID] {
+		a.convMu.Unlock()
+		return
+	}
 	a.knownGroups[convID] = true
 	a.convMu.Unlock()
+	a.persistState()
 }
 
 // isKnownGroup 判断会话是否为已接收过消息的群聊。
@@ -341,9 +367,15 @@ func (a *Adapter) rememberSenderBinding(msg *ChatbotMessage, abm *platform.AstrB
 	if senderStaffID == "" {
 		return
 	}
+	key := a.staffIDKey(senderID)
 	a.staffMu.Lock()
-	a.staffIDMap[a.staffIDKey(senderID)] = senderStaffID
+	if a.staffIDMap[key] == senderStaffID {
+		a.staffMu.Unlock()
+		return
+	}
+	a.staffIDMap[key] = senderStaffID
 	a.staffMu.Unlock()
+	a.persistState()
 }
 
 // staffIDKey 构造私聊会话映射的 key (对应 Python MessageSesion 字符串)。
@@ -356,6 +388,69 @@ func (a *Adapter) getSenderStaffID(senderID string) string {
 	a.staffMu.Lock()
 	defer a.staffMu.Unlock()
 	return a.staffIDMap[a.staffIDKey(senderID)]
+}
+
+// stateFile 返回会话映射持久化文件路径。
+func (a *Adapter) stateFile() string {
+	return filepath.Join(a.dataDir, "state.json")
+}
+
+// loadState 从磁盘加载会话映射, 使重启后私聊/群聊发送不再失效。
+func (a *Adapter) loadState() {
+	data, err := os.ReadFile(a.stateFile())
+	if err != nil {
+		return
+	}
+	var st dingtalkState
+	if err := json.Unmarshal(data, &st); err != nil {
+		logger.I18nWarn("解析钉钉会话状态文件失败: %v", err)
+		return
+	}
+	a.staffMu.Lock()
+	for k, v := range st.StaffIDMap {
+		a.staffIDMap[k] = v
+	}
+	a.staffMu.Unlock()
+	a.convMu.Lock()
+	for _, g := range st.KnownGroups {
+		a.knownGroups[g] = true
+	}
+	a.convMu.Unlock()
+}
+
+// persistState 将会话映射落盘为 JSON (仅在新映射产生时调用, 频率低)。
+func (a *Adapter) persistState() {
+	st := dingtalkState{
+		StaffIDMap:  make(map[string]string),
+		KnownGroups: make([]string, 0),
+	}
+	a.staffMu.Lock()
+	for k, v := range a.staffIDMap {
+		st.StaffIDMap[k] = v
+	}
+	a.staffMu.Unlock()
+	a.convMu.Lock()
+	for g := range a.knownGroups {
+		st.KnownGroups = append(st.KnownGroups, g)
+	}
+	a.convMu.Unlock()
+
+	if err := os.MkdirAll(a.dataDir, 0o755); err != nil {
+		logger.I18nWarn("创建钉钉数据目录失败: %v", err)
+		return
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		return
+	}
+	tmp := a.stateFile() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		logger.I18nWarn("写入钉钉会话状态失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, a.stateFile()); err != nil {
+		logger.I18nWarn("保存钉钉会话状态失败: %v", err)
+	}
 }
 
 // downloadDingFile 下载钉钉消息中的文件 (对应 Python download_ding_file)。
@@ -453,15 +548,23 @@ func (a *Adapter) getAccessToken() string {
 	if err := json.Unmarshal(respBody, &data); err != nil {
 		return ""
 	}
-	inner, _ := data["data"].(map[string]interface{})
-	token := getString(inner, "accessToken")
+	token := getString(data, "accessToken")
+	if token == "" {
+		if inner, ok := data["data"].(map[string]interface{}); ok {
+			token = getString(inner, "accessToken")
+		}
+	}
 	if token == "" {
 		return ""
 	}
 	// 提前 5 分钟过期 (对应 SDK 的 expireIn - 5min 缓冲)
 	expireIn := 7200
-	if v, ok := inner["expireIn"].(float64); ok {
+	if v, ok := data["expireIn"].(float64); ok {
 		expireIn = int(v)
+	} else if inner, ok := data["data"].(map[string]interface{}); ok {
+		if v, ok := inner["expireIn"].(float64); ok {
+			expireIn = int(v)
+		}
 	}
 	a.tokenCache.token = token
 	a.tokenCache.expireAt = time.Now().Add(time.Duration(expireIn-300) * time.Second)
@@ -527,11 +630,11 @@ func (a *Adapter) uploadMedia(filePath, mediaType string) string {
 }
 
 // sendGroupMessage 发送群聊消息 (对应 Python _send_group_message)。
-func (a *Adapter) sendGroupMessage(openConversationID, robotCode, msgKey string, msgParam map[string]interface{}) {
+func (a *Adapter) sendGroupMessage(openConversationID, robotCode, msgKey string, msgParam map[string]interface{}) error {
 	accessToken := a.getAccessToken()
 	if accessToken == "" {
 		logger.I18nError("钉钉群消息发送失败: access_token 为空")
-		return
+		return fmt.Errorf("钉钉群消息发送失败: access_token 为空")
 	}
 	paramJSON, _ := json.Marshal(msgParam)
 	payload := map[string]interface{}{
@@ -546,28 +649,30 @@ func (a *Adapter) sendGroupMessage(openConversationID, robotCode, msgKey string,
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		dingtalkOpenAPI+"/v1.0/robot/groupMessages/send", bytes.NewReader(body))
 	if err != nil {
-		return
+		return fmt.Errorf("钉钉群消息发送失败: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-acs-dingtalk-access-token", accessToken)
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		logger.I18nError("钉钉群消息发送失败: %v", err)
-		return
+		return fmt.Errorf("钉钉群消息发送失败: %v", err)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		logger.I18nError("钉钉群消息发送失败: %d, %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("钉钉群消息发送失败: HTTP %d", resp.StatusCode)
 	}
+	return nil
 }
 
 // sendPrivateMessage 发送私聊消息 (对应 Python _send_private_message)。
-func (a *Adapter) sendPrivateMessage(staffID, robotCode, msgKey string, msgParam map[string]interface{}) {
+func (a *Adapter) sendPrivateMessage(staffID, robotCode, msgKey string, msgParam map[string]interface{}) error {
 	accessToken := a.getAccessToken()
 	if accessToken == "" {
 		logger.I18nError("钉钉私聊消息发送失败: access_token 为空")
-		return
+		return fmt.Errorf("钉钉私聊消息发送失败: access_token 为空")
 	}
 	paramJSON, _ := json.Marshal(msgParam)
 	payload := map[string]interface{}{
@@ -582,29 +687,36 @@ func (a *Adapter) sendPrivateMessage(staffID, robotCode, msgKey string, msgParam
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		dingtalkOpenAPI+"/v1.0/robot/oToMessages/batchSend", bytes.NewReader(body))
 	if err != nil {
-		return
+		return fmt.Errorf("钉钉私聊消息发送失败: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-acs-dingtalk-access-token", accessToken)
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		logger.I18nError("钉钉私聊消息发送失败: %v", err)
-		return
+		return fmt.Errorf("钉钉私聊消息发送失败: %v", err)
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		logger.I18nError("钉钉私聊消息发送失败: %d, %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("钉钉私聊消息发送失败: HTTP %d", resp.StatusCode)
 	}
+	return nil
 }
 
 // sendMessageChain 发送消息链 (对应 Python _send_message_chain)。
-func (a *Adapter) sendMessageChain(targetType, targetID, robotCode string, chain *message.MessageChain, atStr string) {
+func (a *Adapter) sendMessageChain(targetType, targetID, robotCode string, chain *message.MessageChain, atStr string) error {
+	var firstErr error
 	sendMessage := func(msgKey string, msgParam map[string]interface{}) {
+		var err error
 		if targetType == "group" {
-			a.sendGroupMessage(targetID, robotCode, msgKey, msgParam)
+			err = a.sendGroupMessage(targetID, robotCode, msgKey, msgParam)
 		} else {
-			a.sendPrivateMessage(targetID, robotCode, msgKey, msgParam)
+			err = a.sendPrivateMessage(targetID, robotCode, msgKey, msgParam)
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
@@ -749,6 +861,7 @@ func (a *Adapter) sendMessageChain(targetType, targetID, robotCode string, chain
 			})
 		}
 	}
+	return firstErr
 }
 
 // prepareVoiceForDingtalk 优先转换为 OGG(Opus), 不可用时回退 AMR。
@@ -791,22 +904,21 @@ func saveBase64TempFile(b64 string) string {
 // Send 发送消息链 (对应 Python send_by_session + send_message_chain_to_*)。
 // 群聊的 sessionID 为 openConversationId; 私聊的 sessionID 为发送者的 sid,
 // 私聊发送时通过 staff_id 映射找到用户的 staffId, 缺失时回退使用 session_id。
+// 发送失败时返回 error, 不再静默吞掉 (对应 L-27)。
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	if chain == nil {
 		return nil
 	}
 	robotCode := a.clientID
 	if a.isKnownGroup(sessionID) {
-		a.sendMessageChain("group", sessionID, robotCode, chain, "")
-		return nil
+		return a.sendMessageChain("group", sessionID, robotCode, chain, "")
 	}
 	staffID := a.getSenderStaffID(sessionID)
 	if staffID == "" {
 		logger.I18nWarn("钉钉私聊会话缺少 staff_id 映射，回退使用 session_id 作为 userId 发送")
 		staffID = sessionID
 	}
-	a.sendMessageChain("user", staffID, robotCode, chain, "")
-	return nil
+	return a.sendMessageChain("user", staffID, robotCode, chain, "")
 }
 
 // handleMsg 发布消息事件到事件总线。

@@ -56,12 +56,19 @@ func (sc *SessionController) Stop(err error) {
 	close(sc.done)
 }
 
-// Keep extends the session with a timeout.
+// Keep extends the session with a timeout. When resetTimeout is true the
+// countdown is restarted from now with the given timeout; when false the
+// existing countdown is preserved (unless no timer is armed yet, in which case
+// one is started). A timeout <= 0 ends the session immediately.
 func (sc *SessionController) Keep(timeout time.Duration, resetTimeout bool) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	if timeout <= 0 {
 		sc.stopLocked(nil)
+		return
+	}
+	if !resetTimeout && sc.timer != nil {
+		// 不重置计时：保留现有倒计时。
 		return
 	}
 	if sc.timer != nil {
@@ -211,7 +218,7 @@ func Trigger(sessionID string, event Event) error {
 // TriggerByFilter finds a session matching the filter and event.
 func TriggerByFilter(event Event) error {
 	registryMu.RLock()
-	defer registryMu.RUnlock()
+	var target *SessionWaiter
 	for _, sw := range registry {
 		select {
 		case <-sw.controller.Done():
@@ -221,11 +228,18 @@ func TriggerByFilter(event Event) error {
 		if sw.filter != nil {
 			key := sw.filter.Filter(event)
 			if key == sw.ID {
-				return Trigger(sw.ID, event)
+				target = sw
+				break
 			}
 		}
 	}
-	return nil
+	registryMu.RUnlock()
+	if target == nil {
+		return nil
+	}
+	// Trigger outside the RLock: it re-acquires the registry lock, and doing so
+	// while a writer is queued would deadlock this reader (RLock not reentrant).
+	return Trigger(target.ID, event)
 }
 
 // NewSessionWaiter creates a waiter with the given filter.

@@ -17,7 +17,9 @@ import (
 func sendToBackQueue(chain *message.MessageChain, streamID string, queueMgr *WecomAIQueueMgr, streaming bool, suppressUnsupportedLog bool) string {
 	backQueue := queueMgr.GetOrCreateBackQueue(streamID)
 	if chain == nil {
-		backQueue <- &QueueItem{Type: "end", Data: "", Streaming: false}
+		if !trySendBackQueueItem(backQueue, &QueueItem{Type: "end", Data: "", Streaming: false}) {
+			logger.I18nWarn("[WecomAI] 输出队列已满，丢弃结束标记: %s", streamID)
+		}
 		return ""
 	}
 
@@ -26,10 +28,14 @@ func sendToBackQueue(chain *message.MessageChain, streamID string, queueMgr *Wec
 		switch c := comp.(type) {
 		case *message.At:
 			data = "@" + c.Name + " "
-			backQueue <- &QueueItem{Type: "plain", Data: data, Streaming: streaming, SessionID: streamID}
+			if !trySendBackQueueItem(backQueue, &QueueItem{Type: "plain", Data: data, Streaming: streaming, SessionID: streamID}) {
+				logger.I18nWarn("[WecomAI] 输出队列已满，丢弃消息: %s", streamID)
+			}
 		case *message.Plain:
 			data = c.Text
-			backQueue <- &QueueItem{Type: "plain", Data: data, Streaming: streaming, SessionID: streamID}
+			if !trySendBackQueueItem(backQueue, &QueueItem{Type: "plain", Data: data, Streaming: streaming, SessionID: streamID}) {
+				logger.I18nWarn("[WecomAI] 输出队列已满，丢弃消息: %s", streamID)
+			}
 		case *message.Image:
 			// 处理图片消息
 			imageBase64, err := componentImageBase64(c)
@@ -41,7 +47,9 @@ func sendToBackQueue(chain *message.MessageChain, streamID string, queueMgr *Wec
 				logger.I18nWarn("图片数据为空，跳过")
 				continue
 			}
-			backQueue <- &QueueItem{Type: "image", ImageData: imageBase64, Streaming: streaming, SessionID: streamID}
+			if !trySendBackQueueItem(backQueue, &QueueItem{Type: "image", ImageData: imageBase64, Streaming: streaming, SessionID: streamID}) {
+				logger.I18nWarn("[WecomAI] 输出队列已满，丢弃图片消息: %s", streamID)
+			}
 		default:
 			if !suppressUnsupportedLog {
 				logger.I18nWarn("[WecomAI] 不支持的消息组件类型: %s, 跳过", comp.Type())
@@ -76,5 +84,7 @@ func extractPlainTextFromChain(chain *message.MessageChain, stripResult bool) st
 // markStreamComplete 标记流结束（对应 _mark_stream_complete）。
 func markStreamComplete(streamID string, queueMgr *WecomAIQueueMgr) {
 	backQueue := queueMgr.GetOrCreateBackQueue(streamID)
-	backQueue <- &QueueItem{Type: "complete", Data: "", Streaming: false, SessionID: streamID}
+	if !trySendBackQueueItem(backQueue, &QueueItem{Type: "complete", Data: "", Streaming: false, SessionID: streamID}) {
+		logger.I18nWarn("[WecomAI] 输出队列已满，丢弃 complete 标记: %s", streamID)
+	}
 }

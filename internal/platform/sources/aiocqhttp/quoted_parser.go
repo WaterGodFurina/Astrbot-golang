@@ -92,15 +92,27 @@ func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int) ([]mess
 			url, _ := data["url"].(string)
 			file, _ := data["file"].(string)
 			chain = append(chain, &message.Record{URL: url, File: file})
+		case "reply":
+			rid := toString(data["id"])
+			if rid == "" {
+				rid = toString(data["message_id"])
+			}
+			if rid != "" {
+				chain = append(chain, &message.Reply{MessageID: rid})
+			}
 		case "face":
 			chain = append(chain, &message.Face{ID: toString(data["id"])})
 		case "file":
 			url, _ := data["url"].(string)
 			name, _ := data["name"].(string)
-			if name == "" {
-				name, _ = data["file"].(string)
+			fileID := toString(data["file"])
+			if fileID == "" {
+				fileID = toString(data["file_id"])
 			}
-			chain = append(chain, &message.File{URL: url, Name: name})
+			if name == "" {
+				name = fileID
+			}
+			chain = append(chain, &message.File{URL: url, Name: name, FileID: fileID})
 		case "video":
 			url, _ := data["url"].(string)
 			file, _ := data["file"].(string)
@@ -305,6 +317,12 @@ func collectNodeForwardIDs(node *message.Node, pending *[]string, seen map[strin
 				for _, n := range c.Nodes {
 					if n != nil {
 						walk(n.Content)
+					}
+				}
+				for _, fid := range c.ForwardIDs {
+					fid = trimSpace(fid)
+					if fid != "" && !seen[fid] {
+						*pending = append(*pending, fid)
 					}
 				}
 			case *message.Reply:

@@ -22,7 +22,10 @@ import (
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -973,6 +976,17 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.database = ctx.Database
 	s.subPlugins = ctx.SubPlugins
 	s.providerConf = bindProviderSettings(ctx.AstrbotConfig)
+	// Wire dequeue_context_length into the conversation manager so AppendHistory
+	// truncates stored history instead of growing it without bound (M-33).
+	// max_context_length <= 0 (the default -1) keeps the historical no-truncate
+	// behavior.
+	if s.convMgr != nil && s.providerConf != nil {
+		dequeue := 0
+		if s.providerConf.MaxContextLength > 0 {
+			dequeue = s.providerConf.DequeueContextLength
+		}
+		s.convMgr.SetDequeueContextLength(dequeue)
+	}
 	s.subAgents, s.subAgentEnabled = loadSubAgents(ctx.AstrbotConfig)
 	s.kbRetriever = ctx.KBRetriever
 	s.toolSchemaMode = "full"
@@ -1009,11 +1023,9 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	}
 	// Doom-loop confirmation: if a tool was paused for this session, only the
 	// original asker may confirm. A confirmation resumes the original request
-	// (message is rewritten to it); a decline stops.
+	// (message is rewritten to it); any other reply clears the paused state
+	// and the message flows through the normal pipeline.
 	switch s.maybeHandleDoomConfirm(event) {
-	case doomDeclined:
-		event.Stop()
-		return &StageResult{Continue: false}, nil
 	case doomResumed:
 		// fall through: re-run the original request through the pipeline
 	case doomNotConsumed:
@@ -1302,6 +1314,11 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 
+	// Reset the doom-loop counters for this session at each request entry so
+	// repetition is never measured across request boundaries. The paused tool
+	// state is preserved (L-18).
+	s.resetDoomLoopCount(event.UnifiedMsgOrigin())
+
 	// Trace span for this agent invocation (TracePage).
 	if event.Trace == nil {
 		traceEnabled := func() bool {
@@ -1335,6 +1352,11 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 			}
 		}
 	}
+
+	// Dashboard-selected provider/model override (WebUI chat writes
+	// selected_provider/selected_model into event.Metadata, chat_stream.go).
+	// Applied on a copy so the shared provider config is never mutated (L-23).
+	providerCfg = s.applySelectedProviderModel(event, providerCfg)
 
 	// Resolve the conversation. Mirrors Python's `_get_session_conv`: the
 	// conversation is lazily created if it does not exist yet. The current
@@ -1450,6 +1472,13 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 			compressed = append(compressed, s.compressImageForProvider(u))
 		}
 		req.ImageURLs = compressed
+		// Temp files created by compressImageForProvider are consumed by the
+		// provider during chatRound; remove them once the request completes.
+		for _, p := range compressed {
+			if isCompressTempFile(p) {
+				defer os.Remove(p)
+			}
+		}
 	}
 
 	// Group chat context injection: records received before this message are
@@ -1607,7 +1636,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 					"tool_args": truncateRunes(fmt.Sprintf("%v", args), 200),
 				})
 			}
-			result := s.executeTool(event, computerUseRuntime, name, args)
+			result := s.executeToolWithTimeout(event, computerUseRuntime, name, args)
 			// on_llm_tool_respond fires after the tool executed, carrying the
 			// tool name/args plus its result.
 			dispatchSubprocessHooksPayload(s.subPlugins, event, "on_llm_tool_respond", &pluginsdk.ToolCall{
@@ -1705,6 +1734,17 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 		if err != nil {
 			return nil, err
 		}
+		// Anthropic-style XML tool calls (<function_calls>) are parsed into
+		// real tool calls (same as the streaming path) so they execute instead
+		// of leaking into the reply.
+		if calls, ok := parseXMLToolCalls(resp.CompletionText); ok {
+			for i, c := range calls {
+				resp.ToolsCallName = append(resp.ToolsCallName, c.name)
+				resp.ToolsCallArgs = append(resp.ToolsCallArgs, c.args)
+				resp.ToolsCallIDs = append(resp.ToolsCallIDs, fmt.Sprintf("xml_%d", i))
+			}
+			logger.I18nInfo("解析到 %d 个 XML 工具调用并转为标准工具调用", len(calls))
+		}
 		resp.CompletionText = stripToolCallXML(resp.CompletionText)
 		logger.Debug("LLM call completed in %v, text_len=%d", time.Since(start), len(resp.CompletionText))
 		return resp, nil
@@ -1715,6 +1755,9 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 	}
 	full := &provider.LLMResponse{Role: "assistant", CompletionText: "", ToolsCallName: []string{}, ToolsCallArgs: []map[string]interface{}{}, ToolsCallIDs: []string{}}
 	var content, reasoning strings.Builder
+	// ctrlPending accumulates the tail of the stream that might be a control
+	// marker split across chunks; only the confirmed-safe prefix is released.
+	var ctrlPending string
 	for chunk := range streamCh {
 		if chunk.Role == "err" {
 			// err chunk 提前返回后，生产者 goroutine 仍可能继续向缓冲为 100
@@ -1733,8 +1776,19 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 			reasoning.WriteString(chunk.ReasoningContent)
 			// Suppress model control markup (XML tool calls, advisor/reasoning
 			// tags) from the user-facing stream; parsed/handled at completion.
-			if !containsControlText(chunk.CompletionText) {
-				streamer.push(chunk.CompletionText)
+			// A marker split across chunks is caught by holding back the suffix
+			// that could begin a marker until the next chunk resolves it (L-21).
+			ctrlPending += chunk.CompletionText
+			if containsControlText(ctrlPending) {
+				// A (possibly split) control marker is present; drop it all so
+				// none of it leaks to the user.
+				ctrlPending = ""
+			} else {
+				safe := len(ctrlPending) - controlTextPendingLen(ctrlPending)
+				if safe > 0 {
+					streamer.push(ctrlPending[:safe])
+					ctrlPending = ctrlPending[safe:]
+				}
 			}
 			// Display the reasoning content when provider_settings.
 			// display_reasoning_text is enabled (mirrors the Python
@@ -1759,6 +1813,12 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 			content.Reset()
 			content.WriteString(chunk.CompletionText)
 		}
+	}
+	// Release any buffered tail that never resolved into a control marker
+	// (the stream ended without completing one).
+	if ctrlPending != "" {
+		streamer.push(ctrlPending)
+		ctrlPending = ""
 	}
 	full.CompletionText = content.String()
 	full.ReasoningContent = reasoning.String()
@@ -2320,17 +2380,48 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 // are filled in by a follow-up re-query when the LLM chooses a tool.
 func (s *ProcessStage) collectLightTools(computerUseRuntime string) []map[string]interface{} {
 	all := s.collectTools(computerUseRuntime)
-	for _, tool := range all {
-		fn, ok := tool["function"].(map[string]interface{})
-		if !ok {
+	for i, tool := range all {
+		if _, ok := tool["function"].(map[string]interface{}); !ok {
 			continue
 		}
-		fn["parameters"] = map[string]interface{}{
+		// Deep-copy the schema before rewriting parameters so MCP schemas
+		// shared with the cached s.mcpSchemas map are not polluted.
+		cloned := deepCopyInterface(tool).(map[string]interface{})
+		cfn, _ := cloned["function"].(map[string]interface{})
+		cfn["parameters"] = map[string]interface{}{
 			"type":       "object",
 			"properties": map[string]interface{}{},
 		}
+		all[i] = cloned
 	}
 	return all
+}
+
+// deepCopyInterface returns a deep copy of a JSON-like value (map, slice or
+// scalar) so callers can mutate a schema without affecting the original.
+func deepCopyInterface(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		cp := make(map[string]interface{}, len(t))
+		for k, val := range t {
+			cp[k] = deepCopyInterface(val)
+		}
+		return cp
+	case []interface{}:
+		cp := make([]interface{}, len(t))
+		for i, val := range t {
+			cp[i] = deepCopyInterface(val)
+		}
+		return cp
+	case []map[string]interface{}:
+		cp := make([]map[string]interface{}, len(t))
+		for i, val := range t {
+			cp[i] = deepCopyInterface(val).(map[string]interface{})
+		}
+		return cp
+	default:
+		return v
+	}
 }
 
 // collectParamToolsFor returns the full-parameters schemas of the named tools
@@ -2507,16 +2598,18 @@ func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map
 	// Bound the tool call: the SSE transport waits for a response event. A
 	// short first-attempt timeout lets a stale connection fail fast so the
 	// reconnect path (below) kicks in instead of hanging the pipeline.
+	conn := client.Conn()
 	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	result, err := client.CallTool(callCtx, toolName, args)
 	if err != nil {
 		// A transport failure (e.g. SSE connection lost) can leave the client
 		// unable to receive responses; reconnect once and retry with a fresh
-		// timeout.
+		// timeout. Pass the connection the failed call used so a concurrent
+		// reconnect that already rebuilt the connection is not torn down again.
 		logger.I18nWarn("MCP 工具 %s 调用失败 (%v)，正在重连并重试…", name, err)
 		reconnCtx, reconnCancel := context.WithTimeout(ctx, 30*time.Second)
-		rc := client.Reconnect(reconnCtx)
+		rc := client.Reconnect(reconnCtx, conn)
 		reconnCancel()
 		if rc != nil {
 			logger.I18nWarn("MCP 服务器 %q 重连失败: %v", serverName, rc)
@@ -2646,14 +2739,132 @@ func executeGetCurrentTime(timezone string) string {
 	return now.In(loc).Format("2006-01-02 15:04:05") + " " + loc.String()
 }
 
+// webFetchMaxBytes caps how much of a fetched response body is read so a
+// malicious server cannot dump an unbounded payload into the model context.
+const webFetchMaxBytes = 4 << 20
+
+// maxRedirects bounds how many redirects web_fetch follows before giving up.
+const maxRedirects = 10
+
+var (
+	// cloudMetadataAddr is the well-known AWS/GCP/Azure metadata endpoint that
+	// must never be reachable from the fetcher.
+	cloudMetadataAddr = netip.MustParseAddr("169.254.169.254")
+	// blockedNetPrefixes are extra reserved ranges (e.g. CGNAT space used by
+	// some cloud metadata endpoints) rejected on top of the built-in netip
+	// classifications.
+	blockedNetPrefixes = []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.0/10"),
+	}
+)
+
+// validateWebFetchHost resolves host and rejects loopback, private, link-local,
+// multicast, CGNAT and cloud-metadata addresses. It fails closed when the host
+// cannot be resolved at all.
+func validateWebFetchHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("url 缺少主机名")
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("域名解析失败: %v", err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("域名 %q 无解析结果", host)
+	}
+	for _, ip := range ips {
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			continue
+		}
+		addr = addr.Unmap()
+		switch {
+		case addr == cloudMetadataAddr:
+			return fmt.Errorf("拒绝访问云元数据地址 %s", addr)
+		case addr.IsLoopback():
+			return fmt.Errorf("拒绝访问环回地址 %s", addr)
+		case addr.IsPrivate():
+			return fmt.Errorf("拒绝访问私网地址 %s", addr)
+		case addr.IsLinkLocalUnicast():
+			return fmt.Errorf("拒绝访问链路本地地址 %s", addr)
+		case addr.IsLinkLocalMulticast():
+			return fmt.Errorf("拒绝访问链路本地组播地址 %s", addr)
+		case addr.IsMulticast():
+			return fmt.Errorf("拒绝访问组播地址 %s", addr)
+		case addr.IsUnspecified():
+			return fmt.Errorf("拒绝访问未指定地址 %s", addr)
+		}
+		for _, p := range blockedNetPrefixes {
+			if p.Contains(addr) {
+				return fmt.Errorf("拒绝访问保留地址段 %s 内的地址 %s", p, addr)
+			}
+		}
+	}
+	return nil
+}
+
+// validateWebFetchURL parses rawURL and verifies it is an http(s) URL whose
+// host is safe to fetch. It returns a normalized URL (fragment stripped) for
+// the actual request.
+func validateWebFetchURL(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("无法解析 url: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("url 必须以 http:// 或 https:// 开头")
+	}
+	if err := validateWebFetchHost(u.Hostname()); err != nil {
+		return "", err
+	}
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+// webFetchRedirectGuard re-validates the destination of every redirect hop so
+// a chain cannot bounce into a blocked address after the initial check.
+func webFetchRedirectGuard(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("重定向次数过多")
+	}
+	if req.URL == nil {
+		return fmt.Errorf("重定向目标缺少 URL")
+	}
+	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		return fmt.Errorf("重定向目标必须以 http:// 或 https:// 开头")
+	}
+	return validateWebFetchHost(req.URL.Hostname())
+}
+
+// allowedWebFetchContentType reports whether a response Content-Type is safe to
+// surface to the model. Only textual payloads are allowed; binary media
+// (images, archives, PDFs, ...) is rejected.
+func allowedWebFetchContentType(ct string) bool {
+	ct = strings.ToLower(strings.TrimSpace(ct))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch {
+	case ct == "":
+		return true
+	case strings.HasPrefix(ct, "text/"):
+		return true
+	case ct == "application/json":
+		return true
+	case ct == "application/xml":
+		return true
+	case ct == "application/javascript" || ct == "application/x-javascript":
+		return true
+	default:
+		return false
+	}
+}
+
 // executeWebFetch fetches a URL and converts its content to plain text,
 // truncated to maxLength characters.
 func executeWebFetch(rawURL string, maxLength int) string {
-	if rawURL == "" {
+	if strings.TrimSpace(rawURL) == "" {
 		return "web_fetch 错误: 缺少 url 参数"
-	}
-	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-		return "web_fetch 错误: url 必须以 http:// 或 https:// 开头"
 	}
 	if maxLength <= 0 {
 		maxLength = 20000
@@ -2662,8 +2873,16 @@ func executeWebFetch(rawURL string, maxLength int) string {
 		maxLength = 200000
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(rawURL)
+	reqURL, err := validateWebFetchURL(rawURL)
+	if err != nil {
+		return "web_fetch 错误: " + err.Error()
+	}
+
+	client := &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: webFetchRedirectGuard,
+	}
+	resp, err := client.Get(reqURL)
 	if err != nil {
 		return fmt.Sprintf("web_fetch 错误: 请求失败: %v", err)
 	}
@@ -2671,8 +2890,11 @@ func executeWebFetch(rawURL string, maxLength int) string {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Sprintf("web_fetch 错误: HTTP %d", resp.StatusCode)
 	}
+	if !allowedWebFetchContentType(resp.Header.Get("Content-Type")) {
+		return fmt.Sprintf("web_fetch 错误: 不支持的内容类型 %q", resp.Header.Get("Content-Type"))
+	}
 
-	limited := io.LimitReader(resp.Body, int64(maxLength*2))
+	limited := io.LimitReader(resp.Body, int64(webFetchMaxBytes))
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		return fmt.Sprintf("web_fetch 错误: 读取失败: %v", err)
@@ -2707,7 +2929,7 @@ func htmlToText(body []byte) string {
 // executeTool runs a tool call and returns the result text.
 // Dispatches to built-in tools, MCP servers, and the Computer Use local or
 // sandbox executors.
-func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args map[string]interface{}) string {
+func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runtime, name string, args map[string]interface{}) string {
 	umo := event.UnifiedMsgOrigin()
 	logger.Debug("executeTool: name=%s args=%v", name, args)
 
@@ -2735,7 +2957,7 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 		}
 	}
 	if !handled && runtime == "sandbox" {
-		if r, h := s.executeSandboxTool(name, args); h {
+		if r, h := s.executeSandboxTool(ctx, name, args); h {
 			result, handled = r, true
 		}
 	}
@@ -2745,7 +2967,7 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 		}
 	}
 	if !handled {
-		if r, h := s.executeMCPTool(context.Background(), name, args); h {
+		if r, h := s.executeMCPTool(ctx, name, args); h {
 			result, handled = r, true
 		}
 	}
@@ -2755,23 +2977,42 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 		}
 	}
 	if !handled {
+		// Computer Use host tools (shell/python/file/grep) run only on the
+		// "local" runtime. collectTools injects them solely for that runtime,
+		// but OpenAI-compatible providers do not validate tool names, so an
+		// unregistered name could otherwise reach the host executors while
+		// Computer Use is disabled (M-19). The sandbox branch above is gated
+		// the same way.
 		switch name {
-		case "astrbot_execute_shell":
-			result = executeLocalShell(umo, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
-		case "astrbot_shell_session":
-			result = executeShellSession(umo, argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
-		case "astrbot_execute_python":
-			result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
-		case "astrbot_file_read_tool":
-			result = executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0))
-		case "astrbot_file_write_tool":
-			r := executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
-			result = snapshotFileMutation(workspaceRoot(umo), name, r)
-		case "astrbot_file_edit_tool":
-			r := executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
-			result = snapshotFileMutation(workspaceRoot(umo), name, r)
-		case "astrbot_grep_tool":
-			result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
+		case "astrbot_execute_shell", "astrbot_shell_session", "astrbot_execute_python",
+			"astrbot_file_read_tool", "astrbot_file_write_tool", "astrbot_file_edit_tool",
+			"astrbot_grep_tool":
+			if runtime != "local" {
+				result = fmt.Sprintf("工具 %s 未启用（Computer Use 运行时为 %s，需要 local）", name, runtime)
+			} else {
+				switch name {
+				case "astrbot_execute_shell":
+					result = executeLocalShell(umo, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
+				case "astrbot_shell_session":
+					result = executeShellSession(umo, argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
+				case "astrbot_execute_python":
+					result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
+				case "astrbot_file_read_tool":
+					result = executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0))
+				case "astrbot_file_write_tool":
+					ws := workspaceRoot(umo)
+					before := gitTreeHash(ws)
+					r := executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
+					result = snapshotFileMutation(ws, before, name, r)
+				case "astrbot_file_edit_tool":
+					ws := workspaceRoot(umo)
+					before := gitTreeHash(ws)
+					r := executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
+					result = snapshotFileMutation(ws, before, name, r)
+				case "astrbot_grep_tool":
+					result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
+				}
+			}
 		case "future_task":
 			result = executeFutureTask(s.cronMgr, umo, event.GetSenderID(), args)
 		case "web_search_tavily":
@@ -2818,48 +3059,61 @@ func addCronTools(config map[string]interface{}) bool {
 }
 
 // executeSandboxTool routes computer-use tools into the sandbox runtime.
-func (s *ProcessStage) executeSandboxTool(name string, args map[string]interface{}) (string, bool) {
+func (s *ProcessStage) executeSandboxTool(ctx context.Context, name string, args map[string]interface{}) (string, bool) {
 	if s.sandboxMgr == nil {
-		return "Sandbox manager not configured.", true
+		// Only sandbox-only tools are reported as unavailable here; any other
+		// name must fall through to the remaining executors so it is not
+		// swallowed by the missing sandbox.
+		switch name {
+		case "astrbot_execute_shell", "astrbot_execute_python",
+			"astrbot_file_read_tool", "astrbot_file_write_tool",
+			"astrbot_file_edit_tool", "astrbot_grep_tool":
+			return "Sandbox manager not configured.", true
+		}
+		return "", false
 	}
-	ctx := context.Background()
+	// Default 300s (aligned with the local shell runtime); the model-supplied
+	// timeout is respected but capped so a single call cannot hang forever.
 	timeout := argInt(args, "timeout", 0)
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
-		defer cancel()
+	if timeout <= 0 {
+		timeout = 300
 	}
+	if timeout > 600 {
+		timeout = 600
+	}
+	tctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
 	switch name {
 	case "astrbot_execute_shell":
-		if err := s.ensureSandboxStarted(ctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxShell(ctx, s.sandboxMgr, argString(args, "command")), true
+		return sandboxShell(tctx, s.sandboxMgr, argString(args, "command")), true
 	case "astrbot_execute_python":
-		if err := s.ensureSandboxStarted(ctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxPython(ctx, s.sandboxMgr, argString(args, "code")), true
+		return sandboxPython(tctx, s.sandboxMgr, argString(args, "code")), true
 	case "astrbot_file_read_tool":
-		if err := s.ensureSandboxStarted(ctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxFileRead(ctx, s.sandboxMgr, argString(args, "path")), true
+		return sandboxFileRead(tctx, s.sandboxMgr, argString(args, "path")), true
 	case "astrbot_file_write_tool":
-		if err := s.ensureSandboxStarted(ctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxFileWrite(ctx, s.sandboxMgr, argString(args, "path"), argString(args, "content")), true
+		return sandboxFileWrite(tctx, s.sandboxMgr, argString(args, "path"), argString(args, "content")), true
 	case "astrbot_file_edit_tool":
-		if err := s.ensureSandboxStarted(ctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxFileEdit(ctx, s.sandboxMgr, argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all")), true
+		return sandboxFileEdit(tctx, s.sandboxMgr, argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all")), true
 	case "astrbot_grep_tool":
-		if err := s.ensureSandboxStarted(ctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxGrep(ctx, s.sandboxMgr, argString(args, "pattern"), argString(args, "path")), true
+		return sandboxGrep(tctx, s.sandboxMgr, argString(args, "pattern"), argString(args, "path")), true
 	}
 	return "", false
 }
@@ -2881,9 +3135,15 @@ func (s *ProcessStage) ensureSandboxStarted(ctx context.Context) error {
 // resolveProvider picks the provider config to use for this chat.
 func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]interface{}, error) {
 	providers, _ := s.config["provider"].([]interface{})
-	providerSettings, _ := s.config["provider_settings"].(map[string]interface{})
-	if providerSettings == nil {
-		providerSettings = map[string]interface{}{}
+	// Copy the shared provider_settings map so per-request writes (e.g.
+	// persona below) never mutate the shared config that other concurrent
+	// requests read (M-21). Only the top level is written by callers, so a
+	// shallow copy is sufficient.
+	providerSettings := map[string]interface{}{}
+	if ps, ok := s.config["provider_settings"].(map[string]interface{}); ok {
+		for k, v := range ps {
+			providerSettings[k] = v
+		}
 	}
 
 	selected := ""
@@ -2913,6 +3173,38 @@ func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]int
 		}
 	}
 	return nil, nil, fmt.Errorf("未找到可用的模型提供商，请先配置")
+}
+
+// applySelectedProviderModel applies the dashboard-selected provider/model
+// metadata (event.Metadata["selected_provider"] / ["selected_model"], written
+// by chat_stream.go) on top of providerCfg. The result is a fresh map so the
+// shared provider config is never mutated. With no selection the input map is
+// returned unchanged.
+func (s *ProcessStage) applySelectedProviderModel(event *core.Event, providerCfg map[string]interface{}) map[string]interface{} {
+	if event.Metadata == nil {
+		return providerCfg
+	}
+	selProvider, _ := event.Metadata["selected_provider"].(string)
+	selModel, _ := event.Metadata["selected_model"].(string)
+	if selProvider == "" && selModel == "" {
+		return providerCfg
+	}
+	pc := make(map[string]interface{}, len(providerCfg)+1)
+	for k, v := range providerCfg {
+		pc[k] = v
+	}
+	if selProvider != "" {
+		if found := findProviderByID(s.config, selProvider); found != nil {
+			pc = make(map[string]interface{}, len(found)+1)
+			for k, v := range found {
+				pc[k] = v
+			}
+		}
+	}
+	if selModel != "" {
+		pc["model"] = selModel
+	}
+	return pc
 }
 
 // personaPrompt extracts the persona system prompt from settings.
@@ -3104,11 +3396,17 @@ func (s *ProcessStage) conversationHistory(umo string) []map[string]interface{} 
 	if s.convMgr == nil {
 		return nil
 	}
-	conv := s.convMgr.GetConversation(umo)
-	if conv == nil {
+	convID := s.convMgr.GetCurrConversationID(umo)
+	if convID == "" {
 		return nil
 	}
-	history := append([]map[string]interface{}{}, conv.History...)
+	// Read through the manager so the History slice is deep-copied under its
+	// lock — AppendHistory (another message racing this one) mutates the live
+	// History, so reading conv.History directly here would be a data race.
+	history := s.convMgr.GetConversationHistory(convID)
+	if history == nil {
+		return nil
+	}
 
 	maxCtx := 0
 	if ps, ok := s.config["provider_settings"].(map[string]interface{}); ok {

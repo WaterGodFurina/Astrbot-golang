@@ -7,7 +7,10 @@ import (
 	"time"
 )
 
-// Cron expression support (5 fields: minute hour day-of-month month day-of-week).
+// Cron expression support. Accepts 5 fields
+// (minute hour day-of-month month day-of-week) or 6 fields
+// (second minute hour day-of-month month day-of-week), matching Python
+// croniter semantics where the leading field is seconds.
 //
 // Supported per field:
 //   - `*`                any value
@@ -37,8 +40,10 @@ type fieldSpec struct {
 	rangeAny bool
 }
 
-// cronSchedule is a parsed 5-field cron expression.
+// cronSchedule is a parsed cron expression. sec is nil for 5-field (minute
+// granularity) expressions and set for 6-field (seconds granularity) ones.
 type cronSchedule struct {
+	sec                           *fieldSpec
 	minute, hour, dom, month, dow *fieldSpec
 }
 
@@ -75,27 +80,35 @@ func ParseRunAt(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("run_at must be ISO datetime, e.g. 2026-02-02T08:00:00+08:00")
 }
 
-// ParseCron parses a 5-field cron expression.
+// ParseCron parses a 5-field or 6-field cron expression. A 6-field expression
+// is seconds-first (croniter style): "sec min hour dom mon dow".
 func ParseCron(expr string) (*cronSchedule, error) {
 	fields := strings.Fields(strings.TrimSpace(expr))
-	if len(fields) != 5 {
-		return nil, fmt.Errorf("cron expression must have 5 fields, got %d: %q", len(fields), expr)
+	if len(fields) != 5 && len(fields) != 6 {
+		return nil, fmt.Errorf("cron expression must have 5 or 6 fields, got %d: %q", len(fields), expr)
 	}
 	s := &cronSchedule{}
 	var err error
-	if s.minute, err = parseField(fields[0], 0, 59, nil); err != nil {
+	off := 0
+	if len(fields) == 6 {
+		if s.sec, err = parseField(fields[0], 0, 59, nil); err != nil {
+			return nil, fmt.Errorf("second: %w", err)
+		}
+		off = 1
+	}
+	if s.minute, err = parseField(fields[off], 0, 59, nil); err != nil {
 		return nil, fmt.Errorf("minute: %w", err)
 	}
-	if s.hour, err = parseField(fields[1], 0, 23, nil); err != nil {
+	if s.hour, err = parseField(fields[off+1], 0, 23, nil); err != nil {
 		return nil, fmt.Errorf("hour: %w", err)
 	}
-	if s.dom, err = parseField(fields[2], 1, 31, nil); err != nil {
+	if s.dom, err = parseField(fields[off+2], 1, 31, nil); err != nil {
 		return nil, fmt.Errorf("day-of-month: %w", err)
 	}
-	if s.month, err = parseField(fields[3], 1, 12, monthNames); err != nil {
+	if s.month, err = parseField(fields[off+3], 1, 12, monthNames); err != nil {
 		return nil, fmt.Errorf("month: %w", err)
 	}
-	if s.dow, err = parseField(fields[4], 0, 7, dowNames); err != nil {
+	if s.dow, err = parseField(fields[off+4], 0, 7, dowNames); err != nil {
 		return nil, fmt.Errorf("day-of-week: %w", err)
 	}
 	// Normalize dow 7 -> 0 (Sunday) so the spec is consistent.
@@ -226,10 +239,28 @@ func (f *fieldSpec) matches(v int) bool {
 	return f.values[v]
 }
 
+// dayMatches applies cron's day-of-month / day-of-week union-or-and semantics.
+func (s *cronSchedule) dayMatches(d int, weekday time.Weekday) bool {
+	domMatch := s.dom.matches(d)
+	dowMatch := s.dow.matches(int(weekday))
+	switch {
+	case s.dom.any && !s.dow.any:
+		return dowMatch
+	case !s.dom.any && s.dow.any:
+		return domMatch
+	case s.dom.any && s.dow.any:
+		return true
+	}
+	return domMatch || dowMatch
+}
+
 // Next returns the next time after `after` matching the schedule (in the same
 // location as `after`).
 func (s *cronSchedule) Next(after time.Time) time.Time {
 	loc := after.Location()
+	if s.sec != nil {
+		return s.nextSeconds(after, loc)
+	}
 	t := after.Truncate(time.Minute).Add(time.Minute)
 	// Safety bound: ~5 years of per-minute iterations (never reached for a
 	// valid schedule; time.Date normalizes overflowing fields).
@@ -241,18 +272,7 @@ func (s *cronSchedule) Next(after time.Time) time.Time {
 			t = time.Date(y, time.Month(int(m)+1), 1, 0, 0, 0, 0, loc)
 			continue
 		}
-		domMatch := s.dom.matches(d)
-		dowMatch := s.dow.matches(int(t.Weekday()))
-		dayMatch := domMatch || dowMatch
-		switch {
-		case s.dom.any && !s.dow.any:
-			dayMatch = dowMatch
-		case !s.dom.any && s.dow.any:
-			dayMatch = domMatch
-		case s.dom.any && s.dow.any:
-			dayMatch = true
-		}
-		if !dayMatch {
+		if !s.dayMatches(d, t.Weekday()) {
 			t = time.Date(y, m, d+1, 0, 0, 0, 0, loc)
 			continue
 		}
@@ -262,6 +282,41 @@ func (s *cronSchedule) Next(after time.Time) time.Time {
 		}
 		if !s.minute.matches(mn) {
 			t = time.Date(y, m, d, h, mn+1, 0, 0, loc)
+			continue
+		}
+		return t
+	}
+	return time.Time{}
+}
+
+// nextSeconds computes the next fire time for a 6-field (seconds) schedule,
+// iterating at second granularity. Jumps keep the iteration count tiny even
+// though the safety bound spans multiple years.
+func (s *cronSchedule) nextSeconds(after time.Time, loc *time.Location) time.Time {
+	t := after.Truncate(time.Second).Add(time.Second)
+	for i := 0; i < 366*24*60*60*3; i++ {
+		y, m, d := t.Date()
+		h := t.Hour()
+		mn := t.Minute()
+		sc := t.Second()
+		if !s.month.matches(int(m)) {
+			t = time.Date(y, time.Month(int(m)+1), 1, 0, 0, 0, 0, loc)
+			continue
+		}
+		if !s.dayMatches(d, t.Weekday()) {
+			t = time.Date(y, m, d+1, 0, 0, 0, 0, loc)
+			continue
+		}
+		if !s.hour.matches(h) {
+			t = time.Date(y, m, d, h+1, 0, 0, 0, loc)
+			continue
+		}
+		if !s.minute.matches(mn) {
+			t = time.Date(y, m, d, h, mn+1, 0, 0, loc)
+			continue
+		}
+		if !s.sec.matches(sc) {
+			t = time.Date(y, m, d, h, mn, sc+1, 0, loc)
 			continue
 		}
 		return t

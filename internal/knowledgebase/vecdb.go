@@ -161,14 +161,19 @@ func ChunkText(text string, chunkSize, chunkOverlap int) []string {
 	}
 	var chunks []string
 	step := chunkSize - chunkOverlap
-	for start := 0; start < len(runes); start += step {
+	// nextStart 记录实际消费位置：按换行截断时，下一 chunk 起点同步前移到截断
+	// 点，避免 [截断点, start+step) 区间不属于任何 chunk 造成文本静默丢失。
+	nextStart := 0
+	for start := 0; start < len(runes); {
 		end := start + chunkSize
 		if end > len(runes) {
 			end = len(runes)
 		}
 		content := string(runes[start:end])
+		consumed := end
 		if nl := strings.LastIndex(content, "\n"); nl > chunkSize/2 {
 			content = content[:nl]
+			consumed = start + nl
 		}
 		content = strings.TrimSpace(content)
 		if content != "" {
@@ -177,6 +182,16 @@ func ChunkText(text string, chunkSize, chunkOverlap int) []string {
 		if end == len(runes) {
 			break
 		}
+		// 下一 chunk 起点为 max(start+step, 实际消费位置) 中的较小者：若换行
+		// 截断把有效结尾前移（nl < step），则从截断点续上，保证无缝隙。
+		nextStart = start + step
+		if consumed < nextStart {
+			nextStart = consumed
+		}
+		if nextStart <= start {
+			nextStart = start + step
+		}
+		start = nextStart
 	}
 	return chunks
 }

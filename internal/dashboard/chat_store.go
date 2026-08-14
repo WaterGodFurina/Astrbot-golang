@@ -56,7 +56,8 @@ func (cs *chatStore) save() error {
 		return err
 	}
 	// 原子写：先写临时文件并 Sync，再 Rename，避免中途崩溃留下半截 JSON。
-	return writeFileAtomic(cs.path, data, 0644)
+	// 0600：聊天记录含完整对话，仅当前用户可读。
+	return writeFileAtomic(cs.path, data, 0600)
 }
 
 // writeFileAtomic 将 data 原子地写入 path（临时文件 + fsync + rename）。

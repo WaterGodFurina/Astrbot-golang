@@ -103,22 +103,32 @@ func (c *MCPClient) Connect(ctx context.Context) error {
 		return err
 	}
 	c.cl = cl
+	// Any failure after this point must tear down the client (for stdio this
+	// kills/wait the subprocess) and reset state so the client is not reported
+	// as active while holding a half-open connection.
+	fail := func(err error) error {
+		_ = cl.Close()
+		c.cl = nil
+		c.active = false
+		c.tools = nil
+		return err
+	}
 
 	if err := cl.Start(ctx); err != nil {
 		mcpLogger.Error("MCP server %s start failed: %v", c.name, err)
-		return fmt.Errorf("MCP start failed: %w", err)
+		return fail(fmt.Errorf("MCP start failed: %w", err))
 	}
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{Name: "astrbot-go", Version: "1.0.0"}
 	if _, err := cl.Initialize(ctx, initReq); err != nil {
 		mcpLogger.Error("MCP server %s initialize failed: %v", c.name, err)
-		return fmt.Errorf("MCP initialize failed: %w", err)
+		return fail(fmt.Errorf("MCP initialize failed: %w", err))
 	}
 
 	if err := c.listTools(ctx); err != nil {
 		mcpLogger.Error("MCP server %s list tools failed: %v", c.name, err)
-		return err
+		return fail(err)
 	}
 	mcpLogger.Debug("MCP server %s connected: %d tools", c.name, len(c.tools))
 	return nil
@@ -205,7 +215,16 @@ func mcpContentToMap(content mcp.Content) map[string]interface{} {
 		return map[string]interface{}{"type": "audio", "data": v.Data, "mimeType": v.MIMEType}
 	case mcp.EmbeddedResource:
 		return map[string]interface{}{"type": "resource", "resource": v.Resource}
+	case mcp.ResourceLink:
+		text := v.URI
+		if v.Name != "" {
+			text = v.Name + ": " + v.URI
+		}
+		return map[string]interface{}{"type": "text", "text": text}
 	default:
+		if b, err := json.Marshal(content); err == nil {
+			return map[string]interface{}{"type": "text", "text": string(b)}
+		}
 		return map[string]interface{}{"type": "text", "text": fmt.Sprintf("%v", content)}
 	}
 }
@@ -252,17 +271,37 @@ func (c *MCPClient) Cleanup() {
 
 // Reconnect tears down the current connection and establishes a fresh one.
 // Used by callers after a transport failure (e.g. SSE connection lost).
-func (c *MCPClient) Reconnect(ctx context.Context) error {
+//
+// expected is the underlying *client.Client the caller's failed call used.
+// Under reconnectMu we double-check the live connection: if it has already been
+// replaced by a concurrent Reconnect, this is a no-op so a burst of concurrent
+// failures cannot tear down a freshly rebuilt connection (reconnect storm).
+func (c *MCPClient) Reconnect(ctx context.Context, expected *client.Client) error {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+	c.mu.Lock()
+	cur := c.cl
+	c.mu.Unlock()
+	if cur != nil && cur != expected {
+		return nil
+	}
 	// Cleanup 会关闭并清空 cl，与并发的 Connect/CallTool 交错时可能重入破坏状态。
 	// 用独立的 reconnectMu 串行化整段操作；内部 Connect 自行持 c.mu，二者不同
 	// 锁序，不会死锁。
-	c.reconnectMu.Lock()
-	defer c.reconnectMu.Unlock()
 	c.Cleanup()
 	c.mu.Lock()
 	c.active = true
 	c.mu.Unlock()
 	return c.Connect(ctx)
+}
+
+// Conn returns the underlying mcp-go client handle currently in use, or nil
+// when not connected. Callers pass the handle their failed call observed into
+// Reconnect so a concurrent reconnect is not torn down twice.
+func (c *MCPClient) Conn() *client.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cl
 }
 
 // configStringSlice reads a []interface{} config value as []string.

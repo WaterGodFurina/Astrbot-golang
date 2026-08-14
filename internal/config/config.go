@@ -177,17 +177,14 @@ func New(configPath string, defaults map[string]interface{}, schema map[string]i
 	}
 
 	hasNew := checkConfigIntegrity(defaults, conf, "")
+	cfg.data = conf
 	if hasNew {
-		data, err := json.MarshalIndent(conf, "", "    ")
-		if err != nil {
-			return nil, fmt.Errorf("marshal config: %w", err)
-		}
-		if err := os.WriteFile(configPath, data, 0644); err != nil {
+		// Reuse save() for the integrity write-back so it is atomic
+		// (temp file + rename) instead of a plain non-atomic os.WriteFile.
+		if err := cfg.save(4); err != nil {
 			return nil, fmt.Errorf("write config: %w", err)
 		}
 	}
-
-	cfg.data = conf
 	return cfg, nil
 }
 
@@ -565,12 +562,25 @@ func (c *AstrBotConfig) Load() error {
 		return fmt.Errorf("parse config JSON: %w", err)
 	}
 	hasNew := checkConfigIntegrity(c.defaultConf, conf, "")
-	if hasNew {
-		data, _ := json.MarshalIndent(conf, "", "    ")
-		_ = os.WriteFile(c.configPath, data, 0644)
-	}
+	c.mu.Lock()
 	c.data = conf
+	c.mu.Unlock()
+	if hasNew {
+		// Atomic write-back (temp file + rename) via save().
+		if err := c.save(4); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// ResetToDefaults replaces the current data with a copy of the defaults.
+// Used to keep the process running on defaults when a corrupt config file
+// cannot be parsed (the alternative would be silently running on an empty map).
+func (c *AstrBotConfig) ResetToDefaults() {
+	c.mu.Lock()
+	c.data = copyMap(c.defaultConf)
+	c.mu.Unlock()
 }
 
 // schemaToDefaultsMap converts a SchemaNode tree to a default value map.

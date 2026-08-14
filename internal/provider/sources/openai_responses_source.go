@@ -69,6 +69,7 @@ type OpenAIResponsesSource struct {
 	apiBase       string
 	apiKey        string
 	client        *http.Client
+	streamClient  *http.Client
 	customHeaders map[string]string
 }
 
@@ -78,6 +79,7 @@ func NewOpenAIResponsesSource(config, settings map[string]interface{}) *OpenAIRe
 	s := &OpenAIResponsesSource{
 		BaseProvider:  bp,
 		client:        &http.Client{Timeout: 120 * time.Second},
+		streamClient:  newStreamClient(),
 		customHeaders: map[string]string{},
 	}
 	s.apiBase = configString(config, "api_base", "https://api.openai.com/v1")
@@ -155,7 +157,7 @@ func (s *OpenAIResponsesSource) GetModels(ctx context.Context) ([]string, error)
 // TextChat sends a non-streaming Responses API request.
 func (s *OpenAIResponsesSource) TextChat(ctx context.Context, req *provider.ProviderRequest) (*provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, false)
-	resp, err := s.doRequest(ctx, body)
+	resp, err := s.doRequest(ctx, body, s.client)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +183,7 @@ func (s *OpenAIResponsesSource) TextChat(ctx context.Context, req *provider.Prov
 // TextChatStream sends a streaming Responses API request (SSE events).
 func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provider.ProviderRequest) (<-chan *provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, true)
-	resp, err := s.doRequest(ctx, body)
+	resp, err := s.doRequest(ctx, body, s.streamClient)
 	if err != nil {
 		return nil, err
 	}
@@ -201,6 +203,7 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 			callID, name, args string
 		}
 		calls := map[string]*callAcc{}
+		var callOrder []string
 		content := new(strings.Builder)
 		reasoning := new(strings.Builder)
 		var responseID string
@@ -256,6 +259,7 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 					if acc == nil {
 						acc = &callAcc{}
 						calls[event.Item.ID] = acc
+						callOrder = append(callOrder, event.Item.ID)
 					}
 					acc.callID = event.Item.CallID
 					acc.name = event.Item.Name
@@ -281,7 +285,11 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 			}
 			return false
 		})
-		_ = reader.scan()
+		if err := reader.scan(); err != nil {
+			logger.Warn("Responses API stream read error: %v", err)
+			ch <- &provider.LLMResponse{Role: "err", CompletionText: fmt.Sprintf("Responses API stream read error: %v", err)}
+			return
+		}
 
 		if final == nil {
 			// Stream ended without a terminal event: consolidate accumulated state.
@@ -294,7 +302,8 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 				ToolsCallName:    []string{},
 				ToolsCallIDs:     []string{},
 			}
-			for _, acc := range calls {
+			for _, id := range callOrder {
+				acc := calls[id]
 				argsMap := map[string]interface{}{}
 				if acc.args != "" {
 					_ = json.Unmarshal([]byte(acc.args), &argsMap)
@@ -318,7 +327,8 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 				final.ID = responseID
 			}
 			if len(final.ToolsCallArgs) == 0 && len(calls) > 0 {
-				for _, acc := range calls {
+				for _, id := range callOrder {
+					acc := calls[id]
 					argsMap := map[string]interface{}{}
 					if acc.args != "" {
 						_ = json.Unmarshal([]byte(acc.args), &argsMap)
@@ -724,7 +734,7 @@ func (s *OpenAIResponsesSource) isDeepseek() bool {
 	return strings.Contains(s.apiBase, "api.deepseek.com")
 }
 
-func (s *OpenAIResponsesSource) doRequest(ctx context.Context, body map[string]interface{}) (*http.Response, error) {
+func (s *OpenAIResponsesSource) doRequest(ctx context.Context, body map[string]interface{}, client *http.Client) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
@@ -741,5 +751,5 @@ func (s *OpenAIResponsesSource) doRequest(ctx context.Context, body map[string]i
 	for k, v := range s.customHeaders {
 		httpReq.Header.Set(k, v)
 	}
-	return s.client.Do(httpReq)
+	return client.Do(httpReq)
 }

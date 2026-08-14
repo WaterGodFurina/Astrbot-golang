@@ -2,7 +2,9 @@ package t2i
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/fogleman/gg"
 	"image"
@@ -122,6 +124,28 @@ func TestRenderTextWithEmoji(t *testing.T) {
 		t.Fatal("empty image")
 	}
 	t.Logf("emoji image %dx%d (%d bytes)", img.Bounds().Dx(), img.Bounds().Dy(), len(data))
+}
+
+func TestConcurrentRenderNoRace(t *testing.T) {
+	// Rendering must be safe across goroutines: the shared font cache holds a
+	// concurrency-safe *truetype.Font and each render creates its own face.
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := RenderTextToPNG(fmt.Sprintf("并发渲染测试 %d", i), ImageOptions{FontPath: "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"})
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("render %d: %v", i, err)
+		}
+	}
 }
 
 func hasNonBackgroundPixel(img image.Image, bg color.RGBA) bool {

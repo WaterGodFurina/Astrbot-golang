@@ -54,8 +54,13 @@ type Adapter struct {
 	evIDTime map[string]time.Time
 	mu       sync.Mutex
 
-	mediaBaseURL string
-	stopCh       chan struct{}
+	mediaBaseURL    string
+	callbackAPIBase string
+	stopCh          chan struct{}
+	stopOnce        sync.Once
+
+	// mediaMu 保护 mediaBaseURL 的读写（并发 Send 竞争）。
+	mediaMu sync.Mutex
 }
 
 // replyTokenEntry 记录 replyToken 及其接收时间。
@@ -82,6 +87,11 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	}
 	a.lineAPI, _ = NewLineAPIClient(channelAccessToken, channelSecret)
 	a.webhookID, _ = config["webhook_uuid"].(string)
+	if v, ok := config["callback_api_base"].(string); ok && v != "" {
+		a.callbackAPIBase = v
+	} else if v, ok := settings["callback_api_base"].(string); ok && v != "" {
+		a.callbackAPIBase = v
+	}
 	return a
 }
 
@@ -115,7 +125,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 
 // Stop 关闭适配器。
 func (a *Adapter) Stop() error {
-	close(a.stopCh)
+	a.stopOnce.Do(func() { close(a.stopCh) })
 	lineLogger.I18nInfo("LINE 适配器已关闭")
 	return nil
 }
@@ -130,7 +140,8 @@ func (a *Adapter) WebhookCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "LINE 适配器未初始化", http.StatusInternalServerError)
 		return
 	}
-	rawBody, err := io.ReadAll(r.Body)
+	// 限制请求体大小（对应 lark 的 1MB 限制），防止超大报文打爆内存。
+	rawBody, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		http.Error(w, "读取请求体失败", http.StatusBadRequest)
 		return
@@ -162,9 +173,12 @@ func (a *Adapter) WebhookCallback(w http.ResponseWriter, r *http.Request) {
 
 // handleWebhookEvent 处理整个 webhook payload（对应 Python 的 handle_webhook_event）。
 func (a *Adapter) handleWebhookEvent(payload map[string]interface{}) {
+	a.sweepReplyTokens()
 	if destination, ok := payload["destination"].(string); ok {
 		if d := strings.TrimSpace(destination); d != "" {
+			a.mu.Lock()
 			a.destination = d
+			a.mu.Unlock()
 		}
 	}
 
@@ -214,12 +228,14 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 	}
 
 	sourceType, _ := source["type"].(string)
-	userID := strings.TrimSpace(fmt.Sprintf("%v", source["userId"]))
-	groupID := strings.TrimSpace(fmt.Sprintf("%v", source["groupId"]))
-	roomID := strings.TrimSpace(fmt.Sprintf("%v", source["roomId"]))
+	userID := strings.TrimSpace(stringVal(source["userId"]))
+	groupID := strings.TrimSpace(stringVal(source["groupId"]))
+	roomID := strings.TrimSpace(stringVal(source["roomId"]))
 
 	abm := platform.NewAstrBotMessage()
+	a.mu.Lock()
 	abm.SelfID = a.destination
+	a.mu.Unlock()
 	if abm.SelfID == "" {
 		abm.SelfID = a.ID()
 	}
@@ -227,16 +243,18 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 	abm.RawMessage = event
 
 	// 消息 ID：优先 message.id，其次 webhookEventId、deliveryId
-	msgID := fmt.Sprintf("%v", msg["id"])
-	if msgID == "<nil>" || msgID == "" {
-		msgID = event["webhookEventId"].(string)
-	}
-	if msgID == "" || msgID == "<nil>" {
-		if dc, ok := event["deliveryContext"].(map[string]interface{}); ok {
-			msgID = fmt.Sprintf("%v", dc["deliveryId"])
+	msgID := stringVal(msg["id"])
+	if msgID == "" {
+		if id, ok := event["webhookEventId"].(string); ok {
+			msgID = id
 		}
 	}
-	if msgID == "" || msgID == "<nil>" {
+	if msgID == "" {
+		if dc, ok := event["deliveryContext"].(map[string]interface{}); ok {
+			msgID = stringVal(dc["deliveryId"])
+		}
+	}
+	if msgID == "" {
 		msgID = randomHex(16)
 	}
 	abm.MessageID = msgID
@@ -312,11 +330,31 @@ func truncateNick(m *platform.MessageMember) {
 	m.Nickname = nick
 }
 
+// stringVal 安全的 interface{} → string 转换，缺失/非法值返回空串
+// （避免 fmt.Sprintf("%v") 对缺失字段产生 "<nil>" 字面量）。
+func stringVal(v interface{}) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// sweepReplyTokens 清理过期的 replyToken，防止只增不减。
+func (a *Adapter) sweepReplyTokens() {
+	a.rtMu.Lock()
+	defer a.rtMu.Unlock()
+	for session, entry := range a.replyTokens {
+		if time.Since(entry.at) > replyTokenTTL {
+			delete(a.replyTokens, session)
+		}
+	}
+}
+
 // parseLineMessageComponents 解析 LINE 消息内容为消息组件。
 // 对应 Python 的 _parse_line_message_components。
 func (a *Adapter) parseLineMessageComponents(msg map[string]interface{}) []message.Component {
 	msgType, _ := msg["type"].(string)
-	messageID := strings.TrimSpace(fmt.Sprintf("%v", msg["id"]))
+	messageID := strings.TrimSpace(stringVal(msg["id"]))
 
 	switch msgType {
 	case "text":
@@ -412,7 +450,7 @@ func parseTextWithMentions(text string, mentionObj map[string]interface{}) []mes
 		}
 		mentionType, _ := m.item["type"].(string)
 		if mentionType == "user" {
-			targetID := strings.TrimSpace(fmt.Sprintf("%v", m.item["userId"]))
+			targetID := strings.TrimSpace(stringVal(m.item["userId"]))
 			ret = append(ret, &message.At{TargetID: targetID, Name: strings.TrimPrefix(label, "@")})
 		} else {
 			ret = append(ret, &message.Plain{Text: label})
@@ -480,7 +518,7 @@ func (a *Adapter) buildFileComponent(messageID string, msg map[string]interface{
 	if err != nil || content == nil {
 		return nil
 	}
-	defaultName := strings.TrimSpace(fmt.Sprintf("%v", msg["fileName"]))
+	defaultName := strings.TrimSpace(stringVal(msg["fileName"]))
 	if defaultName == "" {
 		defaultName = messageID + ".bin"
 	}
@@ -506,13 +544,12 @@ func getExternalContentURL(msg map[string]interface{}) string {
 	if ptype, _ := provider["type"].(string); ptype != "external" {
 		return ""
 	}
-	return strings.TrimSpace(fmt.Sprintf("%v", provider["originalContentUrl"]))
+	return strings.TrimSpace(stringVal(provider["originalContentUrl"]))
 }
 
 // storeTempContent 把内容写入临时目录并返回文件路径。
 // 对应 Python 的 _store_temp_content：文件名前缀含内容类型与消息 ID。
 func storeTempContent(contentType, messageID string, content []byte, suffix, originalName string) string {
-	tempDir := os.TempDir()
 	namePrefix := "line_" + contentType
 	if originalName != "" {
 		safeStem := sanitizeStem(filepath.Base(originalName))
@@ -523,16 +560,41 @@ func storeTempContent(contentType, messageID string, content []byte, suffix, ori
 			namePrefix = safeStem
 		}
 	}
-	fileName := fmt.Sprintf("%s_%s_%s%s", namePrefix, messageID, randomHex(6), suffix)
-	filePath := filepath.Join(tempDir, fileName)
-	if err := os.MkdirAll(tempDir, 0o755); err == nil {
-		_ = os.WriteFile(filePath, content, 0o644)
+	tmp, err := os.CreateTemp("", namePrefix+"_*"+suffix)
+	if err != nil {
+		lineLogger.I18nWarn("[LINE] 创建临时文件失败: %v", err)
+		return ""
 	}
-	if resolved, err := filepath.Abs(filePath); err == nil {
+	name := tmp.Name()
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		_ = os.Remove(name)
+		return ""
+	}
+	tmp.Close()
+	scheduleLineTempCleanup(name)
+	if resolved, err := filepath.Abs(name); err == nil {
 		return resolved
 	}
-	return filePath
+	return name
 }
+
+// scheduleLineTempCleanup 在延迟后删除临时文件（LINE 在发送后立即回源拉取媒体，
+// 延迟清理保证媒体在消息处理期间可用）。
+func scheduleLineTempCleanup(path string) {
+	if path == "" {
+		return
+	}
+	time.AfterFunc(lineTempCleanupDelay, func() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			lineLogger.I18nWarn("[LINE] 清理临时文件失败 %s: %v", path, err)
+		}
+	})
+}
+
+// lineTempCleanupDelay 是临时媒体文件清理延迟：消息在事件总线中同步处理，
+// 回复在数十秒内完成，延迟清理保证媒体在消费期间可用。
+const lineTempCleanupDelay = time.Hour
 
 // sanitizeStem 将文件名净化：只保留字母数字与 - _ .，去掉首尾的点下划线。
 // 对应 Python 的 safe_stem 处理。

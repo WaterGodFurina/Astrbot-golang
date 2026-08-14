@@ -161,11 +161,17 @@ func (g *GroupChatContext) NeedActiveReply(event *core.Event) bool {
 	return false
 }
 
-// RemoveSession clears all records for a umo (mirrors remove_session).
+// RemoveSession clears all records for a umo (mirrors remove_session). The
+// lock-table entry and the records are removed under the global lock while
+// holding the per-umo lock: the global lock stops new getLock callers from
+// racing a fresh lock into existence, and the per-umo lock serializes with any
+// in-flight HandleMessage/OnReqLLM critical section (L-20).
 func (g *GroupChatContext) RemoveSession(umo string) int {
-	lock := g.getLock(umo)
-	lock.Lock()
-	defer lock.Unlock()
+	g.mu.Lock()
+	lock := g.locks[umo]
+	if lock != nil {
+		lock.Lock()
+	}
 	n := 0
 	if l := g.rawRecords[umo]; l != nil {
 		n = l.Len()
@@ -173,6 +179,10 @@ func (g *GroupChatContext) RemoveSession(umo string) int {
 	delete(g.rawRecords, umo)
 	delete(g.recordIDs, umo)
 	delete(g.locks, umo)
+	if lock != nil {
+		lock.Unlock()
+	}
+	g.mu.Unlock()
 	return n
 }
 

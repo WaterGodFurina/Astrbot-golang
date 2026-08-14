@@ -40,12 +40,13 @@ type PendingResponse struct {
 type WecomAIQueueMgr struct {
 	mu sync.Mutex
 
-	queues           map[string]chan *QueueItem // StreamID → 输入队列
-	backQueues       map[string]chan *QueueItem // StreamID → 输出队列
-	pendingResponses map[string]*PendingResponse
-	completedStreams map[string]time.Time
-	queueCloseEvents map[string]chan struct{}
-	listenerCancels  map[string]func()
+	queues            map[string]chan *QueueItem // StreamID → 输入队列
+	backQueues        map[string]chan *QueueItem // StreamID → 输出队列
+	backQueueLastUsed map[string]time.Time       // StreamID → 输出队列最近使用时间（清理孤立队列用）
+	pendingResponses  map[string]*PendingResponse
+	completedStreams  map[string]time.Time
+	queueCloseEvents  map[string]chan struct{}
+	listenerCancels   map[string]func()
 
 	listenerCallback func(*QueueItem)
 
@@ -53,17 +54,31 @@ type WecomAIQueueMgr struct {
 	backQueueMaxSize int
 }
 
+// queueWriteTimeout 输出队列写入超时，避免队列满时永久阻塞。
+var queueWriteTimeout = 3 * time.Second
+
+// trySendBackQueueItem 尝试向输出队列写入元素，超时返回 false 避免永久阻塞。
+func trySendBackQueueItem(queue chan *QueueItem, item *QueueItem) bool {
+	select {
+	case queue <- item:
+		return true
+	case <-time.After(queueWriteTimeout):
+		return false
+	}
+}
+
 // NewWecomAIQueueMgr 构造队列管理器（queue_maxsize=128, back_queue_maxsize=512）。
 func NewWecomAIQueueMgr() *WecomAIQueueMgr {
 	return &WecomAIQueueMgr{
-		queues:           make(map[string]chan *QueueItem),
-		backQueues:       make(map[string]chan *QueueItem),
-		pendingResponses: make(map[string]*PendingResponse),
-		completedStreams: make(map[string]time.Time),
-		queueCloseEvents: make(map[string]chan struct{}),
-		listenerCancels:  make(map[string]func()),
-		queueMaxSize:     128,
-		backQueueMaxSize: 512,
+		queues:            make(map[string]chan *QueueItem),
+		backQueues:        make(map[string]chan *QueueItem),
+		backQueueLastUsed: make(map[string]time.Time),
+		pendingResponses:  make(map[string]*PendingResponse),
+		completedStreams:  make(map[string]time.Time),
+		queueCloseEvents:  make(map[string]chan struct{}),
+		listenerCancels:   make(map[string]func()),
+		queueMaxSize:      128,
+		backQueueMaxSize:  512,
 	}
 }
 
@@ -88,10 +103,12 @@ func (m *WecomAIQueueMgr) GetOrCreateBackQueue(sessionID string) chan *QueueItem
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if q, ok := m.backQueues[sessionID]; ok {
+		m.backQueueLastUsed[sessionID] = time.Now()
 		return q
 	}
 	q := make(chan *QueueItem, m.backQueueMaxSize)
 	m.backQueues[sessionID] = q
+	m.backQueueLastUsed[sessionID] = time.Now()
 	logger.Debug("[WecomAI] 创建输出队列: %s", sessionID)
 	return q
 }
@@ -104,6 +121,7 @@ func (m *WecomAIQueueMgr) RemoveQueues(sessionID string, markFinished bool) {
 	m.mu.Lock()
 	if _, ok := m.backQueues[sessionID]; ok {
 		delete(m.backQueues, sessionID)
+		delete(m.backQueueLastUsed, sessionID)
 		logger.Debug("[WecomAI] 移除输出队列: %s", sessionID)
 	}
 	if _, ok := m.pendingResponses[sessionID]; ok {
@@ -211,6 +229,21 @@ func (m *WecomAIQueueMgr) CleanupExpiredResponses(maxAgeSeconds int) {
 		logger.Debug("[WecomAI] 清理过期响应及队列: %s", sessionID)
 	}
 	m.mu.Lock()
+	// 清理无 pendingResponse 且长时间未使用的孤立输出队列
+	var orphaned []string
+	for sessionID := range m.backQueues {
+		if _, ok := m.pendingResponses[sessionID]; ok {
+			continue
+		}
+		if lastUsed, ok := m.backQueueLastUsed[sessionID]; ok && now.Sub(lastUsed) > time.Duration(maxAgeSeconds)*time.Second {
+			orphaned = append(orphaned, sessionID)
+		}
+	}
+	for _, sessionID := range orphaned {
+		delete(m.backQueues, sessionID)
+		delete(m.backQueueLastUsed, sessionID)
+		logger.Debug("[WecomAI] 清理孤立输出队列: %s", sessionID)
+	}
 	for sessionID, finishedAt := range m.completedStreams {
 		if now.Sub(finishedAt) > 60*time.Second {
 			delete(m.completedStreams, sessionID)

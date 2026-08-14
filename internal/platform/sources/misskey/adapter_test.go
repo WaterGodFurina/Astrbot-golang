@@ -4,10 +4,16 @@
 package misskey
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	"github.com/gorilla/websocket"
 )
 
 // ---------- 消息链序列化（serialize_message_chain） ----------
@@ -439,11 +445,51 @@ func TestStreamingSubscribeChannel(t *testing.T) {
 		t.Fatal("未连接时订阅应报错")
 	}
 
-	// 期望频道记录（供重连后重订阅）
-	streaming.desiredChannels["main"] = nil
-	if len(streaming.desiredChannels) != 1 {
-		t.Fatalf("desiredChannels 记录错误: %v", streaming.desiredChannels)
+	// 连接后订阅成功并记录 channel_id；重连会清空旧 channel 映射，避免残留
+	server := startTestWSServer(t)
+	streaming.instanceURL = server.URL
+	if !streaming.Connect() {
+		t.Fatal("连接失败")
 	}
+	defer streaming.Disconnect()
+
+	channelID, err := streaming.SubscribeChannel("main", nil)
+	if err != nil {
+		t.Fatalf("已连接订阅失败: %v", err)
+	}
+	if _, ok := streaming.channels[channelID]; !ok {
+		t.Fatalf("channel_id 未记录: %v", streaming.channels)
+	}
+	if len(streaming.channels) != 1 {
+		t.Fatalf("订阅后 channels 数量错误: %d", len(streaming.channels))
+	}
+
+	streaming.UnsubscribeChannel(channelID)
+	if _, ok := streaming.channels[channelID]; ok {
+		t.Fatal("退订后 channel_id 应被移除")
+	}
+}
+
+// startTestWSServer 启动一个接受 WebSocket 升级并等待断开连接的本地测试服务端。
+func startTestWSServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(*http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
 }
 
 func TestStreamURL(t *testing.T) {
@@ -483,4 +529,272 @@ func indexOfStr(s, sub string) int {
 		}
 	}
 	return -1
+}
+
+// ---------- M-30：数值配置兼容 float64 ----------
+
+func TestIntVal(t *testing.T) {
+	cfg := map[string]interface{}{
+		"int":    5,
+		"float":  6.0,
+		"number": json.Number("7"),
+		"str":    "8",
+	}
+	if v := intVal(cfg, "int", 0); v != 5 {
+		t.Fatalf("int 值错误: %d", v)
+	}
+	if v := intVal(cfg, "float", 0); v != 6 {
+		t.Fatalf("float64 值错误: %d", v)
+	}
+	if v := intVal(cfg, "number", 0); v != 7 {
+		t.Fatalf("json.Number 值错误: %d", v)
+	}
+	if v := intVal(cfg, "str", 9); v != 9 {
+		t.Fatalf("非法类型应回落默认值: %d", v)
+	}
+	if v := intVal(cfg, "missing", 10); v != 10 {
+		t.Fatalf("缺失键应回落默认值: %d", v)
+	}
+}
+
+func TestNewReadsFloatConfig(t *testing.T) {
+	// JSON 反序列化后数值均为 float64，配置必须生效而非回落默认值
+	a := New(map[string]interface{}{
+		"id":                          "misskey",
+		"misskey_instance_url":        "https://misskey.example",
+		"misskey_token":               "t",
+		"max_message_length":          float64(1200),
+		"misskey_download_timeout":    float64(20),
+		"misskey_download_chunk_size": float64(8192),
+		"misskey_max_download_bytes":  float64(10485760),
+		"misskey_upload_concurrency":  float64(5),
+	}, nil, nil)
+	if a.maxMessageLength != 1200 {
+		t.Fatalf("max_message_length 错误: %d", a.maxMessageLength)
+	}
+	if a.downloadTimeout != 20 {
+		t.Fatalf("download_timeout 错误: %d", a.downloadTimeout)
+	}
+	if a.downloadChunkSize != 8192 {
+		t.Fatalf("download_chunk_size 错误: %d", a.downloadChunkSize)
+	}
+	if a.maxDownloadBytes != 10485760 {
+		t.Fatalf("max_download_bytes 错误: %d", a.maxDownloadBytes)
+	}
+
+	// 未配置时应回落默认值
+	def := New(nil, nil, nil)
+	if def.maxMessageLength != 3000 || def.downloadTimeout != 15 ||
+		def.downloadChunkSize != 64*1024 || def.maxDownloadBytes != 0 {
+		t.Fatalf("默认值错误: %d %d %d %d", def.maxMessageLength, def.downloadTimeout, def.downloadChunkSize, def.maxDownloadBytes)
+	}
+	// 默认不允许不安全的 TLS 降级
+	if def.allowInsecureDownloads {
+		t.Fatal("allow_insecure_downloads 默认应为关闭")
+	}
+
+	// upload_concurrency 经 intVal 生效且受上限约束
+	a.config["misskey_upload_concurrency"] = float64(99)
+	if v := intVal(a.config, "misskey_upload_concurrency", defaultUploadConcurrency); v != 99 {
+		t.Fatalf("upload_concurrency 错误: %d", v)
+	}
+}
+
+// ---------- M-31：pong 续期读超时 ----------
+
+func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
+	server := startTestWSServer(t)
+	streaming := NewStreamingClient(server.URL, "token")
+	if !streaming.Connect() {
+		t.Fatal("连接失败")
+	}
+	defer streaming.Disconnect()
+
+	// 模拟 Listen 安装的 pong 处理器
+	streaming.conn.SetPongHandler(keepalivePongHandler(streaming.conn))
+	// 先将读超时设到 300ms 后，然后由 pong 续期
+	streaming.conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+
+	readResult := make(chan error, 1)
+	go func() {
+		_, _, err := streaming.conn.ReadMessage()
+		readResult <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	if err := keepalivePongHandler(streaming.conn)(""); err != nil {
+		t.Fatalf("pong 处理失败: %v", err)
+	}
+
+	select {
+	case err := <-readResult:
+		t.Fatalf("pong 续期后读仍返回错误（读超时未刷新）: %v", err)
+	case <-time.After(400 * time.Millisecond):
+		// 仍在阻塞读取，说明 pong 已将读超时续期
+	}
+	// 关闭连接以解除阻塞中的读 goroutine
+	streaming.conn.Close()
+}
+
+func TestStreamingStaysAliveWithPongs(t *testing.T) {
+	// 服务端对每条 ping 回 pong；客户端 Listen 期间不应因读超时断开
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(*http.Request) bool { return true },
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.SetPingHandler(func(appData string) error {
+			return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+		})
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	streaming := NewStreamingClient(server.URL, "token")
+	if !streaming.Connect() {
+		t.Fatal("连接失败")
+	}
+	defer streaming.Disconnect()
+
+	done := make(chan struct{})
+	go func() {
+		streaming.Listen()
+		close(done)
+	}()
+	// 覆盖 2 个心跳周期：若 pong 不续期读超时，Listen 会提前返回
+	select {
+	case <-done:
+		t.Fatal("收到 pong 后连接仍被误判失联")
+	case <-time.After(2500 * time.Millisecond):
+	}
+}
+
+// ---------- M-48：重连清空旧 channel 映射 ----------
+
+func TestConnectClearsChannels(t *testing.T) {
+	server := startTestWSServer(t)
+	streaming := NewStreamingClient(server.URL, "token")
+	if !streaming.Connect() {
+		t.Fatal("连接失败")
+	}
+	defer streaming.Disconnect()
+	if _, err := streaming.SubscribeChannel("main", nil); err != nil {
+		t.Fatalf("订阅失败: %v", err)
+	}
+	if len(streaming.channels) != 1 {
+		t.Fatalf("订阅后 channels 数量错误: %d", len(streaming.channels))
+	}
+	// 重连：旧 channel_id 必须被清空
+	if !streaming.Connect() {
+		t.Fatal("重连失败")
+	}
+	if len(streaming.channels) != 0 {
+		t.Fatalf("重连后 channels 未清空: %v", streaming.channels)
+	}
+}
+
+// ---------- M-49：SSRF 校验 ----------
+
+func TestValidateDownloadURL(t *testing.T) {
+	api := NewMisskeyAPI("https://misskey.example", "t", false, 15, 64*1024, 0)
+
+	// 非 http(s) scheme 拒绝
+	if err := api.validateDownloadURL("ftp://example.com/a.png"); err == nil {
+		t.Fatal("非 http(s) URL 应被拒绝")
+	}
+	// 环回地址拒绝
+	if err := api.validateDownloadURL("http://127.0.0.1/a.png"); err == nil {
+		t.Fatal("环回地址应被拒绝")
+	}
+	// 私网地址拒绝
+	if err := api.validateDownloadURL("http://192.168.1.10/a.png"); err == nil {
+		t.Fatal("私网地址应被拒绝")
+	}
+	// 链路本地/云元数据地址拒绝
+	if err := api.validateDownloadURL("http://169.254.169.254/latest/meta-data/"); err == nil {
+		t.Fatal("云元数据地址应被拒绝")
+	}
+	// 本机 misskey 实例域名放行（自建内网实例仍可下载本站文件）
+	if err := api.validateDownloadURL("https://misskey.example/files/1.png"); err != nil {
+		t.Fatalf("实例域名应放行: %v", err)
+	}
+}
+
+func TestDownloadRedirectGuard(t *testing.T) {
+	api := NewMisskeyAPI("https://misskey.example", "t", false, 15, 64*1024, 0)
+	client := api.downloadClient(true)
+	if client.CheckRedirect == nil {
+		t.Fatal("下载客户端应配置重定向校验")
+	}
+	req, _ := http.NewRequest("GET", "http://192.168.1.1/x", nil)
+	if err := client.CheckRedirect(req, []*http.Request{req}); err == nil {
+		t.Fatal("重定向到内网地址应被拒绝")
+	}
+	req2, _ := http.NewRequest("GET", "https://8.8.8.8/x", nil)
+	if err := client.CheckRedirect(req2, []*http.Request{req2}); err != nil {
+		t.Fatalf("重定向到公网地址应放行: %v", err)
+	}
+}
+
+// ── L-36：Start 配置错误返回 error ───────────────────────────────
+
+func TestStartReturnsErrorOnBadConfig(t *testing.T) {
+	a := New(nil, nil, nil)
+	if err := a.Start(context.Background()); err == nil {
+		t.Fatal("配置不完整时 Start 应返回错误")
+	}
+}
+
+// ── L-36：按 []rune 截断 ─────────────────────────────────────────
+
+func TestTruncateRunes(t *testing.T) {
+	if got := truncateRunes("你好世界", 2); got != "你好" {
+		t.Errorf("truncateRunes(你好世界,2) = %q", got)
+	}
+	if got := truncateRunes("hello", 10); got != "hello" {
+		t.Errorf("truncateRunes(hello,10) = %q", got)
+	}
+	if got := truncateRunes("你好世界", 3); len([]rune(got)) != 3 {
+		t.Errorf("截断结果应为 3 个字符，得到 %q (%d runes)", got, len([]rune(got)))
+	}
+}
+
+// ── L-38：createdAt 时间戳解析 ───────────────────────────────────
+
+func TestParseMisskeyCreatedAt(t *testing.T) {
+	ts, ok := parseMisskeyCreatedAt("2024-01-02T03:04:05.000Z")
+	if !ok || ts != 1704164645 {
+		t.Fatalf("parseMisskeyCreatedAt = %d, ok=%v", ts, ok)
+	}
+	if _, ok := parseMisskeyCreatedAt("not-a-time"); ok {
+		t.Fatal("非法时间应返回 false")
+	}
+	if _, ok := parseMisskeyCreatedAt(nil); ok {
+		t.Fatal("nil 应返回 false")
+	}
+}
+
+func TestConvertNoteMessageTimestamp(t *testing.T) {
+	adapter := New(nil, nil, nil)
+	adapter.botSelfID = "bot-1"
+	adapter.botUsername = "astrbot"
+
+	note := map[string]interface{}{
+		"id":        "note-1",
+		"text":      "@astrbot 你好",
+		"createdAt": "2024-01-02T03:04:05.000Z",
+		"user":      map[string]interface{}{"id": "user-1", "username": "alice"},
+	}
+	abm := adapter.convertMessage(note)
+	if abm.Timestamp != 1704164645 {
+		t.Fatalf("createdAt 应被解析为时间戳，得到 %d", abm.Timestamp)
+	}
 }

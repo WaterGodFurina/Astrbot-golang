@@ -142,15 +142,24 @@ func (m *CronJobManager) SetEnabled(id string, enabled bool) bool {
 	return true
 }
 
-// UpdateJob re-arms and persists an already-existing job after in-place field
-// edits. It preserves the job's Enabled state.
-func (m *CronJobManager) UpdateJob(job *Job) {
+// UpdateJob atomically mutates an existing job under the manager lock, then
+// re-arms and persists it (recomputing NextRun). The mutate callback runs while
+// holding the lock, so the job's fields — including the Payload map — are safe
+// to modify without racing the cron tick goroutine or concurrent List/Get.
+// Returns false when the job does not exist.
+func (m *CronJobManager) UpdateJob(id string, mutate func(*Job)) bool {
 	m.mu.Lock()
-	m.jobs[job.ID] = job
+	job := m.jobs[id]
+	if job == nil {
+		m.mu.Unlock()
+		return false
+	}
+	mutate(job)
 	m.armJobLocked(job)
 	m.computeNextRunLocked(job, time.Now())
 	m.mu.Unlock()
 	m.persist(job)
+	return true
 }
 
 // AddActiveJob creates an active_agent job (cron or one-time run_at).
@@ -160,6 +169,11 @@ func (m *CronJobManager) AddActiveJob(name, cronExpr string, payload map[string]
 	}
 	if !runOnce && cronExpr == "" {
 		return nil, fmt.Errorf("cron_expression is required when run_once=false")
+	}
+	if !runOnce {
+		if _, err := ParseCron(cronExpr); err != nil {
+			return nil, fmt.Errorf("invalid cron_expression %q: %w", cronExpr, err)
+		}
 	}
 	job := &Job{
 		ID:             fmt.Sprintf("job_%d", time.Now().UnixNano()),
@@ -314,24 +328,59 @@ func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 }
 
 // computeNextRunLocked computes the next run time for a job based on its
-// cron expression (recurring) or RunAt (one-time).
+// cron expression (recurring) or RunAt (one-time). If the schedule cannot be
+// computed (missing/invalid cron expression or run_at), the job is pushed far
+// into the future and disabled so a zero NextRun can never make IsDue return
+// true forever (which would fire the job every tick).
 func (m *CronJobManager) computeNextRunLocked(job *Job, now time.Time) {
-	if m.nextRunFn != nil {
-		if t, err := m.nextRunFn(job); err == nil {
-			job.NextRun = t
-		}
+	next, err := m.computeNextRun(job, now)
+	if err != nil {
+		job.Enabled = false
+		job.NextRun = now.Add(cronUnparseableBackoff)
+		logger.Error(
+			"Cron job %s (%s) 无法计算下次执行时间，任务已禁用（cron 表达式请使用 5 或 6 字段格式）: %v",
+			job.ID, job.Name, err,
+		)
 		return
+	}
+	job.NextRun = next
+}
+
+// computeNextRun derives the next fire time without touching manager state.
+func (m *CronJobManager) computeNextRun(job *Job, now time.Time) (time.Time, error) {
+	if m.nextRunFn != nil {
+		t, err := m.nextRunFn(job)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if t.IsZero() {
+			return time.Time{}, fmt.Errorf("schedule never matches")
+		}
+		return t, nil
 	}
 	if job.RunOnce {
-		job.NextRun = job.RunAt
-		return
-	}
-	if job.CronExpression != "" {
-		if sched, err := ParseCron(job.CronExpression); err == nil {
-			job.NextRun = sched.Next(now)
+		if job.RunAt.IsZero() {
+			return time.Time{}, fmt.Errorf("run_once job has no run_at")
 		}
+		return job.RunAt, nil
 	}
+	if job.CronExpression == "" {
+		return time.Time{}, fmt.Errorf("job %s has no cron expression", job.ID)
+	}
+	sched, err := ParseCron(job.CronExpression)
+	if err != nil {
+		return time.Time{}, err
+	}
+	next := sched.Next(now)
+	if next.IsZero() {
+		return time.Time{}, fmt.Errorf("cron expression %q never matches", job.CronExpression)
+	}
+	return next, nil
 }
+
+// cronUnparseableBackoff is how far into the future a job with an
+// unparseable schedule is pushed so it cannot fire repeatedly.
+const cronUnparseableBackoff = 365 * 24 * time.Hour
 
 // Load reloads persisted jobs from the DB and re-arms them with registered
 // handlers.
@@ -344,6 +393,7 @@ func (m *CronJobManager) Load() {
 		logger.I18nWarn("加载定时任务失败: %v", err)
 		return
 	}
+	now := time.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, row := range rows {
@@ -363,9 +413,41 @@ func (m *CronJobManager) Load() {
 				job.Payload = payload
 			}
 		}
+		if job.Payload == nil {
+			job.Payload = map[string]interface{}{}
+		}
+		// The table has no run_at column; run_once jobs persist their schedule
+		// in the payload (payload["run_at"], ISO datetime). Restore it so a
+		// restart never rebuilds a RunOnce job with a zero RunAt — which would
+		// make NextRun zero and fire (then delete) the job immediately.
+		if job.RunOnce {
+			if ra, _ := job.Payload["run_at"].(string); ra != "" {
+				if t, err := time.Parse(time.RFC3339, ra); err == nil {
+					job.RunAt = t
+				} else if t, err := ParseRunAt(ra); err == nil {
+					job.RunAt = t
+				}
+			}
+			if job.RunAt.IsZero() {
+				logger.I18nWarn("run_once 任务 %s（%s）缺少 run_at，已禁用以避免立即误触发", job.ID, job.Name)
+				job.Enabled = false
+			}
+		}
 		m.jobs[job.ID] = job
 		m.armJobLocked(job)
-		m.computeNextRunLocked(job, time.Now())
+		m.computeNextRunLocked(job, now)
+		// A run_once task whose scheduled time already passed while the bot was
+		// down can never fire again on reload (tick would run it once and then
+		// delete it with no chance to honor the original schedule). Drop it
+		// explicitly and warn instead of letting a stale job fire late.
+		if job.RunOnce && !job.RunAt.IsZero() && job.Enabled && !job.NextRun.After(now) {
+			logger.I18nWarn("run_once 任务 %s（%s）原定于 %v 执行，已过期，本次重启后丢弃", job.ID, job.Name, job.RunAt.Format(time.RFC3339))
+			delete(m.jobs, job.ID)
+			if err := m.db.DeleteCronJob(job.ID); err != nil {
+				logger.Error("Failed to delete expired run_once cron job %s: %v", job.ID, err)
+			}
+			continue
+		}
 	}
 	logger.Debug("Loaded %d cron job(s) from database", len(m.jobs))
 }
@@ -373,6 +455,16 @@ func (m *CronJobManager) Load() {
 func (m *CronJobManager) persist(job *Job) {
 	if m.db == nil {
 		return
+	}
+	// run_once jobs persist their schedule in the payload (there is no run_at
+	// column in cron_jobs); Load() restores RunAt from it after a restart.
+	if job.RunOnce && !job.RunAt.IsZero() {
+		if job.Payload == nil {
+			job.Payload = map[string]interface{}{}
+		}
+		if ra, _ := job.Payload["run_at"].(string); ra == "" {
+			job.Payload["run_at"] = job.RunAt.Format(time.RFC3339)
+		}
 	}
 	payloadJSON, err := json.Marshal(job.Payload)
 	if err != nil {

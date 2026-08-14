@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sync"
 )
 
 // LarkWebhookServer implements the Lark webhook event subscription:
@@ -21,6 +22,7 @@ type LarkWebhookServer struct {
 	verifyToken string
 	cipher      cipher.Block
 	callback    func(map[string]interface{})
+	warnOnce    sync.Once
 }
 
 // NewLarkWebhookServer creates a webhook server.
@@ -59,7 +61,7 @@ func (s *LarkWebhookServer) decryptEvent(encrypted string) (map[string]interface
 	if err != nil {
 		return nil, err
 	}
-	if len(enc) < aes.BlockSize {
+	if len(enc) <= aes.BlockSize || (len(enc)-aes.BlockSize)%aes.BlockSize != 0 {
 		return nil, errBadPadding
 	}
 	iv := enc[:aes.BlockSize]
@@ -107,11 +109,13 @@ func (s *LarkWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reques
 		timestamp := r.Header.Get("X-Lark-Request-Timestamp")
 		nonce := r.Header.Get("X-Lark-Request-Nonce")
 		signature := r.Header.Get("X-Lark-Signature")
-		if timestamp != "" && nonce != "" && signature != "" {
-			if !s.verifySignature(timestamp, nonce, signature, body) {
-				writeWebhookError(w, http.StatusUnauthorized, "Invalid signature")
-				return
-			}
+		if timestamp == "" || nonce == "" || signature == "" {
+			writeWebhookError(w, http.StatusUnauthorized, "Missing signature headers")
+			return
+		}
+		if !s.verifySignature(timestamp, nonce, signature, body) {
+			writeWebhookError(w, http.StatusUnauthorized, "Invalid signature")
+			return
 		}
 	}
 
@@ -138,6 +142,14 @@ func (s *LarkWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reques
 			writeWebhookError(w, http.StatusUnauthorized, "Invalid verification token")
 			return
 		}
+	}
+
+	// 未配置 encrypt_key 与 verification_token 时, 事件无法通过任何签名/令牌校验,
+	// 仅提示配置风险, 不阻断流程。
+	if s.encryptKey == "" && s.verifyToken == "" {
+		s.warnOnce.Do(func() {
+			logger.Warn("飞书 Webhook 未配置 encrypt_key 与 verification_token, 事件无法被签名/令牌校验, 存在被伪造的风险")
+		})
 	}
 
 	// URL verification (challenge).

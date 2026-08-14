@@ -264,23 +264,37 @@ func (s *Server) kbRetrieve(kbID, query string, topK int) ([]knowledgebase.Searc
 }
 
 // kbDeleteDoc removes a document: delete its nanovec vectors first (soft
-// kbDeleteDoc removes a document: delete its nanovec vectors first (soft
 // delete), then its SQLite chunk rows (list source of truth).
 func (s *Server) kbDeleteDoc(kbID, docID string) error {
 	if s.database == nil {
 		return nil
 	}
 	chunks, err := s.database.ListKBChunks(kbID, docID)
-	if err == nil && len(chunks) > 0 {
-		if _, dim, derr := s.kbEmbeddingProvider(kbID); derr == nil {
+	if err != nil {
+		return err
+	}
+	if len(chunks) > 0 {
+		if _, dim, derr := s.kbEmbeddingProvider(kbID); derr != nil {
+			logger.I18nWarn("删除文档 %s 的向量失败（嵌入模型不可用: %v），向量库可能残留孤儿向量", docID, derr)
+		} else {
 			lock := kbVecLock(kbID)
 			lock.Lock()
-			if vdb, oerr := knowledgebase.OpenVecDB(s.kbVecDir(kbID), kbID, dim); oerr == nil {
-				for _, c := range chunks {
-					_ = vdb.Delete(c.ChunkID)
+			vdb, oerr := knowledgebase.OpenVecDB(s.kbVecDir(kbID), kbID, dim)
+			if oerr != nil {
+				lock.Unlock()
+				logger.I18nWarn("打开向量库失败，文档 %s 的向量无法删除: %v", docID, oerr)
+				return fmt.Errorf("删除向量索引失败: %w", oerr)
+			}
+			for _, c := range chunks {
+				if err := vdb.Delete(c.ChunkID); err != nil {
+					logger.I18nWarn("删除向量 %s 失败: %v", c.ChunkID, err)
 				}
-				_ = vdb.Vacuum()
-				_ = vdb.Close()
+			}
+			if err := vdb.Vacuum(); err != nil {
+				logger.I18nWarn("向量库压缩失败: %v", err)
+			}
+			if err := vdb.Close(); err != nil {
+				logger.I18nWarn("关闭向量库失败: %v", err)
 			}
 			lock.Unlock()
 		}

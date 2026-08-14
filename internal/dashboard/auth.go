@@ -21,6 +21,7 @@ import (
 
 	"crypto/sha256"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/pquerna/otp/totp"
@@ -38,6 +39,7 @@ var authLogger = log.GetDefault().WithComponent("Auth")
 type PasswordManager struct {
 	mu                     sync.RWMutex
 	configPath             string
+	configMgr              *config.ConfigManager // 注入后 auth 持久化统一走 ConfigManager（M-08）
 	username               string
 	hashedPassword         string // PBKDF2 hash (hex)
 	plainPassword          string // plaintext password (temporary storage)
@@ -151,32 +153,90 @@ func (pm *PasswordManager) generateAndStorePassword() {
 // 校验用的哈希（password_storage_upgraded=true 表示已启用哈希校验）。明文
 // 密码字段在用户通过 SetPassword 设置过时才写入，避免覆盖未知的旧值。
 func (pm *PasswordManager) saveToConfig(plaintextPassword string) {
-	cfg := loadConfigOrNew(pm.configPath)
+	pm.persistDashboard(pm.dashboardAuthFields())
+}
 
-	dash, ok := cfg["dashboard"].(map[string]interface{})
-	if !ok {
-		dash = make(map[string]interface{})
-		cfg["dashboard"] = dash
+// SetConfigManager 注入 ConfigManager，使 auth 的持久化与 ConfigManager.Save
+// 共用同一把内部锁与内存快照，避免"直读文件→改 dashboard 段→原子写回"与
+// ConfigManager 保存互相覆盖（M-08）。
+func (pm *PasswordManager) SetConfigManager(cm interface{}) {
+	pm.mu.Lock()
+	if mgr, ok := cm.(*config.ConfigManager); ok {
+		pm.configMgr = mgr
 	}
+	pm.mu.Unlock()
+}
 
+// dashboardAuthFields 汇总 auth 需要持久化的 dashboard 字段。与
+// injectAuthFields 的回填保持一致（含 jwt_secret 与 totp），确保经
+// ConfigManager 保存时不会丢段（H-24 / M-08）。
+func (pm *PasswordManager) dashboardAuthFields() map[string]interface{} {
 	pm.mu.RLock()
-	dash["username"] = pm.username
-	dash["pbkdf2_password"] = pm.hashedPassword
-	dash["password_change_required"] = pm.passwordChangeRequired
-	dash["password_storage_upgraded"] = true
+	username := pm.username
+	hashed := pm.hashedPassword
 	plain := pm.plainPassword
+	changeReq := pm.passwordChangeRequired
+	secret := pm.jwtSecret
+	totpEnabled := pm.totpEnabled
+	totpSecret := pm.totpSecret
+	recoveryJSON, _ := json.Marshal(pm.totpRecoveryCodes)
 	pm.mu.RUnlock()
+
+	dash := map[string]interface{}{
+		"username":                  username,
+		"pbkdf2_password":           hashed,
+		"password_change_required":  changeReq,
+		"password_storage_upgraded": true,
+		"jwt_secret":                secret,
+		"totp": map[string]interface{}{
+			"enable":             totpEnabled,
+			"secret":             totpSecret,
+			"recovery_code_hash": string(recoveryJSON),
+		},
+	}
 	if plain != "" {
 		dash["password"] = plain
 	}
+	return dash
+}
 
+// persistDashboard 把 dashboard 段写入配置：优先走 ConfigManager（Update 递归
+// 合并 + Save，与 ConfigManager 自己的保存串行化）；无 ConfigManager（独立
+// 模式/单测）时回退为直读文件→合并→原子写回。
+func (pm *PasswordManager) persistDashboard(dash map[string]interface{}) {
+	pm.mu.RLock()
+	cm := pm.configMgr
+	pm.mu.RUnlock()
+	if cm != nil {
+		if cfg := cm.Get("default"); cfg != nil {
+			if err := cfg.Update(map[string]interface{}{"dashboard": dash}); err != nil {
+				authLogger.Error("persistDashboard: config update: %v", err)
+			}
+			return
+		}
+	}
+	pm.writeDashboardDirect(dash)
+}
+
+// writeDashboardDirect 在不经过 ConfigManager 时把 dashboard 段合并写回文件
+// （读取现有配置→覆盖 dashboard 字段→原子写回）。
+func (pm *PasswordManager) writeDashboardDirect(dash map[string]interface{}) {
+	cfg := loadConfigOrNew(pm.configPath)
+	d, ok := cfg["dashboard"].(map[string]interface{})
+	if !ok {
+		d = make(map[string]interface{})
+		cfg["dashboard"] = d
+	}
+	for k, v := range dash {
+		d[k] = v
+	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		authLogger.Error("saveToConfig: marshal config: %v", err)
+		authLogger.Error("writeDashboardDirect: marshal config: %v", err)
 		return
 	}
 	if err := writeConfigFile(pm.configPath, data); err != nil {
-		authLogger.Error("saveToConfig: write config: %v", err)
+		authLogger.Error("writeDashboardDirect: write config: %v", err)
 	}
 }
 
@@ -653,8 +713,14 @@ func (l *loginRateLimiter) Allow(key string, avgInterval, maxBurst float64) bool
 func clientIP(r *http.Request, trustProxy bool) string {
 	if trustProxy {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if idx := strings.IndexByte(xff, ','); idx >= 0 {
-				return strings.TrimSpace(xff[:idx])
+			// 常规反代向 XFF 追加而非覆盖，最右一个非空地址是最近一跳（即
+			// 客户端真实 IP，由可信反代写入）；取首段的话攻击者直接伪造
+			// 第一跳即可获得独立限速桶，绕过暴力破解防护。
+			hops := strings.Split(xff, ",")
+			for i := len(hops) - 1; i >= 0; i-- {
+				if ip := strings.TrimSpace(hops[i]); ip != "" {
+					return ip
+				}
 			}
 			return strings.TrimSpace(xff)
 		}
@@ -690,6 +756,19 @@ func (pm *PasswordManager) TOTPSecret() string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.totpSecret
+}
+
+// TOTPConfig 返回 dashboard.totp 段应持久化的字段，格式与 saveTOTPToConfig
+// 写入一致，供配置整体替换前回填，避免保存 dashboard 时丢 TOTP。
+func (pm *PasswordManager) TOTPConfig() map[string]interface{} {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	recoveryJSON, _ := json.Marshal(pm.totpRecoveryCodes)
+	return map[string]interface{}{
+		"enable":             pm.totpEnabled,
+		"secret":             pm.totpSecret,
+		"recovery_code_hash": string(recoveryJSON),
+	}
 }
 
 // TOTPOtpauthURL 生成 otpauth:// 二维码链接（未启用 TOTP 时返回空串）。
@@ -782,6 +861,30 @@ func (pm *PasswordManager) EnableTOTP(code string) bool {
 	return true
 }
 
+// RegenerateRecoveryCodes 重新生成一批恢复码并返回明文（旧恢复码作废）。
+// 与 GenerateTOTP 不同，它**保留**当前 TOTP 密钥与启用状态，避免把 secret
+// 换成新值导致用户验证器失配（M-07）。
+func (pm *PasswordManager) RegenerateRecoveryCodes() ([]string, error) {
+	pm.mu.RLock()
+	enabled := pm.totpEnabled
+	hasSecret := pm.totpSecret != ""
+	pm.mu.RUnlock()
+	if !enabled || !hasSecret {
+		return nil, fmt.Errorf("TOTP 未启用")
+	}
+	codes := generateRecoveryCodes(10)
+	hashes := make([]string, 0, len(codes))
+	for _, c := range codes {
+		hashes = append(hashes, hashRecoveryCode(c))
+	}
+	pm.mu.Lock()
+	pm.totpRecoveryCodes = hashes
+	pm.mu.Unlock()
+	pm.saveTOTPToConfig()
+	authLogger.Info("Dashboard TOTP 恢复码已重新生成。")
+	return codes, nil
+}
+
 // EnableTOTPNoop 在已有密钥的前提下恢复启用状态（recovery 重新生成恢复码
 // 时 GenerateTOTP 会暂时置为未启用，本方法把它恢复为已启用）。
 func (pm *PasswordManager) EnableTOTPNoop() {
@@ -839,31 +942,7 @@ func (pm *PasswordManager) DisableTOTP() {
 // saveTOTPToConfig 把 TOTP 相关字段写入 config 的 dashboard.totp 段，
 // 恢复码仅以 SHA-256 哈希落盘，不保存明文。
 func (pm *PasswordManager) saveTOTPToConfig() {
-	cfg := make(map[string]interface{})
-	if data, err := os.ReadFile(pm.configPath); err == nil {
-		json.Unmarshal(data, &cfg)
-	}
-
-	dash, ok := cfg["dashboard"].(map[string]interface{})
-	if !ok {
-		dash = make(map[string]interface{})
-		cfg["dashboard"] = dash
-	}
-	totpCfg, ok := dash["totp"].(map[string]interface{})
-	if !ok {
-		totpCfg = make(map[string]interface{})
-		dash["totp"] = totpCfg
-	}
-
-	pm.mu.RLock()
-	totpCfg["enable"] = pm.totpEnabled
-	totpCfg["secret"] = pm.totpSecret
-	recoveryJSON, _ := json.Marshal(pm.totpRecoveryCodes)
-	totpCfg["recovery_code_hash"] = string(recoveryJSON)
-	pm.mu.RUnlock()
-
-	data, _ := json.MarshalIndent(cfg, "", "  ")
-	_ = writeConfigFile(pm.configPath, data)
+	pm.persistDashboard(pm.dashboardAuthFields())
 }
 
 // generateRecoveryCodes 生成 count 个恢复码，每个为 32 位 [A-Z2-7] 随机串，

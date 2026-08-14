@@ -31,13 +31,21 @@ import (
 // chatStreamAdapter captures reply chains from the pipeline for a chat session.
 // It implements platform.PlatformAdapter so platformMgr.Send("dashboard_chat",
 // sessionID, chain) lands here and fans out to SSE subscribers.
+//
+// 同一 session 的多次并发发送可能同时存在多个订阅者。pipeline 的 Send 契约
+// 只携带 sessionID、无法区分 reply 属于哪一次 run，因此按会话内注册顺序
+// （seq）路由：reply 一定产生在对应 run 的 dispatch 过程中，而同一会话的
+// run 在事件总线上串行分发，故取"仍存活且 seq 最小"的订阅者即当前正在
+// dispatch 的 run。订阅者在收到 done 后立即退订，防止下一个 run 的回复
+// 落进自己的 channel。
 type chatStreamAdapter struct {
 	mu          sync.Mutex
-	subscribers map[string]map[chan *message.MessageChain]struct{}
+	seq         uint64
+	subscribers map[string]map[uint64]chan *message.MessageChain // sessionID -> seq -> ch
 }
 
 func newChatStreamAdapter() *chatStreamAdapter {
-	return &chatStreamAdapter{subscribers: make(map[string]map[chan *message.MessageChain]struct{})}
+	return &chatStreamAdapter{subscribers: make(map[string]map[uint64]chan *message.MessageChain)}
 }
 
 func (a *chatStreamAdapter) ID() string   { return "dashboard_chat" }
@@ -47,45 +55,50 @@ func (a *chatStreamAdapter) Type() string { return "dashboard_chat" }
 func (a *chatStreamAdapter) Start(ctx context.Context) error { return nil }
 func (a *chatStreamAdapter) Stop() error                     { return nil }
 
-// Send forwards a reply chain to all subscribers of the session. The channel
-// set is copied under the lock so a concurrent unsubscribe (delete) can never
-// race the map iteration.
+// Send forwards a reply chain to the earliest-registered still-active
+// subscriber of the session. The channel set is copied under the lock so a
+// concurrent unsubscribe (delete) can never race the map iteration.
 func (a *chatStreamAdapter) Send(sessionID string, chain *message.MessageChain) error {
 	a.mu.Lock()
-	targets := make([]chan *message.MessageChain, 0, len(a.subscribers[sessionID]))
-	for ch := range a.subscribers[sessionID] {
-		targets = append(targets, ch)
+	var bestSeq uint64
+	var target chan *message.MessageChain
+	for seq, ch := range a.subscribers[sessionID] {
+		if target == nil || seq < bestSeq {
+			bestSeq = seq
+			target = ch
+		}
 	}
 	a.mu.Unlock()
-	if len(targets) == 0 {
+	if target == nil {
 		return nil
 	}
-	for _, ch := range targets {
-		select {
-		case ch <- chain:
-		default:
-			// Subscriber not draining; drop rather than block the pipeline.
-		}
+	select {
+	case target <- chain:
+	default:
+		// Subscriber not draining; drop rather than block the pipeline.
 	}
 	return nil
 }
 
-func (a *chatStreamAdapter) subscribe(sessionID string) chan *message.MessageChain {
+func (a *chatStreamAdapter) subscribe(sessionID string) (chan *message.MessageChain, uint64) {
 	ch := make(chan *message.MessageChain, 64)
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.subscribers[sessionID] == nil {
-		a.subscribers[sessionID] = make(map[chan *message.MessageChain]struct{})
+		a.subscribers[sessionID] = make(map[uint64]chan *message.MessageChain)
 	}
-	a.subscribers[sessionID][ch] = struct{}{}
-	a.mu.Unlock()
-	return ch
+	a.seq++
+	a.subscribers[sessionID][a.seq] = ch
+	return ch, a.seq
 }
 
-func (a *chatStreamAdapter) unsubscribe(sessionID string, ch chan *message.MessageChain) {
+func (a *chatStreamAdapter) unsubscribe(sessionID string, seq uint64, ch chan *message.MessageChain) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if subs, ok := a.subscribers[sessionID]; ok {
-		delete(subs, ch)
+		if subs[seq] == ch {
+			delete(subs, seq)
+		}
 		if len(subs) == 0 {
 			delete(a.subscribers, sessionID)
 		}
@@ -165,18 +178,20 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 			"llm_checkpoint_id": fmt.Sprintf("c_%d", time.Now().UnixNano()),
 		},
 	})
+	runID := fmt.Sprintf("r_%d", time.Now().UnixNano())
 	sendSSE(w, flusher, map[string]interface{}{
 		"type": "run_started",
-		"data": map[string]interface{}{"run_id": fmt.Sprintf("r_%d", time.Now().UnixNano())},
+		"data": map[string]interface{}{"run_id": runID},
 	})
 
-	// Subscribe to the pipeline reply for this session.
-	ch := s.chatAdapter.subscribe(sessionID)
-	defer s.chatAdapter.unsubscribe(sessionID, ch)
+	// Subscribe to the pipeline reply for this session. runID 标识本次 run，
+	// 即使同一 session 并发发送也不会把别的请求的回复累积进来。
+	ch, subSeq := s.chatAdapter.subscribe(sessionID)
+	defer s.chatAdapter.unsubscribe(sessionID, subSeq, ch)
 
 	// Run the user message through the pipeline; done is closed when the
 	// event finishes processing.
-	done := s.processChatEvent(r.Context(), sessionID, text, body.SelectedProvider, body.SelectedModel, body.Flags)
+	done := s.processChatEvent(r.Context(), sessionID, runID, text, body.SelectedProvider, body.SelectedModel, body.Flags)
 	if done == nil {
 		sendSSE(w, flusher, map[string]interface{}{"type": "error", "data": "对话管道不可用"})
 		sendSSE(w, flusher, map[string]interface{}{"type": "end", "data": nil})
@@ -194,7 +209,9 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 			sendSSE(w, flusher, map[string]interface{}{"type": "end", "data": nil})
 			return
 		case <-done:
-			// Pipeline finished; flush any pending text then complete.
+			// 本 run 的回复在 done 触发前已全部送入 ch；先退订再排空，
+			// 避免同一 session 下一个 run 的回复落到本 channel。
+			s.chatAdapter.unsubscribe(sessionID, subSeq, ch)
 			for {
 				select {
 				case chain := <-ch:
@@ -257,7 +274,7 @@ func emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full *strings.Bui
 // core.PipelineDone signal that the bus closes once the event is dispatched.
 // Fallback: when the bus is unavailable (queue full / no scheduler), run the
 // event through the scheduler directly in a goroutine.
-func (s *Server) processChatEvent(ctx context.Context, sessionID, text, providerID, model string, flags map[string]interface{}) <-chan struct{} {
+func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, providerID, model string, flags map[string]interface{}) <-chan struct{} {
 	bus, ok := s.eventBus.(*core.EventBus)
 	if !ok || bus == nil {
 		return nil
@@ -286,6 +303,9 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, text, provider
 		CallLLM:           true,
 		Metadata:          map[string]interface{}{},
 		Ctx:               ctx,
+	}
+	if runID != "" {
+		event.Metadata["run_id"] = runID
 	}
 	if providerID != "" {
 		event.Metadata["selected_provider"] = providerID
@@ -429,6 +449,11 @@ type wsClient struct {
 	runs  map[string]context.CancelFunc
 }
 
+// wsPingInterval is how often the server sends a WS Ping to keep idle
+// connections within the 10-minute read deadline (browsers only reply pong to
+// a received ping). Exposed as a var so tests can shorten it.
+var wsPingInterval = 4 * time.Minute
+
 // handleUnifiedChatWS serves the WebUI's websocket chat transport
 // (GET /api/v1/unified-chat/ws?token=...). The client sends messages shaped
 // like {ct:"chat", t:"send", session_id, message_id, message:[parts], flags,
@@ -456,6 +481,27 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
 		return nil
 	})
+
+	// 服务端每 4 分钟主动发一次 Ping，否则空闲连接收不到任何帧、读侧
+	// 10 分钟 ReadDeadline 一到就被强制断开。
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go func() {
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPing:
+				return
+			case <-ticker.C:
+				client.writeMu.Lock()
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+					client.cancel()
+				}
+				client.writeMu.Unlock()
+			}
+		}
+	}()
 
 	for {
 		_, raw, err := conn.ReadMessage()
@@ -592,8 +638,8 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 		"message_id": messageID,
 	})
 
-	ch := s.chatAdapter.subscribe(sessionID)
-	defer s.chatAdapter.unsubscribe(sessionID, ch)
+	ch, subSeq := s.chatAdapter.subscribe(sessionID)
+	defer s.chatAdapter.unsubscribe(sessionID, subSeq, ch)
 
 	// Derive a per-run context from the connection so an interrupt can cancel
 	// this specific run (registered by message_id) without tearing down the
@@ -609,7 +655,7 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 		runCancel()
 	}()
 
-	done := s.processChatEvent(runCtx, sessionID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags)
+	done := s.processChatEvent(runCtx, sessionID, messageID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags)
 	if done == nil {
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "error", "data": "对话管道不可用", "message_id": messageID})
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
@@ -626,6 +672,7 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 			s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
 			return
 		case <-done:
+			s.chatAdapter.unsubscribe(sessionID, subSeq, ch)
 			for {
 				select {
 				case chain := <-ch:

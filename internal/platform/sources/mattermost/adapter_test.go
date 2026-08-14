@@ -403,3 +403,46 @@ func TestBuildWSURL(t *testing.T) {
 		t.Fatalf("http 转换错误: %s", got)
 	}
 }
+
+// ── L-37：大小写折叠不改变字节长度 ──────────────────────────────
+
+func TestAsciiLower(t *testing.T) {
+	if got := asciiLower("ABCxyz"); got != "abcxyz" {
+		t.Errorf("asciiLower(ABCxyz) = %q", got)
+	}
+	// 非 ASCII 字符原样保留，字节长度不变
+	s := "İ@Astrbot"
+	if lower := asciiLower(s); len(lower) != len(s) {
+		t.Errorf("asciiLower 应保持字节长度: %d -> %d", len(s), len(lower))
+	}
+}
+
+func TestFindMentionSpansUnicode(t *testing.T) {
+	// İ 经 strings.ToLower 字节长度会变（2→3），旧实现在 lowerText 上取下标
+	// 再对原文切片，导致提及切分错位；asciiLower 保持等长。
+	text := "İ@astrbot hi"
+	spans := findMentionSpans(text, "astrbot")
+	if len(spans) != 1 {
+		t.Fatalf("期望 1 个提及 span，得到 %v", spans)
+	}
+	if spans[0][0] != 2 || spans[0][1] != 10 {
+		t.Fatalf("span 应为 [2,10]，得到 %v", spans)
+	}
+	// 切分后的文本片段应保持完整可读（不包含半截字节/错位）
+	adapter := New(nil, nil, nil)
+	adapter.botSelfID = "bot-1"
+	adapter.botUsername = "astrbot"
+	comps := adapter.parseTextComponents(text)
+	if len(comps) != 3 {
+		t.Fatalf("期望 Plain+At+Plain 三个组件，得到 %d: %v", len(comps), comps)
+	}
+	if plain, ok := comps[0].(*message.Plain); !ok || plain.Text != "İ" {
+		t.Errorf("组件 0 应为 Plain(İ)，得到 %v", comps[0])
+	}
+	if at, ok := comps[1].(*message.At); !ok || at.Name != "astrbot" {
+		t.Errorf("组件 1 应为 At(astrbot)，得到 %v", comps[1])
+	}
+	if plain, ok := comps[2].(*message.Plain); !ok || plain.Text != " hi" {
+		t.Errorf("组件 2 应为 Plain( hi)，得到 %v", comps[2])
+	}
+}

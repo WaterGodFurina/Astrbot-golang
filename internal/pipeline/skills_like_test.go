@@ -84,3 +84,65 @@ func TestLightAndParamToolSchemas(t *testing.T) {
 		t.Fatal("param tool missing full parameters")
 	}
 }
+
+func TestCollectLightToolsDoesNotPolluteMCPCache(t *testing.T) {
+	s := NewProcessStage()
+	s.mcpMu.Lock()
+	s.mcpLoaded = true
+	s.mcpSchemas = map[string]map[string]interface{}{
+		"files.read": {
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "files.read",
+				"description": "MCP 服务器工具（files）: 读取文件",
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"path": map[string]interface{}{
+							"type": "string",
+							"items": []interface{}{
+								map[string]interface{}{"nested": true},
+							},
+						},
+					},
+					"required": []interface{}{"path"},
+				},
+			},
+		},
+	}
+	s.mcpMu.Unlock()
+
+	light := s.collectLightTools("none")
+	var found bool
+	for _, tool := range light {
+		fn, _ := tool["function"].(map[string]interface{})
+		if fn["name"] != "files.read" {
+			continue
+		}
+		found = true
+		params, _ := fn["parameters"].(map[string]interface{})
+		if props, _ := params["properties"].(map[string]interface{}); len(props) != 0 {
+			t.Fatalf("light MCP tool parameters should be empty, got %v", props)
+		}
+	}
+	if !found {
+		t.Fatal("files.read tool missing from light tools")
+	}
+
+	// The cached schema must keep its full parameters after the light pass.
+	s.mcpMu.Lock()
+	defer s.mcpMu.Unlock()
+	cached := s.mcpSchemas["files.read"]
+	fn, _ := cached["function"].(map[string]interface{})
+	params, ok := fn["parameters"].(map[string]interface{})
+	if !ok {
+		t.Fatal("cached MCP tool lost parameters map")
+	}
+	props, _ := params["properties"].(map[string]interface{})
+	if _, ok := props["path"]; !ok {
+		t.Fatalf("cached MCP tool parameters were polluted, got %v", props)
+	}
+	if _, ok := params["required"]; !ok {
+		t.Fatal("cached MCP tool lost required field")
+	}
+}

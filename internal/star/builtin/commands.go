@@ -153,7 +153,9 @@ func nameCmd(deps Deps, e *core.Event) {
 	manualNeeded := platformNeedsManualName(e.Source.Platform)
 
 	if len(al) == 0 || strings.TrimSpace(al[0]) == "" {
+		state.mu.Lock()
 		cur := state.umoAliases[umo]
+		state.mu.Unlock()
 		if manualNeeded {
 			if cur == "" {
 				reply(e, i18n.Get(
@@ -302,6 +304,9 @@ func providerCmd(deps Deps, e *core.Event) {
 				reachability = checkReachability(all)
 			}
 		}
+		state.mu.Lock()
+		selected := state.selectedLLM[umo]
+		state.mu.Unlock()
 		for i, p := range providers {
 			line := i18n.Get("%d. %s (%s)", i+1, p.ID, p.Model)
 			if code, tested := reachability[p.ID]; tested {
@@ -311,7 +316,7 @@ func providerCmd(deps Deps, e *core.Event) {
 					line += i18n.Get(" ❌(errcode: %s)", code)
 				}
 			}
-			if state.selectedLLM[umo] == p.ID {
+			if selected == p.ID {
 				line += i18n.Get(" 👈")
 			}
 			lines = append(lines, line)

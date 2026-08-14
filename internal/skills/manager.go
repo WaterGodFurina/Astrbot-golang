@@ -203,11 +203,14 @@ func NormalizeSkillMarkdownPath(skillDir string) string {
 
 // ListSkills returns all discovered skills.
 func (sm *SkillManager) ListSkills(activeOnly bool, runtime string) []*SkillInfo {
+	// 只在读取配置快照期间持读锁；发现/扫描基于本地副本进行，末尾的自动补全
+	// 保存改在写锁下合并写回（见 persistSkillConfigs），避免读锁下执行磁盘写
+	// 与 SetSkillActive/DeleteSkill 互相覆盖。
 	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-
 	cfg := sm.loadConfig()
 	skillConfigs := cfg.Skills
+	sm.mu.RUnlock()
+
 	modified := false
 	skillsByName := make(map[string]*SkillInfo)
 
@@ -315,8 +318,7 @@ func (sm *SkillManager) ListSkills(activeOnly bool, runtime string) []*SkillInfo
 	}
 
 	if modified {
-		cfg.Skills = skillConfigs
-		sm.saveConfig(cfg)
+		sm.persistSkillConfigs(skillConfigs)
 	}
 
 	result := make([]*SkillInfo, 0, len(skillsByName))
@@ -349,11 +351,28 @@ func (sm *SkillManager) ListSkillsInfo() []map[string]interface{} {
 	return result
 }
 
-// SetSkillActive enables/disables a skill.
+// validateSkillName rejects names that cannot be used as a single directory
+// segment under skillsRoot: empty, ".", "..", or anything containing path
+// separators / illegal characters (aligned with skillNameRe and the safe-join
+// checks used at the other skill path entry points).
+func validateSkillName(name string) error {
+	if name == "" || name == "." || name == ".." || !skillNameRe.MatchString(name) {
+		return fmt.Errorf("非法技能名")
+	}
+	return nil
+}
+
+// SetSkillActive enables/disables a skill. 写路径持写锁，与 ListSkills 的自动
+// 补全保存互斥，避免并发读写 skills.json 互相覆盖。
 func (sm *SkillManager) SetSkillActive(name string, active bool) error {
+	if err := validateSkillName(name); err != nil {
+		return err
+	}
 	if sm.IsSandboxOnlySkill(name) {
 		return fmt.Errorf("sandbox preset skill cannot be enabled/disabled from local skill management")
 	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	cfg := sm.loadConfig()
 	if cfg.Skills == nil {
 		cfg.Skills = make(map[string]map[string]interface{})
@@ -364,6 +383,9 @@ func (sm *SkillManager) SetSkillActive(name string, active bool) error {
 
 // IsSandboxOnlySkill checks if a skill exists only in sandbox cache.
 func (sm *SkillManager) IsSandboxOnlySkill(name string) bool {
+	if validateSkillName(name) != nil {
+		return false
+	}
 	skillMd := NormalizeSkillMarkdownPath(filepath.Join(sm.skillsRoot, name))
 	if skillMd != "" {
 		return false
@@ -377,11 +399,17 @@ func (sm *SkillManager) IsSandboxOnlySkill(name string) bool {
 	return false
 }
 
-// DeleteSkill removes a local skill.
+// DeleteSkill removes a local skill. 写路径持写锁，防止与并发
+// ListSkills/SetSkillActive 的配置保存互相覆盖。
 func (sm *SkillManager) DeleteSkill(name string) error {
+	if err := validateSkillName(name); err != nil {
+		return err
+	}
 	if sm.IsSandboxOnlySkill(name) {
 		return fmt.Errorf("sandbox preset skill cannot be deleted from local skill management")
 	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	skillDir := filepath.Join(sm.skillsRoot, name)
 	if _, err := os.Stat(skillDir); err == nil {
 		if err := os.RemoveAll(skillDir); err != nil {
@@ -458,6 +486,22 @@ func BuildSkillsPrompt(skills []*SkillInfo) string {
 
 // --- internal helpers ---
 
+// persistSkillConfigs merges discovered-skill defaults into skills.json under
+// the write lock. 重读当前配置后再合并，避免覆盖并发 SetSkillActive/DeleteSkill
+// 已写入的其他技能条目。
+func (sm *SkillManager) persistSkillConfigs(updates map[string]map[string]interface{}) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	cfg := sm.loadConfig()
+	if cfg.Skills == nil {
+		cfg.Skills = make(map[string]map[string]interface{})
+	}
+	for name, sc := range updates {
+		cfg.Skills[name] = sc
+	}
+	_ = sm.saveConfig(cfg)
+}
+
 func (sm *SkillManager) loadConfig() skillsConfig {
 	data, err := os.ReadFile(sm.configPath)
 	if err != nil {
@@ -470,9 +514,44 @@ func (sm *SkillManager) loadConfig() skillsConfig {
 	return cfg
 }
 
+// saveConfig writes skills.json atomically: 先写临时文件并 fsync，再 os.Rename
+// 替换，避免并发写/崩溃截断导致配置丢失（与 plugin manifest 的 Save 一致）。
 func (sm *SkillManager) saveConfig(cfg skillsConfig) error {
-	data, _ := json.MarshalIndent(cfg, "", "    ")
-	return os.WriteFile(sm.configPath, data, 0644)
+	data, err := json.MarshalIndent(cfg, "", "    ")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(sm.configPath)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, filepath.Base(sm.configPath)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, sm.configPath); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func (sm *SkillManager) loadSandboxCache() SandboxCache {

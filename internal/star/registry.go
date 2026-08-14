@@ -224,6 +224,9 @@ func (r *StarHandlerRegistry) All() []*StarHandlerMetadata {
 
 // GetHandlersByEventType returns handlers matching the event type.
 // If pluginsName is non-empty, only handlers from those plugins are returned.
+// Ownership is matched via PluginName: subprocess plugin handlers all share the
+// constant module path "data.plugins", so module-path matching could not tell
+// them apart; the real plugin identity lives in PluginName.
 func (r *StarHandlerRegistry) GetHandlersByEventType(et EventType, pluginsName []string) []*StarHandlerMetadata {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -233,10 +236,9 @@ func (r *StarHandlerRegistry) GetHandlersByEventType(et EventType, pluginsName [
 			continue
 		}
 		if len(pluginsName) > 0 {
-			// check if handler's module path matches any plugin
 			matched := false
 			for _, pName := range pluginsName {
-				if h.HandlerModulePath == pName || h.HandlerModulePath == "/"+pName {
+				if h.PluginName == pName {
 					matched = true
 					break
 				}

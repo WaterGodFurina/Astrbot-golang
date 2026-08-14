@@ -297,12 +297,19 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 		return "", "", fmt.Errorf("创建 Clang 安装锁失败: %w", err)
 	}
 	if err := extractClangArchive(ctx, archivePath, root, info.triple); err != nil {
-		_ = os.Remove(lockPath)
+		// 保留安装锁：取消/中断或解压错误时，下次运行会丢弃 root 重来，而不是
+		// 信任半成品 zig。归档本身损坏（非用户取消）时同时清除缓存文件，避免
+		// 损坏归档被"已缓存"逻辑长期信任导致 cgo 安装持续失败。
+		if ctx.Err() == nil {
+			_ = os.Remove(archivePath)
+		}
 		return "", "", fmt.Errorf("解压 C 编译器失败: %w", err)
 	}
 	// Only remove the lock after a clean extract; then verify the zig binary.
 	if cc, cxx, ok := zigCCFromRoot(root); !ok {
-		_ = os.Remove(lockPath)
+		// 解压完成但布局不对（归档损坏/与平台不匹配）：同样保留锁并清除缓存，
+		// 避免下次继续信任这个无法使用的归档。
+		_ = os.Remove(archivePath)
 		return "", "", fmt.Errorf("解压后未找到 zig/clang 可执行文件")
 	} else if err := os.Remove(lockPath); err != nil {
 		return "", "", fmt.Errorf("清理 Clang 安装锁失败: %w", err)
@@ -391,7 +398,7 @@ func downloadClangArchive(ctx context.Context, archive, dest string, progress fu
 		logger.I18nInfo("Clang 压缩包已缓存: %s", dest)
 		return nil
 	}
-	client := &http.Client{Timeout: 30 * time.Minute}
+	client := &http.Client{Timeout: 30 * time.Minute, CheckRedirect: safeRedirect}
 	var lastErr error
 	for _, base := range zigMirrorBases() {
 		url := base + "/" + archive

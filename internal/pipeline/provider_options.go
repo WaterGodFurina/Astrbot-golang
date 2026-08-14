@@ -8,6 +8,7 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -267,6 +268,13 @@ func (s *ProcessStage) compressImageForProvider(urlOrPath string) string {
 	return name
 }
 
+// isCompressTempFile reports whether p is one of the temp files created by
+// compressImageForProvider, so callers can schedule its removal after the
+// request consumes it without risking the original image path.
+func isCompressTempFile(p string) bool {
+	return strings.HasPrefix(filepath.Base(p), "astrbot-compress-")
+}
+
 // imageCompressArgs reads provider_settings.image_compress_enabled/options.
 func (s *ProcessStage) imageCompressArgs() (bool, int, int) {
 	maxSize, quality := 1280, 95
@@ -346,12 +354,15 @@ func (s *ProcessStage) executeToolWithTimeout(event *core.Event, runtime, name s
 	defer cancel()
 	done := make(chan string, 1)
 	go func() {
-		done <- s.executeTool(event, runtime, name, args)
+		done <- s.executeTool(ctx, event, runtime, name, args)
 	}()
 	select {
 	case result := <-done:
 		return result
 	case <-ctx.Done():
+		// The timeout context is cancelled so executors honouring ctx (MCP,
+		// sandbox) abort their underlying call; the goroutine is allowed to
+		// drain in the background so the main path is never blocked.
 		logger.I18nWarn("工具 %s 调用超时（%v），已中断", name, timeout)
 		return fmt.Sprintf("Error: tool %s call timed out after %v", name, timeout)
 	}

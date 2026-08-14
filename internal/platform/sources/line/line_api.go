@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"net/url"
@@ -178,7 +179,7 @@ func readContentResponse(resp *http.Response) *ContentResult {
 	}
 }
 
-// readBody 读取响应体（读取失败时返回空）。
+// readBody 读取响应体（仅 io.EOF 视为正常结束，其他读取错误记录并保留已读部分）。
 func readBody(resp *http.Response) []byte {
 	defer resp.Body.Close()
 	buf := make([]byte, 0, 4096)
@@ -188,7 +189,11 @@ func readBody(resp *http.Response) []byte {
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
 		}
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
+			lineLogger.I18nWarn("[LINE] 读取响应体失败: %v", err)
 			break
 		}
 	}

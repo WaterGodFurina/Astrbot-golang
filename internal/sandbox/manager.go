@@ -165,6 +165,10 @@ func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workd
 	}
 	c := exec.CommandContext(ctx, cmd, args...)
 	c.Dir = dir
+	// 显式设置最小化环境：只保留 PATH（嵌套子进程找命令）、HOME 与本地化变量。
+	// 默认 exec 会继承宿主全部环境变量，沙箱内 `env` 可读到 ASTRBOT_*/API key
+	// 等敏感变量，这里全部剔除。
+	c.Env = localBooterEnv()
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr
@@ -176,6 +180,23 @@ func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workd
 		return stdout.String(), stderr.String(), ee.ExitCode(), nil
 	}
 	return stdout.String(), stderr.String(), -1, err
+}
+
+// localBooterEnv returns the minimal environment for sandbox commands: PATH
+// plus a few locale variables. Host secrets (ASTRBOT_*, API keys, tokens) are
+// deliberately excluded so `env` inside the sandbox cannot leak them.
+func localBooterEnv() []string {
+	path := os.Getenv("PATH")
+	if strings.TrimSpace(path) == "" {
+		path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	env := []string{"PATH=" + path}
+	for _, key := range []string{"HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ"} {
+		if v := os.Getenv(key); v != "" {
+			env = append(env, key+"="+v)
+		}
+	}
+	return env
 }
 
 func (b *LocalBooter) ListSkills(ctx context.Context) ([]skills.SandboxCacheEntry, error) {
@@ -267,6 +288,16 @@ type DockerBooter struct {
 	containerID string
 	name        string
 	image       string
+
+	// 资源/网络隔离参数（可经 ASTRBOT_SANDBOX_* 环境变量覆盖，默认值见
+	// NewDockerBooter）：memory/cpus/pidsLimit 限制容器资源，network 默认
+	// "none" 切断容器网络（设 "full" 等可放行），capDropAll 移除全部
+	// Linux capabilities。
+	memory     string
+	cpus       string
+	pidsLimit  string
+	network    string
+	capDropAll bool
 }
 
 // NewDockerBooter creates a Docker-based sandbox booter.
@@ -275,9 +306,23 @@ func NewDockerBooter(image string) *DockerBooter {
 		image = "ubuntu:22.04"
 	}
 	return &DockerBooter{
-		image: image,
-		name:  fmt.Sprintf("astrbot-sandbox-%d", time.Now().UnixNano()),
+		image:      image,
+		name:       fmt.Sprintf("astrbot-sandbox-%d", time.Now().UnixNano()),
+		memory:     sandboxEnv("ASTRBOT_SANDBOX_MEMORY", "512m"),
+		cpus:       sandboxEnv("ASTRBOT_SANDBOX_CPUS", "1"),
+		pidsLimit:  sandboxEnv("ASTRBOT_SANDBOX_PIDS_LIMIT", "64"),
+		network:    sandboxEnv("ASTRBOT_SANDBOX_NETWORK", "none"),
+		capDropAll: true,
 	}
+}
+
+// sandboxEnv returns the value of an ASTRBOT_SANDBOX_* env override, or the
+// fallback when unset/blank.
+func sandboxEnv(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func (b *DockerBooter) Type() BooterType { return BooterDocker }
@@ -288,25 +333,57 @@ func (b *DockerBooter) Start(ctx context.Context) error {
 	if b.running {
 		return nil
 	}
-	// Reuse an existing managed container if one is still running.
+	// Reuse an existing managed container if it is still running; a stopped
+	// one (e.g. after a host reboot) is restarted, or discarded and rebuilt.
 	if out, err := dockerOutput(ctx, "ps", "-aq", "--filter", "label=astrbot.sandbox=managed"); err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
 			}
-			if _, err := dockerOutput(ctx, "inspect", "-f", "{{.State.Running}}", line); err == nil {
+			running, err := dockerOutput(ctx, "inspect", "-f", "{{.State.Running}}", line)
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(running) == "true" {
 				b.containerID = line
 				b.running = true
 				logger.Debug("Docker sandbox booter reusing container %s", line)
 				return nil
 			}
+			_, startErr := dockerOutput(ctx, "start", line)
+			if startErr == nil {
+				b.containerID = line
+				b.running = true
+				logger.Debug("Docker sandbox booter restarted container %s", line)
+				return nil
+			}
+			logger.I18nWarn("docker start 失败，移除容器 %s: %v", line, startErr)
+			_, _ = dockerOutput(ctx, "rm", "-f", line)
 		}
 	}
-	// Create a fresh container that idles until exec'd into.
+	// Create a fresh container that idles until exec'd into. Resource limits,
+	// capability drops and (by default) no network are applied so a runaway
+	// skill cannot exhaust the host or reach internal services.
 	args := []string{"run", "-d", "--name", b.name,
 		"--label", "astrbot.sandbox=managed",
-		"--workdir", "/workspace", b.image, "tail", "-f", "/dev/null"}
+		"--workdir", "/workspace"}
+	if b.memory != "" {
+		args = append(args, "--memory", b.memory)
+	}
+	if b.cpus != "" {
+		args = append(args, "--cpus", b.cpus)
+	}
+	if b.pidsLimit != "" {
+		args = append(args, "--pids-limit", b.pidsLimit)
+	}
+	if b.network != "" {
+		args = append(args, "--network", b.network)
+	}
+	if b.capDropAll {
+		args = append(args, "--cap-drop", "ALL")
+	}
+	args = append(args, b.image, "tail", "-f", "/dev/null")
 	if out, err := dockerOutput(ctx, args...); err != nil {
 		logger.I18nWarn("docker run 失败: %v (%s)", err, strings.TrimSpace(out))
 		return fmt.Errorf("start docker sandbox: %w", err)
@@ -410,14 +487,17 @@ func (b *DockerBooter) ReadFile(ctx context.Context, path string) (string, error
 	if cid == "" {
 		return "", fmt.Errorf("docker sandbox not running")
 	}
-	out, err := dockerOutput(ctx, "exec", "-w", SandboxWorkdir, cid, "sh", "-c", "cat '"+strings.ReplaceAll(path, "'", "'\\''")+"' 2>/dev/null || echo '__NO_SUCH_FILE__'")
+	// Use the exit code to detect a missing file instead of grepping stdout
+	// for a sentinel string (which a file's own content could spoof).
+	var stdout, stderr strings.Builder
+	code, err := dockerRun(ctx, []string{"exec", "-w", SandboxWorkdir, cid, "sh", "-c", "cat '" + strings.ReplaceAll(path, "'", "'\\''") + "' 2>/dev/null"}, nil, &stdout, &stderr)
 	if err != nil {
 		return "", err
 	}
-	if strings.Contains(out, "__NO_SUCH_FILE__") {
+	if code != 0 {
 		return "", fmt.Errorf("file not found: %s", path)
 	}
-	return out, nil
+	return stdout.String(), nil
 }
 
 func (b *DockerBooter) WriteFile(ctx context.Context, path, content string) error {

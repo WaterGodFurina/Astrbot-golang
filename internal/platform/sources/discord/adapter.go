@@ -1,15 +1,20 @@
 package discord
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 
@@ -55,8 +60,21 @@ type Adapter struct {
 	// reply is delivered through the interaction followup webhook (mirrors
 	// DiscordPlatformEvent.interaction_followup_webhook).
 	followupsMu sync.Mutex
-	followups   map[string]*discordgo.Interaction
+	followups   map[string]followupEntry
 }
+
+// followupEntry records a pending slash-command interaction together with the
+// time it was registered so a stale entry (whose interaction token expires
+// after ~15 minutes) is not used to reply via an invalid webhook.
+type followupEntry struct {
+	interaction  *discordgo.Interaction
+	registeredAt time.Time
+}
+
+// followupMaxAge bounds how long a slash-command interaction may be replied
+// to via its followup webhook. Older entries fall back to a normal channel
+// message (Discord interaction tokens expire after roughly 15 minutes).
+const followupMaxAge = 5 * time.Minute
 
 // New creates a Discord adapter.
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
@@ -75,7 +93,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	a.activityName, _ = config["discord_activity_name"].(string)
 	a.guildID, _ = config["discord_guild_id_for_debug"].(string)
 	a.allowBotMessages, _ = config["discord_allow_bot_messages"].(bool)
-	a.followups = make(map[string]*discordgo.Interaction)
+	a.followups = make(map[string]followupEntry)
 	return a
 }
 
@@ -185,12 +203,13 @@ func (a *Adapter) Stop() error {
 	if a.session == nil {
 		return nil
 	}
-	if a.enableCmdRegister {
+	if a.enableCmdRegister && a.session.State != nil && a.session.State.User != nil {
 		// Clean up registered commands (bulk overwrite with empty list).
+		appID := a.session.State.User.ID
 		if a.guildID != "" {
-			_, _ = a.session.ApplicationCommandBulkOverwrite(a.session.State.User.ID, a.guildID, []*discordgo.ApplicationCommand{})
+			_, _ = a.session.ApplicationCommandBulkOverwrite(appID, a.guildID, []*discordgo.ApplicationCommand{})
 		} else {
-			_, _ = a.session.ApplicationCommandBulkOverwrite(a.session.State.User.ID, "", []*discordgo.ApplicationCommand{})
+			_, _ = a.session.ApplicationCommandBulkOverwrite(appID, "", []*discordgo.ApplicationCommand{})
 		}
 	}
 	if err := a.session.Close(); err != nil {
@@ -365,47 +384,48 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 				files = append(files, f)
 			}
 		case *message.Record:
-			if c.URL != "" {
-				files = append(files, &discordgo.File{Name: "audio", Reader: mustFetchURL(c.URL)})
-			} else if c.Path != "" {
-				files = append(files, &discordgo.File{Name: "audio", Reader: mustOpenFile(c.Path)})
+			f := a.fileFromMedia(c.URL, c.Path, "audio")
+			if f != nil {
+				files = append(files, f)
 			}
 		case *message.File:
-			if c.URL != "" {
-				files = append(files, &discordgo.File{Name: c.Name, Reader: mustFetchURL(c.URL)})
-			} else if c.Path != "" {
-				files = append(files, &discordgo.File{Name: c.Name, Reader: mustOpenFile(c.Path)})
+			name := c.Name
+			if name == "" {
+				name = "file"
+			}
+			f := a.fileFromMedia(c.URL, c.Path, name)
+			if f != nil {
+				files = append(files, f)
 			}
 		case *message.Video:
-			if c.URL != "" {
-				files = append(files, &discordgo.File{Name: "video", Reader: mustFetchURL(c.URL)})
-			} else if c.Path != "" {
-				files = append(files, &discordgo.File{Name: "video", Reader: mustOpenFile(c.Path)})
+			f := a.fileFromMedia(c.URL, c.Path, "video")
+			if f != nil {
+				files = append(files, f)
 			}
 		}
 	}
 
 	content := strings.Join(contentParts, "")
-	if len(content) > 2000 {
+	if utf8.RuneCountInString(content) > 2000 {
 		logger.I18nWarn("Discord 消息内容超过 2000 字符，将被截断")
-		content = content[:2000]
+		content = string([]rune(content)[:2000])
 	}
 	if content == "" && len(files) == 0 {
 		logger.Debug("Discord 尝试发送空消息，已忽略")
 		return nil
 	}
 
-	// Slash-command replies go through the interaction followup webhook.
+	// Slash-command replies go through the interaction followup webhook. Only
+	// a matching, not-yet-expired interaction is used; stale entries fall back
+	// to a normal channel message so replies are not routed to an invalid
+	// webhook (interaction tokens expire after ~15 minutes).
 	a.followupsMu.Lock()
-	interaction := a.followups[channelID]
+	entry, ok := a.followups[channelID]
 	delete(a.followups, channelID)
 	a.followupsMu.Unlock()
-	if interaction != nil {
+	if ok && time.Since(entry.registeredAt) < followupMaxAge {
 		params := &discordgo.WebhookParams{Content: content, Files: files}
-		if reference != nil && reference.MessageID != "" {
-			params.Content = referencePrefix(reference.MessageID) + params.Content
-		}
-		_, err := a.session.FollowupMessageCreate(interaction, false, params)
+		_, err := a.session.FollowupMessageCreate(entry.interaction, false, params)
 		return err
 	}
 
@@ -418,12 +438,6 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	}
 	_, err := a.session.ChannelMessageSendComplex(channelID, data)
 	return err
-}
-
-// referencePrefix builds a Discord reply marker for followup webhook replies
-// (webhooks cannot use MessageReference).
-func referencePrefix(messageID string) string {
-	return fmt.Sprintf("<@%s> ", "")
 }
 
 // React adds an emoji reaction to a message.
@@ -476,9 +490,17 @@ func (a *Adapter) handleInteraction(s *discordgo.Session, i *discordgo.Interacti
 	}
 	abm.Group = &platform.Group{GroupID: channelID}
 	abm.MessageStr = messageStr
+	userID, username := "", ""
+	if i.Member != nil && i.Member.User != nil {
+		userID = i.Member.User.ID
+		username = i.Member.User.Username
+	} else if i.User != nil {
+		userID = i.User.ID
+		username = i.User.Username
+	}
 	abm.Sender = platform.MessageMember{
-		UserID:   i.Member.User.ID,
-		Nickname: i.Member.User.Username,
+		UserID:   userID,
+		Nickname: username,
 	}
 
 	abm.Message = []message.Component{&message.Plain{Text: messageStr}}
@@ -516,60 +538,189 @@ func (a *Adapter) handleInteraction(s *discordgo.Session, i *discordgo.Interacti
 		},
 	}
 	a.followupsMu.Lock()
-	a.followups[channelID] = i.Interaction
+	a.pruneFollowupsLocked(time.Now())
+	a.followups[channelID] = followupEntry{interaction: i.Interaction, registeredAt: time.Now()}
 	a.followupsMu.Unlock()
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.Error("Failed to publish slash-command event: %v", err)
 	}
 }
 
-// mediaFile builds a discordgo.File from image component fields.
+// pruneFollowupsLocked removes followup entries that are older than
+// followupMaxAge so the map does not accumulate entries for slash commands
+// that never produce a reply. Caller must hold followupsMu.
+func (a *Adapter) pruneFollowupsLocked(now time.Time) {
+	for ch, entry := range a.followups {
+		if now.Sub(entry.registeredAt) >= followupMaxAge {
+			delete(a.followups, ch)
+		}
+	}
+}
+
+// mediaFile builds a discordgo.File from image component fields. Base64 data
+// is decoded before upload and a filename extension is derived from the media
+// bytes. It returns nil when the media cannot be read so the caller skips the
+// attachment instead of uploading a broken or typed-nil reader.
 func (a *Adapter) mediaFile(path, file, b64, url, name string) *discordgo.File {
 	if path != "" {
-		return &discordgo.File{Name: name, Reader: mustOpenFile(path)}
+		return openFile(path, name)
 	}
 	if file != "" {
-		return &discordgo.File{Name: name, Reader: mustOpenFile(file)}
+		return openFile(file, name)
 	}
 	if b64 != "" {
-		return &discordgo.File{Name: name, Reader: strings.NewReader(b64)}
+		data, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			logger.I18nWarn("Discord 解码 base64 媒体失败: %v", err)
+			return nil
+		}
+		return &discordgo.File{Name: mediaFilename(name, sniffMediaExtension(data)), Reader: bytes.NewReader(data)}
 	}
 	if url != "" {
-		return &discordgo.File{Name: name, Reader: mustFetchURL(url)}
+		return fetchFile(url, name)
 	}
 	return nil
 }
 
-// mustOpenFile opens a local file (nil reader on failure).
-func mustOpenFile(path string) *os.File {
+// fileFromMedia builds a discordgo.File from a URL or a local path source.
+func (a *Adapter) fileFromMedia(url, path, name string) *discordgo.File {
+	if url != "" {
+		return fetchFile(url, name)
+	}
+	if path != "" {
+		return openFile(path, name)
+	}
+	return nil
+}
+
+// maxMediaBytes bounds the download size of remote media so an oversized or
+// malicious source cannot exhaust memory. It aligns with Discord's standard
+// attachment upload limit.
+const maxMediaBytes = 25 << 20
+
+// openFile opens a local file for upload (nil on failure). The upload name is
+// given a file extension when the source path carries one.
+func openFile(path, name string) *discordgo.File {
 	f, err := os.Open(path)
 	if err != nil {
 		logger.I18nWarn("打开文件失败: %v", err)
 		return nil
 	}
-	return f
+	return &discordgo.File{Name: mediaFilename(name, filepath.Ext(path)), Reader: f}
 }
 
-// mustFetchURL fetches a URL body (nil reader on failure).
-func mustFetchURL(rawURL string) *strings.Reader {
-	resp, err := http.Get(rawURL)
+// fetchFile downloads a URL body for upload (nil on failure). The download is
+// bounded by a context timeout, rejects non-200 responses and caps the body
+// size so a bad or hostile URL cannot hang the sender or exhaust memory.
+func fetchFile(rawURL, name string) *discordgo.File {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		logger.I18nWarn("下载 URL 失败: %v", err)
+		return nil
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		logger.I18nWarn("下载 URL 失败: %v", err)
 		return nil
 	}
 	defer resp.Body.Close()
-	body := make([]byte, 0, 8*1024)
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			body = append(body, buf[:n]...)
-		}
-		if err != nil {
-			break
-		}
+	if resp.StatusCode != http.StatusOK {
+		logger.I18nWarn("下载 URL 失败: HTTP %d (%s)", resp.StatusCode, rawURL)
+		return nil
 	}
-	return strings.NewReader(string(body))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxMediaBytes+1))
+	if err != nil {
+		logger.I18nWarn("读取 URL 内容失败: %v", err)
+		return nil
+	}
+	if len(body) > maxMediaBytes {
+		logger.I18nWarn("下载 URL 失败: 媒体大小超过 %d 字节上限", maxMediaBytes)
+		return nil
+	}
+	ext := extensionFromContentType(resp.Header.Get("Content-Type"))
+	if ext == "" {
+		ext = filepath.Ext(req.URL.Path)
+	}
+	if ext == "" {
+		ext = sniffMediaExtension(body)
+	}
+	return &discordgo.File{Name: mediaFilename(name, ext), Reader: bytes.NewReader(body)}
+}
+
+// mediaFilename ensures the upload filename carries an extension. A name that
+// already has one (e.g. a real filename) is kept as-is; otherwise the
+// detected ext is appended, defaulting to a per-kind extension.
+func mediaFilename(name, ext string) string {
+	if filepath.Ext(name) != "" {
+		return name
+	}
+	if ext != "" {
+		return name + ext
+	}
+	switch name {
+	case "image":
+		return name + ".png"
+	case "audio":
+		return name + ".mp3"
+	case "video":
+		return name + ".mp4"
+	}
+	return name + ".bin"
+}
+
+// sniffMediaExtension guesses a file extension from media magic bytes.
+func sniffMediaExtension(data []byte) string {
+	if len(data) < 4 {
+		return ""
+	}
+	switch {
+	case bytes.Equal(data[:4], []byte("\x89PNG")):
+		return ".png"
+	case data[0] == 0xFF && data[1] == 0xD8:
+		return ".jpg"
+	case bytes.Equal(data[:4], []byte("GIF8")):
+		return ".gif"
+	case bytes.Equal(data[:4], []byte("RIFF")) && len(data) >= 12 && bytes.Equal(data[8:12], []byte("WEBP")):
+		return ".webp"
+	case bytes.Equal(data[:3], []byte("ID3")):
+		return ".mp3"
+	case len(data) >= 8 && bytes.Equal(data[4:8], []byte("ftyp")):
+		return ".mp4"
+	}
+	return ""
+}
+
+// extensionFromContentType maps a media Content-Type to a file extension.
+func extensionFromContentType(ct string) string {
+	if ct == "" {
+		return ""
+	}
+	if idx := strings.Index(ct, ";"); idx >= 0 {
+		ct = ct[:idx]
+	}
+	switch strings.TrimSpace(strings.ToLower(ct)) {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "audio/mpeg", "audio/mp3":
+		return ".mp3"
+	case "audio/ogg":
+		return ".ogg"
+	case "audio/wav", "audio/x-wav":
+		return ".wav"
+	case "video/mp4":
+		return ".mp4"
+	case "video/webm":
+		return ".webm"
+	}
+	return ""
 }
 
 // registerCommands collects all star-registered commands and registers them

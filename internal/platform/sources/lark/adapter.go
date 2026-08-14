@@ -54,7 +54,8 @@ type Adapter struct {
 	mu       sync.Mutex
 	evIDTime map[string]time.Time
 
-	stopCh chan struct{}
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // New creates a Lark adapter.
@@ -117,7 +118,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 	if a.connMode == "webhook" {
 		a.webhook = NewLarkWebhookServer(a.appID, a.appSecret, a.encryptKey, a.verifyTok)
 		a.webhook.SetCallback(func(eventData map[string]interface{}) {
-			if eventID, _ := eventData["event_id"].(string); eventID != "" {
+			if eventID := webhookEventID(eventData); eventID != "" {
 				if a.isDuplicateEvent(eventID) {
 					logger.Debug("[Lark Webhook] 跳过重复事件: %s", eventID)
 					return
@@ -168,7 +169,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 
 // Stop shuts down the adapter.
 func (a *Adapter) Stop() error {
-	close(a.stopCh)
+	a.stopOnce.Do(func() { close(a.stopCh) })
 	if a.wsClient != nil {
 		a.wsClient.Close()
 	}
@@ -205,6 +206,17 @@ func (a *Adapter) refreshBotInfo(ctx context.Context) error {
 	return nil
 }
 
+// webhookEventID 提取事件的 event_id: schema v2 位于 header 中, 兼容旧格式的顶层字段。
+func webhookEventID(eventData map[string]interface{}) string {
+	if header, ok := eventData["header"].(map[string]interface{}); ok {
+		if id, _ := header["event_id"].(string); id != "" {
+			return id
+		}
+	}
+	id, _ := eventData["event_id"].(string)
+	return id
+}
+
 // isDuplicateEvent mirrors _is_duplicate_event (30-minute window).
 func (a *Adapter) isDuplicateEvent(eventID string) bool {
 	a.mu.Lock()
@@ -238,11 +250,18 @@ func (a *Adapter) convertMsg(event *larkim.P2MessageReceiveV1) {
 		}
 	}
 	abm.Message = []message.Component{}
+	chatID := ""
+	if msg.ChatId != nil {
+		chatID = *msg.ChatId
+	}
 	abm.Type = platform.FriendMessage
 	if msg.ChatType != nil && *msg.ChatType == "group" {
 		abm.Type = platform.GroupMessage
 	}
 	abm.Group = &platform.Group{GroupID: ""}
+	if abm.Type == platform.GroupMessage && chatID != "" {
+		abm.Group = &platform.Group{GroupID: chatID, GroupName: chatID}
+	}
 	abm.SelfID = a.botOpenID
 	if a.botOpenID == "" {
 		abm.SelfID = a.botName

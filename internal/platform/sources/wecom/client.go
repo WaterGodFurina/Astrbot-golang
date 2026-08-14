@@ -87,6 +87,7 @@ func (c *WeChatClient) GetAccessToken(ctx context.Context) (string, error) {
 }
 
 // request 发起企业微信 API 请求并解析 JSON 响应（errcode != 0 时返回 WeChatClientError）。
+// 收到 40014/42001（access_token 无效/过期）时清空缓存并自动重试一次。
 func (c *WeChatClient) request(ctx context.Context, method, apiPath string, query url.Values, body interface{}) (map[string]interface{}, error) {
 	if query == nil {
 		query = url.Values{}
@@ -99,6 +100,29 @@ func (c *WeChatClient) request(ctx context.Context, method, apiPath string, quer
 		}
 		query.Set("access_token", token)
 	}
+	data, err := c.doRequest(ctx, method, apiPath, query, body)
+	if err == nil {
+		return data, nil
+	}
+	// 清除失效的 access_token 缓存并重试一次
+	var weErr *WeChatClientError
+	if asError(err, &weErr) && (weErr.ErrCode == 40014 || weErr.ErrCode == 42001) {
+		c.mu.Lock()
+		c.accessToken = ""
+		c.tokenExpire = time.Time{}
+		c.mu.Unlock()
+		token, getErr := c.GetAccessToken(ctx)
+		if getErr != nil {
+			return nil, getErr
+		}
+		query.Set("access_token", token)
+		return c.doRequest(ctx, method, apiPath, query, body)
+	}
+	return nil, err
+}
+
+// doRequest 实际发起 HTTP 请求并解析响应。
+func (c *WeChatClient) doRequest(ctx context.Context, method, apiPath string, query url.Values, body interface{}) (map[string]interface{}, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)

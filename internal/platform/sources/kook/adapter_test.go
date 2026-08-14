@@ -1,12 +1,46 @@
 package kook
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
+
+// ---------- 客户端状态访问器 ----------
+
+// TestClientStateAccessors 验证 lastSN/sessionID/lastHeartbeatTime/heartbeatFailedCount
+// 的跨 goroutine 访问统一经由 stateMu 保护 (对应 M-26)。
+func TestClientStateAccessors(t *testing.T) {
+	client := NewKookClient(&KookConfig{}, nil)
+	client.setSessionID("sess_1")
+	client.setLastSN(42)
+	client.setLastHeartbeatTime(time.Unix(100, 0))
+	client.setHeartbeatFailedCount(3)
+
+	if got := client.sessionIDValue(); got != "sess_1" {
+		t.Errorf("sessionID 应为 sess_1, 实际 %q", got)
+	}
+	if got := client.lastSNValue(); got != 42 {
+		t.Errorf("lastSN 应为 42, 实际 %d", got)
+	}
+	if got := client.lastHeartbeatTimeValue(); !got.Equal(time.Unix(100, 0)) {
+		t.Errorf("lastHeartbeatTime 读取错误: %v", got)
+	}
+	if got := client.incHeartbeatFailedCount(); got != 4 {
+		t.Errorf("heartbeatFailedCount 自增后应为 4, 实际 %d", got)
+	}
+	client.setHeartbeatFailedCount(0)
+	if got := client.lastSNValue(); got != 42 {
+		t.Errorf("setHeartbeatFailedCount 不应影响 lastSN: %d", got)
+	}
+}
 
 // ---------- WS 帧解析 ----------
 
@@ -446,5 +480,57 @@ func TestSendPayloadChannelVsDirect(t *testing.T) {
 	}
 	if client.config.Token != "token" {
 		t.Fatal("token 读取错误")
+	}
+}
+
+// rewriteKookHostTransport 将请求重定向到测试服务器 (KOOK API 域名无法从单测访问)。
+type rewriteKookHostTransport struct {
+	base string
+}
+
+func (t *rewriteKookHostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req2 := req.Clone(req.Context())
+	req2.URL.Scheme = "http"
+	req2.URL.Host = strings.TrimPrefix(t.base, "http://")
+	return http.DefaultTransport.RoundTrip(req2)
+}
+
+// TestRolesRecordPendingDedup 验证同频道并发查询只发起一次请求, 且等待方
+// 能正确读到结果 (对应 L-31: roles 必须先赋值再 close(done))。
+func TestRolesRecordPendingDedup(t *testing.T) {
+	var mu sync.Mutex
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		time.Sleep(50 * time.Millisecond) // 制造并发等待窗口
+		_, _ = w.Write([]byte(`{"code":0,"data":{"roles":[42]}}`))
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Transport: &rewriteKookHostTransport{base: srv.URL}}
+	rr := NewRolesRecord(client)
+	rr.SetBotID("bot_1")
+
+	var wg sync.WaitGroup
+	results := make([]bool, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = rr.HasRoleInChannel(context.Background(), 42, 111)
+		}(i)
+	}
+	wg.Wait()
+
+	if results[0] != true || results[1] != true {
+		t.Fatalf("并发查询应都返回 true (等待方不能把成功结果误读为 nil), 实际 %v (L-31)", results)
+	}
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("同频道并发查询应只发起 1 次请求, 实际 %d", n)
 	}
 }

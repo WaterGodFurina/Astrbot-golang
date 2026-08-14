@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
@@ -47,6 +48,10 @@ type AzureTTSProvider struct {
 	provider.BaseProvider
 	client  *http.Client
 	initErr error
+
+	// mu 保护 token/tokenExpire（native 模式）与 timeOffset/lastSync（OTTS
+	// 模式）的读写，GetAudio 可能被并发调用。
+	mu sync.Mutex
 
 	// native Azure mode
 	subscriptionKey string
@@ -135,14 +140,14 @@ func (s *AzureTTSProvider) syncTime(ctx context.Context) error {
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		if time.Since(s.lastSync) > time.Hour {
+		if s.syncAge() > time.Hour {
 			return fmt.Errorf("时间同步失败: %w", err)
 		}
 		return nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		if time.Since(s.lastSync) > time.Hour {
+		if s.syncAge() > time.Hour {
 			return fmt.Errorf("时间同步失败: 状态码 %d", resp.StatusCode)
 		}
 		return nil
@@ -151,14 +156,23 @@ func (s *AzureTTSProvider) syncTime(ctx context.Context) error {
 		Timestamp int64 `json:"timestamp"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		if time.Since(s.lastSync) > time.Hour {
+		if s.syncAge() > time.Hour {
 			return fmt.Errorf("时间同步响应解析失败: %w", err)
 		}
 		return nil
 	}
+	s.mu.Lock()
 	s.timeOffset = m.Timestamp - time.Now().Unix()
 	s.lastSync = time.Now()
+	s.mu.Unlock()
 	return nil
+}
+
+// syncAge returns how long ago the last successful OTTS time sync happened.
+func (s *AzureTTSProvider) syncAge() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Since(s.lastSync)
 }
 
 // generateSignature builds the OTTS signature: {timestamp}-{nonce}-0-{md5}.
@@ -166,7 +180,10 @@ func (s *AzureTTSProvider) generateSignature(ctx context.Context) (string, error
 	if err := s.syncTime(ctx); err != nil {
 		return "", err
 	}
-	timestamp := time.Now().Unix() + s.timeOffset
+	s.mu.Lock()
+	offset := s.timeOffset
+	s.mu.Unlock()
+	timestamp := time.Now().Unix() + offset
 	nonce := ttsRandomNonce(10)
 	path := "/"
 	if u, err := url.Parse(s.otts.apiURL); err == nil && u.Path != "" {
@@ -196,17 +213,33 @@ func (s *AzureTTSProvider) refreshToken(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.token = strings.TrimSpace(string(data))
 	s.tokenExpire = time.Now().Add(540 * time.Second)
+	s.mu.Unlock()
 	return nil
+}
+
+// nativeTokenValid reports whether a cached native bearer token is present and
+// not yet expired.
+func (s *AzureTTSProvider) nativeTokenValid() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.token != "" && time.Now().Before(s.tokenExpire)
 }
 
 // getNativeAudio synthesizes via the Microsoft Speech REST endpoint.
 func (s *AzureTTSProvider) getNativeAudio(ctx context.Context, text string) (string, error) {
-	if s.token == "" || time.Now().After(s.tokenExpire) {
+	if !s.nativeTokenValid() {
 		if err := s.refreshToken(ctx); err != nil {
 			return "", err
 		}
+	}
+	s.mu.Lock()
+	token := s.token
+	s.mu.Unlock()
+	if token == "" {
+		return "", fmt.Errorf("Azure token 为空")
 	}
 	ssml := azureBuildSSML(s.voice, s.style, s.role, s.rate, s.volume, text)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader([]byte(ssml)))
@@ -215,7 +248,7 @@ func (s *AzureTTSProvider) getNativeAudio(ctx context.Context, text string) (str
 	}
 	req.Header.Set("Content-Type", "application/ssml+xml")
 	req.Header.Set("X-Microsoft-OutputFormat", azureOutputFormat)
-	req.Header.Set("Authorization", "Bearer "+s.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "AstrBot/Go")
 	resp, err := s.client.Do(req)
 	if err != nil {

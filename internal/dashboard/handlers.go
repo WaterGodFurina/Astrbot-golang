@@ -28,6 +28,15 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 )
 
+// 上传/解压大小上限：防止认证用户通过超大 multipart 上传或高压缩比 zip
+// （zip 炸弹）耗尽磁盘。import-url 已有 64MB 响应体上限、market 有 4MB 上限。
+const (
+	maxMultipartBodySize = 256 << 20 // 256 MiB：multipart 请求体总量上限
+	maxKBDocFileSize     = 64 << 20  // 64 MiB：单个 KB 文档上限
+	maxSkillFileSize     = 64 << 20  // 64 MiB：skill zip 解压后单个文件上限
+	maxSkillExtractTotal = 256 << 20 // 256 MiB：skill zip 解压总字节上限
+)
+
 // ── Auth handlers ────────────────────────────────────────────
 // (handleAuth, handleLogin, handleLogout, handleCheck, handleSetupStatus,
 //  handleSetup, handleAccountEdit are in server.go)
@@ -45,7 +54,10 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request, part
 			// Frontend sends the config object directly (DynamicConfig),
 			// not wrapped in {"config": ...}.
 			var raw json.RawMessage
-			_ = json.NewDecoder(r.Body).Decode(&raw)
+			if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			var body struct {
 				Config map[string]interface{} `json:"config"`
 			}
@@ -57,11 +69,13 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request, part
 					body.Config = direct
 				}
 			}
-			if body.Config != nil {
-				if err := s.setConfigDataAll(body.Config); err != nil {
-					writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
-					return
-				}
+			if body.Config == nil {
+				writeJSON(w, http.StatusBadRequest, apiError("缺少 config 配置"))
+				return
+			}
+			if err := s.setConfigDataAll(body.Config); err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+				return
 			}
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"message": "保存成功",
@@ -119,7 +133,7 @@ func (s *Server) getConfigSnapshot() map[string]interface{} {
 		if pd, ok := persisted["dashboard"].(map[string]interface{}); ok {
 			for k, v := range pd {
 				switch k {
-				case "password", "pbkdf2_password", "jwt_secret":
+				case "password", "pbkdf2_password", "jwt_secret", "totp":
 					continue
 				}
 				dash[k] = v
@@ -134,9 +148,9 @@ func (s *Server) getConfigSnapshot() map[string]interface{} {
 }
 
 // redactDashboardSecrets strips the dashboard auth secrets (plaintext password,
-// PBKDF2 hash, JWT signing secret) from a config map before it is returned to
-// the client. The client never needs them; on save, injectAuthFields re-asserts
-// them from the password manager so round-trips are unaffected.
+// PBKDF2 hash, JWT signing secret, TOTP 段) from a config map before it is
+// returned to the client. The client never needs them; on save, injectAuthFields
+// re-asserts them from the password manager so round-trips are unaffected.
 func redactDashboardSecrets(cfg map[string]interface{}) {
 	dash, ok := cfg["dashboard"].(map[string]interface{})
 	if !ok {
@@ -145,6 +159,7 @@ func redactDashboardSecrets(cfg map[string]interface{}) {
 	delete(dash, "password")
 	delete(dash, "pbkdf2_password")
 	delete(dash, "jwt_secret")
+	delete(dash, "totp")
 }
 
 // deepMerge recursively overlays src values onto dst; dst keys win at leaf level.
@@ -1148,12 +1163,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request, parts []st
 	case "", "get":
 		writeJSON(w, http.StatusOK, apiOK(s.getConfigSnapshot()))
 	case "set", "update":
-		// Accept config updates (stub — would need to merge into config file)
-		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "config updated",
-		}))
+		logger.I18nWarn("legacy /api/config %s 已废弃，忽略修改请求；请改用 /api/v1/system-config 或 /api/v1/config-profiles", sub)
+		writeJSON(w, http.StatusNotImplemented, apiError("该接口已废弃，请使用 /api/v1/system-config 或 /api/v1/config-profiles"))
 	case "reload":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"message": "config reloaded",
@@ -1218,6 +1229,9 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 		if r.Method == http.MethodPost {
 			var body map[string]interface{}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body == nil {
+				body = map[string]interface{}{}
+			}
 			if body["config"] == nil {
 				body["config"] = map[string]interface{}{}
 			}
@@ -1628,7 +1642,11 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 			}))
 		case http.MethodDelete:
 			botID := r.URL.Query().Get("bot_id")
-			s.deleteBotByID(botID)
+			if err := s.deleteBotByID(botID); err != nil {
+				logger.I18nWarn("删除机器人 %s 失败: %v", botID, err)
+				writeJSON(w, http.StatusInternalServerError, apiError("删除失败"))
+				return
+			}
 			s.notifyPlatformsChanged()
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"message": "删除成功",
@@ -1817,14 +1835,18 @@ func (s *Server) setBotEnabled(w http.ResponseWriter, r *http.Request) {
 // deleteBot handles DELETE /api/v1/bots/delete.
 func (s *Server) deleteBot(w http.ResponseWriter, r *http.Request) {
 	botID := r.URL.Query().Get("bot_id")
-	s.deleteBotByID(botID)
+	if err := s.deleteBotByID(botID); err != nil {
+		logger.I18nWarn("删除机器人 %s 失败: %v", botID, err)
+		writeJSON(w, http.StatusInternalServerError, apiError("删除失败"))
+		return
+	}
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 		"message": "删除成功",
 	}))
 }
 
 // deleteBotByID removes a platform config by id and persists the change.
-func (s *Server) deleteBotByID(botID string) {
+func (s *Server) deleteBotByID(botID string) error {
 	platforms := s.getBotList()
 	next := make([]interface{}, 0, len(platforms))
 	for _, p := range platforms {
@@ -1835,7 +1857,7 @@ func (s *Server) deleteBotByID(botID string) {
 		}
 		next = append(next, p)
 	}
-	_ = s.setConfigData("platform", next)
+	return s.setConfigData("platform", next)
 }
 
 // getBotByID returns a single bot config by id.
@@ -1968,7 +1990,11 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			return
 		}
 		log.GetDefault().SetLevel(log.ParseLevel(level))
-		_ = s.setConfigData("log_level", level)
+		if err := s.setConfigData("log_level", level); err != nil {
+			logger.I18nWarn("保存日志级别失败: %v", err)
+			writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"log_level": level}))
 	default:
 		// /api/v1/plugins/{plugin_id}, /{plugin_id}/config, /{plugin_id}/source,
@@ -1994,7 +2020,11 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 					return
 				}
 				log.GetDefault().SetLevel(log.ParseLevel(level))
-				_ = s.setConfigData("log_level", level)
+				if err := s.setConfigData("log_level", level); err != nil {
+					logger.I18nWarn("保存日志级别失败: %v", err)
+					writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+					return
+				}
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"log_level": level}))
 				return
 			case "config":
@@ -2713,7 +2743,8 @@ func (s *Server) writeKBList(w http.ResponseWriter, r *http.Request) {
 // after the files are persisted.
 type kbUploadTask struct {
 	TaskID       string
-	Status       string // "completed" | "failed"
+	KBID         string // 所属知识库，deleteKB 时据此清理遗留任务
+	Status       string // "completed" | "failed" | "processing"
 	Stage        string
 	FileIndex    int
 	Current      int
@@ -2732,9 +2763,22 @@ func (s *Server) getKBTask(taskID string) *kbUploadTask {
 
 // recordKBTask stores a knowledge-base upload task state.
 func (s *Server) recordKBTask(t *kbUploadTask) {
+	if t == nil || t.TaskID == "" {
+		return
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.kbTasks[t.TaskID] = t
+	s.mu.Unlock()
+	if t.Status == "completed" || t.Status == "failed" {
+		// 终态在 TTL 后自动清除（仅当仍是本条记录时），避免 map 只增不删。
+		time.AfterFunc(kbTaskCleanupTTL, func() {
+			s.mu.Lock()
+			if s.kbTasks[t.TaskID] == t {
+				delete(s.kbTasks, t.TaskID)
+			}
+			s.mu.Unlock()
+		})
+	}
 }
 
 // handleKBDocuments handles document endpoints: list (GET), upload (POST
@@ -2748,6 +2792,10 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 		url, _ := body["url"].(string)
 		if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
 			writeJSON(w, http.StatusOK, apiError("缺少或无效的参数 url"))
+			return
+		}
+		if err := validateOutboundURL(url); err != nil {
+			writeJSON(w, http.StatusOK, apiError("下载文档失败: "+err.Error()))
 			return
 		}
 		chunkSize := 512
@@ -2767,7 +2815,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 			writeJSON(w, http.StatusOK, apiError("创建下载请求失败: "+err.Error()))
 			return
 		}
-		client := &http.Client{Timeout: 60 * time.Second}
+		client := newOutboundClient(60 * time.Second)
 		resp, err := client.Do(req)
 		if err != nil {
 			writeJSON(w, http.StatusOK, apiError("下载文档失败: "+err.Error()))
@@ -2808,6 +2856,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 		taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
 		s.recordKBTask(&kbUploadTask{
 			TaskID: taskID,
+			KBID:   kbID,
 			Status: "processing",
 			Stage:  "chunking",
 			Total:  100,
@@ -2818,6 +2867,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 			if _, err := s.indexKBFile(kbID, docID, name, content, chunkSize, chunkOverlap); err != nil {
 				s.recordKBTask(&kbUploadTask{
 					TaskID:       taskID,
+					KBID:         kbID,
 					Status:       "completed",
 					Stage:        "embedding_failed",
 					Current:      100,
@@ -2830,6 +2880,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 			}
 			s.recordKBTask(&kbUploadTask{
 				TaskID:       taskID,
+				KBID:         kbID,
 				Status:       "completed",
 				Stage:        "completed",
 				Current:      100,
@@ -2856,10 +2907,16 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 		if r.Method == http.MethodDelete {
 			// Delete nanovec vectors first, then SQLite chunk rows, then the
 			// on-disk file.
-			_ = s.kbDeleteDoc(kbID, docID)
+			if err := s.kbDeleteDoc(kbID, docID); err != nil {
+				logger.I18nWarn("删除文档 %s 失败: %v", docID, err)
+				writeJSON(w, http.StatusInternalServerError, apiError("删除文档失败: "+err.Error()))
+				return
+			}
 			dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
 			if doc := s.kbDocumentByID(kbID, docID); doc != nil {
-				_ = os.Remove(filepath.Join(dir, sanitizePath(anyStr(doc["doc_name"]))))
+				if err := os.Remove(filepath.Join(dir, sanitizePath(anyStr(doc["doc_name"])))); err != nil {
+					logger.I18nWarn("删除文档文件 %s 失败: %v", docID, err)
+				}
 			}
 			writeJSON(w, http.StatusOK, apiOKMsg("文档已删除", map[string]interface{}{}))
 			return
@@ -2875,7 +2932,13 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 		// Multipart upload: save the files under the KB's data directory, then
 		// index them asynchronously (chunk → embed → SQLite + nanovec dual
 		// write). The WebUI polls the returned task for progress.
+		r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
 		if err := r.ParseMultipartForm(64 << 20); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeJSON(w, http.StatusRequestEntityTooLarge, apiError("上传文件过大（上限 256MB）"))
+				return
+			}
 			writeJSON(w, http.StatusOK, apiError("解析上传文件失败: "+err.Error()))
 			return
 		}
@@ -2921,13 +2984,19 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 					src.Close()
 					continue
 				}
-				if _, err := io.Copy(out, src); err != nil {
+				n, err := io.Copy(out, io.LimitReader(src, maxKBDocFileSize+1))
+				if err != nil {
 					out.Close()
 					src.Close()
+					_ = os.Remove(dst)
 					continue
 				}
 				out.Close()
 				src.Close()
+				if n > maxKBDocFileSize {
+					_ = os.Remove(dst)
+					continue
+				}
 				info, _ := os.Stat(dst)
 				mod := int64(0)
 				if info != nil {
@@ -2948,6 +3017,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 		taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
 		s.recordKBTask(&kbUploadTask{
 			TaskID: taskID,
+			KBID:   kbID,
 			Status: "processing",
 			Stage:  "chunking",
 			Total:  len(docs) * 100,
@@ -2974,6 +3044,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 			for i, d := range docs {
 				s.recordKBTask(&kbUploadTask{
 					TaskID:       taskID,
+					KBID:         kbID,
 					Status:       "processing",
 					Stage:        "chunking",
 					FileIndex:    i,
@@ -2993,6 +3064,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 					failed++
 					s.recordKBTask(&kbUploadTask{
 						TaskID:       taskID,
+						KBID:         kbID,
 						Status:       "processing",
 						Stage:        "embedding_failed",
 						FileIndex:    i,
@@ -3012,6 +3084,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 			}
 			s.recordKBTask(&kbUploadTask{
 				TaskID:       taskID,
+				KBID:         kbID,
 				Status:       status,
 				Stage:        "completed",
 				Current:      total * 100,
@@ -3271,6 +3344,14 @@ func (s *Server) deleteKB(kbID string) error {
 	// 级联清理 3：释放该 KB 的向量写锁（kbVecMu 中的常驻 Mutex），
 	// 防止每 KB 一把锁随删除积累导致内存泄漏。
 	kbVecMu.Delete(kbID)
+	// 级联清理 4：清理该 KB 遗留的上传/索引任务（kbTasks 只增不删的泄漏点）。
+	s.mu.Lock()
+	for tid, t := range s.kbTasks {
+		if t != nil && t.KBID == kbID {
+			delete(s.kbTasks, tid)
+		}
+	}
+	s.mu.Unlock()
 	// Remove from in-memory manager too.
 	if km, ok := s.kbMgr.(interface {
 		DeleteKB(kbID string) bool
@@ -3984,6 +4065,9 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		case http.MethodPost:
 			var body map[string]interface{}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body == nil {
+				body = map[string]interface{}{}
+			}
 			if err := s.personas.upsertPersona(body); err != nil {
 				writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
 				return
@@ -4010,6 +4094,9 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		case http.MethodPut:
 			var body map[string]interface{}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body == nil {
+				body = map[string]interface{}{}
+			}
 			if pid, ok := body["persona_id"].(string); ok && pid != "" {
 				personaID = pid
 			}
@@ -4038,7 +4125,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 			FolderID  string `json:"folder_id"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		_ = s.personas.movePersona(body.PersonaID, body.FolderID)
+		if err := s.personas.movePersona(body.PersonaID, body.FolderID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("移动失败: "+err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"message": "移动成功",
 		}))
@@ -4047,7 +4137,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 			Items []map[string]interface{} `json:"items"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		_ = s.personas.reorder(body.Items)
+		if err := s.personas.reorder(body.Items); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"message": "更新成功",
 		}))
@@ -4099,6 +4192,9 @@ func (s *Server) handlePersonaFolders(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPut:
 			var body map[string]interface{}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body == nil {
+				body = map[string]interface{}{}
+			}
 			body["folder_id"] = folderID
 			if err := s.personas.upsertFolder(body); err != nil {
 				writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
@@ -4125,6 +4221,9 @@ func (s *Server) handlePersonaFolders(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var body map[string]interface{}
 		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body == nil {
+			body = map[string]interface{}{}
+		}
 		if err := s.personas.upsertFolder(body); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
 			return
@@ -4314,7 +4413,11 @@ func (s *Server) updateTool(w http.ResponseWriter, r *http.Request, toolID, acti
 			permissions = map[string]interface{}{}
 		}
 		permissions[toolID] = map[string]interface{}{"permission": body.Permission}
-		_ = s.setConfigData("tool_permissions", permissions)
+		if err := s.setConfigData("tool_permissions", permissions); err != nil {
+			logger.I18nWarn("保存工具 %s 权限失败: %v", toolID, err)
+			writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOKMsg("工具权限已更新", map[string]interface{}{}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -4586,7 +4689,12 @@ func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request, serverNam
 			result["success"] = false
 			result["error"] = "MCP server 缺少 url"
 		} else {
-			client := &http.Client{Timeout: 10 * time.Second}
+			if err := validateOutboundURL(url); err != nil {
+				result["success"] = false
+				result["error"] = err.Error()
+				break
+			}
+			client := newOutboundClient(10 * time.Second)
 			resp, err := client.Get(url)
 			if err != nil {
 				result["success"] = false
@@ -5488,7 +5596,11 @@ func (s *Server) updateCommand(w http.ResponseWriter, r *http.Request, handlerFu
 		rec["permission"] = perm
 	}
 	records[handlerFullName] = rec
-	_ = s.setConfigData("command_configs", records)
+	if err := s.setConfigData("command_configs", records); err != nil {
+		logger.I18nWarn("保存指令 %s 配置失败: %v", handlerFullName, err)
+		writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+		return
+	}
 
 	writeJSON(w, http.StatusOK, apiOK(s.findCommandPayload(sm, handlerFullName)))
 }
@@ -5796,10 +5908,16 @@ func (s *Server) handleConfigProfiles(w http.ResponseWriter, r *http.Request, pa
 				Name   string                 `json:"name"`
 				Config map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			confID := "default"
 			if body.Config != nil {
-				_ = s.setConfigDataAll(body.Config)
+				if err := s.setConfigDataAll(body.Config); err != nil {
+					writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+					return
+				}
 			}
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"conf_id": confID,
@@ -6286,7 +6404,13 @@ func (s *Server) updateSkillFile(w http.ResponseWriter, r *http.Request) {
 // Each file is a .zip skill package containing a SKILL.md; it is extracted
 // into data/skills/<name>/ (mirrors astrbot skills_service.batch_upload_skills).
 func (s *Server) uploadSkillsBatch(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, apiError("上传文件过大（上限 256MB）"))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiError("解析上传失败: "+err.Error()))
 		return
 	}
@@ -6350,6 +6474,7 @@ func installSkillFromZip(src io.ReaderAt, size int64, skillsRoot, nameHint strin
 	if err != nil {
 		return "", fmt.Errorf("invalid zip: %v", err)
 	}
+	var totalExtracted int64
 	for _, f := range zr.File {
 		dest := filepath.Join(tmpDir, filepath.Clean(f.Name))
 		if !strings.HasPrefix(dest, tmpDir+string(os.PathSeparator)) {
@@ -6369,9 +6494,19 @@ func installSkillFromZip(src io.ReaderAt, size int64, skillsRoot, nameHint strin
 			rc.Close()
 			return "", err
 		}
-		_, _ = io.Copy(out, rc)
+		n, copyErr := io.Copy(out, io.LimitReader(rc, maxSkillFileSize+1))
 		out.Close()
 		rc.Close()
+		if copyErr != nil {
+			return "", copyErr
+		}
+		if n > maxSkillFileSize {
+			return "", fmt.Errorf("zip 内单文件解压后超过 %dMB", maxSkillFileSize>>20)
+		}
+		totalExtracted += n
+		if totalExtracted > maxSkillExtractTotal {
+			return "", fmt.Errorf("zip 解压总大小超过 %dMB", maxSkillExtractTotal>>20)
+		}
 	}
 
 	// Locate SKILL.md
@@ -6537,7 +6672,11 @@ func (s *Server) handleConversationByID(w http.ResponseWriter, r *http.Request, 
 				History []map[string]interface{} `json:"history"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			if s.conversationUpdateByCID(convID, map[string]interface{}{"history": body.History}) {
+			history := make([]interface{}, 0, len(body.History))
+			for _, h := range body.History {
+				history = append(history, h)
+			}
+			if s.conversationUpdateByCID(convID, map[string]interface{}{"history": history}) {
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 					"message": "conversation " + convID + " messages updated",
 				}))

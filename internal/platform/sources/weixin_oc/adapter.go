@@ -6,6 +6,10 @@ package weixin_oc
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,6 +26,12 @@ import (
 )
 
 var logger = log.GetDefault().WithComponent("WeixinOC")
+
+// maxMediaDownloadSize 限制发送时下载外部媒体的大小上限。
+const maxMediaDownloadSize = 20 << 20
+
+// mediaHTTPClient 用于发送时下载外部媒体（带超时，避免 DefaultClient 永久挂起）。
+var mediaHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 // Adapter implements the Weixin OC adapter.
 type Adapter struct {
@@ -268,6 +278,26 @@ func messageToEvent(msg *ilink.Message, fromUser string, components []message.Co
 	return event
 }
 
+// downloadMedia 下载媒体 URL 并返回内容（上限 maxMediaDownloadSize）。
+func downloadMedia(rawURL string) ([]byte, error) {
+	resp, err := mediaHTTPClient.Get(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("下载媒体失败: HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxMediaDownloadSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxMediaDownloadSize {
+		return nil, fmt.Errorf("媒体文件超过大小上限 %d 字节", maxMediaDownloadSize)
+	}
+	return data, nil
+}
+
 // saveMedia writes inbound media bytes to a temp file.
 func (a *Adapter) saveMedia(data []byte, kind, suffix string) string {
 	tmp, err := os.CreateTemp("", "weixin_oc_"+kind+"_*"+suffix)
@@ -306,6 +336,11 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 				return err
 			}
 			pendingText = ""
+		case *message.Record:
+			if err := a.sendRecord(ctx, sessionID, c); err != nil {
+				return err
+			}
+			pendingText = ""
 		}
 	}
 	if strings.TrimSpace(pendingText) != "" {
@@ -314,15 +349,25 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	return nil
 }
 
+// resolveMedia 解析媒体组件的二进制内容：优先本地文件，其次 base64，最后下载 URL。
+func resolveMedia(path, file, b64, url string) ([]byte, error) {
+	if path == "" {
+		path = file
+	}
+	if path != "" {
+		return os.ReadFile(path)
+	}
+	if b64 != "" {
+		return base64.StdEncoding.DecodeString(b64)
+	}
+	if url != "" {
+		return downloadMedia(url)
+	}
+	return nil, fmt.Errorf("媒体组件缺少可用的内容（path/file/base64/url 均为空）")
+}
+
 func (a *Adapter) sendImage(ctx context.Context, userID string, img *message.Image) error {
-	path := img.Path
-	if path == "" {
-		path = img.File
-	}
-	if path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
+	data, err := resolveMedia(img.Path, img.File, img.Base64, img.URL)
 	if err != nil {
 		return err
 	}
@@ -339,11 +384,7 @@ func (a *Adapter) sendImage(ctx context.Context, userID string, img *message.Ima
 }
 
 func (a *Adapter) sendFile(ctx context.Context, userID string, f *message.File) error {
-	path := f.Path
-	if path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
+	data, err := resolveMedia(f.Path, "", "", f.URL)
 	if err != nil {
 		return err
 	}
@@ -359,11 +400,7 @@ func (a *Adapter) sendFile(ctx context.Context, userID string, f *message.File) 
 }
 
 func (a *Adapter) sendVideo(ctx context.Context, userID string, v *message.Video) error {
-	path := v.Path
-	if path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(path)
+	data, err := resolveMedia(v.Path, "", "", v.URL)
 	if err != nil {
 		return err
 	}
@@ -373,5 +410,22 @@ func (a *Adapter) sendVideo(ctx context.Context, userID string, v *message.Video
 	}
 	return a.bot.SendVideo(ctx, userID, &ilink.VideoItem{
 		Media: &ilink.CDNMedia{EncryptQueryParam: up.EncryptedParam, AESKey: up.AESKey},
+	})
+}
+
+func (a *Adapter) sendRecord(ctx context.Context, userID string, rec *message.Record) error {
+	data, err := resolveMedia(rec.Path, rec.File, rec.Base64, rec.URL)
+	if err != nil {
+		return err
+	}
+	up, err := a.bot.Upload(ctx, data, userID, "voice")
+	if err != nil {
+		return err
+	}
+	return a.bot.SendVoice(ctx, userID, &ilink.VoiceItem{
+		Media: &ilink.CDNMedia{
+			EncryptQueryParam: up.EncryptedParam,
+			AESKey:            up.AESKey,
+		},
 	})
 }

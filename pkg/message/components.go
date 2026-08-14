@@ -244,7 +244,9 @@ func (n *Nodes) Clone() Component {
 			nodes[i] = node.Clone().(*Node)
 		}
 	}
-	return &Nodes{Nodes: nodes}
+	forwardIDs := make([]string, len(n.ForwardIDs))
+	copy(forwardIDs, n.ForwardIDs)
+	return &Nodes{Nodes: nodes, ForwardIDs: forwardIDs}
 }
 
 // Poke represents a poke action.
@@ -289,7 +291,37 @@ type Json struct {
 
 func (j *Json) Type() ComponentType { return CompJson }
 func (j *Json) String() string      { return fmt.Sprintf("[Json:%v]", j.Data) }
-func (j *Json) Clone() Component    { return &Json{Data: j.Data} }
+func (j *Json) Clone() Component {
+	return &Json{Data: deepCopyJSONMap(j.Data)}
+}
+
+// deepCopyJSONMap recursively copies a JSON card payload so the clone never
+// shares map or slice storage with the original.
+func deepCopyJSONMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = deepCopyJSONValue(v)
+	}
+	return out
+}
+
+func deepCopyJSONValue(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		return deepCopyJSONMap(t)
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = deepCopyJSONValue(e)
+		}
+		return out
+	default:
+		return v
+	}
+}
 
 // Share represents a link share.
 type Share struct {

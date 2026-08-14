@@ -155,6 +155,12 @@ func (c *WecomAIBotLongConnectionClient) runOnce(ctx context.Context) error {
 		}
 	}()
 
+	// 消息处理队列：独立 goroutine 顺序消费回调，避免读循环被消息处理阻塞
+	// （处理回调可能调用 SendCommand 等待响应，若在读循环内执行将自阻塞）。
+	handlerCh := make(chan map[string]interface{}, 256)
+	handlerDone := make(chan struct{})
+	go c.handlerLoop(handlerCh, handlerDone)
+
 	for {
 		if c.isShutdown() {
 			break
@@ -164,11 +170,31 @@ func (c *WecomAIBotLongConnectionClient) runOnce(ctx context.Context) error {
 		if err != nil {
 			break
 		}
-		c.handleTextMessage(string(data))
+		c.handleTextMessage(string(data), handlerCh)
 	}
 	close(heartbeatStop)
 	<-heartbeatDone
+	close(handlerCh)
+	<-handlerDone
 	return nil
+}
+
+// handlerLoop 顺序消费回调消息并交给 messageHandler 处理。
+func (c *WecomAIBotLongConnectionClient) handlerLoop(ch chan map[string]interface{}, done chan struct{}) {
+	defer close(done)
+	for payload := range ch {
+		if c.messageHandler == nil {
+			continue
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.I18nError("[WecomAI][LongConn] 处理回调消息异常: %v", r)
+				}
+			}()
+			c.messageHandler(payload)
+		}()
+	}
 }
 
 // subscribe 发送 aibot_subscribe 并等待响应（对应 _subscribe）。
@@ -208,7 +234,7 @@ func (c *WecomAIBotLongConnectionClient) subscribe() error {
 }
 
 // handleTextMessage 处理收到的文本消息（对应 _handle_text_message）。
-func (c *WecomAIBotLongConnectionClient) handleTextMessage(text string) {
+func (c *WecomAIBotLongConnectionClient) handleTextMessage(text string, handlerCh chan map[string]interface{}) {
 	var payload map[string]interface{}
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
 		logger.I18nWarn("[WecomAI][LongConn] 收到非 JSON 消息: %s", text)
@@ -232,8 +258,11 @@ func (c *WecomAIBotLongConnectionClient) handleTextMessage(text string) {
 
 	cmd, _ := payload["cmd"].(string)
 	if cmd == "aibot_msg_callback" || cmd == "aibot_event_callback" {
-		if c.messageHandler != nil {
-			c.messageHandler(payload)
+		// 投递到独立 handler goroutine，读循环保持收帧（waiter 才能被喂入）
+		select {
+		case handlerCh <- payload:
+		default:
+			logger.I18nWarn("[WecomAI][LongConn] 消息处理队列已满，丢弃回调消息")
 		}
 		return
 	}

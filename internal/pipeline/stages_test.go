@@ -45,29 +45,90 @@ func TestExecuteGetCurrentTime(t *testing.T) {
 }
 
 func TestExecuteWebFetch(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		w.Write([]byte("<html><head><script>var x=1;</script><style>.a{}</style></head><body><h1>Hello</h1><p>World</p></body></html>"))
-	}))
-	defer srv.Close()
+	cases := []struct {
+		name, url, want string
+	}{
+		{"empty", "", "错误"},
+		{"non-http", "ftp://example.com/x", "错误"},
+		{"loopback", "http://127.0.0.1/", "环回"},
+		{"localhost", "http://localhost/", "环回"},
+		{"private", "http://10.0.0.1/", "私网"},
+		{"link-local metadata", "http://169.254.169.254/latest/meta-data/", "元数据"},
+		{"ipv6 loopback", "http://[::1]/", "环回"},
+	}
+	for _, c := range cases {
+		if out := executeWebFetch(c.url, 1000); !strings.Contains(out, c.want) {
+			t.Errorf("executeWebFetch(%q) = %q, want substring %q", c.url, out, c.want)
+		}
+	}
+}
 
-	out := executeWebFetch(srv.URL, 1000)
-	if strings.Contains(out, "<h1>") {
-		t.Errorf("HTML tags not stripped: %q", out)
+func TestValidateWebFetchHost(t *testing.T) {
+	blocked := []string{
+		"127.0.0.1", "127.8.8.8", "10.0.0.1", "172.16.0.1", "172.31.255.255",
+		"192.168.1.1", "169.254.169.254", "169.254.1.1", "::1", "fe80::1",
+		"0.0.0.0", "100.64.0.1", "100.100.100.200",
 	}
-	if !strings.Contains(out, "Hello") || !strings.Contains(out, "World") {
-		t.Errorf("expected text content: %q", out)
+	for _, h := range blocked {
+		if err := validateWebFetchHost(h); err == nil {
+			t.Errorf("expected %q to be rejected", h)
+		}
 	}
-	if strings.Contains(out, "var x") || strings.Contains(out, ".a{}") {
-		t.Errorf("script/style content leaked: %q", out)
+	allowed := []string{"1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222"}
+	for _, h := range allowed {
+		if err := validateWebFetchHost(h); err != nil {
+			t.Errorf("expected %q to be allowed, got %v", h, err)
+		}
 	}
+}
 
-	// Bad URL / errors handled gracefully.
-	if out := executeWebFetch("", 100); !strings.Contains(out, "错误") {
-		t.Errorf("expected error for empty url, got: %q", out)
+func TestValidateWebFetchURL(t *testing.T) {
+	if _, err := validateWebFetchURL("ftp://example.com/x"); err == nil {
+		t.Errorf("expected non-http scheme rejected")
 	}
-	if out := executeWebFetch("ftp://x", 100); !strings.Contains(out, "错误") {
-		t.Errorf("expected error for non-http url, got: %q", out)
+	if _, err := validateWebFetchURL("http://127.0.0.1/x"); err == nil {
+		t.Errorf("expected loopback rejected")
+	}
+	u, err := validateWebFetchURL("http://1.1.1.1/page#frag")
+	if err != nil {
+		t.Fatalf("expected public url allowed: %v", err)
+	}
+	if strings.Contains(u, "#") {
+		t.Errorf("fragment not stripped: %q", u)
+	}
+}
+
+func TestWebFetchRedirectGuard(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://1.1.1.1/", nil)
+	if err := webFetchRedirectGuard(req, nil); err != nil {
+		t.Errorf("expected public redirect allowed, got %v", err)
+	}
+	req2 := httptest.NewRequest("GET", "http://127.0.0.1/", nil)
+	if err := webFetchRedirectGuard(req2, nil); err == nil {
+		t.Errorf("expected loopback redirect rejected")
+	}
+	req3 := httptest.NewRequest("GET", "http://8.8.8.8/", nil)
+	if err := webFetchRedirectGuard(req3, make([]*http.Request, maxRedirects)); err == nil {
+		t.Errorf("expected too-many-redirects rejected")
+	}
+	req4 := httptest.NewRequest("GET", "ftp://1.1.1.1/", nil)
+	if err := webFetchRedirectGuard(req4, nil); err == nil {
+		t.Errorf("expected non-http redirect rejected")
+	}
+}
+
+func TestAllowedWebFetchContentType(t *testing.T) {
+	allowed := []string{"text/html", "text/html; charset=utf-8", "text/plain", "application/json", "application/xml", ""}
+	for _, ct := range allowed {
+		if !allowedWebFetchContentType(ct) {
+			t.Errorf("expected %q to be allowed", ct)
+		}
+	}
+	blocked := []string{"image/png", "image/jpeg", "application/octet-stream", "application/pdf", "application/zip"}
+	for _, ct := range blocked {
+		if allowedWebFetchContentType(ct) {
+			t.Errorf("expected %q to be rejected", ct)
+		}
 	}
 }
 

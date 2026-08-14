@@ -125,14 +125,20 @@ func (c *WXBizMsgCrypt) Decrypt(encrypted string) (string, error) {
 	if padLen <= 0 || padLen > 32 || padLen > len(pt) {
 		return "", ErrBadPadding
 	}
+	for i := len(pt) - padLen; i < len(pt); i++ {
+		if pt[i] != byte(padLen) {
+			return "", ErrBadPadding
+		}
+	}
 	pt = pt[:len(pt)-padLen]
 	if len(pt) < 20 {
 		return "", ErrBadPadding
 	}
-	contentLen := int(binary.BigEndian.Uint32(pt[16:20]))
-	if contentLen > len(pt)-20 {
+	contentLenUint := binary.BigEndian.Uint32(pt[16:20])
+	if contentLenUint > uint32(len(pt)-20) {
 		return "", ErrBadPadding
 	}
+	contentLen := int(contentLenUint)
 	content := string(pt[20 : 20+contentLen])
 	fromCorpID := string(pt[20+contentLen:])
 	if fromCorpID != c.receiveID {

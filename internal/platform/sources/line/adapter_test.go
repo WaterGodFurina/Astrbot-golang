@@ -3,11 +3,15 @@ package line
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
 
@@ -253,6 +257,37 @@ func TestBuildLineMessagesFileService(t *testing.T) {
 	}
 }
 
+// TestBuildLineMessagesCallbackBase 验证配置 callback_api_base 时媒体 URL 使用公网地址 (对应 H-19)。
+func TestBuildLineMessagesCallbackBase(t *testing.T) {
+	a := New(map[string]interface{}{
+		"id":                   "line-test",
+		"channel_access_token": "test-token",
+		"channel_secret":       "secret",
+		"callback_api_base":    "https://bot.example.com",
+	}, nil, nil)
+	tmpFile := t.TempDir() + "/local.png"
+	if err := writeTestFile(tmpFile, []byte("fake-png")); err != nil {
+		t.Fatalf("写入测试文件失败: %v", err)
+	}
+	chain := &message.MessageChain{Chain: []message.Component{
+		&message.Image{Path: tmpFile},
+	}}
+	messages, err := a.buildLineMessages(context.Background(), chain)
+	if err != nil {
+		t.Fatalf("buildLineMessages: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("期望 1 条消息，实际 %d", len(messages))
+	}
+	imgMsg, ok := messages[0].(*messaging_api.ImageMessage)
+	if !ok {
+		t.Fatalf("消息 0 应为 ImageMessage，实际 %T", messages[0])
+	}
+	if !strings.HasPrefix(imgMsg.OriginalContentUrl, "https://bot.example.com/api/file/") {
+		t.Errorf("配置 callback_api_base 后媒体 URL 应使用公网 HTTPS 地址，实际 %q", imgMsg.OriginalContentUrl)
+	}
+}
+
 // ── 文件名提取 ───────────────────────────────────────────────────
 
 func TestExtractFilenameFromDisposition(t *testing.T) {
@@ -380,5 +415,158 @@ func TestNewAdapterMissingConfig(t *testing.T) {
 	}
 	if err := a.Send("G1", &message.MessageChain{Chain: []message.Component{&message.Plain{Text: "hi"}}}); err == nil {
 		t.Error("lineAPI 未初始化时 Send 应返回错误")
+	}
+}
+
+// ── L-33：缺失字段不 panic、不产生 "<nil>" ──────────────────────
+
+func TestStringVal(t *testing.T) {
+	if got := stringVal(nil); got != "" {
+		t.Errorf("stringVal(nil) = %q，期望空串", got)
+	}
+	if got := stringVal("x"); got != "x" {
+		t.Errorf("stringVal(\"x\") = %q", got)
+	}
+	if got := stringVal(123); got != "" {
+		t.Errorf("stringVal(123) = %q，期望空串", got)
+	}
+}
+
+func TestConvertMessageMissingFields(t *testing.T) {
+	a := New(map[string]interface{}{"id": "line-test"}, nil, nil)
+	// 缺失 webhookEventId / userId / message.id / deliveryContext：
+	// 旧代码会 panic（类型断言）或产生 "<nil>" 字面量。
+	event := map[string]interface{}{
+		"type":    "message",
+		"mode":    "active",
+		"source":  map[string]interface{}{"type": "user"},
+		"message": map[string]interface{}{"type": "text", "text": "hi"},
+	}
+	abm := a.convertMessage(event)
+	if abm == nil {
+		t.Fatal("convertMessage 不应返回 nil")
+	}
+	if abm.MessageID == "" {
+		t.Error("MessageID 应回退到随机值而非空")
+	}
+	if strings.Contains(abm.Sender.UserID, "<nil>") || strings.Contains(abm.SessionID, "<nil>") || strings.Contains(abm.MessageID, "<nil>") {
+		t.Errorf("缺失字段不应产生 <nil> 字面量: %+v", abm)
+	}
+}
+
+// ── L-35：replyToken TTL 清理 ────────────────────────────────────
+
+func TestSweepReplyTokens(t *testing.T) {
+	a := New(map[string]interface{}{"id": "line-test"}, nil, nil)
+	a.rtMu.Lock()
+	a.replyTokens["fresh"] = replyTokenEntry{token: "T1", at: time.Now()}
+	a.replyTokens["stale"] = replyTokenEntry{token: "T2", at: time.Now().Add(-2 * replyTokenTTL)}
+	a.rtMu.Unlock()
+
+	a.sweepReplyTokens()
+
+	a.rtMu.Lock()
+	defer a.rtMu.Unlock()
+	if _, ok := a.replyTokens["fresh"]; !ok {
+		t.Error("未过期的 replyToken 不应被清理")
+	}
+	if _, ok := a.replyTokens["stale"]; ok {
+		t.Error("过期 replyToken 应被清理")
+	}
+}
+
+// ── L-36：按 []rune 截断 ─────────────────────────────────────────
+
+func TestTruncateRunes(t *testing.T) {
+	if got := truncateRunes("你好世界", 2); got != "你好" {
+		t.Errorf("truncateRunes(你好世界,2) = %q", got)
+	}
+	if got := truncateRunes("hello", 10); got != "hello" {
+		t.Errorf("truncateRunes(hello,10) = %q", got)
+	}
+	if got := truncateRunes("你好世界", 3); len([]rune(got)) != 3 {
+		t.Errorf("截断结果应为 3 个字符，得到 %q (%d runes)", got, len([]rune(got)))
+	}
+}
+
+// ── L-32：临时媒体文件清理 ───────────────────────────────────────
+
+func TestStoreTempContent(t *testing.T) {
+	path := storeTempContent("test", "msg-1", []byte("content"), ".txt", "file.txt")
+	if path == "" {
+		t.Fatal("storeTempContent 返回空路径")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("临时文件应存在: %v", err)
+	}
+	if !strings.HasPrefix(filepath.Base(path), "file") {
+		t.Errorf("文件名前缀应保留原文件名: %s", filepath.Base(path))
+	}
+	_ = os.Remove(path)
+}
+
+// TestMediaServerTokenSweep 验证过期 token 被清除、owned 临时文件被删除（L-32/L-35）。
+func TestMediaServerTokenSweep(t *testing.T) {
+	ms := &mediaServer{tokens: map[string]mediaTokenEntry{}}
+
+	ownedFile := filepath.Join(t.TempDir(), "owned.bin")
+	if err := os.WriteFile(ownedFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherFile := filepath.Join(t.TempDir(), "other.bin")
+	if err := os.WriteFile(otherFile, []byte("y"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ms.tokenMu.Lock()
+	ms.tokens["owned"] = mediaTokenEntry{path: ownedFile, owned: true, at: time.Now().Add(-2 * mediaTokenTTL)}
+	ms.tokens["other"] = mediaTokenEntry{path: otherFile, owned: false, at: time.Now().Add(-2 * mediaTokenTTL)}
+	ms.tokenMu.Unlock()
+
+	// 触发一次注册以执行 sweep
+	if _, err := ms.registerFile(filepath.Join(t.TempDir(), "live.bin"), false); err != nil {
+		t.Fatal(err)
+	}
+
+	ms.tokenMu.RLock()
+	_, ownedExists := ms.tokens["owned"]
+	_, otherExists := ms.tokens["other"]
+	ms.tokenMu.RUnlock()
+	if ownedExists || otherExists {
+		t.Error("过期 token 应被清除")
+	}
+	if _, err := os.Stat(ownedFile); !os.IsNotExist(err) {
+		t.Errorf("owned 临时文件应在 token 过期时被删除: %v", err)
+	}
+	if _, err := os.Stat(otherFile); err != nil {
+		t.Errorf("非 owned 文件不应被删除: %v", err)
+	}
+}
+
+// ── L-35：readBody 区分 io.EOF 与其他读取错误 ────────────────────
+
+// chunkErrReader 在返回数据的同时返回非 EOF 错误，模拟响应体读取中断。
+type chunkErrReader struct {
+	readErr error
+}
+
+func (r *chunkErrReader) Read(p []byte) (int, error) {
+	n := copy(p, []byte("partial-data"))
+	return n, r.readErr
+}
+
+func (r *chunkErrReader) Close() error { return nil }
+
+func TestReadBodyNonEOFError(t *testing.T) {
+	resp := &http.Response{Body: &chunkErrReader{readErr: errors.New("boom")}}
+	got := readBody(resp)
+	if string(got) != "partial-data" {
+		t.Errorf("非 EOF 读取错误时不应吞掉已读部分，得到 %q", string(got))
+	}
+
+	resp2 := &http.Response{Body: &chunkErrReader{readErr: io.EOF}}
+	got2 := readBody(resp2)
+	if string(got2) != "partial-data" {
+		t.Errorf("EOF 结束时应保留已读部分，得到 %q", string(got2))
 	}
 }

@@ -25,13 +25,14 @@ type XiaomiSource struct {
 // NewXiaomiSource creates a Xiaomi provider with api_base defaulting to
 // https://api.xiaomimimo.com/v1 and model defaulting to mimo-v2.5.
 func NewXiaomiSource(config, settings map[string]interface{}) *XiaomiSource {
-	if configString(config, "api_base", "") == "" {
-		config["api_base"] = "https://api.xiaomimimo.com/v1"
+	cfg := cloneMap(config)
+	if configString(cfg, "api_base", "") == "" {
+		cfg["api_base"] = "https://api.xiaomimimo.com/v1"
 	}
-	if configString(config, "model", "") == "" {
-		config["model"] = "mimo-v2.5"
+	if configString(cfg, "model", "") == "" {
+		cfg["model"] = "mimo-v2.5"
 	}
-	return &XiaomiSource{OpenAISource: NewOpenAISource(config, settings)}
+	return &XiaomiSource{OpenAISource: NewOpenAISource(cfg, settings)}
 }
 
 // GetModels returns the known Xiaomi models, falling back to the built-in list

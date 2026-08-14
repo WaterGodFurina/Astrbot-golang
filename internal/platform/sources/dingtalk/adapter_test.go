@@ -1,13 +1,68 @@
 package dingtalk
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	"github.com/gorilla/websocket"
 )
+
+// rewriteHostTransport 将请求重定向到测试服务器 (钉钉 API 域名无法从单测访问)。
+type rewriteHostTransport struct {
+	base string
+}
+
+// RoundTrip 重写目标 host 到测试服务器。
+func (t *rewriteHostTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req2 := req.Clone(req.Context())
+	req2.URL.Scheme = "http"
+	req2.URL.Host = strings.TrimPrefix(t.base, "http://")
+	return http.DefaultTransport.RoundTrip(req2)
+}
+
+// newTokenTestAdapter 构造指向测试服务器的钉钉适配器。
+func newTokenTestAdapter(t *testing.T, handler http.HandlerFunc) *Adapter {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	a := New(map[string]interface{}{"client_id": "c1", "client_secret": "s1"}, nil, nil)
+	a.httpClient = &http.Client{Transport: &rewriteHostTransport{base: srv.URL}}
+	return a
+}
+
+// TestGetAccessTokenFlatResponse 验证扁平响应 {"accessToken": ...} 解析 (对应 H-16)。
+func TestGetAccessTokenFlatResponse(t *testing.T) {
+	a := newTokenTestAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1.0/oauth2/accessToken" {
+			t.Errorf("请求路径应为 /v1.0/oauth2/accessToken, 实际 %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"accessToken":"tok-flat","expireIn":7200}`))
+	})
+	if got := a.getAccessToken(); got != "tok-flat" {
+		t.Fatalf("扁平 accessToken 应解析成功, 实际 %q", got)
+	}
+	// 缓存应生效 (第二次调用不再发起请求)
+	if got := a.getAccessToken(); got != "tok-flat" {
+		t.Fatalf("缓存命中应返回同一 token, 实际 %q", got)
+	}
+}
+
+// TestGetAccessTokenNestedFallback 验证嵌套结构 {"data":{"accessToken":...}} 兜底解析。
+func TestGetAccessTokenNestedFallback(t *testing.T) {
+	a := newTokenTestAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"accessToken":"tok-nested","expireIn":3600}}`))
+	})
+	if got := a.getAccessToken(); got != "tok-nested" {
+		t.Fatalf("嵌套 accessToken 应兜底解析成功, 实际 %q", got)
+	}
+}
 
 // ---------- 会话 id 转换 ----------
 
@@ -228,6 +283,16 @@ func TestReconnectDelay(t *testing.T) {
 	}
 }
 
+// TestReconnectDelaySaturation 验证重连延迟在极多次失败后仍封顶 300 秒,
+// 不会因 1<<(retryCount-1) 移位溢出为 0/负数而退化为热循环 (对应 L-26)。
+func TestReconnectDelaySaturation(t *testing.T) {
+	for _, n := range []int{63, 64, 100, 1000} {
+		if got := dingtalkReconnectDelay(n).Seconds(); got != 300 {
+			t.Fatalf("重连延迟(%d) 应饱和到 300, 实际 %v", n, got)
+		}
+	}
+}
+
 // TestGroupMessagePayload 验证群聊消息发送 payload 构造 (msgKey/msgParam)。
 func TestGroupMessagePayload(t *testing.T) {
 	_ = New(map[string]interface{}{"client_id": "c1", "client_secret": "s1"}, nil, nil)
@@ -381,5 +446,174 @@ func TestBuildAckFrame(t *testing.T) {
 	}
 	if parsed["data"] != `{"response": "OK"}` {
 		t.Fatalf("确认帧 data 应为 JSON 字符串: %+v", parsed)
+	}
+}
+
+// ---------- 发送失败返回 error (L-27) ----------
+
+// newSendErrorAdapter 构造返回 500 的钉钉适配器 (token 请求正常, 发送请求失败)。
+func newSendErrorAdapter(t *testing.T) *Adapter {
+	t.Helper()
+	return newTokenTestAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"tok","expireIn":7200}`))
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+}
+
+// TestSendGroupMessageError 验证群聊发送失败时 Send 返回 error (而非静默 nil)。
+func TestSendGroupMessageError(t *testing.T) {
+	a := newSendErrorAdapter(t)
+	a.convMu.Lock()
+	a.knownGroups["conv_1"] = true
+	a.convMu.Unlock()
+	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: "hi"}}}
+	if err := a.Send("conv_1", chain); err == nil {
+		t.Fatal("群聊发送失败应返回 error, 而非静默 nil (L-27)")
+	}
+}
+
+// TestSendPrivateMessageError 验证私聊发送失败时 Send 返回 error。
+func TestSendPrivateMessageError(t *testing.T) {
+	a := newSendErrorAdapter(t)
+	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: "hi"}}}
+	if err := a.Send("sender_1", chain); err == nil {
+		t.Fatal("私聊发送失败应返回 error, 而非静默 nil (L-27)")
+	}
+}
+
+// TestSendPrivateMessageUsesStaffID 验证私聊发送使用持久化的 staff_id 而非回退 session_id。
+func TestSendPrivateMessageUsesStaffID(t *testing.T) {
+	var gotStaffID string
+	a := newTokenTestAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"tok","expireIn":7200}`))
+		case "/v1.0/robot/oToMessages/batchSend":
+			var payload struct {
+				UserIDs []string `json:"userIds"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if len(payload.UserIDs) == 1 {
+				gotStaffID = payload.UserIDs[0]
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	// 模拟已记录 staff_id 映射
+	a.staffMu.Lock()
+	a.staffIDMap[a.staffIDKey("sender_1")] = "staff_1"
+	a.staffMu.Unlock()
+	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: "hi"}}}
+	if err := a.Send("sender_1", chain); err != nil {
+		t.Fatalf("发送不应失败: %v", err)
+	}
+	if gotStaffID != "staff_1" {
+		t.Fatalf("私聊发送应使用持久化 staff_id, 实际 %q", gotStaffID)
+	}
+}
+
+// TestStatePersistenceRoundTrip 验证会话映射落盘后重启可恢复 (对应 L-27)。
+func TestStatePersistenceRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	config := map[string]interface{}{
+		"client_id":         "c1",
+		"client_secret":     "s1",
+		"dingtalk_data_dir": dir,
+	}
+	a := New(config, nil, nil)
+	a.rememberGroup("conv_1")
+	a.rememberSenderBinding(&ChatbotMessage{SenderStaffID: "staff_1"},
+		&platform.AstrBotMessage{Type: platform.FriendMessage, Sender: platform.MessageMember{UserID: "sender_1"}})
+
+	// 新的适配器实例模拟进程重启
+	b := New(config, nil, nil)
+	if !b.isKnownGroup("conv_1") {
+		t.Fatal("群聊会话应在重启后从磁盘恢复")
+	}
+	if b.getSenderStaffID("sender_1") != "staff_1" {
+		t.Fatal("staff_id 映射应在重启后从磁盘恢复")
+	}
+}
+
+// ---------- Callback 先 ack 再异步处理 (L-28) ----------
+
+// newWSPair 建立一对真实 WebSocket 连接, 返回客户端连接与服务端收到的帧通道。
+func newWSPair(t *testing.T) (*websocket.Conn, <-chan []byte, func()) {
+	t.Helper()
+	frames := make(chan []byte, 8)
+	up := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		for {
+			_, msg, err := c.ReadMessage()
+			if err != nil {
+				close(frames)
+				return
+			}
+			frames <- msg
+		}
+	}))
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		srv.Close()
+		t.Fatalf("dial ws: %v", err)
+	}
+	cleanup := func() {
+		_ = conn.Close()
+		srv.Close()
+	}
+	return conn, frames, cleanup
+}
+
+// TestHandleCallbackAcksBeforeAsyncProcessing 验证 Callback 帧先发送 ack,
+// 再把数据投递到异步处理队列, 下载/转码等耗时操作不再阻塞 WS 读循环。
+func TestHandleCallbackAcksBeforeAsyncProcessing(t *testing.T) {
+	conn, frames, cleanup := newWSPair(t)
+	defer cleanup()
+
+	a := New(map[string]interface{}{"client_id": "c1", "client_secret": "s1"}, nil, nil)
+	a.msgCh = make(chan map[string]interface{}, 8)
+
+	callbackData, _ := json.Marshal(`{"msgId":"m1","conversationType":"2","msgtype":"text","text":{"content":"hi"}}`)
+	frame := &dingFrame{
+		Type:    "Callback",
+		Headers: dingFrameHeader{Topic: chatTopic, MessageID: "frame_1"},
+		Data:    callbackData,
+	}
+	a.handleCallback(context.Background(), conn, frame)
+
+	// ack 应立即到达 (无需依赖异步处理完成)
+	select {
+	case ackMsg := <-frames:
+		var ack dingAckFrame
+		if err := json.Unmarshal(ackMsg, &ack); err != nil {
+			t.Fatalf("ack 解析失败: %v", err)
+		}
+		if ack.Code != 200 || ack.Headers["messageId"] != "frame_1" {
+			t.Fatalf("ack 内容错误: %+v", ack)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("先发送 ack 后异步处理: 未在超时内收到 ack")
+	}
+
+	// 原始数据应进入异步处理队列
+	select {
+	case data := <-a.msgCh:
+		if data["msgId"] != "m1" {
+			t.Fatalf("入队数据错误: %+v", data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("回调数据应入队待异步处理 (L-28)")
 	}
 }

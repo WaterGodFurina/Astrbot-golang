@@ -402,11 +402,20 @@ func (c *MattermostClient) ParsePostAttachments(ctx context.Context, fileIDs []s
 			mimeType = "application/octet-stream"
 		}
 		suffix := filepath.Ext(filename)
-		filePath := filepath.Join(os.TempDir(), fmt.Sprintf("astrbot_mattermost_%s%s", fileID, suffix))
-		if err := os.WriteFile(filePath, fileBytes, 0644); err != nil {
+		tmp, err := os.CreateTemp("", "astrbot_mattermost_*"+suffix)
+		if err != nil {
+			logger.I18nWarn("Mattermost 创建附件临时文件失败 %s: %v", fileID, err)
+			continue
+		}
+		filePath := tmp.Name()
+		if _, err := tmp.Write(fileBytes); err != nil {
+			tmp.Close()
+			_ = os.Remove(filePath)
 			logger.I18nWarn("Mattermost 写入附件失败 %s -> %s: %v", fileID, filePath, err)
 			continue
 		}
+		tmp.Close()
+		scheduleAttachmentCleanup(filePath)
 		tempPaths = append(tempPaths, filePath)
 
 		switch {
@@ -424,6 +433,22 @@ func (c *MattermostClient) ParsePostAttachments(ctx context.Context, fileIDs []s
 		}
 	}
 	return components, tempPaths
+}
+
+// attachmentCleanupDelay 是附件临时文件的清理延迟：消息在事件总线中同步处理，
+// 回复在数十秒内完成，延迟清理保证媒体在消费期间可用。
+const attachmentCleanupDelay = time.Hour
+
+// scheduleAttachmentCleanup 在延迟后删除附件临时文件。
+func scheduleAttachmentCleanup(path string) {
+	if path == "" {
+		return
+	}
+	time.AfterFunc(attachmentCleanupDelay, func() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			logger.Debug("Mattermost 清理附件临时文件失败 %s: %v", path, err)
+		}
+	})
 }
 
 // ParseWebsocketPost 解析 WebSocket 事件中的 post 字符串（对应 parse_websocket_post）。

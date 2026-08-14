@@ -1,6 +1,10 @@
 package weixin_oc
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"testing"
 
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
@@ -84,5 +88,71 @@ func TestTypeAndID(t *testing.T) {
 	a := New(map[string]interface{}{"id": "custom"}, nil, nil)
 	if a.ID() != "custom" || a.Type() != "weixin_oc" {
 		t.Errorf("id/type: %s %s", a.ID(), a.Type())
+	}
+}
+
+// TestResolveMediaMissingContent: 无 path/file/base64/url 的媒体应返回明确错误，
+// 而非静默 nil（L-44 回归）。
+func TestResolveMediaMissingContent(t *testing.T) {
+	a := New(map[string]interface{}{"id": "wx"}, nil, nil)
+	if _, err := resolveMedia("", "", "", ""); err == nil {
+		t.Error("空媒体应返回错误")
+	}
+	if err := a.sendImage(context.Background(), "u", &message.Image{}); err == nil {
+		t.Error("空图片组件应返回错误")
+	}
+	if err := a.sendFile(context.Background(), "u", &message.File{}); err == nil {
+		t.Error("空文件组件应返回错误")
+	}
+	if err := a.sendVideo(context.Background(), "u", &message.Video{}); err == nil {
+		t.Error("空视频组件应返回错误")
+	}
+	if err := a.sendRecord(context.Background(), "u", &message.Record{}); err == nil {
+		t.Error("空语音组件应返回错误")
+	}
+	// Send 中 Record 分支不应再被静默丢弃。
+	err := a.Send("u", &message.MessageChain{Chain: []message.Component{&message.Record{}}})
+	if err == nil {
+		t.Error("Send 空 Record 应返回明确错误")
+	}
+}
+
+// TestResolveMediaBase64AndFile: base64 与本地文件均可被解析。
+func TestResolveMediaBase64AndFile(t *testing.T) {
+	data, err := resolveMedia("", "", "aGVsbG8=", "")
+	if err != nil || string(data) != "hello" {
+		t.Errorf("base64 解析失败: %v %q", err, data)
+	}
+	if _, err := resolveMedia("", "", "!!!not-base64!!!", ""); err == nil {
+		t.Error("非法 base64 应报错")
+	}
+	tmp := t.TempDir()
+	p := tmp + "/f.bin"
+	if err := os.WriteFile(p, []byte("file-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, err = resolveMedia(p, "", "", "")
+	if err != nil || string(data) != "file-bytes" {
+		t.Errorf("本地文件解析失败: %v %q", err, data)
+	}
+}
+
+// TestDownloadMedia: URL 下载成功与失败分支。
+func TestDownloadMedia(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bad" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("data-bytes"))
+	}))
+	defer srv.Close()
+
+	data, err := downloadMedia(srv.URL + "/ok")
+	if err != nil || string(data) != "data-bytes" {
+		t.Errorf("下载应成功，实际: %v %q", err, data)
+	}
+	if _, err := downloadMedia(srv.URL + "/bad"); err == nil {
+		t.Error("HTTP 非 2xx 应报错")
 	}
 }

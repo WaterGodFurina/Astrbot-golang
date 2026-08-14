@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
@@ -92,7 +93,7 @@ type Adapter struct {
 	rolesCache *RolesRecord
 
 	// 主循环控制
-	running bool
+	running atomic.Bool
 	ctx     context.Context
 	cancel  context.CancelFunc
 	stopCh  chan struct{}
@@ -135,7 +136,7 @@ func (a *Adapter) Type() string { return "kook" }
 
 // Start 启动适配器 (对应 Python run + _main_loop)。
 func (a *Adapter) Start(ctx context.Context) error {
-	a.running = true
+	a.running.Store(true)
 	a.ctx, a.cancel = context.WithCancel(ctx)
 	logger.I18nInfo("[KOOK] 启动KOOK适配器")
 	go a.mainLoop()
@@ -144,7 +145,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 
 // Stop 停止适配器。
 func (a *Adapter) Stop() error {
-	a.running = false
+	a.running.Store(false)
 	if a.cancel != nil {
 		a.cancel()
 	}
@@ -161,7 +162,7 @@ func (a *Adapter) mainLoop() {
 	maxConsecutiveFailures := a.kookConfig.MaxConsecutiveFailures
 	maxRetryDelay := a.kookConfig.MaxRetryDelay
 
-	for a.running {
+	for a.running.Load() {
 		logger.I18nInfo("[KOOK] 尝试连接KOOK服务器...")
 		// 获取机器人信息
 		a.client.GetBotInfo(a.ctx)
@@ -172,12 +173,12 @@ func (a *Adapter) mainLoop() {
 			logger.I18nInfo("[KOOK] 连接成功，开始监听消息")
 			consecutiveFailures = 0 // 重置失败计数
 			// Connect 会阻塞到连接结束
-			if a.running {
+			if a.running.Load() {
 				logger.I18nWarn("[KOOK] 连接断开，准备重连")
 			}
 			continue
 		}
-		if !a.running {
+		if !a.running.Load() {
 			return
 		}
 		consecutiveFailures++
@@ -186,10 +187,14 @@ func (a *Adapter) mainLoop() {
 			logger.I18nError("[KOOK] 连续失败次数过多，停止重连")
 			return
 		}
-		// 指数退避
-		waitTime := 1 << consecutiveFailures
-		if waitTime > maxRetryDelay {
-			waitTime = maxRetryDelay
+		// 指数退避 (饱和运算, 钳制移位指数, 防止溢出为 0/负数使延迟归零退化为热循环)
+		exp := consecutiveFailures
+		if exp > 30 {
+			exp = 30
+		}
+		waitTime := int64(1) << exp
+		if waitTime > int64(maxRetryDelay) {
+			waitTime = int64(maxRetryDelay)
 		}
 		logger.I18nInfo("[KOOK] 等待 %d 秒后重试...", waitTime)
 		select {

@@ -16,7 +16,8 @@ type LongcatSource struct {
 // NewLongcatSource creates a LongCat provider, defaulting api_base to
 // https://api.longcat.chat/openai/v1 and normalizing ".../openai" to ".../openai/v1".
 func NewLongcatSource(config, settings map[string]interface{}) *LongcatSource {
-	apiBase := strings.TrimSpace(configString(config, "api_base", ""))
+	cfg := cloneMap(config)
+	apiBase := strings.TrimSpace(configString(cfg, "api_base", ""))
 	if apiBase == "" {
 		apiBase = "https://api.longcat.chat/openai/v1"
 	} else {
@@ -25,8 +26,8 @@ func NewLongcatSource(config, settings map[string]interface{}) *LongcatSource {
 			apiBase += "/v1"
 		}
 	}
-	config["api_base"] = apiBase
-	return &LongcatSource{OpenAISource: NewOpenAISource(config, settings)}
+	cfg["api_base"] = apiBase
+	return &LongcatSource{OpenAISource: NewOpenAISource(cfg, settings)}
 }
 
 var _ provider.ChatProvider = (*LongcatSource)(nil)

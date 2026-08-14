@@ -1,6 +1,8 @@
 package log
 
 import (
+	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -97,4 +99,36 @@ func TestConcurrentPublish(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestLogHistorySurvivesTraceBytes is a regression test for M-36: trace
+// entries are charged to historyBytes by their serialized payload length, so
+// eviction must subtract the same amount. Previously a log() call evicted
+// trace entries at zero bytes, inflating historyBytes until every log call
+// flushed the entire history.
+func TestLogHistorySurvivesTraceBytes(t *testing.T) {
+	l := &Logger{out: io.Discard, history: []LogEntry{}}
+
+	// Large trace payloads so the serialized size dwarfs any message length.
+	big := strings.Repeat("x", 64<<10) // 64 KiB
+	for i := 0; i < 40; i++ {
+		l.PublishTrace(map[string]interface{}{"type": "trace", "span_id": "big", "fields": big})
+	}
+
+	l.Info("hello after trace flood")
+
+	hist := l.History()
+	if len(hist) == 0 {
+		t.Fatal("history was emptied by trace-accounting drift")
+	}
+	found := false
+	for _, e := range hist {
+		if !e.IsTrace() && e.Message == "hello after trace flood" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("the log entry itself was evicted by trace-accounting drift")
+	}
 }

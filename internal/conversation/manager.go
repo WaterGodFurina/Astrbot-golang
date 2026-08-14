@@ -61,6 +61,9 @@ type Manager struct {
 	db      *db.Database
 	byCID   map[string]*Conversation // key = conversation_id
 	current map[string]string        // key = unified_msg_origin -> conversation_id
+	// dequeueContextLength caps how many history entries AppendHistory keeps
+	// per conversation. <= 0 keeps the full history (default).
+	dequeueContextLength int
 }
 
 // NewManager creates a conversation manager backed by the database. A nil db
@@ -129,6 +132,36 @@ func (m *Manager) loadFromDB() {
 			m.current[conv.UserID] = conv.CID
 		}
 	}
+}
+
+// copyHistory returns a deep copy of a history slice so the result never
+// aliases the live Conversation.History that AppendHistory mutates under the
+// manager lock.
+func copyHistory(history []map[string]interface{}) []map[string]interface{} {
+	if history == nil {
+		return nil
+	}
+	out := make([]map[string]interface{}, len(history))
+	for i, h := range history {
+		if h == nil {
+			out[i] = nil
+			continue
+		}
+		entry := make(map[string]interface{}, len(h))
+		for k, v := range h {
+			entry[k] = v
+		}
+		out[i] = entry
+	}
+	return out
+}
+
+// copyConversationLocked returns a deep copy of a conversation's mutable state
+// (History, and the scalar fields it embeds). Caller must hold m.mu.
+func copyConversationLocked(conv *Conversation) *Conversation {
+	snap := *conv
+	snap.History = copyHistory(conv.History)
+	return &snap
 }
 
 // GetOrCreateConversation returns the current conversation for a session,
@@ -201,7 +234,7 @@ func (m *Manager) GetAllConversations() []interface{} {
 	convs := make([]*Conversation, 0, len(m.byCID))
 	for _, conv := range m.byCID {
 		if !conv.IsDeleted {
-			convs = append(convs, conv)
+			convs = append(convs, copyConversationLocked(conv))
 		}
 	}
 	m.mu.RUnlock()
@@ -215,17 +248,63 @@ func (m *Manager) GetAllConversations() []interface{} {
 }
 
 // GetConversationByCID returns a serialized conversation by its cid, or nil.
+// The serialization happens on a lock-held deep copy so a concurrent
+// AppendHistory can never tear the returned history.
 func (m *Manager) GetConversationByCID(cid string) map[string]interface{} {
 	m.mu.RLock()
 	conv := m.byCID[cid]
-	m.mu.RUnlock()
+	var snap *Conversation
 	if conv != nil && !conv.IsDeleted {
-		return serializeConversation(conv)
+		snap = copyConversationLocked(conv)
+	}
+	m.mu.RUnlock()
+	if snap != nil {
+		return serializeConversation(snap)
 	}
 	if m.db != nil {
 		row, found, err := m.db.GetConversationByID(cid)
 		if err == nil && found {
 			return serializeConversation(rowToConversation(row))
+		}
+	}
+	return nil
+}
+
+// GetConversationHistory returns a deep copy of a conversation's history by
+// cid, or nil. Safe to read outside the manager lock.
+func (m *Manager) GetConversationHistory(cid string) []map[string]interface{} {
+	m.mu.RLock()
+	conv := m.byCID[cid]
+	if conv != nil && !conv.IsDeleted {
+		hist := copyHistory(conv.History)
+		m.mu.RUnlock()
+		return hist
+	}
+	m.mu.RUnlock()
+	if m.db != nil {
+		row, found, err := m.db.GetConversationByID(cid)
+		if err == nil && found {
+			return copyHistory(rowToConversation(row).History)
+		}
+	}
+	return nil
+}
+
+// GetConversationSnapshot returns a deep copy of a conversation's core fields
+// by cid, or nil. Safe to read outside the manager lock.
+func (m *Manager) GetConversationSnapshot(cid string) *Conversation {
+	m.mu.RLock()
+	conv := m.byCID[cid]
+	if conv != nil && !conv.IsDeleted {
+		snap := copyConversationLocked(conv)
+		m.mu.RUnlock()
+		return snap
+	}
+	m.mu.RUnlock()
+	if m.db != nil {
+		row, found, err := m.db.GetConversationByID(cid)
+		if err == nil && found {
+			return rowToConversation(row)
 		}
 	}
 	return nil
@@ -433,9 +512,19 @@ func (m *Manager) DeleteConversationByCID(cid string) bool {
 	return true
 }
 
+// SetDequeueContextLength sets the maximum number of history entries kept per
+// conversation by AppendHistory. A value <= 0 (the default) keeps the full
+// history. Mirrors Python's dequeue_context_length handling.
+func (m *Manager) SetDequeueContextLength(n int) {
+	m.mu.Lock()
+	m.dequeueContextLength = n
+	m.mu.Unlock()
+}
+
 // AppendHistory appends a message to the current conversation of a session.
 // The conversation is lazily created when missing (Python's `_get_session_conv`
-// behavior).
+// behavior). When a dequeue context length is configured, the oldest entries
+// are dropped so the stored history and its persisted content stay bounded.
 func (m *Manager) AppendHistory(unifiedMsgOrigin string, role, content string) {
 	m.mu.Lock()
 	conv := m.byCID[m.current[unifiedMsgOrigin]]
@@ -448,6 +537,9 @@ func (m *Manager) AppendHistory(unifiedMsgOrigin string, role, content string) {
 		"role":    role,
 		"content": content,
 	})
+	if m.dequeueContextLength > 0 && len(conv.History) > m.dequeueContextLength {
+		conv.History = conv.History[len(conv.History)-m.dequeueContextLength:]
+	}
 	conv.UpdatedAt = time.Now()
 	if conv.Title == "" && role == "user" {
 		conv.Title = deriveTitle(content)
@@ -516,12 +608,17 @@ func (m *Manager) SetPersona(unifiedMsgOrigin, personaID string) {
 
 // persist writes a conversation to the database. Uses UpsertConversation
 // (single transaction) to avoid the TOCTOU race between the existence check
-// and INSERT/UPDATE that the previous Get+Create/Update sequence had.
+// and INSERT/UPDATE that the previous Get+Create/Update sequence had. The
+// History is deep-copied while holding the read lock so serialization cannot
+// race a concurrent AppendHistory.
 func (m *Manager) persist(conv *Conversation) {
 	if m.db == nil {
 		return
 	}
-	historyJSON, err := json.Marshal(conv.History)
+	m.mu.RLock()
+	history := copyHistory(conv.History)
+	m.mu.RUnlock()
+	historyJSON, err := json.Marshal(history)
 	if err != nil {
 		logger.Error("persist conversation %s: marshal history: %v", conv.CID, err)
 		return

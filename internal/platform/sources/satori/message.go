@@ -770,6 +770,36 @@ func convertNodesToSatori(nodes *message.Nodes) string {
 	return "<message forward>" + strings.Join(nodeParts, "") + "</message>"
 }
 
+// maxMediaDownloadSize 限制发送时下载外部媒体的大小上限。
+const maxMediaDownloadSize = 20 << 20
+
+// mediaHTTPClient 用于发送时下载外部媒体（带超时，避免 DefaultClient 永久挂起）。
+var mediaHTTPClient = &http.Client{Timeout: 30 * time.Second}
+
+// fetchMedia 下载媒体 URL 并返回内容与最终 URL 路径（供 MIME 推断）。
+func fetchMedia(rawURL string) ([]byte, string, error) {
+	resp, err := mediaHTTPClient.Get(rawURL)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, "", fmt.Errorf("下载媒体失败: HTTP %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxMediaDownloadSize+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if len(raw) > maxMediaDownloadSize {
+		return nil, "", fmt.Errorf("媒体文件超过大小上限 %d 字节", maxMediaDownloadSize)
+	}
+	path := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		path = resp.Request.URL.Path
+	}
+	return raw, path, nil
+}
+
 // imageToDataURL 将图片组件解析为带 MIME 的 data URL
 // （对齐 Python resolve_media_ref_to_base64_data + to_data_url）。
 func imageToDataURL(img *message.Image) (string, error) {
@@ -797,17 +827,12 @@ func imageToDataURL(img *message.Image) (string, error) {
 		data = raw
 		mimeType = mimeTypeByExt(filepath.Ext(img.File))
 	case img.URL != "":
-		resp, err := http.Get(img.URL)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-		raw, err := io.ReadAll(resp.Body)
+		raw, path, err := fetchMedia(img.URL)
 		if err != nil {
 			return "", err
 		}
 		data = raw
-		mimeType = mimeTypeByExt(filepath.Ext(resp.Request.URL.Path))
+		mimeType = mimeTypeByExt(filepath.Ext(path))
 	default:
 		return "", fmt.Errorf("图片组件没有可用的资源引用")
 	}
@@ -843,12 +868,7 @@ func recordToBase64(rec *message.Record) (string, error) {
 		}
 		data = raw
 	case rec.URL != "":
-		resp, err := http.Get(rec.URL)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-		raw, err := io.ReadAll(resp.Body)
+		raw, _, err := fetchMedia(rec.URL)
 		if err != nil {
 			return "", err
 		}

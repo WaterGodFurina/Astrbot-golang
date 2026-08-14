@@ -75,6 +75,20 @@ type LogEntry struct {
 // IsTrace reports whether the entry is a trace event.
 func (e *LogEntry) IsTrace() bool { return e.Trace != nil }
 
+// entrySize is the byte count an entry contributes to historyBytes. Trace
+// entries store their payload (a serialized map) rather than a Message, so
+// their size is the serialized payload length — the same figure PublishTrace
+// charges when adding them. Eviction must subtract the same amount, otherwise
+// the byte account drifts for trace entries and eventually every log() call
+// flushes the whole history.
+func entrySize(e LogEntry) int {
+	if e.IsTrace() {
+		raw, _ := json.Marshal(e.Trace)
+		return len(raw)
+	}
+	return len(e.Message)
+}
+
 var defaultLogger = &Logger{
 	level:    LevelInfo,
 	out:      os.Stdout,
@@ -243,7 +257,10 @@ func (l *Logger) Unsubscribe(ch <-chan LogEntry) {
 }
 
 func (l *Logger) log(level Level, component, format string, args ...interface{}) {
-	if level < l.level {
+	l.mu.RLock()
+	current := l.level
+	l.mu.RUnlock()
+	if level < current {
 		return
 	}
 	entry := LogEntry{
@@ -258,13 +275,13 @@ func (l *Logger) log(level Level, component, format string, args ...interface{})
 	// and total text size (~1MB) so a long session cannot bloat memory.
 	l.history = append(l.history, entry)
 	for len(l.history) > maxHistory || l.historyBytes > maxHistoryBytes {
-		l.historyBytes -= len(l.history[0].Message)
+		l.historyBytes -= entrySize(l.history[0])
 		l.history = l.history[1:]
 		if len(l.history) == 0 {
 			break
 		}
 	}
-	l.historyBytes += len(entry.Message)
+	l.historyBytes += entrySize(entry)
 	subs := make([]chan LogEntry, len(l.subscribers))
 	copy(subs, l.subscribers)
 	fileOut := l.fileOut
@@ -328,17 +345,10 @@ func (l *Logger) PublishTrace(payload map[string]interface{}) {
 	}
 	// Trace payloads are bounded (~ a few hundred bytes); use a loose cap.
 	for l.historyBytes > maxHistoryBytes && len(l.history) > 1 {
-		first := l.history[0]
-		if first.IsTrace() {
-			raw, _ := json.Marshal(first.Trace)
-			l.historyBytes -= len(raw)
-		} else {
-			l.historyBytes -= len(first.Message)
-		}
+		l.historyBytes -= entrySize(l.history[0])
 		l.history = l.history[1:]
 	}
-	raw, _ := json.Marshal(payload)
-	l.historyBytes += len(raw)
+	l.historyBytes += entrySize(entry)
 	subs := make([]chan LogEntry, len(l.subscribers))
 	copy(subs, l.subscribers)
 	l.mu.Unlock()

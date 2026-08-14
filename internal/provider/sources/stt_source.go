@@ -133,7 +133,6 @@ func (s *OpenAIWhisperSource) fetchAudio(ctx context.Context, audioURL string) (
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+s.apiKey)
 		return req, nil
 	}, cfg, "STT-Whisper")
 	if err != nil {
@@ -155,12 +154,16 @@ func (s *OpenAIWhisperSource) fetchAudio(ctx context.Context, audioURL string) (
 	if err != nil {
 		return "", noop, err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxAudioBytes+1))
+	f.Close()
+	if err != nil {
 		os.Remove(path)
 		return "", noop, err
 	}
-	f.Close()
+	if n > maxAudioBytes {
+		os.Remove(path)
+		return "", noop, fmt.Errorf("audio exceeds %d bytes", maxAudioBytes)
+	}
 	return path, func() { os.Remove(path) }, nil
 }
 

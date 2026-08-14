@@ -68,7 +68,10 @@ func qqOfficialPostJSON(ctx context.Context, apiURL string, payload map[string]i
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	client := &http.Client{Timeout: time.Duration(timeoutMS) * time.Millisecond}
+	if err := validateOutboundURL(apiURL); err != nil {
+		return nil, err
+	}
+	client := newOutboundClient(time.Duration(timeoutMS) * time.Millisecond)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

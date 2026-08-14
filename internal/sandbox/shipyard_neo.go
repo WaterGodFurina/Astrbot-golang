@@ -48,9 +48,14 @@ type ShipyardNeoBooter struct {
 	accessToken string
 	profile     string
 	ttl         int
-	client      *http.Client
-	sandboxID   string
-	caps        []string
+	// client 用于创建/就绪轮询/文件等短请求（60s 总超时）。
+	client *http.Client
+	// execClient 用于 shell/python exec：请求体携带 timeout:300 秒，不设总
+	// 超时，超时语义完全交给 ctx（与 Manager.Exec 的调用方上下文一致），否则
+	// Client.Timeout=60s 会提前掐断运行超过 1 分钟的命令。
+	execClient *http.Client
+	sandboxID  string
+	caps       []string
 }
 
 // NewShipyardNeoBooter creates a Bay-backed booter.
@@ -70,6 +75,9 @@ func NewShipyardNeoBooter(endpointURL, accessToken, profile string, ttl int) *Sh
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+		// execClient 无总超时：Exec 的命令超时由请求体 timeout 字段（300s）与
+		// ctx 控制，Client.Timeout 会覆盖整个请求周期，60s 会把长命令掐断。
+		execClient: &http.Client{},
 	}
 }
 
@@ -130,7 +138,7 @@ func (b *ShipyardNeoBooter) Start(ctx context.Context) error {
 	for {
 		info, err := b.get(ctx, ep, "/v1/sandboxes/"+id, nil)
 		if err != nil {
-			b.delete(ctx, ep, id)
+			b.delete(ep, id)
 			return fmt.Errorf("sandbox %s readiness check failed: %w", id, err)
 		}
 		status, _ := info["status"].(string)
@@ -147,16 +155,16 @@ func (b *ShipyardNeoBooter) Start(ctx context.Context) error {
 			return nil
 		}
 		if status == "failed" || status == "expired" {
-			b.delete(ctx, ep, id)
+			b.delete(ep, id)
 			return fmt.Errorf("sandbox %s reached terminal state: %s", id, status)
 		}
 		if time.Now().After(deadline) {
-			b.delete(ctx, ep, id)
+			b.delete(ep, id)
 			return fmt.Errorf("sandbox %s did not become ready within %s (last status: %s)", id, neoReadinessTimeout, status)
 		}
 		select {
 		case <-ctx.Done():
-			b.delete(ctx, ep, id)
+			b.delete(ep, id)
 			return ctx.Err()
 		case <-time.After(neoPollInterval):
 		}
@@ -243,7 +251,7 @@ func (b *ShipyardNeoBooter) Exec(ctx context.Context, cmd string, args []string,
 	switch {
 	case cmd == "python3" || cmd == "python":
 		payload := map[string]interface{}{"code": body, "timeout": 300}
-		resp, err := b.post(ctx, ep, "/v1/sandboxes/"+id+"/python/exec", payload)
+		resp, err := b.execPost(ctx, ep, "/v1/sandboxes/"+id+"/python/exec", payload)
 		if err != nil {
 			return "", "", -1, err
 		}
@@ -260,7 +268,7 @@ func (b *ShipyardNeoBooter) Exec(ctx context.Context, cmd string, args []string,
 			"timeout": 300,
 			"cwd":     normalizeNeoCwd(workdir),
 		}
-		resp, err := b.post(ctx, ep, "/v1/sandboxes/"+id+"/shell/exec", payload)
+		resp, err := b.execPost(ctx, ep, "/v1/sandboxes/"+id+"/shell/exec", payload)
 		if err != nil {
 			return "", "", -1, err
 		}
@@ -352,7 +360,7 @@ func normalizeNeoCwd(workdir string) string {
 
 // ---- Bay HTTP helpers ----
 
-func (b *ShipyardNeoBooter) do(ctx context.Context, ep, method, path string, body interface{}, params map[string]string, contentType string) ([]byte, error) {
+func (b *ShipyardNeoBooter) do(ctx context.Context, client *http.Client, ep, method, path string, body interface{}, params map[string]string, contentType string) ([]byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		switch v := body.(type) {
@@ -382,7 +390,7 @@ func (b *ShipyardNeoBooter) do(ctx context.Context, ep, method, path string, bod
 	}
 	req.URL.RawQuery = q.Encode()
 
-	resp, err := b.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -398,7 +406,7 @@ func (b *ShipyardNeoBooter) do(ctx context.Context, ep, method, path string, bod
 }
 
 func (b *ShipyardNeoBooter) get(ctx context.Context, ep, path string, params map[string]string) (map[string]interface{}, error) {
-	data, err := b.do(ctx, ep, http.MethodGet, path, nil, params, "")
+	data, err := b.do(ctx, b.client, ep, http.MethodGet, path, nil, params, "")
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +418,22 @@ func (b *ShipyardNeoBooter) get(ctx context.Context, ep, path string, params map
 }
 
 func (b *ShipyardNeoBooter) post(ctx context.Context, ep, path string, body interface{}) (map[string]interface{}, error) {
-	data, err := b.do(ctx, ep, http.MethodPost, path, body, nil, "application/json")
+	data, err := b.do(ctx, b.client, ep, http.MethodPost, path, body, nil, "application/json")
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// execPost issues a POST on the exec client (no overall timeout; cancellation
+// follows ctx), used by the shell/python exec endpoints whose commands may run
+// up to the request's timeout field (300s).
+func (b *ShipyardNeoBooter) execPost(ctx context.Context, ep, path string, body interface{}) (map[string]interface{}, error) {
+	data, err := b.do(ctx, b.execClient, ep, http.MethodPost, path, body, nil, "application/json")
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +445,7 @@ func (b *ShipyardNeoBooter) post(ctx context.Context, ep, path string, body inte
 }
 
 func (b *ShipyardNeoBooter) put(ctx context.Context, ep, path string, body interface{}) (map[string]interface{}, error) {
-	data, err := b.do(ctx, ep, http.MethodPut, path, body, nil, "application/json")
+	data, err := b.do(ctx, b.client, ep, http.MethodPut, path, body, nil, "application/json")
 	if err != nil {
 		return nil, err
 	}
@@ -433,8 +456,13 @@ func (b *ShipyardNeoBooter) put(ctx context.Context, ep, path string, body inter
 	return m, nil
 }
 
-func (b *ShipyardNeoBooter) delete(ctx context.Context, ep, id string) {
-	_, _ = b.do(ctx, ep, http.MethodDelete, "/v1/sandboxes/"+id, nil, nil, "")
+func (b *ShipyardNeoBooter) delete(ep, id string) {
+	// Use an independent short-timeout context: callers may pass a ctx that is
+	// already canceled (e.g. the failure paths in Start), which would make the
+	// DELETE fail instantly and leak the remote sandbox until Bay's TTL.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = b.do(ctx, b.client, ep, http.MethodDelete, "/v1/sandboxes/"+id, nil, nil, "")
 }
 
 // discoverBayCredentials mirrors _discover_bay_credentials: it looks for a Bay

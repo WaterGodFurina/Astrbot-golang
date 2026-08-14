@@ -24,24 +24,47 @@ func newSSEReader(ctx context.Context, resp *http.Response, onData func(data str
 
 // scan reads the stream until done, EOF, or an error. The stream body is NOT
 // closed here so callers control resp.Body lifetime.
+//
+// Per the SSE spec a single event may span several `data:` lines (joined with
+// a newline) and is terminated by a blank line; events are dispatched to onData
+// one at a time. The ctx parameter is intentionally not consulted here: the
+// blocking scanner cannot be interrupted mid-read, and callers already bound
+// the stream lifetime via their request context or http.Client timeout, so
+// checking ctx here would only add a no-op.
 func (r *sseReader) scan() error {
+	var dataLines []string
+	dispatch := func() (bool, error) {
+		if len(dataLines) == 0 {
+			return false, nil
+		}
+		data := strings.TrimSpace(strings.Join(dataLines, "\n"))
+		dataLines = dataLines[:0]
+		if data == "" {
+			return false, nil
+		}
+		if data == "[DONE]" {
+			return true, nil
+		}
+		return r.onData(data), nil
+	}
 	for r.scanner.Scan() {
 		line := strings.TrimSpace(r.scanner.Text())
-		if line == "" || strings.HasPrefix(line, ":") {
+		if line == "" {
+			if stop, err := dispatch(); err != nil || stop {
+				return err
+			}
+			continue
+		}
+		if line[0] == ':' {
 			continue
 		}
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			return nil
-		}
-		if data != "" {
-			if r.onData(data) {
-				return nil
-			}
-		}
+		dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+	}
+	if stop, err := dispatch(); err != nil || stop {
+		return err
 	}
 	if err := r.scanner.Err(); err != nil && err != io.EOF {
 		return err

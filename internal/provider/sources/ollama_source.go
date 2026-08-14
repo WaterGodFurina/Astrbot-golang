@@ -18,8 +18,9 @@ import (
 // OllamaSource is an Ollama local LLM provider.
 type OllamaSource struct {
 	provider.BaseProvider
-	apiBase string
-	client  *http.Client
+	apiBase      string
+	client       *http.Client
+	streamClient *http.Client
 }
 
 // NewOllamaSource creates an Ollama provider.
@@ -30,6 +31,7 @@ func NewOllamaSource(config, settings map[string]interface{}) *OllamaSource {
 		client: &http.Client{
 			Timeout: 300 * time.Second, // Ollama can be slow
 		},
+		streamClient: newStreamClient(),
 	}
 	s.apiBase, _ = config["api_base"].(string)
 	if s.apiBase == "" {
@@ -39,7 +41,7 @@ func NewOllamaSource(config, settings map[string]interface{}) *OllamaSource {
 }
 
 // doRequest sends an HTTP request with retry logic.
-func (s *OllamaSource) doRequest(ctx context.Context, body map[string]interface{}) (*http.Response, error) {
+func (s *OllamaSource) doRequest(ctx context.Context, body map[string]interface{}, client *http.Client) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
@@ -53,7 +55,7 @@ func (s *OllamaSource) doRequest(ctx context.Context, body map[string]interface{
 	msgs, _ := body["messages"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	cfg := RetryConfigFromSettings(s.Settings())
-	return DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+	return DoWithRetry(ctx, client, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
 		if err != nil {
 			return nil, err
@@ -66,7 +68,7 @@ func (s *OllamaSource) doRequest(ctx context.Context, body map[string]interface{
 // TextChat sends a non-streaming chat request.
 func (s *OllamaSource) TextChat(ctx context.Context, req *provider.ProviderRequest) (*provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, false)
-	resp, err := s.doRequest(ctx, body)
+	resp, err := s.doRequest(ctx, body, s.client)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +105,7 @@ func (s *OllamaSource) TextChat(ctx context.Context, req *provider.ProviderReque
 // TextChatStream sends a streaming chat request.
 func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.ProviderRequest) (<-chan *provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, true)
-	resp, err := s.doRequest(ctx, body)
+	resp, err := s.doRequest(ctx, body, s.streamClient)
 	if err != nil {
 		return nil, err
 	}
@@ -133,6 +135,7 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 				if err == io.EOF {
 					break
 				}
+				ch <- &provider.LLMResponse{Role: "err", CompletionText: fmt.Sprintf("Ollama stream decode error: %v", err)}
 				return
 			}
 			if chunk.Message.Content != "" {

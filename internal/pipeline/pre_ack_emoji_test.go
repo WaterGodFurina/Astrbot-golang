@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 // fakeReactor records reaction calls.
 type fakeReactor struct {
 	platform.PlatformAdapter
+	mu        sync.Mutex
 	reactions []string
 }
 
@@ -18,8 +20,28 @@ func (f *fakeReactor) ID() string   { return "fake" }
 func (f *fakeReactor) Type() string { return "lark" }
 
 func (f *fakeReactor) React(sessionID, messageID, emoji string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.reactions = append(f.reactions, emoji)
 	return nil
+}
+
+func (f *fakeReactor) reactionCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.reactions)
+}
+
+// waitForReaction polls until the async reaction is recorded or times out.
+func (f *fakeReactor) waitForReaction(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if f.reactionCount() > 0 {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
 }
 
 // TestPreAckEmojiTriggered: enabled pre_ack_emoji on a supported platform
@@ -48,7 +70,11 @@ func TestPreAckEmojiTriggered(t *testing.T) {
 		MessageObj:        &core.MessageObj{MessageID: "m1"},
 	}
 	s.applyPreAckEmoji(ev)
-	time.Sleep(100 * time.Millisecond)
+	if !reactor.waitForReaction(2 * time.Second) {
+		t.Fatalf("expected 1 reaction Typing, got %v", reactor.reactions)
+	}
+	reactor.mu.Lock()
+	defer reactor.mu.Unlock()
 	if len(reactor.reactions) != 1 || reactor.reactions[0] != "Typing" {
 		t.Errorf("expected 1 reaction Typing, got %v", reactor.reactions)
 	}

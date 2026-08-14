@@ -1,11 +1,13 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
@@ -254,10 +257,52 @@ func resolveLocalPath(path, umo string, write bool) (string, error) {
 			continue
 		}
 		if within, err := pathWithin(rootAbs, resolved); err == nil && within {
+			if err := enforceRealPathWithin(resolved, roots); err != nil {
+				return "", err
+			}
 			return resolved, nil
 		}
 	}
 	return "", fmt.Errorf("path %q is outside the allowed workspace and skill directories", path)
+}
+
+// enforceRealPathWithin resolves symlinks on the given path (falling back to
+// the deepest existing ancestor for paths that do not exist yet) and rejects
+// it when its real location is outside the allowed roots. This closes the
+// lexical-check gap that lets a symlink inside the workspace point at files
+// elsewhere on the host. A path that does not exist anywhere yet keeps the
+// lexical result, so the check never breaks create-first flows.
+func enforceRealPathWithin(resolved string, roots []string) error {
+	cur := resolved
+	var tail []string
+	for {
+		real, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			for _, comp := range tail {
+				real = filepath.Join(real, comp)
+			}
+			for _, root := range roots {
+				rootAbs, aerr := filepath.Abs(root)
+				if aerr != nil {
+					continue
+				}
+				rootReal := rootAbs
+				if r, rerr := filepath.EvalSymlinks(rootAbs); rerr == nil {
+					rootReal = r
+				}
+				if within, werr := pathWithin(rootReal, real); werr == nil && within {
+					return nil
+				}
+			}
+			return fmt.Errorf("path %q resolves outside the allowed workspace and skill directories", resolved)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur || parent == "." {
+			return nil
+		}
+		tail = append([]string{filepath.Base(cur)}, tail...)
+		cur = parent
+	}
 }
 
 func pathWithin(root, target string) (bool, error) {
@@ -558,24 +603,36 @@ type shellSession struct {
 	OutputFile string
 	StartTime  time.Time
 	Cmd        *exec.Cmd
-	Stdin      *os.File
+	Stdin      io.WriteCloser
 	Owner      string
+
+	// exitMu guards the exit state written by the Wait goroutine and read by
+	// status(); reading Cmd.ProcessState directly would race with cmd.Wait().
+	exitMu   sync.Mutex
+	done     bool
+	success  bool
+	exitCode int
 }
 
 var (
 	shellSessionsMu sync.Mutex
 	shellSessions   = map[string]*shellSession{}
+	// shellSessionTTL is how long a completed session stays listed so
+	// poll/status can still report its exit info before it is reaped (L-17).
+	shellSessionTTL = 30 * time.Minute
 )
 
 func (s *shellSession) status() map[string]interface{} {
 	state := "running"
 	exitCode := 0
-	if s.Cmd != nil && s.Cmd.ProcessState != nil {
+	s.exitMu.Lock()
+	if s.done {
 		state = "completed"
-		if !s.Cmd.ProcessState.Success() {
-			exitCode = s.Cmd.ProcessState.ExitCode()
+		if !s.success {
+			exitCode = s.exitCode
 		}
 	}
+	s.exitMu.Unlock()
 	return map[string]interface{}{
 		"session_id":  s.ID,
 		"command":     s.Command,
@@ -617,28 +674,54 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 		}
 		cmd.Stdout = f
 		cmd.Stderr = f
-		stdin, _ := cmd.StdinPipe()
+		stdin, stdinErr := cmd.StdinPipe()
 		if err := cmd.Start(); err != nil {
 			f.Close()
+			if stdin != nil {
+				stdin.Close()
+			}
 			return "Error executing command: " + err.Error()
 		}
+		if stdinErr != nil {
+			logger.I18nWarn("shell session stdin pipe creation failed: %v", stdinErr)
+			stdin = nil
+		}
 		id := randHex(8)
-		shellSessionsMu.Lock()
-		shellSessions[id] = &shellSession{
+		ses := &shellSession{
 			ID:         id,
 			Command:    command,
 			Cwd:        ws,
 			OutputFile: outFile,
 			StartTime:  time.Now(),
 			Cmd:        cmd,
-			Stdin:      nil,
+			Stdin:      stdin,
 			Owner:      umo,
 		}
+		shellSessionsMu.Lock()
+		shellSessions[id] = ses
 		shellSessionsMu.Unlock()
-		_ = stdin.Close()
 		go func() {
-			_ = cmd.Wait()
+			err := cmd.Wait()
+			if stdin != nil {
+				_ = stdin.Close()
+			}
 			f.Close()
+			ses.exitMu.Lock()
+			ses.done = true
+			ses.success = err == nil
+			if ee, ok := err.(*exec.ExitError); ok {
+				ses.exitCode = ee.ExitCode()
+			}
+			ses.exitMu.Unlock()
+			// Reap the completed session after the TTL so poll/status can still
+			// report its exit info in the meantime.
+			time.AfterFunc(shellSessionTTL, func() {
+				shellSessionsMu.Lock()
+				if cur := shellSessions[id]; cur == ses {
+					delete(shellSessions, id)
+				}
+				shellSessionsMu.Unlock()
+			})
 		}()
 		return fmt.Sprintf("Command started in background (session id: %s). "+
 			"Output written to `%s`. Use astrbot_file_read_tool to read it, "+
@@ -649,7 +732,32 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 	defer cancel()
 	cmd = exec.CommandContext(ctx, shellPath(), "-c", command)
 	cmd.Dir = ws
-	out, err := cmd.CombinedOutput()
+	if runtime.GOOS != "windows" {
+		// Run the shell in its own process group so a timeout kills the whole
+		// group: sh -c "a; b &" leaves grandchildren running otherwise (L-22).
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
+	// CommandContext only kills the direct child on timeout; grandchildren that
+	// inherit the output pipes would keep CombinedOutput blocked and survive as
+	// orphans. Start first so cmd.Process is set before the kill goroutine
+	// reads it, then kill the whole process group the moment the timeout fires.
+	var outBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &outBuf
+	if err := cmd.Start(); err != nil {
+		return "Error executing command: " + err.Error()
+	}
+	groupDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		case <-groupDone:
+		}
+	}()
+	err := cmd.Wait()
+	close(groupDone)
+	out := outBuf.Bytes()
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("Command timed out after %d seconds. Output so far:\n%s", timeout, string(out))
 	}
@@ -693,24 +801,27 @@ func executeShellSession(umo, action, sessionID, data string) string {
 		out, _ := json.Marshal(items)
 		return string(out)
 	case "poll", "get", "status":
-		return shellSessionPoll(sessionID)
+		return shellSessionPoll(sessionID, umo)
 	case "write", "write_line":
-		return shellSessionWrite(sessionID, data)
+		return shellSessionWrite(sessionID, data, umo)
 	case "interrupt":
-		return shellSessionSignal(sessionID, false)
+		return shellSessionSignal(sessionID, false, umo)
 	case "terminate", "kill":
-		return shellSessionSignal(sessionID, true)
+		return shellSessionSignal(sessionID, true, umo)
 	default:
 		return fmt.Sprintf("Unknown action %q. Valid actions: list, poll, write, write_line, interrupt, terminate.", action)
 	}
 }
 
-func shellSessionPoll(sessionID string) string {
+func shellSessionPoll(sessionID, umo string) string {
 	shellSessionsMu.Lock()
 	s, ok := shellSessions[sessionID]
 	shellSessionsMu.Unlock()
 	if !ok {
 		return "Session not found: " + sessionID
+	}
+	if s.Owner != umo {
+		return "Session " + sessionID + " does not belong to the current user."
 	}
 	tail := ""
 	if data, err := os.ReadFile(s.OutputFile); err == nil {
@@ -724,28 +835,34 @@ func shellSessionPoll(sessionID string) string {
 	return string(st) + "\nOutput:\n" + tail
 }
 
-func shellSessionWrite(sessionID, data string) string {
+func shellSessionWrite(sessionID, data, umo string) string {
 	shellSessionsMu.Lock()
 	s, ok := shellSessions[sessionID]
 	shellSessionsMu.Unlock()
 	if !ok {
 		return "Session not found: " + sessionID
 	}
+	if s.Owner != umo {
+		return "Session " + sessionID + " does not belong to the current user."
+	}
 	if s.Stdin == nil {
 		return "Session " + sessionID + " does not accept input."
 	}
-	if _, err := s.Stdin.WriteString(data + "\n"); err != nil {
+	if _, err := io.WriteString(s.Stdin, data+"\n"); err != nil {
 		return "Error writing to session: " + err.Error()
 	}
 	return "Written to session " + sessionID + "."
 }
 
-func shellSessionSignal(sessionID string, kill bool) string {
+func shellSessionSignal(sessionID string, kill bool, umo string) string {
 	shellSessionsMu.Lock()
 	s, ok := shellSessions[sessionID]
 	shellSessionsMu.Unlock()
 	if !ok {
 		return "Session not found: " + sessionID
+	}
+	if s.Owner != umo {
+		return "Session " + sessionID + " does not belong to the current user."
 	}
 	if s.Cmd == nil || s.Cmd.Process == nil {
 		return "Session " + sessionID + " is not running."
@@ -886,11 +1003,10 @@ func executeGrep(pattern, path, glob string, resultLimit int, umo string) string
 	if searchPath == "" {
 		searchPath = "."
 	}
-	resolved := searchPath
-	if !filepath.IsAbs(resolved) {
-		resolved = filepath.Join(workspaceRoot(umo), searchPath)
+	resolved, err := resolveLocalPath(searchPath, umo, false)
+	if err != nil {
+		return "Error searching: " + err.Error()
 	}
-	resolved = filepath.Clean(resolved)
 
 	var matches []string
 	_ = filepath.WalkDir(resolved, func(p string, d os.DirEntry, err error) error {

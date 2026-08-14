@@ -77,6 +77,12 @@ type Adapter struct {
 	stopCh         chan struct{}
 	stopped        bool
 	httpClient     *http.Client
+
+	// writeMu 串行化同一 WebSocket 连接上的所有写操作
+	// （gorilla/websocket 要求同一时刻仅一个写者）。
+	writeMu sync.Mutex
+	// hbCancel 当前连接心跳循环的取消函数（仅在 a.mu 保护下读写）。
+	hbCancel context.CancelFunc
 }
 
 // New creates a QQ official adapter from config.
@@ -215,7 +221,7 @@ func (a *Adapter) runLoop(ctx context.Context) {
 			return
 		default:
 		}
-		err := a.connectOnce(ctx)
+		err := a.connectOnceSafe(ctx)
 		if err != nil {
 			logger.Error("[QQOfficial] gateway error: %v, retrying in 5s", err)
 		}
@@ -233,6 +239,19 @@ func (a *Adapter) runLoop(ctx context.Context) {
 		case <-time.After(5 * time.Second):
 		}
 	}
+}
+
+// connectOnceSafe wraps connectOnce with a panic recovery so that a malformed
+// dispatch frame (e.g. a missing/mistyped author field) cannot crash the whole
+// process; the error is returned so runLoop can tear down and reconnect.
+func (a *Adapter) connectOnceSafe(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("[QQOfficial] panic recovered in gateway loop: %v", r)
+			err = fmt.Errorf("panic in gateway loop: %v", r)
+		}
+	}()
+	return a.connectOnce(ctx)
 }
 
 // connectOnce performs one gateway connection lifecycle.
@@ -256,33 +275,9 @@ func (a *Adapter) connectOnce(ctx context.Context) error {
 	prevSeq := a.lastSeq
 	a.mu.Unlock()
 
-	// Read loop with heartbeat
-	heartbeatCh := make(chan time.Duration, 1)
-	done := make(chan struct{})
-	var heartbeatCancel context.CancelFunc
-
-	go func() {
-		select {
-		case interval := <-heartbeatCh:
-			if heartbeatCancel != nil {
-				heartbeatCancel()
-			}
-			var hctx context.Context
-			hctx, heartbeatCancel = context.WithCancel(ctx)
-			a.heartbeatLoop(hctx, interval)
-		case <-done:
-			return
-		case <-a.stopCh:
-			return
-		}
-	}()
-
-	defer func() {
-		close(done)
-		if heartbeatCancel != nil {
-			heartbeatCancel()
-		}
-	}()
+	// Read loop with heartbeat: 心跳由收到 HELLO 后启动的独立 goroutine 驱动，
+	// 取消函数 hbCancel 由主循环（唯一持有者）创建与取消，避免跨 goroutine 竞争。
+	defer a.stopHeartbeat()
 
 	for {
 		select {
@@ -305,9 +300,12 @@ func (a *Adapter) connectOnce(ctx context.Context) error {
 		op, _ := frame["op"].(float64)
 		switch int(op) {
 		case wsHello:
+			a.stopHeartbeat()
 			if d, ok := frame["d"].(map[string]interface{}); ok {
 				if interval, ok := d["heartbeat_interval"].(float64); ok {
-					heartbeatCh <- time.Duration(interval) * time.Millisecond
+					hctx, hbCancel := context.WithCancel(ctx)
+					a.setHeartbeatCancel(hbCancel)
+					go a.heartbeatLoop(hctx, time.Duration(interval)*time.Millisecond)
 				}
 			}
 			if prevSession != "" {
@@ -343,6 +341,9 @@ func (a *Adapter) connectOnce(ctx context.Context) error {
 func (a *Adapter) sendFrame(ws *websocket.Conn, op int, d map[string]interface{}) error {
 	payload := map[string]interface{}{"op": op, "d": d}
 	data, _ := json.Marshal(payload)
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	return ws.WriteMessage(websocket.TextMessage, data)
 }
 
@@ -363,10 +364,34 @@ func (a *Adapter) heartbeatLoop(ctx context.Context, interval time.Duration) {
 			}
 			payload := map[string]interface{}{"op": wsHeartbeat, "d": seq}
 			data, _ := json.Marshal(payload)
-			if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
+			a.writeMu.Lock()
+			_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			err := ws.WriteMessage(websocket.TextMessage, data)
+			a.writeMu.Unlock()
+			if err != nil {
 				return
 			}
 		}
+	}
+}
+
+// setHeartbeatCancel 记录当前连接心跳循环的取消函数，并取消之前遗留的心跳。
+func (a *Adapter) setHeartbeatCancel(c context.CancelFunc) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.hbCancel != nil {
+		a.hbCancel()
+	}
+	a.hbCancel = c
+}
+
+// stopHeartbeat 取消当前连接的心跳循环（幂等）。
+func (a *Adapter) stopHeartbeat() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.hbCancel != nil {
+		a.hbCancel()
+		a.hbCancel = nil
 	}
 }
 
@@ -381,6 +406,7 @@ func (a *Adapter) handleDispatch(frame map[string]interface{}) {
 	}
 	switch t {
 	case "READY":
+		var selfID string
 		a.mu.Lock()
 		if sid, ok := d["session_id"].(string); ok {
 			a.wsSessionID = sid
@@ -388,10 +414,11 @@ func (a *Adapter) handleDispatch(frame map[string]interface{}) {
 		if user, ok := d["user"].(map[string]interface{}); ok {
 			if uid, ok := user["id"].(string); ok {
 				a.SelfID = uid
+				selfID = uid
 			}
 		}
 		a.mu.Unlock()
-		logger.I18nInfo("[QQOfficial] 机器人 %s 启动成功！", a.SelfID)
+		logger.I18nInfo("[QQOfficial] 机器人 %s 启动成功！", selfID)
 	case "RESUMED":
 		logger.I18nInfo("[QQOfficial] 机器人重连成功")
 	case "C2C_MESSAGE_CREATE":
@@ -483,16 +510,13 @@ func (a *Adapter) handleMessage(d map[string]interface{}, scene string) {
 	if author, ok := d["author"].(map[string]interface{}); ok {
 		senderOpenID, _ = author["user_openid"].(string)
 		senderName, _ = author["username"].(string)
-	}
-	if senderOpenID == "" {
-		senderOpenID, _ = d["author"].(map[string]interface{})["member_openid"].(string)
+		if senderOpenID == "" {
+			senderOpenID, _ = author["member_openid"].(string)
+		}
 	}
 	// C2C messages carry no username (the QQ API does not expose it), so the
 	// nickname is left empty here; the pipeline resolves it via the user's
 	// `/name` alias when building the system reminder.
-	if senderOpenID == "" {
-		senderOpenID, _ = d["author"].(map[string]interface{})["member_openid"].(string)
-	}
 
 	chain := []message.Component{}
 	if int(msgType) == 103 {
@@ -674,8 +698,9 @@ func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msg
 	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q (msg_id=%s)", convID, isGroup, msgStr, msgID)
 	// Deduplicate identical msg_id re-deliveries within a short window (the QQ
 	// official WS may redeliver the same event after a reconnect/retry).
+	a.mu.Lock()
+	selfID := a.SelfID
 	if msgID != "" {
-		a.mu.Lock()
 		if a.recentMsg == nil {
 			a.recentMsg = make(map[string]time.Time)
 		}
@@ -691,8 +716,8 @@ func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msg
 				delete(a.recentMsg, id)
 			}
 		}
-		a.mu.Unlock()
 	}
+	a.mu.Unlock()
 	msgObj := platform.NewAstrBotMessage()
 	if isGroup {
 		msgObj.Type = platform.GroupMessage
@@ -700,7 +725,7 @@ func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msg
 	} else {
 		msgObj.Type = platform.FriendMessage
 	}
-	msgObj.SelfID = a.SelfID
+	msgObj.SelfID = selfID
 	msgObj.SessionID = convID
 	msgObj.MessageID = msgID
 	msgObj.Sender = platform.MessageMember{UserID: senderID, Nickname: senderName}
@@ -724,23 +749,26 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	lastMsgID := a.sessionLastMsg[sessionID]
 	a.mu.Unlock()
 
-	plainText, imageRef, fileRef, fileName := extractSendParts(chain)
+	plainText, imageRef, fileRef, fileName, fileType := extractSendParts(chain)
 
 	switch scene {
 	case "friend":
-		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, lastMsgID)
+		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
 	case "group":
-		return a.sendGroup(sessionID, plainText, imageRef, fileRef, fileName, lastMsgID)
+		return a.sendGroup(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
 	case "channel":
 		return a.sendChannel(sessionID, plainText, imageRef)
 	default:
 		// fallback: treat as friend (C2C)
-		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, lastMsgID)
+		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
 	}
 }
 
 // extractSendParts pulls plain text and media refs from a message chain.
-func extractSendParts(chain *message.MessageChain) (plain string, imageRef string, fileRef string, fileName string) {
+// fileType 保留媒体组件类型（Record→语音、Video→视频、File→文件），
+// 避免仅凭 fileName 区分而把语音误判为视频。
+func extractSendParts(chain *message.MessageChain) (plain string, imageRef string, fileRef string, fileName string, fileType int) {
+	fileType = fileTypeFile
 	for _, c := range chain.Chain {
 		switch comp := c.(type) {
 		case *message.Plain:
@@ -763,6 +791,7 @@ func extractSendParts(chain *message.MessageChain) (plain string, imageRef strin
 					fileRef = comp.URL
 				}
 				fileName = comp.Name
+				fileType = fileTypeFile
 			}
 		case *message.Video:
 			if fileRef == "" {
@@ -771,6 +800,7 @@ func extractSendParts(chain *message.MessageChain) (plain string, imageRef strin
 				} else {
 					fileRef = comp.URL
 				}
+				fileType = fileTypeVideo
 			}
 		case *message.Record:
 			if fileRef == "" {
@@ -779,10 +809,11 @@ func extractSendParts(chain *message.MessageChain) (plain string, imageRef strin
 				} else {
 					fileRef = comp.URL
 				}
+				fileType = fileTypeVoice
 			}
 		}
 	}
-	return plain, imageRef, fileRef, fileName
+	return plain, imageRef, fileRef, fileName, fileType
 }
 
 func readFileBase64(path string) string {
@@ -841,7 +872,11 @@ func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType in
 		payload["file_name"] = fileName
 	}
 	if strings.HasPrefix(fileData, "data:") {
-		fileData = strings.SplitN(fileData, ",", 2)[1]
+		parts := strings.SplitN(fileData, ",", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("无效的 data: URI 文件数据")
+		}
+		fileData = parts[1]
 	}
 	if kind == "friend" {
 		payload["openid"] = targetID
@@ -860,7 +895,7 @@ func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType in
 }
 
 // sendC2C sends a message to a C2C user.
-func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName, msgID string) error {
+func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string) error {
 	payload := map[string]interface{}{"content": plainText}
 	payload["msg_seq"] = rand.Intn(10000) + 1
 	if msgID != "" {
@@ -874,10 +909,6 @@ func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName, msgID 
 		payload["media"] = media
 		payload["msg_type"] = 7
 	} else if fileRef != "" {
-		fileType := fileTypeFile
-		if fileName == "" {
-			fileType = fileTypeVideo
-		}
 		media, err := a.uploadFile("friend", openID, fileRef, fileType, fileName)
 		if err != nil {
 			return err
@@ -889,7 +920,7 @@ func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName, msgID 
 }
 
 // sendGroup sends a message to a group.
-func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName, msgID string) error {
+func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string) error {
 	payload := map[string]interface{}{"content": plainText}
 	if msgID != "" {
 		payload["msg_id"] = msgID
@@ -903,10 +934,6 @@ func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName,
 		payload["media"] = media
 		payload["msg_type"] = 7
 	} else if fileRef != "" {
-		fileType := fileTypeFile
-		if fileName == "" {
-			fileType = fileTypeVideo
-		}
 		media, err := a.uploadFile("group", groupOpenID, fileRef, fileType, fileName)
 		if err != nil {
 			return err

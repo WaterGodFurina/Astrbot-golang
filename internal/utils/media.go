@@ -33,13 +33,21 @@ func FileURIToPath(uri string) string {
 	return u.Path
 }
 
+// maxDownloadBytes bounds the response body of remote downloads, protecting
+// against unbounded memory/disk usage (mirrors the t2i 64MB limit).
+const maxDownloadBytes = 64 << 20
+
+// downloadClient carries an overall timeout and uses http.DefaultTransport so
+// the globally-configured proxy (ConfigureGlobalProxy) is honored.
+var downloadClient = &http.Client{Timeout: 60 * time.Second}
+
 // DownloadFile downloads a file from a URL to a local path.
 func DownloadFile(ctx context.Context, urlStr, destPath string) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := downloadClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -55,8 +63,14 @@ func DownloadFile(ctx context.Context, urlStr, destPath string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	written, err := io.Copy(f, io.LimitReader(resp.Body, maxDownloadBytes+1))
+	if err != nil {
+		return err
+	}
+	if written > maxDownloadBytes {
+		return fmt.Errorf("download exceeds size limit of %d bytes", maxDownloadBytes)
+	}
+	return nil
 }
 
 // DownloadToBase64 downloads a URL and returns base64-encoded data.
@@ -65,7 +79,7 @@ func DownloadToBase64(ctx context.Context, urlStr string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := downloadClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -73,9 +87,12 @@ func DownloadToBase64(ctx context.Context, urlStr string) (string, error) {
 	if resp.StatusCode != 200 {
 		return "", fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes+1))
 	if err != nil {
 		return "", err
+	}
+	if len(data) > maxDownloadBytes {
+		return "", fmt.Errorf("download exceeds size limit of %d bytes", maxDownloadBytes)
 	}
 	return base64.StdEncoding.EncodeToString(data), nil
 }

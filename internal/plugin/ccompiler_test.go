@@ -389,6 +389,44 @@ func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
 	}
 }
 
+// TestClangExtractFailureKeepsLockAndClearsCache verifies that when the
+// downloaded Clang archive fails to extract (i.e. it is corrupt), the install
+// lock is PRESERVED so the next run discards the half-extracted root, and the
+// corrupt archive cache file is removed so it is not trusted forever (which
+// would otherwise make cgo installs fail indefinitely).
+func TestClangExtractFailureKeepsLockAndClearsCache(t *testing.T) {
+	if _, _, ok := detectSystemClang(); ok {
+		t.Skip("system clang present; download path not exercised")
+	}
+	info, err := zigArchiveInfoFor()
+	if err != nil {
+		t.Skipf("no zig archive for this platform: %v", err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ASTRBOT_CLANG_BIN", t.TempDir())
+	// Serve a non-archive body so download succeeds but extraction fails.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("this is definitely not a zip or tar archive"))
+	}))
+	defer srv.Close()
+	t.Setenv("ASTRBOT_CLANG_MIRROR", srv.URL)
+
+	_, _, err = downloadAndSetupClang(context.Background(), InstallOptions{})
+	if err == nil {
+		t.Fatal("expected extract failure for a corrupt archive")
+	}
+
+	root := clangRoot()
+	lock := filepath.Join(root, clangLockFile)
+	if _, serr := os.Stat(lock); os.IsNotExist(serr) {
+		t.Error("install lock must be preserved on extract failure so the next run discards the root")
+	}
+	cacheFile := filepath.Join(toolchainUserStateDir(), "clang-download", info.archive)
+	if _, serr := os.Stat(cacheFile); !os.IsNotExist(serr) {
+		t.Errorf("corrupt archive cache %s should have been removed, stat err=%v", cacheFile, serr)
+	}
+}
+
 // TestExtractAbortsOnCancel verifies that a cancelled context aborts extraction
 // (leaving the caller's lock in place for a later retry).
 func TestExtractAbortsOnCancel(t *testing.T) {

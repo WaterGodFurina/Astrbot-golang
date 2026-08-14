@@ -176,17 +176,21 @@ func (m *SubprocessManager) ListFailedPlugins() map[string]interface{} {
 
 // SetEnabled enables/disables an installed plugin: enable loads the cached
 // binary from the manifest (idempotent when already running), disable unloads
-// it; the manifest Enabled flag is persisted either way.
+// it; the manifest Enabled flag is persisted either way. manifestMu is released
+// around Load/Unload because both trigger lifecycle-hook RPCs (on_plugin_loaded
+// / on_plugin_unloaded) that must not run while holding the manifest write lock
+// (a hung plugin would otherwise freeze every manifest operation).
 func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 	// 串行化 manifest 读→改→写，防止并发 SetEnabled/BindSource 丢条目。
 	m.manifestMu.Lock()
-	defer m.manifestMu.Unlock()
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
+		m.manifestMu.Unlock()
 		return err
 	}
 	entry := man.Get(id)
 	if entry == nil {
+		m.manifestMu.Unlock()
 		return fmt.Errorf("plugin %s not in install manifest", id)
 	}
 	if enabled {
@@ -194,21 +198,50 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 			// 用带超时的 context 调用 Load：插件二进制握手/注册卡死时避免
 			// WebUI 启用请求被阻塞 15-30s。
 			loadCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			if _, err := m.Load(loadCtx, id, entry.Binary); err != nil {
+			m.manifestMu.Unlock() // Load 会触发 on_plugin_loaded RPC，不能持锁
+			_, loadErr := m.Load(loadCtx, id, entry.Binary)
+			cancel()
+			m.manifestMu.Lock()
+			if loadErr != nil {
+				m.manifestMu.Unlock()
+				return loadErr
+			}
+			// 重新读取，避免持锁期间磁盘 manifest 已被并发更新而旧快照被覆盖。
+			if man, err = LoadManifest(m.manifestPath()); err != nil {
+				m.manifestMu.Unlock()
 				return err
+			}
+			entry = man.Get(id)
+			if entry == nil {
+				m.manifestMu.Unlock()
+				return fmt.Errorf("plugin %s not in install manifest", id)
 			}
 		}
 		entry.Enabled = true
 	} else {
 		if m.Get(id) != nil {
-			if err := m.Unload(id); err != nil {
+			m.manifestMu.Unlock() // Unload 会触发 on_plugin_unloaded RPC，不能持锁
+			unloadErr := m.Unload(id)
+			m.manifestMu.Lock()
+			if unloadErr != nil {
+				m.manifestMu.Unlock()
+				return unloadErr
+			}
+			if man, err = LoadManifest(m.manifestPath()); err != nil {
+				m.manifestMu.Unlock()
 				return err
+			}
+			entry = man.Get(id)
+			if entry == nil {
+				m.manifestMu.Unlock()
+				return fmt.Errorf("plugin %s not in install manifest", id)
 			}
 		}
 		entry.Enabled = false
 	}
-	return man.Save(m.manifestPath())
+	err = man.Save(m.manifestPath())
+	m.manifestMu.Unlock()
+	return err
 }
 
 // BindSource updates the persisted install source of an installed plugin so
@@ -303,6 +336,11 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 // (data/plugins_config/<name>)，deleteData 是否删除插件运行时数据
 // (data/plugins/<name>/data)。二进制与文档缓存始终清理。
 func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) error {
+	// 持 per-plugin 生命周期锁：与 Load/InstallFromSource 尾段互斥，防止并发
+	// 安装/卸载交错导致"卸载后条目被重建"或"删除已重新安装插件的二进制"。
+	unlock := m.lockOp(id)
+	defer unlock()
+
 	name := id
 	var entry *ManifestEntry
 	// 串行化 manifest 读→改→写：先读取条目，Unload 之后在锁内 Remove+Save。
@@ -318,10 +356,16 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 	}
 	if m.Get(id) != nil {
 		m.manifestMu.Unlock()
-		if err := m.Unload(id); err != nil {
+		if err := m.unloadLocked(id); err != nil {
 			return err
 		}
 		m.manifestMu.Lock()
+		// 卸载窗口内插件可能被并发安装重新加载：复查实例表，命中则中止卸载，
+		// 避免 Remove+Save 清掉新安装的条目。
+		if m.Get(id) != nil {
+			m.manifestMu.Unlock()
+			return fmt.Errorf("plugin %s 在卸载期间被重新加载，已中止卸载", id)
+		}
 	}
 	man.Remove(id)
 	if err := man.Save(m.manifestPath()); err != nil {
@@ -370,13 +414,18 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 }
 
 // safeDataDirPath joins a manifest-recorded relative subpath under dataDir,
-// rejecting any path that escapes dataDir (protects Uninstall's os.RemoveAll
-// from traversal in a tampered manifest).
+// rejecting any path that escapes dataDir or resolves back to the dataDir
+// root itself (protects Uninstall's os.RemoveAll from traversal in a tampered
+// manifest, and from wiping the whole dataDir for legacy entries with empty
+// footprint fields).
 func (m *SubprocessManager) safeDataDirPath(sub string) (string, error) {
 	if sub == "" {
-		return m.dataDir, nil
+		return "", fmt.Errorf("empty data subpath")
 	}
 	abs := filepath.Join(m.dataDir, filepath.Clean(filepath.FromSlash(sub)))
+	if abs == m.dataDir {
+		return "", fmt.Errorf("unsafe data subpath: %s", sub)
+	}
 	rel, err := filepath.Rel(m.dataDir, abs)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("unsafe data subpath: %s", sub)
@@ -790,12 +839,16 @@ func rawRepoDocURLs(repo string, candidates []string) []string {
 		host = u.Host
 		path = strings.Trim(u.Path, "/")
 	} else {
-		// git@host:owner/repo.git shorthand
+		// git@host:owner/repo.git shorthand. 逐段安全解析：先定位 '@' 后第一个
+		// ':' 作为 host 边界，再解析 owner/repo 路径，任何一段缺失都不越界。
 		if at := strings.Index(repo, "@"); at >= 0 {
-			rest := strings.TrimPrefix(repo[at+1:], ":")
-			if i := strings.Index(rest, "/"); i > 0 {
-				host = repo[at+1 : strings.Index(repo[at+1:], ":")+at+1]
-				path = rest
+			hostPart := repo[at+1:]
+			if colon := strings.Index(hostPart, ":"); colon >= 0 {
+				host = hostPart[:colon]
+				rest := strings.TrimPrefix(hostPart[colon+1:], ":")
+				if i := strings.Index(rest, "/"); i > 0 {
+					path = rest
+				}
 			}
 		}
 	}

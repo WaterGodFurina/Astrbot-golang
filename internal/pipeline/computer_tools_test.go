@@ -1,9 +1,12 @@
 package pipeline
 
 import (
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // inTempDir changes into a fresh temp dir so workspaceRoot and the data/*
@@ -108,6 +111,59 @@ func TestResolveLocalPathWriteRoots(t *testing.T) {
 	}
 }
 
+func TestResolveLocalPathRejectsSymlinkEscape(t *testing.T) {
+	dir := inTempDir(t)
+	umo := "t:c"
+	ws := filepath.Join(dir, "data", "workspaces", "t_c")
+	if err := os.MkdirAll(filepath.Join(ws, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(dir, "outside")
+	if err := os.MkdirAll(outside, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(ws, "link")); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	// A lexical path under the workspace that traverses a symlink pointing
+	// outside must be rejected, whether or not the target exists yet.
+	if _, err := resolveLocalPath(filepath.Join(ws, "link", "secret.txt"), umo, false); err == nil {
+		t.Errorf("expected rejection for non-existent symlink escape")
+	}
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveLocalPath(filepath.Join(ws, "link", "secret.txt"), umo, false); err == nil {
+		t.Errorf("expected rejection for existing symlink escape")
+	}
+
+	// A plain path inside the workspace still resolves.
+	if _, err := resolveLocalPath(filepath.Join(ws, "sub", "ok.txt"), umo, false); err != nil {
+		t.Errorf("expected normal workspace path allowed: %v", err)
+	}
+}
+
+func TestExecuteGrepRestrictsToWorkspace(t *testing.T) {
+	dir := inTempDir(t)
+	umo := "t:c"
+
+	if out := executeGrep("x", "/etc", "", 10, umo); !strings.Contains(out, "outside") {
+		t.Errorf("expected absolute path outside workspace rejected, got: %q", out)
+	}
+	if out := executeGrep("x", "../../../etc", "", 10, umo); !strings.Contains(out, "outside") {
+		t.Errorf("expected traversal path rejected, got: %q", out)
+	}
+
+	ws := filepath.Join(dir, "data", "workspaces", "t_c")
+	if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("hello world\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if out := executeGrep("world", "", "", 10, umo); !strings.Contains(out, "notes.txt") {
+		t.Errorf("expected grep within workspace to find match, got: %q", out)
+	}
+}
+
 func TestSandboxResolvePath(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"foo.txt", "/workspace/foo.txt"},
@@ -122,5 +178,117 @@ func TestSandboxResolvePath(t *testing.T) {
 		if got := sandboxResolvePath(c.in); got != c.want {
 			t.Errorf("sandboxResolvePath(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func registerTestShellSession(t *testing.T, id, owner string, stdin io.WriteCloser) {
+	t.Helper()
+	shellSessionsMu.Lock()
+	shellSessions[id] = &shellSession{
+		ID:    id,
+		Owner: owner,
+		Stdin: stdin,
+	}
+	shellSessionsMu.Unlock()
+	t.Cleanup(func() {
+		shellSessionsMu.Lock()
+		delete(shellSessions, id)
+		shellSessionsMu.Unlock()
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+	})
+}
+
+func TestShellSessionWriteOwnershipAndData(t *testing.T) {
+	pr, pw := io.Pipe()
+	registerTestShellSession(t, "write1", "alice", pw)
+
+	if out := shellSessionWrite("write1", "hello", "bob"); !strings.Contains(out, "does not belong") {
+		t.Errorf("write from wrong owner not blocked: %q", out)
+	}
+	got := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 16)
+		n, err := pr.Read(buf)
+		if err != nil {
+			got <- "err: " + err.Error()
+			return
+		}
+		got <- string(buf[:n])
+	}()
+	if out := shellSessionWrite("write1", "hello", "alice"); !strings.Contains(out, "Written to session") {
+		t.Errorf("write from owner failed: %q", out)
+	}
+	select {
+	case data := <-got:
+		if data != "hello\n" {
+			t.Errorf("session received %q, want %q", data, "hello\n")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out reading from stdin pipe")
+	}
+	_ = pr.Close()
+}
+
+func TestShellSessionPollOwnership(t *testing.T) {
+	registerTestShellSession(t, "poll1", "alice", nil)
+	if out := shellSessionPoll("poll1", "bob"); !strings.Contains(out, "does not belong") {
+		t.Errorf("poll from wrong owner not blocked: %q", out)
+	}
+	if out := shellSessionPoll("poll1", "alice"); strings.Contains(out, "does not belong") {
+		t.Errorf("poll from owner incorrectly blocked: %q", out)
+	}
+}
+
+func TestShellSessionSignalOwnership(t *testing.T) {
+	registerTestShellSession(t, "sig1", "alice", nil)
+	if out := shellSessionSignal("sig1", true, "bob"); !strings.Contains(out, "does not belong") {
+		t.Errorf("signal from wrong owner not blocked: %q", out)
+	}
+	if out := shellSessionSignal("sig1", true, "alice"); !strings.Contains(out, "not running") {
+		t.Errorf("signal from owner failed: %q", out)
+	}
+}
+
+func TestBackgroundShellSessionStdinWrite(t *testing.T) {
+	inTempDir(t)
+	umo := "bg:test"
+	out := executeLocalShell(umo, "cat", true, 0)
+	prefix := "session id: "
+	idx := strings.Index(out, prefix)
+	if idx < 0 {
+		t.Fatalf("no session id in output: %q", out)
+	}
+	id := out[idx+len(prefix):]
+	if end := strings.IndexByte(id, ')'); end >= 0 {
+		id = id[:end]
+	}
+
+	shellSessionsMu.Lock()
+	s := shellSessions[id]
+	shellSessionsMu.Unlock()
+	if s == nil || s.Stdin == nil {
+		t.Fatalf("session %s not registered with a stdin pipe", id)
+	}
+	if r := shellSessionWrite(id, "x", "other:user"); !strings.Contains(r, "does not belong") {
+		t.Fatalf("write from wrong owner not blocked: %q", r)
+	}
+	if r := shellSessionWrite(id, "hello world", umo); !strings.Contains(r, "Written to session") {
+		t.Fatalf("write to background session failed: %q", r)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	ok := false
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		if strings.Contains(shellSessionPoll(id, umo), "hello world") {
+			ok = true
+			break
+		}
+	}
+	shellSessionSignal(id, true, umo)
+	if !ok {
+		t.Fatal("background session output did not contain written data")
 	}
 }

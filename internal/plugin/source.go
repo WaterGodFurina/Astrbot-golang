@@ -212,7 +212,7 @@ func (m *SubprocessManager) fetchSource(ctx context.Context, id, source string) 
 		if err := validateSourceURL(source); err != nil {
 			return cleanup(fmt.Errorf("invalid archive source %q: %w", source, err))
 		}
-		archive := filepath.Join(tmp, "src-archive"+filepath.Ext(source))
+		archive := filepath.Join(tmp, "src-archive"+archiveExt(source))
 		if err := downloadFile(ctx, source, archive); err != nil {
 			return cleanup(fmt.Errorf("download %s: %w", source, err))
 		}
@@ -281,6 +281,17 @@ func validateSourceURL(raw string) error {
 	return nil
 }
 
+// safeRedirect is an http.Client CheckRedirect that re-applies the SSRF guard
+// (rejectLocalHost) to every redirect hop: the default client follows redirects
+// without revalidating the target, so an attacker-chosen 302 could otherwise
+// redirect an archive download to a private/metadata endpoint.
+func safeRedirect(req *http.Request, via []*http.Request) error {
+	if err := rejectLocalHost(req.URL.Hostname()); err != nil {
+		return fmt.Errorf("重定向目标 %s: %w", req.URL, err)
+	}
+	return nil
+}
+
 // rejectLocalHost rejects hosts that are or resolve to the local machine,
 // private or link-local networks (SSRF guard).
 func rejectLocalHost(host string) error {
@@ -340,6 +351,22 @@ func isArchiveURL(s string) bool {
 		strings.HasSuffix(s, ".tgz")
 }
 
+// archiveExt maps an archive source URL to a fixed cache-file extension that
+// extractArchive recognizes. filepath.Ext("x.tar.gz") returns only ".gz",
+// which matches none of the switch cases, so multi-dot suffixes are preserved.
+func archiveExt(s string) string {
+	lower := strings.ToLower(s)
+	switch {
+	case strings.HasSuffix(lower, ".tar.gz"):
+		return ".tar.gz"
+	case strings.HasSuffix(lower, ".tgz"):
+		return ".tgz"
+	case strings.HasSuffix(lower, ".zip"):
+		return ".zip"
+	}
+	return filepath.Ext(s)
+}
+
 func gitClone(ctx context.Context, url, dest string) error {
 	// URL 以 "-" 开头会被 git 当作选项解析（如 --upload-pack=...），
 	// 直接拒绝，防止命令行参数注入。
@@ -364,7 +391,7 @@ func downloadFile(ctx context.Context, url, dest string) error {
 // downloadFileWithProgress streams a URL to dest, invoking progress(downloaded,
 // total) as bytes are written (when non-nil) so callers can show a live bar.
 func downloadFileWithProgress(ctx context.Context, url, dest string, progress func(downloaded, total int64)) error {
-	client := &http.Client{Timeout: 30 * time.Minute}
+	client := &http.Client{Timeout: 30 * time.Minute, CheckRedirect: safeRedirect}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err

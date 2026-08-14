@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 // fakeStdioServer is a tiny JSON-RPC MCP server that echoes the request id so
@@ -125,4 +128,62 @@ func TestMCPSSEHandshakeRequiresEndpoint(t *testing.T) {
 		t.Fatal("expected error when no endpoint event is sent")
 	}
 	client.Cleanup()
+}
+
+// TestMCPContentToMapCoversResourceLink verifies ResourceLink is rendered as a
+// URI text block and unknown content falls back to a JSON dump instead of a Go
+// struct dump (L-46.9a).
+func TestMCPContentToMapCoversResourceLink(t *testing.T) {
+	link := mcpContentToMap(mcp.ResourceLink{URI: "file:///a.txt", Name: "a"})
+	if link["type"] != "text" {
+		t.Fatalf("resource link type = %v, want text", link["type"])
+	}
+	if text, _ := link["text"].(string); !strings.Contains(text, "file:///a.txt") {
+		t.Fatalf("resource link text = %q, want URI", text)
+	}
+
+	toolUse := mcpContentToMap(mcp.ToolUseContent{Name: "lookup", Input: map[string]interface{}{"q": "x"}})
+	if toolUse["type"] != "text" {
+		t.Fatalf("tool use type = %v, want text", toolUse["type"])
+	}
+	if text, _ := toolUse["text"].(string); !strings.Contains(text, "lookup") || !strings.Contains(text, `"q":"x"`) {
+		t.Fatalf("tool use dump = %q, want JSON with name and input", text)
+	}
+}
+
+// TestMCPReconnectSkipsStaleConnection verifies Reconnect is a no-op when the
+// live connection has already been replaced by a concurrent reconnect, so a
+// burst of concurrent failures cannot tear down a freshly rebuilt connection
+// (L-46.9b).
+func TestMCPReconnectSkipsStaleConnection(t *testing.T) {
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("python3 not available")
+	}
+	script := writeFakeServer(t)
+	c := NewMCPClient("fake", map[string]interface{}{
+		"transport": "stdio",
+		"command":   "/usr/bin/python3",
+		"args":      []interface{}{script},
+	})
+	defer c.Cleanup()
+	if err := c.Connect(context.Background()); err != nil {
+		t.Skipf("connect failed: %v", err)
+	}
+	live := c.Conn()
+	if live == nil {
+		t.Fatal("expected a live connection")
+	}
+
+	// The caller observed a stale/broken handle; the live connection differs,
+	// so Reconnect must leave it untouched and report success.
+	stale := &client.Client{}
+	if err := c.Reconnect(context.Background(), stale); err != nil {
+		t.Fatalf("stale reconnect must be a no-op, got err %v", err)
+	}
+	if got := c.Conn(); got != live {
+		t.Fatal("stale reconnect tore down the replaced connection")
+	}
+	if !c.IsActive() {
+		t.Fatal("client should still be active after the no-op reconnect")
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
@@ -184,6 +185,22 @@ func (a *Adapter) downloadMessageResource(ctx context.Context, messageID, fileKe
 	return io.ReadAll(resp.File)
 }
 
+// tempMediaCleanupDelay 是临时媒体文件的清理延迟：消息在事件总线中同步处理，
+// 回复在数十秒内完成，延迟清理保证媒体在消费期间可用。
+const tempMediaCleanupDelay = 30 * time.Minute
+
+// scheduleTempCleanup 在延迟后删除临时文件（消费方处理完媒体后执行清理）。
+func scheduleTempCleanup(path string) {
+	if path == "" {
+		return
+	}
+	time.AfterFunc(tempMediaCleanupDelay, func() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			logger.Debug("清理飞书临时文件失败 %s: %v", path, err)
+		}
+	})
+}
+
 // downloadFileToTemp saves a message resource to a temp file.
 func (a *Adapter) downloadFileToTemp(ctx context.Context, messageID, fileKey, resourceType, fileName, defaultSuffix string) string {
 	data, err := a.downloadMessageResource(ctx, messageID, fileKey, "file")
@@ -199,12 +216,14 @@ func (a *Adapter) downloadFileToTemp(ctx context.Context, messageID, fileKey, re
 		logger.Error("创建飞书临时文件失败: %v", err)
 		return ""
 	}
+	name := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
+		_ = os.Remove(name)
 		return ""
 	}
-	name := tmp.Name()
 	tmp.Close()
+	scheduleTempCleanup(name)
 	return name
 }
 
@@ -358,14 +377,19 @@ func convertToLark(ctx context.Context, client *lark.Client, comps []message.Com
 			if path == "" {
 				path = c.File
 			}
+			tempPath := ""
 			if path == "" && c.Base64 != "" {
-				path = writeTempBase64(c.Base64, "lark_img")
+				tempPath = writeTempBase64(c.Base64, "lark_img")
+				path = tempPath
 			}
 			if path == "" {
 				logger.Error("飞书图片路径为空，无法上传")
 				continue
 			}
 			key, err := uploadImage(ctx, client, path)
+			if tempPath != "" {
+				_ = os.Remove(tempPath)
+			}
 			if err != nil {
 				logger.Error("无法上传飞书图片: %v", err)
 				continue

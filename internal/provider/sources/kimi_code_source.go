@@ -28,6 +28,7 @@ type KimiCodeSource struct {
 	apiBase        string
 	apiKey         string
 	client         *http.Client
+	streamClient   *http.Client
 	customHeaders  map[string]string
 	thinkingConfig map[string]interface{}
 }
@@ -38,6 +39,7 @@ func NewKimiCodeSource(config, settings map[string]interface{}) *KimiCodeSource 
 	s := &KimiCodeSource{
 		BaseProvider:  bp,
 		client:        &http.Client{Timeout: 120 * time.Second},
+		streamClient:  newStreamClient(),
 		customHeaders: map[string]string{},
 	}
 	s.apiBase = configString(config, "api_base", kimiCodeAPIBase)
@@ -116,7 +118,7 @@ func (s *KimiCodeSource) GetModels(ctx context.Context) ([]string, error) {
 // TextChat sends a non-streaming Anthropic-style Messages request.
 func (s *KimiCodeSource) TextChat(ctx context.Context, req *provider.ProviderRequest) (*provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, false)
-	resp, err := s.doRequest(ctx, body)
+	resp, err := s.doRequest(ctx, body, s.client)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +190,7 @@ func (s *KimiCodeSource) TextChat(ctx context.Context, req *provider.ProviderReq
 // TextChatStream sends a streaming Anthropic-style Messages request (SSE).
 func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.ProviderRequest) (<-chan *provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, true)
-	resp, err := s.doRequest(ctx, body)
+	resp, err := s.doRequest(ctx, body, s.streamClient)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +310,11 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 			}
 			return false
 		})
-		_ = reader.scan()
+		if err := reader.scan(); err != nil {
+			logger.Warn("Kimi Code stream read error: %v", err)
+			ch <- &provider.LLMResponse{Role: "err", CompletionText: fmt.Sprintf("Kimi Code stream read error: %v", err)}
+			return
+		}
 
 		final := &provider.LLMResponse{
 			Role:             "assistant",
@@ -365,15 +371,17 @@ func (s *KimiCodeSource) buildRequestBody(req *provider.ProviderRequest, stream 
 		body["system"] = []map[string]interface{}{{"type": "text", "text": req.SystemPrompt}}
 	}
 	// Build messages (Kimi follows the Anthropic user/assistant convention).
+	// Convert OpenAI-style tool_calls/tool history into Anthropic tool_use /
+	// tool_result content blocks so tool-loop follow-ups stay valid.
 	messages := []map[string]interface{}{}
 	for _, msg := range req.Contexts {
 		role, _ := msg["role"].(string)
 		if role == "system" {
 			continue
 		}
-		messages = append(messages, msg)
+		messages = append(messages, anthropicMessage(msg))
 	}
-	messages = append(messages, req.ToUserMessage())
+	messages = append(messages, anthropicMessage(req.ToUserMessage()))
 	body["messages"] = messages
 
 	// Convert OpenAI function schema to Anthropic tool definitions.
@@ -437,7 +445,7 @@ func (s *KimiCodeSource) applyThinkingConfig(body map[string]interface{}) {
 	}
 }
 
-func (s *KimiCodeSource) doRequest(ctx context.Context, body map[string]interface{}) (*http.Response, error) {
+func (s *KimiCodeSource) doRequest(ctx context.Context, body map[string]interface{}, client *http.Client) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
@@ -455,5 +463,5 @@ func (s *KimiCodeSource) doRequest(ctx context.Context, body map[string]interfac
 	}
 	msgs, _ := body["messages"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
-	return s.client.Do(httpReq)
+	return client.Do(httpReq)
 }

@@ -33,6 +33,16 @@ import (
 // 文本消息长度上限（LINE 限制为 5000 字符，Python 侧同样截断）。
 const lineTextLimit = 5000
 
+// truncateRunes 按 Unicode 码点截断字符串（LINE 的 5000 限制按字符计，
+// 按字节截断会产生 UTF-8 乱码）。
+func truncateRunes(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
+}
+
 // fileMessage 是 LINE file 消息对象（官方 SDK 未生成该模型，按协议手写）。
 // 对应 Python 的 {"type": "file", "fileName": ..., "fileSize": ..., "originalContentUrl": ...}。
 type fileMessage struct {
@@ -77,8 +87,8 @@ func (a *Adapter) componentToMessageObject(ctx context.Context, comp message.Com
 		if text == "" {
 			return nil
 		}
-		if len(text) > lineTextLimit {
-			text = text[:lineTextLimit]
+		if len([]rune(text)) > lineTextLimit {
+			text = truncateRunes(text, lineTextLimit)
 		}
 		return &messaging_api.TextMessage{Text: text}
 	case *message.At:
@@ -90,8 +100,8 @@ func (a *Adapter) componentToMessageObject(ctx context.Context, comp message.Com
 			return nil
 		}
 		text := "@" + name
-		if len(text) > lineTextLimit {
-			text = text[:lineTextLimit]
+		if len([]rune(text)) > lineTextLimit {
+			text = truncateRunes(text, lineTextLimit)
 		}
 		return &messaging_api.TextMessage{Text: text}
 	case *message.Image:
@@ -251,7 +261,7 @@ func (a *Adapter) resolveVideoPreviewURL(ctx context.Context, v *message.Video) 
 	videoPath := strings.TrimSpace(v.Path)
 	if videoPath != "" && isLocalFile(videoPath) {
 		if thumb, ok := extractVideoFrame(videoPath); ok {
-			return a.registerToFileService(thumb)
+			return a.registerOwnedFileToService(thumb)
 		}
 	}
 	return ""
@@ -316,12 +326,24 @@ var (
 	mediaServerOnce sync.Once
 )
 
+// mediaTokenTTL 是媒体文件 token 的有效期：LINE 在发送后立即回源拉取，
+// 超过该时间未拉取的 token（及适配器创建的临时文件）将被清理，
+// 防止 tokens 只增不减。
+const mediaTokenTTL = time.Hour
+
+// mediaTokenEntry 记录 token 对应的文件路径、注册时间与归属。
+type mediaTokenEntry struct {
+	path  string
+	owned bool // owned 表示文件由本适配器创建的临时文件，token 过期时一并删除
+	at    time.Time
+}
+
 // mediaServer 提供本地媒体文件的 HTTP 访问。
 type mediaServer struct {
 	mux     *http.ServeMux
 	srv     *http.Server
 	port    int
-	tokens  map[string]string // token -> 文件路径
+	tokens  map[string]mediaTokenEntry // token -> 文件信息
 	tokenMu sync.RWMutex
 }
 
@@ -331,7 +353,7 @@ func startMediaServer() (string, error) {
 	mediaServerOnce.Do(func() {
 		ms := &mediaServer{
 			mux:    http.NewServeMux(),
-			tokens: map[string]string{},
+			tokens: map[string]mediaTokenEntry{},
 		}
 		ms.mux.HandleFunc("/api/file/", ms.handleFile)
 		// 在 127.0.0.1 上寻找可用端口（从 6185 起尝试）
@@ -366,27 +388,44 @@ func startMediaServer() (string, error) {
 func (ms *mediaServer) handleFile(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.URL.Path, "/api/file/")
 	ms.tokenMu.RLock()
-	path := ms.tokens[token]
+	entry := ms.tokens[token]
 	ms.tokenMu.RUnlock()
-	if path == "" {
+	if entry.path == "" {
 		http.NotFound(w, r)
 		return
 	}
-	http.ServeFile(w, r, path)
+	http.ServeFile(w, r, entry.path)
+}
+
+// sweepExpiredTokensLocked 删除过期 token；owned 的临时文件一并清理。
+// 调用方需持有 tokenMu 写锁。
+func (ms *mediaServer) sweepExpiredTokensLocked() {
+	now := time.Now()
+	for token, entry := range ms.tokens {
+		if now.Sub(entry.at) > mediaTokenTTL {
+			if entry.owned {
+				_ = os.Remove(entry.path)
+			}
+			delete(ms.tokens, token)
+		}
+	}
 }
 
 // registerFile 把本地文件注册到文件服务并返回可访问 URL。
-func (ms *mediaServer) registerFile(path string) (string, error) {
-	token := randomHex(16)
+// owned 表示该文件由本适配器创建的临时文件，token 过期时一并删除。
+func (ms *mediaServer) registerFile(path string, owned bool) (string, error) {
 	ms.tokenMu.Lock()
-	ms.tokens[token] = path
+	ms.sweepExpiredTokensLocked()
+	token := randomHex(16)
+	ms.tokens[token] = mediaTokenEntry{path: path, owned: owned, at: time.Now()}
 	ms.tokenMu.Unlock()
 	return fmt.Sprintf("/api/file/%s", token), nil
 }
 
-// registerToFileService 把本地文件注册到媒体文件服务，返回完整 URL。
-// 对应 Python 的 segment.register_to_file_service()。
-func (a *Adapter) registerToFileService(path string) string {
+// fileServiceBase 确保本地媒体文件服务器已启动，返回其 baseURL（加锁保护 mediaBaseURL）。
+func (a *Adapter) fileServiceBase() string {
+	a.mediaMu.Lock()
+	defer a.mediaMu.Unlock()
 	if a.mediaBaseURL == "" {
 		base, err := startMediaServer()
 		if err != nil {
@@ -395,11 +434,40 @@ func (a *Adapter) registerToFileService(path string) string {
 		}
 		a.mediaBaseURL = base
 	}
-	rel, err := mediaFileServer.registerFile(path)
+	return a.mediaBaseURL
+}
+
+// registerToFileService 把本地文件注册到媒体文件服务，返回完整 URL。
+// 对应 Python 的 segment.register_to_file_service()：优先使用配置的
+// callback_api_base 公网地址拼接，缺失时回退到本机地址。
+func (a *Adapter) registerToFileService(path string) string {
+	return a.registerFileToService(path, false)
+}
+
+// registerOwnedFileToService 注册本适配器创建的临时文件（token 过期时随文件一并清理）。
+func (a *Adapter) registerOwnedFileToService(path string) string {
+	return a.registerFileToService(path, true)
+}
+
+// registerFileToService 把本地文件注册到媒体文件服务并返回完整 URL。
+func (a *Adapter) registerFileToService(path string, owned bool) string {
+	base := a.fileServiceBase()
+	if base == "" {
+		return ""
+	}
+	rel, err := mediaFileServer.registerFile(path, owned)
 	if err != nil {
 		return ""
 	}
-	return a.mediaBaseURL + rel
+	cb := strings.TrimRight(a.callbackAPIBase, "/")
+	if cb == "" {
+		lineLogger.I18nWarn("[LINE] 未配置 callback_api_base，媒体 URL 将使用本机地址，LINE 服务器无法访问")
+		return base + rel
+	}
+	if !strings.HasPrefix(cb, "https://") {
+		lineLogger.I18nWarn("[LINE] callback_api_base 不是 HTTPS 地址（LINE 要求公网 HTTPS），媒体消息发送可能失败: %s", cb)
+	}
+	return cb + rel
 }
 
 // probeMediaDuration 通过 ffprobe 获取媒体时长（毫秒），失败返回 (0, false)。

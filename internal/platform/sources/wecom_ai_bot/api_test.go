@@ -155,6 +155,42 @@ func TestProcessEncryptedImage(t *testing.T) {
 	_ = encryptedBase64
 }
 
+// TestProcessEncryptedImageUnpaddedKey 43 位不带 padding 的 AES 密钥（回归 H-01：
+// 旧的 (-len(key))%4 补位在 43 位密钥时负数取模导致 panic）。
+func TestProcessEncryptedImageUnpaddedKey(t *testing.T) {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	plainImage := []byte("unpadded-key-image")
+	pad := 16 - len(plainImage)%16
+	padded := append(plainImage, byte(pad))
+	for i := 1; i < pad; i++ {
+		padded = append(padded, byte(pad))
+	}
+	block, _ := aes.NewCipher(key)
+	ct := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, key[:16]).CryptBlocks(ct, padded)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(ct)
+	}))
+	defer srv.Close()
+
+	unpaddedKey := base64.StdEncoding.EncodeToString(key)[:43]
+	ok, data := processEncryptedImage(srv.URL, unpaddedKey)
+	if !ok {
+		t.Fatalf("图片处理失败: %s", data)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		t.Fatalf("结果 base64 解码失败: %v", err)
+	}
+	if string(decoded) != "unpadded-key-image" {
+		t.Errorf("解密结果不一致: %q", decoded)
+	}
+}
+
 // TestVerifyURLAPI API 客户端 URL 验证（含 API 客户端层面的封装）。
 func TestVerifyURLAPI(t *testing.T) {
 	c := makeTestJSONCrypt(t)
@@ -190,5 +226,20 @@ func TestEncryptMessageAPI(t *testing.T) {
 	}
 	if !strings.Contains(encrypted, `"encrypt"`) {
 		t.Errorf("加密响应格式异常: %s", encrypted)
+	}
+}
+
+// TestAPIClientInvalidEncodingAESKey 回归 L-45.6：无效 EncodingAESKey 在构造期被
+// 校验并记录日志，加解密器不初始化，运行时以错误码暴露而不是静默吞掉。
+func TestAPIClientInvalidEncodingAESKey(t *testing.T) {
+	c := NewWecomAIBotAPIClient("token", "bad_key_not_base64")
+	if c.wxcpt != nil {
+		t.Error("无效 EncodingAESKey 时加解密器不应初始化")
+	}
+	if ret, _ := c.DecryptMessage(nil, "", "", ""); ret != APIDecryptError {
+		t.Errorf("无效密钥时 DecryptMessage 应返回 -40001，got %d", ret)
+	}
+	if got := c.EncryptMessage("x", "n", "t"); got != "" {
+		t.Error("无效密钥时 EncryptMessage 应返回空串")
 	}
 }

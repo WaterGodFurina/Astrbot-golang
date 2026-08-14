@@ -111,9 +111,18 @@ func parseRetryAfterSeconds(s string) (time.Duration, error) {
 // backoffDelay computes exponential backoff for the given attempt.
 // Matches Python's wait_exponential(multiplier=1, min=0.2, max=30).
 func backoffDelay(attempt int, cfg RetryConfig) time.Duration {
-	delay := cfg.MinDelay * time.Duration(1<<(attempt-1))
-	if delay > cfg.MaxDelay {
-		delay = cfg.MaxDelay
+	exp := attempt - 1
+	if exp < 0 {
+		exp = 0
+	}
+	// 饱和退避: 钳制移位指数, 防止 MaxAttempts 配置过大时 1<<(attempt-1)
+	// 溢出为 0/负数, 使退避延迟归零退化为热循环。
+	if exp > 30 {
+		exp = 30
+	}
+	delay := cfg.MinDelay * time.Duration(1<<exp)
+	if delay > cfg.MaxDelay || delay <= 0 {
+		return cfg.MaxDelay
 	}
 	return delay
 }
@@ -220,9 +229,11 @@ func DoWithRetry(
 		}
 	}
 
+	// On the exhausted path the last retryable response body was already
+	// consumed and closed, so only its status is folded into the error and a
+	// nil response is returned (never a closed body).
 	if lastResp != nil {
-		return lastResp, fmt.Errorf("[%s] max retries (%d) exceeded: last status %d",
-			providerLabel, cfg.MaxAttempts, lastResp.StatusCode)
+		lastErr = fmt.Errorf("last status %d", lastResp.StatusCode)
 	}
 	return nil, fmt.Errorf("[%s] max retries (%d) exceeded: %w", providerLabel, cfg.MaxAttempts, lastErr)
 }

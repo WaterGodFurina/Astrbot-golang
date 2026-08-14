@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
@@ -132,6 +134,11 @@ func TestAdapterCallbackTextMessage(t *testing.T) {
 	if w.Code != http.StatusOK || w.Body.String() != "success" {
 		t.Fatalf("回调响应异常: %d %s", w.Code, w.Body.String())
 	}
+	// convertMessage 已改为异步执行，等待事件发布
+	deadline := time.Now().Add(2 * time.Second)
+	for bus.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if bus.count() != 1 {
 		t.Fatalf("应发布 1 个事件，got %d", bus.count())
 	}
@@ -201,6 +208,11 @@ func TestWebhookPlatformInterface(t *testing.T) {
 	a.WebhookCallback(w2, req2)
 	if w2.Body.String() != "success" {
 		t.Errorf("POST 分发异常: %q", w2.Body.String())
+	}
+	// convertMessage 已改为异步执行，等待事件发布
+	deadline := time.Now().Add(2 * time.Second)
+	for bus.count() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
 	if bus.count() != 1 || bus.last().MessageStr != "统一Webhook测试" {
 		t.Errorf("事件异常: %d", bus.count())
@@ -355,6 +367,84 @@ func TestSendChainAppMode(t *testing.T) {
 	}
 }
 
+// TestSendChainURLOnlyFileVideo URL-only 文件/视频组件应能解析下载并发送（回归 M-45）。
+func TestSendChainURLOnlyFileVideo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/file.bin":
+			w.Write([]byte("file-bytes"))
+		case r.URL.Path == "/video.mp4":
+			w.Write([]byte("video-bytes"))
+		case strings.HasSuffix(r.URL.Path, "/gettoken"):
+			w.Write([]byte(`{"errcode":0,"errmsg":"ok","access_token":"T","expires_in":7200}`))
+		case strings.HasSuffix(r.URL.Path, "/media/upload"):
+			w.Write([]byte(`{"errcode":0,"errmsg":"ok","media_id":"MEDIA_1","type":"image","created_at":"1407783380"}`))
+		case strings.HasSuffix(r.URL.Path, "/message/send"):
+			w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	a := &Adapter{client: NewWeChatClient("corpid", "secret", srv.URL+"/cgi-bin/")}
+	chain := &message.MessageChain{Chain: []message.Component{
+		&message.File{URL: srv.URL + "/file.bin"},
+		&message.Video{URL: srv.URL + "/video.mp4"},
+	}}
+	if err := a.sendChain(chain, "1000002", "zhangsan"); err != nil {
+		t.Fatalf("URL-only 文件/视频发送失败: %v", err)
+	}
+}
+
+// TestHandleKFMsgOrEventCursorAdvance KF 同步游标逐页推进且逐条转换（回归 M-46）。
+func TestHandleKFMsgOrEventCursorAdvance(t *testing.T) {
+	bus := &fakeEventBus{}
+	a := newTestAdapter(t, bus, map[string]interface{}{"kf_name": "客服"})
+
+	var mu sync.Mutex
+	var cursors []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/gettoken"):
+			w.Write([]byte(`{"errcode":0,"errmsg":"ok","access_token":"T","expires_in":7200}`))
+		case strings.HasSuffix(r.URL.Path, "/kf/sync_msg"):
+			var body map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&body)
+			cursor, _ := body["cursor"].(string)
+			mu.Lock()
+			cursors = append(cursors, cursor)
+			mu.Unlock()
+			if cursor == "" {
+				w.Write([]byte(`{"errcode":0,"errmsg":"ok","has_more":1,"next_cursor":"cur_1","msg_list":[` +
+					`{"msgtype":"text","external_userid":"wm_1","open_kfid":"wk","msgid":"m1","text":{"content":"A"}},` +
+					`{"msgtype":"text","external_userid":"wm_1","open_kfid":"wk","msgid":"m2","text":{"content":"B"}}]}`))
+			} else {
+				w.Write([]byte(`{"errcode":0,"errmsg":"ok","has_more":0,"next_cursor":"","msg_list":[` +
+					`{"msgtype":"text","external_userid":"wm_1","open_kfid":"wk","msgid":"m3","text":{"content":"C"}}]}`))
+			}
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	a.client = NewWeChatClient("corpid", "secret", srv.URL+"/cgi-bin/")
+
+	msg := &WecomMessage{Type: "event", Event: "kf_msg_or_event", Token: "tok", OpenKfID: "wk"}
+	a.handleKFMsgOrEvent(msg)
+
+	if bus.count() != 3 {
+		t.Fatalf("应逐条处理 3 条消息，got %d", bus.count())
+	}
+	mu.Lock()
+	got := make([]string, len(cursors))
+	copy(got, cursors)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != "" || got[1] != "cur_1" {
+		t.Errorf("游标应推进为 [\"\", cur_1]，got %v", got)
+	}
+}
+
 // TestSendChainKFModeError 客服模式 Send 返回错误（不支持主动发送）。
 func TestSendChainKFModeError(t *testing.T) {
 	bus := &fakeEventBus{}
@@ -456,5 +546,89 @@ func TestConvertMessageUnsupported(t *testing.T) {
 	a.convertMessage(msg)
 	if bus.count() != 0 {
 		t.Error("未支持类型不应发布事件")
+	}
+}
+
+// TestRESTClientTokenInvalidRetry 回归 L-45.1：收到 40014/42001 时清空 access_token
+// 缓存并重新获取后重试一次。
+func TestRESTClientTokenInvalidRetry(t *testing.T) {
+	for _, code := range []int{40014, 42001} {
+		t.Run(fmt.Sprintf("errcode_%d", code), func(t *testing.T) {
+			var mu sync.Mutex
+			tokenCalls := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/gettoken"):
+					tokenCalls++
+					if tokenCalls == 1 {
+						w.Write([]byte(`{"errcode":0,"errmsg":"ok","access_token":"TOKEN_OLD","expires_in":7200}`))
+					} else {
+						w.Write([]byte(`{"errcode":0,"errmsg":"ok","access_token":"TOKEN_NEW","expires_in":7200}`))
+					}
+				case strings.HasSuffix(r.URL.Path, "/message/send"):
+					switch r.URL.Query().Get("access_token") {
+					case "TOKEN_OLD":
+						fmt.Fprintf(w, `{"errcode":%d,"errmsg":"token invalid"}`, code)
+					case "TOKEN_NEW":
+						w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+					default:
+						w.WriteHeader(500)
+						w.Write([]byte(`{"errcode":-1,"errmsg":"unexpected token"}`))
+					}
+				default:
+					w.WriteHeader(404)
+				}
+			}))
+			defer srv.Close()
+
+			client := NewWeChatClient("corpid", "secret", srv.URL+"/cgi-bin/")
+			if err := client.SendText(t.Context(), "1000002", "zhangsan", "hi"); err != nil {
+				t.Fatalf("发送失败: %v", err)
+			}
+			mu.Lock()
+			calls := tokenCalls
+			mu.Unlock()
+			if calls != 2 {
+				t.Errorf("token 失效后应重新获取 access_token，gettoken 调用次数 got %d want 2", calls)
+			}
+		})
+	}
+}
+
+// TestWecomServerStartBindFailure 回归 L-45.4：端口占用时 Start 应返回错误而不是仅记日志。
+func TestWecomServerStartBindFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	a := newTestAdapter(t, &fakeEventBus{}, nil)
+	s := &WecomServer{adapter: a}
+	if err := s.Start(t.Context(), "127.0.0.1", port); err == nil {
+		t.Error("端口占用时 Start 应返回错误")
+	}
+}
+
+// TestAppMessageDedup 回归 L-45.5：应用消息按 MsgId 做短窗口去重。
+func TestAppMessageDedup(t *testing.T) {
+	a := newTestAdapter(t, &fakeEventBus{}, nil)
+	m1 := &WecomMessage{Type: "text", ID: "msg_1", Content: "a", Source: "u", Agent: "1"}
+	m2 := &WecomMessage{Type: "text", ID: "msg_1", Content: "a", Source: "u", Agent: "1"}
+	m3 := &WecomMessage{Type: "text", ID: "msg_2", Content: "b", Source: "u", Agent: "1"}
+	if a.isDuplicateAppMessage(m1) {
+		t.Error("首次不应判重")
+	}
+	if !a.isDuplicateAppMessage(m2) {
+		t.Error("同一 MsgId 短时间内应判重")
+	}
+	if a.isDuplicateAppMessage(m3) {
+		t.Error("不同 MsgId 不应判重")
+	}
+	if a.isDuplicateAppMessage(&WecomMessage{Type: "text"}) {
+		t.Error("无 MsgId 的消息不应判重")
 	}
 }

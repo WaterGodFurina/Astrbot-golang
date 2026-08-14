@@ -154,3 +154,24 @@ func TestJSONCryptIllegalBuffer(t *testing.T) {
 		t.Error("篡改数据不应解密成功")
 	}
 }
+
+// TestJSONCryptRejectsInconsistentPadding 回归 L-45.3：篡改内部 padding 字节（保持末字节不变）
+// 时，旧的"只校验末字节"实现会解密成功，加固后必须拒绝。
+func TestJSONCryptRejectsInconsistentPadding(t *testing.T) {
+	c := makeTestJSONCrypt(t)
+	ret, encrypted := c.encrypt("hello")
+	if ret != MsgCryptOK {
+		t.Fatal("加密失败")
+	}
+	raw, _ := base64.StdEncoding.DecodeString(encrypted)
+	// 篡改倒数第 2 个字节（属于 padding 区域），末字节（pad 值）保持不变
+	raw[len(raw)-2] ^= 0xff
+	tampered := base64.StdEncoding.EncodeToString(raw)
+	timestamp := "1"
+	nonce := "n"
+	_, sig := c.GetSHA1(timestamp, nonce, tampered)
+	ret, _ = c.DecryptMsg([]byte(`{"encrypt":"`+tampered+`"}`), sig, timestamp, nonce)
+	if ret != MsgCryptIllegalBuffer {
+		t.Errorf("内部 padding 字节不一致时应返回 -40008，got %d", ret)
+	}
+}

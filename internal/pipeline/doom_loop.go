@@ -34,7 +34,6 @@ type doomConfirmResult int
 const (
 	doomNotConsumed doomConfirmResult = iota // no paused tool for this session
 	doomResumed                              // asker confirmed -> re-run the original request
-	doomDeclined                             // asker declined or another sender -> stop
 )
 
 // maybeHandleDoomConfirm is called at the start of Process: if this session has
@@ -55,13 +54,16 @@ func (s *ProcessStage) maybeHandleDoomConfirm(event *core.Event) doomConfirmResu
 	paused := tr.pausedTool
 	resume := tr.resumePrompt
 	text := strings.ToLower(strings.TrimSpace(event.MessageStr))
-	confirm := strings.Contains(text, "继续") || strings.Contains(text, "继续执行") ||
-		strings.Contains(text, "continue") || strings.Contains(text, "是") ||
-		strings.Contains(text, "yes")
-	if confirm {
+	// Whole-message confirmation: only an exact confirm reply resumes the
+	// paused tool, so ordinary messages (e.g. "是的"、"继续读") cannot replay it.
+	confirmed := text == "继续" || text == "继续执行" || text == "continue" ||
+		text == "是" || text == "yes"
+	if confirmed {
 		tr.pausedTool = ""
 		tr.lastTool = ""
 		tr.count = 0
+		tr.askSender = ""
+		tr.resumePrompt = ""
 		s.doomMu.Unlock()
 		// Replace the confirmation message with the original request so the
 		// pipeline re-runs it (tool paused state cleared).
@@ -69,12 +71,36 @@ func (s *ProcessStage) maybeHandleDoomConfirm(event *core.Event) doomConfirmResu
 			event.PlainText = resume
 			event.MessageStr = resume
 		}
+		// Mark the event as woken so the resume reaches the LLM stage even in
+		// group chats where a bare-text reply is not otherwise a wake command.
+		event.IsAtOrWakeCommand = true
+		event.SetExtra("llm_wake", true)
 		s.replyText(event, "已解除工具 "+paused+" 的暂停，正在继续执行。")
 		return doomResumed
 	}
+	// Declined or any other reply from the asker: clear the paused state so
+	// the session is no longer blocked, and let the message flow through the
+	// normal pipeline.
+	tr.pausedTool = ""
+	tr.lastTool = ""
+	tr.count = 0
+	tr.askSender = ""
+	tr.resumePrompt = ""
 	s.doomMu.Unlock()
 	s.replyText(event, "已停止工具 "+paused+" 的执行。如需继续，请回复“继续”。")
-	return doomDeclined
+	return doomNotConsumed
+}
+
+// resetDoomLoopCount clears the same-tool repetition counters for a session at
+// the start of a new agent request, so counts never leak across request
+// boundaries. The paused state (and its asker/resume prompt) is preserved.
+func (s *ProcessStage) resetDoomLoopCount(umo string) {
+	s.doomMu.Lock()
+	defer s.doomMu.Unlock()
+	if tr := s.doomTrackers[umo]; tr != nil {
+		tr.lastTool = ""
+		tr.count = 0
+	}
 }
 
 // checkDoomLoop tracks consecutive same-tool calls. Returns false when the tool

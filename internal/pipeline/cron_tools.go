@@ -144,32 +144,45 @@ func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, args map[
 		if jobID == "" {
 			return "error: job_id is required for action=edit."
 		}
-		job := mgr.Get(jobID)
-		if job == nil {
-			return "error: task not found: " + jobID
+		note := strings.TrimSpace(argString(args, "note"))
+		cronExpr := argString(args, "cron_expression")
+		runAt := argString(args, "run_at")
+		if note == "" && cronExpr == "" && runAt == "" {
+			return "error: nothing to update for task " + jobID
 		}
-		// Recreate with the same identity: simplest correct edit is to update
-		// the note/cron and re-arm.
-		changed := false
-		if n := strings.TrimSpace(argString(args, "note")); n != "" {
-			job.Payload["note"] = n
-			job.Description = n
-			changed = true
+		var runAtTime time.Time
+		if runAt != "" {
+			t, err := time.Parse(time.RFC3339, runAt)
+			if err != nil {
+				return "error: run_at must be ISO datetime, e.g., 2026-02-02T08:00:00+08:00"
+			}
+			runAtTime = t
 		}
-		if e := argString(args, "cron_expression"); e != "" {
-			job.CronExpression = e
-			job.RunOnce = false
-			changed = true
-		}
-		if r := argString(args, "run_at"); r != "" {
-			if t, err := time.Parse(time.RFC3339, r); err == nil {
-				job.RunAt = t
-				job.RunOnce = true
-				changed = true
+		if cronExpr != "" {
+			if _, err := cron.ParseCron(cronExpr); err != nil {
+				return "error: invalid cron_expression (use 5 or 6 fields, e.g. '0 8 * * *'): " + err.Error()
 			}
 		}
-		if changed {
-			mgr.Add(job) // re-arms + persists
+		// Mutate under the manager lock so the edit never races the cron tick
+		// goroutine or concurrent List/Serialize reads (M-17). The manager
+		// re-arms and persists the job and recomputes its NextRun.
+		updated := mgr.UpdateJob(jobID, func(job *cron.Job) {
+			if note != "" {
+				job.Payload["note"] = note
+				job.Description = note
+			}
+			if cronExpr != "" {
+				job.CronExpression = cronExpr
+				job.RunOnce = false
+			}
+			if runAt != "" {
+				job.RunAt = runAtTime
+				job.RunOnce = true
+				job.Payload["run_at"] = runAt
+			}
+		})
+		if !updated {
+			return "error: task not found: " + jobID
 		}
 		return fmt.Sprintf("task updated: job_id=%s", jobID)
 	default:
