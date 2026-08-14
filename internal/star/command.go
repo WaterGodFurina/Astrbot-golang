@@ -77,6 +77,15 @@ func (cf *CommandFilter) CommandName() string {
 	return cf.commandName
 }
 
+// HasParentCommand reports whether this command belongs to a command group
+// (mirrors Python's parent_command_names != [""] check; used by platform
+// adapters that only register top-level commands).
+func (cf *CommandFilter) HasParentCommand() bool {
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+	return cf.parentGroup != nil
+}
+
 // Aliases returns the registered aliases.
 func (cf *CommandFilter) Aliases() []string {
 	cf.mu.RLock()

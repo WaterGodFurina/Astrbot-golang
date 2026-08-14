@@ -14,17 +14,21 @@
 package pipeline
 
 import (
+	"sort"
+	"strconv"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
+	"unicode"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -136,6 +140,12 @@ type WakingCheckStage struct {
 	ignoreAtAll  bool
 	cmdPrefix    string
 	aiWakePrefix string
+
+	// Ported from astrbot/core/pipeline/waking_check/stage.py
+	ignoreBotSelfMessage         bool
+	uniqueSession                bool
+	emptyMentionWaiting          bool
+	emptyMentionWaitingNeedReply bool
 }
 
 func NewWakingCheckStage() *WakingCheckStage {
@@ -176,6 +186,10 @@ func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
 		s.wakeByFriend = false
 	}
 	s.ignoreAtAll = ps.IgnoreAtAll
+	s.ignoreBotSelfMessage = ps.IgnoreBotSelfMessage
+	s.uniqueSession = ps.UniqueSession
+	s.emptyMentionWaiting = ps.EmptyMentionWaiting
+	s.emptyMentionWaitingNeedReply = ps.EmptyMentionWaitingNeedReply
 	if ps.CmdPrefix != "" {
 		s.cmdPrefix = ps.CmdPrefix
 	}
@@ -197,6 +211,23 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 		return &StageResult{Continue: true}, nil
 	}
 
+	// Apply unique session: in group chats each member gets an isolated
+	// conversation id (ported from build_unique_session_id).
+	if s.uniqueSession && event.Source.IsGroup {
+		if sid := buildUniqueSessionID(event.Source.Platform, event.Source.SenderID, event.Source.ConvID); sid != "" {
+			event.Source.ConvID = sid
+			logger.Debug("WakingCheck: unique session applied, conv=%s", sid)
+		}
+	}
+
+	// Ignore bot self messages (ported from waking_check/stage.py).
+	if s.ignoreBotSelfMessage && event.Source.SelfID != "" &&
+		event.Source.SelfID == event.Source.SenderID {
+		event.Stop()
+		logger.Debug("WakingCheck: ignored bot self message")
+		return &StageResult{Continue: false}, nil
+	}
+
 	// Use the pure-text message string (Python's event.message_str), which
 	// excludes At components, so "/help" is matched by the "/" wake prefix.
 	text := event.MessageStr
@@ -214,6 +245,11 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 		for _, prefix := range s.wakePrefixes {
 			if strings.HasPrefix(text, prefix) {
 				s.applyPrefixWake(event, text, prefix)
+				// A message that is only the wake prefix (e.g. "/") triggers
+				// the empty-mention flow (ported from builtin_stars/astrbot/main.py).
+				if event.WakeCommand == "" && s.emptyMentionWaiting {
+					return s.applyEmptyMention(event)
+				}
 				return &StageResult{Continue: true}, nil
 			}
 		}
@@ -249,13 +285,16 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 							}
 						}
 					}
-					if !matched {
-						// @mention without a prefix still starts a chat
-						// (Python: is_at_or_wake_command triggers the LLM agent).
-						event.SetExtra("llm_wake", true)
-						logger.Debug("Woken by @mention (chat enabled)")
+				if !matched {
+					// @mention without a prefix still starts a chat
+					// (Python: is_at_or_wake_command triggers the LLM agent).
+					if s.emptyMentionWaiting && isSingleEmptyMention(event) {
+						return s.applyEmptyMention(event)
 					}
-					return &StageResult{Continue: true}, nil
+					event.SetExtra("llm_wake", true)
+					logger.Debug("Woken by @mention (chat enabled)")
+				}
+				return &StageResult{Continue: true}, nil
 				}
 			}
 			if _, ok := comp.(*message.AtAll); ok {
@@ -317,6 +356,62 @@ func (s *WakingCheckStage) applyPrefixWake(event *core.Event, text, prefix strin
 	event.PlainText = trimmed
 	logger.Debug("Woken by prefix '%s', stripped to %q (llm_wake=%v)",
 		prefix, event.MessageStr, event.GetExtra("llm_wake"))
+}
+
+// emptyMentionPrompt instructs the LLM to greet the user when they only
+// mentioned the bot without content (mirrors builtin_stars/astrbot/main.py).
+const emptyMentionPrompt = "注意，你正在社交媒体上中与用户进行聊天，用户只是通过@来唤醒你，但并未在这条消息中输入内容，他可能会在接下来一条发送他想发送的内容。" +
+	"你友好地询问用户想要聊些什么或者需要什么帮助，回复要符合人设，不要太过机械化。" +
+	"请注意，你仅需要输出要回复用户的内容，不要输出其他任何东西"
+
+// isSingleEmptyMention reports whether the message chain contains only a
+// single @-mention of the bot (Python: len(messages)==1 and At self).
+func isSingleEmptyMention(event *core.Event) bool {
+	if event.Message == nil || len(event.Message.Chain) != 1 {
+		return false
+	}
+	at, ok := event.Message.Chain[0].(*message.At)
+	return ok && at.TargetID != "" && at.TargetID == event.Source.SelfID
+}
+
+// applyEmptyMention handles a message that only mentions the bot (or only
+// carries a wake prefix) without any content. When empty_mention_waiting_need_reply
+// is enabled the LLM is asked to greet the user; otherwise the event is stopped.
+func (s *WakingCheckStage) applyEmptyMention(event *core.Event) (*StageResult, error) {
+	if !s.emptyMentionWaitingNeedReply {
+		event.Stop()
+		logger.Debug("WakingCheck: empty mention ignored (empty_mention_waiting_need_reply=false)")
+		return &StageResult{Continue: false}, nil
+	}
+	event.PlainText = emptyMentionPrompt
+	event.MessageStr = emptyMentionPrompt
+	event.SetExtra("llm_wake", true)
+	logger.Debug("WakingCheck: empty mention -> LLM greeting")
+	return &StageResult{Continue: true}, nil
+}
+
+// buildUniqueSessionID constructs the per-member session id for group chats
+// when unique_session is enabled (ported from waking_check/stage.py
+// UNIQUE_SESSION_ID_BUILDERS).
+func buildUniqueSessionID(platform, senderID, groupID string) string {
+	switch platform {
+	case "aiocqhttp", "slack":
+		return senderID + "_" + groupID
+	case "dingtalk", "qq_official", "qq_official_webhook":
+		return senderID
+	case "lark":
+		return senderID + "%" + groupID
+	case "misskey":
+		return groupID + "_" + senderID
+	case "matrix":
+		if groupID != "" {
+			return senderID + "_" + groupID
+		}
+		return senderID
+	default:
+		// telegram / discord / webchat have no builder (None in Python).
+		return ""
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +686,7 @@ type PreProcessStage struct {
 	config      map[string]interface{}
 	providerMgr *provider.ProviderManager
 	convMgr     *conversation.Manager
+	platformMgr *platform.PlatformManager
 }
 
 func NewPreProcessStage() *PreProcessStage {
@@ -603,10 +699,61 @@ func (s *PreProcessStage) Initialize(ctx *PipelineContext) error {
 	s.config = ctx.AstrbotConfig
 	s.providerMgr = ctx.ProviderManager
 	s.convMgr = ctx.ConvManager
+	s.platformMgr = ctx.PlatformMgr
 	return nil
 }
 
+// applyPreAckEmoji sends a pre-response emoji reaction when the platform
+// config enables platform_specific.<platform>.pre_ack_emoji for a woken
+// message (ported from preprocess_stage/stage.py). Runs async so a slow
+// platform API never blocks the pipeline.
+func (s *PreProcessStage) applyPreAckEmoji(event *core.Event) {
+	if !event.IsAtOrWakeCommand || s.platformMgr == nil ||
+		event.MessageObj == nil || event.MessageObj.MessageID == "" {
+		return
+	}
+	platform := event.Source.Platform
+	switch platform {
+	case "telegram", "lark", "discord":
+	default:
+		return
+	}
+	ps, ok := s.config["platform_specific"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	p, ok := ps[platform].(map[string]interface{})
+	if !ok {
+		return
+	}
+	cfg, ok := p["pre_ack_emoji"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	enabled, _ := cfg["enable"].(bool)
+	if !enabled {
+		return
+	}
+	emojis := toStringList(cfg["emojis"])
+	if len(emojis) == 0 {
+		return
+	}
+	emoji := emojis[rand.Intn(len(emojis))]
+	go func() {
+		if err := s.platformMgr.React(platform, event.Source.ConvID, event.MessageObj.MessageID, emoji); err != nil {
+			logger.I18nWarn("pre_ack_emoji 发送失败 (%s): %v", platform, err)
+		}
+	}()
+}
+
 func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	// Pre-response emoji reaction for platforms that enable pre_ack_emoji.
+	s.applyPreAckEmoji(event)
+
+	// Quoted-message parser limits (provider_settings.quoted_message_parser):
+	// cap nested quote/forward depth and quoted image count.
+	applyQuotedMessageParser(s.config, event)
+
 	if event.Message == nil || len(event.Message.Chain) == 0 {
 		return &StageResult{Continue: true}, nil
 	}
@@ -736,6 +883,15 @@ type ProcessStage struct {
 	subAgentEnabled bool
 	subAgents       []*SubAgent
 
+	// Platform config toggles consumed by handler matching (ported from
+	// waking_check/stage.py).
+	disableBuiltinCommands bool
+	noPermissionReply      bool
+
+	// groupCtx tracks group-chat context awareness (provider_ltm_settings:
+	// group_icl_enable records + active_reply probability).
+	groupCtx *GroupChatContext
+
 	// Knowledge-base context retrieval for prompt injection. Provided by the
 	// lifecycle (reuses the dashboard retrieval pipeline); nil = no KB.
 	kbRetriever func(umo, query string) (string, error)
@@ -806,6 +962,12 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	if ctx.UmoAliasResolver != nil {
 		s.umoAlias = ctx.UmoAliasResolver
 	}
+	ps := bindPlatformSettings(ctx.AstrbotConfig)
+	s.noPermissionReply = ps.NoPermissionReply
+	if db, ok := ctx.AstrbotConfig["disable_builtin_commands"].(bool); ok {
+		s.disableBuiltinCommands = db
+	}
+	s.groupCtx = NewGroupChatContext(ctx.AstrbotConfig)
 	return nil
 }
 
@@ -832,6 +994,33 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	// @filter.on_message): plugins observe every incoming message.
 	dispatchSubprocessHooks(s.subPlugins, event, "on_message")
 
+	// Group chat context awareness (mirrors main.py on_message): record the
+	// message when group_icl_enable (or active_reply) is enabled.
+	if s.groupCtx != nil && s.groupChatContextEnabled(event) && event.Message != nil {
+		hasImageOrPlain := false
+		for _, comp := range event.Message.Chain {
+			if _, ok := comp.(*message.Plain); ok {
+				hasImageOrPlain = true
+				break
+			}
+			if _, ok := comp.(*message.Image); ok {
+				hasImageOrPlain = true
+				break
+			}
+		}
+		if hasImageOrPlain {
+			needActive := s.groupCtx.NeedActiveReply(event)
+			if s.groupLTMSetting(event, "group_icl_enable") {
+				s.groupCtx.HandleMessage(event)
+			}
+			// Active reply: a non-woken group message may trigger an LLM
+			// reply with a configured probability (mirrors main.py).
+			if needActive && !event.IsAtOrWakeCommand {
+				event.SetExtra("active_reply", true)
+			}
+		}
+	}
+
 	// Record the incoming message for statistics (message_count).
 	if s.database != nil {
 		msg := event.MessageStr
@@ -841,13 +1030,31 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 		if msg != "" {
 			_ = s.database.RecordPlatformMessage(event.Source.Platform, event.UnifiedMsgOrigin(), event.Source.SenderID, msg)
 		}
+		// Group message history retention (provider_ltm_settings).
+		if event.Source.IsGroup && event.Source.Platform != "webchat" {
+			if s.groupLTMSetting(event, "group_message_history_enable") {
+				keep := providerLTMInt(s.config, "group_message_history_max_cnt", 700)
+				_ = s.database.TrimPlatformMessageHistory(event.Source.Platform, event.UnifiedMsgOrigin(), keep)
+			}
+		}
 	}
 
 	// Try plugin handlers first
-	activated := s.findMatchingHandlers(event)
+	activated, permissionDenied := s.findMatchingHandlers(event)
 	// Session custom rules (session_plugin_config) can disable/enable plugins
 	// for this session.
 	activated = s.filterHandlersBySession(event, activated)
+	if permissionDenied {
+		// Ported from waking_check/stage.py: a permission filter failed. When
+		// no_permission_reply is enabled, tell the user; either way the event
+		// is stopped before any handler or the LLM runs.
+		if s.noPermissionReply && !event.IsStopped() {
+			event.Result = &message.MessageEventResult{}
+			event.Result.Chain = []message.Component{&message.Plain{Text: fmt.Sprintf("您(ID: %s)的权限不足以使用此指令。通过 /sid 获取 ID 并请管理员添加。", event.Source.SenderID)}}
+		}
+		event.Stop()
+		return &StageResult{Continue: false}, nil
+	}
 	if len(activated) > 0 {
 		// Execute handlers in priority order
 		for _, handler := range activated {
@@ -864,10 +1071,21 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 		}
 	}
 
-	// If not woken, stop
+	// If not woken, stop — unless an active reply was requested by the group
+	// chat context (provider_ltm_settings.active_reply probability hit) or the
+	// caller explicitly requested an LLM call (event.CallLLM, e.g. the WebUI
+	// dashboard chat which bypasses platform wake words).
 	if !event.IsAtOrWakeCommand {
-		event.Stop()
-		return &StageResult{Continue: false}, nil
+		if event.CallLLM {
+			logger.Debug("ProcessStage: explicit CallLLM for %s", event.UnifiedMsgOrigin())
+			event.SetExtra("llm_wake", true)
+		} else if active, _ := event.GetExtra("active_reply").(bool); active {
+			logger.Debug("ProcessStage: active reply triggered for %s", event.UnifiedMsgOrigin())
+			event.SetExtra("llm_wake", true)
+		} else {
+			event.Stop()
+			return &StageResult{Continue: false}, nil
+		}
 	}
 
 	// Call LLM agent
@@ -883,21 +1101,29 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 }
 
 // findMatchingHandlers returns plugin handlers that match this event.
-func (s *ProcessStage) findMatchingHandlers(event *core.Event) []*star.StarHandlerMetadata {
+// Ported from waking_check/stage.py: non-permission filters are AND-ed
+// together; a failing PermissionFilter marks permissionDenied (the caller
+// decides whether to notify the user). Built-in command handlers are skipped
+// when disable_builtin_commands is enabled.
+func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star.StarHandlerMetadata, permissionDenied bool) {
 	if s.pluginMgr == nil {
-		return nil
+		return nil, false
 	}
 	registry := s.pluginMgr.Handlers()
 	if registry == nil {
-		return nil
+		return nil, false
 	}
 
 	// Get all filter-type handlers, sorted by priority
-	handlers := registry.GetFilterHandlers()
+	all := registry.GetFilterHandlers()
 	result := []*star.StarHandlerMetadata{}
+	denied := false
 
-	for _, handler := range handlers {
+	for _, handler := range all {
 		if !handler.Enabled {
+			continue
+		}
+		if s.disableBuiltinCommands && handler.HandlerModulePath == "astrbot.builtin_stars.builtin_commands.main" {
 			continue
 		}
 		// Build filter context from event
@@ -908,21 +1134,33 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) []*star.StarHandl
 			EventPlatform: event.Source.Platform,
 			EventRole:     event.Role,
 		}
-		// Check each filter on the handler
-		matched := false
+		// All non-permission filters must pass (AND); a failing permission
+		// filter marks the event as permission-denied.
+		passed := true
+		filterDenied := false
 		for _, filter := range handler.EventFilters {
-			if filter.Match(fctx) {
-				matched = true
+			if _, isPerm := filter.(*star.PermissionFilter); isPerm {
+				if !filter.Match(fctx) {
+					filterDenied = true
+				}
+				continue
+			}
+			if !filter.Match(fctx) {
+				passed = false
 				break
 			}
 		}
-		if matched {
-			logger.Debug("ProcessStage: handler %s matched for message %q", handler.HandlerFullName, event.MessageStr)
-			result = append(result, handler)
+		if !passed {
+			continue
 		}
+		if filterDenied {
+			denied = true
+			continue
+		}
+		result = append(result, handler)
 	}
 
-	return result
+	return result, denied
 }
 
 // executeHandler invokes a single handler.
@@ -1025,6 +1263,20 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		return nil
 	}
 
+	// Trace span for this agent invocation (TracePage).
+	if event.Trace == nil {
+		traceEnabled := func() bool {
+			if v, ok := s.config["trace_enable"].(bool); ok {
+				return v
+			}
+			return false
+		}
+		event.Trace = log.NewTraceSpan("astr_main_agent", event.UnifiedMsgOrigin(), event.Source.SenderName, truncateRunes(prompt, 60), traceEnabled)
+		event.Trace.Record("astr_agent_prepare", map[string]interface{}{
+			"persona_id": personaIDOrDefault(s.config),
+		})
+	}
+
 	providerCfg, providerSettings, err := s.resolveProvider()
 	if err != nil {
 		event.Result = &message.MessageEventResult{}
@@ -1079,6 +1331,13 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		}
 	}
 
+	// Trace: persona selection (sel_persona).
+	if event.Trace != nil {
+		event.Trace.Record("sel_persona", map[string]interface{}{
+			"persona_id": personaID,
+		})
+	}
+
 	// Resolve the persona system prompt (conv.Persona holds the persona id).
 	systemPrompt := ""
 	if s.personaPrompt != nil {
@@ -1091,6 +1350,10 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// Inject active skills into the system prompt (mirrors Python's
 	// astr_main_agent._ensure_persona_and_skills).
 	systemPrompt = s.applySkills(systemPrompt, providerSettings, personaID)
+
+	// LLM safety mode: prefix the safety prompt when enabled (mirrors
+	// astr_main_agent._apply_llm_safety_mode).
+	systemPrompt = s.applyLLMSafetyMode(systemPrompt)
 
 	// Apply on_llm_request hooks from subprocess plugins: they may modify the
 	// system prompt (e.g. identity injection) or stop the LLM call entirely.
@@ -1127,8 +1390,33 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		Prompt:       prompt,
 		SessionID:    event.UnifiedMsgOrigin(),
 		SystemPrompt: systemPrompt,
+		ImageURLs:    []string{},
+		AudioURLs:    []string{},
 		Conversation: s.convMgr,
 		Contexts:     s.conversationHistory(event.UnifiedMsgOrigin()),
+	}
+
+	// Sanitize context by the provider's supported modalities
+	// (provider_settings.sanitize_context_by_modalities).
+	if s.providerConf != nil && s.providerConf.SanitizeContextByModalities {
+		if mods := providerModalities(providerCfg); len(mods) > 0 {
+			req.Contexts = sanitizeContextByModalities(req.Contexts, mods)
+		}
+	}
+
+	// Image compression for the provider (provider_settings.image_compress_*).
+	if len(req.ImageURLs) > 0 {
+		compressed := make([]string, 0, len(req.ImageURLs))
+		for _, u := range req.ImageURLs {
+			compressed = append(compressed, s.compressImageForProvider(u))
+		}
+		req.ImageURLs = compressed
+	}
+
+	// Group chat context injection: records received before this message are
+	// appended to the request (mirrors GroupChatContext.on_req_llm).
+	if s.groupCtx != nil && s.groupChatContextEnabled(event) && s.groupLTMSetting(event, "group_icl_enable") {
+		s.groupCtx.OnReqLLM(event, req)
 	}
 
 	providerType, _ := providerCfg["type"].(string)
@@ -1198,6 +1486,10 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	if s.providerConf != nil {
 		streamingEnabled = s.providerConf.StreamingResponse
 	}
+	// unsupported_streaming_strategy=turn_off disables streaming entirely.
+	if streamingEnabled && s.unsupportedStreamingStrategyIsTurnOff() {
+		streamingEnabled = false
+	}
 
 	// System context reminder (identifier / group name / datetime), appended as
 	// an extra user-content part like Python's astr_main_agent.
@@ -1262,10 +1554,23 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 				doomed = true
 				break
 			}
+			// Trace: tool call + result (agent_tool_call / agent_tool_result).
+			if event.Trace != nil {
+				event.Trace.Record("agent_tool_call", map[string]interface{}{
+					"tool_name": name,
+					"tool_args": truncateRunes(fmt.Sprintf("%v", args), 200),
+				})
+			}
 			result := s.executeTool(event, computerUseRuntime, name, args)
 			// Oversized tool output is spilled to a file with a read hint so the
 			// model does not re-run the tool just to see the full result.
 			result = materializeToolResult(result, toolID)
+			if event.Trace != nil {
+				event.Trace.Record("agent_tool_result", map[string]interface{}{
+					"tool_name":  name,
+					"tool_result": truncateRunes(result, 200),
+				})
+			}
 			messages = append(messages, map[string]interface{}{
 				"role":         "tool",
 				"tool_call_id": toolID,
@@ -1308,6 +1613,15 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// on_llm_response fires after the LLM reply is produced (e.g. plugins that
 	// capture conversation memory).
 	dispatchSubprocessHooks(s.subPlugins, event, "on_llm_response")
+
+	// Persist the bot reply for enabled group sessions (mirrors
+	// builtin_stars/astrbot/main.py persist_llm_response).
+	if s.database != nil && event.Source.IsGroup && event.Source.Platform != "webchat" &&
+		s.groupLTMSetting(event, "group_message_history_enable") && resp.CompletionText != "" {
+		_ = s.database.RecordPlatformMessage(event.Source.Platform, event.UnifiedMsgOrigin(), event.Source.SelfID, resp.CompletionText)
+		keep := providerLTMInt(s.config, "group_message_history_max_cnt", 700)
+		_ = s.database.TrimPlatformMessageHistory(event.Source.Platform, event.UnifiedMsgOrigin(), keep)
+	}
 
 	streamer.flush()
 	if streamer.sentAny() {
@@ -1361,6 +1675,13 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 			// tags) from the user-facing stream; parsed/handled at completion.
 			if !containsControlText(chunk.CompletionText) {
 				streamer.push(chunk.CompletionText)
+			}
+			// Display the reasoning content when provider_settings.
+			// display_reasoning_text is enabled (mirrors the Python
+			// `chain.type == "reasoning" and not show_reasoning: continue`).
+			if s.providerConf != nil && s.providerConf.DisplayReasoningText &&
+				chunk.ReasoningContent != "" {
+				streamer.push(chunk.ReasoningContent)
 			}
 			continue
 		}
@@ -2798,6 +3119,20 @@ type ResultDecorateStage struct {
 	ttsEnabled      bool
 	ttsTriggerProb  float64
 	ttsDualOutput   bool
+
+	// forward_threshold: replies longer than this are sent as a forward
+	// message (OneBot node) on the aiocqhttp platform.
+	forwardThreshold int
+
+	// segmented reply (platform_settings.segmented_reply) settings.
+	segEnabled            bool
+	segOnlyLLMResult      bool
+	segSplitMode          string
+	segRegex              string
+	segSplitWords         []string
+	segWordsPattern       *regexp.Regexp
+	segContentCleanupRule *regexp.Regexp
+	segWordsThreshold     int
 }
 
 func NewResultDecorateStage() *ResultDecorateStage {
@@ -2811,7 +3146,51 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 	s.replyPrefix = ps.ReplyPrefix
 	s.replyWithMention = ps.ReplyWithMention
 	s.replyWithQuote = ps.ReplyWithQuote
+	s.forwardThreshold = 1500
+	if ps.ForwardThreshold > 0 {
+		s.forwardThreshold = ps.ForwardThreshold
+	}
 	s.subPlugins = ctx.SubPlugins
+
+	// Segmented reply settings (mirrors result_decorate/stage.py initialize).
+	if sr, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
+		if cfg, ok := sr["segmented_reply"].(map[string]interface{}); ok {
+			s.segEnabled, _ = cfg["enable"].(bool)
+			s.segOnlyLLMResult, _ = cfg["only_llm_result"].(bool)
+			s.segSplitMode, _ = cfg["split_mode"].(string)
+			if s.segSplitMode == "" {
+				s.segSplitMode = "regex"
+			}
+			s.segRegex, _ = cfg["regex"].(string)
+			s.segWordsThreshold = 150
+			if v, ok := cfg["words_count_threshold"].(int); ok && v > 0 {
+				s.segWordsThreshold = v
+			}
+			if v, ok := cfg["words_count_threshold"].(float64); ok && v > 0 {
+				s.segWordsThreshold = int(v)
+			}
+			s.segSplitWords = []string{"。", "？", "！", "~", "…"}
+			if ws := toStringList(cfg["split_words"]); len(ws) > 0 {
+				s.segSplitWords = ws
+			}
+			// Build the words split pattern (Python: (.*?(w1|w2)|.+$) DOTALL).
+			if len(s.segSplitWords) > 0 {
+				escaped := make([]string, 0, len(s.segSplitWords))
+				for _, w := range s.segSplitWords {
+					escaped = append(escaped, regexp.QuoteMeta(w))
+				}
+				sort.SliceStable(escaped, func(i, j int) bool { return len(escaped[i]) > len(escaped[j]) })
+				if re, err := regexp.Compile("(.*?(" + strings.Join(escaped, "|") + ")|.+$)"); err == nil {
+					s.segWordsPattern = re
+				}
+			}
+			if rule, _ := cfg["content_cleanup_rule"].(string); rule != "" {
+				if re, err := regexp.Compile(rule); err == nil {
+					s.segContentCleanupRule = re
+				}
+			}
+		}
+	}
 
 	// t2i top-level keys: t2i (bool), t2i_word_threshold, t2i_strategy
 	// (local/remote), t2i_endpoint, t2i_active_template, t2i_use_file_service.
@@ -2867,8 +3246,50 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		}
 	}
 
+	// Segmented reply: split long Plain components into multiple segments
+	// (mirrors result_decorate/stage.py). The actual per-segment delivery
+	// with intervals happens in RespondStage.
+	if s.segEnabled && s.isSegmentedReplyPlatform(event.Source.Platform) {
+		if !s.segOnlyLLMResult || event.Result.IsModelResult() {
+			s.applySegmentedReply(event)
+		}
+	}
+
+	// Text-to-image: when enabled and the reply is long enough, replace the
+	// plain text with a rendered image (local gg engine or remote t2i service).
+	if s.t2iEnabled {
+		if err := s.applyT2I(event); err != nil {
+			// On failure keep the original text reply.
+			logger.I18nWarn("t2i 转换失败，回退文本回复: %v", err)
+		}
+	}
+
+	// Forward message: on the aiocqhttp (OneBot) platform a reply whose plain
+	// text is longer than forward_threshold is sent as a forward node
+	// (ported from result_decorate/stage.py). When triggered the chain becomes
+	// a single Node and @/quote decorations are skipped (Python can_decorate).
+	forwarded := false
+	if event.Source.Platform == "aiocqhttp" && s.forwardThreshold > 0 {
+		wordCnt := 0
+		for _, comp := range event.Result.Chain {
+			if plain, ok := comp.(*message.Plain); ok {
+				wordCnt += len([]rune(plain.Text))
+			}
+		}
+		if wordCnt > s.forwardThreshold {
+			node := &message.Node{
+				UIN:     event.Source.SelfID,
+				Name:    "AstrBot",
+				Content: event.Result.Chain,
+			}
+			event.Result.Chain = []message.Component{node}
+			forwarded = true
+			logger.Debug("ResultDecorate: reply > %d chars, sent as forward node", s.forwardThreshold)
+		}
+	}
+
 	// Apply @mention (only for group messages)
-	if s.replyWithMention && event.Source.IsGroup {
+	if !forwarded && s.replyWithMention && event.Source.IsGroup {
 		// Insert At component at the beginning
 		at := &message.At{TargetID: event.Source.SenderID, Name: event.Source.SenderName}
 		newChain := make([]message.Component, 0, len(event.Result.Chain)+1)
@@ -2884,21 +3305,12 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 	}
 
 	// Apply reply quote
-	if s.replyWithQuote && event.MessageObj != nil && event.MessageObj.MessageID != "" {
+	if !forwarded && s.replyWithQuote && event.MessageObj != nil && event.MessageObj.MessageID != "" {
 		reply := &message.Reply{MessageID: event.MessageObj.MessageID}
 		newChain := make([]message.Component, 0, len(event.Result.Chain)+1)
 		newChain = append(newChain, reply)
 		newChain = append(newChain, event.Result.Chain...)
 		event.Result.Chain = newChain
-	}
-
-	// Text-to-image: when enabled and the reply is long enough, replace the
-	// plain text with a rendered image (local gg engine or remote t2i service).
-	if s.t2iEnabled {
-		if err := s.applyT2I(event); err != nil {
-			// On failure keep the original text reply.
-			logger.I18nWarn("t2i 转换失败，回退文本回复: %v", err)
-		}
 	}
 
 	// TTS: convert the reply to voice when enabled (global switch + session
@@ -3170,6 +3582,14 @@ func chainToSDK(chain []message.Component) []pluginsdk.Component {
 type RespondStage struct {
 	platformMgr *platform.PlatformManager
 	subPlugins  *plugin.SubprocessManager
+
+	// Segmented-reply delivery settings (respond/stage.py initialize).
+	segEnabled     *bool
+	segOnlyLLMResult *bool
+	intervalMethod string
+	logBase        float64
+	segIntervalLo  float64
+	segIntervalHi  float64
 }
 
 func NewRespondStage() *RespondStage {
@@ -3181,6 +3601,39 @@ func (s *RespondStage) Name() string { return "respond" }
 func (s *RespondStage) Initialize(ctx *PipelineContext) error {
 	s.platformMgr = ctx.PlatformMgr
 	s.subPlugins = ctx.SubPlugins
+
+	// Segmented-reply interval settings (mirrors respond/stage.py initialize).
+	if ps, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
+		if cfg, ok := ps["segmented_reply"].(map[string]interface{}); ok {
+			if v, ok := cfg["enable"].(bool); ok {
+				s.segEnabled = &v
+			}
+			if v, ok := cfg["only_llm_result"].(bool); ok {
+				s.segOnlyLLMResult = &v
+			}
+			s.intervalMethod, _ = cfg["interval_method"].(string)
+			s.logBase = 2.6
+			if v, ok := cfg["log_base"].(float64); ok && v > 0 {
+				s.logBase = v
+			}
+			if v, ok := cfg["log_base"].(int); ok && v > 0 {
+				s.logBase = float64(v)
+			}
+			s.segIntervalLo, s.segIntervalHi = 1.5, 3.5
+			if iv, ok := cfg["interval"].(string); ok && s.segEnabled != nil && *s.segEnabled {
+				parts := strings.Split(strings.ReplaceAll(iv, " ", ""), ",")
+				if len(parts) == 2 {
+					if lo, err := strconv.ParseFloat(parts[0], 64); err == nil {
+						s.segIntervalLo = lo
+					}
+					if hi, err := strconv.ParseFloat(parts[1], 64); err == nil {
+						s.segIntervalHi = hi
+					}
+				}
+			}
+			logger.Info("Segmented-reply interval: [%v, %v]", s.segIntervalLo, s.segIntervalHi)
+		}
+	}
 	return nil
 }
 
@@ -3227,21 +3680,156 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 
 	// Send via platform manager
 	if s.platformMgr != nil {
-		chain := event.Result.ToMessageChain()
-		chain.Chain = validChain
-		err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
-		if err != nil {
-			logger.Error("Failed to send message chain: %v", err)
-		} else if s.subPlugins != nil {
-			// on_after_message_sent fires after a reply is delivered (e.g.
-			// plugins that clean up pending state or react to sent messages).
-			dispatchSubprocessHooks(s.subPlugins, event, "on_after_message_sent")
+		// Segmented reply: deliver each component with a computed interval,
+		// keeping Reply/At as the header of the first segment and sending
+		// Record components separately (mirrors respond/stage.py).
+		if s.segReplyRequired(event) && len(validChain) > 1 {
+			s.sendSegmented(ctx, event, validChain)
+		} else {
+			chain := event.Result.ToMessageChain()
+			chain.Chain = validChain
+			err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
+			if err != nil {
+				logger.Error("Failed to send message chain: %v", err)
+			} else if s.subPlugins != nil {
+				// on_after_message_sent fires after a reply is delivered (e.g.
+				// plugins that clean up pending state or react to sent messages).
+				dispatchSubprocessHooks(s.subPlugins, event, "on_after_message_sent")
+			}
 		}
 	}
 
 	// Clear the result
 	event.Result = nil
 	return &StageResult{Continue: false}, nil
+}
+
+// segReplyRequired mirrors respond/stage.py is_seg_reply_required: enabled +
+// (not only_llm_result or the result is a model result) + platform allowed.
+func (s *RespondStage) segReplyRequired(event *core.Event) bool {
+	if s.segEnabled == nil || !*s.segEnabled {
+		return false
+	}
+	if event.Result == nil {
+		return false
+	}
+	if *s.segOnlyLLMResult && !event.Result.IsModelResult() {
+		return false
+	}
+	return !segPlatformBlacklist[event.Source.Platform]
+}
+
+// sendSegmented delivers the chain component by component with an interval
+// between sends. Reply/At header components are attached to the first
+// segment only; Record components are always sent alone.
+func (s *RespondStage) sendSegmented(ctx context.Context, event *core.Event, chain []message.Component) {
+	header := []message.Component{}
+	body := []message.Component{}
+	for _, comp := range chain {
+		switch comp.(type) {
+		case *message.Reply, *message.At:
+			header = append(header, comp)
+		default:
+			body = append(body, comp)
+		}
+	}
+	if len(body) == 0 {
+		// Reply/At only: nothing meaningful to send (Python may fix #2670).
+		return
+	}
+
+	sendOne := func(comps []message.Component) {
+		chain := event.Result.ToMessageChain()
+		chain.Chain = comps
+		if err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain); err != nil {
+			logger.Error("Failed to send segmented message chain: %v", err)
+		}
+	}
+
+	headerFirst := len(header) > 0
+	for i, comp := range body {
+		// Compute the interval before sending this segment.
+		interval := s.calcSegmentInterval(ctx, comp)
+		if interval > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
+		}
+		if _, isRecord := comp.(*message.Record); isRecord {
+			// Record must be sent alone.
+			sendOne([]message.Component{comp})
+			continue
+		}
+		if headerFirst {
+			seg := make([]message.Component, 0, len(header)+1)
+			seg = append(seg, header...)
+			seg = append(seg, comp)
+			sendOne(seg)
+			headerFirst = false
+		} else {
+			sendOne([]message.Component{comp})
+		}
+		_ = i
+	}
+
+	// Fire on_after_message_sent after the segmented delivery completes.
+	if s.subPlugins != nil {
+		dispatchSubprocessHooks(s.subPlugins, event, "on_after_message_sent")
+	}
+}
+
+// calcSegmentInterval mirrors respond/stage.py _calc_comp_interval: log
+// method uses log(word_count+1, log_base) + [0, 0.5); random uses the
+// configured interval range.
+func (s *RespondStage) calcSegmentInterval(ctx context.Context, comp message.Component) time.Duration {
+	if s.intervalMethod == "log" {
+		var base float64 = 2.6
+		if s.logBase > 0 {
+			base = s.logBase
+		}
+		seconds := 1.0 + rand.Float64()*0.5
+		if plain, ok := comp.(*message.Plain); ok {
+			wc := wordCount(plain.Text)
+			seconds = math.Log(float64(wc)+1) / math.Log(base)
+			seconds += rand.Float64() * 0.5
+		}
+		return time.Duration(seconds * float64(time.Second))
+	}
+	// random
+	lo, hi := s.segIntervalLo, s.segIntervalHi
+	if hi <= lo {
+		lo, hi = 1.5, 3.5
+	}
+	seconds := lo + rand.Float64()*(hi-lo)
+	return time.Duration(seconds * float64(time.Second))
+}
+
+// wordCount mirrors _word_cnt: words for ASCII text, alphanumeric runes
+// otherwise.
+func wordCount(text string) int {
+	allASCII := true
+	for _, r := range text {
+		if r >= 128 {
+			allASCII = false
+			break
+		}
+	}
+	if allASCII {
+		return len(strings.Fields(text))
+	}
+	count := 0
+	for _, r := range text {
+		if isAlnum(r) {
+			count++
+		}
+	}
+	return count
+}
+
+func isAlnum(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 // ---------------------------------------------------------------------------
@@ -3370,4 +3958,15 @@ func (p *Pipeline) Process(ctx context.Context, event *core.Event) error {
 		}
 	}
 	return nil
+}
+
+// personaIDOrDefault returns the configured default persona id (used by the
+// trace span record).
+func personaIDOrDefault(cfg map[string]interface{}) string {
+	if ps, ok := cfg["provider_settings"].(map[string]interface{}); ok {
+		if v, ok := ps["default_personality"].(string); ok {
+			return v
+		}
+	}
+	return ""
 }

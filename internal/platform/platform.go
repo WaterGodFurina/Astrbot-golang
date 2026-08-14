@@ -5,6 +5,7 @@ package platform
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -137,6 +138,31 @@ type PlatformAdapter interface {
 	Start(ctx context.Context) error
 	Stop() error
 	Send(sessionID string, chain *message.MessageChain) error
+}
+
+// Reactor is an optional capability for platforms that support emoji
+// reactions on messages (telegram / lark / discord). Used by the
+// pre_ack_emoji feature in the PreProcessStage.
+type Reactor interface {
+	// React adds an emoji reaction to the message identified by messageID.
+	// sessionID is the conversation id (discord needs the channel id).
+	React(sessionID, messageID, emoji string) error
+}
+
+// StarManagerSetter is implemented by adapters that register commands from
+// the star handler registry (e.g. Discord slash commands).
+type StarManagerSetter interface {
+	SetStarManager(mgr interface{})
+}
+
+// WebhookPlatform is an optional capability for platforms that receive
+// events through the unified webhook entry
+// (/api/v1/webhooks/platforms/{webhook_uuid}).
+type WebhookPlatform interface {
+	// WebhookUUID returns the registered webhook uuid.
+	WebhookUUID() string
+	// WebhookCallback handles the webhook request.
+	WebhookCallback(w http.ResponseWriter, r *http.Request)
 }
 
 // StreamFragmenter is an optional capability for platforms that support
@@ -650,6 +676,20 @@ func (pm *PlatformManager) GetFragmenter(platformID string) StreamFragmenter {
 		return frag
 	}
 	return nil
+}
+
+// React adds an emoji reaction to a message on the given platform. Returns
+// an error if the platform does not support reactions or is not loaded.
+func (pm *PlatformManager) React(platformID, sessionID, messageID, emoji string) error {
+	adapter := pm.resolveAdapter(platformID)
+	if adapter == nil {
+		return fmt.Errorf("platform %s not found", platformID)
+	}
+	r, ok := adapter.(Reactor)
+	if !ok {
+		return fmt.Errorf("platform %s does not support reactions", platformID)
+	}
+	return r.React(sessionID, messageID, emoji)
 }
 
 func (pm *PlatformManager) resolveAdapter(platformID string) PlatformAdapter {

@@ -286,8 +286,31 @@ func providerCmd(deps Deps, e *core.Event) {
 	providers := listProviders(deps)
 	if len(al) == 0 {
 		lines := []string{i18n.Get("## LLM Providers\n")}
+
+		// Provider reachability check (provider_settings.reachability_check,
+		// default on): test each LLM provider and mark ✅/❌ (mirrors
+		// builtin_commands/commands/provider.py).
+		reachability := map[string]string{}
+		cfg := deps.ConfigMgr.Get("default")
+		all := map[string]interface{}{}
+		if cfg != nil {
+			all = cfg.All()
+		}
+		if rc, ok := all["provider_settings"].(map[string]interface{}); ok {
+			if enabled, _ := rc["reachability_check"].(bool); enabled {
+				reply(e, i18n.Get("👀 正在测试提供商可达性..."))
+				reachability = checkReachability(all)
+			}
+		}
 		for i, p := range providers {
 			line := i18n.Get("%d. %s (%s)", i+1, p.ID, p.Model)
+			if code, tested := reachability[p.ID]; tested {
+				if code == "" {
+					line += " ✅"
+				} else {
+					line += i18n.Get(" ❌(errcode: %s)", code)
+				}
+			}
 			if state.selectedLLM[umo] == p.ID {
 				line += i18n.Get(" 👈")
 			}

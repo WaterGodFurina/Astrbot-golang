@@ -18,6 +18,7 @@ import (
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -45,6 +46,13 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	a.Token, _ = config["token"].(string)
 	a.apiBase = "https://api.telegram.org/bot" + a.Token
 	return a
+}
+
+// SetEventBus injects the event bus (implements platform.EventBusSetter).
+func (a *Adapter) SetEventBus(bus platform.EventBus) {
+	if eb, ok := bus.(*core.EventBus); ok {
+		a.EventBus = eb
+	}
 }
 
 // Start begins long-polling for updates.
@@ -125,6 +133,21 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := a.apiCall(ctx, "sendMessage", params)
+	return err
+}
+
+// React adds an emoji reaction to a message (Telegram Bot API setMessageReaction).
+func (a *Adapter) React(sessionID, messageID, emoji string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	params := map[string]interface{}{
+		"chat_id":    sessionID,
+		"message_id": messageID,
+		"reaction": []map[string]interface{}{
+			{"type": "emoji", "emoji": emoji},
+		},
+	}
+	_, err := a.apiCall(ctx, "setMessageReaction", params)
 	return err
 }
 

@@ -84,6 +84,72 @@ type Server struct {
 	// restartFunc 由 lifecycle 注入，供 WebUI"重启"按钮触发进程自重启
 	//（spawn 新进程 → 优雅停机 → 退出）。
 	restartFunc func()
+	// webhookHandlers maps webhook_uuid -> platform callback for the unified
+	// webhook entry (/api/v1/webhooks/platforms/{uuid}).
+	webhookMu      sync.RWMutex
+	webhookHandlers map[string]func(http.ResponseWriter, *http.Request)
+}
+
+// RegisterWebhook registers a unified-webhook callback by uuid.
+func (s *Server) RegisterWebhook(uuid string, handler func(http.ResponseWriter, *http.Request)) {
+	if uuid == "" {
+		return
+	}
+	s.webhookMu.Lock()
+	defer s.webhookMu.Unlock()
+	if s.webhookHandlers == nil {
+		s.webhookHandlers = make(map[string]func(http.ResponseWriter, *http.Request))
+	}
+	s.webhookHandlers[uuid] = handler
+}
+
+// ClearWebhooks removes all unified-webhook callbacks (used when reloading
+// platform adapters so stale uuids do not linger).
+func (s *Server) ClearWebhooks() {
+	s.webhookMu.Lock()
+	defer s.webhookMu.Unlock()
+	s.webhookHandlers = make(map[string]func(http.ResponseWriter, *http.Request))
+}
+
+// UnregisterWebhook removes a unified-webhook callback by uuid.
+func (s *Server) UnregisterWebhook(uuid string) {
+	if uuid == "" {
+		return
+	}
+	s.webhookMu.Lock()
+	defer s.webhookMu.Unlock()
+	delete(s.webhookHandlers, uuid)
+}
+
+// handleWebhooks dispatches GET/POST /api/v1/webhooks/platforms/{webhook_uuid}.
+func (s *Server) handleWebhooks(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) < 2 || parts[0] != "platforms" || parts[1] == "" {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"platforms": s.webhookUUIDs(),
+		}))
+		return
+	}
+	uuid := parts[1]
+	s.webhookMu.RLock()
+	handler := s.webhookHandlers[uuid]
+	s.webhookMu.RUnlock()
+	if handler == nil {
+		logger.Warn("未找到 webhook_uuid 为 %s 的平台", uuid)
+		writeJSON(w, http.StatusNotFound, apiError("平台未找到"))
+		return
+	}
+	handler(w, r)
+}
+
+// webhookUUIDs returns the list of registered webhook uuids.
+func (s *Server) webhookUUIDs() []string {
+	s.webhookMu.RLock()
+	defer s.webhookMu.RUnlock()
+	uuids := make([]string, 0, len(s.webhookHandlers))
+	for uuid := range s.webhookHandlers {
+		uuids = append(uuids, uuid)
+	}
+	return uuids
 }
 
 // defaultPluginMarketURL is the default plugin marketplace registry served by

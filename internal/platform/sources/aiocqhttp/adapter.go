@@ -44,6 +44,10 @@ type Adapter struct {
 
 	pendingMu sync.Mutex
 	pending   map[string]chan map[string]interface{} // echo -> response channel
+
+	// quotedParser carries quoted_message_parser settings for forward-message
+	// fetching (get_forward_msg / get_msg).
+	quotedParser quotedParserSettings
 }
 
 // New creates an aiocqhttp adapter from config.
@@ -72,6 +76,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	if id, ok := config["id"].(string); ok {
 		a.SelfID = id
 	}
+	a.quotedParser = resolveQuotedParserSettings(settings)
 	return a
 }
 
@@ -124,19 +129,83 @@ func (a *Adapter) Stop() error {
 // action (send_group_msg vs send_private_msg) is chosen. Delivery happens over
 // the reverse WebSocket connection; an error is returned when none is active.
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
-	segments := a.convertToCQFormat(chain)
-	params := map[string]interface{}{"message": segments}
-	// groupConvs is written by the WS read loop under a.mu; read it under the
-	// same lock so Send (running on pipeline/plugin goroutines) cannot race.
 	a.mu.Lock()
 	isGroup := a.groupConvs[sessionID]
 	a.mu.Unlock()
+
+	// Forward nodes cannot be mixed with normal segments: send each node via
+	// send_group_forward_msg / send_private_forward_msg (OneBot v11).
+	if hasForwardNode(chain) {
+		return a.sendForward(sessionID, chain, isGroup)
+	}
+
+	segments := a.convertToCQFormat(chain)
+	params := map[string]interface{}{"message": segments}
 	if isGroup {
 		params["group_id"] = sessionID
 	} else {
 		params["user_id"] = sessionID
 	}
 	return a.sendAction("send_msg", params)
+}
+
+// hasForwardNode reports whether the chain contains Node/Nodes components.
+func hasForwardNode(chain *message.MessageChain) bool {
+	if chain == nil {
+		return false
+	}
+	for _, comp := range chain.Chain {
+		switch comp.(type) {
+		case *message.Node, *message.Nodes:
+			return true
+		}
+	}
+	return false
+}
+
+// sendForward sends Node components as combined-forward messages. A single
+// Node becomes one node in the forward message; a Nodes component supplies
+// the whole node list.
+func (a *Adapter) sendForward(sessionID string, chain *message.MessageChain, isGroup bool) error {
+	nodes := []map[string]interface{}{}
+	for _, comp := range chain.Chain {
+		switch c := comp.(type) {
+		case *message.Node:
+			nodes = append(nodes, a.nodeToCQ(c))
+		case *message.Nodes:
+			for _, n := range c.Nodes {
+				nodes = append(nodes, a.nodeToCQ(n))
+			}
+		}
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	action := "send_group_forward_msg"
+	params := map[string]interface{}{"messages": nodes}
+	if isGroup {
+		params["group_id"] = sessionID
+	} else {
+		action = "send_private_forward_msg"
+		params["user_id"] = sessionID
+	}
+	return a.sendAction(action, params)
+}
+
+// nodeToCQ converts a Node component to the OneBot v11 "node" segment.
+func (a *Adapter) nodeToCQ(n *message.Node) map[string]interface{} {
+	content := []map[string]interface{}{}
+	if n.Content != nil {
+		content = a.convertToCQFormat(&message.MessageChain{Chain: n.Content})
+	}
+	return map[string]interface{}{
+		"type": "node",
+		"data": map[string]interface{}{
+			"uin":     n.UIN,
+			"name":    n.Name,
+			"content": content,
+		},
+	}
 }
 
 // sendAction sends a OneBot v11 API call over an active reverse-WS connection.
@@ -278,6 +347,25 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			a.pendingMu.Unlock()
 		}
+	}
+}
+
+// CallActionCtx sends a OneBot v11 API call with a context timeout.
+func (a *Adapter) CallActionCtx(ctx context.Context, api string, params map[string]any) (map[string]any, error) {
+	done := make(chan struct{})
+	var (
+		ret map[string]any
+		err error
+	)
+	go func() {
+		ret, err = a.CallAction(api, params)
+		close(done)
+	}()
+	select {
+	case <-done:
+		return ret, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
@@ -466,6 +554,9 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 
 	// Convert message segments
 	msgChain := a.convertFromCQFormat(raw)
+	// Fetch quoted-reply content and combined-forward messages
+	// (quoted_message_parser; mirrors QuotedMessageExtractor).
+	a.enrichForwardAndQuoted(msgChain)
 
 	msgID, _ := raw["message_id"].(string)
 	if msgID == "" {
@@ -569,6 +660,8 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 }
 
 // convertFromCQFormat converts OneBot v11 message segments to MessageChain.
+// Forward (node/nodes) segments are parsed inline; their remote ids are
+// fetched by enrichForwardAndQuoted.
 func (a *Adapter) convertFromCQFormat(raw map[string]interface{}) *message.MessageChain {
 	chain := &message.MessageChain{Chain: []message.Component{}}
 
@@ -577,73 +670,60 @@ func (a *Adapter) convertFromCQFormat(raw map[string]interface{}) *message.Messa
 		return chain
 	}
 
-	for _, seg := range segments {
-		segMap, ok := seg.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		segType, _ := segMap["type"].(string)
-		data, _ := segMap["data"].(map[string]interface{})
+	parsed, _ := a.parseOneBotSegments(segments, 0)
+	chain.Chain = parsed
+	return chain
+}
 
-		switch segType {
-		case "text":
-			text, _ := data["text"].(string)
-			chain.Chain = append(chain.Chain, &message.Plain{Text: text})
-		case "at":
-			qq, _ := data["qq"].(string)
-			if qq == "" {
-				if qqFloat, ok := data["qq"].(float64); ok {
-					qq = fmt.Sprintf("%v", int64(qqFloat))
-				}
+// enrichForwardAndQuoted resolves remote content referenced by the chain:
+// reply ids are fetched with get_msg (building the quoted chain) and forward
+// ids with get_forward_msg (BFS, max_forward_fetch hops). Mirrors the
+// QuotedMessageExtractor flow for the aiocqhttp platform.
+func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain) {
+	if chain == nil || len(chain.Chain) == 0 {
+		return
+	}
+	var replyIDs []string
+	var forwardIDs []string
+	for _, comp := range chain.Chain {
+		switch c := comp.(type) {
+		case *message.Reply:
+			if c.MessageID != "" {
+				replyIDs = append(replyIDs, c.MessageID)
 			}
-			name, _ := data["name"].(string)
-			if qq == "all" {
-				chain.Chain = append(chain.Chain, &message.AtAll{})
-			} else {
-				chain.Chain = append(chain.Chain, &message.At{TargetID: qq, Name: name})
+		case *message.Nodes:
+			// A Nodes component with no node list means "to be fetched".
+			if len(c.Nodes) == 0 {
+				forwardIDs = append(forwardIDs, c.IDs()...)
 			}
-		case "reply":
-			id, _ := data["id"].(string)
-			chain.Chain = append(chain.Chain, &message.Reply{MessageID: id})
-		case "image":
-			url, _ := data["url"].(string)
-			file, _ := data["file"].(string)
-			chain.Chain = append(chain.Chain, &message.Image{URL: url, File: file})
-		case "record":
-			url, _ := data["url"].(string)
-			file, _ := data["file"].(string)
-			chain.Chain = append(chain.Chain, &message.Record{URL: url, File: file})
-		case "face":
-			id, _ := data["id"].(string)
-			chain.Chain = append(chain.Chain, &message.Face{ID: id})
-		case "file":
-			url, _ := data["url"].(string)
-			name, _ := data["name"].(string)
-			if name == "" {
-				name, _ = data["file"].(string)
-			}
-			chain.Chain = append(chain.Chain, &message.File{URL: url, Name: name})
-		case "video":
-			url, _ := data["url"].(string)
-			file, _ := data["file"].(string)
-			chain.Chain = append(chain.Chain, &message.Video{URL: url, FileID: file})
-		case "json":
-			jsonStr, _ := data["data"].(string)
-			var jsonData map[string]interface{}
-			if jsonStr != "" {
-				_ = json.Unmarshal([]byte(jsonStr), &jsonData)
-			}
-			if jsonData == nil {
-				jsonData = make(map[string]interface{})
-			}
-			chain.Chain = append(chain.Chain, &message.Json{Data: jsonData})
-		case "poke":
-			id, _ := data["id"].(string)
-			chain.Chain = append(chain.Chain, &message.Poke{Target: id})
 		}
 	}
 
-	return chain
+	// Fetch quoted reply content (get_msg) — build Reply.Chain.
+	for _, rid := range replyIDs {
+		quotedChain, nestedForwardIDs := a.fetchQuotedContent(rid)
+		for _, comp := range chain.Chain {
+			if reply, ok := comp.(*message.Reply); ok && reply.MessageID == rid {
+				reply.Chain = quotedChain
+				reply.SenderNick = ""
+			}
+		}
+		forwardIDs = append(forwardIDs, nestedForwardIDs...)
+	}
+
+	// Fetch combined-forward messages (get_forward_msg BFS).
+	if len(forwardIDs) > 0 {
+		nodes := a.resolveNestedForwards(forwardIDs)
+		if len(nodes) > 0 {
+			// Replace placeholder Nodes components with the fetched nodes.
+			for i, comp := range chain.Chain {
+				if n, ok := comp.(*message.Nodes); ok && len(n.Nodes) == 0 {
+					chain.Chain[i] = &message.Nodes{Nodes: nodes}
+					break
+				}
+			}
+		}
+	}
 }
 
 // convertToCQFormat converts a MessageChain to OneBot v11 message segments.

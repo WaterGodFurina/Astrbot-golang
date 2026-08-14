@@ -849,6 +849,23 @@ func (d *Database) RecordPlatformMessage(platformID, userID, senderID, content s
 	})
 }
 
+// TrimPlatformMessageHistory keeps only the most recent `keep` rows for a
+// platform session (mirrors Python insert_message_chain max_messages trimming).
+func (d *Database) TrimPlatformMessageHistory(platformID, userID string, keep int) error {
+	if keep < 1 {
+		keep = 1
+	}
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`DELETE FROM platform_message_history WHERE platform_id=? AND user_id=?
+			 AND id NOT IN (SELECT id FROM platform_message_history
+			   WHERE platform_id=? AND user_id=? ORDER BY id DESC LIMIT ?)`,
+			platformID, userID, platformID, userID, keep,
+		)
+		return err
+	})
+}
+
 // PlatformMessageRow is one row from platform_message_history.
 type PlatformMessageRow struct {
 	ID         int64

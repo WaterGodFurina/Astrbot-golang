@@ -151,9 +151,7 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 
 	// ── Webhooks ──────────────────────────────────────────
 	case "webhooks":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"platforms": []interface{}{},
-		}))
+		s.handleWebhooks(w, r, rest)
 
 	// ── Trace ─────────────────────────────────────────────
 	case "trace":

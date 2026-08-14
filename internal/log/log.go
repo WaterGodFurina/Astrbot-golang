@@ -1,6 +1,7 @@
 package log
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -61,13 +62,18 @@ const maxHistory = 200
 // long-running process cannot bloat memory.
 const maxHistoryBytes = 1 << 20 // 1 MiB
 
-// LogEntry represents a single log record.
+// LogEntry represents a single log record. Trace, when non-nil, carries a
+// full trace-event payload (type=trace) instead of a formatted message.
 type LogEntry struct {
 	Timestamp time.Time
 	Level     Level
 	Component string
 	Message   string
+	Trace     map[string]interface{} // nil unless this is a trace event
 }
+
+// IsTrace reports whether the entry is a trace event.
+func (e *LogEntry) IsTrace() bool { return e.Trace != nil }
 
 var defaultLogger = &Logger{
 	level:    LevelInfo,
@@ -302,6 +308,47 @@ func (l *Logger) History() []LogEntry {
 	out := make([]LogEntry, len(l.history))
 	copy(out, l.history)
 	return out
+}
+
+// PublishTrace publishes a trace event (type=trace) to the history buffer and
+// all SSE subscribers, mirroring Python's TraceSpan.record (log_broker.publish).
+// The payload is the full trace object consumed by the TraceDisplayer:
+// {type, level, time, span_id, name, umo, sender_name, message_outline, action, fields}.
+func (l *Logger) PublishTrace(payload map[string]interface{}) {
+	entry := LogEntry{
+		Timestamp: time.Now(),
+		Level:     LevelInfo,
+		Component: "Trace",
+		Trace:     payload,
+	}
+	l.mu.Lock()
+	l.history = append(l.history, entry)
+	for len(l.history) > maxHistory {
+		l.history = l.history[1:]
+	}
+	// Trace payloads are bounded (~ a few hundred bytes); use a loose cap.
+	for l.historyBytes > maxHistoryBytes && len(l.history) > 1 {
+		first := l.history[0]
+		if first.IsTrace() {
+			raw, _ := json.Marshal(first.Trace)
+			l.historyBytes -= len(raw)
+		} else {
+			l.historyBytes -= len(first.Message)
+		}
+		l.history = l.history[1:]
+	}
+	raw, _ := json.Marshal(payload)
+	l.historyBytes += len(raw)
+	subs := make([]chan LogEntry, len(l.subscribers))
+	copy(subs, l.subscribers)
+	l.mu.Unlock()
+
+	for _, ch := range subs {
+		select {
+		case ch <- entry:
+		default: // drop if subscriber is slow
+		}
+	}
 }
 
 func (l *Logger) Debug(format string, args ...interface{}) {

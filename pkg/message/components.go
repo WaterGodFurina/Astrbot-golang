@@ -219,9 +219,20 @@ func (n *Node) Clone() Component {
         return &Node{UIN: n.UIN, Name: n.Name, Content: content}
 }
 
-// Nodes represents multiple forward message nodes.
+// Nodes represents multiple forward message nodes. ForwardIDs carries the
+// remote combined-forward message ids (OneBot get_forward_msg) when the
+// node list itself has not been fetched yet.
 type Nodes struct {
-        Nodes []*Node `json:"nodes,omitempty"`
+        Nodes      []*Node  `json:"nodes,omitempty"`
+        ForwardIDs []string `json:"forward_ids,omitempty"`
+}
+
+// IDs returns the remote forward-message ids.
+func (n *Nodes) IDs() []string {
+        if len(n.ForwardIDs) > 0 {
+                return n.ForwardIDs
+        }
+        return nil
 }
 
 func (n *Nodes) Type() ComponentType { return CompNodes }

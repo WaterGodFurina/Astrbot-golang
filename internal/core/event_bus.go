@@ -75,6 +75,9 @@ type Event struct {
 	Result            *message.MessageEventResult
 	stopped           bool
 	HasSendOper       bool
+
+	// Trace records agent invocation spans (TracePage /api/v1/trace).
+	Trace *log.TraceSpan
 }
 
 // UnifiedMsgOrigin returns platform:conversation_id.

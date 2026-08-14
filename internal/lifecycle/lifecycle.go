@@ -608,6 +608,9 @@ func (l *Lifecycle) ReloadPlatforms(ctx context.Context) {
 	logger.I18nInfo("正在重载平台适配器...")
 	l.platformMgr.StopAll()
 	l.platformMgr.Clear()
+	if l.dashboard != nil {
+		l.dashboard.ClearWebhooks()
+	}
 	if err := l.loadPlatforms(ctx); err != nil {
 		logger.Error("Failed to reload platforms: %v", err)
 	}
@@ -789,6 +792,11 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 	if ps, ok := all["platform_settings"].(map[string]interface{}); ok {
 		settings = ps
 	}
+	// Attach provider_settings so adapters that implement quoted-message
+	// parsing (quoted_message_parser.*) can read their limits.
+	if ps, ok := all["provider_settings"].(map[string]interface{}); ok {
+		settings["provider_settings"] = ps
+	}
 	loaded, skipped, failed := 0, 0, 0
 	for _, p := range platforms {
 		config, ok := p.(map[string]interface{})
@@ -817,7 +825,16 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 		if bus, ok := adapter.(platform.EventBusSetter); ok {
 			bus.SetEventBus(l.eventBus)
 		}
+		// Star registry injection: platform adapters that register commands
+		// (e.g. Discord slash commands) read the active handler registry.
+		if sm, ok := adapter.(platform.StarManagerSetter); ok {
+			sm.SetStarManager(l.starMgr)
+		}
 		l.platformMgr.Register(adapter)
+		// Unified webhook registration (lark webhook mode).
+		if wh, ok := adapter.(platform.WebhookPlatform); ok && l.dashboard != nil {
+			l.dashboard.RegisterWebhook(wh.WebhookUUID(), wh.WebhookCallback)
+		}
 		if err := adapter.Start(ctx); err != nil {
 			logger.Error("Failed to start platform %s: %v", ptype, err)
 			failed++

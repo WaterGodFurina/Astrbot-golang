@@ -22,7 +22,16 @@ type ProviderSettings struct {
 	GroupNameDisplay     bool   `mapstructure:"group_name_display"`
 	DatetimeSystemPrompt bool   `mapstructure:"datetime_system_prompt"`
 	MaxAgentStep         int    `mapstructure:"max_agent_step"`
+	ToolCallTimeout      int    `mapstructure:"tool_call_timeout"`
 	ToolSchemaMode       string `mapstructure:"tool_schema_mode"`
+	LLMSafetyMode        bool   `mapstructure:"llm_safety_mode"`
+	SafetyModeStrategy   string `mapstructure:"safety_mode_strategy"`
+	UnsupportedStreamingStrategy string `mapstructure:"unsupported_streaming_strategy"`
+	DisplayReasoningText bool   `mapstructure:"display_reasoning_text"`
+	ShowToolUseStatus    bool   `mapstructure:"show_tool_use_status"`
+	ShowToolCallResult   bool   `mapstructure:"show_tool_call_result"`
+	BufferIntermediateMessages bool `mapstructure:"buffer_intermediate_messages"`
+	SanitizeContextByModalities bool `mapstructure:"sanitize_context_by_modalities"`
 	MaxContextLength     int    `mapstructure:"max_context_length"`
 	DequeueContextLength int    `mapstructure:"dequeue_context_length"`
 	ContextLimitStrategy string `mapstructure:"context_limit_reached_strategy"`
@@ -58,6 +67,9 @@ type PlatformSettings struct {
 	WakeByFriend                 *bool    `mapstructure:"wake_by_friend"`
 	FriendMessageNeedsWakePrefix bool     `mapstructure:"friend_message_needs_wake_prefix"`
 	IgnoreAtAll                  bool     `mapstructure:"ignore_at_all"`
+	IgnoreBotSelfMessage         bool     `mapstructure:"ignore_bot_self_message"`
+	NoPermissionReply            bool     `mapstructure:"no_permission_reply"`
+	UniqueSession                bool     `mapstructure:"unique_session"`
 	CmdPrefix                    string   `mapstructure:"cmd_prefix"`
 	EnableIDWhiteList            bool     `mapstructure:"enable_id_white_list"`
 	IDWhitelist                  []string `mapstructure:"id_whitelist"`
@@ -68,7 +80,9 @@ type PlatformSettings struct {
 	ReplyPrefix                  string   `mapstructure:"reply_prefix"`
 	ReplyWithMention             bool     `mapstructure:"reply_with_mention"`
 	ReplyWithQuote               bool     `mapstructure:"reply_with_quote"`
+	ForwardThreshold             int      `mapstructure:"forward_threshold"`
 	EmptyMentionWaiting          bool     `mapstructure:"empty_mention_waiting"`
+	EmptyMentionWaitingNeedReply bool     `mapstructure:"empty_mention_waiting_need_reply"`
 	// Legacy flat keys used by RateLimitStage.
 	RateLimitTime     float64 `mapstructure:"rate_limit_time"`
 	RateLimitStrategy string  `mapstructure:"rate_limit_strategy"`

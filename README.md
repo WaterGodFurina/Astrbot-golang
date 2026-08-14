@@ -21,7 +21,7 @@ astrbot-go/
 │   ├── star/                  # 指令系统 (子进程插件命令/filter/hook 桥接进管线)
 │   ├── lifecycle/             # 生命周期管理，组装所有模块
 │   ├── pipeline/              # 消息处理管线 (9 阶段)
-│   ├── platform/              # 平台适配器 (qqofficial/telegram/aiocqhttp/webchat)
+│   ├── platform/              # 平台适配器 (18 个：QQ官方/Telegram/WebChat/Discord/Lark/微信系列/OneBot/Satori/Line/Slack/Mattermost/Misskey/Kook/DingTalk/WeCom 等)
 │   ├── provider/              # LLM Provider 管理
 │   ├── dashboard/             # WebUI API 服务器 + 路由 + 认证
 │   ├── core/                  # 事件总线 + Pipeline 调度器
@@ -148,6 +148,33 @@ cgo 插件的 C 编译器（zig/clang/GCC）也存放在同一私有目录下（
 
 插件系统已全面采用子进程方案（go-plugin + gRPC），旧 `.so` 插件方案及其 `legacy_plugin_mode` 配置项已彻底移除，不再提供 `.so` 加载路径。
 
+## 平台适配器
+
+共 18 个平台适配器，对齐 Python AstrBot v4.27.3 全平台覆盖：
+
+| 适配器 | 说明 | 关键实现 |
+|--------|------|----------|
+| aiocqhttp | OneBot v11 | HTTP 接收 + 反向 WebSocket 发送，CQ 码转换，群转发/撤回/引用解析，同 msgID 去重 |
+| qq_official | QQ 开放平台 | botpy WS 网关，原生 C2C 流式（StreamFragmenter） |
+| qq_official_webhook | QQ 开放平台 Webhook | Ed25519 签名校验，webhook 回调，REST 发送 |
+| telegram | Telegram | 长轮询，完整多媒体（photo/voice/document/video），setMessageReaction，30s 超时 |
+| webchat | 内置 Web 聊天 | HTTP `/chat` `/poll`，SSE/WebSocket 双 transport，JWT 鉴权 |
+| lark | 飞书 | 官方 SDK，socket 长连接 / webhook 双模式，post 富文本，im/v1/message_reaction，AES-256-CBC webhook 解密 |
+| discord | Discord | gateway + Application Command（斜杠指令 1:1 star 桥接），content+files 发送，MessageReactionAdd |
+| weixin_oc | 个人微信 | iLink 协议（QR 登录 + 长轮询），一键注册，token/context 持久化 |
+| weixin_official_account | 微信公众号 | MpAccount SDK，ReadMessage 校验+解密，客服消息 custom/send |
+| wecom | 企业微信 | WXBizMsgCrypt（AES-256-CBC + SHA1），应用+客服双模式，素材上传 |
+| wecom_ai_bot | 企业微信 AI 机器人 | WXBizJsonMsgCrypt，webhook/长连接双模式，队列管理，流聚合 |
+| line | LINE | 官方 SDK，webhook X-Line-Signature 校验，GetMessageContent，事件去重 |
+| slack | Slack | Socket Mode + Webhook 双模式，blocks 解析，react，附件上传 |
+| mattermost | Mattermost | WS 长连接 + REST（posts/files/users），multipart 上传，@提及解析 |
+| misskey | Misskey | REST + WS streaming，note/renote/引用，文件上传，react，重连 |
+| kook | KOOK | gateway WS（心跳/信令）+ REST，kmarkdown/卡片解析，(met)/(rol) 选择器 |
+| dingtalk | 钉钉 | Stream 协议（connections/open WS + 心跳），REST 机器人消息，AES，重连退避 |
+| satori | Satori 通用协议 | WS 信令（IDENTIFY/心跳/READY/EVENT），元素解析/发送，react |
+
+统一 Webhook 入口：所有适配器均支持 `PlatformWebhook` 接口，dashboard 统一注册/分发 webhook 回调。
+
 ## Provider 支持情况
 
 | 能力 | 支持 |
@@ -190,6 +217,7 @@ go test ./... -v
 
 ## 代码规模
 
-- 124 个 Go 文件（含测试 150 个）
-- 约 34,000 行 Go 代码
-- 对齐 Python AstrBot v4.27.2 的核心架构
+- 274 个 Go 文件（非测试 199，测试 75）
+- 约 83,000 行（核心代码 ~69,000 行 + 测试 ~14,000 行）
+- 18 个平台适配器 + 14 类 LLM Provider 能力
+- 对齐 Python AstrBot v4.27.3 全平台全核心架构

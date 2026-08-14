@@ -74,6 +74,25 @@ func providerLTMBool(cfg map[string]interface{}, key string) bool {
 	return b
 }
 
+// providerLTMInt reads an int under provider_ltm_settings with a default.
+func providerLTMInt(cfg map[string]interface{}, key string, def int) int {
+	ps, _ := cfg["provider_ltm_settings"].(map[string]interface{})
+	if ps == nil {
+		return def
+	}
+	switch v := ps[key].(type) {
+	case int:
+		if v > 0 {
+			return v
+		}
+	case float64:
+		if v > 0 {
+			return int(v)
+		}
+	}
+	return def
+}
+
 // kbAgenticMode reads provider kb_agentic_mode from the top-level config.
 func kbAgenticMode(cfg map[string]interface{}) bool {
 	v, _ := cfg["kb_agentic_mode"].(bool)

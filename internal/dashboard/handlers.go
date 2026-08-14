@@ -250,12 +250,15 @@ func (s *Server) injectPlatformSection(metadata *config.OrderedJSON) {
 				"appid": "", "secret": "",
 				"enable_group_c2c": true, "enable_guild_direct_message": true,
 			},
+			"QQ 官方机器人(Webhook)": map[string]interface{}{
+				"id": "default", "type": "qq_official_webhook", "enable": true,
+				"appid": "", "secret": "",
+				"is_sandbox": false, "unified_webhook_mode": true,
+				"webhook_uuid": "", "callback_server_host": "0.0.0.0", "port": 6196,
+			},
 			"OneBot v11": map[string]interface{}{
 				"id": "default", "type": "aiocqhttp", "enable": true,
 				"ws_reverse_host": "0.0.0.0", "ws_reverse_port": 6199, "ws_reverse_token": "",
-			},
-			"WebChat": map[string]interface{}{
-				"id": "default", "type": "webchat", "enable": false,
 			},
 			"Telegram": map[string]interface{}{
 				"id": "telegram", "type": "telegram", "enable": true,
@@ -267,6 +270,147 @@ func (s *Server) injectPlatformSection(metadata *config.OrderedJSON) {
 				"telegram_command_auto_refresh":      true,
 				"telegram_command_register_interval": 300,
 				"telegram_polling_restart_delay":     5.0,
+			},
+			"飞书(Lark)": map[string]interface{}{
+				"id": "lark", "type": "lark", "enable": true,
+				"app_id": "", "app_secret": "",
+				"domain":                  "https://open.feishu.cn",
+				"lark_connection_mode":    "socket",
+				"webhook_uuid":            "",
+				"lark_encrypt_key":        "",
+				"lark_verification_token": "",
+			},
+			"Discord": map[string]interface{}{
+				"id": "discord", "type": "discord", "enable": true,
+				"discord_token":              "",
+				"discord_proxy":              "",
+				"discord_command_register":   true,
+				"discord_activity_name":      "",
+				"discord_allow_bot_messages": false,
+			},
+			"KOOK": map[string]interface{}{
+				"id": "kook", "type": "kook", "enable": true,
+				"kook_bot_token":                "",
+				"kook_reconnect_delay":          1,
+				"kook_max_reconnect_delay":      60,
+				"kook_max_retry_delay":          60,
+				"kook_heartbeat_interval":       30,
+				"kook_heartbeat_timeout":        6,
+				"kook_max_heartbeat_failures":   3,
+				"kook_max_consecutive_failures": 5,
+			},
+			"钉钉(DingTalk)": map[string]interface{}{
+				"id": "dingtalk", "type": "dingtalk", "enable": true,
+				"client_id":        "",
+				"client_secret":    "",
+				"card_template_id": "",
+			},
+			"微信开放平台(Weixin OC)": map[string]interface{}{
+				"id": "weixin_oc", "type": "weixin_oc", "enable": true,
+				"weixin_oc_base_url":              "https://ilinkai.weixin.qq.com",
+				"weixin_oc_cdn_base_url":          "https://cdn.wx.qq.com",
+				"weixin_oc_bot_type":              "3",
+				"weixin_oc_qr_poll_interval":      2,
+				"weixin_oc_long_poll_timeout_ms":  35000,
+				"weixin_oc_api_timeout_ms":        120000,
+			},
+			"微信公众号": map[string]interface{}{
+				"id": "weixin_official_account", "type": "weixin_official_account", "enable": true,
+				"appid":               "",
+				"secret":              "",
+				"token":               "",
+				"encoding_aes_key":    "",
+				"api_base_url":        "https://api.weixin.qq.com/cgi-bin/",
+				"unified_webhook_mode": true,
+				"webhook_uuid":        "",
+				"callback_server_host": "0.0.0.0",
+				"port":                6194,
+				"active_send_mode":    false,
+			},
+			"Satori": map[string]interface{}{
+				"id": "satori", "type": "satori", "enable": true,
+				"satori_api_base_url":       "http://localhost:5140/satori/v1",
+				"satori_endpoint":           "ws://localhost:5140/satori/v1/events",
+				"satori_token":              "",
+				"satori_auto_reconnect":     true,
+				"satori_heartbeat_interval": 10,
+				"satori_reconnect_delay":    5,
+			},
+			"Line": map[string]interface{}{
+				"id": "line", "type": "line", "enable": true,
+				"channel_access_token": "",
+				"channel_secret":       "",
+				"unified_webhook_mode": true,
+				"webhook_uuid":         "",
+			},
+			"Slack": map[string]interface{}{
+				"id": "slack", "type": "slack", "enable": true,
+				"bot_token":             "",
+				"app_token":             "",
+				"signing_secret":        "",
+				"slack_connection_mode": "socket", // webhook, socket
+				"unified_webhook_mode":  true,
+				"webhook_uuid":          "",
+				"slack_webhook_host":    "0.0.0.0",
+				"slack_webhook_port":    6197,
+				"slack_webhook_path":    "/astrbot-slack-webhook/callback",
+			},
+			"Misskey": map[string]interface{}{
+				"id": "misskey", "type": "misskey", "enable": true,
+				"misskey_instance_url":             "https://misskey.example",
+				"misskey_token":                    "",
+				"max_message_length":               3000,
+				"misskey_default_visibility":       "public",
+				"misskey_local_only":               false,
+				"misskey_enable_chat":              true,
+				"misskey_enable_file_upload":       true,
+				"misskey_upload_concurrency":       3,
+				"misskey_upload_folder":            "",
+				"misskey_allow_insecure_downloads": false,
+				"misskey_download_timeout":         15,
+				"misskey_download_chunk_size":      65536,
+				"misskey_max_download_bytes":       0,
+			},
+			"Mattermost": map[string]interface{}{
+				"id": "mattermost", "type": "mattermost", "enable": true,
+				"mattermost_url":             "https://chat.example.com",
+				"mattermost_bot_token":       "",
+				"mattermost_reconnect_delay": 5.0,
+			},
+			"企业微信应用 & 微信客服": map[string]interface{}{
+				"id": "wecom", "type": "wecom", "enable": true,
+				"corpid":               "",
+				"secret":               "",
+				"token":                "",
+				"encoding_aes_key":     "",
+				"kf_name":              "",
+				"api_base_url":         "https://qyapi.weixin.qq.com/cgi-bin/",
+				"unified_webhook_mode": true,
+				"webhook_uuid":         "",
+				"callback_server_host": "0.0.0.0",
+				"port":                 6195,
+			},
+			"企业微信 (智能机器人)": map[string]interface{}{
+				"id":                                     "wecom_ai_bot",
+				"type":                                   "wecom_ai_bot",
+				"hint":                                   "如果发现字段有异常，请重新创建",
+				"enable":                                 true,
+				"wecom_ai_bot_connection_mode":           "long_connection", // long_connection, webhook
+				"wecom_ai_bot_name":                      "",
+				"wecomaibot_ws_bot_id":                   "",
+				"wecomaibot_ws_secret":                   "",
+				"wecomaibot_token":                       "",
+				"wecomaibot_encoding_aes_key":            "",
+				"wecomaibot_init_respond_text":           "",
+				"wecomaibot_friend_message_welcome_text": "",
+				"msg_push_webhook_url":                   "",
+				"only_use_webhook_url_to_send":           false,
+				"wecomaibot_ws_url":                      "wss://openws.work.weixin.qq.com",
+				"wecomaibot_heartbeat_interval":          30,
+				"unified_webhook_mode":                   true,
+				"webhook_uuid":                           "",
+				"callback_server_host":                   "0.0.0.0",
+				"port":                                   6198,
 			},
 		},
 		"items": map[string]interface{}{
@@ -361,6 +505,451 @@ func (s *Server) injectPlatformSection(metadata *config.OrderedJSON) {
 				"description": "Telegram 轮询重启延迟",
 				"type":        "float",
 				"hint":        "当轮询意外结束尝试自动重启时的延迟时间，单位为秒。默认为 5s。",
+			},
+			"app_id": map[string]interface{}{
+				"description": "app_id",
+				"type":        "string",
+				"hint":        "必填项。飞书开放平台的 App ID。",
+			},
+			"app_secret": map[string]interface{}{
+				"description": "app_secret",
+				"type":        "string",
+				"hint":        "必填项。飞书开放平台的 App Secret。",
+			},
+			"domain": map[string]interface{}{
+				"description": "开放平台域名",
+				"type":        "string",
+				"hint":        "默认 https://open.feishu.cn，Lark 国际版填 https://open.larksuite.com。",
+			},
+			"lark_connection_mode": map[string]interface{}{
+				"description": "订阅方式",
+				"type":        "string",
+				"options":     []string{"socket", "webhook"},
+				"labels":      []string{"长连接模式", "推送至服务器模式"},
+			},
+			"webhook_uuid": map[string]interface{}{
+				"description": "Webhook UUID",
+				"type":        "string",
+				"hint":        "推送至服务器模式下的回调标识。回调地址为 /api/v1/webhooks/platforms/{webhook_uuid}。",
+			},
+			"lark_encrypt_key": map[string]interface{}{
+				"description": "Encrypt Key",
+				"type":        "string",
+				"hint":        "用于解密飞书回调数据的加密密钥",
+			},
+			"lark_verification_token": map[string]interface{}{
+				"description": "Verification Token",
+				"type":        "string",
+				"hint":        "用于验证飞书回调请求的令牌",
+			},
+			"discord_token": map[string]interface{}{
+				"description": "Discord Bot Token",
+				"type":        "string",
+				"hint":        "在此处填入你的 Discord Bot Token",
+			},
+			"discord_proxy": map[string]interface{}{
+				"description": "Discord 代理地址",
+				"type":        "string",
+				"hint":        "可选的代理地址：http://ip:port",
+			},
+			"discord_command_register": map[string]interface{}{
+				"description": "注册 Discord 指令",
+				"type":        "bool",
+				"hint":        "启用后，自动将插件指令注册为 Discord 斜杠指令",
+			},
+			"discord_activity_name": map[string]interface{}{
+				"description": "Discord 活动名称",
+				"type":        "string",
+				"hint":        "可选的 Discord 活动名称。留空则不设置活动。",
+			},
+			"discord_allow_bot_messages": map[string]interface{}{
+				"description": "允许接收机器人消息",
+				"type":        "bool",
+				"hint":        "启用后，AstrBot 将接收来自其他 Discord 机器人的消息。适用于机器人间通信场景（如消息转发）。默认关闭。",
+			},
+			"mattermost_url": map[string]interface{}{
+				"description": "Mattermost URL",
+				"type":        "string",
+				"hint":        "Mattermost 服务地址，例如 https://chat.example.com。",
+			},
+			"mattermost_bot_token": map[string]interface{}{
+				"description": "Mattermost Bot Token",
+				"type":        "string",
+				"hint":        "在 Mattermost 中创建 Bot 账户后生成的访问令牌。",
+			},
+			"mattermost_reconnect_delay": map[string]interface{}{
+				"description": "Mattermost 重连延迟",
+				"type":        "float",
+				"hint":        "WebSocket 断开后的重连等待时间，单位为秒。默认 5 秒。",
+			},
+			"misskey_instance_url": map[string]interface{}{
+				"description": "Misskey 实例 URL",
+				"type":        "string",
+				"hint":        "例如 https://misskey.example，填写 Bot 账号所在的 Misskey 实例地址",
+			},
+			"misskey_token": map[string]interface{}{
+				"description": "Misskey Access Token",
+				"type":        "string",
+				"hint":        "连接服务设置生成的 API 鉴权访问令牌（Access token）",
+			},
+			"max_message_length": map[string]interface{}{
+				"description": "最大消息长度",
+				"type":        "int",
+				"hint":        "发帖时文本的最大长度，超出部分将被截断并追加省略号。默认 3000。",
+			},
+			"misskey_default_visibility": map[string]interface{}{
+				"description": "默认帖子可见性",
+				"type":        "string",
+				"options":     []string{"public", "home", "followers"},
+				"hint":        "机器人发帖时的默认可见性设置。public：公开，home：主页时间线，followers：仅关注者。",
+			},
+			"misskey_local_only": map[string]interface{}{
+				"description": "仅限本站（不参与联合）",
+				"type":        "bool",
+				"hint":        "启用后，机器人发出的帖子将仅在本实例可见，不会联合到其他实例",
+			},
+			"misskey_enable_chat": map[string]interface{}{
+				"description": "启用聊天消息响应",
+				"type":        "bool",
+				"hint":        "启用后，机器人将会监听和响应私信聊天消息",
+			},
+			"misskey_enable_file_upload": map[string]interface{}{
+				"description": "启用文件上传到 Misskey",
+				"type":        "bool",
+				"hint":        "启用后，适配器会尝试将消息链中的文件上传到 Misskey。URL 文件会先尝试服务器端上传，异步上传失败时会回退到下载后本地上传。",
+			},
+			"misskey_allow_insecure_downloads": map[string]interface{}{
+				"description": "允许不安全下载（禁用 SSL 验证）",
+				"type":        "bool",
+				"hint":        "当远端服务器存在证书问题导致无法正常下载时，自动禁用 SSL 验证作为回退方案。适用于某些图床的证书配置问题。启用有安全风险，仅在必要时使用。",
+			},
+			"misskey_download_timeout": map[string]interface{}{
+				"description": "远端下载超时时间（秒）",
+				"type":        "int",
+				"hint":        "下载远程文件时的超时时间（秒），用于异步上传回退到本地上传的场景。",
+			},
+			"misskey_download_chunk_size": map[string]interface{}{
+				"description": "流式下载分块大小（字节）",
+				"type":        "int",
+				"hint":        "流式下载和计算 MD5 时使用的每次读取字节数，过小会增加开销，过大会占用内存。",
+			},
+			"misskey_max_download_bytes": map[string]interface{}{
+				"description": "最大允许下载字节数（超出则中止）",
+				"type":        "int",
+				"hint":        "如果希望限制下载文件的最大大小以防止 OOM，请填写最大字节数；留空或 null 表示不限制。",
+			},
+			"misskey_upload_concurrency": map[string]interface{}{
+				"description": "并发上传限制",
+				"type":        "int",
+				"hint":        "同时进行的文件上传任务上限（整数，默认 3）。",
+			},
+			"misskey_upload_folder": map[string]interface{}{
+				"description": "上传到网盘的目标文件夹 ID",
+				"type":        "string",
+				"hint":        "可选：填写 Misskey 网盘中目标文件夹的 ID，上传的文件将放置到该文件夹内。留空则使用账号网盘根目录。",
+			},
+			"channel_access_token": map[string]interface{}{
+				"description": "LINE Channel Access Token",
+				"type":        "string",
+				"hint":        "LINE Messaging API 的 channel access token。",
+			},
+			"channel_secret": map[string]interface{}{
+				"description": "LINE Channel Secret",
+				"type":        "string",
+				"hint":        "用于校验 LINE Webhook 签名。",
+			},
+			"bot_token": map[string]interface{}{
+				"description": "Bot Token",
+				"type":        "string",
+				"hint":        "Slack Bot User OAuth Token（xoxb- 开头）。",
+			},
+			"app_token": map[string]interface{}{
+				"description": "App Token",
+				"type":        "string",
+				"hint":        "Slack App-Level Token（xapp- 开头），Socket Mode 必需。",
+			},
+			"signing_secret": map[string]interface{}{
+				"description": "Signing Secret",
+				"type":        "string",
+				"hint":        "用于校验 Slack Webhook 签名，Webhook Mode 必需。",
+			},
+			"slack_connection_mode": map[string]interface{}{
+				"description": "Slack Connection Mode",
+				"type":        "string",
+				"options":     []string{"webhook", "socket"},
+				"hint":        "The connection mode for Slack. `webhook` uses a webhook server, `socket` uses Slack's Socket Mode.",
+			},
+			"slack_webhook_host": map[string]interface{}{
+				"description": "Slack Webhook Host",
+				"type":        "string",
+				"hint":        "Only valid when Slack connection mode is `webhook`.",
+				"condition": map[string]interface{}{
+					"slack_connection_mode": "webhook",
+					"unified_webhook_mode":  false,
+				},
+			},
+			"slack_webhook_port": map[string]interface{}{
+				"description": "Slack Webhook Port",
+				"type":        "int",
+				"hint":        "Only valid when Slack connection mode is `webhook`.",
+				"condition": map[string]interface{}{
+					"slack_connection_mode": "webhook",
+					"unified_webhook_mode":  false,
+				},
+			},
+			"slack_webhook_path": map[string]interface{}{
+				"description": "Slack Webhook Path",
+				"type":        "string",
+				"hint":        "Only valid when Slack connection mode is `webhook`.",
+				"condition": map[string]interface{}{
+					"slack_connection_mode": "webhook",
+					"unified_webhook_mode":  false,
+				},
+			},
+			"corpid": map[string]interface{}{
+				"description": "企业 ID",
+				"type":        "string",
+				"hint":        "必填项。企业微信管理后台「我的企业」中的企业 ID（CorpID）。",
+			},
+			"token": map[string]interface{}{
+				"description": "回调 Token",
+				"type":        "string",
+				"hint":        "必填项。企业微信应用回调配置中的 Token。",
+			},
+			"encoding_aes_key": map[string]interface{}{
+				"description": "EncodingAESKey",
+				"type":        "string",
+				"hint":        "必填项。企业微信应用回调配置中的 EncodingAESKey，用于消息加解密。",
+			},
+			"kf_name": map[string]interface{}{
+				"description": "微信客服名称",
+				"type":        "string",
+				"hint":        "可选。填写后启用微信客服模式，使用客服帐号接收与发送消息。",
+			},
+			"api_base_url": map[string]interface{}{
+				"description": "企业微信 API 基础地址",
+				"type":        "string",
+				"hint":        "默认 https://qyapi.weixin.qq.com/cgi-bin/。",
+			},
+			"callback_server_host": map[string]interface{}{
+				"description": "回调服务器主机",
+				"type":        "string",
+				"hint":        "回调服务器主机。统一 Webhook 模式下无需填写。",
+				"condition": map[string]interface{}{
+					"unified_webhook_mode": false,
+				},
+			},
+			"port": map[string]interface{}{
+				"description": "回调服务器端口",
+				"type":        "int",
+				"hint":        "回调服务器端口。统一 Webhook 模式下无需填写。",
+				"condition": map[string]interface{}{
+					"unified_webhook_mode": false,
+				},
+			},
+			"wecom_ai_bot_name": map[string]interface{}{
+				"description": "企业微信智能机器人的名字",
+				"type":        "string",
+				"hint":        "请务必填写正确，否则无法使用一些指令。",
+			},
+			"wecom_ai_bot_connection_mode": map[string]interface{}{
+				"description": "企业微信智能机器人连接模式",
+				"type":        "string",
+				"options":     []string{"webhook", "long_connection"},
+				"labels":      []string{"Webhook 回调", "长连接"},
+				"hint":        "Webhook 回调模式需要配置 Token/EncodingAESKey。长连接模式需要配置 BotID/Secret。",
+			},
+			"wecomaibot_init_respond_text": map[string]interface{}{
+				"description": "企业微信智能机器人初始响应文本",
+				"type":        "string",
+				"hint":        "当机器人收到消息时，首先回复的文本内容。留空则不设置。",
+			},
+			"wecomaibot_friend_message_welcome_text": map[string]interface{}{
+				"description": "企业微信智能机器人私聊欢迎语",
+				"type":        "string",
+				"hint":        "当用户当天进入智能机器人单聊会话，回复欢迎语，留空则不回复。",
+			},
+			"wecomaibot_token": map[string]interface{}{
+				"description": "企业微信智能机器人 Token",
+				"type":        "string",
+				"hint":        "用于 Webhook 回调模式的身份验证。",
+				"condition": map[string]interface{}{
+					"wecom_ai_bot_connection_mode": "webhook",
+				},
+			},
+			"wecomaibot_encoding_aes_key": map[string]interface{}{
+				"description": "企业微信智能机器人 EncodingAESKey",
+				"type":        "string",
+				"hint":        "用于 Webhook 回调模式的消息加密解密。",
+				"condition": map[string]interface{}{
+					"wecom_ai_bot_connection_mode": "webhook",
+				},
+			},
+			"msg_push_webhook_url": map[string]interface{}{
+				"description": "企业微信消息推送 Webhook URL",
+				"type":        "string",
+				"hint":        "用于 send_by_session 主动消息推送。格式示例: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx",
+			},
+			"only_use_webhook_url_to_send": map[string]interface{}{
+				"description": "仅使用 Webhook 发送消息",
+				"type":        "bool",
+				"hint":        "启用后，企业微信智能机器人的所有回复都改为通过消息推送 Webhook 发送。消息推送 Webhook 支持更多的消息类型（如图片、文件等）。",
+			},
+			"wecomaibot_ws_bot_id": map[string]interface{}{
+				"description": "长连接 BotID",
+				"type":        "string",
+				"hint":        "企业微信智能机器人长连接模式凭证 BotID。",
+				"condition": map[string]interface{}{
+					"wecom_ai_bot_connection_mode": "long_connection",
+				},
+			},
+			"wecomaibot_ws_secret": map[string]interface{}{
+				"description": "长连接 Secret",
+				"type":        "string",
+				"hint":        "企业微信智能机器人长连接模式凭证 Secret。",
+				"condition": map[string]interface{}{
+					"wecom_ai_bot_connection_mode": "long_connection",
+				},
+			},
+			"wecomaibot_ws_url": map[string]interface{}{
+				"description": "长连接 WebSocket 地址",
+				"type":        "string",
+				"invisible":   true,
+				"hint":        "默认值为 wss://openws.work.weixin.qq.com，一般无需修改。",
+				"condition": map[string]interface{}{
+					"wecom_ai_bot_connection_mode": "long_connection",
+				},
+			},
+			"wecomaibot_heartbeat_interval": map[string]interface{}{
+				"description": "长连接心跳间隔",
+				"type":        "int",
+				"invisible":   true,
+				"hint":        "长连接模式心跳间隔（秒），建议 30 秒。",
+				"condition": map[string]interface{}{
+					"wecom_ai_bot_connection_mode": "long_connection",
+				},
+			},
+			"satori_api_base_url": map[string]interface{}{
+				"description": "Satori API 终结点",
+				"type":        "string",
+				"hint":        "Satori API 的基础地址。",
+			},
+			"satori_endpoint": map[string]interface{}{
+				"description": "Satori WebSocket 终结点",
+				"type":        "string",
+				"hint":        "Satori 事件的 WebSocket 端点。",
+			},
+			"satori_token": map[string]interface{}{
+				"description": "Satori 令牌",
+				"type":        "string",
+				"hint":        "用于 Satori API 身份验证的令牌。",
+			},
+			"satori_auto_reconnect": map[string]interface{}{
+				"description": "启用自动重连",
+				"type":        "bool",
+				"hint":        "断开连接时是否自动重新连接 WebSocket。",
+			},
+			"satori_heartbeat_interval": map[string]interface{}{
+				"description": "Satori 心跳间隔",
+				"type":        "int",
+				"hint":        "发送心跳消息的间隔（秒）。",
+			},
+			"satori_reconnect_delay": map[string]interface{}{
+				"description": "Satori 重连延迟",
+				"type":        "int",
+				"hint":        "尝试重新连接前的延迟时间（秒）。",
+			},
+			"kook_bot_token": map[string]interface{}{
+				"description": "机器人 Token",
+				"type":        "string",
+				"hint":        "必填项。从 KOOK 开发者平台获取的机器人 Token。",
+			},
+			"kook_reconnect_delay": map[string]interface{}{
+				"description": "重连延迟",
+				"type":        "int",
+				"hint":        "重连延迟时间（秒），使用指数退避策略。",
+			},
+			"kook_max_reconnect_delay": map[string]interface{}{
+				"description": "最大重连延迟",
+				"type":        "int",
+				"hint":        "重连延迟的最大值（秒）。",
+			},
+			"kook_max_retry_delay": map[string]interface{}{
+				"description": "最大重试延迟",
+				"type":        "int",
+				"hint":        "重试的最大延迟时间（秒）。",
+			},
+			"kook_heartbeat_interval": map[string]interface{}{
+				"description": "心跳间隔",
+				"type":        "int",
+				"hint":        "心跳检测间隔时间（秒）。",
+			},
+			"kook_heartbeat_timeout": map[string]interface{}{
+				"description": "心跳超时时间",
+				"type":        "int",
+				"hint":        "心跳检测超时时间（秒）。",
+			},
+			"kook_max_heartbeat_failures": map[string]interface{}{
+				"description": "最大心跳失败次数",
+				"type":        "int",
+				"hint":        "允许的最大心跳失败次数，超过后断开连接。",
+			},
+			"kook_max_consecutive_failures": map[string]interface{}{
+				"description": "最大连续失败次数",
+				"type":        "int",
+				"hint":        "允许的最大连续失败次数，超过后停止重试。",
+			},
+			"client_id": map[string]interface{}{
+				"description": "Client ID",
+				"type":        "string",
+				"hint":        "必填项。钉钉开放平台应用的 Client ID（AppKey）。",
+			},
+			"client_secret": map[string]interface{}{
+				"description": "Client Secret",
+				"type":        "string",
+				"hint":        "必填项。钉钉开放平台应用的 Client Secret（AppSecret）。",
+			},
+			"card_template_id": map[string]interface{}{
+				"description": "卡片模板 ID",
+				"type":        "string",
+				"hint":        "可选。钉钉互动卡片模板 ID。启用后将使用互动卡片进行流式回复。",
+			},
+			"weixin_oc_base_url": map[string]interface{}{
+				"description": "开放平台基础地址",
+				"type":        "string",
+				"hint":        "默认 https://ilinkai.weixin.qq.com",
+			},
+			"weixin_oc_cdn_base_url": map[string]interface{}{
+				"description": "CDN 基础地址",
+				"type":        "string",
+				"hint":        "默认 https://cdn.wx.qq.com",
+			},
+			"weixin_oc_bot_type": map[string]interface{}{
+				"description": "机器人类型",
+				"type":        "string",
+				"hint":        "默认 3（开放平台机器人）。",
+			},
+			"weixin_oc_qr_poll_interval": map[string]interface{}{
+				"description": "二维码轮询间隔（秒）",
+				"type":        "int",
+			},
+			"weixin_oc_long_poll_timeout_ms": map[string]interface{}{
+				"description": "长轮询超时（毫秒）",
+				"type":        "int",
+			},
+			"weixin_oc_api_timeout_ms": map[string]interface{}{
+				"description": "API 超时（毫秒）",
+				"type":        "int",
+			},
+			"unified_webhook_mode": map[string]interface{}{
+				"description": "统一 Webhook 模式",
+				"type":        "bool",
+				"hint":        "启用后使用 AstrBot 统一 Webhook 入口。",
+			},
+			"active_send_mode": map[string]interface{}{
+				"description": "主动发送模式",
+				"type":        "bool",
+				"hint":        "启用后回调直接调用客服消息接口回复（否则走被动回复）。",
 			},
 		},
 	}
@@ -1065,8 +1654,48 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 			}))
 		}
 	case "stats":
+		// Bot stats: list the enabled platform instances with their metadata
+		// (mirrors Python BotConfigService.get_bot_stats ->
+		// PlatformManager.get_all_stats). The CronJob "未来计划" page filters
+		// meta.support_proactive_message to pick delivery targets.
+		statsList := make([]interface{}, 0, 4)
+		for _, b := range s.getBotList() {
+			pc, ok := b.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			enabled, _ := pc["enable"].(bool)
+			id, _ := pc["id"].(string)
+			ptype, _ := pc["type"].(string)
+			if id == "" {
+				id = ptype
+			}
+			meta := map[string]interface{}{
+				"id":                         id,
+				"name":                       ptype,
+				"display_name":               platformDisplayName(ptype),
+				"support_streaming_message":  true,
+				"support_proactive_message":  true,
+			}
+			statsList = append(statsList, map[string]interface{}{
+				"id":              id,
+				"type":            ptype,
+				"display_name":    platformDisplayName(ptype),
+				"status":          map[bool]string{true: "running", false: "stopped"}[enabled],
+				"error_count":     0,
+				"last_error":      nil,
+				"unified_webhook": false,
+				"meta":            meta,
+			})
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"platforms": []interface{}{},
+			"platforms": statsList,
+			"summary": map[string]interface{}{
+				"total":        len(statsList),
+				"running":      countEnabledBots(s.getBotList()),
+				"error":        0,
+				"total_errors": 0,
+			},
 		}))
 	case "create":
 		if r.Method == http.MethodPost {
@@ -2834,10 +3463,10 @@ func (s *Server) sessionGroupMap(g map[string]interface{}, id string) map[string
 	name, _ := g["name"].(string)
 	umos, _ := g["umos"].([]interface{})
 	return map[string]interface{}{
-		"id":         id,
-		"name":       name,
-		"umos":       umos,
-		"umo_count":  len(umos),
+		"id":        id,
+		"name":      name,
+		"umos":      umos,
+		"umo_count": len(umos),
 	}
 }
 
@@ -2966,8 +3595,8 @@ func (s *Server) handleSessionRules(w http.ResponseWriter, r *http.Request, part
 	}
 	if r.Method == http.MethodPost {
 		var body struct {
-			UMO      string      `json:"umo"`
-			RuleKey  string      `json:"rule_key"`
+			UMO       string      `json:"umo"`
+			RuleKey   string      `json:"rule_key"`
 			RuleValue interface{} `json:"rule_value"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -3985,6 +4614,10 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request, parts []stri
 		entries := log.GetDefault().History()
 		logs := make([]interface{}, 0, len(entries))
 		for _, entry := range entries {
+			if entry.IsTrace() {
+				logs = append(logs, entry.Trace)
+				continue
+			}
 			logs = append(logs, map[string]interface{}{
 				"level":    sseLogLevel(entry.Level),
 				"time":     float64(entry.Timestamp.UnixMilli()) / 1000.0,
@@ -4026,12 +4659,17 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 			if !more {
 				return
 			}
-			payload := map[string]interface{}{
-				"type":     "log",
-				"level":    sseLogLevel(entry.Level),
-				"time":     float64(entry.Timestamp.UnixMilli()) / 1000.0,
-				"data":     sseLogLine(entry),
-				"category": "system",
+			var payload map[string]interface{}
+			if entry.IsTrace() {
+				payload = entry.Trace
+			} else {
+				payload = map[string]interface{}{
+					"type":     "log",
+					"level":    sseLogLevel(entry.Level),
+					"time":     float64(entry.Timestamp.UnixMilli()) / 1000.0,
+					"data":     sseLogLine(entry),
+					"category": "system",
+				}
 			}
 			data, _ := json.Marshal(payload)
 			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", entry.Timestamp.UnixMilli(), data)
@@ -5031,17 +5669,6 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "webchat",
-			"id":                        "webchat",
-			"description":               "内置 WebChat 适配器",
-			"display_name":              "WebChat",
-			"support_streaming_message": true,
-			"support_proactive_message": true,
-			"default_config": map[string]interface{}{
-				"id": "default", "type": "webchat", "enable": false,
-			},
-		},
-		map[string]interface{}{
 			"type":                      "telegram",
 			"id":                        "telegram",
 			"description":               "Telegram Bot 适配器",
@@ -5080,8 +5707,39 @@ func (s *Server) handleBotRegistration(w http.ResponseWriter, r *http.Request, b
 			return
 		}
 		writeJSON(w, http.StatusOK, apiOK(result))
-	case "lark", "weixin_oc", "dingtalk":
-		writeJSON(w, http.StatusOK, apiError(botType+" 一键注册尚未实现"))
+	case "weixin_oc":
+		result, err := s.weixinOCRegistration(action, body.PlatformConfig, body.RegistrationCode)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(result))
+	case "lark":
+		domain := ""
+		if v, ok := body.PlatformConfig["domain"].(string); ok {
+			domain = v
+		}
+		deviceCode := body.RegistrationCode
+		if deviceCode == "" {
+			deviceCode = body.TaskID
+		}
+		result, err := s.larkRegistration(action, domain, deviceCode)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(result))
+	case "dingtalk":
+		deviceCode := body.RegistrationCode
+		if deviceCode == "" {
+			deviceCode = body.TaskID
+		}
+		result, err := s.dingtalkRegistration(action, deviceCode)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(result))
 	default:
 		writeJSON(w, http.StatusOK, apiError("Unsupported platform registration: "+botType))
 	}
@@ -5893,21 +6551,34 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request, parts []str
 	}
 	switch sub {
 	case "", "settings":
-		if r.Method == http.MethodPut {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"settings": map[string]interface{}{
-					"enabled": false,
-					"level":   "info",
-				},
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"settings": map[string]interface{}{
-					"enabled": false,
-					"level":   "info",
-				},
-			}))
+		cfg := s.getConfigData("default")
+		traceEnabled := true
+		if cfg != nil {
+			if v, ok := cfg["trace_enable"].(bool); ok {
+				traceEnabled = v
+			}
 		}
+		if r.Method == http.MethodPut {
+			var body struct {
+				TraceEnable *bool `json:"trace_enable"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.TraceEnable != nil {
+				if err := s.setConfigData("trace_enable", *body.TraceEnable); err != nil {
+					writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+					return
+				}
+				traceEnabled = *body.TraceEnable
+				if traceEnabled {
+					logger.I18nInfo("追踪(trace)记录已开启")
+				} else {
+					logger.I18nInfo("追踪(trace)记录已关闭")
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"trace_enable": traceEnabled,
+		}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
@@ -5974,4 +6645,45 @@ func sanitizeSkillDirName(name string) string {
 		}
 	}
 	return sb.String()
+}
+
+// platformDisplayName returns a human-friendly name for a platform type.
+func platformDisplayName(ptype string) string {
+	names := map[string]string{
+		"aiocqhttp":               "OneBot v11",
+		"qq_official":             "QQ 官方机器人",
+		"qq_official_webhook":     "QQ 官方机器人(Webhook)",
+		"lark":                    "飞书(Lark)",
+		"dingtalk":                "钉钉(DingTalk)",
+		"discord":                 "Discord",
+		"telegram":                "Telegram",
+		"slack":                   "Slack",
+		"kook":                    "KOOK",
+		"satori":                  "Satori",
+		"misskey":                 "Misskey",
+		"line":                    "LINE",
+		"mattermost":              "Mattermost",
+		"wecom":                   "企业微信",
+		"wecom_ai_bot":            "企业微信智能机器人",
+		"weixin_oc":               "微信开放平台",
+		"weixin_official_account": "微信公众号",
+		"webchat":                 "WebChat",
+	}
+	if n, ok := names[ptype]; ok {
+		return n
+	}
+	return ptype
+}
+
+// countEnabledBots returns how many configured platforms are enabled.
+func countEnabledBots(platforms []interface{}) int {
+	n := 0
+	for _, b := range platforms {
+		if pc, ok := b.(map[string]interface{}); ok {
+			if enabled, ok := pc["enable"].(bool); ok && enabled {
+				n++
+			}
+		}
+	}
+	return n
 }
