@@ -57,22 +57,21 @@ func (s *TEIRerankSource) Rerank(ctx context.Context, query string, documents []
 	if topN > 0 {
 		payload["top_n"] = topN
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
-	}
+	bodyBytes, _ := json.Marshal(payload)
 
 	url := s.baseURL + "/rerank"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if s.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+s.apiKey)
-	}
-
-	resp, err := s.client.Do(req)
+	cfg := RetryConfigFromSettings(s.Settings())
+	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if s.apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		}
+		return req, nil
+	}, cfg, "Rerank-TEI")
 	if err != nil {
 		return nil, err
 	}

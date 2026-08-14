@@ -63,20 +63,19 @@ func (s *OpenAITTSSource) GetAudio(ctx context.Context, text string) (string, er
 		"input":           text,
 		"response_format": "wav",
 	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return "", err
-	}
+	payloadBytes, _ := json.Marshal(body)
 
 	url := s.apiBase + "/audio/speech"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-
-	resp, err := s.client.Do(req)
+	cfg := RetryConfigFromSettings(s.Settings())
+	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payloadBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		return req, nil
+	}, cfg, "TTS-OpenAI")
 	if err != nil {
 		return "", err
 	}
@@ -113,7 +112,15 @@ func (s *OpenAITTSSource) Test(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-	resp, err := s.client.Do(req)
+	cfg := RetryConfigFromSettings(s.Settings())
+	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		return req, nil
+	}, cfg, "TTS-OpenAI")
 	if err != nil {
 		return err
 	}

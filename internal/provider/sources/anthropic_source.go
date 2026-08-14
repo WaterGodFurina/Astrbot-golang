@@ -47,29 +47,37 @@ func NewAnthropicSource(config, settings map[string]interface{}) *AnthropicSourc
 	return s
 }
 
+// doRequest sends an HTTP request with retry logic.
+func (s *AnthropicSource) doRequest(ctx context.Context, body map[string]interface{}) (*http.Response, error) {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal body: %w", err)
+	}
+	url := fmt.Sprintf("%s/messages", s.apiBase)
+	msgs, _ := body["messages"].([]map[string]interface{})
+	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
+	cfg := RetryConfigFromSettings(s.Settings())
+	return DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-api-key", s.apiKey)
+		httpReq.Header.Set("anthropic-version", "2023-06-01")
+		return httpReq, nil
+	}, cfg, "Anthropic")
+}
+
 // TextChat sends a non-streaming chat request.
 func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRequest) (*provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, false)
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	url := fmt.Sprintf("%s/messages", s.apiBase)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", s.apiKey)
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	msgs, _ := body["messages"].([]map[string]interface{})
-	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
-	resp, err := s.client.Do(httpReq)
+	resp, err := s.doRequest(ctx, body)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		return &provider.LLMResponse{
 			Role:           "err",
@@ -110,25 +118,11 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 // TextChatStream sends a streaming chat request (SSE).
 func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.ProviderRequest) (<-chan *provider.LLMResponse, error) {
 	body := s.buildRequestBody(req, true)
-	jsonBody, err := json.Marshal(body)
+	resp, err := s.doRequest(ctx, body)
 	if err != nil {
 		return nil, err
 	}
-	url := fmt.Sprintf("%s/messages", s.apiBase)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", s.apiKey)
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	msgs, _ := body["messages"].([]map[string]interface{})
-	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
-	resp, err := s.client.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))

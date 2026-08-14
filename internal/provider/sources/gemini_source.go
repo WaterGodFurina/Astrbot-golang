@@ -47,6 +47,16 @@ func NewGeminiSource(config, settings map[string]interface{}) *GeminiSource {
 	return s
 }
 
+// doRequest sends an HTTP request with retry logic.
+func (s *GeminiSource) doRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
+	cfg := RetryConfigFromSettings(s.Settings())
+	return DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		// Clone the request to get a fresh body for each retry attempt.
+		clone := req.Clone(ctx)
+		return clone, nil
+	}, cfg, "Gemini")
+}
+
 // TextChat sends a non-streaming chat request.
 func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderRequest) (*provider.LLMResponse, error) {
 	model := s.GetModel()
@@ -66,12 +76,12 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 	httpReq.Header.Set("Content-Type", "application/json")
 	contents, _ := body["contents"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, model, len(contents))
-	resp, err := s.client.Do(httpReq)
+	resp, err := s.doRequest(ctx, httpReq)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		return &provider.LLMResponse{
 			Role:           "err",
@@ -131,9 +141,14 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 	httpReq.Header.Set("Content-Type", "application/json")
 	contents, _ := body["contents"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, model, len(contents))
-	resp, err := s.client.Do(httpReq)
+	resp, err := s.doRequest(ctx, httpReq)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 	ch := make(chan *provider.LLMResponse, 100)
 	go func() {

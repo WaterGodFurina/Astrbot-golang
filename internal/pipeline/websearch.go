@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider/sources"
 )
 
 // httpJSON performs a JSON HTTP request and returns the body bytes.
@@ -33,7 +35,12 @@ func httpJSON(method, url string, headers map[string]string, payload interface{}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	cfg := sources.DefaultRetryConfig()
+	resp, err := sources.DoWithRetry(ctx, http.DefaultClient, func() (*http.Request, error) {
+		// Clone the request to get a fresh body for each retry attempt.
+		clone := req.Clone(ctx)
+		return clone, nil
+	}, cfg, "WebSearch")
 	if err != nil {
 		return nil, 0, err
 	}

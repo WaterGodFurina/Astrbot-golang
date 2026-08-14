@@ -351,14 +351,17 @@ func (s *OpenAISource) doRequest(ctx context.Context, body map[string]interface{
 	url := fmt.Sprintf("%s/chat/completions", s.apiBase)
 	msgs, _ := body["messages"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
-	for k, v := range s.extraHeaders {
-		httpReq.Header.Set(k, v)
-	}
-	return s.client.Do(httpReq)
+	cfg := RetryConfigFromSettings(s.Settings())
+	return DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+		for k, v := range s.extraHeaders {
+			httpReq.Header.Set(k, v)
+		}
+		return httpReq, nil
+	}, cfg, "OpenAI")
 }

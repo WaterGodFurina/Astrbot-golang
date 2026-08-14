@@ -68,29 +68,35 @@ func (s *OpenAIWhisperSource) GetText(ctx context.Context, audioURL string) (str
 	}
 	defer file.Close()
 
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
-	_ = mw.WriteField("model", s.GetModel())
-	fw, err := mw.CreateFormFile("file", filepath.Base(path))
+	fileData, err := io.ReadAll(file)
 	if err != nil {
-		return "", err
-	}
-	if _, err := io.Copy(fw, file); err != nil {
-		return "", err
-	}
-	if err := mw.Close(); err != nil {
-		return "", err
+		return "", fmt.Errorf("read audio file: %w", err)
 	}
 
 	url := s.apiBase + "/audio/transcriptions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-
-	resp, err := s.client.Do(req)
+	cfg := RetryConfigFromSettings(s.Settings())
+	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		_ = mw.WriteField("model", s.GetModel())
+		fw, err := mw.CreateFormFile("file", filepath.Base(path))
+		if err != nil {
+			return nil, err
+		}
+		if _, err := fw.Write(fileData); err != nil {
+			return nil, err
+		}
+		if err := mw.Close(); err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		return req, nil
+	}, cfg, "STT-Whisper")
 	if err != nil {
 		return "", err
 	}
@@ -121,13 +127,17 @@ func (s *OpenAIWhisperSource) fetchAudio(ctx context.Context, audioURL string) (
 		return audioURL, noop, nil
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, audioURL, nil)
+	cfg := RetryConfigFromSettings(s.Settings())
+	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, audioURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		return req, nil
+	}, cfg, "STT-Whisper")
 	if err != nil {
 		return "", noop, err
-	}
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return "", noop, fmt.Errorf("download audio: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -162,7 +172,15 @@ func (s *OpenAIWhisperSource) Test(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-	resp, err := s.client.Do(req)
+	cfg := RetryConfigFromSettings(s.Settings())
+	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		return req, nil
+	}, cfg, "STT-Whisper")
 	if err != nil {
 		return err
 	}

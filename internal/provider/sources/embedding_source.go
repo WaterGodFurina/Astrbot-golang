@@ -75,20 +75,19 @@ func (s *OpenAIEmbeddingSource) embed(ctx context.Context, texts []string) ([][]
 	if s.dim > 0 {
 		body["dimensions"] = s.dim
 	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
+	payloadBytes, _ := json.Marshal(body)
 
 	url := s.apiBase + "/embeddings"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-
-	resp, err := s.client.Do(req)
+	cfg := RetryConfigFromSettings(s.Settings())
+	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payloadBytes))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		return req, nil
+	}, cfg, "Embedding")
 	if err != nil {
 		return nil, err
 	}
