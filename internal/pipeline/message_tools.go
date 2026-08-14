@@ -22,7 +22,7 @@ func sendMessageToolSchema() map[string]interface{} {
 					"messages": map[string]interface{}{
 						"type": "array",
 						"items": map[string]interface{}{
-							"type":       "object",
+							"type": "object",
 							"properties": map[string]interface{}{
 								"type":            map[string]interface{}{"type": "string", "enum": []interface{}{"plain", "image", "record", "video", "file", "mention_user"}},
 								"text":            map[string]interface{}{"type": "string", "description": "Text content (plain/record)."},

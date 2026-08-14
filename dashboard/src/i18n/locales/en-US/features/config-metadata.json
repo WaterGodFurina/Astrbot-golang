@@ -106,7 +106,8 @@
       "kb_agentic_mode": {
         "description": "Agentic Knowledge Base Retrieval",
         "hint": "When enabled, knowledge base retrieval becomes an LLM Tool, allowing the model to autonomously decide when to query the knowledge base. Requires the model to support function calling."
-      }
+      },
+      "hint": "AstrBot's \"external brain\"."
     },
     "websearch": {
       "description": "Web Search",
@@ -144,7 +145,8 @@
           "description": "Exa API Key",
           "hint": "Multiple keys can be added for rotation. Get a key at https://dashboard.exa.ai"
         }
-      }
+      },
+      "hint": "Lets AstrBot access the internet to stay up to date."
     },
     "file_extract": {
       "description": "File Extract",
@@ -844,7 +846,7 @@
         "baidu_aip": {
           "enable": {
             "description": "Use Baidu Content Safety Moderation",
-            "hint": "You need to manually install the baidu-aip library."
+            "hint": "Uses the official golang-sdk (github.com/Baidu-AIP/golang-sdk). This dependency is not bundled; install and rebuild yourself: `go get github.com/Baidu-AIP/golang-sdk` + `go build -tags baidu_aip`. If enabled without the SDK compiled in, an error is logged and messages pass through (fail-open)."
           },
           "app_id": {
             "description": "App ID"

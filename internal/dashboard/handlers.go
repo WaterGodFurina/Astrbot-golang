@@ -307,25 +307,25 @@ func (s *Server) injectPlatformSection(metadata *config.OrderedJSON) {
 			},
 			"微信开放平台(Weixin OC)": map[string]interface{}{
 				"id": "weixin_oc", "type": "weixin_oc", "enable": true,
-				"weixin_oc_base_url":              "https://ilinkai.weixin.qq.com",
-				"weixin_oc_cdn_base_url":          "https://cdn.wx.qq.com",
-				"weixin_oc_bot_type":              "3",
-				"weixin_oc_qr_poll_interval":      2,
-				"weixin_oc_long_poll_timeout_ms":  35000,
-				"weixin_oc_api_timeout_ms":        120000,
+				"weixin_oc_base_url":             "https://ilinkai.weixin.qq.com",
+				"weixin_oc_cdn_base_url":         "https://cdn.wx.qq.com",
+				"weixin_oc_bot_type":             "3",
+				"weixin_oc_qr_poll_interval":     2,
+				"weixin_oc_long_poll_timeout_ms": 35000,
+				"weixin_oc_api_timeout_ms":       120000,
 			},
 			"微信公众号": map[string]interface{}{
 				"id": "weixin_official_account", "type": "weixin_official_account", "enable": true,
-				"appid":               "",
-				"secret":              "",
-				"token":               "",
-				"encoding_aes_key":    "",
-				"api_base_url":        "https://api.weixin.qq.com/cgi-bin/",
+				"appid":                "",
+				"secret":               "",
+				"token":                "",
+				"encoding_aes_key":     "",
+				"api_base_url":         "https://api.weixin.qq.com/cgi-bin/",
 				"unified_webhook_mode": true,
-				"webhook_uuid":        "",
+				"webhook_uuid":         "",
 				"callback_server_host": "0.0.0.0",
-				"port":                6194,
-				"active_send_mode":    false,
+				"port":                 6194,
+				"active_send_mode":     false,
 			},
 			"Satori": map[string]interface{}{
 				"id": "satori", "type": "satori", "enable": true,
@@ -1671,11 +1671,11 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 				id = ptype
 			}
 			meta := map[string]interface{}{
-				"id":                         id,
-				"name":                       ptype,
-				"display_name":               platformDisplayName(ptype),
-				"support_streaming_message":  true,
-				"support_proactive_message":  true,
+				"id":                        id,
+				"name":                      ptype,
+				"display_name":              platformDisplayName(ptype),
+				"support_streaming_message": true,
+				"support_proactive_message": true,
 			}
 			statsList = append(statsList, map[string]interface{}{
 				"id":              id,
@@ -5141,6 +5141,40 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 
 // ── Update handlers ──────────────────────────────────────────
 
+// installGoPackage runs `go install <pkg>` via the plugin Go toolchain — the
+// Go equivalent of pip install. Body: {"package": "...", "mirror": "..."}
+// where mirror is an optional GOPROXY override.
+func (s *Server) installGoPackage(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Package string `json:"package"`
+		Mirror  string `json:"mirror"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if s.subPluginMgr == nil {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"status":  "error",
+			"message": "插件运行时不可用",
+		}))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
+	defer cancel()
+	out, err := s.subPluginMgr.GoInstall(ctx, body.Package, body.Mirror)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"status":  "error",
+			"message": "安装失败: " + err.Error(),
+			"output":  out,
+		}))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"status":  "ok",
+		"message": "安装成功: " + body.Package,
+		"output":  out,
+	}))
+}
+
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
 	if len(parts) > 0 {
@@ -5165,9 +5199,8 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []st
 			"message": "update not supported in Go version",
 		}))
 	case "pip-install":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "pip install not applicable in Go version",
-		}))
+		// Go 版：用 go install 安装 Go 库（原 Python 的 pip install）。
+		s.installGoPackage(w, r)
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
@@ -6459,62 +6492,7 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 		}))
 	case "by-id":
 		if len(parts) > 1 {
-			convID := parts[1]
-			if len(parts) > 2 && parts[2] == "messages" {
-				if r.Method == http.MethodPut {
-					var body struct {
-						History []map[string]interface{} `json:"history"`
-					}
-					_ = json.NewDecoder(r.Body).Decode(&body)
-					if s.conversationUpdateByCID(convID, map[string]interface{}{"history": body.History}) {
-						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-							"message": "conversation " + convID + " messages updated",
-						}))
-					} else {
-						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
-							"message": "conversation not found",
-						}))
-					}
-				} else {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-				}
-			} else {
-				switch r.Method {
-				case http.MethodGet:
-					detail := s.getConversationDetail(convID)
-					if detail == nil {
-						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
-							"message": "conversation not found",
-						}))
-						return
-					}
-					writeJSON(w, http.StatusOK, apiOK(detail))
-				case http.MethodPatch:
-					var body map[string]interface{}
-					_ = json.NewDecoder(r.Body).Decode(&body)
-					if s.conversationUpdateByCID(convID, body) {
-						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-							"message": "conversation " + convID + " updated",
-						}))
-					} else {
-						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
-							"message": "conversation not found",
-						}))
-					}
-				case http.MethodDelete:
-					if s.conversationDeleteByCID(convID) {
-						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-							"message": "conversation " + convID + " deleted",
-						}))
-					} else {
-						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
-							"message": "conversation not found",
-						}))
-					}
-				default:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-				}
-			}
+			s.handleConversationByID(w, r, parts[1], parts[2:])
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		}
@@ -6537,6 +6515,74 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"data": []interface{}{},
 		}))
+	default:
+		// Direct conversation-id form (matches the OpenAPI generated client):
+		// /conversations/{conversation_id} and
+		// /conversations/{conversation_id}/messages.
+		if sub == "" {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		s.handleConversationByID(w, r, sub, parts[1:])
+	}
+}
+
+// handleConversationByID serves a single conversation by its id, optionally
+// with a "/messages" sub-path (PUT to replace history). Shared by the legacy
+// "/by-id/{id}" form and the direct "/{id}" form.
+func (s *Server) handleConversationByID(w http.ResponseWriter, r *http.Request, convID string, rest []string) {
+	if len(rest) > 0 && rest[0] == "messages" {
+		if r.Method == http.MethodPut {
+			var body struct {
+				History []map[string]interface{} `json:"history"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if s.conversationUpdateByCID(convID, map[string]interface{}{"history": body.History}) {
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"message": "conversation " + convID + " messages updated",
+				}))
+			} else {
+				writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+					"message": "conversation not found",
+				}))
+			}
+		} else {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		}
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		detail := s.getConversationDetail(convID)
+		if detail == nil {
+			writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+				"message": "conversation not found",
+			}))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(detail))
+	case http.MethodPatch:
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if s.conversationUpdateByCID(convID, body) {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"message": "conversation " + convID + " updated",
+			}))
+		} else {
+			writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+				"message": "conversation not found",
+			}))
+		}
+	case http.MethodDelete:
+		if s.conversationDeleteByCID(convID) {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"message": "conversation " + convID + " deleted",
+			}))
+		} else {
+			writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
+				"message": "conversation not found",
+			}))
+		}
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}

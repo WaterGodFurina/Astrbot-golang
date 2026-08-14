@@ -166,11 +166,9 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		// Short token redirect endpoint
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 
-	// ── Pip install (stub) ───────────────────────────────
+	// ── Go package install (Go 版的 pip install) ─────────
 	case "pip":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"status": "not_supported",
-		}))
+		s.installGoPackage(w, r)
 
 	default:
 		writeJSON(w, http.StatusNotFound, apiError("unknown endpoint: /api/"+category))

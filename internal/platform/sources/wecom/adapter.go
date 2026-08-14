@@ -59,10 +59,10 @@ type Adapter struct {
 	crypto *WXBizMsgCrypt
 	server *WecomServer
 
-	mu          sync.Mutex
-	agentID     string // 最近一次收到的消息的 AgentID（用于回复）
-	seenKFText  map[string]time.Time
-	stopCh      chan struct{}
+	mu         sync.Mutex
+	agentID    string // 最近一次收到的消息的 AgentID（用于回复）
+	seenKFText map[string]time.Time
+	stopCh     chan struct{}
 }
 
 // New 构造企业微信适配器。

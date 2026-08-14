@@ -13,9 +13,9 @@ var defaultSegRegex = regexp.MustCompile(`.*?[。？！~…]+|.+$`)
 
 // segPlatformBlacklist mirrors the Python platforms that never segment.
 var segPlatformBlacklist = map[string]bool{
-	"qq_official_webhook":    true,
+	"qq_official_webhook":     true,
 	"weixin_official_account": true,
-	"dingtalk":               true,
+	"dingtalk":                true,
 }
 
 // isSegmentedReplyPlatform reports whether the platform supports segmented

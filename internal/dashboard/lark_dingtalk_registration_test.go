@@ -156,10 +156,10 @@ func larkStartWithEndpoint(endpoint string) (map[string]interface{}, error) {
 	return map[string]interface{}{
 		"status": "pending", "device_code": larkRegStringField(data, "device_code"),
 		"registration_code": larkRegStringField(data, "device_code"), "user_code": userCode,
-		"verification_uri": larkRegStringField(data, "verification_uri"),
+		"verification_uri":          larkRegStringField(data, "verification_uri"),
 		"verification_uri_complete": verificationURIComplete,
-		"expires_in": larkRegIntField(data, "expires_in", 300),
-		"interval":   larkRegIntField(data, "interval", 5),
+		"expires_in":                larkRegIntField(data, "expires_in", 300),
+		"interval":                  larkRegIntField(data, "interval", 5),
 	}, nil
 }
 

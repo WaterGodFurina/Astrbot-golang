@@ -110,7 +110,7 @@ func reply(e *core.Event, text string) {
 
 func helpCmd(deps Deps, e *core.Event) {
 	lines := []string{
-		i18n.Get("AstrBot v%s(WebUI: 0.1.0-go)", version),
+		i18n.Get("AstrBot v%s(WebUI: 1.0.0-go)", version),
 		i18n.Get("/help - 显示帮助"),
 		i18n.Get("/sid - 获取会话 ID 信息"),
 		i18n.Get("/reset - 重置 LLM 会话"),
@@ -132,12 +132,12 @@ func helpCmd(deps Deps, e *core.Event) {
 func sidCmd(e *core.Event) {
 	umo := e.UnifiedMsgOrigin()
 	uid := e.Source.SenderID
-	ret := fmt.Sprintf(
-		"UMO: 「%s」\nUID: 「%s」\n*Use UMO to set whitelist and configure routing, use UID to set admin list\n\nYour session information:\nBot ID: 「%s」\nMessage Type: 「%s」\nSession ID: 「%s」",
+	ret := i18n.Get(
+		"UMO: 「%s」\nUID: 「%s」\n*使用 UMO 设置白名单与路由，使用 UID 设置管理员列表\n\n您的会话信息:\nBot ID: 「%s」\nMessage Type: 「%s」\nSession ID: 「%s」",
 		umo, uid, e.Source.Platform, e.Source.ConvID, e.Source.ConvID,
 	)
 	if e.Source.IsGroup {
-		ret += fmt.Sprintf("\n\nThe group's ID: 「%s」. Set this ID to whitelist to allow the entire group.", e.Source.ConvID)
+		ret += i18n.Get("\n\n群号: 「%s」。将此 ID 加入白名单可放行整个群。", e.Source.ConvID)
 	}
 	reply(e, ret)
 }

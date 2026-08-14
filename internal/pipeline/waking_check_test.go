@@ -269,3 +269,42 @@ func TestFindMatchingHandlersDisableBuiltin(t *testing.T) {
 		t.Error("plugin handler must still match")
 	}
 }
+
+// TestWakingCheckAdminRole: senders listed in config "admins_id" get
+// event.Role="admin" (so admin-gated commands like /provider respond); everyone
+// else is "member". Mirrors astrbot/core/pipeline/waking_check/stage.py.
+func TestWakingCheckAdminRole(t *testing.T) {
+	s := NewWakingCheckStage()
+	if err := s.Initialize(&PipelineContext{
+		AstrbotConfig: map[string]interface{}{
+			"wake_prefix": []interface{}{"/"},
+			"admins_id":   []interface{}{"astrbot", "u-admin"},
+		},
+	}); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+
+	admin := wakeEvent("/provider", true, "bot", []message.Component{&message.Plain{Text: "/provider"}})
+	admin.Source.SenderID = "u-admin"
+	if _, err := s.Process(context.Background(), admin); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if admin.Role != "admin" {
+		t.Errorf("sender in admins_id: want role admin, got %q", admin.Role)
+	}
+	if !admin.Source.IsAdmin {
+		t.Error("Source.IsAdmin should be true for an admin sender")
+	}
+
+	normal := wakeEvent("/provider", true, "bot", []message.Component{&message.Plain{Text: "/provider"}})
+	normal.Source.SenderID = "u-normal"
+	if _, err := s.Process(context.Background(), normal); err != nil {
+		t.Fatalf("Process: %v", err)
+	}
+	if normal.Role != "member" {
+		t.Errorf("non-admin sender: want role member, got %q", normal.Role)
+	}
+	if normal.Source.IsAdmin {
+		t.Error("Source.IsAdmin should be false for a normal sender")
+	}
+}

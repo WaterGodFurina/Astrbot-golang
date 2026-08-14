@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	wxmp "github.com/blusewang/wx/mp_api"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	wxmp "github.com/blusewang/wx/mp_api"
 )
 
 func sigOf(parts ...string) string {

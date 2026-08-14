@@ -3,10 +3,10 @@ package discord
 import (
 	"testing"
 
-	"github.com/bwmarrin/discordgo"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	"github.com/bwmarrin/discordgo"
 )
 
 // TestConvertMessage: user mention is stripped and attachments become components.

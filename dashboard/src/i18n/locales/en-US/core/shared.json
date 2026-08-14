@@ -60,7 +60,8 @@
     "confirmSelection": "Confirm Selection",
     "selectPersonaPool": "Select Persona Pool...",
     "rootFolder": "All Personas",
-    "emptyFolder": "This folder is empty"
+    "emptyFolder": "This folder is empty",
+    "editPersona": "Edit current persona"
   },
   "personaQuickPreview": {
     "title": "Persona Capabilities",

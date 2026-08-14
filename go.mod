@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.0.2
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.1.0
 	github.com/blusewang/wx v1.3.3
 	github.com/bwmarrin/discordgo v0.25.1
 	github.com/dobest1024/go-weixin-ilink v0.2.0

@@ -190,13 +190,13 @@ type EventBus struct {
 	// queue is a growable slice guarded by queueMu. It replaces the previous
 	// fixed-capacity channel: Publish never drops events (it blocks once the
 	// queue reaches maxQueueCap) and the queue auto-grows under bursts.
-	queueMu   sync.Mutex
-	cond      *sync.Cond
-	queue     []*Event
-	queueCap  int
-	stopCh    chan struct{}
-	done      chan struct{} // closed when the dispatch loop exits
-	stopOnce  sync.Once     // 保证 stopCh 只 close 一次（Stop 可被重复调用）
+	queueMu  sync.Mutex
+	cond     *sync.Cond
+	queue    []*Event
+	queueCap int
+	stopCh   chan struct{}
+	done     chan struct{} // closed when the dispatch loop exits
+	stopOnce sync.Once     // 保证 stopCh 只 close 一次（Stop 可被重复调用）
 }
 
 // maxQueueCap bounds how large the event queue may grow before Publish blocks.

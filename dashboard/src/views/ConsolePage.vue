@@ -35,23 +35,23 @@ const { tm } = useModuleI18n('features/console');
           color="primary"
           style="margin-right: 16px;"
         ></v-switch>
-        <v-dialog v-model="pipDialog" width="400">
+        <v-dialog v-model="goInstallDialog" width="400">
           <template v-slot:activator="{ props }">
-            <v-btn variant="text" v-bind="props">{{ tm('pipInstall.button') }}</v-btn>
+            <v-btn variant="text" v-bind="props">{{ tm('goInstall.button') }}</v-btn>
           </template>
           <v-card>
             <v-card-title class="text-h3 pa-4 pb-0 pl-6">
-              <span>{{ tm('pipInstall.dialogTitle') }}</span>
+              <span>{{ tm('goInstall.dialogTitle') }}</span>
             </v-card-title>
             <v-card-text>
-              <v-text-field v-model="pipInstallPayload.package" :label="tm('pipInstall.packageLabel')" variant="outlined"></v-text-field>
-              <v-text-field v-model="pipInstallPayload.mirror" :label="tm('pipInstall.mirrorLabel')" variant="outlined"></v-text-field>
-              <small>{{ tm('pipInstall.mirrorHint') }}</small>
+              <v-text-field v-model="goInstallPayload.package" :label="tm('goInstall.packageLabel')" variant="outlined"></v-text-field>
+              <v-text-field v-model="goInstallPayload.mirror" :label="tm('goInstall.mirrorLabel')" variant="outlined"></v-text-field>
+              <small>{{ tm('goInstall.mirrorHint') }}</small>
             </v-card-text>
             <v-card-actions>
               <v-spacer></v-spacer>
-              <v-btn color="blue-darken-1" variant="text" @click="pipInstall" :loading="loading">
-                {{ tm('pipInstall.installButton') }}
+              <v-btn color="blue-darken-1" variant="text" @click="goInstall" :loading="loading">
+                {{ tm('goInstall.installButton') }}
               </v-btn>
             </v-card-actions>
           </v-card>
@@ -71,8 +71,8 @@ export default {
     return {
       autoScrollEnabled: localStorage.getItem('console_auto_scroll') !== 'false',
       hideUserChatEnabled: localStorage.getItem('console_hide_user_chat') === 'true',
-      pipDialog: false,
-      pipInstallPayload: {
+      goInstallDialog: false,
+      goInstallPayload: {
         package: '',
         mirror: ''
       },
@@ -96,20 +96,20 @@ export default {
     }
   },
   methods: {
-    pipInstall() {
+    goInstall() {
       const toast = useToast();
       this.loading = true;
-      updatesApi.installPip(this.pipInstallPayload)
+      updatesApi.installPip(this.goInstallPayload)
         .then(res => {
           if (res.data.status === 'ok') {
-            toast.success(res.data.message || tm('pipInstall.installSuccess'));
-            this.pipDialog = false;
+            toast.success(res.data.message || tm('goInstall.installSuccess'));
+            this.goInstallDialog = false;
           } else {
-            toast.error(res.data.message || tm('pipInstall.installFailed'));
+            toast.error(res.data.message || tm('goInstall.installFailed'));
           }
         })
         .catch(err => {
-          toast.error(err.response?.data?.message || tm('pipInstall.requestFailed'));
+          toast.error(err.response?.data?.message || tm('goInstall.requestFailed'));
         }).finally(() => {
           this.loading = false;
         });

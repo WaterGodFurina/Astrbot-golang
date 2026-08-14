@@ -42,22 +42,22 @@ type Adapter struct {
 
 	EventBus *core.EventBus
 
-	botToken     string
-	appToken     string
+	botToken      string
+	appToken      string
 	signingSecret string
 
-	connectionMode    string // "socket" | "webhook"
+	connectionMode     string // "socket" | "webhook"
 	unifiedWebhookMode bool
-	webhookHost       string
-	webhookPort       int
-	webhookPath       string
-	webhookUUID       string
+	webhookHost        string
+	webhookPort        int
+	webhookPath        string
+	webhookUUID        string
 
-	client    *slack.Client
-	socket    *socketmode.Client
+	client       *slack.Client
+	socket       *socketmode.Client
 	socketCancel context.CancelFunc
-	webhook   *SlackWebhookServer
-	botSelfID string
+	webhook      *SlackWebhookServer
+	botSelfID    string
 
 	stopCh chan struct{}
 	mu     sync.Mutex

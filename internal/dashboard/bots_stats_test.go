@@ -60,5 +60,3 @@ func TestBotsStats(t *testing.T) {
 		t.Errorf("summary.total: %v", resp.Data.Summary["total"])
 	}
 }
-
-

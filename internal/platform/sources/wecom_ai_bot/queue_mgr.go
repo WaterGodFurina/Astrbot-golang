@@ -40,8 +40,8 @@ type PendingResponse struct {
 type WecomAIQueueMgr struct {
 	mu sync.Mutex
 
-	queues       map[string]chan *QueueItem // StreamID → 输入队列
-	backQueues   map[string]chan *QueueItem // StreamID → 输出队列
+	queues           map[string]chan *QueueItem // StreamID → 输入队列
+	backQueues       map[string]chan *QueueItem // StreamID → 输出队列
 	pendingResponses map[string]*PendingResponse
 	completedStreams map[string]time.Time
 	queueCloseEvents map[string]chan struct{}
@@ -49,7 +49,7 @@ type WecomAIQueueMgr struct {
 
 	listenerCallback func(*QueueItem)
 
-	queueMaxSize    int
+	queueMaxSize     int
 	backQueueMaxSize int
 }
 

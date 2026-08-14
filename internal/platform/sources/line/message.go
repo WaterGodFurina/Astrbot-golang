@@ -318,11 +318,11 @@ var (
 
 // mediaServer 提供本地媒体文件的 HTTP 访问。
 type mediaServer struct {
-	mux      *http.ServeMux
-	srv      *http.Server
-	port     int
-	tokens   map[string]string // token -> 文件路径
-	tokenMu  sync.RWMutex
+	mux     *http.ServeMux
+	srv     *http.Server
+	port    int
+	tokens  map[string]string // token -> 文件路径
+	tokenMu sync.RWMutex
 }
 
 // startMediaServer 启动（或复用）本地媒体文件服务器，返回 baseURL。

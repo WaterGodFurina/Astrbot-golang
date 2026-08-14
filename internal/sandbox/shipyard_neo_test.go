@@ -119,12 +119,12 @@ func TestShipyardNeoBooterMissingConfig(t *testing.T) {
 
 func TestNormalizeNeoCwd(t *testing.T) {
 	cases := map[string]string{
-		"/workspace":   ".",
-		"/workspace/":  ".",
-		"/workspace/a": "a",
+		"/workspace":     ".",
+		"/workspace/":    ".",
+		"/workspace/a":   "a",
 		"/workspace/a/b": "a/b",
-		"a":            "a",
-		"":             ".",
+		"a":              "a",
+		"":               ".",
 	}
 	for in, want := range cases {
 		if got := normalizeNeoCwd(in); got != want {

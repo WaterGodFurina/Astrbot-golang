@@ -181,7 +181,8 @@ func TestZigArchiveInfo(t *testing.T) {
 // TestInstallCGoPluginPromptsForCompiler verifies that installing a plugin
 // whose metadata.json declares cgo=true surfaces a CCompilerPromptError (and
 // does not attempt to build) until the user picks a compiler.
-func TestInstallCGoPluginPromptsForCompiler(t *testing.T) {	m := newTestManager(t)
+func TestInstallCGoPluginPromptsForCompiler(t *testing.T) {
+	m := newTestManager(t)
 	ctx := context.Background()
 
 	src := t.TempDir()
@@ -330,6 +331,7 @@ func f2(t *testing.T, path string) *os.File {
 	}
 	return f
 }
+
 // TestClangLockFileDiscardsInterruptedInstall verifies that a leftover// .install-lock makes downloadAndSetupClang discard the cached root and
 // re-download instead of trusting a half-extracted Clang. It serves a fake zig
 // archive from a local httptest server so the test needs no network.

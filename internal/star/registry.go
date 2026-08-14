@@ -61,18 +61,18 @@ type HandlerFilter interface {
 
 // StarHandlerMetadata describes a registered handler.
 type StarHandlerMetadata struct {
-	HandlerFullName   string                 `json:"handler_full_name"`   // module_handler
-	HandlerName       string                 `json:"handler_name"`        // method name
-	HandlerModulePath string                 `json:"handler_module_path"` // module path
+	HandlerFullName   string `json:"handler_full_name"`   // module_handler
+	HandlerName       string `json:"handler_name"`        // method name
+	HandlerModulePath string `json:"handler_module_path"` // module path
 	// PluginName identifies the owning plugin (inst.ID) so session rules can
 	// enable/disable specific plugins. Empty = built-in/system (never filtered).
-	PluginName        string                 `json:"plugin_name,omitempty"`
-	Handler           HandlerFunc            `json:"-"`
-	EventType         EventType              `json:"event_type"`
-	EventFilters      []HandlerFilter        `json:"-"`
-	Desc              string                 `json:"desc,omitempty"`
-	ExtrasConfigs     map[string]interface{} `json:"extras_configs,omitempty"`
-	Enabled           bool                   `json:"enabled"`
+	PluginName    string                 `json:"plugin_name,omitempty"`
+	Handler       HandlerFunc            `json:"-"`
+	EventType     EventType              `json:"event_type"`
+	EventFilters  []HandlerFilter        `json:"-"`
+	Desc          string                 `json:"desc,omitempty"`
+	ExtrasConfigs map[string]interface{} `json:"extras_configs,omitempty"`
+	Enabled       bool                   `json:"enabled"`
 }
 
 // IsEnabled returns true if the handler is enabled.

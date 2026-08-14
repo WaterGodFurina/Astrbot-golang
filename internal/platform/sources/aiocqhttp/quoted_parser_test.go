@@ -24,7 +24,7 @@ func TestParseForwardInline(t *testing.T) {
 					map[string]interface{}{
 						"type": "node",
 						"data": map[string]interface{}{
-							"uin":  "u1", "name": "user1",
+							"uin": "u1", "name": "user1",
 							"content": []interface{}{
 								map[string]interface{}{"type": "text", "data": map[string]interface{}{"text": "转发内容"}},
 							},

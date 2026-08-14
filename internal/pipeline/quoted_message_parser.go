@@ -10,8 +10,8 @@ import (
 // (max_forward_fetch / warn_on_action_failure) is not applicable in Go
 // (no get_forward_msg implementation); the depth/image limits apply.
 type quotedMessageParserSettings struct {
-	maxComponentChainDepth int
-	maxForwardNodeDepth    int
+	maxComponentChainDepth  int
+	maxForwardNodeDepth     int
 	maxQuotedFallbackImages int
 }
 

@@ -169,10 +169,10 @@ func bochaSearchToolSchema() map[string]interface{} {
 func braveSearchToolSchema() map[string]interface{} {
 	return webSearchToolSchema("web_search_brave", "Search the web using Brave. Returns recent search results with titles, URLs and snippets.",
 		map[string]interface{}{
-			"count":      map[string]interface{}{"type": "integer", "description": "Optional. Number of results, 1-20. Default 10."},
-			"country":    map[string]interface{}{"type": "string", "description": "Optional. Country code. Default US."},
+			"count":       map[string]interface{}{"type": "integer", "description": "Optional. Number of results, 1-20. Default 10."},
+			"country":     map[string]interface{}{"type": "string", "description": "Optional. Country code. Default US."},
 			"search_lang": map[string]interface{}{"type": "string", "description": "Optional. Search language. Default zh-hans."},
-			"freshness":  map[string]interface{}{"type": "string", "enum": []interface{}{"day", "week", "month", "year"}, "description": "Optional. Freshness window."},
+			"freshness":   map[string]interface{}{"type": "string", "enum": []interface{}{"day", "week", "month", "year"}, "description": "Optional. Freshness window."},
 		})
 }
 
@@ -599,7 +599,7 @@ func executeWebSearchBaidu(cfg map[string]interface{}, args map[string]interface
 	}
 	data, status, err := httpJSON(http.MethodPost, "https://qianfan.baidubce.com/v2/ai_search/web_search",
 		map[string]string{
-			"Authorization":            "Bearer " + apiKey,
+			"Authorization":              "Bearer " + apiKey,
 			"X-Appbuilder-Authorization": "Bearer " + apiKey,
 		}, payload)
 	if err != nil {
@@ -672,11 +672,11 @@ func executeWebSearchExa(cfg map[string]interface{}, args map[string]interface{}
 func parseExaResults(data []byte) ([]searchResult, error) {
 	var resp struct {
 		Results []struct {
-			Title    string   `json:"title"`
-			URL      string   `json:"url"`
-			Text     string   `json:"text"`
+			Title      string   `json:"title"`
+			URL        string   `json:"url"`
+			Text       string   `json:"text"`
 			Highlights []string `json:"highlights"`
-			Summary  string   `json:"summary"`
+			Summary    string   `json:"summary"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {

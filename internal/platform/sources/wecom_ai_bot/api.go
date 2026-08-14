@@ -25,11 +25,11 @@ type WecomAIBotConstants struct{}
 
 // 消息类型
 const (
-	MSGTypeText  = "text"
-	MSGTypeImage = "image"
-	MSGTypeMixed = "mixed"
+	MSGTypeText   = "text"
+	MSGTypeImage  = "image"
+	MSGTypeMixed  = "mixed"
 	MSGTypeStream = "stream"
-	MSGTypeEvent = "event"
+	MSGTypeEvent  = "event"
 )
 
 // 流消息状态
@@ -40,22 +40,22 @@ const (
 
 // 错误码（与 WecomAIBotConstants 一致）
 const (
-	APISuccess               = 0
-	APIDecryptError          = -40001
+	APISuccess                = 0
+	APIDecryptError           = -40001
 	APIValidateSignatureError = -40002
-	APIParseXMLError         = -40003
-	APIComputeSignatureError = -40004
-	APIIllegalAESKey         = -40005
-	APIValidateAppIDError    = -40006
-	APIEncryptAESError       = -40007
-	APIIllegalBuffer         = -40008
+	APIParseXMLError          = -40003
+	APIComputeSignatureError  = -40004
+	APIIllegalAESKey          = -40005
+	APIValidateAppIDError     = -40006
+	APIEncryptAESError        = -40007
+	APIIllegalBuffer          = -40008
 )
 
 // WecomAIBotAPIClient 企业微信智能机器人 API 客户端。
 type WecomAIBotAPIClient struct {
-	token           string
-	encodingAESKey  string
-	wxcpt           *WXBizJsonMsgCrypt
+	token          string
+	encodingAESKey string
+	wxcpt          *WXBizJsonMsgCrypt
 }
 
 // NewWecomAIBotAPIClient 构造 API 客户端（receiveid 固定为空串）。

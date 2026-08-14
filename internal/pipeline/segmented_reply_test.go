@@ -42,8 +42,8 @@ func TestSegmentedReplyWords(t *testing.T) {
 		"platform_settings": map[string]interface{}{
 			"segmented_reply": map[string]interface{}{
 				"enable": true, "only_llm_result": false,
-				"split_mode": "words",
-				"split_words": []interface{}{"。", "！"},
+				"split_mode":            "words",
+				"split_words":           []interface{}{"。", "！"},
 				"words_count_threshold": 150, "content_cleanup_rule": "",
 			},
 		},

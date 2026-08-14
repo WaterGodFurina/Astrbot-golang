@@ -246,8 +246,8 @@ func TestStripAdvisorMarkup(t *testing.T) {
 func TestWebSearchInjection(t *testing.T) {
 	cfg := map[string]interface{}{
 		"provider_settings": map[string]interface{}{
-			"web_search":         true,
-			"websearch_provider": "tavily",
+			"web_search":           true,
+			"websearch_provider":   "tavily",
 			"websearch_tavily_key": []interface{}{"tvly-test-key"},
 		},
 	}
@@ -266,8 +266,8 @@ func TestWebSearchInjection(t *testing.T) {
 	// Disabled provider -> not injected.
 	s2 := testProcessStageWithConfig(t, map[string]interface{}{
 		"provider_settings": map[string]interface{}{
-			"web_search":         false,
-			"websearch_provider": "tavily",
+			"web_search":           false,
+			"websearch_provider":   "tavily",
 			"websearch_tavily_key": []interface{}{"tvly-test-key"},
 		},
 	})
@@ -293,11 +293,11 @@ func TestTavilyKeys(t *testing.T) {
 
 func TestWebSearchProvidersInjection(t *testing.T) {
 	providers := map[string]string{
-		"tavily": "websearch_tavily_key",
-		"bocha":  "websearch_bocha_key",
-		"brave":  "websearch_brave_key",
+		"tavily":    "websearch_tavily_key",
+		"bocha":     "websearch_bocha_key",
+		"brave":     "websearch_brave_key",
 		"firecrawl": "websearch_firecrawl_key",
-		"exa":    "websearch_exa_key",
+		"exa":       "websearch_exa_key",
 	}
 	for provider, key := range providers {
 		cfg := map[string]interface{}{

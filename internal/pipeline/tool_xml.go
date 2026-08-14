@@ -85,4 +85,3 @@ func parseXMLToolCalls(s string) ([]xmlToolCall, bool) {
 	}
 	return calls, len(calls) > 0
 }
-

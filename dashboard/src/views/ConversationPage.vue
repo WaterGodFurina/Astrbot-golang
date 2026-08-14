@@ -882,8 +882,14 @@ export default {
                         };
                         this.selectedConversation = mergedConversation;
 
-                        const historyData = detailData.history || '[]';
-                        this.conversationHistory = JSON.parse(historyData);
+                        const historyData = detailData.history;
+                        if (typeof historyData === 'string') {
+                            this.conversationHistory = JSON.parse(historyData);
+                        } else if (Array.isArray(historyData)) {
+                            this.conversationHistory = historyData;
+                        } else {
+                            this.conversationHistory = [];
+                        }
                         this.editedHistory = JSON.stringify(this.conversationHistory, null, 2);
                     } catch (e) {
                         this.conversationHistory = [];
@@ -1160,11 +1166,19 @@ export default {
             }
         },
 
-        // 格式化时间戳
+        // 格式化时间戳。兼容三种来源：RFC3339 字符串（后端 API 返回格式）、
+        // Unix 秒（10 位）、Unix 毫秒（13 位）。
         formatTimestamp(timestamp) {
             if (!timestamp) return this.tm('status.unknown');
 
-            const date = new Date(timestamp * 1000);
+            let date;
+            if (typeof timestamp === 'number') {
+                date = new Date(timestamp < 1e12 ? timestamp * 1000 : timestamp);
+            } else {
+                date = new Date(timestamp);
+            }
+            if (isNaN(date.getTime())) return this.tm('status.unknown');
+
             const locale = this.locale || 'zh-CN';
             return new Intl.DateTimeFormat(locale, {
                 year: 'numeric',

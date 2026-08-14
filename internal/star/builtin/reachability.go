@@ -30,11 +30,11 @@ func testProviderReachability(all map[string]interface{}, pc map[string]interfac
 		return "NOT_CHAT"
 	}
 	req := &provider.ProviderRequest{
-		Prompt:     "ping",
-		SessionID:  "reachability_check",
-		Contexts:   []map[string]interface{}{},
-		ImageURLs:  []string{},
-		AudioURLs:  []string{},
+		Prompt:    "ping",
+		SessionID: "reachability_check",
+		Contexts:  []map[string]interface{}{},
+		ImageURLs: []string{},
+		AudioURLs: []string{},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

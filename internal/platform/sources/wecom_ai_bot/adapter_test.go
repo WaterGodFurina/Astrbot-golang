@@ -353,7 +353,7 @@ func TestWebhookClientSend(t *testing.T) {
 		t.Fatalf("构造失败: %v", err)
 	}
 	if err := client.SendPayload(t.Context(), map[string]interface{}{
-		"msgtype": "markdown_v2",
+		"msgtype":     "markdown_v2",
 		"markdown_v2": map[string]interface{}{"content": "hello"},
 	}); err != nil {
 		t.Fatalf("发送失败: %v", err)
@@ -470,7 +470,7 @@ func TestSendOnlyWebhookMode(t *testing.T) {
 func TestWebhookPlatformInterface(t *testing.T) {
 	bus := &fakeEventBus{}
 	a := newTestAIBotAdapter(t, bus, map[string]interface{}{
-		"webhook_uuid":        "ai-123",
+		"webhook_uuid":         "ai-123",
 		"unified_webhook_mode": true,
 	})
 	var _ platform.WebhookPlatform = a
@@ -480,8 +480,8 @@ func TestWebhookPlatformInterface(t *testing.T) {
 	// 长连接模式不应接受 webhook 回调
 	longConn := newTestAIBotAdapter(t, bus, map[string]interface{}{
 		"wecom_ai_bot_connection_mode": "long_connection",
-		"wecomaibot_ws_bot_id":          "bot1",
-		"wecomaibot_ws_secret":          "sec1",
+		"wecomaibot_ws_bot_id":         "bot1",
+		"wecomaibot_ws_secret":         "sec1",
 	})
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("{}"))

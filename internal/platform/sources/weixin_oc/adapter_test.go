@@ -3,8 +3,8 @@ package weixin_oc
 import (
 	"testing"
 
-	ilink "github.com/dobest1024/go-weixin-ilink"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	ilink "github.com/dobest1024/go-weixin-ilink"
 )
 
 // buildTextMessage creates an iLink message with a plain-text item.

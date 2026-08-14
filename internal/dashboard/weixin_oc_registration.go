@@ -21,12 +21,12 @@ import (
 )
 
 const (
-	weixinOCDefaultBaseURL       = "https://ilinkai.weixin.qq.com"
-	weixinOCDefaultCDNBaseURL    = "https://novac2c.cdn.weixin.qq.com/c2c"
-	weixinOCDefaultBotType       = "3"
-	weixinOCDefaultQRInterval    = 1
-	weixinOCDefaultLongPollMS    = 35000
-	weixinOCDefaultAPITimeoutMS  = 15000
+	weixinOCDefaultBaseURL      = "https://ilinkai.weixin.qq.com"
+	weixinOCDefaultCDNBaseURL   = "https://novac2c.cdn.weixin.qq.com/c2c"
+	weixinOCDefaultBotType      = "3"
+	weixinOCDefaultQRInterval   = 1
+	weixinOCDefaultLongPollMS   = 35000
+	weixinOCDefaultAPITimeoutMS = 15000
 )
 
 // weixinOCStringField reads a string field from an API payload (Python
@@ -147,13 +147,13 @@ func weixinOCLoginResult(data map[string]interface{}, defaultBaseURL string) map
 			baseURL = defaultBaseURL
 		}
 		return map[string]interface{}{
-			"status":                 "created",
-			"qr_status":              rawStatus,
-			"weixin_oc_token":        botToken,
-			"weixin_oc_account_id":   weixinOCStringField(data, "ilink_bot_id"),
-			"weixin_oc_base_url":     strings.TrimRight(baseURL, "/"),
-			"weixin_oc_user_id":      weixinOCStringField(data, "ilink_user_id"),
-			"platform_id_suffix":     randomPlatformIDSuffix(),
+			"status":               "created",
+			"qr_status":            rawStatus,
+			"weixin_oc_token":      botToken,
+			"weixin_oc_account_id": weixinOCStringField(data, "ilink_bot_id"),
+			"weixin_oc_base_url":   strings.TrimRight(baseURL, "/"),
+			"weixin_oc_user_id":    weixinOCStringField(data, "ilink_user_id"),
+			"platform_id_suffix":   randomPlatformIDSuffix(),
 		}
 	case "expired":
 		return map[string]interface{}{"status": "expired", "qr_status": rawStatus, "message": "二维码已过期"}

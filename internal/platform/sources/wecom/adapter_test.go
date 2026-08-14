@@ -50,15 +50,15 @@ func (f *fakeEventBus) last() *core.Event {
 func newTestAdapter(t *testing.T, bus platform.EventBus, extra map[string]interface{}) *Adapter {
 	t.Helper()
 	config := map[string]interface{}{
-		"id":                  "wecom",
-		"type":                "wecom",
-		"corpid":              "ww1234567890abcdef",
-		"secret":              "test_secret",
-		"token":               "test_token",
-		"encoding_aes_key":    testEncodingAESKey(t),
-		"api_base_url":        "https://qyapi.weixin.qq.com/cgi-bin/",
+		"id":                   "wecom",
+		"type":                 "wecom",
+		"corpid":               "ww1234567890abcdef",
+		"secret":               "test_secret",
+		"token":                "test_token",
+		"encoding_aes_key":     testEncodingAESKey(t),
+		"api_base_url":         "https://qyapi.weixin.qq.com/cgi-bin/",
 		"callback_server_host": "127.0.0.1",
-		"port":                6195,
+		"port":                 6195,
 	}
 	for k, v := range extra {
 		config[k] = v
@@ -396,11 +396,11 @@ func TestConvertKFTextMessage(t *testing.T) {
 	bus := &fakeEventBus{}
 	a := newTestAdapter(t, bus, map[string]interface{}{"kf_name": "客服"})
 	msg := map[string]interface{}{
-		"msgtype":       "text",
+		"msgtype":         "text",
 		"external_userid": "wm_xxx",
-		"open_kfid":     "wk_open",
-		"msgid":         "msgid_1",
-		"text":          map[string]interface{}{"content": " 客服你好 "},
+		"open_kfid":       "wk_open",
+		"msgid":           "msgid_1",
+		"text":            map[string]interface{}{"content": " 客服你好 "},
 	}
 	a.convertKFMessage(msg)
 	if bus.count() != 1 {

@@ -35,10 +35,10 @@ func (e *WeChatClientError) Error() string {
 
 // WeChatClient 企业微信 API 客户端（corpid + secret）。
 type WeChatClient struct {
-	corpID   string
-	secret   string
-	apiBase  string // 形如 https://qyapi.weixin.qq.com/cgi-bin/
-	http     *http.Client
+	corpID  string
+	secret  string
+	apiBase string // 形如 https://qyapi.weixin.qq.com/cgi-bin/
+	http    *http.Client
 
 	mu          sync.Mutex
 	accessToken string
@@ -320,7 +320,7 @@ func (c *WeChatClient) KFAddContactWay(ctx context.Context, openKFID, scene stri
 // payload 示例：{"msgtype": "text", "text": {"content": "..."}}。
 func (c *WeChatClient) KFSend(ctx context.Context, touser, openKFID, msgID string, payload map[string]interface{}) error {
 	body := map[string]interface{}{
-		"touser":   touser,
+		"touser":    touser,
 		"open_kfid": openKFID,
 	}
 	if msgID != "" {

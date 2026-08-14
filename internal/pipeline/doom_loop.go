@@ -33,8 +33,8 @@ type doomConfirmResult int
 
 const (
 	doomNotConsumed doomConfirmResult = iota // no paused tool for this session
-	doomResumed                             // asker confirmed -> re-run the original request
-	doomDeclined                            // asker declined or another sender -> stop
+	doomResumed                              // asker confirmed -> re-run the original request
+	doomDeclined                             // asker declined or another sender -> stop
 )
 
 // maybeHandleDoomConfirm is called at the start of Process: if this session has

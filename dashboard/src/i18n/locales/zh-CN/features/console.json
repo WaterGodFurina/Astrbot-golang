@@ -8,18 +8,18 @@
     "enabled": "已排除用户对话",
     "disabled": "排除用户对话"
   },
-  "pipInstall": {
-    "button": "安装 pip 库",
-    "dialogTitle": "安装 Pip 库",
-    "packageLabel": "*库名，如 llmtuner",
-    "mirrorLabel": "强制 PyPI 软件仓库链接（可选）",
-    "mirrorHint": "强制 PyPI 软件仓库链接 > 配置项 `PyPI 软件仓库地址`",
+  "debugHint": {
+    "text": "Debug 日志需要在「配置文件 → 系统 → 控制台日志级别」中开启"
+  },
+  "goInstall": {
+    "button": "安装 Go 库",
+    "dialogTitle": "安装 Go 库",
+    "packageLabel": "*模块路径，如 github.com/user/repo",
+    "mirrorLabel": "GOPROXY 镜像地址（可选）",
+    "mirrorHint": "GOPROXY 代理地址，默认使用系统配置（如 goproxy.cn）。留空则使用配置项 `goproxy`。",
     "installButton": "安装",
     "installSuccess": "安装成功。",
     "installFailed": "安装失败。",
     "requestFailed": "请求失败。"
-  },
-  "debugHint": {
-    "text": "Debug 日志需要在「配置文件 → 系统 → 控制台日志级别」中开启"
   }
 }

@@ -145,6 +145,34 @@ func (m *SubprocessManager) SetGoConfig(goproxy, goflags string) {
 	}
 }
 
+// GoInstall installs a Go module/binary into the toolchain's GOPATH/bin using
+// the bundled (or system) go toolchain — the Go equivalent of "pip install".
+// pkg may include a version suffix (e.g. "github.com/x/y@latest"); an explicit
+// "@latest" is appended when absent. It returns the combined command output.
+func (m *SubprocessManager) GoInstall(ctx context.Context, pkg, goproxy string) (string, error) {
+	if m.toolchain == nil {
+		return "", fmt.Errorf("Go 工具链不可用")
+	}
+	bin, err := m.toolchain.GoBin()
+	if err != nil {
+		return "", err
+	}
+	if pkg = strings.TrimSpace(pkg); pkg == "" {
+		return "", fmt.Errorf("模块名不能为空")
+	}
+	if !strings.Contains(pkg, "@") {
+		pkg += "@latest"
+	}
+	extra := map[string]string{}
+	if strings.TrimSpace(goproxy) != "" {
+		extra["GOPROXY"] = strings.TrimSpace(goproxy)
+	}
+	cmd := exec.CommandContext(ctx, bin, "install", pkg)
+	cmd.Env = m.toolchain.BuildEnv(extra)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 // applyGitHubProxy 对 github.com 的 git 源 URL 应用加速前缀（如 ghfast.top）。
 func (m *SubprocessManager) applyGitHubProxy(source string) string {
 	if m.githubProxy == "" {
@@ -394,6 +422,8 @@ func (m *SubprocessManager) Load(ctx context.Context, id, binary string) (*Plugi
 
 	m.startWatch(inst)
 	logger.I18nInfo("插件 %s 已从 %s 加载 (v%s)", id, inst.Binary, inst.Version)
+	// 通知所有已加载插件：新插件加载完成（on_plugin_loaded）。
+	m.TriggerHookPayload(ctx, pluginsdk.EventOnPluginLoaded, map[string]string{"plugin_name": inst.Name})
 	return inst, nil
 }
 
@@ -452,6 +482,10 @@ func (m *SubprocessManager) Unload(id string) error {
 	}
 	delete(m.instances, id)
 	m.mu.Unlock()
+
+	// 通知其余已加载插件：某插件被卸载（on_plugin_unloaded）。已从
+	// instances 中删除，被卸载插件自身不会收到。
+	m.TriggerHookPayload(context.Background(), pluginsdk.EventOnPluginUnloaded, map[string]string{"plugin_name": inst.Name})
 
 	inst.mu.Lock()
 	inst.stopped = true
@@ -824,9 +858,17 @@ func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 	}
 }
 
-// TriggerHook fires lifecycle hooks (e.g. "startup"/"shutdown") on all running
-// plugins via RPC.
+// TriggerHook fires payload-less lifecycle hooks (e.g. "startup"/"shutdown") on
+// all running plugins via RPC.
 func (m *SubprocessManager) TriggerHook(ctx context.Context, event string) {
+	m.TriggerHookPayload(ctx, event, nil)
+}
+
+// TriggerHookPayload fires lifecycle hooks (e.g. "startup"/"shutdown",
+// "on_astrbot_loaded", "on_plugin_loaded", "on_plugin_unloaded",
+// "on_platform_loaded") on all running plugins via RPC, attaching a JSON
+// payload for payload-carrying events (nil for event-only hooks).
+func (m *SubprocessManager) TriggerHookPayload(ctx context.Context, event string, payload any) {
 	for _, inst := range m.List() {
 		if inst.Client == nil || inst.Meta == nil {
 			continue
@@ -835,7 +877,7 @@ func (m *SubprocessManager) TriggerHook(ctx context.Context, event string) {
 			if h.Event != event {
 				continue
 			}
-			if _, _, err := inst.Client.HandleHook(ctx, h.Name, &pluginsdk.Event{}, nil); err != nil {
+			if _, _, err := inst.Client.HandleHookWithPayload(ctx, h.Name, &pluginsdk.Event{}, nil, payload); err != nil {
 				logger.I18nWarn("钩子 %s (%s) 在插件 %s 上执行失败: %v", h.Name, h.Event, inst.ID, err)
 			}
 		}

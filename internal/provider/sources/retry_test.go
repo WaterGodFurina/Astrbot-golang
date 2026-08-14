@@ -39,14 +39,14 @@ func TestIsRetryableStatus(t *testing.T) {
 
 func TestParseRetryAfter(t *testing.T) {
 	tests := []struct {
-		header   string
-		wantGT   time.Duration // want > this value
-		wantLT   time.Duration // want < this value
+		header string
+		wantGT time.Duration // want > this value
+		wantLT time.Duration // want < this value
 	}{
 		{"", 0, 1},
 		{"invalid", 0, 1},
-		{"5", 4*time.Second, 6*time.Second},
-		{"0.5", 400*time.Millisecond, 600*time.Millisecond},
+		{"5", 4 * time.Second, 6 * time.Second},
+		{"0.5", 400 * time.Millisecond, 600 * time.Millisecond},
 	}
 	for _, tt := range tests {
 		got := ParseRetryAfter(tt.header)
@@ -79,10 +79,10 @@ func TestRetryConfigFromSettings(t *testing.T) {
 	}
 
 	settings := map[string]interface{}{
-		"request_max_retries":            10,
-		"request_retry_min_delay_ms":     100,
-		"request_retry_max_delay_ms":     60000,
-		"request_retry_rate_limits":      false,
+		"request_max_retries":        10,
+		"request_retry_min_delay_ms": 100,
+		"request_retry_max_delay_ms": 60000,
+		"request_retry_rate_limits":  false,
 	}
 	cfg = RetryConfigFromSettings(settings)
 	if cfg.MaxAttempts != 10 {

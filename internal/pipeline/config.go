@@ -11,34 +11,34 @@ import (
 // absent" (nil) from "explicitly false" — matching the original assertion
 // logic which treated absent keys as true/allow.
 type ProviderSettings struct {
-	Enable               *bool  `mapstructure:"enable"`
-	DefaultProviderID    string `mapstructure:"default_provider_id"`
-	DefaultPersonality   string `mapstructure:"default_personality"`
-	Persona              string `mapstructure:"persona"`
-	ComputerUseRuntime   string `mapstructure:"computer_use_runtime"`
-	StreamingResponse    bool   `mapstructure:"streaming_response"`
-	WakePrefix           string `mapstructure:"wake_prefix"`
-	Identifier           bool   `mapstructure:"identifier"`
-	GroupNameDisplay     bool   `mapstructure:"group_name_display"`
-	DatetimeSystemPrompt bool   `mapstructure:"datetime_system_prompt"`
-	MaxAgentStep         int    `mapstructure:"max_agent_step"`
-	ToolCallTimeout      int    `mapstructure:"tool_call_timeout"`
-	ToolSchemaMode       string `mapstructure:"tool_schema_mode"`
-	LLMSafetyMode        bool   `mapstructure:"llm_safety_mode"`
-	SafetyModeStrategy   string `mapstructure:"safety_mode_strategy"`
-	UnsupportedStreamingStrategy string `mapstructure:"unsupported_streaming_strategy"`
-	DisplayReasoningText bool   `mapstructure:"display_reasoning_text"`
-	ShowToolUseStatus    bool   `mapstructure:"show_tool_use_status"`
-	ShowToolCallResult   bool   `mapstructure:"show_tool_call_result"`
-	BufferIntermediateMessages bool `mapstructure:"buffer_intermediate_messages"`
-	SanitizeContextByModalities bool `mapstructure:"sanitize_context_by_modalities"`
-	MaxContextLength     int    `mapstructure:"max_context_length"`
-	DequeueContextLength int    `mapstructure:"dequeue_context_length"`
-	ContextLimitStrategy string `mapstructure:"context_limit_reached_strategy"`
-	LLMCompressInstruction string `mapstructure:"llm_compress_instruction"`
-	LLMCompressKeepRecentRatio float64 `mapstructure:"llm_compress_keep_recent_ratio"`
-	LLMCompressProviderID string  `mapstructure:"llm_compress_provider_id"`
-	Proactive            struct {
+	Enable                       *bool   `mapstructure:"enable"`
+	DefaultProviderID            string  `mapstructure:"default_provider_id"`
+	DefaultPersonality           string  `mapstructure:"default_personality"`
+	Persona                      string  `mapstructure:"persona"`
+	ComputerUseRuntime           string  `mapstructure:"computer_use_runtime"`
+	StreamingResponse            bool    `mapstructure:"streaming_response"`
+	WakePrefix                   string  `mapstructure:"wake_prefix"`
+	Identifier                   bool    `mapstructure:"identifier"`
+	GroupNameDisplay             bool    `mapstructure:"group_name_display"`
+	DatetimeSystemPrompt         bool    `mapstructure:"datetime_system_prompt"`
+	MaxAgentStep                 int     `mapstructure:"max_agent_step"`
+	ToolCallTimeout              int     `mapstructure:"tool_call_timeout"`
+	ToolSchemaMode               string  `mapstructure:"tool_schema_mode"`
+	LLMSafetyMode                bool    `mapstructure:"llm_safety_mode"`
+	SafetyModeStrategy           string  `mapstructure:"safety_mode_strategy"`
+	UnsupportedStreamingStrategy string  `mapstructure:"unsupported_streaming_strategy"`
+	DisplayReasoningText         bool    `mapstructure:"display_reasoning_text"`
+	ShowToolUseStatus            bool    `mapstructure:"show_tool_use_status"`
+	ShowToolCallResult           bool    `mapstructure:"show_tool_call_result"`
+	BufferIntermediateMessages   bool    `mapstructure:"buffer_intermediate_messages"`
+	SanitizeContextByModalities  bool    `mapstructure:"sanitize_context_by_modalities"`
+	MaxContextLength             int     `mapstructure:"max_context_length"`
+	DequeueContextLength         int     `mapstructure:"dequeue_context_length"`
+	ContextLimitStrategy         string  `mapstructure:"context_limit_reached_strategy"`
+	LLMCompressInstruction       string  `mapstructure:"llm_compress_instruction"`
+	LLMCompressKeepRecentRatio   float64 `mapstructure:"llm_compress_keep_recent_ratio"`
+	LLMCompressProviderID        string  `mapstructure:"llm_compress_provider_id"`
+	Proactive                    struct {
 		AddCronTools *bool `mapstructure:"add_cron_tools"`
 	} `mapstructure:"proactive_capability"`
 }

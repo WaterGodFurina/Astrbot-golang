@@ -71,9 +71,9 @@ type Adapter struct {
 	ws             *websocket.Conn
 	wsSessionID    string
 	lastSeq        int
-	sessionScene   map[string]string // convID -> "group"/"friend"/"channel"
+	sessionScene   map[string]string    // convID -> "group"/"friend"/"channel"
 	recentMsg      map[string]time.Time // msgID -> received at (dedupe)
-	sessionLastMsg map[string]string // convID -> last message id
+	sessionLastMsg map[string]string    // convID -> last message id
 	stopCh         chan struct{}
 	stopped        bool
 	httpClient     *http.Client

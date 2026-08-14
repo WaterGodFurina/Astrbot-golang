@@ -23,10 +23,10 @@ const (
 
 // MessageChain describes a complete message with ordered components.
 type MessageChain struct {
-	Chain         []Component `json:"chain"`
-	UseT2I        *bool       `json:"use_t2i,omitempty"`        // nil = follow config
-	UseMarkdown   *bool       `json:"use_markdown,omitempty"`   // nil = follow platform default
-	Type          string      `json:"type,omitempty"`           // message type tag
+	Chain       []Component `json:"chain"`
+	UseT2I      *bool       `json:"use_t2i,omitempty"`      // nil = follow config
+	UseMarkdown *bool       `json:"use_markdown,omitempty"` // nil = follow platform default
+	Type        string      `json:"type,omitempty"`         // message type tag
 }
 
 // NewMessageChain creates a MessageChain from components.
@@ -182,12 +182,12 @@ func (mc *MessageChain) GetAll(t ComponentType) []Component {
 
 // MessageEventResult describes a message event's result with components and control flow.
 type MessageEventResult struct {
-	Chain              []Component        `json:"chain"`
-	UseT2I             *bool              `json:"use_t2i,omitempty"`
-	UseMarkdown        *bool              `json:"use_markdown,omitempty"`
-	Type               string             `json:"type,omitempty"`
-	ResultType         EventResultType    `json:"result_type"`
-	ResultContentType  ResultContentType  `json:"result_content_type"`
+	Chain             []Component       `json:"chain"`
+	UseT2I            *bool             `json:"use_t2i,omitempty"`
+	UseMarkdown       *bool             `json:"use_markdown,omitempty"`
+	Type              string            `json:"type,omitempty"`
+	ResultType        EventResultType   `json:"result_type"`
+	ResultContentType ResultContentType `json:"result_content_type"`
 }
 
 // NewMessageEventResult creates a default MessageEventResult.

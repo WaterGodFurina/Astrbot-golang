@@ -39,15 +39,15 @@ func NewGroupChatContext(config map[string]interface{}) *GroupChatContext {
 
 // groupContextCfg resolves provider_ltm_settings for a session (cfg()).
 type groupContextCfg struct {
-	groupMessageMaxCnt      int
-	imageCaption            bool
-	imageCaptionPrompt      string
-	imageCaptionProviderID  string
-	enableActiveReply       bool
-	arMethod                string
-	arPossibility           float64
-	arPrompt                string
-	arWhitelist             []string
+	groupMessageMaxCnt     int
+	imageCaption           bool
+	imageCaptionPrompt     string
+	imageCaptionProviderID string
+	enableActiveReply      bool
+	arMethod               string
+	arPossibility          float64
+	arPrompt               string
+	arWhitelist            []string
 }
 
 func (g *GroupChatContext) getLock(umo string) *sync.Mutex {
@@ -398,10 +398,10 @@ func callImageCaptionProvider(cfg map[string]interface{}, providerID, imageURL, 
 		return "", fmt.Errorf("提供商 %s 不支持聊天能力", providerType)
 	}
 	req := &provider.ProviderRequest{
-		Prompt:     prompt,
-		ImageURLs:  []string{imageURL},
-		SessionID:  "image_caption",
-		Contexts:   []map[string]interface{}{},
+		Prompt:    prompt,
+		ImageURLs: []string{imageURL},
+		SessionID: "image_caption",
+		Contexts:  []map[string]interface{}{},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

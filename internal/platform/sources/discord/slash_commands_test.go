@@ -3,8 +3,8 @@ package discord
 import (
 	"testing"
 
-	"github.com/bwmarrin/discordgo"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/bwmarrin/discordgo"
 )
 
 // TestExtractCommandInfoValid: a top-level command with a Discord-valid name
@@ -77,12 +77,12 @@ func TestCollectFromRegistry(t *testing.T) {
 
 	// Enabled top-level command -> registered.
 	h1 := &star.StarHandlerMetadata{
-		HandlerFullName: "p1_echo",
+		HandlerFullName:   "p1_echo",
 		HandlerModulePath: "plugin1",
-		EventType:       star.EventTypeFilter,
-		EventFilters:    []star.HandlerFilter{star.NewCommandFilter("echo", nil, nil)},
-		Desc:            "回显",
-		Enabled:         true,
+		EventType:         star.EventTypeFilter,
+		EventFilters:      []star.HandlerFilter{star.NewCommandFilter("echo", nil, nil)},
+		Desc:              "回显",
+		Enabled:           true,
 	}
 	mgr.Handlers().Append(h1)
 
@@ -91,23 +91,23 @@ func TestCollectFromRegistry(t *testing.T) {
 
 	// Sub-command -> skipped.
 	h3 := &star.StarHandlerMetadata{
-		HandlerFullName: "p3_ban",
+		HandlerFullName:   "p3_ban",
 		HandlerModulePath: "plugin3",
-		EventType:       star.EventTypeFilter,
-		EventFilters:    []star.HandlerFilter{star.NewCommandFilter("ban", nil, star.NewCommandGroupFilter("admin", nil, nil))},
-		Desc:            "ban",
-		Enabled:         true,
+		EventType:         star.EventTypeFilter,
+		EventFilters:      []star.HandlerFilter{star.NewCommandFilter("ban", nil, star.NewCommandGroupFilter("admin", nil, nil))},
+		Desc:              "ban",
+		Enabled:           true,
 	}
 	mgr.Handlers().Append(h3)
 
 	// Uppercase name -> skipped.
 	h4 := &star.StarHandlerMetadata{
-		HandlerFullName: "p4_bad",
+		HandlerFullName:   "p4_bad",
 		HandlerModulePath: "plugin4",
-		EventType:       star.EventTypeFilter,
-		EventFilters:    []star.HandlerFilter{star.NewCommandFilter("BadName", nil, nil)},
-		Desc:            "bad",
-		Enabled:         true,
+		EventType:         star.EventTypeFilter,
+		EventFilters:      []star.HandlerFilter{star.NewCommandFilter("BadName", nil, nil)},
+		Desc:              "bad",
+		Enabled:           true,
 	}
 	mgr.Handlers().Append(h4)
 

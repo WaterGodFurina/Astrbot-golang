@@ -846,7 +846,7 @@
         "baidu_aip": {
           "enable": {
             "description": "使用百度内容安全审核",
-            "hint": "您需要手动安装 baidu-aip 库。"
+            "hint": "使用官方 golang-sdk（github.com/Baidu-AIP/golang-sdk）。该依赖不随构建下载，需自行安装并重编译：`go get github.com/Baidu-AIP/golang-sdk` + `go build -tags baidu_aip`。未编译 SDK 时开启本选项会记录错误日志并放行消息（fail-open）。"
           },
           "app_id": {
             "description": "App ID"

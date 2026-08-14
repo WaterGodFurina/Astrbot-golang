@@ -180,7 +180,7 @@ func (a *Adapter) downloadMessageResource(ctx context.Context, messageID, fileKe
 		logger.Error("飞书消息资源响应中不包含文件流: %s", fileKey)
 		return nil, fmt.Errorf("lark resource empty")
 	}
-	
+
 	return io.ReadAll(resp.File)
 }
 
@@ -263,11 +263,11 @@ func (a *Adapter) buildReplyFromParentID(ctx context.Context, parentMessageID st
 		}
 	}
 	reply := &message.Reply{
-		MessageID:      quotedID,
-		Chain:          quotedChain,
-		SenderID:       quotedSender,
+		MessageID:  quotedID,
+		Chain:      quotedChain,
+		SenderID:   quotedSender,
 		SenderNick: nickname,
-		MessageStr:     quotedText,
+		MessageStr: quotedText,
 	}
 	return reply
 }

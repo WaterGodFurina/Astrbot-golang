@@ -33,11 +33,11 @@ var logger = log.GetDefault().WithComponent("T2I")
 const twemojiBase = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@15.1.0/assets/72x72/"
 
 var (
-	emojiDirOnce    sync.Once
-	emojiDir        string
-	emojiImgCache   sync.Map // codepoint -> image.Image
+	emojiDirOnce     sync.Once
+	emojiDir         string
+	emojiImgCache    sync.Map // codepoint -> image.Image
 	emojiFailedCache sync.Map // codepoint -> bool (negative cache for offline)
-	glyphFontCache  sync.Map // font path -> *truetype.Font
+	glyphFontCache   sync.Map // font path -> *truetype.Font
 )
 
 // glyphFont returns a parsed truetype.Font for glyph-existence checks.
@@ -128,15 +128,15 @@ func (o ImageOptions) withDefaults() ImageOptions {
 
 // imageLine is a unit of layout: either a wrapped text block or a picture.
 type imageLine struct {
-	kind      string // "text" | "image"
-	text      []string
-	size      float64
-	color     color.RGBA
-	align     string // "left" | "center" | "right"
-	hasEmoji  bool
-	img       image.Image
-	imgW      int
-	imgH      int
+	kind     string // "text" | "image"
+	text     []string
+	size     float64
+	color    color.RGBA
+	align    string // "left" | "center" | "right"
+	hasEmoji bool
+	img      image.Image
+	imgW     int
+	imgH     int
 }
 
 // fontFaceCache caches parsed font faces keyed by path+size (parsing a TTF on

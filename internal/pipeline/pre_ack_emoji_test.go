@@ -43,9 +43,9 @@ func TestPreAckEmojiTriggered(t *testing.T) {
 	s.platformMgr = pm
 
 	ev := &core.Event{
-		Source:           core.EventSource{Platform: "lark"},
+		Source:            core.EventSource{Platform: "lark"},
 		IsAtOrWakeCommand: true,
-		MessageObj:       &core.MessageObj{MessageID: "m1"},
+		MessageObj:        &core.MessageObj{MessageID: "m1"},
 	}
 	s.applyPreAckEmoji(ev)
 	time.Sleep(100 * time.Millisecond)

@@ -177,12 +177,12 @@ func TestConvertMessageSkipsBot(t *testing.T) {
 	a := New(map[string]interface{}{"id": "slack-test"}, nil, nil)
 	// 机器人消息 / 编辑 / 删除应被过滤，不会走到 convertMessage
 	event := map[string]interface{}{
-		"type":     "message",
-		"subtype":  "bot_message",
-		"bot_id":   "B123",
-		"user":     "U1",
-		"channel":  "C1",
-		"text":     "bot 消息",
+		"type":          "message",
+		"subtype":       "bot_message",
+		"bot_id":        "B123",
+		"user":          "U1",
+		"channel":       "C1",
+		"text":          "bot 消息",
 		"client_msg_id": "CM2",
 	}
 	a.processIncomingEvent(event)

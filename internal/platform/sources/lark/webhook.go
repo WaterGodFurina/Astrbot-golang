@@ -15,20 +15,20 @@ import (
 // challenge verification, AES-256-CBC decryption (lark_encrypt_key) and
 // SHA256 signature verification. Ported 1:1 from lark/server.py.
 type LarkWebhookServer struct {
-	appID    string
-	appSecret string
-	encryptKey string
+	appID       string
+	appSecret   string
+	encryptKey  string
 	verifyToken string
-	cipher   cipher.Block
-	callback func(map[string]interface{})
+	cipher      cipher.Block
+	callback    func(map[string]interface{})
 }
 
 // NewLarkWebhookServer creates a webhook server.
 func NewLarkWebhookServer(appID, appSecret, encryptKey, verifyToken string) *LarkWebhookServer {
 	s := &LarkWebhookServer{
-		appID:      appID,
-		appSecret:  appSecret,
-		encryptKey: encryptKey,
+		appID:       appID,
+		appSecret:   appSecret,
+		encryptKey:  encryptKey,
 		verifyToken: verifyToken,
 	}
 	if encryptKey != "" {

@@ -21,13 +21,13 @@ import (
 
 // WecomAIBotLongConnectionClient 企业微信智能机器人 WebSocket 长连接客户端。
 type WecomAIBotLongConnectionClient struct {
-	botID   string
-	secret  string
-	wsURL   string
+	botID             string
+	secret            string
+	wsURL             string
 	heartbeatInterval time.Duration
 	messageHandler    func(map[string]interface{})
 
-	conn  *websocket.Conn
+	conn       *websocket.Conn
 	httpDialer *websocket.Dialer
 
 	mu              sync.Mutex

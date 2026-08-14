@@ -738,17 +738,17 @@ func (d *Database) GetCronJob(jobID string) (CronJobRow, bool, error) {
 // Using a fixed allowlist (rather than interpolating map keys) prevents SQL
 // injection through arbitrary field names.
 var cronJobWritableFields = map[string]bool{
-	"name":             true,
-	"description":      true,
-	"job_type":         true,
-	"cron_expression":  true,
-	"timezone":         true,
-	"payload":          true,
-	"status":           true,
-	"persistent":       true,
-	"enabled":          true,
-	"run_once":         true,
-	"next_run_time":    true,
+	"name":            true,
+	"description":     true,
+	"job_type":        true,
+	"cron_expression": true,
+	"timezone":        true,
+	"payload":         true,
+	"status":          true,
+	"persistent":      true,
+	"enabled":         true,
+	"run_once":        true,
+	"next_run_time":   true,
 }
 
 // UpdateCronJob patches a cron job's mutable fields.

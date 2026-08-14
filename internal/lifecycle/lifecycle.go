@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/backup"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
@@ -350,6 +351,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 
 	// Trigger startup hooks
 	l.subPluginMgr.TriggerHook(ctx, "startup")
+	// Python SDK 的 on_astrbot_loaded：宿主加载完成后通知所有插件。
+	l.subPluginMgr.TriggerHook(ctx, pluginsdk.EventOnAstrbotLoaded)
 
 	logger.I18nInfo("AstrBot Go 已启动 - API 端口 :6185")
 	return nil
@@ -504,8 +507,8 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 			}
 			return l.dashboard.RetrieveKBContext(umo, query)
 		},
-		ProviderManager:       l.providerMgr,
-		SubPlugins:            l.subPluginMgr,
+		ProviderManager: l.providerMgr,
+		SubPlugins:      l.subPluginMgr,
 	}
 
 	stageFactory := []func() core.PipelineStage{
@@ -841,6 +844,8 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 			continue
 		}
 		logger.I18nInfo("平台 %s (%s) 已启动", adapter.ID(), adapter.Type())
+		// Python SDK 的 on_platform_loaded：通知所有插件该平台适配器已加载。
+		l.subPluginMgr.TriggerHookPayload(ctx, pluginsdk.EventOnPlatformLoaded, map[string]string{"platform": adapter.ID()})
 		loaded++
 	}
 	if loaded == 0 && (failed > 0 || skipped == 0) {

@@ -53,12 +53,12 @@ func TestSaveWritesPythonOrder(t *testing.T) {
 	cfg := NewConfig(path, DefaultConfig())
 	// Simulate a config that would otherwise be alphabetized.
 	cfg.data = map[string]interface{}{
-		"provider":         []interface{}{},
-		"config_version":   2,
-		"log_level":        "INFO",
-		"dashboard":        map[string]interface{}{"host": "0.0.0.0"},
+		"provider":          []interface{}{},
+		"config_version":    2,
+		"log_level":         "INFO",
+		"dashboard":         map[string]interface{}{"host": "0.0.0.0"},
 		"platform_settings": map[string]interface{}{"reply_prefix": ""},
-		"platform":         []interface{}{},
+		"platform":          []interface{}{},
 	}
 	if err := cfg.Save(); err != nil {
 		t.Fatalf("save: %v", err)

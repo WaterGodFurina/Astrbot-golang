@@ -577,9 +577,9 @@ func (s *SessionServiceManager) EnableSession(unifiedMsgOrigin string) {
 // Session rule keys (mirrors Python AVAILABLE_SESSION_RULE_KEYS). Stored in the
 // preferences table with scope="umo", scope_id=umo.
 const (
-	RuleServiceConfig         = "session_service_config"
-	RulePluginConfig          = "session_plugin_config"
-	RuleKBConfig              = "kb_config"
+	RuleServiceConfig          = "session_service_config"
+	RulePluginConfig           = "session_plugin_config"
+	RuleKBConfig               = "kb_config"
 	RuleProviderChatCompletion = "provider_perf_chat_completion"
 	RuleProviderSpeechToText   = "provider_perf_speech_to_text"
 	RuleProviderTextToSpeech   = "provider_perf_text_to_speech"

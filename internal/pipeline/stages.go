@@ -14,8 +14,6 @@
 package pipeline
 
 import (
-	"sort"
-	"strconv"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -27,10 +25,12 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
-	"unicode"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
@@ -146,6 +146,11 @@ type WakingCheckStage struct {
 	uniqueSession                bool
 	emptyMentionWaiting          bool
 	emptyMentionWaitingNeedReply bool
+
+	// adminsID lists the configured admin sender ids (config "admins_id").
+	// Senders in this list get event.Role="admin" (mirrors Python's waking_check
+	// admin detection); everyone else is "member".
+	adminsID []string
 }
 
 func NewWakingCheckStage() *WakingCheckStage {
@@ -200,12 +205,36 @@ func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
 		s.aiWakePrefix = strings.TrimSpace(psAI.WakePrefix)
 	}
 
+	// Admin ids (top-level "admins_id", e.g. ["astrbot"]). Used to mark the
+	// sender as admin so admin-gated commands (/provider /name) respond.
+	s.adminsID = toStringList(ctx.AstrbotConfig["admins_id"])
+
 	logger.Debug("WakingCheck initialized: prefixes=%v, nicknames=%v, wakeByAt=%v, wakeByPrefix=%v, wakeByFriend=%v, aiWakePrefix=%q",
 		s.wakePrefixes, s.nickname, s.wakeByAt, s.wakeByPrefix, s.wakeByFriend, s.aiWakePrefix)
 	return nil
 }
 
 func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
+	// Ported from waking_check/stage.py: 设置 sender 身份。配置在
+	// admins_id 中的发送者标记为 admin，其余为 member；webchat 的 API key
+	// 可通过 _api_key_allow_admin_role 显式关闭管理员身份。
+	event.Role = "member"
+	apiKeyAllowAdminRole := true
+	if v := event.GetExtra("_api_key_allow_admin_role"); v != nil {
+		if b, isBool := v.(bool); isBool {
+			apiKeyAllowAdminRole = b
+		}
+	}
+	if apiKeyAllowAdminRole {
+		for _, adminID := range s.adminsID {
+			if event.Source.SenderID == adminID {
+				event.Role = "admin"
+				break
+			}
+		}
+	}
+	event.Source.IsAdmin = event.Role == "admin"
+
 	// If the event already has is_at_or_wake_command set, skip
 	if event.IsAtOrWakeCommand {
 		return &StageResult{Continue: true}, nil
@@ -285,16 +314,16 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 							}
 						}
 					}
-				if !matched {
-					// @mention without a prefix still starts a chat
-					// (Python: is_at_or_wake_command triggers the LLM agent).
-					if s.emptyMentionWaiting && isSingleEmptyMention(event) {
-						return s.applyEmptyMention(event)
+					if !matched {
+						// @mention without a prefix still starts a chat
+						// (Python: is_at_or_wake_command triggers the LLM agent).
+						if s.emptyMentionWaiting && isSingleEmptyMention(event) {
+							return s.applyEmptyMention(event)
+						}
+						event.SetExtra("llm_wake", true)
+						logger.Debug("Woken by @mention (chat enabled)")
 					}
-					event.SetExtra("llm_wake", true)
-					logger.Debug("Woken by @mention (chat enabled)")
-				}
-				return &StageResult{Continue: true}, nil
+					return &StageResult{Continue: true}, nil
 				}
 			}
 			if _, ok := comp.(*message.AtAll); ok {
@@ -1063,6 +1092,12 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 			}
 			if err := s.executeHandler(ctx, event, handler); err != nil {
 				logger.Error("Handler %s failed: %v", handler.HandlerFullName, err)
+				// on_plugin_error: notify other plugins of the failure.
+				dispatchSubprocessHooksPayload(s.subPlugins, event, "on_plugin_error", &pluginsdk.PluginError{
+					PluginName:  handler.PluginName,
+					HandlerName: handler.HandlerName,
+					Error:       err.Error(),
+				})
 			}
 		}
 		// If any handler produced a result, yield
@@ -1251,9 +1286,13 @@ func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
 
 // callLLMAgent invokes the LLM provider and sets the result.
 func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) error {
-	prompt := event.PlainText
+	// Prefer the adapter's clean message_str (mirrors Python's use of
+	// event.message_str). PlainText is the chain-rendered text and may carry a
+	// self-mention (e.g. the qq_official adapter prepends At{qq_official} to
+	// C2C messages), which would otherwise pollute the prompt and history.
+	prompt := event.MessageStr
 	if prompt == "" {
-		prompt = event.MessageStr
+		prompt = event.PlainText
 	}
 	if prompt == "" {
 		prompt = extractPlainText(event.Message)
@@ -1554,6 +1593,13 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 				doomed = true
 				break
 			}
+			// provider_settings.show_tool_use_status: notify the user a tool is
+			// being called (mirrors astr_agent_run_util.py). When
+			// show_tool_call_result is also enabled the status is folded into
+			// the result notice sent after the tool returns.
+			if s.providerConf != nil && s.providerConf.ShowToolUseStatus && !s.providerConf.ShowToolCallResult {
+				s.sendToolStatus(event, toolStatusCall(name))
+			}
 			// Trace: tool call + result (agent_tool_call / agent_tool_result).
 			if event.Trace != nil {
 				event.Trace.Record("agent_tool_call", map[string]interface{}{
@@ -1562,12 +1608,24 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 				})
 			}
 			result := s.executeTool(event, computerUseRuntime, name, args)
+			// on_llm_tool_respond fires after the tool executed, carrying the
+			// tool name/args plus its result.
+			dispatchSubprocessHooksPayload(s.subPlugins, event, "on_llm_tool_respond", &pluginsdk.ToolCall{
+				Name:   name,
+				Args:   args,
+				Result: result,
+			})
 			// Oversized tool output is spilled to a file with a read hint so the
 			// model does not re-run the tool just to see the full result.
 			result = materializeToolResult(result, toolID)
+			// provider_settings.show_tool_use_status + show_tool_call_result:
+			// send a combined "tool called → result" notice.
+			if s.providerConf != nil && s.providerConf.ShowToolUseStatus && s.providerConf.ShowToolCallResult {
+				s.sendToolStatus(event, fmt.Sprintf("%s\n%s", toolStatusCall(name), toolStatusResult(result)))
+			}
 			if event.Trace != nil {
 				event.Trace.Record("agent_tool_result", map[string]interface{}{
-					"tool_name":  name,
+					"tool_name":   name,
 					"tool_result": truncateRunes(result, 200),
 				})
 			}
@@ -1611,8 +1669,10 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	}
 
 	// on_llm_response fires after the LLM reply is produced (e.g. plugins that
-	// capture conversation memory).
-	dispatchSubprocessHooks(s.subPlugins, event, "on_llm_response")
+	// capture conversation memory). Payload carries the reply text.
+	dispatchSubprocessHooksPayload(s.subPlugins, event, "on_llm_response", &pluginsdk.LLMResponse{
+		Text: resp.CompletionText,
+	})
 
 	// Persist the bot reply for enabled group sessions (mirrors
 	// builtin_stars/astrbot/main.py persist_llm_response).
@@ -2042,10 +2102,18 @@ func buildToolCallsMessage(resp *provider.LLMResponse) []map[string]interface{} 
 }
 
 // dispatchSubprocessHooks runs every loaded subprocess plugin's hooks whose
-// Event matches the given event name. These are pipeline-adjacent events
-// (on_message, on_llm_response, on_after_message_sent, on_waiting_llm_request,
-// on_tool_call) that are not star filter handlers.
+// Event matches the given event name (payload-less). These are
+// pipeline-adjacent events (on_message, on_llm_response, on_after_message_sent,
+// on_waiting_llm_request, on_tool_call) that are not star filter handlers.
 func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, hookEvent string) {
+	dispatchSubprocessHooksPayload(sub, event, hookEvent, nil)
+}
+
+// dispatchSubprocessHooksPayload is dispatchSubprocessHooks with a JSON payload
+// for payload-carrying events (on_llm_response → sdk.LLMResponse,
+// on_using_llm_tool/on_llm_tool_respond → sdk.ToolCall, on_plugin_error →
+// sdk.PluginError).
+func dispatchSubprocessHooksPayload(sub *plugin.SubprocessManager, event *core.Event, hookEvent string, payload any) {
 	if sub == nil {
 		return
 	}
@@ -2059,7 +2127,7 @@ func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, h
 				continue
 			}
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-			_, _, err := inst.Client.HandleHook(rpcCtx, h.Name, sdkEvent, nil)
+			_, _, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, sdkEvent, nil, payload)
 			rpcCancel()
 			if err != nil {
 				logger.I18nWarn("插件 %s 钩子 %s (%s) 执行失败: %v", inst.Name, h.Name, hookEvent, err)
@@ -2643,15 +2711,18 @@ func (s *ProcessStage) executeTool(event *core.Event, runtime, name string, args
 	umo := event.UnifiedMsgOrigin()
 	logger.Debug("executeTool: name=%s args=%v", name, args)
 
-	// Dispatch registered plugins' on_tool_call hooks before executing the tool,
-	// stashing the tool name/args on the event metadata for them to read.
+	// Dispatch registered plugins' on_tool_call / on_using_llm_tool hooks before
+	// executing the tool, stashing the tool name/args on the event metadata for
+	// them to read and carrying a sdk.ToolCall payload.
 	if s.subPlugins != nil {
 		if event.Metadata == nil {
 			event.Metadata = make(map[string]interface{})
 		}
 		event.Metadata["tool_name"] = name
 		event.Metadata["tool_args"] = args
-		dispatchSubprocessHooks(s.subPlugins, event, "on_tool_call")
+		call := &pluginsdk.ToolCall{Name: name, Args: args}
+		dispatchSubprocessHooksPayload(s.subPlugins, event, "on_tool_call", call)
+		dispatchSubprocessHooksPayload(s.subPlugins, event, "on_using_llm_tool", call)
 	}
 
 	result := ""
@@ -3114,11 +3185,11 @@ type ResultDecorateStage struct {
 	t2iUseFileService bool
 
 	// TTS settings (provider_tts_settings) + provider manager.
-	providerMgr     *provider.ProviderManager
-	convMgr         *conversation.Manager
-	ttsEnabled      bool
-	ttsTriggerProb  float64
-	ttsDualOutput   bool
+	providerMgr    *provider.ProviderManager
+	convMgr        *conversation.Manager
+	ttsEnabled     bool
+	ttsTriggerProb float64
+	ttsDualOutput  bool
 
 	// forward_threshold: replies longer than this are sent as a forward
 	// message (OneBot node) on the aiocqhttp platform.
@@ -3584,12 +3655,12 @@ type RespondStage struct {
 	subPlugins  *plugin.SubprocessManager
 
 	// Segmented-reply delivery settings (respond/stage.py initialize).
-	segEnabled     *bool
+	segEnabled       *bool
 	segOnlyLLMResult *bool
-	intervalMethod string
-	logBase        float64
-	segIntervalLo  float64
-	segIntervalHi  float64
+	intervalMethod   string
+	logBase          float64
+	segIntervalLo    float64
+	segIntervalHi    float64
 }
 
 func NewRespondStage() *RespondStage {

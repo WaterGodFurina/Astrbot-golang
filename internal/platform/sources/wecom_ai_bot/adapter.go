@@ -41,36 +41,36 @@ type Adapter struct {
 	// EventBus 事件总线（lifecycle 通过 SetEventBus 注入）
 	EventBus platform.EventBus
 
-	id                  string
-	connectionMode      string
-	token               string
-	encodingAESKey      string
-	port                int
-	host                string
-	botName             string
-	initialRespondText  string
+	id                       string
+	connectionMode           string
+	token                    string
+	encodingAESKey           string
+	port                     int
+	host                     string
+	botName                  string
+	initialRespondText       string
 	friendMessageWelcomeText string
-	unifiedWebhookMode  bool
-	webhookUUID         string
-	msgPushWebhookURL   string
-	onlyUseWebhookURLToSend bool
-	longConnectionBotID string
-	longConnectionSecret string
-	longConnectionWSURL string
-	heartbeatInterval   int
+	unifiedWebhookMode       bool
+	webhookUUID              string
+	msgPushWebhookURL        string
+	onlyUseWebhookURLToSend  bool
+	longConnectionBotID      string
+	longConnectionSecret     string
+	longConnectionWSURL      string
+	heartbeatInterval        int
 
-	apiClient           *WecomAIBotAPIClient
-	server              *WecomAIBotServer
+	apiClient            *WecomAIBotAPIClient
+	server               *WecomAIBotServer
 	longConnectionClient *WecomAIBotLongConnectionClient
-	webhookClient       *WecomAIBotWebhookClient
+	webhookClient        *WecomAIBotWebhookClient
 
 	queueMgr *WecomAIQueueMgr
 
 	// streamPlainCache 流式文本缓存（stream_id → 已聚合文本）
-	streamPlainCache   map[string]string
-	streamCacheMu      sync.Mutex
+	streamPlainCache map[string]string
+	streamCacheMu    sync.Mutex
 	// sessionStreamMap 会话 ID → 最近的 stream_id（Go 端 Send 接口只有 sessionID）
-	sessionStreamMap   sync.Map
+	sessionStreamMap sync.Map
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -80,12 +80,12 @@ type Adapter struct {
 // New 构造企业微信智能机器人适配器。
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		config:         config,
-		settings:       settings,
-		EventBus:       eventBus,
-		queueMgr:       NewWecomAIQueueMgr(),
+		config:           config,
+		settings:         settings,
+		EventBus:         eventBus,
+		queueMgr:         NewWecomAIQueueMgr(),
 		streamPlainCache: make(map[string]string),
-		stopCh:         make(chan struct{}),
+		stopCh:           make(chan struct{}),
 	}
 	a.id, _ = config["id"].(string)
 	if a.id == "" {

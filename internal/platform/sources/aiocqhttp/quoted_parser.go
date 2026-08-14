@@ -14,7 +14,7 @@ import (
 // fetching parts). max_component_chain_depth / max_quoted_fallback_images are
 // applied pipeline-side by quoted_message_parser.go.
 type quotedParserSettings struct {
-	maxForwardFetch    int
+	maxForwardFetch     int
 	maxForwardNodeDepth int
 	warnOnActionFailure bool
 }

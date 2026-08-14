@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -220,7 +221,7 @@ func RemoveDir(path string) error {
 
 // PortChecker checks if a TCP port is reachable.
 func PortChecker(port int, host string) bool {
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	conn, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
 		return false

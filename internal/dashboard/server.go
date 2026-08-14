@@ -86,7 +86,7 @@ type Server struct {
 	restartFunc func()
 	// webhookHandlers maps webhook_uuid -> platform callback for the unified
 	// webhook entry (/api/v1/webhooks/platforms/{uuid}).
-	webhookMu      sync.RWMutex
+	webhookMu       sync.RWMutex
 	webhookHandlers map[string]func(http.ResponseWriter, *http.Request)
 }
 
@@ -309,7 +309,7 @@ func (s *Server) setupRoutes() {
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "ok",
-		"version": "0.1.0-go",
+		"version": "1.0.0-go",
 	})
 }
 
@@ -657,7 +657,7 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 	case "version":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"version":           "4.27.2-go",
-			"dashboard_version": "0.1.0-go",
+			"dashboard_version": "1.0.0-go",
 			"python_version":    "go1.23",
 		}))
 	case "versions":

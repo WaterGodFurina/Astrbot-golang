@@ -4,10 +4,28 @@
 
 /**
  * 获取提供商类型对应的图标
- * @param {string} type - 提供商类型
+ * @param {string} type - 提供商类型（如 "openai_chat_completion" / "openai"）
  * @returns {string} 图标 URL
  */
 export function getProviderIcon(type) {
+  if (!type) return '';
+  // 归一化：去掉提供商类型后缀，使 "openai_chat_completion" → "openai"、
+  // "googlegenai_chat_completion" → "google"、"kimi-code" → "kimi" 等，
+  // 从而命中下方图标映射。
+  const key = String(type).trim()
+    .replace(/_chat_completion$/, '')
+    .replace(/_speech_to_text$/, '')
+    .replace(/_text_to_speech$/, '')
+    .replace(/_embedding$/, '')
+    .replace(/_rerank$/, '')
+    .replace(/_tts$/, '')
+    .replace(/_stt$/, '')
+    .replace(/_api$/, '')
+    .replace(/^googlegenai$/, 'google')
+    .replace(/^openai_responses$/, 'openai')
+    .replace(/^openai_whisper$/, 'openai')
+    .replace(/^kimi-code$/, 'kimi');
+
   const icons = {
     'openai': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/openai.svg',
     'azure': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/azure.svg',
@@ -32,6 +50,7 @@ export function getProviderIcon(type) {
     'fastgpt': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/fastgpt-color.svg',
     'lm_studio': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/lmstudio.svg',
     'fishaudio': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/fishaudio.svg',
+    'elevenlabs': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/elevenlabs.svg',
     'minimax': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/minimax.svg',
     'minimax-token-plan': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/minimax.svg',
     'mimo': 'https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/xiaomi.svg',
@@ -49,8 +68,9 @@ export function getProviderIcon(type) {
     "bailian": "https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/bailian-color.svg",
     "volcengine": 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/volcengine-color.svg',
     'huggingface': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/huggingface.svg',
+    'tei': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/huggingface.svg',
   };
-  return icons[type] || '';
+  return icons[key] || '';
 }
 
 /**

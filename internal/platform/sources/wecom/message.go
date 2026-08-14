@@ -28,7 +28,7 @@ type WecomMessage struct {
 	// 文本消息内容
 	Content string
 	// 图片消息：图片 URL 与 MediaID
-	PicURL string
+	PicURL  string
 	MediaID string
 	// 语音消息格式
 	Format string
@@ -36,7 +36,7 @@ type WecomMessage struct {
 	// 事件
 	Event string
 	// 客服事件：Token 与 OpenKfId
-	Token   string
+	Token    string
 	OpenKfID string
 
 	// Raw 原始 XML 解析后的数据（raw_message）

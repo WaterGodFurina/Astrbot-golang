@@ -12,7 +12,7 @@ import (
 // the WebUI "items" shape, and LoadConfigWithDefaults fills nested defaults.
 func TestNormalizeSchemaAndDefaults(t *testing.T) {
 	schema := map[string]interface{}{
-		"type":       "object",
+		"type": "object",
 		"properties": map[string]interface{}{
 			"enabled": map[string]interface{}{
 				"type": "boolean", "description": "on/off", "default": true,
@@ -63,7 +63,7 @@ func flatProps(schema map[string]interface{}) map[string]interface{} {
 func TestLoadConfigWithDefaults(t *testing.T) {
 	m := NewSubprocessManager(nil, t.TempDir())
 	schema := map[string]interface{}{
-		"type":       "object",
+		"type": "object",
 		"properties": map[string]interface{}{
 			"foo": map[string]interface{}{"type": "string", "default": "bar"},
 		},
