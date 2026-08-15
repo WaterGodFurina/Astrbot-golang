@@ -9,7 +9,7 @@
 #   - 手动（workflow_dispatch）：留空 ref 即自动使用当前 GitHub 最新 release 版本；
 #     也可指定分支/tag/SHA 构建特定版本
 #   - 推送 tag（v* / 1.x.y）：自动触发
-name: Astrbot 多平台发布构建
+name: AstrBot-golang 多平台发布构建
 
 on:
   workflow_dispatch:
@@ -182,11 +182,11 @@ jobs:
       - name: 打包 zip（Windows）
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path "astrbot${{ matrix.ext }}" -DestinationPath "astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip"
+        run: Compress-Archive -Path "astrbot${{ matrix.ext }}" -DestinationPath "astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip"
 
       - name: 打包 zip（Linux/macOS）
         if: runner.os != 'Windows'
-        run: zip "astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip" "astrbot${{ matrix.ext }}"
+        run: zip "astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip" "astrbot${{ matrix.ext }}"
 
       # 推送到已存在的最新 Release（不创建新 release）；若该版本没有
       # Release（只有 tag），回退上传 Artifact 兜底，绝不创建 release。
