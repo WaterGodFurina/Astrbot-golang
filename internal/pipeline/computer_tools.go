@@ -16,10 +16,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 )
 
 // errStopGrep stops a directory walk once the result limit is reached.
@@ -732,11 +732,10 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 	defer cancel()
 	cmd = exec.CommandContext(ctx, shellPath(), "-c", command)
 	cmd.Dir = ws
-	if runtime.GOOS != "windows" {
-		// Run the shell in its own process group so a timeout kills the whole
-		// group: sh -c "a; b &" leaves grandchildren running otherwise (L-22).
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	}
+	// Run the shell in its own process group so a timeout kills the whole
+	// group: sh -c "a; b &" leaves grandchildren running otherwise (L-22).
+	// Windows 无进程组，SetProcessGroup 为 no-op（taskkill /T 兜底）。
+	utils.SetProcessGroup(cmd)
 	// CommandContext only kills the direct child on timeout; grandchildren that
 	// inherit the output pipes would keep CombinedOutput blocked and survive as
 	// orphans. Start first so cmd.Process is set before the kill goroutine
@@ -751,7 +750,7 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = utils.KillProcessGroup(cmd)
 		case <-groupDone:
 		}
 	}()

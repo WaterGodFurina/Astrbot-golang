@@ -235,3 +235,75 @@ func TestAuthPersistViaConfigManager(t *testing.T) {
 		t.Fatal("on-disk config missing dashboard.jwt_secret after auth persist")
 	}
 }
+
+func TestSetPasswordRotatesJWTSecret(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "cmd_config.json")
+	pm := NewPasswordManager(cfgPath)
+
+	// 设置初始密码并登录，取得旧 secret 下的会话 token。
+	pm.SetPassword("OldPass@123")
+	oldSecret := pm.JWTSecret()
+	oldToken, err := pm.Login("OldPass@123")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	if !pm.IsAuthenticated(oldToken) {
+		t.Fatal("改密前签发的 token 应可认证")
+	}
+	// 遗留内存 token 也应在改密后失效。
+	legacy := generateRandomToken(32)
+	pm.RegisterToken(legacy)
+	if !pm.IsAuthenticated(legacy) {
+		t.Fatal("遗留内存 token 应可认证")
+	}
+
+	// 改密：轮换 secret，全部旧会话失效。
+	pm.SetPassword("NewPass@456")
+	if pm.JWTSecret() == oldSecret {
+		t.Error("改密后 jwt_secret 应被轮换")
+	}
+	if pm.IsAuthenticated(oldToken) {
+		t.Error("旧 secret 签发的 JWT 在轮换后应失效")
+	}
+	if pm.IsAuthenticated(legacy) {
+		t.Error("遗留内存 token 在改密后应被清除")
+	}
+	if pm.VerifyPassword("OldPass@123") {
+		t.Error("旧密码应校验失败")
+	}
+	newToken, err := pm.Login("NewPass@456")
+	if err != nil {
+		t.Fatalf("新密码登录: %v", err)
+	}
+	if !pm.IsAuthenticated(newToken) {
+		t.Error("新密码签发的 token 应可认证")
+	}
+
+	// 落盘配置携带新 secret。
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("config not written: %v", err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	dash, _ := cfg["dashboard"].(map[string]interface{})
+	persisted, _ := dash["jwt_secret"].(string)
+	if persisted == "" || persisted == oldSecret {
+		t.Errorf("落盘 jwt_secret 应为轮换后的值, got %q", persisted)
+	}
+
+	// 重启加载后语义保持一致。
+	pm2 := NewPasswordManager(cfgPath)
+	if pm2.JWTSecret() != pm.JWTSecret() {
+		t.Error("重启后 secret 应等于轮换后的值")
+	}
+	if pm2.IsAuthenticated(oldToken) {
+		t.Error("旧 token 重启后应保持失效")
+	}
+	if !pm2.IsAuthenticated(newToken) {
+		t.Error("新 token 重启后应保持有效")
+	}
+}

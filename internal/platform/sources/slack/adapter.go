@@ -165,8 +165,11 @@ func (a *Adapter) Start(ctx context.Context) error {
 	}
 	// 获取机器人自身用户 ID（auth_test）
 	if resp, err := a.client.AuthTestContext(ctx); err == nil {
+		a.mu.Lock()
 		a.botSelfID = resp.UserID
-		logger.I18nInfo("Slack auth test OK. Bot ID: %s", a.botSelfID)
+		botSelfID := a.botSelfID
+		a.mu.Unlock()
+		logger.I18nInfo("Slack auth test OK. Bot ID: %s", botSelfID)
 	} else {
 		logger.I18nWarn("Slack auth test 失败: %v", err)
 	}
@@ -193,10 +196,12 @@ func (socketLogAdapter) Output(_ int, s string) error {
 // startSocketMode 启动 Socket Mode 客户端（对应 Python SlackSocketClient）。
 func (a *Adapter) startSocketMode(ctx context.Context) error {
 	socketCtx, cancel := context.WithCancel(ctx)
+	a.mu.Lock()
 	a.socketCancel = cancel
 	a.socket = socketmode.New(a.client,
 		socketmode.OptionLog(socketLogAdapter{}),
 	)
+	a.mu.Unlock()
 	logger.I18nInfo("Slack 适配器 (Socket Mode) 启动中...")
 
 	go func() {
@@ -294,7 +299,10 @@ func (a *Adapter) processIncomingEvent(event map[string]interface{}) {
 
 // startWebhookMode 启动 Webhook 模式（对应 Python run() 的 webhook 分支）。
 func (a *Adapter) startWebhookMode(ctx context.Context) error {
-	a.webhook = NewSlackWebhookServer(a.signingSecret, a.webhookPath, a.handleWebhookEvent)
+	wh := NewSlackWebhookServer(a.signingSecret, a.webhookPath, a.handleWebhookEvent)
+	a.mu.Lock()
+	a.webhook = wh
+	a.mu.Unlock()
 
 	// 统一 webhook 模式：不启动独立服务器，等待 dashboard 回调注入 (非阻塞)
 	if a.unifiedWebhookMode {
@@ -312,19 +320,26 @@ func (a *Adapter) startWebhookMode(ctx context.Context) error {
 // Stop 关闭适配器。
 func (a *Adapter) Stop() error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	select {
 	case <-a.stopCh:
 	default:
 		close(a.stopCh)
 	}
-	if a.socket != nil {
-		if a.socketCancel != nil {
-			a.socketCancel()
-		}
+	// 取出 cancel 并在锁外调用：cancel() 可能触发 socketmode 的回调/清理，
+	// 不应持锁执行。置 nil 防止重复 Stop 二次调用已取消的 cancel。
+	var cancel context.CancelFunc
+	if a.socket != nil && a.socketCancel != nil {
+		cancel = a.socketCancel
+		a.socketCancel = nil
 	}
-	if a.webhook != nil {
-		a.webhook.Stop()
+	webhook := a.webhook
+	a.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if webhook != nil {
+		webhook.Stop()
 	}
 	logger.I18nInfo("Slack 适配器已被关闭")
 	return nil
@@ -359,7 +374,9 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 	defer cancel()
 
 	abm := platform.NewAstrBotMessage()
+	a.mu.Lock()
 	abm.SelfID = a.botSelfID
+	a.mu.Unlock()
 	abm.Message = []message.Component{}
 
 	// 获取用户信息

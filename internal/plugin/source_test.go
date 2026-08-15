@@ -23,10 +23,40 @@ func TestArchiveExt(t *testing.T) {
 		"https://example.com/x.ZIP":    ".zip",
 		"https://example.com/x.bin":    ".bin",
 		"/local/dir/archive.tar.gz":    ".tar.gz",
+		// Query strings and fragments must not break archive detection (L-46
+		// follow-up: "https://x/y.zip?token=..." was misrouted to git clone).
+		"https://example.com/x.zip?token=abc":      ".zip",
+		"https://example.com/x.tar.gz?sig=1":       ".tar.gz",
+		"https://example.com/x.tgz#frag":           ".tgz",
+		"https://example.com/x.zip?token=abc#frag": ".zip",
 	}
 	for in, want := range cases {
 		if got := archiveExt(in); got != want {
 			t.Errorf("archiveExt(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestIsArchiveURLWithQuery verifies archive URLs carrying a query string or
+// fragment are still recognized as archives instead of falling through to a
+// git clone.
+func TestIsArchiveURLWithQuery(t *testing.T) {
+	cases := map[string]bool{
+		"https://example.com/x.zip":             true,
+		"https://example.com/x.zip?token=abc":   true,
+		"https://example.com/x.zip?token=abc#f": true,
+		"https://example.com/x.tar.gz?sig=1":    true,
+		"https://example.com/x.tgz#frag":        true,
+		"https://example.com/x.zip/":            false,
+		"https://example.com/x.bin?token=abc":   false,
+		"https://example.com/x.bin":             false,
+		"/local/dir/archive.zip":                true,
+		"/local/dir/archive.tar.gz":             true,
+		"/local/dir/archive.tgz":                true,
+	}
+	for in, want := range cases {
+		if got := isArchiveURL(in); got != want {
+			t.Errorf("isArchiveURL(%q) = %v, want %v", in, got, want)
 		}
 	}
 }

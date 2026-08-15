@@ -1,0 +1,216 @@
+# AstrBot-Golang 多平台发布构建
+#
+# 结构镜像自 cosmic-native 工作流：
+#   - release-meta：探测版本元信息（不绑定特定版本号，自动取 GitHub 最新 release）
+#   - astrbot-native：按矩阵交叉编译多平台二进制（go.mod 的 Go 版本变更后自动同步，
+#     无需手动修改本文件）
+#
+# 触发方式：
+#   - 手动（workflow_dispatch）：留空 ref 即自动使用当前 GitHub 最新 release 版本；
+#     也可指定分支/tag/SHA 构建特定版本
+#   - 推送 tag（v* / 1.x.y）：自动触发
+name: Astrbot 多平台发布构建
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '构建的 git 引用（分支/tag/SHA）。留空 = 自动使用 GitHub 最新 release'
+        required: false
+        default: ''
+      go_version:
+        description: '覆盖 Go 版本（留空 = 自动读取 go.mod，保持同步）'
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*.*'
+
+jobs:
+  # ── go.sum 重建：go-querystruct v1.0.0 的 tag 被上游 force-push 过，sumdb
+  # 记录的内容已不存在于 proxy.golang.org / 源码；goproxy.cn 缓存了含
+  # params 包的正确内容。本 job 用 goproxy.cn 重建 go.sum 并自动提交回仓库，
+  # 之后 tag 需同步到新提交再触发构建（详见 memory.md）。
+  update-go-sum:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: 用 goproxy.cn 重建 go.sum（含 params 的正确内容）
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+        run: go mod tidy
+
+      - name: 有变更则提交回仓库并同步 tag
+        run: |
+          if ! git diff --quiet go.mod go.sum; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            # checkout 处于 detached HEAD，先切回 main 分支再提交推送
+            git checkout -B main
+            git add go.mod go.sum
+            git commit -m "chore: rebuild go.sum"
+            git push origin main --force
+            # 同步发布 tag，触发 tag 事件自动跑完整构建
+            git tag -f 1.0.1 HEAD
+            git push origin 1.0.1 --force
+            echo "已提交新的 go.sum 并同步 tag"
+          else
+            echo "go.sum 与 goproxy.cn 一致，无变更"
+          fi
+
+  # ── 版本/元信息：自动探测最新 release 版本 + 读取 go.mod 的 Go 版本 ──
+  release-meta:
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.meta.outputs.kind }}
+      ref: ${{ steps.meta.outputs.ref }}
+      version: ${{ steps.meta.outputs.version }}
+      go_version: ${{ steps.meta.outputs.go_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: 读取 go.mod 的 Go 版本
+        id: gomod
+        run: |
+          ver=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' go.mod | head -1)
+          echo "go_version=${ver}" >> "$GITHUB_OUTPUT"
+          echo "go.mod Go 版本: ${ver}"
+
+      - name: 探测最新 release 版本（GitHub API，不绑定特定版本号）
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          KIND="release"
+          REF="${{ inputs.ref }}"
+          VERSION=""
+          if [ -z "$REF" ]; then
+            # 自动取 GitHub 最新 release 的 tag（非特定版本号）
+            if TAG=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null); then
+              REF="$TAG"
+              VERSION="$TAG"
+              echo "已自动定位到最新 release: ${TAG}"
+            else
+              # 无 release 时回退到最近 tag，再退到当前 commit
+              KIND="tag"
+              REF="$(git describe --tags --abbrev=0 2>/dev/null || echo "${GITHUB_SHA}")"
+              VERSION="$REF"
+              echo "无 GitHub release，回退到最近 tag: ${REF}"
+            fi
+          else
+            VERSION="$REF"
+            echo "使用手动指定 ref: ${REF}"
+          fi
+          echo "kind=${KIND}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "go_version=${{ steps.gomod.outputs.go_version }}" >> "$GITHUB_OUTPUT"
+
+  # ── 多平台原生构建矩阵（镜像 cosmic-native）──
+  astrbot-native:
+    name: AstrBot ${{ matrix.resource }}
+    needs: [release-meta, update-go-sum]
+    permissions:
+      contents: write
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc,   resource: windows-x86_64,     goos: windows, goarch: amd64,   ext: .exe, libc: msvc }
+          - { runner: windows-latest, target: aarch64-pc-windows-msvc,  resource: windows-aarch64,    goos: windows, goarch: arm64,   ext: .exe, libc: msvc }
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-gnu,   resource: linux-x86_64-gnu,     goos: linux, goarch: amd64,   ext: '',   libc: gnu }
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-musl,  resource: linux-x86_64-musl,    goos: linux, goarch: amd64,   ext: '',   libc: musl }
+          - { runner: ubuntu-latest,  target: aarch64-unknown-linux-gnu,  resource: linux-aarch64-gnu,    goos: linux, goarch: arm64,   ext: '',   libc: gnu }
+          - { runner: ubuntu-latest,  target: aarch64-unknown-linux-musl, resource: linux-aarch64-musl,   goos: linux, goarch: arm64,   ext: '',   libc: musl }
+          - { runner: ubuntu-latest,  target: loongarch64-unknown-linux-gnu,  resource: linux-loongarch64-gnu,  goos: linux, goarch: loong64, ext: '', libc: gnu }
+          - { runner: ubuntu-latest,  target: loongarch64-unknown-linux-musl, resource: linux-loongarch64-musl, goos: linux, goarch: loong64, ext: '', libc: musl }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin,   resource: macos-x86_64,   goos: darwin, goarch: amd64,  ext: '', libc: '' }
+          - { runner: macos-14,       target: aarch64-apple-darwin,  resource: macos-aarch64,  goos: darwin, goarch: arm64,  ext: '', libc: '' }
+          - { runner: ubuntu-latest,  target: aarch64-linux-android, resource: android-aarch64, goos: android, goarch: arm64, ext: '', libc: '' }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release-meta.outputs.ref }}
+
+      # Go 版本自动跟随 go.mod：go.mod 的 go 指令变更后，此处自动使用新版本，
+      # 无需手动修改本 workflow（requirements: go 版本与 go.mod 同步）。
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # 用 env 块注入交叉编译环境变量：bash（Linux/macOS）与
+      # PowerShell（Windows runner）均支持，避免平台 shell 语法差异。
+      # GOPROXY=goproxy.cn：go-querystruct v1.0.0 上游 force-push 后，
+      # proxy.golang.org 的内容缺少 params 包无法编译，goproxy.cn 有正确内容。
+      # GONOSUMDB：goproxy.cn 内容与 sumdb 记录不一致，豁免该模块的 sumdb 校验
+      # （go.sum 仍强制校验）。GOFLAGS=-mod=mod：检出 tag 的 go.sum 可能缺少
+      # go-querystruct 条目，构建时自动补全（自愈），保证构建不被旧 go.sum 阻塞。
+      - name: 交叉编译 AstrBot（CGO_ENABLED=0，纯 Go，modernc.org/sqlite）
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GOFLAGS: -mod=mod
+        run: go build -trimpath -ldflags="-s -w" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
+
+      # 打包为 zip：asset 名带 version+resource，多个矩阵分支/多次运行
+      # 之间不会同名覆盖（此前裸文件名 `astrbot` 在多平台间冲突导致上传 404）。
+      - name: 打包 zip（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "astrbot${{ matrix.ext }}" -DestinationPath "astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip"
+
+      - name: 打包 zip（Linux/macOS）
+        if: runner.os != 'Windows'
+        run: zip "astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip" "astrbot${{ matrix.ext }}"
+
+      # 推送到已存在的最新 Release（不创建新 release）；若该版本没有
+      # Release（只有 tag），回退上传 Artifact 兜底，绝不创建 release。
+      # shell: bash 显式指定：Windows runner 默认 PowerShell 不认 bash 语法。
+      - name: 上传到最新 Release（不存在则跳过）
+        id: release_upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release-meta.outputs.version }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "astrbot-$VERSION-${{ matrix.resource }}.zip" --clobber
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+            echo "已上传到 Release $VERSION (${{ matrix.resource }})"
+          else
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Release $VERSION 不存在，不创建 release，改用 Artifact"
+          fi
+
+      - name: 上传 Artifact（Release 不存在时兜底）
+        if: steps.release_upload.outputs.uploaded != 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}
+          path: astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip
+          if-no-files-found: error

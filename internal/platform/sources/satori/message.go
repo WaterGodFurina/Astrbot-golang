@@ -714,9 +714,12 @@ func convertComponentToSatori(comp message.Component) string {
 	case *message.Reply:
 		return fmt.Sprintf(`<reply id="%s"/>`, c.MessageID)
 	case *message.Video:
-		ref := c.Path
+		// 优先 URL：<video src> 是交给 Satori 网关解析的资源引用，materialize
+		// 会把同一 URL 同时填充为本地临时 Path，而该临时文件在 Send 返回后即被
+		// 清理，且网关未必与 bot 同机，无法读取 bot 侧的临时路径。
+		ref := c.URL
 		if ref == "" {
-			ref = c.URL
+			ref = c.Path
 		}
 		if ref == "" {
 			ref = c.FileID

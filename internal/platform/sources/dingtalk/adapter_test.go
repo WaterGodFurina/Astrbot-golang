@@ -1,10 +1,13 @@
 package dingtalk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -615,5 +618,93 @@ func TestHandleCallbackAcksBeforeAsyncProcessing(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("回调数据应入队待异步处理 (L-28)")
+	}
+}
+
+// ---------- 端到端：URL 媒体经 PlatformManager.Send 物化后上传 (方案4) ----------
+
+// TestSendMaterializedURLMediaThroughManager 验证经 PlatformManager.Send（而非
+// adapter 直调）发送含 URL 的 Record/Image 链：materialize 先下载为本地临时文件，
+// 钉钉适配器在 Send 期间能读到本地文件并上传，Send 返回后临时文件被 cleanup 删除。
+func TestSendMaterializedURLMediaThroughManager(t *testing.T) {
+	// 媒体源服务器：/voice.ogg（.ogg 扩展名，prepareVoiceForDingtalk 无需 ffmpeg 转码）
+	// 与 /image.png。materialize 使用默认 http.Client 直接访问该地址（127.0.0.1）。
+	mediaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/voice.ogg":
+			_, _ = w.Write([]byte("voice-bytes"))
+		case "/image.png":
+			_, _ = w.Write([]byte("image-bytes"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mediaSrv.Close()
+
+	var uploadedVoice, uploadedImage bool
+	var voiceBody []byte
+	a := newTokenTestAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"tok","expireIn":7200}`))
+		case "/media/upload":
+			mediaType := r.URL.Query().Get("type")
+			if err := r.ParseMultipartForm(64 << 20); err != nil {
+				t.Errorf("解析上传表单失败: %v", err)
+			}
+			if mediaType == "voice" {
+				uploadedVoice = true
+				if files := r.MultipartForm.File["media"]; len(files) > 0 {
+					f, _ := files[0].Open()
+					voiceBody, _ = io.ReadAll(f)
+					_ = f.Close()
+				}
+			} else if mediaType == "image" {
+				uploadedImage = true
+			}
+			_, _ = w.Write([]byte(`{"media_id":"m1"}`))
+		case "/v1.0/robot/groupMessages/send":
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	a.convMu.Lock()
+	a.knownGroups["conv_1"] = true
+	a.convMu.Unlock()
+
+	pm := platform.NewPlatformManager()
+	pm.Register(a)
+
+	chain := message.NewMessageChain(
+		&message.Record{URL: mediaSrv.URL + "/voice.ogg"},
+		message.ImageFromURL(mediaSrv.URL+"/image.png"),
+	)
+	if err := pm.Send(a.ID(), "conv_1", chain); err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+	if !uploadedVoice {
+		t.Fatal("语音媒体应被物化为本地文件并上传到钉钉")
+	}
+	if !uploadedImage {
+		t.Fatal("图片媒体应被物化为本地文件并上传到钉钉")
+	}
+	// 上传到钉钉的语音内容应与下载的原始内容一致（.ogg 无需转码）
+	if !bytes.Equal(voiceBody, []byte("voice-bytes")) {
+		t.Fatalf("上传的语音内容 = %q, 期望 %q", voiceBody, "voice-bytes")
+	}
+
+	// Send 返回后，materialize 的临时文件应被 PlatformManager.Send 的 cleanup 删除
+	rec := chain.Chain[0].(*message.Record)
+	if rec.File == "" {
+		t.Fatal("语音应已物化为本地临时文件")
+	}
+	if _, err := os.Stat(rec.File); !os.IsNotExist(err) {
+		t.Fatalf("语音临时文件 %s 应在 Send 后被清理, stat err = %v", rec.File, err)
+	}
+	img := chain.Chain[1].(*message.Image)
+	if _, err := os.Stat(img.Path); !os.IsNotExist(err) {
+		t.Fatalf("图片临时文件 %s 应在 Send 后被清理, stat err = %v", img.Path, err)
 	}
 }

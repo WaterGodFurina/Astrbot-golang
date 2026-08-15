@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -436,4 +437,75 @@ func TestGetFileBase64RejectsOversize(t *testing.T) {
 	if _, err := a.getFileBase64(context.Background(), srv.URL); err == nil {
 		t.Error("超过大小上限的 Slack 文件下载应报错")
 	}
+}
+
+// ── socket/webhook 字段竞态回归（race detector 验证）────────────────
+
+// runStartStopRace concurrently drives one startXxx (which assigns
+// a.socket/a.webhook/socketCancel) against repeated Stop calls, so the write
+// under lock and the read+consume under lock are exercised under -race.
+func runStartStopRace(t *testing.T, a *Adapter, start func()) {
+	t.Helper()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		start()
+	}()
+	for i := 0; i < 50; i++ {
+		if err := a.Stop(); err != nil {
+			t.Fatalf("Stop 返回错误: %v", err)
+		}
+	}
+	wg.Wait()
+}
+
+// TestSocketModeStartStopConcurrent verifies that assigning a.socket and
+// a.socketCancel under a.mu does not race with Stop's locked read, and that
+// the cancel is consumed exactly once (subsequent Stops are no-ops).
+func TestSocketModeStartStopConcurrent(t *testing.T) {
+	a := New(map[string]interface{}{
+		"id":                    "slack-race",
+		"bot_token":             "xoxb-test",
+		"app_token":             "xapp-test",
+		"slack_connection_mode": "socket",
+	}, nil, nil)
+	if a.client == nil {
+		t.Fatal("adapter 应初始化 client")
+	}
+	// Pre-cancelled ctx makes socketmode.RunContext exit immediately without
+	// dialing Slack; the test only exercises the field-sync/lifecycle.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	defer cancel()
+
+	runStartStopRace(t, a, func() {
+		_ = a.startSocketMode(ctx)
+	})
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.socketCancel != nil {
+		t.Error("Stop 后 socketCancel 应被置 nil（防止重复取消）")
+	}
+	if a.socket == nil {
+		t.Error("socket 客户端应已创建")
+	}
+}
+
+// TestWebhookModeStartStopConcurrent mirrors the socket test for the webhook
+// field (a.webhook), in unified mode so no HTTP server is started.
+func TestWebhookModeStartStopConcurrent(t *testing.T) {
+	a := New(map[string]interface{}{
+		"id":                    "slack-race",
+		"bot_token":             "xoxb-test",
+		"signing_secret":        "secret",
+		"slack_connection_mode": "webhook",
+		"unified_webhook_mode":  true,
+		"webhook_uuid":          "uuid-1",
+	}, nil, nil)
+
+	runStartStopRace(t, a, func() {
+		_ = a.startWebhookMode(context.Background())
+	})
 }

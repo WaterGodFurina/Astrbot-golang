@@ -304,3 +304,69 @@ func TestRecordKBTaskStoresKBIDAndNilSafe(t *testing.T) {
 		t.Fatalf("KBID = %q, want kb1", got.KBID)
 	}
 }
+
+// ── handleChatSessions "messages" GET must return real history ──
+
+func TestChatSessionsMessagesReturnsHistory(t *testing.T) {
+	cs := newChatStore(t.TempDir())
+	sess, err := cs.createSession("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs.appendMessage(sess.SessionID, map[string]interface{}{"role": "user", "content": "hello"})
+	cs.appendMessage(sess.SessionID, map[string]interface{}{"role": "assistant", "content": "world"})
+
+	s := &Server{chat: cs}
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/chat/sessions/"+sess.SessionID+"/messages", nil)
+	s.handleChatSessions(w, r, []string{sess.SessionID, "messages"})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp struct {
+		Data struct {
+			Messages []map[string]interface{} `json:"messages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Data.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2 (was a stub returning empty)", len(resp.Data.Messages))
+	}
+	if resp.Data.Messages[0]["content"] != "hello" {
+		t.Errorf("first message content = %v", resp.Data.Messages[0]["content"])
+	}
+}
+
+// ── skillFilePath: ".." inside a name is legal; real traversal stays blocked ──
+
+func TestSkillFilePathAllowsDotsInsideName(t *testing.T) {
+	// "a..b" is a legitimate single-segment directory name, not traversal.
+	p, err := skillFilePath("a..b", "file.txt")
+	if err != nil {
+		t.Fatalf("skillFilePath(a..b) should be allowed: %v", err)
+	}
+	if !strings.HasSuffix(p, string(os.PathSeparator)+"a..b"+string(os.PathSeparator)+"file.txt") {
+		t.Errorf("unexpected path: %s", p)
+	}
+
+	// Actual traversal vectors remain blocked: skillName separators / exact
+	// ".." are rejected, and relPath ".." is neutralized by Clean + the
+	// containment check so the result never escapes the skill root.
+	if _, err := skillFilePath("..", "x"); err == nil {
+		t.Error("exact '..' must be rejected")
+	}
+	if _, err := skillFilePath("../evil", "x"); err == nil {
+		t.Error("separator traversal name must be rejected")
+	}
+	root, _ := filepath.Abs(filepath.Join("data", "skills", "ok"))
+	p2, err := skillFilePath("ok", "../../etc/passwd")
+	if err != nil {
+		t.Fatalf("relPath '..' should be neutralized, not error: %v", err)
+	}
+	if !strings.HasPrefix(p2, root+string(os.PathSeparator)) {
+		t.Errorf("relPath traversal escaped skill root: %s", p2)
+	}
+}

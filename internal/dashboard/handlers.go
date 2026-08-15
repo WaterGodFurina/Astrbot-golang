@@ -5206,8 +5206,19 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 						"message": "message updated",
 					}))
 				} else {
+					// 返回该会话的真实历史消息（此前为恒空 stub）。
+					detail := s.chat.sessionDetail(sessionID)
+					messages := []interface{}{}
+					if detail != nil {
+						if h, ok := detail["history"].([]map[string]interface{}); ok {
+							messages = make([]interface{}, len(h))
+							for i, m := range h {
+								messages[i] = m
+							}
+						}
+					}
 					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"messages": []interface{}{},
+						"messages": messages,
 					}))
 				}
 				return
@@ -6253,10 +6264,12 @@ func skillFileEditable(name string) bool {
 // skillFilePath resolves a file path inside data/skills/<name>, guarding
 // against path traversal.
 func skillFilePath(skillName, relPath string) (string, error) {
-	// 校验 skillName：仅允许单段目录名，拒绝空名、"."、含路径分隔符或
-	// ".." 的名字，防止 skillName 携带 ../ 使 root 越出 data/skills/ 目录。
+	// 校验 skillName：仅允许单段目录名，拒绝空名、"."、含路径分隔符的名字，
+	// 防止 skillName 携带 ../ 使 root 越出 data/skills/ 目录。注意不拒绝
+	// 形如 "a..b" 的名字——".." 仅是合法目录名字符，真正越界由下面的
+	// filepath.Clean + containment 检查兜底（与 skills/manager.go 一致）。
 	if skillName == "" || skillName == "." || skillName == ".." ||
-		strings.ContainsAny(skillName, `/\\`) || strings.Contains(skillName, "..") {
+		strings.ContainsAny(skillName, `/\\`) {
 		return "", fmt.Errorf("非法技能名")
 	}
 	root, err := filepath.Abs(filepath.Join("data", "skills", skillName))

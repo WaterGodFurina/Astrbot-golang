@@ -345,26 +345,40 @@ func isLocalArchiveFile(s string) bool {
 	return isArchiveURL(s)
 }
 
+// archivePath returns the path portion of s used for archive-suffix matching.
+// For http/https URLs the query string and fragment are stripped (a source like
+// "https://x/y.zip?token=..." must still be recognized as a .zip archive and
+// not fall through to a git clone). Local paths are returned unchanged.
+func archivePath(s string) string {
+	if isHTTP(s) {
+		if u, err := url.Parse(s); err == nil && u.Path != "" {
+			return u.Path
+		}
+	}
+	return s
+}
+
 func isArchiveURL(s string) bool {
-	return strings.HasSuffix(s, ".zip") ||
-		strings.HasSuffix(s, ".tar.gz") ||
-		strings.HasSuffix(s, ".tgz")
+	p := archivePath(s)
+	return strings.HasSuffix(p, ".zip") ||
+		strings.HasSuffix(p, ".tar.gz") ||
+		strings.HasSuffix(p, ".tgz")
 }
 
 // archiveExt maps an archive source URL to a fixed cache-file extension that
 // extractArchive recognizes. filepath.Ext("x.tar.gz") returns only ".gz",
 // which matches none of the switch cases, so multi-dot suffixes are preserved.
 func archiveExt(s string) string {
-	lower := strings.ToLower(s)
+	p := strings.ToLower(archivePath(s))
 	switch {
-	case strings.HasSuffix(lower, ".tar.gz"):
+	case strings.HasSuffix(p, ".tar.gz"):
 		return ".tar.gz"
-	case strings.HasSuffix(lower, ".tgz"):
+	case strings.HasSuffix(p, ".tgz"):
 		return ".tgz"
-	case strings.HasSuffix(lower, ".zip"):
+	case strings.HasSuffix(p, ".zip"):
 		return ".zip"
 	}
-	return filepath.Ext(s)
+	return filepath.Ext(p)
 }
 
 func gitClone(ctx context.Context, url, dest string) error {

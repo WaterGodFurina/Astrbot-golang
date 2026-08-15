@@ -7,6 +7,7 @@ package weixin_oc
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,12 @@ import (
 )
 
 var logger = log.GetDefault().WithComponent("WeixinOC")
+
+// sdkCallTimeout bounds every SDK call (media download / upload / send). The
+// ilink SDK's default HTTP client has no Timeout of its own — it relies on the
+// passed context — so context.Background() would let a stuck CDN/API hang the
+// message handler forever.
+const sdkCallTimeout = 30 * time.Second
 
 // maxMediaDownloadSize 限制发送时下载外部媒体的大小上限。
 const maxMediaDownloadSize = 20 << 20
@@ -192,12 +199,19 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 		components = append(components, &message.Plain{Text: body})
 	}
 
-	// Media items: image / voice / file / video.
+	// Media items: image / voice / file / video. The SDK downloads via
+	// http.NewRequestWithContext and its default client has no Timeout, so a
+	// stuck CDN must be bounded here.
+	ctx, cancel := context.WithTimeout(context.Background(), sdkCallTimeout)
+	defer cancel()
 	for _, item := range msg.ItemList {
 		switch item.Type {
 		case ilink.ItemTypeImage:
 			if item.ImageItem != nil && item.ImageItem.Media != nil {
-				if data, err := a.bot.DownloadImage(context.Background(), item.ImageItem); err == nil && len(data) > 0 {
+				data, err := a.bot.DownloadImage(ctx, item.ImageItem)
+				if err != nil {
+					a.logMediaError("image", msg.MessageID, err)
+				} else if len(data) > 0 {
 					if path := a.saveMedia(data, "image", ".png"); path != "" {
 						components = append(components, &message.Image{Path: path, File: path})
 					}
@@ -205,7 +219,10 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 			}
 		case ilink.ItemTypeVoice:
 			if item.VoiceItem != nil && item.VoiceItem.Media != nil {
-				if data, _, err := a.bot.DownloadVoice(context.Background(), item.VoiceItem); err == nil && len(data) > 0 {
+				data, _, err := a.bot.DownloadVoice(ctx, item.VoiceItem)
+				if err != nil {
+					a.logMediaError("voice", msg.MessageID, err)
+				} else if len(data) > 0 {
 					if path := a.saveMedia(data, "audio", ".wav"); path != "" {
 						components = append(components, &message.Record{Path: path, File: path, URL: path})
 					}
@@ -214,7 +231,10 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 		case ilink.ItemTypeFile:
 			if item.FileItem != nil && item.FileItem.Media != nil {
 				name := item.FileItem.FileName
-				if data, _, err := a.bot.DownloadFile(context.Background(), item.FileItem); err == nil && len(data) > 0 {
+				data, _, err := a.bot.DownloadFile(ctx, item.FileItem)
+				if err != nil {
+					a.logMediaError("file", msg.MessageID, err)
+				} else if len(data) > 0 {
 					if path := a.saveMedia(data, "file", filepath.Ext(name)); path != "" {
 						components = append(components, &message.File{Name: name, Path: path})
 					}
@@ -222,7 +242,10 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 			}
 		case ilink.ItemTypeVideo:
 			if item.VideoItem != nil && item.VideoItem.Media != nil {
-				if data, err := a.bot.Download(context.Background(), item.VideoItem.Media.EncryptQueryParam, item.VideoItem.Media.AESKey); err == nil && len(data) > 0 {
+				data, err := a.bot.Download(ctx, item.VideoItem.Media.EncryptQueryParam, item.VideoItem.Media.AESKey)
+				if err != nil {
+					a.logMediaError("video", msg.MessageID, err)
+				} else if len(data) > 0 {
 					if path := a.saveMedia(data, "video", ".mp4"); path != "" {
 						components = append(components, &message.Video{Path: path, FileID: path})
 					}
@@ -315,7 +338,11 @@ func (a *Adapter) saveMedia(data []byte, kind, suffix string) string {
 
 // Send sends a message chain to a user.
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
-	ctx := context.Background()
+	// SDK upload/send calls use http.NewRequestWithContext with a client that
+	// has no Timeout — always bound them so a stuck connection cannot hang the
+	// whole send path.
+	ctx, cancel := context.WithTimeout(context.Background(), sdkCallTimeout)
+	defer cancel()
 	var pendingText string
 	for _, comp := range chain.Chain {
 		switch c := comp.(type) {
@@ -428,4 +455,14 @@ func (a *Adapter) sendRecord(ctx context.Context, userID string, rec *message.Re
 			AESKey:            up.AESKey,
 		},
 	})
+}
+
+// logMediaError logs an inbound media download failure, calling out timeouts
+// explicitly since the SDK's default HTTP client has no built-in deadline.
+func (a *Adapter) logMediaError(kind string, msgID int64, err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		logger.Warn("媒体下载超时（kind=%s message_id=%d）: %v", kind, msgID, err)
+		return
+	}
+	logger.Debug("媒体下载失败（kind=%s message_id=%d）: %v", kind, msgID, err)
 }

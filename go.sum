@@ -15,6 +15,8 @@ cloud.google.com/go/pubsub v1.1.0/go.mod h1:EwwdRX2sKPjnvnqCa270oGRyludottCI76h+
 cloud.google.com/go/storage v1.0.0/go.mod h1:IhtSnM/ZTZV8YYJWCY8RULGVqBDmpoyjwiyrjsg+URw=
 cloud.google.com/go/storage v1.5.0/go.mod h1:tpKbwo567HUNpVclU5sGELwQWBDZ8gh0ZeosJ0Rtdos=
 dmitri.shuralyov.com/gpu/mtl v0.0.0-20190408044501-666a987793e9/go.mod h1:H6x//7gZCb22OMCxBHrMx7a5I7Hp++hsVxbQ4BYO7hU=
+github.com/Baidu-AIP/golang-sdk v1.3.0 h1:4seSE5qO+YFGRI+QoaxTgAaLdbWqEZwJW/SjPwvdeRY=
+github.com/Baidu-AIP/golang-sdk v1.3.0/go.mod h1:bXnGw7xPeKt8aF7UCELKrV6UZ/46spItONK1RQBQj1Y=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
 github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f h1:LCMtWWBtcYBtQz5Erl2jshPyIiSU28eFpLG6itRTyxM=
@@ -23,10 +25,10 @@ github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5 h1:bBmmB7he0i
 github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5/go.mod h1:0UcFaCkhp6vZw6l5Dpq0Dp673CoF9GdvA8lTfst0GiU=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=
 github.com/STARRY-S/zip v0.2.3/go.mod h1:lqJ9JdeRipyOQJrYSOtpNAiaesFO6zVDsE8GIGFaoSk=
-github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.0.2 h1:yu/eEJMLLXVABV8SemWfbHoAJ12fraPYhCdRjaTHakw=
-github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.0.2/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
 github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.1.0 h1:oQErGSDzVAz3h3Te6OJ2RaoyeCMDTeQstpbAQ85zeN4=
 github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.1.0/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
+github.com/WaterGodFurina/nanovec v1.0.1 h1:ooxW9HHgubXg5Sw/LakyBZDca3EK3x2ia7XhSWyC9uI=
+github.com/WaterGodFurina/nanovec v1.0.1/go.mod h1:doZwEzURN2t8myIZADAy4cyEomjYQTeZsW0NwtElyMI=
 github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=
 github.com/andybalholm/brotli v1.2.0/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/blusewang/wx v1.3.3 h1:QZP04/QTjaYF6B91ueVZtEcr7luUjSQ+YPAJC76PDAo=
@@ -131,8 +133,6 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/hashicorp/yamux v0.1.1 h1:yrQxtgseBDrq9Y652vSRDvsKCJKOUD+GzTS4Y0Y8pvE=
 github.com/hashicorp/yamux v0.1.1/go.mod h1:CtWFDAQgb7dxtzFs4tWbplKIe2jSi3+5vKbgIO0SLnQ=
-github.com/hungpdn/nanovec v0.0.0-20260205215424-956786fcfa80 h1:crUbVUo+i66wohBxzxK7Sjq3DpWn9R9LZZuRk3xiSJM=
-github.com/hungpdn/nanovec v0.0.0-20260205215424-956786fcfa80/go.mod h1:doZwEzURN2t8myIZADAy4cyEomjYQTeZsW0NwtElyMI=
 github.com/ianlancetaylor/demangle v0.0.0-20181102032728-5e5cf60278f6/go.mod h1:aSSvb/t6k1mPoxDqO4vJh6VOCGPwU4O0C2/Eqndh1Sc=
 github.com/jhump/protoreflect v1.15.1 h1:HUMERORf3I3ZdX05WaQ6MIpd/NJ434hTp5YiKgfCL6c=
 github.com/jhump/protoreflect v1.15.1/go.mod h1:jD/2GMKKE6OqX8qTjhADU1e6DShO+gavG9e0Q693nKo=

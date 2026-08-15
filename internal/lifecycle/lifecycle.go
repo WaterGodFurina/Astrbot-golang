@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
@@ -607,7 +606,7 @@ func (l *Lifecycle) Restart() {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	utils.DetachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		logger.Error("Restart: spawn new instance failed: %v", err)
 		return
@@ -863,8 +862,13 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 		l.subPluginMgr.TriggerHookPayload(ctx, pluginsdk.EventOnPlatformLoaded, map[string]string{"platform": adapter.ID()})
 		loaded++
 	}
-	if loaded == 0 && (failed > 0 || skipped == 0) {
+	if loaded == 0 && failed > 0 {
 		return fmt.Errorf("loadPlatforms: no platform started (created %d, failed %d, skipped %d)", loaded, failed, skipped)
+	}
+	if loaded == 0 {
+		// 配置里没有平台（或全部禁用）也允许启动：dashboard 等仍可用，
+		// 后续真正收发消息时 PlatformManager 会因找不到适配器报错。
+		logger.I18nWarn("当前未启动任何平台适配器（配置中平台为空或全部禁用），机器人将以无平台模式运行")
 	}
 	return nil
 }
@@ -942,11 +946,11 @@ func cleanupOrphanPlugins() {
 	}
 	logger.I18nWarn("发现 %d 个上次异常退出遗留的孤儿插件进程，正在清理...", len(orphans))
 	for _, pid := range orphans {
-		_ = syscall.Kill(pid, syscall.SIGTERM)
+		_ = utils.KillProcess(pid)
 	}
 	time.Sleep(orphanCleanupGrace)
 	for _, pid := range orphans {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+		_ = utils.ForceKillProcess(pid)
 	}
 	logger.I18nInfo("已清理 %d 个孤儿插件进程", len(orphans))
 }

@@ -631,7 +631,11 @@ func (pm *PasswordManager) SetUsername(username string) {
 	pm.saveToConfig("")
 }
 
-// SetPassword updates the dashboard password (re-hashes).
+// SetPassword updates the dashboard password (re-hashes) and rotates the JWT
+// signing secret so every previously-issued session token becomes invalid:
+// existing JWTs fail signature verification against the new secret, and legacy
+// in-memory tokens are dropped. This is the standard "credential change logs
+// all sessions out" behavior.
 func (pm *PasswordManager) SetPassword(password string) {
 	if password == "" {
 		return
@@ -642,6 +646,8 @@ func (pm *PasswordManager) SetPassword(password string) {
 	pm.hashedPassword = newHash
 	pm.plainPassword = password
 	pm.passwordChangeRequired = false
+	pm.jwtSecret = generateRandomToken(32)
+	pm.tokens = make(map[string]bool)
 	pm.mu.Unlock()
 	// Now persist to config file (uses pm.hashedPassword which is already updated)
 	pm.saveToConfig(password)

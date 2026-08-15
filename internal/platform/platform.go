@@ -659,10 +659,20 @@ func (pm *PlatformManager) StopAll() {
 
 // Send sends a message chain to a session.
 func (pm *PlatformManager) Send(platformID, sessionID string, chain *message.MessageChain) error {
+	if platformID == "" {
+		return fmt.Errorf("platformID 为空：无法确定目标平台，请传入平台类型或实例 ID")
+	}
 	adapter := pm.resolveAdapter(platformID)
 	if adapter == nil {
-		return fmt.Errorf("platform %s not found", platformID)
+		return fmt.Errorf("platform %q not found", platformID)
 	}
+	// 在发送前把链中的远程 http(s) 媒体 URL 物化为本地临时文件，使
+	// "把 URL 当本地路径" 的适配器（如钉钉 voice/video/file）不再把 URL
+	// 直接喂给 os.ReadFile / ffmpeg。URL 字段保留不变，URL-aware 的适配器
+	// 不受影响；下载失败/被拒绝时组件原样保留。临时文件在 Send 返回后
+	// 由 cleanup 统一删除（适配器自身产生的临时文件由适配器各自负责）。
+	cleanup := materializeRemoteMedia(chain)
+	defer cleanup()
 	return adapter.Send(sessionID, chain)
 }
 
@@ -681,9 +691,12 @@ func (pm *PlatformManager) GetFragmenter(platformID string) StreamFragmenter {
 // React adds an emoji reaction to a message on the given platform. Returns
 // an error if the platform does not support reactions or is not loaded.
 func (pm *PlatformManager) React(platformID, sessionID, messageID, emoji string) error {
+	if platformID == "" {
+		return fmt.Errorf("platformID 为空：无法确定目标平台")
+	}
 	adapter := pm.resolveAdapter(platformID)
 	if adapter == nil {
-		return fmt.Errorf("platform %s not found", platformID)
+		return fmt.Errorf("platform %q not found", platformID)
 	}
 	r, ok := adapter.(Reactor)
 	if !ok {

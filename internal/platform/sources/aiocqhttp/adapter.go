@@ -9,8 +9,10 @@ package aiocqhttp
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -222,12 +224,16 @@ func (a *Adapter) nodeToCQ(n *message.Node) map[string]interface{} {
 	}
 }
 
-// sendAction sends a OneBot v11 API call over an active reverse-WS connection.
+// sendAction sends a OneBot v11 API call over an active reverse-WS connection,
+// fire-and-forget. The echo is registered in pending and consumed
+// asynchronously by observeSendAction so the API-level response is not silently
+// dropped: failures (status != ok) and missing responses are logged.
 func (a *Adapter) sendAction(action string, params map[string]interface{}) error {
+	echo := fmt.Sprintf("astrbot-%d", time.Now().UnixNano())
 	payload, err := json.Marshal(map[string]interface{}{
 		"action": action,
 		"params": params,
-		"echo":   fmt.Sprintf("astrbot-%d", time.Now().UnixNano()),
+		"echo":   echo,
 	})
 	if err != nil {
 		return err
@@ -243,6 +249,13 @@ func (a *Adapter) sendAction(action string, params map[string]interface{}) error
 	if len(conns) == 0 {
 		return fmt.Errorf("aiocqhttp: no active WebSocket connection to send %s", action)
 	}
+
+	// Register the echo before writing so a fast response cannot arrive before
+	// the waiter exists.
+	ch := make(chan map[string]interface{}, 1)
+	a.pendingMu.Lock()
+	a.pending[echo] = ch
+	a.pendingMu.Unlock()
 
 	// Try each connection; drop ones that fail so future sends pick a healthy peer.
 	var lastErr error
@@ -260,12 +273,39 @@ func (a *Adapter) sendAction(action string, params map[string]interface{}) error
 			lastErr = err
 			continue
 		}
+		go a.observeSendAction(action, echo, ch)
 		return nil
 	}
+
+	// Write failed on every connection: drop the pending registration so the
+	// map does not accumulate a waiter that will never be consumed.
+	a.pendingMu.Lock()
+	delete(a.pending, echo)
+	a.pendingMu.Unlock()
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no reachable connection")
 	}
 	return fmt.Errorf("aiocqhttp: failed to send %s: %w", action, lastErr)
+}
+
+// observeSendAction consumes the echo response of a fire-and-forget sendAction.
+// The read loop delivers the response to ch and closes it; a missing response is
+// cleaned up after actionTimeout.
+func (a *Adapter) observeSendAction(action, echo string, ch chan map[string]interface{}) {
+	select {
+	case resp, ok := <-ch:
+		if !ok {
+			return
+		}
+		if _, err := parseActionResult(resp); err != nil {
+			logger.Warn("aiocqhttp: %s 返回失败: %v", action, err)
+		}
+	case <-time.After(actionTimeout):
+		a.pendingMu.Lock()
+		delete(a.pending, echo)
+		a.pendingMu.Unlock()
+		logger.Warn("aiocqhttp: %s 超时（%s 内未收到响应）", action, actionTimeout)
+	}
 }
 
 // handleHTTP handles HTTP POST requests from OneBot v11 implementations.
@@ -280,8 +320,22 @@ func (a *Adapter) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bound the request body so a peer cannot exhaust memory with an oversized
+	// payload (the token is optional per OneBot v11, so this endpoint may be
+	// reachable without authentication).
+	const maxEventBody = 1 << 20 // 1 MiB
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxEventBody+1))
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+	if len(body) > maxEventBody {
+		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	var event map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+	if err := json.Unmarshal(body, &event); err != nil {
 		logger.Error("Failed to decode event: %v", err)
 		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
@@ -302,7 +356,24 @@ func (a *Adapter) authValid(r *http.Request) bool {
 	}
 	auth := r.Header.Get("Authorization")
 	queryToken := r.URL.Query().Get("access_token")
-	return strings.HasPrefix(auth, "Bearer "+a.Token) || auth == a.Token || queryToken == a.Token
+	// Bound input length so oversized headers/queries can't be used to probe
+	// or exhaust resources.
+	const maxAuthLen = 4096
+	if len(auth) > maxAuthLen || len(queryToken) > maxAuthLen {
+		return false
+	}
+	// Exact (constant-time) comparison: HasPrefix on "Bearer "+token would
+	// accept trailing garbage (token "tok" + "Bearer tokXYZ").
+	token := []byte(a.Token)
+	const bearerPrefix = "Bearer "
+	if strings.HasPrefix(auth, bearerPrefix) {
+		got := []byte(strings.TrimPrefix(auth, bearerPrefix))
+		if subtle.ConstantTimeCompare(got, token) == 1 {
+			return true
+		}
+	}
+	return subtle.ConstantTimeCompare([]byte(auth), token) == 1 ||
+		subtle.ConstantTimeCompare([]byte(queryToken), token) == 1
 }
 
 // handleWebSocket serves the reverse WebSocket endpoint. OneBot
@@ -468,8 +539,10 @@ func (a *Adapter) CallAction(api string, params map[string]any) (map[string]any,
 	return nil, fmt.Errorf("aiocqhttp: failed to call %s: %w", api, lastErr)
 }
 
-// actionTimeout bounds how long CallAction waits for an echo response.
-const actionTimeout = 10 * time.Second
+// actionTimeout bounds how long CallAction waits for an echo response, and how
+// long sendAction's async observer waits for the fire-and-forget response.
+// Var (not const) so tests can shorten it.
+var actionTimeout = 10 * time.Second
 
 // actionSeq is a process-wide monotonic counter producing unique echo strings
 // for OneBot actions. Concurrent plugin goroutines call CallAction, so the
@@ -900,13 +973,16 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 			switch {
 			case c.Base64 != "":
 				imgData["file"] = "base64://" + c.Base64
+			case c.URL != "":
+				// 远程 URL 交由 OneBot 侧下载；materialize 会把同一 URL 同时
+				// 填充为本地临时 Path/File，这里必须优先 URL，避免把会在
+				// PlatformManager.Send 返回后被清理的临时路径发给 OneBot。
+				imgData["url"] = c.URL
+				imgData["file"] = c.URL
 			case c.Path != "":
 				imgData["file"] = c.Path
 			case c.File != "":
 				imgData["file"] = c.File
-			case c.URL != "":
-				imgData["url"] = c.URL
-				imgData["file"] = c.URL
 			}
 			segments = append(segments, map[string]interface{}{
 				"type": "image",
