@@ -235,6 +235,26 @@ func (c *AstrBotConfig) Set(key string, value interface{}) error {
 	return c.Save()
 }
 
+// DeleteNested removes a leaf key at a nested path (e.g. "dashboard",
+// "password") and saves. Missing intermediate maps are ignored.
+func (c *AstrBotConfig) DeleteNested(keys ...string) error {
+	c.mu.Lock()
+	if len(keys) > 0 {
+		node := c.data
+		for i, k := range keys {
+			if i == len(keys)-1 {
+				delete(node, k)
+			} else if m, ok := node[k].(map[string]interface{}); ok {
+				node = m
+			} else {
+				break
+			}
+		}
+	}
+	c.mu.Unlock()
+	return c.Save()
+}
+
 // Save persists the current config to disk atomically.
 func (c *AstrBotConfig) Save() error {
 	return c.save(2)
@@ -407,6 +427,13 @@ func checkConfigIntegrity(refer, conf map[string]interface{}, path string) bool 
 			logger.I18nWarn("配置类型在 %s 处不匹配，使用默认值", fullPath)
 			newConf[key] = refVal
 			hasNew = true
+		} else if !refIsMap && !sameConfigKind(refVal, userVal) {
+			// 参考值为列表等容器而用户值是其他类型：下游（如限流配置、工具
+			// schema）会对列表做类型断言，保留错误类型会导致 panic。与 map
+			// 分支对称，直接以默认值替换。
+			logger.I18nWarn("配置类型在 %s 处不匹配，使用默认值", fullPath)
+			newConf[key] = refVal
+			hasNew = true
 		} else {
 			newConf[key] = userVal
 		}
@@ -508,6 +535,24 @@ func joinPath(parent, key string) string {
 	return parent + "." + key
 }
 
+// sameConfigKind reports whether user's value has the same container kind as
+// the reference value (both lists, both maps, or the reference is a scalar).
+// Scalar types are not strongly validated — only container kind mismatches
+// (e.g. reference expects a list but the user wrote a string) are caught, so
+// downstream type assertions cannot panic.
+func sameConfigKind(ref, user interface{}) bool {
+	switch ref.(type) {
+	case []interface{}:
+		_, ok := user.([]interface{})
+		return ok
+	case map[string]interface{}:
+		_, ok := user.(map[string]interface{})
+		return ok
+	default:
+		return true
+	}
+}
+
 func repeatSpace(n int) string {
 	if n <= 0 {
 		return ""
@@ -530,7 +575,10 @@ type SchemaNode struct {
 	Items        *SchemaNode            // for list type
 }
 
-// NewConfig creates an AstrBotConfig from a path and schema.
+// NewConfig creates an AstrBotConfig from a path and schema. When the config
+// file already exists it is loaded (and integrity-checked) immediately, so a
+// fresh config is never left empty; when it is missing the defaults are saved.
+// A failed load is logged (the caller may still retry Load or reset).
 func NewConfig(path string, schema *SchemaNode) *AstrBotConfig {
 	defaults := schemaToDefaultsMap(schema)
 	cfg := &AstrBotConfig{
@@ -543,6 +591,8 @@ func NewConfig(path string, schema *SchemaNode) *AstrBotConfig {
 		if err := cfg.save(4); err != nil {
 			logger.Error("Failed to create default config: %v", err)
 		}
+	} else if err := cfg.Load(); err != nil {
+		logger.Error("Failed to load existing config %s: %v", path, err)
 	}
 	return cfg
 }

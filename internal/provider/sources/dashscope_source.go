@@ -62,6 +62,9 @@ func (s *DashScopeSource) TextChatStream(ctx context.Context, req *provider.Prov
 		apiBase:      s.apiBase,
 		apiKey:       s.apiKey,
 		client:       s.client,
+		// DashScope does not create a dedicated stream client; reuse the
+		// (timeout-bounded) request client so streaming cannot hang forever.
+		streamClient: s.client,
 	}
 	return openai.TextChatStream(ctx, req)
 }

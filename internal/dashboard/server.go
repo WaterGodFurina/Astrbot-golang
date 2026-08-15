@@ -1457,13 +1457,10 @@ func (s *Server) injectAuthFields(dash map[string]interface{}) {
 	}
 	dash["username"] = s.auth.Username()
 	if h := s.auth.HashedPassword(); h != "" {
-		dash["pbkdf2_password"] = h
+		dash["password"] = h
 	}
-	// The plaintext password mirrors the hash so a config save round-trip
-	// (which strips "password") does not drop the persisted credential.
-	if p := s.auth.PlainPassword(); p != "" {
-		dash["password"] = p
-	}
+	// 明文密码不再持久化：password 字段只存哈希，配置保存（会剔除 password
+	// 键）不会丢失凭据。
 	if sec := s.auth.JWTSecret(); sec != "" {
 		dash["jwt_secret"] = sec
 	}

@@ -1,9 +1,11 @@
 package pipeline
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 )
@@ -74,11 +76,21 @@ func TestDoomLoop(t *testing.T) {
 	event := &core.Event{
 		Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"},
 	}
-	// shell is whitelisted (exempt from doom detection).
+	// Shell is tracked by command content: DIFFERENT commands never trip the
+	// detector, but re-issuing the SAME command is paused like any other tool.
+	shellArgs := func(cmd string) map[string]interface{} { return map[string]interface{}{"command": cmd} }
 	for i := 0; i < 10; i++ {
-		if !s.checkDoomLoop(event, "astrbot_execute_shell") {
-			t.Fatal("whitelisted tool should never be paused")
+		if !s.checkDoomLoop(event, doomLoopKey("astrbot_execute_shell", shellArgs(fmt.Sprintf("cmd %d", i)))) {
+			t.Fatal("distinct shell commands should never be paused")
 		}
+	}
+	for i := 0; i < doomLoopThreshold-1; i++ {
+		if !s.checkDoomLoop(event, doomLoopKey("astrbot_execute_shell", shellArgs("rm -rf /tmp/x"))) {
+			t.Fatal("same shell command before threshold should pass")
+		}
+	}
+	if s.checkDoomLoop(event, doomLoopKey("astrbot_execute_shell", shellArgs("rm -rf /tmp/x"))) {
+		t.Fatal("repeated identical shell command at threshold should be paused")
 	}
 	// A non-whitelisted tool pauses after doomLoopThreshold consecutive calls.
 	for i := 0; i < doomLoopThreshold-1; i++ {
@@ -134,6 +146,65 @@ func TestDoomConfirmByUMOAndSender(t *testing.T) {
 	}
 	if !s.checkDoomLoop(event, "read") {
 		t.Fatal("tool should be unpaused after confirmation")
+	}
+}
+
+// TestDoomTrackerPruneIdleSessions: a tracker of a session idle beyond the TTL
+// is pruned lazily on the next checkDoomLoop, so the map cannot grow without
+// bound on long-running bots (5.3).
+func TestDoomTrackerPruneIdleSessions(t *testing.T) {
+	s := testProcessStageWithConfig(t, map[string]interface{}{})
+	event := &core.Event{
+		Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"},
+	}
+	s.checkDoomLoop(event, "read")
+	s.checkDoomLoop(event, "read")
+
+	// Age the session beyond the TTL.
+	s.doomMu.Lock()
+	s.doomTrackers[event.UnifiedMsgOrigin()].lastSeen = time.Now().Add(-doomTrackerTTL - time.Minute)
+	s.doomMu.Unlock()
+
+	// The next check prunes the stale tracker and starts counting fresh.
+	if !s.checkDoomLoop(event, "read") {
+		t.Fatal("stale tracker must be pruned, not counted toward a loop")
+	}
+	s.doomMu.Lock()
+	tr := s.doomTrackers[event.UnifiedMsgOrigin()]
+	count := -1
+	if tr != nil {
+		count = tr.count
+	}
+	s.doomMu.Unlock()
+	if count != 1 {
+		t.Fatalf("expected a fresh tracker with count=1 after pruning, got count=%d", count)
+	}
+}
+
+// TestDoomTrackerPausedSessionNotPruned: a paused session (pending owner
+// confirmation) survives the TTL sweep so the doom-confirm flow cannot be
+// broken by pruning (5.3).
+func TestDoomTrackerPausedSessionNotPruned(t *testing.T) {
+	s := testProcessStageWithConfig(t, map[string]interface{}{})
+	event := &core.Event{
+		Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"},
+	}
+	for i := 0; i < doomLoopThreshold; i++ {
+		s.checkDoomLoop(event, "read")
+	} // paused
+
+	s.doomMu.Lock()
+	s.doomTrackers[event.UnifiedMsgOrigin()].lastSeen = time.Now().Add(-doomTrackerTTL - time.Minute)
+	s.doomMu.Unlock()
+
+	if s.checkDoomLoop(event, "read") {
+		t.Fatal("paused tool must stay paused after an idle period beyond the TTL")
+	}
+	if got := s.maybeHandleDoomConfirm(&core.Event{
+		MessageStr: "继续",
+		Source:     core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"},
+	}); got != doomResumed {
+		t.Fatal("paused session must still be confirmable after the TTL sweep")
 	}
 }
 

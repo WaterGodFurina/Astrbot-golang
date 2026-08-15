@@ -1,10 +1,15 @@
 package pipeline
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/ratelimit"
 )
 
 func TestBuiltinToolsSchema(t *testing.T) {
@@ -153,5 +158,89 @@ func TestMCPContentText(t *testing.T) {
 	}
 	if out := mcpContentText(nil); out != "" {
 		t.Errorf("expected empty for nil, got %q", out)
+	}
+}
+
+// TestRateLimitStallDropsAfterMaxDelays: the stall strategy re-queues a
+// rate-limited event up to rateLimitMaxDelays times, then stops it instead of
+// re-queuing forever under sustained traffic (5.4).
+func TestRateLimitStallDropsAfterMaxDelays(t *testing.T) {
+	s := NewRateLimitStage()
+	// One slot per hour so every event after the first stalls for ~1h.
+	s.limiter = ratelimit.NewRateLimiter(1, time.Hour, ratelimit.StrategyStall)
+	s.eventBus = core.NewEventBus(10)
+
+	ctx := context.Background()
+	mk := func(msg string) *core.Event {
+		return &core.Event{
+			MessageStr: msg,
+			Source:     core.EventSource{Platform: "plat", ConvID: "c1"},
+		}
+	}
+
+	// Fill the only slot of the window.
+	first, err := s.Process(ctx, mk("first"))
+	if err != nil || first == nil || !first.Continue {
+		t.Fatalf("first event should be allowed: res=%+v err=%v", first, err)
+	}
+
+	// Below the cap: the event is re-queued and the counter increments.
+	ev := mk("stalled")
+	for i := 0; i < rateLimitMaxDelays; i++ {
+		res, err := s.Process(ctx, ev)
+		if err != nil {
+			t.Fatalf("process attempt %d: %v", i, err)
+		}
+		if res == nil || res.Continue {
+			t.Fatalf("stalled event must not continue (attempt %d)", i)
+		}
+		if ev.IsStopped() {
+			t.Fatalf("event stopped before the cap (attempt %d)", i)
+		}
+		if got, _ := ev.GetExtra(rateLimitDelaysKey).(int); got != i+1 {
+			t.Fatalf("delay counter = %d, want %d (attempt %d)", got, i+1, i)
+		}
+	}
+
+	// At the cap: the event is dropped (stopped) instead of re-queued again.
+	res, err := s.Process(ctx, ev)
+	if err != nil {
+		t.Fatalf("final process: %v", err)
+	}
+	if res == nil || res.Continue {
+		t.Fatal("capped event must not continue")
+	}
+	if !ev.IsStopped() {
+		t.Fatal("capped event must be stopped instead of re-queued")
+	}
+}
+
+// TestRateLimitStallCountsPerEvent: re-queue counters live in event metadata,
+// so different events of the same session are counted independently.
+func TestRateLimitStallCountsPerEvent(t *testing.T) {
+	s := NewRateLimitStage()
+	s.limiter = ratelimit.NewRateLimiter(1, time.Hour, ratelimit.StrategyStall)
+	s.eventBus = core.NewEventBus(10)
+
+	ctx := context.Background()
+	mk := func(msg string) *core.Event {
+		return &core.Event{
+			MessageStr: msg,
+			Source:     core.EventSource{Platform: "plat", ConvID: "c1"},
+		}
+	}
+	if res, err := s.Process(ctx, mk("first")); err != nil || !res.Continue {
+		t.Fatalf("first event should be allowed: %v", err)
+	}
+	a, b := mk("a"), mk("b")
+	for i := 0; i < rateLimitMaxDelays; i++ {
+		s.Process(ctx, a)
+		s.Process(ctx, b)
+	}
+	if got, _ := a.GetExtra(rateLimitDelaysKey).(int); got != rateLimitMaxDelays {
+		t.Fatalf("a counter = %d, want %d", got, rateLimitMaxDelays)
+	}
+	if got, _ := b.GetExtra(rateLimitDelaysKey).(int); got != rateLimitMaxDelays {
+		t.Fatalf("b counter = %d, want %d", got, rateLimitMaxDelays)
 	}
 }

@@ -160,6 +160,52 @@ func TestDispatchWorkerPreservesSessionOrder(t *testing.T) {
 	}
 }
 
+// TestDispatchWorkerSurvivesPanic ensures a panic in dispatch (here: a broken
+// completion signal with a nil channel, which panics in close) is recovered by
+// the worker goroutine instead of crashing the process, and the same worker
+// keeps processing subsequent events of that session.
+func TestDispatchWorkerSurvivesPanic(t *testing.T) {
+	bus := NewEventBus(10)
+	received := make(chan *Event, 4)
+	bus.RegisterScheduler("test", func() *PipelineScheduler {
+		s := NewPipelineScheduler("test")
+		s.AddStage(&captureStage{received: received})
+		return s
+	}())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go bus.Start(ctx)
+	defer bus.Stop()
+
+	// Same UMO so both events land on the same worker.
+	source := EventSource{Platform: "plat", ConvID: "same"}
+	broken := &Event{
+		MessageStr: "broken",
+		Source:     source,
+		Metadata:   map[string]interface{}{MetadataPipelineDone: &PipelineDone{ch: nil}},
+	}
+	if err := bus.Publish(broken); err != nil {
+		t.Fatalf("publish broken failed: %v", err)
+	}
+	ok := &Event{MessageStr: "ok", Source: source}
+	if err := bus.Publish(ok); err != nil {
+		t.Fatalf("publish ok failed: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case got := <-received:
+			if got == ok {
+				return
+			}
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	t.Fatal("worker did not dispatch the next event after recovering from a panic")
+}
+
 // TestDispatchWorkerConcurrentAcrossSessions verifies a slow event blocked in
 // one session does not stall a different session's event.
 func TestDispatchWorkerConcurrentAcrossSessions(t *testing.T) {

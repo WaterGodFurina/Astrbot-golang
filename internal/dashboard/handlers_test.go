@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -440,5 +442,117 @@ func TestLoginRateLimit(t *testing.T) {
 	// A different IP is unaffected.
 	if !limiter.Allow("5.6.7.8", 1.0, 3.0) {
 		t.Fatal("a different client should not be throttled")
+	}
+}
+
+// TestSetupChangesPasswordToHashAndOverridesUsername: 前端改密（setup 端点）
+// 必须把新密码转为哈希写入配置，且显式填写的用户名覆盖配置文件中的 username。
+func TestSetupChangesPasswordToHashAndOverridesUsername(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "cmd_config.json")
+	s := NewServer(0, cfgPath)
+	defer s.Stop()
+
+	// 重置等待状态：磁盘只有 password=哈希 + change_required=true，无 username。
+	s.auth.SetUsername("")
+	pm := s.auth
+	if pm.Username() != "" {
+		// SetUsername 忽略空值，改用直接构造等待状态。
+		pm.mu.Lock()
+		pm.username = ""
+		pm.mu.Unlock()
+	}
+	if pm.Username() != "" {
+		t.Fatal("failed to set up waiting state")
+	}
+
+	// 通过 setup 端点显式填用户名 + 密码（首次设置，无需旧密码）。
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup",
+		strings.NewReader(`{"username":"myadmin","password":"HashMe@123","confirm_password":"HashMe@123"}`))
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("setup: want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+
+	// 1) 磁盘 password 必须是 PBKDF2 哈希，绝不是明文。
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := cfg["dashboard"].(map[string]interface{})
+	if h, _ := d["password"].(string); !isPBKDF2Hash(h) {
+		t.Fatalf("dashboard.password must be a PBKDF2 hash after setup, got %q", h)
+	}
+	if h, _ := d["password"].(string); h == "HashMe@123" {
+		t.Fatal("plaintext password must never be persisted")
+	}
+	if _, exists := d["pbkdf2_password"]; exists {
+		t.Fatal("legacy pbkdf2_password key must not be written")
+	}
+	// 2) 显式填写的用户名覆盖（写入）配置文件。
+	if got, _ := d["username"].(string); got != "myadmin" {
+		t.Fatalf("username must be written to config, got %q", got)
+	}
+
+	// 3) 登录用新凭据。
+	if !s.auth.VerifyPassword("HashMe@123") {
+		t.Fatal("new password must verify")
+	}
+	if s.auth.Username() != "myadmin" {
+		t.Fatalf("in-memory username = %q, want myadmin", s.auth.Username())
+	}
+
+	// 4) 重启后凭据完整，不重置。
+	pm2 := NewPasswordManager(cfgPath)
+	if pm2.Username() != "myadmin" {
+		t.Fatalf("reloaded username = %q, want myadmin", pm2.Username())
+	}
+	if pm2.PasswordChangeRequired() {
+		t.Fatal("after setup, change must no longer be required")
+	}
+	if !pm2.VerifyPassword("HashMe@123") {
+		t.Fatal("reloaded manager must verify the new password")
+	}
+}
+
+// TestAccountEditOverridesUsername: 前端改密同时显式填新用户名时，配置中的
+// username 被覆盖（非首次设置路径）。
+func TestAccountEditOverridesUsername(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "cmd_config.json")
+	s := NewServer(0, cfgPath)
+	defer s.Stop()
+
+	s.auth.SetPassword("OldPw@123")
+	s.auth.SetUsername("old_admin")
+	if got, _ := readDashboardSection(t, cfgPath)["username"].(string); got != "old_admin" {
+		t.Fatalf("setup username = %q, want old_admin", got)
+	}
+
+	req := authedRequest(t, s, http.MethodPost, "/api/auth/account/edit",
+		strings.NewReader(`{"new_username":"new_admin","new_password":"NewPw@456","password":"OldPw@123"}`))
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("account edit: want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+
+	d := readDashboardSection(t, cfgPath)
+	if got, _ := d["username"].(string); got != "new_admin" {
+		t.Fatalf("username must be overridden in config, got %q", got)
+	}
+	if h, _ := d["password"].(string); !isPBKDF2Hash(h) {
+		t.Fatalf("password must be a PBKDF2 hash after edit, got %q", h)
+	}
+	if s.auth.VerifyPassword("OldPw@123") {
+		t.Fatal("old password must no longer verify")
+	}
+	if !s.auth.VerifyPassword("NewPw@456") {
+		t.Fatal("new password must verify")
 	}
 }

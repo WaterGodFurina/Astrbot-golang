@@ -18,12 +18,26 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-// forbiddenImports are packages plugin source may not import (safety
-// blacklist). Plugins run as subprocesses; these primitives allow arbitrary
-// host execution / memory tricks and are surfaced to the user as risks.
+// forbiddenImports are packages plugin source may not import. This is a
+// 风险提示 (risk hint), NOT a security boundary: it only flags exact-match
+// import paths in the plugin's own .go files and never blocks anything by
+// itself.
+//
+// What it does NOT cover:
+//   - indirect imports (a dependency pulling in os/exec, syscall, ...);
+//   - cgo (import "C" / #cgo flags are reported as risks, not hard-rejected);
+//   - //go:linkname and //go:generate (reported as risks, not hard-rejected);
+//   - equivalent unlisted packages (os, net, net/http, io/fs, ...) that can
+//     spawn processes or touch the host filesystem/network just as easily.
+//
+// The real isolation boundary is the child process: plugins run as separate
+// subprocesses under the same OS user, so a misbehaving plugin can reach the
+// host's files and network no matter what is listed here. This list only
+// surfaces obvious risk to the user before install.
 var forbiddenImports = []string{"os/exec", "syscall", "unsafe", "reflect"}
 
 // riskyDirectives are comment directives in the plugin's own source that can
@@ -61,6 +75,14 @@ type ScanFinding struct {
 // file and collects any blacklisted import as a ScanFinding. It does NOT
 // reject the plugin; the caller decides (install is blocked unless the user
 // explicitly ignores the risk). Does not require network or a Go toolchain.
+//
+// Like forbiddenImports, this scan is a 风险提示 (risk hint), not a security
+// boundary. It only inspects the plugin's own source for exact-match imports
+// and comment directives: indirect dependencies, cgo, //go:linkname and
+// //go:generate (flagged, never hard-blocked), and unlisted equivalents
+// (os, net, net/http, io/fs, ...) are all outside its coverage. Real
+// isolation comes from running the plugin as a child subprocess of AstrBot
+// (same OS user), never from this scan.
 func StaticScan(srcDir string) ([]ScanFinding, error) {
 	var findings []ScanFinding
 	err := filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
@@ -294,6 +316,19 @@ func safeRedirect(req *http.Request, via []*http.Request) error {
 
 // rejectLocalHost rejects hosts that are or resolve to the local machine,
 // private or link-local networks (SSRF guard).
+//
+// The check FAILS CLOSED: a host whose name cannot be resolved is rejected
+// instead of skipped, so a resolution error or attacker-controlled DNS can
+// never silently bypass the guard.
+//
+// Residual DNS-rebinding window: this guard resolves the hostname, then the
+// actual connection happens separately. On the HTTP download path
+// (downloadFileWithProgress) the connection is pinned to a single resolution
+// (see pinnedDialContext), so the address dialed cannot be swapped between
+// the check and the connect. Git clones go through the external `git` CLI,
+// which re-resolves the hostname on its own; for that path this check remains
+// a best-effort hint and a rebinding attacker could still point git at an
+// internal address.
 func rejectLocalHost(host string) error {
 	h := strings.ToLower(strings.TrimSuffix(host, "."))
 	if h == "localhost" || h == "ip6-localhost" || strings.HasSuffix(h, ".localhost") {
@@ -310,8 +345,9 @@ func rejectLocalHost(host string) error {
 	}
 	ips, err := net.LookupIP(h)
 	if err != nil {
-		// 解析失败不误杀：克隆/下载仍会失败并暴露连接错误。
-		return nil
+		// 解析失败必须拒绝（fail closed）：无法验证目标不是内网地址时
+		// 不允许继续，防止 DNS 故障/恶意 DNS 跳过 SSRF 检查。
+		return fmt.Errorf("域名解析失败: %s (%w)", host, err)
 	}
 	for _, ip := range ips {
 		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
@@ -319,6 +355,56 @@ func rejectLocalHost(host string) error {
 		}
 	}
 	return nil
+}
+
+// pinnedDialContext returns an http.Transport DialContext that resolves each
+// hostname exactly once (on first use) and pins every subsequent dial of that
+// host to the first resolution result. Combined with rejectLocalHost, this
+// closes the DNS-rebinding TOCTOU window on the HTTP download path: the
+// address actually dialed comes from a single resolution, so an attacker
+// cannot answer "public IP" to the guard and "internal IP" to the connection.
+// The request URL is left untouched, so the Host header and TLS SNI still
+// carry the original hostname. Redirect targets are resolved independently
+// (and each is re-checked by safeRedirect). IPv4 is preferred when a host
+// returns both families, since the pin removes the dialer's multi-address
+// fallback.
+func pinnedDialContext() func(ctx context.Context, network, addr string) (net.Conn, error) {
+	var mu sync.Mutex
+	pinned := map[string]net.IP{}
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		ip, ok := pinned[host]
+		mu.Unlock()
+		if !ok {
+			ips, err := net.LookupIP(host)
+			if err != nil {
+				return nil, fmt.Errorf("resolve %s: %w", host, err)
+			}
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("resolve %s: no addresses", host)
+			}
+			ip = ips[0]
+			for _, cand := range ips {
+				if cand.To4() != nil {
+					ip = cand
+					break
+				}
+			}
+			mu.Lock()
+			if prev, ok := pinned[host]; ok {
+				ip = prev // a concurrent dial won the pin race; use its result
+			} else {
+				pinned[host] = ip
+			}
+			mu.Unlock()
+		}
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+	}
 }
 
 func isHTTP(s string) bool {
@@ -404,8 +490,25 @@ func downloadFile(ctx context.Context, url, dest string) error {
 
 // downloadFileWithProgress streams a URL to dest, invoking progress(downloaded,
 // total) as bytes are written (when non-nil) so callers can show a live bar.
+//
+// The connection is pinned to a single DNS resolution per host
+// (pinnedDialContext), so after rejectLocalHost's check the actual dial
+// cannot be re-resolved to a different (e.g. internal) address. Each redirect
+// hop is re-validated by safeRedirect and resolves on its own.
 func downloadFileWithProgress(ctx context.Context, url, dest string, progress func(downloaded, total int64)) error {
-	client := &http.Client{Timeout: 30 * time.Minute, CheckRedirect: safeRedirect}
+	// Pinning: 每个 host 只解析一次，连接地址 = 检查时验证过的地址
+	// （DNS-rebinding TOCTOU 防护，见 pinnedDialContext）。URL 保持不变，
+	// Host header 与 TLS SNI 仍然携带原始主机名。
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           pinnedDialContext(),
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	client := &http.Client{Timeout: 30 * time.Minute, CheckRedirect: safeRedirect, Transport: transport}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err

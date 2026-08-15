@@ -48,7 +48,10 @@ func sendActionWS(t *testing.T, wantStatus string) (*Adapter, *httptest.Server) 
 		t.Fatalf("dial ws: %v", err)
 	}
 	a := New(map[string]interface{}{"id": "test"}, nil, nil)
-	a.addConn(conn)
+	if err := a.addConn(conn); err != nil {
+		srv.Close()
+		t.Fatalf("addConn: %v", err)
+	}
 	// 镜像生产读循环：把带 echo 的响应帧投递给 pending 等待者。
 	go func() {
 		for {

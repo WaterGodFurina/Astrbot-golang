@@ -14,6 +14,7 @@ import (
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 )
 
 // sdkModulePath is the module path of the standalone plugin SDK that every
@@ -64,10 +65,26 @@ func (c *Compiler) goflagsEnv() string {
 	return base
 }
 
+// validateModuleName rejects module names that could corrupt or inject into
+// the generated go.mod: the name is written verbatim into the `module` line,
+// so newlines/whitespace/control characters would let it smuggle arbitrary
+// extra lines (e.g. a forged `require`).
+func validateModuleName(moduleName string) error {
+	if err := module.CheckPath(moduleName); err != nil {
+		return fmt.Errorf("非法 module 名称 %q: %w", moduleName, err)
+	}
+	return nil
+}
+
 // Prepare ensures the plugin module builds against the local SDK: it writes a
 // go.mod (when missing) or patches the existing one to require the SDK module
 // and replace it with the local SDK directory.
 func (c *Compiler) Prepare(srcDir, moduleName string) error {
+	// moduleName 会原样写入 go.mod 的 module 行，先校验为合法 Go module
+	// path，拒绝换行/空白/控制字符等注入（go.mod 注入）。
+	if err := validateModuleName(moduleName); err != nil {
+		return err
+	}
 	sdkDir, err := c.sdkDir()
 	if err != nil {
 		return fmt.Errorf("resolve SDK dir: %w", err)

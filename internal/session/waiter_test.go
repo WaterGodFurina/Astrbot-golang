@@ -148,7 +148,9 @@ func TestTriggerByFilterNoSelfDeadlock(t *testing.T) {
 		messages: &message.MessageChain{Chain: []message.Component{}},
 	}
 
-	sw := NewSessionWaiter(&DefaultSessionFilter{}, "aiocqhttp:group_12345:user_alice")
+	reg := NewWaiterRegistry()
+
+	sw := NewSessionWaiter(reg, &DefaultSessionFilter{}, "aiocqhttp:group_12345:user_alice")
 	triggered := make(chan struct{}, 1)
 	sw.handler = func(ctx context.Context, controller *SessionController, event Event) error {
 		triggered <- struct{}{}
@@ -157,18 +159,12 @@ func TestTriggerByFilterNoSelfDeadlock(t *testing.T) {
 	sw.controller = NewSessionController()
 	sw.controller.Keep(time.Minute, true)
 
-	registryMu.Lock()
-	registry[sw.ID] = sw
-	registryMu.Unlock()
-	defer func() {
-		registryMu.Lock()
-		delete(registry, sw.ID)
-		registryMu.Unlock()
-	}()
+	reg.put(sw)
+	defer reg.remove(sw.ID)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- TriggerByFilter(originalSender)
+		done <- reg.TriggerByFilter(context.Background(), originalSender)
 	}()
 	select {
 	case err := <-done:
@@ -182,5 +178,91 @@ func TestTriggerByFilterNoSelfDeadlock(t *testing.T) {
 	case <-triggered:
 	default:
 		t.Error("matching waiter was not triggered")
+	}
+}
+
+// TestWaiterRegistryIsolation: 每个 registry 实例独立（bug.md 6.8）——
+// 一个 registry 里注册的 waiter 不会被另一个 registry 的 Trigger 命中。
+func TestWaiterRegistryIsolation(t *testing.T) {
+	regA := NewWaiterRegistry()
+	regB := NewWaiterRegistry()
+
+	sw := NewSessionWaiter(regA, &DefaultSessionFilter{}, "aiocqhttp:g:u")
+	triggered := make(chan struct{}, 1)
+	sw.handler = func(ctx context.Context, controller *SessionController, event Event) error {
+		triggered <- struct{}{}
+		return nil
+	}
+	sw.controller = NewSessionController()
+	sw.controller.Keep(time.Minute, true)
+	regA.put(sw)
+	defer regA.remove(sw.ID)
+
+	ev := &mockEvent{origin: "aiocqhttp:g", senderID: "u", messages: &message.MessageChain{Chain: []message.Component{}}}
+
+	// 不同 registry 的 Trigger 不得命中。
+	if err := regB.TriggerByFilter(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	if regB.IsWaiting(sw.ID) {
+		t.Fatal("registry B must not see registry A's waiter")
+	}
+	select {
+	case <-triggered:
+		t.Fatal("registry B must not trigger registry A's waiter")
+	default:
+	}
+
+	// 本 registry 正常命中。
+	if err := regA.TriggerByFilter(context.Background(), ev); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-triggered:
+	default:
+		t.Error("registry A must trigger its own waiter")
+	}
+}
+
+// TestTriggerPassesContext: Trigger 必须把调用方 context 透传给 handler
+// （bug.md 6.9），handler 可感知取消。
+func TestTriggerPassesContext(t *testing.T) {
+	reg := NewWaiterRegistry()
+	sw := NewSessionWaiter(reg, &DefaultSessionFilter{}, "aiocqhttp:g:u")
+	gotCtx := make(chan context.Context, 1)
+	sw.handler = func(ctx context.Context, controller *SessionController, event Event) error {
+		gotCtx <- ctx
+		return nil
+	}
+	sw.controller = NewSessionController()
+	sw.controller.Keep(time.Minute, true)
+	reg.put(sw)
+	defer reg.remove(sw.ID)
+
+	ev := &mockEvent{origin: "aiocqhttp:g", senderID: "u", messages: &message.MessageChain{Chain: []message.Component{}}}
+
+	base := context.WithValue(context.Background(), "marker", "x")
+	ctx, cancel := context.WithCancel(base)
+	defer cancel()
+	if err := reg.Trigger(ctx, sw.ID, ev); err != nil {
+		t.Fatal(err)
+	}
+	got := <-gotCtx
+	if got == context.Background() {
+		t.Fatal("handler must receive the caller's context, not context.Background()")
+	}
+	if v := got.Value("marker"); v != "x" {
+		t.Fatalf("handler context lost caller value: %v", v)
+	}
+	select {
+	case <-got.Done():
+		t.Fatal("handler context must not be pre-cancelled")
+	default:
+	}
+	cancel()
+	select {
+	case <-got.Done():
+	default:
+		t.Fatal("cancelling the caller context must cancel the handler context")
 	}
 }

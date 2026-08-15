@@ -40,6 +40,16 @@ type Adapter struct {
 	SelfID   string
 	upgrader websocket.Upgrader
 
+	// allowedOrigins is the WebSocket Origin 白名单（配置 ws_reverse_origins，
+	// 逗号分隔）。非浏览器客户端（OneBot 实现）不发 Origin，放行；带 Origin 的
+	// 浏览器连接必须命中白名单，否则拒绝（防 CSWSH 跨站 WebSocket 劫持）。
+	allowedOrigins []string
+
+	// maxReverseWSConns is the cap on concurrent reverse-WS connections
+	// (config ws_reverse_max_conns, default defaultMaxReverseWSConns). 0/negative
+	// means the default applies.
+	maxReverseWSConns int
+
 	mu          sync.Mutex
 	conns       map[*websocket.Conn]struct{}    // active reverse-WS connections
 	connWriteMu map[*websocket.Conn]*sync.Mutex // per-connection write serialization
@@ -61,10 +71,10 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		connWriteMu: make(map[*websocket.Conn]*sync.Mutex),
 		groupConvs:  make(map[string]bool),
 		pending:     make(map[string]chan map[string]interface{}),
-		upgrader: websocket.Upgrader{
-			// OneBot implementations connect from arbitrary origins.
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
+		allowedOrigins: parseOriginList(config["ws_reverse_origins"]),
+	}
+	a.upgrader = websocket.Upgrader{
+		CheckOrigin: a.checkOrigin,
 	}
 	a.Host, _ = config["ws_reverse_host"].(string)
 	if a.Host == "" {
@@ -77,11 +87,57 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		a.Port = 6199
 	}
 	a.Token, _ = config["ws_reverse_token"].(string)
+	if n, ok := config["ws_reverse_max_conns"].(float64); ok && n > 0 {
+		a.maxReverseWSConns = int(n)
+	} else if n, ok := config["ws_reverse_max_conns"].(int); ok && n > 0 {
+		a.maxReverseWSConns = n
+	}
 	if id, ok := config["id"].(string); ok {
 		a.SelfID = id
 	}
 	a.quotedParser = resolveQuotedParserSettings(settings)
 	return a
+}
+
+// parseOriginList reads the ws_reverse_origins config value, which may be a
+// comma-separated string or a list of strings.
+func parseOriginList(raw interface{}) []string {
+	var origins []string
+	switch v := raw.(type) {
+	case string:
+		for _, o := range strings.Split(v, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				origins = append(origins, o)
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					origins = append(origins, s)
+				}
+			}
+		}
+	}
+	return origins
+}
+
+// checkOrigin gates the reverse-WebSocket upgrade on the request's Origin
+// header. Non-browser clients (OneBot 实现) do not send Origin and are
+// allowed; a present Origin must match the configured whitelist, otherwise the
+// connection is rejected to prevent cross-site WebSocket hijacking (CSWSH).
+func (a *Adapter) checkOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	for _, allowed := range a.allowedOrigins {
+		if strings.EqualFold(origin, allowed) {
+			return true
+		}
+	}
+	logger.Warn("aiocqhttp: 拒绝跨站 WebSocket 连接 (Origin=%q 不在 ws_reverse_origins 白名单)", origin)
+	return false
 }
 
 // SetEventBus injects the event bus. This overrides BaseAdapter.SetEventBus so
@@ -229,7 +285,9 @@ func (a *Adapter) nodeToCQ(n *message.Node) map[string]interface{} {
 // asynchronously by observeSendAction so the API-level response is not silently
 // dropped: failures (status != ok) and missing responses are logged.
 func (a *Adapter) sendAction(action string, params map[string]interface{}) error {
-	echo := fmt.Sprintf("astrbot-%d", time.Now().UnixNano())
+	// 与 CallAction 共用原子计数器：仅用纳秒时间戳在高并发下可能在同一纳秒
+	// 碰撞，导致响应被路由到错误的调用方。
+	echo := fmt.Sprintf("astrbot-%d-%d", time.Now().UnixNano(), actionSeq.Add(1))
 	payload, err := json.Marshal(map[string]interface{}{
 		"action": action,
 		"params": params,
@@ -376,6 +434,25 @@ func (a *Adapter) authValid(r *http.Request) bool {
 		subtle.ConstantTimeCompare([]byte(queryToken), token) == 1
 }
 
+// defaultMaxReverseWSConns is the default cap on concurrent reverse WebSocket
+// connections (config ws_reverse_max_conns overrides it).
+const defaultMaxReverseWSConns = 8
+
+// maxConns returns the configured reverse-WS connection limit.
+func (a *Adapter) maxConns() int {
+	if a.maxReverseWSConns > 0 {
+		return a.maxReverseWSConns
+	}
+	return defaultMaxReverseWSConns
+}
+
+// connCount returns the number of active reverse-WS connections.
+func (a *Adapter) connCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.conns)
+}
+
 // handleWebSocket serves the reverse WebSocket endpoint. OneBot
 // implementations connect here and both push events and receive API calls.
 func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -384,12 +461,27 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 限制并发反向 WS 连接数（6.4）：在 Upgrade 之前检查，避免为将被拒绝
+	// 的连接浪费一个已升级的 socket。预检是尽力而为的，addConn 在锁内会做
+	// 权威校验以堵住并发连接涌入的竞态窗口。
+	if a.connCount() >= a.maxConns() {
+		logger.I18nWarn("反向 WebSocket 连接数已达上限（%d），拒绝新连接", a.maxConns())
+		http.Error(w, fmt.Sprintf("aiocqhttp: too many reverse WebSocket connections (max %d)", a.maxConns()), http.StatusServiceUnavailable)
+		return
+	}
+
 	conn, err := a.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Error("WebSocket upgrade failed: %v", err)
 		return
 	}
-	a.addConn(conn)
+	if err := a.addConn(conn); err != nil {
+		// 预检之后、addConn 之前有并发连接涌入，addConn 在锁内再次校验上限
+		// 并拒绝。连接此时已升级，直接关闭。
+		logger.I18nWarn("反向 WebSocket 连接数已达上限，拒绝: %v", err)
+		conn.Close()
+		return
+	}
 	logger.I18nInfo("反向 WebSocket 客户端已连接 (%s)", conn.RemoteAddr())
 
 	defer func() {
@@ -589,11 +681,20 @@ func (a *Adapter) setSelfID(id string) {
 	a.mu.Unlock()
 }
 
-func (a *Adapter) addConn(c *websocket.Conn) {
+// addConn registers a connection and enforces the max-connection limit under
+// lock (the pre-Upgrade check in handleWebSocket is advisory; this is the
+// authoritative one that closes the check-then-insert race window). Returns an
+// error — without inserting — once the limit is reached, so the caller can
+// reject the excess connection.
+func (a *Adapter) addConn(c *websocket.Conn) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if len(a.conns) >= a.maxConns() {
+		return fmt.Errorf("aiocqhttp: reverse WebSocket connection limit reached (%d)", a.maxConns())
+	}
 	a.conns[c] = struct{}{}
 	a.connWriteMu[c] = &sync.Mutex{}
+	return nil
 }
 
 func (a *Adapter) removeConn(c *websocket.Conn) {

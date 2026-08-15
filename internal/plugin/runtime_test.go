@@ -344,11 +344,21 @@ func TestCrashMaxRestarts(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	// With MaxRestarts=2 the plugin is allowed two automatic restarts, then
-	// the third crash marks it failed and removes it.
+	// With MaxRestarts=2 the plugin gets exactly two start chances: the
+	// initial start plus one automatic restart; the second crash trips
+	// count >= maxRestarts, marking it failed and removing it.
+	seen := map[*PluginInstance]bool{}
+	starts := 0
 	waitFor(t, 12*time.Second, "max-restart failure", func() bool {
+		if inst := m.Get("test"); inst != nil && !seen[inst] {
+			seen[inst] = true
+			starts++
+		}
 		return m.Get("test") == nil && len(m.Failed()) > 0
 	})
+	if starts != 2 {
+		t.Errorf("MaxRestarts=2 should allow exactly 2 start chances (initial + 1 restart), got %d", starts)
+	}
 	if _, ok := m.Failed()["test"]; !ok {
 		t.Errorf("plugin should be recorded as failed: %v", m.Failed())
 	}

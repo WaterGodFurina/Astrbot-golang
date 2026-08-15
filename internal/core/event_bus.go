@@ -337,14 +337,14 @@ func (bus *EventBus) startWorkers(ctx context.Context, n int) {
 			for {
 				select {
 				case event := <-ch:
-					bus.dispatch(ctx, event)
+					bus.dispatchSafely(ctx, event)
 				case <-bus.workerStop:
 					// Producer (dispatch loop) has exited; process whatever is
 					// still buffered for this worker, then finish.
 					for {
 						select {
 						case event := <-ch:
-							bus.dispatch(ctx, event)
+							bus.dispatchSafely(ctx, event)
 						default:
 							return
 						}
@@ -353,6 +353,21 @@ func (bus *EventBus) startWorkers(ctx context.Context, n int) {
 			}
 		}(ch)
 	}
+}
+
+// dispatchSafely runs dispatch with panic recovery so a panic while
+// dispatching one event (e.g. the scheduler snapshot, dispatch logging or a
+// broken completion signal) cannot crash the whole process; the worker logs
+// it and keeps processing subsequent events. Stage panics are already
+// recovered inside PipelineScheduler.Process, so this only guards panics in
+// dispatch itself and anything else outside the scheduler's recover.
+func (bus *EventBus) dispatchSafely(ctx context.Context, event *Event) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("EventBus worker recovered from panic while dispatching event: %v", r)
+		}
+	}()
+	bus.dispatch(ctx, event)
 }
 
 // enqueueToWorker routes an event to the worker owning its session shard,
@@ -423,6 +438,13 @@ func (bus *EventBus) PublishDelayed(event *Event, delay time.Duration) {
 		return
 	}
 	time.AfterFunc(delay, func() {
+		// The callback runs on a timer goroutine: recover so a panic here
+		// (e.g. inside Publish) cannot crash the process.
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("EventBus recovered from panic in delayed publish: %v", r)
+			}
+		}()
 		if bus.isStopped() {
 			return
 		}

@@ -66,6 +66,51 @@ func TestExecuteFutureTaskEditMissingJob(t *testing.T) {
 	}
 }
 
+// TestExecuteFutureTaskOwnershipIsolation: 定时任务的 list/delete/edit 只允许
+// 操作本会话本用户创建的任务（bug.md 4.4）。
+func TestExecuteFutureTaskOwnershipIsolation(t *testing.T) {
+	m := cron.NewCronJobManager(nil)
+	m.RegisterHandler("active_agent", func(ctx context.Context, j *cron.Job) error { return nil })
+
+	created := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{
+		"action": "create", "name": "t", "cron_expression": "0 8 * * *", "note": "u1 secret",
+	})
+	if !strings.Contains(created, "task created: job_id=") {
+		t.Fatalf("create failed: %q", created)
+	}
+	id := strings.TrimPrefix(strings.Split(created, "job_id=")[1], "job_")
+	id = "job_" + strings.TrimSpace(id[:strings.Index(id, " ")])
+
+	// 同一会话的另一用户：list 看不到，delete/edit 被拒绝。
+	otherList := executeFutureTask(m, "qq:group:1", "u2", map[string]interface{}{"action": "list"})
+	if strings.Contains(otherList, "u1 secret") || strings.Contains(otherList, id) {
+		t.Fatalf("other user in same session must not see the task: %q", otherList)
+	}
+	if got := executeFutureTask(m, "qq:group:1", "u2", map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "task not found") {
+		t.Fatalf("other user must not delete the task: %q", got)
+	}
+	if got := executeFutureTask(m, "qq:group:1", "u2", map[string]interface{}{"action": "edit", "job_id": id, "note": "hijacked"}); !strings.Contains(got, "task not found") {
+		t.Fatalf("other user must not edit the task: %q", got)
+	}
+
+	// 其他会话的同一用户：同样不可见不可操作。
+	if got := executeFutureTask(m, "qq:group:2", "u1", map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "task not found") {
+		t.Fatalf("other session must not delete the task: %q", got)
+	}
+
+	// 创建者本人：list 可见、edit 可改、delete 可删。
+	ownList := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{"action": "list"})
+	if !strings.Contains(ownList, id) {
+		t.Fatalf("owner must see the task in list: %q", ownList)
+	}
+	if got := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{"action": "edit", "job_id": id, "note": "mine"}); !strings.Contains(got, "task updated") {
+		t.Fatalf("owner edit failed: %q", got)
+	}
+	if got := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "task deleted") {
+		t.Fatalf("owner delete failed: %q", got)
+	}
+}
+
 // TestExecuteToolRuntimeNoneBlocksHostTools: with computer_use_runtime=none the
 // host shell/python/file executors must not run even if the model emits the
 // tool name directly (M-19).

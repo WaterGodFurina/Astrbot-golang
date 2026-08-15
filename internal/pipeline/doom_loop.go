@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"strings"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
@@ -11,12 +12,28 @@ import (
 // pause the tool and ask the session owner for confirmation.
 const doomLoopThreshold = 5
 
-// doomWhitelist lists tools that are exempt from doom-loop detection: they are
-// inherently iterative (each invocation is a distinct user-visible action) and
-// frequent repetition is legitimate.
-var doomWhitelist = map[string]bool{
-	"astrbot_execute_shell": true,
-	"astrbot_shell_session": true,
+// doomTrackerTTL is how long an idle session's doom tracker is kept before it
+// is pruned. Paused sessions (waiting for owner confirmation) are never
+// pruned, so the doom-confirm flow survives the TTL.
+const doomTrackerTTL = 30 * time.Minute
+
+// doomWhitelist lists tools that are exempt from doom-loop detection. 当前为
+// 空：shell 工具也参与检测，但按命令内容做键（见 doomLoopKey），不会因为
+// 顺序执行不同命令的常规工作流而误判。
+var doomWhitelist = map[string]bool{}
+
+// doomLoopKey derives the repetition key for a tool call. For shell execution
+// tools the command text is part of the key: a loop re-issuing the SAME command
+// is caught by the detector, while sequentially running different commands (a
+// normal coding workflow) is not.
+func doomLoopKey(toolName string, args map[string]interface{}) string {
+	switch toolName {
+	case "astrbot_execute_shell":
+		return toolName + "\x00" + argString(args, "command")
+	case "astrbot_shell_session":
+		return toolName + "\x00" + argString(args, "action") + "\x00" + argString(args, "command")
+	}
+	return toolName
 }
 
 // doomTracker tracks per-session tool-call repetition.
@@ -26,6 +43,7 @@ type doomTracker struct {
 	pausedTool   string // tool paused by a doom loop, waiting for owner confirmation
 	askSender    string // the sender who triggered the loop (only they may answer)
 	resumePrompt string // original request text to resume after confirmation
+	lastSeen     time.Time
 }
 
 // doomConfirmResult classifies a doom-confirmation message.
@@ -47,6 +65,7 @@ func (s *ProcessStage) maybeHandleDoomConfirm(event *core.Event) doomConfirmResu
 		s.doomMu.Unlock()
 		return doomNotConsumed
 	}
+	tr.lastSeen = time.Now()
 	if event.Source.SenderID != tr.askSender {
 		s.doomMu.Unlock()
 		return doomNotConsumed // not the asker; treat as a normal message
@@ -100,6 +119,7 @@ func (s *ProcessStage) resetDoomLoopCount(umo string) {
 	if tr := s.doomTrackers[umo]; tr != nil {
 		tr.lastTool = ""
 		tr.count = 0
+		tr.lastSeen = time.Now()
 	}
 }
 
@@ -114,11 +134,15 @@ func (s *ProcessStage) checkDoomLoop(event *core.Event, toolName string) bool {
 	umo := event.UnifiedMsgOrigin()
 	s.doomMu.Lock()
 	defer s.doomMu.Unlock()
+	// Lazy TTL sweep: drop trackers of sessions idle beyond the TTL before
+	// touching this session's entry.
+	s.pruneDoomTrackers()
 	tr := s.doomTrackers[umo]
 	if tr == nil {
 		tr = &doomTracker{}
 		s.doomTrackers[umo] = tr
 	}
+	tr.lastSeen = time.Now()
 	// If this exact tool is already paused, refuse to run it.
 	if tr.pausedTool == toolName {
 		return false
@@ -138,6 +162,19 @@ func (s *ProcessStage) checkDoomLoop(event *core.Event, toolName string) bool {
 		return false
 	}
 	return true
+}
+
+// pruneDoomTrackers removes trackers for sessions that have been idle longer
+// than doomTrackerTTL. Sessions with an active pause (pending owner
+// confirmation) are kept so the doom-confirm flow cannot be broken by the
+// sweep. Caller must hold doomMu.
+func (s *ProcessStage) pruneDoomTrackers() {
+	cutoff := time.Now().Add(-doomTrackerTTL)
+	for umo, tr := range s.doomTrackers {
+		if tr.pausedTool == "" && tr.lastSeen.Before(cutoff) {
+			delete(s.doomTrackers, umo)
+		}
+	}
 }
 
 // askDoomConfirm sends a confirmation request to the session owner.

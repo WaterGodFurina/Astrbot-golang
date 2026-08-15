@@ -1,14 +1,10 @@
-# 注意:
+# AstrBot-golang
 
-本项目还在移植（使用DeepSeek作为辅助）。本项目不负责在使用本项目时所造成的任何后果。日志级别可通过配置文件 `data/cmd_config.json` 中的 `log_level`（DEBUG/INFO/WARN/ERROR/CRITICAL）或环境变量 `ASTRBOT_LOG_LEVEL` 设置，环境变量优先级更高，默认 INFO。
+该项目由[AstrBot](https://github.com/AstrBotDevs/AstrBot)迁移而来，目前移植进度94%左右，已验证60%的功能(核心功能已得到全部验证)
 
-# 原仓库
+## 原仓库
 
 [https://github.com/AstrBotDevs/AstrBot](https://github.com/AstrBotDevs/AstrBot)
-
-# AstrBot-Go
-
-AstrBot 的 Go 语言移植版本，从 AstrBot 的 v4.27.2 移植而来。
 
 ## 架构
 
@@ -39,16 +35,9 @@ astrbot-go/
 └── go.mod
 ```
 
-# 插件系统重构
+## Agent改进
 
-插件系统已从 Linux 专用的 Go 原生 `.so` 方案重构为**子进程方案**（go-plugin + gRPC），解决旧方案的四大痛点：
-
-| 痛点 | 旧 `.so` 方案 | 新子进程方案 |
-|------|--------------|--------------|
-| 平台 | 仅 Linux | Windows / macOS / Linux（含 Termux） |
-| 热卸载 | `.so` 无法卸载，内存不释放 | 杀掉子进程即被 OS 完全回收 |
-| 分发 | 每个平台单独编译二进制 | 只发 Go 源码，用户侧自动编译 |
-| 隔离 | 与主进程同地址空间，崩溃拖垮主进程 | 独立子进程，崩溃不影响主进程 |
+本项目在基于AstrBot上，加入了一些opencode的Agent特性，使模型在执行Agent操作时不会重复执行
 
 ## 插件 SDK
 
@@ -98,7 +87,7 @@ func setup() error {
 
 SDK 也支持声明式写法（直接在 `sdk.Plugin{Commands: []sdk.Command{...}}` 里声明），两者等价。
 
-## 自带 Go 工具链
+### 自带 Go 工具链
 
 首次编译插件时，程序自动下载官方 Go 免安装包到用户私有目录（`~/.local/share/astrbot-go/` 等），无需用户装 Go：
 
@@ -113,11 +102,11 @@ cgo 插件的 C 编译器（zig/clang/GCC）也存放在同一私有目录下（
 - `ASTRBOT_CLANG_MIRROR`：C 编译器下载镜像（如 gh-proxy 加速地址）
 - `ASTRBOT_CC`：系统 GCC 覆盖（检测优先级 `ASTRBOT_CC` > `CC` > PATH `gcc`）
 
-## 静态扫描 + 风险提示
+### 静态扫描 + 风险提示
 
 安装插件前会静态扫描源码，发现 `os/exec`、`syscall`、`unsafe` 等危险包时，**WebUI 弹出风险对话框并列出具体代码行**，由用户选择"无视风险，继续安装"或"取消安装"。
 
-## 已知局限与注意事项
+### 已知局限与注意事项
 
 1. **cgo 支持（声明式 + 自动选择 C 编译器）**：插件在 `metadata.json` 里显式声明 `"cgo": true` 才启用 cgo（缺省为 false，纯 Go 编译）。声明 cgo 后，宿主自动检测/选择 C 编译器：
    - 系统已有 GCC（按 `ASTRBOT_CC` > `CC` 环境变量 > PATH 中的 `gcc` 检测）→ WebUI 询问"使用系统 GCC 还是 Clang"
@@ -136,7 +125,7 @@ cgo 插件的 C 编译器（zig/clang/GCC）也存放在同一私有目录下（
 5. **Termux（Android）**：官方没有 Android 的 Go 包，需先 `pkg install golang` 再设 `ASTRBOT_GO_BIN` 指向它，或手动安装 Go；cgo 插件需 `pkg install clang`（Termux 无官方 zig 包）。
 6. **cgo 编译器下载中断安全**：下载缓存于 `~/.local/share/astrbot-go/clang-download/`，支持断点续传（HTTP Range）；解压前写 `.install-lock`，若上次安装被中断，下次会自动丢弃半成品并重新下载。
 
-## 安装与热重载
+### 安装与热重载
 
 - WebUI「安装插件」支持上传 `.zip` 归档或填 Git/归档 URL
 - 插件包根目录须含 `metadata.json`（身份/cgo 声明）与 `main.go`（入口），缺任一安装失败

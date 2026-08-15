@@ -149,25 +149,38 @@ type SessionWaiter struct {
 	filter     SessionFilter
 	handler    HandlerFunc
 	controller *SessionController
+	reg        *WaiterRegistry
 	mu         sync.Mutex
 }
 
-var (
-	registryMu sync.RWMutex
-	registry   = make(map[string]*SessionWaiter)
-)
+// WaiterRegistry scopes session waiters to an explicit instance instead of a
+// package-global registry (bug.md 6.8): multi-instance and test scenarios no
+// longer share state and cannot cross-interfere. Callers create one registry
+// per session-waiter subsystem and hand it to NewSessionWaiter.
+type WaiterRegistry struct {
+	mu sync.RWMutex
+	m  map[string]*SessionWaiter
+}
+
+// NewWaiterRegistry creates an empty waiter registry.
+func NewWaiterRegistry() *WaiterRegistry {
+	return &WaiterRegistry{m: make(map[string]*SessionWaiter)}
+}
+
+// NewSessionWaiter creates a waiter with the given filter, registered in reg.
+func NewSessionWaiter(reg *WaiterRegistry, filter SessionFilter, sessionID string) *SessionWaiter {
+	return &SessionWaiter{ID: sessionID, filter: filter, reg: reg}
+}
 
 // RegisterWait starts waiting for external input.
 func (sw *SessionWaiter) RegisterWait(ctx context.Context, handler HandlerFunc, timeout time.Duration) error {
 	sw.handler = handler
 	sw.controller = NewSessionController()
 
-	registryMu.Lock()
-	registry[sw.ID] = sw
-	registryMu.Unlock()
+	sw.reg.put(sw)
+	defer sw.reg.remove(sw.ID)
 
 	sw.controller.Keep(timeout, true)
-	defer sw.cleanup()
 
 	select {
 	case <-sw.controller.Done():
@@ -178,20 +191,24 @@ func (sw *SessionWaiter) RegisterWait(ctx context.Context, handler HandlerFunc, 
 	}
 }
 
-func (sw *SessionWaiter) cleanup() {
-	registryMu.Lock()
-	delete(registry, sw.ID)
-	registryMu.Unlock()
-	if sw.controller != nil {
-		sw.controller.Stop(nil)
-	}
+func (r *WaiterRegistry) put(sw *SessionWaiter) {
+	r.mu.Lock()
+	r.m[sw.ID] = sw
+	r.mu.Unlock()
 }
 
-// Trigger dispatches an event to a matching session.
-func Trigger(sessionID string, event Event) error {
-	registryMu.RLock()
-	sw, ok := registry[sessionID]
-	registryMu.RUnlock()
+func (r *WaiterRegistry) remove(sessionID string) {
+	r.mu.Lock()
+	delete(r.m, sessionID)
+	r.mu.Unlock()
+}
+
+// Trigger dispatches an event to a matching session. The handler runs with the
+// caller's context (so it can be cancelled), not a detached Background one.
+func (r *WaiterRegistry) Trigger(ctx context.Context, sessionID string, event Event) error {
+	r.mu.RLock()
+	sw, ok := r.m[sessionID]
+	r.mu.RUnlock()
 	if !ok {
 		return nil
 	}
@@ -208,7 +225,7 @@ func Trigger(sessionID string, event Event) error {
 	default:
 	}
 	sw.controller.AddHistoryChain(event.GetMessages())
-	if err := sw.handler(context.Background(), sw.controller, event); err != nil {
+	if err := sw.handler(ctx, sw.controller, event); err != nil {
 		sw.controller.Stop(err)
 		return err
 	}
@@ -216,10 +233,10 @@ func Trigger(sessionID string, event Event) error {
 }
 
 // TriggerByFilter finds a session matching the filter and event.
-func TriggerByFilter(event Event) error {
-	registryMu.RLock()
+func (r *WaiterRegistry) TriggerByFilter(ctx context.Context, event Event) error {
+	r.mu.RLock()
 	var target *SessionWaiter
-	for _, sw := range registry {
+	for _, sw := range r.m {
 		select {
 		case <-sw.controller.Done():
 			continue
@@ -233,25 +250,20 @@ func TriggerByFilter(event Event) error {
 			}
 		}
 	}
-	registryMu.RUnlock()
+	r.mu.RUnlock()
 	if target == nil {
 		return nil
 	}
 	// Trigger outside the RLock: it re-acquires the registry lock, and doing so
 	// while a writer is queued would deadlock this reader (RLock not reentrant).
-	return Trigger(target.ID, event)
+	return r.Trigger(ctx, target.ID, event)
 }
 
-// NewSessionWaiter creates a waiter with the given filter.
-func NewSessionWaiter(filter SessionFilter, sessionID string) *SessionWaiter {
-	return &SessionWaiter{ID: sessionID, filter: filter}
-}
-
-// IsWaiting checks if a session with the given ID is active.
-func IsWaiting(sessionID string) bool {
-	registryMu.RLock()
-	defer registryMu.RUnlock()
-	sw, ok := registry[sessionID]
+// IsWaiting checks if a session with the given ID is active in this registry.
+func (r *WaiterRegistry) IsWaiting(sessionID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	sw, ok := r.m[sessionID]
 	if !ok {
 		return false
 	}

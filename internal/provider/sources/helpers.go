@@ -17,11 +17,13 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
-// newStreamClient returns an http.Client with no overall request timeout so a
-// long streaming response body is not truncated mid-stream. Cancellation is
-// delegated to the caller's context instead.
+// newStreamClient returns an http.Client for streaming reads. A generous
+// whole-request timeout bounds the read so a dead connection cannot leave the
+// streaming goroutine blocked on body reads forever, even if the caller's
+// context is never cancelled. Cancellation at token granularity is delegated
+// to the caller's context via sseReader.scan.
 func newStreamClient() *http.Client {
-	return &http.Client{}
+	return &http.Client{Timeout: 10 * time.Minute}
 }
 
 // stripURLQuery returns the URL without its query string, for safe logging.

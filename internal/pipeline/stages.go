@@ -630,6 +630,19 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 			// matching Python's async sleep + resume. This must not block the
 			// single-goroutine event bus, so we schedule a delayed re-queue.
 			if s.eventBus != nil {
+				delays := 0
+				if v, ok := event.GetExtra(rateLimitDelaysKey).(int); ok {
+					delays = v
+				}
+				// Bound the re-queues: under sustained traffic an event must
+				// not be re-delayed forever (queue starvation/growth).
+				if delays >= rateLimitMaxDelays {
+					logger.I18nWarn("会话 %s 限流: 事件 %q 已延迟重排队 %d 次，超过上限 %d，丢弃",
+						sessionID, event.MessageStr, delays, rateLimitMaxDelays)
+					event.Stop()
+					return &StageResult{Continue: false}, nil
+				}
+				event.SetExtra(rateLimitDelaysKey, delays+1)
 				s.eventBus.PublishDelayed(event, stall)
 			} else {
 				// No bus reference (tests): fall back to stopping the event.
@@ -643,6 +656,15 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 	}
 	return &StageResult{Continue: true}, nil
 }
+
+// rateLimitDelaysKey is the Event.Metadata key counting how many times an
+// event has been re-queued by the rate-limit stall strategy.
+const rateLimitDelaysKey = "rate_limit_delays"
+
+// rateLimitMaxDelays bounds how many times a rate-limited event may be
+// re-queued before it is dropped with a notice, so sustained traffic cannot
+// keep a single event (and the queue) alive forever.
+const rateLimitMaxDelays = 5
 
 // ---------------------------------------------------------------------------
 // Stage 5: ContentSafetyCheckStage
@@ -1617,7 +1639,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 			if i < len(resp.ToolsCallIDs) {
 				toolID = resp.ToolsCallIDs[i]
 			}
-			if !s.checkDoomLoop(event, name) {
+			if !s.checkDoomLoop(event, doomLoopKey(name, args)) {
 				// Tool paused by doom-loop detection; stop the whole tool loop.
 				doomed = true
 				break

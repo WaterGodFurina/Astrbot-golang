@@ -102,8 +102,10 @@ type SubprocessManager struct {
 
 	// AutoRestart enables automatic restart of crashed plugins.
 	AutoRestart bool
-	// MaxRestarts caps consecutive automatic restarts before the plugin is
-	// marked failed.
+	// MaxRestarts caps the total number of start chances: the plugin gets 1
+	// initial start plus at most MaxRestarts-1 automatic restarts before it is
+	// marked failed (handleExit trips count >= MaxRestarts on the
+	// MaxRestarts-th crash).
 	MaxRestarts int
 	// RestartBaseDelay is the base backoff before the first restart (scaled
 	// linearly per consecutive crash).
@@ -779,7 +781,11 @@ func (m *SubprocessManager) handleExit(inst *PluginInstance) {
 		m.markFailed(inst, fmt.Errorf("plugin %s exited unexpectedly (auto-restart disabled)", inst.ID))
 		return
 	}
-	if count > maxRestarts {
+	// count >= maxRestarts: 第 maxRestarts 次崩溃即停用，插件总共获得
+	// maxRestarts 次启动机会（1 次初始 + maxRestarts-1 次重启）。
+	// restarts 预算跨实例传递（restart 里 newInst.restarts = inst.restarts），
+	// 因此计数语义在重启后保持一致。
+	if count >= maxRestarts {
 		m.markFailed(inst, fmt.Errorf("plugin %s exited unexpectedly %d time(s)", inst.ID, count))
 		return
 	}

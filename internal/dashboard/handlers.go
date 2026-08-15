@@ -124,11 +124,11 @@ func (s *Server) getConfigSnapshot() map[string]interface{} {
 		}
 	}
 	if s.auth != nil {
-		// Preserve persisted dashboard auth fields (pbkdf2_password,
-		// jwt_secret, ...) so a WebUI save round-trip does not drop them.
-		// The password hash, plaintext password and JWT signing secret are
-		// intentionally excluded: the client never needs them, and they are
-		// re-asserted by injectAuthFields on save.
+		// Preserve persisted dashboard auth fields (jwt_secret, ...) so a
+		// WebUI save round-trip does not drop them. The password hash, JWT
+		// signing secret and TOTP section are intentionally excluded: the
+		// client never needs them, and they are re-asserted by
+		// injectAuthFields on save.
 		dash := map[string]interface{}{}
 		if pd, ok := persisted["dashboard"].(map[string]interface{}); ok {
 			for k, v := range pd {
@@ -147,10 +147,10 @@ func (s *Server) getConfigSnapshot() map[string]interface{} {
 	return cfg
 }
 
-// redactDashboardSecrets strips the dashboard auth secrets (plaintext password,
-// PBKDF2 hash, JWT signing secret, TOTP 段) from a config map before it is
-// returned to the client. The client never needs them; on save, injectAuthFields
-// re-asserts them from the password manager so round-trips are unaffected.
+// redactDashboardSecrets strips the dashboard auth secrets (password hash,
+// JWT signing secret, TOTP 段) from a config map before it is returned to the
+// client. The client never needs them; on save, injectAuthFields re-asserts
+// them from the password manager so round-trips are unaffected.
 func redactDashboardSecrets(cfg map[string]interface{}) {
 	dash, ok := cfg["dashboard"].(map[string]interface{})
 	if !ok {

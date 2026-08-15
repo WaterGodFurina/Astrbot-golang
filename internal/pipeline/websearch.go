@@ -18,7 +18,7 @@ import (
 // requests the payload (a string map) is appended to the URL as query
 // parameters; for other methods it is serialized as the JSON body.
 func httpJSON(method, url string, headers map[string]string, payload interface{}) ([]byte, int, error) {
-	var bodyReader io.Reader
+	var body []byte
 	if method == http.MethodGet {
 		if m, ok := payload.(map[string]interface{}); ok && len(m) > 0 {
 			u, err := neturl.Parse(url)
@@ -33,29 +33,33 @@ func httpJSON(method, url string, headers map[string]string, payload interface{}
 			url = u.String()
 		}
 	} else if payload != nil {
-		data, err := json.Marshal(payload)
+		var err error
+		body, err = json.Marshal(payload)
 		if err != nil {
 			return nil, 0, err
 		}
-		bodyReader = bytes.NewReader(data)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
-	if err != nil {
-		return nil, 0, err
-	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
 	cfg := sources.DefaultRetryConfig()
 	resp, err := sources.DoWithRetry(ctx, http.DefaultClient, func() (*http.Request, error) {
-		// Clone the request to get a fresh body for each retry attempt.
-		clone := req.Clone(ctx)
-		return clone, nil
+		// 每次重试都重新构造请求与 Body（http.Request.Clone 是浅拷贝，Body
+		// 共享同一 reader，首次消耗后重试会发送空请求体）。
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, url, reader)
+		if err != nil {
+			return nil, err
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		return req, nil
 	}, cfg, "WebSearch")
 	if err != nil {
 		return nil, 0, err

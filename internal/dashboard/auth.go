@@ -30,19 +30,21 @@ import (
 
 const (
 	PasswordLength = 16
-	Username       = "astrbot"
+	// Username 是默认/重置后的 dashboard 用户名（配置缺失或凭据被清空时使用）。
+	Username = "admin"
 )
 
 var authLogger = log.GetDefault().WithComponent("Auth")
 
 // PasswordManager handles dashboard password generation, hashing, and verification.
+// 凭据只以两种形式存在：内存中的明文（生成后临时持有、打印给用户）与配置里的
+// PBKDF2 哈希（dashboard.password 字段，永不写明文）。
 type PasswordManager struct {
 	mu                     sync.RWMutex
 	configPath             string
 	configMgr              *config.ConfigManager // 注入后 auth 持久化统一走 ConfigManager（M-08）
 	username               string
-	hashedPassword         string // PBKDF2 hash (hex)
-	plainPassword          string // plaintext password (temporary storage)
+	hashedPassword         string // PBKDF2 hash（dashboard.password 字段）
 	passwordChangeRequired bool
 	jwtSecret              string
 	tokens                 map[string]bool // active session tokens
@@ -53,7 +55,17 @@ type PasswordManager struct {
 }
 
 // NewPasswordManager creates a password manager, generating a random password
-// on first run (or when --reset-password is used).
+// on first run, when the config holds no usable credential, or when
+// --reset-password is used. The generated password is printed to the console
+// and stored only as a PBKDF2 hash; the user must change it after logging in.
+//
+// dashboard.password 只允许存放哈希（PBKDF2 或遗留 MD5），绝不出现明文。空值
+// 规则（均触发重置并打印新随机密码，用户名恢复默认 admin）：
+//   - password 为空、username 非空：去除用户名，重置；
+//   - username 为空、password 非空：清除密码，重置；
+//   - 两者都为空：重置；
+//   - 两者都有但用户从未设置过自己的密码（password_change_required=true，
+//     初始密码只打印不落盘）：重置。
 func NewPasswordManager(configPath string) *PasswordManager {
 	pm := &PasswordManager{
 		configPath: configPath,
@@ -62,6 +74,10 @@ func NewPasswordManager(configPath string) *PasswordManager {
 
 	// Check if we need to generate a new password
 	needGenerate := false
+	// 磁盘存在需要迁移的旧凭据键（明文 password 残留 / 旧字段名
+	// pbkdf2_password）时，启动完成（JWT secret 就绪）后主动保存一次，
+	// 让磁盘立即收敛为 password=哈希，不把明文留在磁盘上。
+	migrateAuthKeys := false
 
 	// Check for --reset-password flag via env
 	if os.Getenv("ASTRBOT_RESET_DASHBOARD_PASSWORD") == "1" {
@@ -74,17 +90,61 @@ func NewPasswordManager(configPath string) *PasswordManager {
 		var cfg map[string]interface{}
 		if json.Unmarshal(data, &cfg) == nil {
 			if dash, ok := cfg["dashboard"].(map[string]interface{}); ok {
-				if user, ok := dash["username"].(string); ok && user != "" {
+				// 记录磁盘上是否存在 username 键：无键时 username 保持内存默认
+				// admin，但需要区分"从未设置"与"重置等待状态"（两者都表现为
+				// 无键，均不重置；只有键存在但值为空才按用户空值规则处理）。
+				diskHasUsername := false
+				if user, ok := dash["username"].(string); ok {
+					diskHasUsername = true
 					pm.username = user
 				}
-				if hashed, ok := dash["pbkdf2_password"].(string); ok && hashed != "" {
-					pm.hashedPassword = hashed
+				// 哈希统一存 dashboard.password 字段；旧版 pbkdf2_password 字段
+				// 迁移兼容（写回时会被统一为 password）。
+				hashed, _ := dash["password"].(string)
+				// password 字段只允许是合法哈希：旧配置的明文会被当作无效
+				// 凭据，绝不拿明文参与校验。
+				if hashed != "" && !isPBKDF2Hash(hashed) && !isMD5Hash(hashed) {
+					hashed = ""
+					migrateAuthKeys = true
 				}
-				if plain, ok := dash["password"].(string); ok && plain != "" {
-					pm.plainPassword = plain
+				if hashed == "" {
+					// 回退旧字段名（迁移期）。
+					if legacy, _ := dash["pbkdf2_password"].(string); legacy != "" &&
+						(isPBKDF2Hash(legacy) || isMD5Hash(legacy)) {
+						hashed = legacy
+						migrateAuthKeys = true
+					}
 				}
-				if pm.hashedPassword == "" {
-					// No PBKDF2 password set, need to generate
+				if _, legacy := dash["pbkdf2_password"]; legacy {
+					migrateAuthKeys = true
+				}
+				pm.hashedPassword = hashed
+				if changeReq, ok := dash["password_change_required"].(bool); ok {
+					pm.passwordChangeRequired = changeReq
+				}
+				// 空值/凭据缺失即重置（详见 NewPasswordManager 注释）。
+				switch {
+				case pm.hashedPassword == "" && pm.username != "":
+					// password 为空：去除用户名，让用户重新设置账号密码。
+					pm.username = ""
+					needGenerate = true
+				case pm.hashedPassword == "" && pm.username == "":
+					needGenerate = true
+				case !diskHasUsername || pm.username == "":
+					// 磁盘无 username 键（重置后等待状态）或用户名空、密码非空：
+					//  - change_required=true：等待用户设置，恢复默认 admin 供
+					//    登录，不重复重置；
+					//  - change_required=false：用户已设置过自己的密码但用户名
+					//    异常缺失，清除密码值，让用户重新设置账号密码。
+					if pm.passwordChangeRequired {
+						pm.username = Username
+					} else {
+						pm.hashedPassword = ""
+						needGenerate = true
+					}
+				case pm.passwordChangeRequired:
+					// 初始生成的密码只打印不落盘，用户尚未改密（重启后无人
+					// 知晓）——自动重置并打印新随机密码。
 					needGenerate = true
 				}
 				// 读取 TOTP 配置：dashboard.totp.{enable,secret,recovery_code_hash}
@@ -119,21 +179,34 @@ func NewPasswordManager(configPath string) *PasswordManager {
 	// Generate or load JWT secret
 	pm.ensureJWTSecret()
 
+	// 迁移清理：启动时把磁盘凭据键统一为 password=哈希（删除明文残留与
+	// 旧字段名），避免明文在磁盘上长期存在。
+	if migrateAuthKeys && pm.jwtSecret != "" {
+		pm.saveToConfig()
+	}
+
 	return pm
 }
 
 // generateAndStorePassword creates a random password, hashes it, stores the hash,
-// and prints the plaintext to the console for the user.
+// and prints the plaintext to the console for the user. 用户名被清空（空值重置）
+// 时恢复默认 admin 用于打印与登录，但**不写入配置文件**——重置只落密码哈希，
+// 用户名等用户在改密/设置流程中显式重设后才由 SetUsername 落盘。
 func (pm *PasswordManager) generateAndStorePassword() {
 	password := generateRandomPassword()
 	hashed := hashPBKDF2(password)
 	pm.mu.Lock()
+	if pm.username == "" {
+		pm.username = Username
+	}
 	pm.hashedPassword = hashed
 	pm.passwordChangeRequired = true
 	pm.mu.Unlock()
 
-	// Save to config file
-	pm.saveToConfig(password)
+	// 持久化密码哈希（不含 username：重置时用户名不落盘）。
+	fields := pm.dashboardAuthFields()
+	delete(fields, "username")
+	pm.persistDashboard(fields)
 
 	// Print credentials to console
 	authLogger.Info("")
@@ -144,15 +217,13 @@ func (pm *PasswordManager) generateAndStorePassword() {
 	authLogger.Info("  Password: %s", password)
 	authLogger.Info("  >>> Change it after logging in <<<")
 	authLogger.Info("========================================")
-	authLogger.Info("")
+	authLogger.Info("  NOTE: 初始密码不落盘（仅存哈希）。若在改密前重启，将自动重置并打印新密码；也可用 --reset-password 手动重置。")
 }
 
-// saveToConfig writes the username/password to the config JSON file.
-// 与 Python AstrBot 一致，dashboard.username 与 dashboard.password（明文）都要
-// 落盘，保证首次登录改密后凭据持久化、重启后依然可登录；pbkdf2_password 为
-// 校验用的哈希（password_storage_upgraded=true 表示已启用哈希校验）。明文
-// 密码字段在用户通过 SetPassword 设置过时才写入，避免覆盖未知的旧值。
-func (pm *PasswordManager) saveToConfig(plaintextPassword string) {
+// saveToConfig writes the username/password hash to the config JSON file.
+// dashboard.password 只存 PBKDF2 哈希，绝不写明文；旧字段名 pbkdf2_password
+// 与历史明文残留由 persistDashboard 一并清除。
+func (pm *PasswordManager) saveToConfig() {
 	pm.persistDashboard(pm.dashboardAuthFields())
 }
 
@@ -170,11 +241,11 @@ func (pm *PasswordManager) SetConfigManager(cm interface{}) {
 // dashboardAuthFields 汇总 auth 需要持久化的 dashboard 字段。与
 // injectAuthFields 的回填保持一致（含 jwt_secret 与 totp），确保经
 // ConfigManager 保存时不会丢段（H-24 / M-08）。
+// password 字段只存放 PBKDF2 哈希，绝不写明文。
 func (pm *PasswordManager) dashboardAuthFields() map[string]interface{} {
 	pm.mu.RLock()
 	username := pm.username
 	hashed := pm.hashedPassword
-	plain := pm.plainPassword
 	changeReq := pm.passwordChangeRequired
 	secret := pm.jwtSecret
 	totpEnabled := pm.totpEnabled
@@ -182,9 +253,9 @@ func (pm *PasswordManager) dashboardAuthFields() map[string]interface{} {
 	recoveryJSON, _ := json.Marshal(pm.totpRecoveryCodes)
 	pm.mu.RUnlock()
 
-	dash := map[string]interface{}{
+	return map[string]interface{}{
 		"username":                  username,
-		"pbkdf2_password":           hashed,
+		"password":                  hashed,
 		"password_change_required":  changeReq,
 		"password_storage_upgraded": true,
 		"jwt_secret":                secret,
@@ -194,15 +265,14 @@ func (pm *PasswordManager) dashboardAuthFields() map[string]interface{} {
 			"recovery_code_hash": string(recoveryJSON),
 		},
 	}
-	if plain != "" {
-		dash["password"] = plain
-	}
-	return dash
 }
 
 // persistDashboard 把 dashboard 段写入配置：优先走 ConfigManager（Update 递归
 // 合并 + Save，与 ConfigManager 自己的保存串行化）；无 ConfigManager（独立
 // 模式/单测）时回退为直读文件→合并→原子写回。
+// 升级清理：合并式 Update 不会删除旧键，这里显式移除历史遗留的明文 password、
+// 旧字段名 pbkdf2_password 以及（当本次不携带 username 时）旧 username 键，
+// 保证磁盘只存在 password=哈希。
 func (pm *PasswordManager) persistDashboard(dash map[string]interface{}) {
 	pm.mu.RLock()
 	cm := pm.configMgr
@@ -211,6 +281,10 @@ func (pm *PasswordManager) persistDashboard(dash map[string]interface{}) {
 		if cfg := cm.Get("default"); cfg != nil {
 			if err := cfg.Update(map[string]interface{}{"dashboard": dash}); err != nil {
 				authLogger.Error("persistDashboard: config update: %v", err)
+			}
+			_ = cfg.DeleteNested("dashboard", "pbkdf2_password")
+			if _, has := dash["username"]; !has {
+				_ = cfg.DeleteNested("dashboard", "username")
 			}
 			return
 		}
@@ -229,6 +303,12 @@ func (pm *PasswordManager) writeDashboardDirect(dash map[string]interface{}) {
 	}
 	for k, v := range dash {
 		d[k] = v
+	}
+	// 升级清理：只允许 password=哈希；移除旧字段名与任何明文残留。
+	delete(d, "pbkdf2_password")
+	if _, has := dash["username"]; !has {
+		// 本次未携带 username（重置场景）：用户名不落盘，删除旧键。
+		delete(d, "username")
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -324,18 +404,13 @@ func writeConfigFile(path string, data []byte) error {
 	return os.Rename(tmpName, path)
 }
 
-// VerifyPassword checks if the given plaintext password matches the stored credential.
-// Prefers the plaintext password field (temporary storage); falls back to
-// PBKDF2 (Python-generated) and MD5 (legacy) formats.
+// VerifyPassword checks the given plaintext password against the stored hash.
+// Only hash comparison is performed (PBKDF2 authoritative, legacy MD5
+// supported); the config never holds a plaintext password to fall back to.
 func (pm *PasswordManager) VerifyPassword(password string) bool {
 	pm.mu.RLock()
-	plain := pm.plainPassword
 	stored := pm.hashedPassword
 	pm.mu.RUnlock()
-
-	if plain != "" {
-		return subtle.ConstantTimeCompare([]byte(password), []byte(plain)) == 1
-	}
 
 	if stored == "" {
 		return false
@@ -389,14 +464,6 @@ func (pm *PasswordManager) HashedPassword() string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.hashedPassword
-}
-
-// PlainPassword returns the plaintext dashboard password (empty when only a
-// PBKDF2 hash was loaded and no plaintext was ever persisted).
-func (pm *PasswordManager) PlainPassword() string {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-	return pm.plainPassword
 }
 
 // PasswordChangeRequired returns whether the user must change their password.
@@ -480,19 +547,36 @@ func isPBKDF2Hash(stored string) bool {
 	return strings.HasPrefix(stored, "pbkdf2_sha256$")
 }
 
-// randomChoice picks a random byte from the given charset.
-func randomChoice(charset string) byte {
-	b := make([]byte, 1)
-	mustRandRead(b)
-	return charset[int(b[0])%len(charset)]
+// cryptoRandInt returns a uniformly distributed int in [0, n) using rejection
+// sampling. Plain modulo over a random byte is biased when n does not divide
+// 256, which matters for password/secret generation (bug.md 5.1).
+func cryptoRandInt(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	// 以 2^32 为界：limit 是小于 2^32 的最大 n 的倍数，落在 [limit, 2^32) 的
+	// 样本重试，保证每个输出等概率。
+	const maxUint32 = uint64(1) << 32
+	limit := maxUint32 - maxUint32%uint64(n)
+	var b [4]byte
+	for {
+		mustRandRead(b[:])
+		v := uint64(b[0])<<24 | uint64(b[1])<<16 | uint64(b[2])<<8 | uint64(b[3])
+		if v < limit {
+			return int(v % uint64(n))
+		}
+	}
 }
 
-// shuffleBytes shuffles a byte slice in-place using crypto/rand.
+// randomChoice picks a random byte from the given charset (uniform, unbiased).
+func randomChoice(charset string) byte {
+	return charset[cryptoRandInt(len(charset))]
+}
+
+// shuffleBytes shuffles a byte slice in-place using crypto/rand (unbiased).
 func shuffleBytes(b []byte) {
 	for i := len(b) - 1; i > 0; i-- {
-		j := make([]byte, 1)
-		mustRandRead(j)
-		idx := int(j[0]) % (i + 1)
+		idx := cryptoRandInt(i + 1)
 		b[i], b[idx] = b[idx], b[i]
 	}
 }
@@ -628,7 +712,7 @@ func (pm *PasswordManager) SetUsername(username string) {
 		pm.username = username
 	}
 	pm.mu.Unlock()
-	pm.saveToConfig("")
+	pm.saveToConfig()
 }
 
 // SetPassword updates the dashboard password (re-hashes) and rotates the JWT
@@ -636,6 +720,9 @@ func (pm *PasswordManager) SetUsername(username string) {
 // existing JWTs fail signature verification against the new secret, and legacy
 // in-memory tokens are dropped. This is the standard "credential change logs
 // all sessions out" behavior.
+// 用户名在改密时默认填 admin：若当前用户名未设置（重置等待状态，用户名不
+// 落盘），改密后自动以 admin 写入配置文件；用户在前端显式填写了其他用户名
+// 时由 SetUsername 先行覆盖。
 func (pm *PasswordManager) SetPassword(password string) {
 	if password == "" {
 		return
@@ -643,14 +730,18 @@ func (pm *PasswordManager) SetPassword(password string) {
 	// Hash the new password and update in-memory state FIRST
 	newHash := hashPBKDF2(password)
 	pm.mu.Lock()
+	if pm.username == "" {
+		pm.username = Username
+	}
 	pm.hashedPassword = newHash
-	pm.plainPassword = password
 	pm.passwordChangeRequired = false
 	pm.jwtSecret = generateRandomToken(32)
 	pm.tokens = make(map[string]bool)
 	pm.mu.Unlock()
-	// Now persist to config file (uses pm.hashedPassword which is already updated)
-	pm.saveToConfig(password)
+	// Now persist to config file (uses pm.hashedPassword which is already updated).
+	// saveToConfig 的 dashboardAuthFields 会带上 username（默认 admin），
+	// 改密后用户名自动填入配置文件。
+	pm.saveToConfig()
 }
 
 // loginRateLimiter is a per-IP token bucket used to slow down dashboard login
@@ -909,8 +1000,9 @@ func (pm *PasswordManager) VerifyTOTP(code string) bool {
 }
 
 // VerifyTOTPEx 校验 TOTP 验证码，返回是否通过以及是否用的是恢复码。
-// usedRecovery=true 表示本次登录消耗了一个恢复码（一次性语义：调用方应
-// DisableTOTP 关闭双重认证，对齐"使用恢复码登录将禁用双因素认证"）。
+// 恢复码为一次性：命中后立即从列表移除并持久化，不可重复使用
+// （usedRecovery=true 时调用方通常还会 DisableTOTP 关闭双重认证，对齐
+// "使用恢复码登录将禁用双因素认证"）。
 func (pm *PasswordManager) VerifyTOTPEx(code string) (ok, usedRecovery bool) {
 	if code == "" {
 		return false, false
@@ -927,7 +1019,17 @@ func (pm *PasswordManager) VerifyTOTPEx(code string) (ok, usedRecovery bool) {
 	if totp.Validate(code, secret) {
 		return true, false
 	}
-	if verifyRecoveryCode(code, hashes) {
+	if hit := recoveryCodeHashFor(code, hashes); hit != "" {
+		// 一次性消耗：从内存列表移除并持久化，防止恢复码被复用。
+		pm.mu.Lock()
+		for i, h := range pm.totpRecoveryCodes {
+			if h == hit {
+				pm.totpRecoveryCodes = append(pm.totpRecoveryCodes[:i], pm.totpRecoveryCodes[i+1:]...)
+				break
+			}
+		}
+		pm.mu.Unlock()
+		pm.saveTOTPToConfig()
 		return true, true
 	}
 	return false, false
@@ -956,12 +1058,10 @@ func (pm *PasswordManager) saveTOTPToConfig() {
 func generateRecoveryCodes(count int) []string {
 	codes := make([]string, 0, count)
 	for i := 0; i < count; i++ {
-		b := make([]byte, recoveryCodeLength)
-		mustRandRead(b)
 		var sb strings.Builder
 		sb.Grow(recoveryCodeLength)
-		for _, x := range b {
-			sb.WriteByte(recoveryCodeAlphabet[int(x)%len(recoveryCodeAlphabet)])
+		for j := 0; j < recoveryCodeLength; j++ {
+			sb.WriteByte(recoveryCodeAlphabet[cryptoRandInt(len(recoveryCodeAlphabet))])
 		}
 		codes = append(codes, sb.String())
 	}
@@ -974,11 +1074,11 @@ func hashRecoveryCode(code string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// verifyRecoveryCode 模糊校验恢复码：忽略大小写、空格与连字符（前端输入的
-// 恢复码为 4 位一组并用连字符分隔），比对 SHA-256 哈希是否命中任一已存哈希。
-func verifyRecoveryCode(code string, hashes []string) bool {
+// recoveryCodeHashFor 归一化恢复码（忽略大小写、空格与连字符），比对
+// SHA-256 哈希是否命中任一已存哈希；命中返回对应哈希，未命中返回空串。
+func recoveryCodeHashFor(code string, hashes []string) string {
 	if code == "" || len(hashes) == 0 {
-		return false
+		return ""
 	}
 	normalized := strings.ToUpper(strings.TrimSpace(code))
 	normalized = strings.ReplaceAll(normalized, "-", "")
@@ -986,10 +1086,16 @@ func verifyRecoveryCode(code string, hashes []string) bool {
 	candidate := hashRecoveryCode(normalized)
 	for _, h := range hashes {
 		if subtle.ConstantTimeCompare([]byte(candidate), []byte(h)) == 1 {
-			return true
+			return h
 		}
 	}
-	return false
+	return ""
+}
+
+// verifyRecoveryCode 模糊校验恢复码：忽略大小写、空格与连字符（前端输入的
+// 恢复码为 4 位一组并用连字符分隔），比对 SHA-256 哈希是否命中任一已存哈希。
+func verifyRecoveryCode(code string, hashes []string) bool {
+	return recoveryCodeHashFor(code, hashes) != ""
 }
 
 // parseRecoveryCodeHashes 解析 config 中保存的恢复码哈希：优先当作 JSON

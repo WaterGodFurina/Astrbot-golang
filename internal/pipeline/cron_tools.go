@@ -119,11 +119,12 @@ func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, args map[
 		return fmt.Sprintf("task created: job_id=%s name=%q next_run=%s", job.ID, name, next.Format(time.RFC3339))
 	case "list":
 		jobs := mgr.List()
-		if len(jobs) == 0 {
-			return "no future tasks."
-		}
 		var lines []string
 		for _, j := range jobs {
+			// 只列出当前会话当前用户创建的任务，防止泄露其他会话/用户的 note。
+			if !taskOwnedBy(j, umo, senderID) {
+				continue
+			}
 			next := ""
 			if !j.NextRun.IsZero() {
 				next = j.NextRun.Format(time.RFC3339)
@@ -131,11 +132,18 @@ func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, args map[
 			lines = append(lines, fmt.Sprintf("- job_id=%s name=%q cron=%q run_once=%v next_run=%s note=%q",
 				j.ID, j.Name, j.CronExpression, j.RunOnce, next, j.Payload["note"]))
 		}
+		if len(lines) == 0 {
+			return "no future tasks."
+		}
 		return strings.Join(lines, "\n")
 	case "delete":
 		jobID := argString(args, "job_id")
 		if jobID == "" {
 			return "error: job_id is required for action=delete."
+		}
+		// 归属校验：只能删除本会话本用户创建的任务。
+		if !taskOwnedBy(mgr.Get(jobID), umo, senderID) {
+			return "error: task not found: " + jobID
 		}
 		mgr.Remove(jobID)
 		return fmt.Sprintf("task deleted: job_id=%s", jobID)
@@ -143,6 +151,10 @@ func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, args map[
 		jobID := argString(args, "job_id")
 		if jobID == "" {
 			return "error: job_id is required for action=edit."
+		}
+		// 归属校验：只能修改本会话本用户创建的任务。
+		if !taskOwnedBy(mgr.Get(jobID), umo, senderID) {
+			return "error: task not found: " + jobID
 		}
 		note := strings.TrimSpace(argString(args, "note"))
 		cronExpr := argString(args, "cron_expression")
@@ -188,4 +200,17 @@ func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, args map[
 	default:
 		return fmt.Sprintf("error: unknown action %q. Valid actions: create, edit, delete, list.", action)
 	}
+}
+
+// taskOwnedBy reports whether a cron job was created by the given user within
+// the given session. Jobs created through the future_task tool record both in
+// their payload; other jobs (system-scheduled, from other sessions) are not
+// manageable through the tool.
+func taskOwnedBy(job *cron.Job, umo, senderID string) bool {
+	if job == nil {
+		return false
+	}
+	session, _ := job.Payload["session"].(string)
+	sender, _ := job.Payload["sender_id"].(string)
+	return session == umo && sender == senderID
 }

@@ -125,12 +125,17 @@ func (s *ProcessStage) executeSendMessage(event *core.Event, args map[string]int
 		}
 	}
 	chain := &message.MessageChain{}
+	umo := event.UnifiedMsgOrigin()
 	for _, m := range raw {
 		mm, ok := m.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if comp := buildSendComponent(mm); comp != nil {
+		comp, err := buildSendComponent(mm, umo)
+		if err != nil {
+			return "Error: " + err.Error()
+		}
+		if comp != nil {
 			chain.Chain = append(chain.Chain, comp)
 		}
 	}
@@ -144,39 +149,99 @@ func (s *ProcessStage) executeSendMessage(event *core.Event, args map[string]int
 }
 
 // buildSendComponent maps a send_message_to_user message dict to a component.
-func buildSendComponent(m map[string]interface{}) message.Component {
+// URL 字段做 SSRF 校验（仅 http/https、拒绝内网/环回/云元数据地址），path
+// 字段限制在 workspace/skills/plugins/temp 内，防止 LLM 读取宿主机任意文件。
+func buildSendComponent(m map[string]interface{}, umo string) (message.Component, error) {
 	t, _ := m["type"].(string)
 	text, _ := m["text"].(string)
 	path, _ := m["path"].(string)
 	url, _ := m["url"].(string)
+
+	resolvePath := func() (string, error) {
+		if path == "" {
+			return "", nil
+		}
+		p, err := resolveLocalPath(path, umo, false)
+		if err != nil {
+			return "", fmt.Errorf("媒体文件路径不安全: %v", err)
+		}
+		return p, nil
+	}
+	checkURL := func() error {
+		if url == "" {
+			return nil
+		}
+		if _, err := validateWebFetchURL(url); err != nil {
+			return fmt.Errorf("媒体 URL 不安全: %v", err)
+		}
+		return nil
+	}
+
 	switch t {
 	case "plain", "":
-		return &message.Plain{Text: text}
+		return &message.Plain{Text: text}, nil
 	case "image":
 		if path != "" {
-			return message.ImageFromFile(path)
+			p, err := resolvePath()
+			if err != nil {
+				return nil, err
+			}
+			return message.ImageFromFile(p), nil
 		}
 		if url != "" {
-			return message.ImageFromURL(url)
+			if err := checkURL(); err != nil {
+				return nil, err
+			}
+			return message.ImageFromURL(url), nil
 		}
 		if b64, ok := m["base64"].(string); ok && b64 != "" {
-			return message.ImageFromBase64(b64)
+			return message.ImageFromBase64(b64), nil
 		}
 	case "record":
-		return &message.Record{Path: path, File: path, URL: url, Text: text}
+		if err := checkURL(); err != nil {
+			return nil, err
+		}
+		p, err := resolvePath()
+		if err != nil {
+			return nil, err
+		}
+		if p == "" {
+			p = path
+		}
+		return &message.Record{Path: p, File: p, URL: url, Text: text}, nil
 	case "video":
-		return &message.Video{Path: path, URL: url}
+		if err := checkURL(); err != nil {
+			return nil, err
+		}
+		p, err := resolvePath()
+		if err != nil {
+			return nil, err
+		}
+		if p == "" {
+			p = path
+		}
+		return &message.Video{Path: p, URL: url}, nil
 	case "file":
+		if err := checkURL(); err != nil {
+			return nil, err
+		}
+		p, err := resolvePath()
+		if err != nil {
+			return nil, err
+		}
+		if p == "" {
+			p = path
+		}
 		name, _ := m["name"].(string)
 		if name == "" {
-			name = filepath.Base(path)
+			name = filepath.Base(p)
 		}
-		return &message.File{Path: path, URL: url, Name: name}
+		return &message.File{Path: p, URL: url, Name: name}, nil
 	case "mention_user":
 		uid, _ := m["mention_user_id"].(string)
-		return &message.At{TargetID: uid}
+		return &message.At{TargetID: uid}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // executeGroupHistory implements get_group_message_history: reads the last N

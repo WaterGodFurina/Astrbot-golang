@@ -143,7 +143,41 @@ func (b *LocalBooter) mapPath(path string) (string, error) {
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("沙盒路径越界：%q 逃出沙盒根目录 %s", path, root)
 	}
+	if err := verifyNoSymlinkEscape(root, joined); err != nil {
+		return "", err
+	}
 	return joined, nil
+}
+
+// verifyNoSymlinkEscape 解析 p 最深一层已存在的祖先的真实路径，校验其仍在
+// root 之内。词法检查挡不住沙盒内指向宿主目录的符号链接（如 /workspace/evil
+// -> /etc），只有解析符号链接后才能确认真实落点没有逃出沙盒根目录。
+func verifyNoSymlinkEscape(root, p string) error {
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		// 根目录本身不存在，沙盒内不可能有符号链接，无从逃逸。
+		return nil
+	}
+	cur := p
+	for {
+		resolved, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			rel, rerr := filepath.Rel(resolvedRoot, resolved)
+			if rerr != nil {
+				return rerr
+			}
+			if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("沙盒路径 %q 经符号链接逃出沙盒根目录 %s", p, root)
+			}
+			return nil
+		}
+		// 目标尚未创建（写入新文件等）：逐级向上找已存在的祖先再解析。
+		parent := filepath.Dir(cur)
+		if parent == cur || parent == root {
+			return nil
+		}
+		cur = parent
+	}
 }
 
 func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workdir string) (string, string, int, error) {

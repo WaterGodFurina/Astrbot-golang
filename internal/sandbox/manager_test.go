@@ -48,6 +48,48 @@ func TestLocalBooterFileRoundTrip(t *testing.T) {
 	}
 }
 
+// TestLocalBooterSymlinkEscapeRejected: a symlink inside the sandbox root that
+// points outside must not smuggle host file access (bug.md 3.3).
+func TestLocalBooterSymlinkEscapeRejected(t *testing.T) {
+	root := t.TempDir()
+	b := NewLocalBooter()
+	b.SetRoot(root)
+	ctx := context.Background()
+	if err := b.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer b.Stop()
+
+	// Build /workspace/evil -> host /etc (outside the sandbox root).
+	evil := filepath.Join(root, "evil")
+	if err := os.MkdirAll(evil, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc", filepath.Join(evil, "link")); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+
+	// Reading through the symlink must fail.
+	if _, err := b.ReadFile(ctx, "evil/link/passwd"); err == nil {
+		t.Fatal("reading /etc/passwd through an in-sandbox symlink must be rejected")
+	}
+	// Writing through the symlink must fail too.
+	if err := b.WriteFile(ctx, "evil/link/pwned.txt", "x"); err == nil {
+		t.Fatal("writing outside the sandbox through a symlink must be rejected")
+	}
+	// A symlink whose target stays inside the root is fine.
+	inside := filepath.Join(root, "inside.txt")
+	if err := os.WriteFile(inside, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../inside.txt", filepath.Join(evil, "ok")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := b.ReadFile(ctx, "evil/ok"); err != nil || got != "ok" {
+		t.Fatalf("in-root symlink should be readable: err=%v got=%q", err, got)
+	}
+}
+
 func TestLocalBooterExec(t *testing.T) {
 	b := NewLocalBooter()
 	b.SetRoot(t.TempDir())

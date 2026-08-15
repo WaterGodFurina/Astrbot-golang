@@ -129,3 +129,72 @@ func TestLoadAtomicWriteBack(t *testing.T) {
 		t.Errorf("atomic write-back left temp files behind: %v", matches)
 	}
 }
+
+// TestCheckConfigIntegrityListTypeMismatch: 参考值为列表而用户值为其他类型时
+// 必须用默认值替换（bug.md 6.6），否则下游对列表的类型断言会 panic。
+func TestCheckConfigIntegrityListTypeMismatch(t *testing.T) {
+	defaults := map[string]interface{}{
+		"provider_settings": map[string]interface{}{
+			"websearch_tavily_key": []interface{}{},
+			"fallback_chat_models": []interface{}{},
+			"wake_prefix":          "/",
+		},
+	}
+
+	// 用户把列表写成了字符串：必须被修正为默认值（空列表）。
+	user := map[string]interface{}{
+		"provider_settings": map[string]interface{}{
+			"websearch_tavily_key": "sk-xxxx",
+			"fallback_chat_models": 42,
+			"wake_prefix":          "/",
+		},
+	}
+	changed := checkConfigIntegrity(defaults, user, "")
+
+	ps := user["provider_settings"].(map[string]interface{})
+	if _, ok := ps["websearch_tavily_key"].([]interface{}); !ok {
+		t.Errorf("websearch_tavily_key must be restored to a list, got %#v", ps["websearch_tavily_key"])
+	}
+	if _, ok := ps["fallback_chat_models"].([]interface{}); !ok {
+		t.Errorf("fallback_chat_models must be restored to a list, got %#v", ps["fallback_chat_models"])
+	}
+	if !changed {
+		t.Error("type mismatch should report a change (hasNew=true)")
+	}
+
+	// 合法列表保持原样。
+	okUser := map[string]interface{}{
+		"provider_settings": map[string]interface{}{
+			"websearch_tavily_key": []interface{}{"k1"},
+			"fallback_chat_models": []interface{}{"m1"},
+			"wake_prefix":          "/",
+		},
+	}
+	if c := checkConfigIntegrity(defaults, okUser, ""); c {
+		t.Error("well-typed list must not be touched")
+	}
+	if got := okUser["provider_settings"].(map[string]interface{})["websearch_tavily_key"].([]interface{})[0]; got != "k1" {
+		t.Errorf("list contents must be preserved, got %v", got)
+	}
+}
+
+// TestNewConfigAutoLoadsExisting: NewConfig 在配置文件已存在时必须自动加载，
+// 不允许返回空配置（bug.md 6.7）。
+func TestNewConfigAutoLoadsExisting(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"log_level": "WARN", "wake_prefix": "/x"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := NewConfig(cfgPath, DefaultConfig())
+	if got := cfg.GetString("log_level"); got != "WARN" {
+		t.Errorf("NewConfig must auto-load existing file: log_level = %q, want WARN", got)
+	}
+	// 缺失的默认键仍被补全（integrity 生效）。
+	if got := cfg.GetString("wake_prefix"); got != "/x" {
+		t.Errorf("wake_prefix = %q, want /x", got)
+	}
+	if _, ok := cfg.Get("dashboard").(map[string]interface{}); !ok {
+		t.Error("missing default keys must be filled in after auto-load")
+	}
+}

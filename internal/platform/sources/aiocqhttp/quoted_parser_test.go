@@ -486,7 +486,9 @@ func TestStopClosesConns(t *testing.T) {
 	defer conn.Close()
 
 	a := testAdapter()
-	a.addConn(conn)
+	if err := a.addConn(conn); err != nil {
+		t.Fatalf("addConn: %v", err)
+	}
 
 	if err := a.Stop(); err != nil {
 		t.Fatalf("Stop: %v", err)

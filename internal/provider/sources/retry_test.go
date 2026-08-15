@@ -58,17 +58,64 @@ func TestParseRetryAfter(t *testing.T) {
 
 func TestBackoffDelay(t *testing.T) {
 	cfg := RetryConfig{MinDelay: 200 * time.Millisecond, MaxDelay: 30 * time.Second}
-	if d := backoffDelay(1, cfg); d != 200*time.Millisecond {
-		t.Errorf("attempt 1: got %v, want 200ms", d)
+	// backoffDelay applies ±20% jitter, so assert the [0.8x, 1.2x] range.
+	if d := backoffDelay(1, cfg); d < 160*time.Millisecond || d > 240*time.Millisecond {
+		t.Errorf("attempt 1: got %v, want in [160ms, 240ms]", d)
 	}
-	if d := backoffDelay(2, cfg); d != 400*time.Millisecond {
-		t.Errorf("attempt 2: got %v, want 400ms", d)
+	if d := backoffDelay(2, cfg); d < 320*time.Millisecond || d > 480*time.Millisecond {
+		t.Errorf("attempt 2: got %v, want in [320ms, 480ms]", d)
 	}
-	if d := backoffDelay(5, cfg); d != 3200*time.Millisecond {
-		t.Errorf("attempt 5: got %v, want 3.2s", d)
+	if d := backoffDelay(5, cfg); d < 2560*time.Millisecond || d > 3840*time.Millisecond {
+		t.Errorf("attempt 5: got %v, want in [2.56s, 3.84s]", d)
 	}
 	if d := backoffDelay(10, cfg); d != 30*time.Second {
 		t.Errorf("attempt 10: got %v, want 30s (clamped)", d)
+	}
+}
+
+// TestBackoffDelayJitter verifies the ±20% jitter keeps every delay inside
+// [0.8x, 1.2x] of the base and <= MaxDelay, and that jitter actually applies:
+// many samples of the same attempt must not all be identical (L-26: 惊群效应).
+func TestBackoffDelayJitter(t *testing.T) {
+	cfg := RetryConfig{MinDelay: 200 * time.Millisecond, MaxDelay: 30 * time.Second}
+	bases := map[int]time.Duration{
+		1: 200 * time.Millisecond,
+		2: 400 * time.Millisecond,
+		5: 3200 * time.Millisecond,
+	}
+	distinct := map[int]map[time.Duration]bool{}
+	for i := 0; i < 500; i++ {
+		for attempt, base := range bases {
+			d := backoffDelay(attempt, cfg)
+			lo := base * 8 / 10
+			hi := base * 12 / 10
+			if d < lo || d > hi {
+				t.Fatalf("attempt %d: got %v, want in [%v, %v] (±20%% of %v)", attempt, d, lo, hi, base)
+			}
+			if d > cfg.MaxDelay || d <= 0 {
+				t.Fatalf("attempt %d: got %v, out of (0, MaxDelay=%v]", attempt, d, cfg.MaxDelay)
+			}
+			if distinct[attempt] == nil {
+				distinct[attempt] = map[time.Duration]bool{}
+			}
+			distinct[attempt][d] = true
+		}
+	}
+	for attempt := range bases {
+		if len(distinct[attempt]) < 2 {
+			t.Errorf("attempt %d: jitter not applied, all %d samples identical", attempt, len(distinct[attempt]))
+		}
+	}
+}
+
+// TestBackoffDelayJitterClampedMax verifies jitter never pushes a saturated
+// delay past MaxDelay: the value must stay exactly MaxDelay.
+func TestBackoffDelayJitterClampedMax(t *testing.T) {
+	cfg := RetryConfig{MinDelay: 200 * time.Millisecond, MaxDelay: 30 * time.Second}
+	for i := 0; i < 200; i++ {
+		if d := backoffDelay(30, cfg); d != 30*time.Second {
+			t.Fatalf("attempt 30: got %v, want 30s (jittered but clamped)", d)
+		}
 	}
 }
 
@@ -367,11 +414,15 @@ func TestDoWithRetryExponentialBackoff(t *testing.T) {
 	}
 	d1 := timestamps[1].Sub(timestamps[0])
 	d2 := timestamps[2].Sub(timestamps[1])
-	if d1 < 90*time.Millisecond {
-		t.Errorf("delay 1 = %v, want >= 100ms", d1)
+	// With ±20% jitter, attempt-1 sleeps in [80ms, 120ms); keep a floor well
+	// below the jitter range to prove a real sleep happened without flaking.
+	if d1 < 70*time.Millisecond {
+		t.Errorf("delay 1 = %v, want >= 70ms (100ms base, ±20%% jitter)", d1)
 	}
-	if d2 < 190*time.Millisecond {
-		t.Errorf("delay 2 = %v, want >= 200ms (clamped)", d2)
+	// Attempt 2 sleeps 200ms * jitter, clamped to MaxDelay: [160ms, 200ms].
+	// Keep the floor below the jitter range to prove a real sleep, not flake.
+	if d2 < 140*time.Millisecond {
+		t.Errorf("delay 2 = %v, want >= 140ms (200ms capped by MaxDelay, ±20%% jitter)", d2)
 	}
 }
 

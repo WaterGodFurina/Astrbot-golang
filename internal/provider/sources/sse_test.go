@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // collectSSEData scans an SSE body and returns the dispatched events.
@@ -76,5 +77,94 @@ func TestSSEReaderStopsOnData(t *testing.T) {
 	}
 	if len(events) != 1 || events[0] != "one" {
 		t.Fatalf("expected scan to stop after 'one', got %v", events)
+	}
+}
+
+// TestSSEReaderStopsOnContextCancel verifies the scan loop honors context
+// cancellation at token boundaries: cancelling mid-stream stops the scan at
+// the next boundary without consuming the remaining tokens.
+func TestSSEReaderStopsOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var events []string
+	reader := newSSEReader(ctx, &http.Response{
+		Body: io.NopCloser(strings.NewReader("data: one\n\ndata: two\n\ndata: three\n\n")),
+	}, func(data string) bool {
+		events = append(events, data)
+		cancel()
+		return false
+	})
+	if err := reader.scan(); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(events) != 1 || events[0] != "one" {
+		t.Fatalf("expected scan to stop at the boundary after cancel, got %v", events)
+	}
+}
+
+// TestSSEReaderBlockedOnReadHonorsCancel verifies cancellation is observed
+// even when the scanner is blocked waiting for the next token on a live
+// connection: the scan must stop at the next token boundary (the blocked read
+// itself cannot be interrupted, but the loop must not continue past it).
+func TestSSEReaderBlockedOnReadHonorsCancel(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var events []string
+	reader := newSSEReader(ctx, &http.Response{Body: pr}, func(data string) bool {
+		events = append(events, data)
+		return false
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- reader.scan() }()
+
+	// Feed one event and wait until it has been dispatched, so the scanner is
+	// guaranteed to be blocked in Scan() on the still-open pipe.
+	if _, err := pw.Write([]byte("data: one\n\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(events) < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("first event was not dispatched")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancel()
+	// Deliver the next token; scan must observe the cancellation at this
+	// boundary and stop without dispatching it.
+	if _, err := pw.Write([]byte("data: two\n\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("scan did not stop after context cancellation at token boundary")
+	}
+	if len(events) != 1 || events[0] != "one" {
+		t.Fatalf("expected only the pre-cancel event, got %v", events)
+	}
+}
+
+// TestSSEReaderCancelBeforeStart verifies a pre-cancelled context stops the
+// scan immediately without reading the stream.
+func TestSSEReaderCancelBeforeStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reader := newSSEReader(ctx, &http.Response{
+		Body: io.NopCloser(strings.NewReader("data: one\n\n")),
+	}, func(data string) bool {
+		t.Fatal("onData must not be called for a pre-cancelled context")
+		return false
+	})
+	if err := reader.scan(); err != nil {
+		t.Fatalf("scan: %v", err)
 	}
 }

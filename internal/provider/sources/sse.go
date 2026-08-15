@@ -11,6 +11,7 @@ import (
 // sseReader parses a Server-Sent Events stream line by line, invoking
 // onData for every `data:` payload (including the sentinel "[DONE]").
 type sseReader struct {
+	ctx     context.Context
 	scanner *bufio.Scanner
 	onData  func(data string) (stop bool)
 }
@@ -19,7 +20,7 @@ type sseReader struct {
 func newSSEReader(ctx context.Context, resp *http.Response, onData func(data string) (stop bool)) *sseReader {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	return &sseReader{scanner: scanner, onData: onData}
+	return &sseReader{ctx: ctx, scanner: scanner, onData: onData}
 }
 
 // scan reads the stream until done, EOF, or an error. The stream body is NOT
@@ -27,10 +28,17 @@ func newSSEReader(ctx context.Context, resp *http.Response, onData func(data str
 //
 // Per the SSE spec a single event may span several `data:` lines (joined with
 // a newline) and is terminated by a blank line; events are dispatched to onData
-// one at a time. The ctx parameter is intentionally not consulted here: the
-// blocking scanner cannot be interrupted mid-read, and callers already bound
-// the stream lifetime via their request context or http.Client timeout, so
-// checking ctx here would only add a no-op.
+// one at a time.
+//
+// The context is honored at token boundaries: bufio.Scanner.Scan() blocks on
+// the underlying read and cannot be interrupted mid-read, so the cancelled
+// context is checked at the top of every loop iteration. A cancellation that
+// arrives between tokens stops the scan at the next boundary (or immediately
+// when the stream is idle), so the goroutine can never keep looping forever
+// after cancellation. While a read is blocked mid-token, cancellation still
+// surfaces through the HTTP transport — the request carries ctx, and the
+// http.Client used for streaming bounds the whole read — but this loop check
+// guarantees progress even when the transport does not.
 func (r *sseReader) scan() error {
 	var dataLines []string
 	dispatch := func() (bool, error) {
@@ -47,7 +55,15 @@ func (r *sseReader) scan() error {
 		}
 		return r.onData(data), nil
 	}
-	for r.scanner.Scan() {
+	for {
+		select {
+		case <-r.ctx.Done():
+			return nil
+		default:
+		}
+		if !r.scanner.Scan() {
+			break
+		}
 		line := strings.TrimSpace(r.scanner.Text())
 		if line == "" {
 			if stop, err := dispatch(); err != nil || stop {

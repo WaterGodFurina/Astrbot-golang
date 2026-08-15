@@ -85,13 +85,16 @@ func (l *Lifecycle) SetWebUIDir(dir string) {
 
 // Start initializes all components and begins event processing.
 func (l *Lifecycle) Start(ctx context.Context) error {
+	// 孤儿插件清理必须在获取 l.mu 之前执行（6.2）：cleanupOrphanPlugins
+	// 在发现孤儿后会 SIGTERM 并休眠 orphanCleanupGrace(1s) 等待退出。若在
+	// 持锁状态下休眠，会阻塞 Stop / ReloadPipelineScheduler 等所有其他锁
+	// 使用者。放在加锁前执行仍满足顺序约定——清理在插件加载（后续
+	// subPluginMgr.LoadInstalled）之前完成。cleanupOrphanPlugins 不触碰
+	// 任何 l 的状态，因此锁外执行是安全的。
+	cleanupOrphanPlugins()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	// 启动前清扫历史孤儿插件子进程：主进程被 SIGKILL/崩溃时 go-plugin 的
-	// autoKill 未生效，插件进程会以 PPID=1 继续存活。先清理再启动，避免
-	// 新实例与旧孤儿并存。
-	cleanupOrphanPlugins()
 
 	logger.I18nInfo("AstrBot Go - 正在初始化")
 	l.startedAt = time.Now()
@@ -873,20 +876,35 @@ func (l *Lifecycle) loadPlatforms(ctx context.Context) error {
 	return nil
 }
 
-// dockerAvailable reports whether the docker CLI is present on this host
-// (used to pick a sandbox backend). The result is cached after the first call.
-var dockerOnce sync.Once
-var dockerOK bool
+// dockerCheckTTL is how long dockerAvailable caches its result before re-running
+// the LookPath check, so a Docker install after the process started is detected
+// within one TTL. Var (not const) so tests can shorten it.
+var dockerCheckTTL = 30 * time.Second
 
+// dockerCache memoizes the dockerAvailable result together with its expiry.
+var dockerCache struct {
+	mu      sync.Mutex
+	checked time.Time
+	ok      bool
+}
+
+// dockerAvailable reports whether the docker CLI is present on this host
+// (used to pick a sandbox backend). Unlike a permanent sync.Once cache, the
+// result expires after dockerCheckTTL and the LookPath check re-runs, so a
+// Docker installed after the first call is eventually detected (6.1).
 func dockerAvailable() bool {
-	dockerOnce.Do(func() {
-		_, err := exec.LookPath(os.Getenv("ASTRBOT_DOCKER_BIN"))
-		if err != nil {
-			_, err = exec.LookPath("docker")
-		}
-		dockerOK = err == nil
-	})
-	return dockerOK
+	dockerCache.mu.Lock()
+	defer dockerCache.mu.Unlock()
+	if !dockerCache.checked.IsZero() && time.Since(dockerCache.checked) < dockerCheckTTL {
+		return dockerCache.ok
+	}
+	_, err := exec.LookPath(os.Getenv("ASTRBOT_DOCKER_BIN"))
+	if err != nil {
+		_, err = exec.LookPath("docker")
+	}
+	dockerCache.checked = time.Now()
+	dockerCache.ok = err == nil
+	return dockerCache.ok
 }
 
 // orphanCleanupGrace is how long cleanupOrphanPlugins waits after SIGTERM

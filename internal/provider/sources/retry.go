@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -108,8 +109,11 @@ func parseRetryAfterSeconds(s string) (time.Duration, error) {
 	return time.Duration(sec * float64(time.Second)), nil
 }
 
-// backoffDelay computes exponential backoff for the given attempt.
-// Matches Python's wait_exponential(multiplier=1, min=0.2, max=30).
+// backoffDelay computes exponential backoff for the given attempt with ±20%
+// random jitter. Matches Python's wait_exponential(multiplier=1, min=0.2,
+// max=30), plus jitter to break the thundering-herd effect: without jitter,
+// clients that fail at the same instant retry in perfect lockstep, hammering
+// the already-struggling server.
 func backoffDelay(attempt int, cfg RetryConfig) time.Duration {
 	exp := attempt - 1
 	if exp < 0 {
@@ -121,6 +125,8 @@ func backoffDelay(attempt int, cfg RetryConfig) time.Duration {
 		exp = 30
 	}
 	delay := cfg.MinDelay * time.Duration(1<<exp)
+	// 抖动: 以 [0.8, 1.2) 随机缩放延迟, 打散并发客户端的同步重试。
+	delay = time.Duration(float64(delay) * (0.8 + 0.4*rand.Float64()))
 	if delay > cfg.MaxDelay || delay <= 0 {
 		return cfg.MaxDelay
 	}

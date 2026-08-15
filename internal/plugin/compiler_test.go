@@ -8,6 +8,47 @@ import (
 	"testing"
 )
 
+// TestPrepareRejectsInvalidModuleName verifies Prepare fails closed on a
+// moduleName that could inject extra lines into go.mod (newlines, tabs,
+// spaces, ...) and never writes a go.mod for the rejected input (go.mod
+// injection).
+func TestPrepareRejectsInvalidModuleName(t *testing.T) {
+	badNames := []string{
+		"example.com/bad\nrequire evil.com/x v0.0.0",
+		"has space",
+		"bad/module\tname",
+		"example.com/\n",
+		"",
+	}
+	for _, bad := range badNames {
+		if err := validateModuleName(bad); err == nil {
+			t.Errorf("validateModuleName(%q) should fail", bad)
+		}
+		// Prepare must reject before doing any work and must not leave a
+		// go.mod behind. NewCompiler(nil): validation runs before sdkDir(),
+		// so no toolchain is touched for the rejected input.
+		dir := t.TempDir()
+		err := NewCompiler(nil).Prepare(dir, bad)
+		if err == nil {
+			t.Errorf("Prepare(%q) should return an error", bad)
+		}
+		if _, serr := os.Stat(filepath.Join(dir, "go.mod")); serr == nil {
+			t.Errorf("Prepare(%q) must not write go.mod", bad)
+		}
+	}
+
+	// Sanity: names produced by the safe derivation paths are valid.
+	for _, ok := range []string{
+		"example.com/astrbot-plugin/test",
+		moduleNameFromID("Test-Plugin_1"),
+		"example.com/astrbot-plugin/plugin",
+	} {
+		if err := validateModuleName(ok); err != nil {
+			t.Errorf("validateModuleName(%q) should pass: %v", ok, err)
+		}
+	}
+}
+
 // TestSDKInModCacheUsesExplicitGoAndWorkDir verifies that the module-cache
 // lookup runs the provided go binary (the bundled toolchain, not the system
 // `go` on PATH) with the working directory pinned to the go.mod location
