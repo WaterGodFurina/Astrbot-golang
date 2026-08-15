@@ -25,6 +25,10 @@ github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5 h1:bBmmB7he0i
 github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5/go.mod h1:0UcFaCkhp6vZw6l5Dpq0Dp673CoF9GdvA8lTfst0GiU=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=
 github.com/STARRY-S/zip v0.2.3/go.mod h1:lqJ9JdeRipyOQJrYSOtpNAiaesFO6zVDsE8GIGFaoSk=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.0.3 h1:L9glT1OIkJsW2NMGlMW8y1YVXnE+kfRYiCFhrvdcc00=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.0.3/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.0.4 h1:y1Kt8skkt4+hTAln5AY7B5BGs1W3Yp8s/84r1Dfo8TE=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.0.4/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
 github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.1.0 h1:oQErGSDzVAz3h3Te6OJ2RaoyeCMDTeQstpbAQ85zeN4=
 github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.1.0/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
 github.com/WaterGodFurina/nanovec v1.0.1 h1:ooxW9HHgubXg5Sw/LakyBZDca3EK3x2ia7XhSWyC9uI=
@@ -433,6 +437,8 @@ google.golang.org/protobuf v1.34.2 h1:6xV6lTsCfpGD21XK49h7MhtcApnLqkfYgPcdHftf6h
 google.golang.org/protobuf v1.34.2/go.mod h1:qYOHts0dSfpeUzUFpOMr/WGzszTmLH+DiWniOlNbLDw=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c h1:Hei/4ADfdWqJk1ZMxUNpqntNwaWcugrBjAiHlqqRiVk=
+gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c/go.mod h1:JHkPIbrfpd72SG/EVd6muEfDQjcINNoR0C8j2r3qZ4Q=
 gopkg.in/errgo.v2 v2.1.0/go.mod h1:hNsd1EY+bozCKY1Ytp96fpM3vjJbqLJn88ws8XvfDNI=
 gopkg.in/yaml.v2 v2.2.2/go.mod h1:hI93XBmqTisBFMUTm0b8Fm+jr3Dg1NNxqwp+5A1VGuI=
 gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=

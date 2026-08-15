@@ -34,6 +34,14 @@ type ManifestEntry struct {
 	Repo           string `json:"repo,omitempty"`
 	DownloadURL    string `json:"download_url,omitempty"`
 
+	// Language is "go" (compiled binary) or "python" (source tree run under
+	// the embedded Python SDK). Empty/absent = "go" (legacy entries).
+	Language string `json:"language,omitempty"`
+	// DisplayName / ShortDesc are the plugin's display metadata (Python
+	// metadata.yaml display_name / short_desc), surfaced to the WebUI.
+	DisplayName string `json:"display_name,omitempty"`
+	ShortDesc   string `json:"short_desc,omitempty"`
+
 	// 插件在 dataDir 下创建的目录足迹（相对 dataDir），供卸载时按
 	// "删除配置文件 / 删除插件数据" 选项精确清理。
 	ConfigDir string `json:"config_dir,omitempty"` // plugins_config/<name>  (config.json + config_schema.json)

@@ -1,10 +1,12 @@
 package plugin
 
 import (
+	"encoding/base64"
 	"fmt"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -55,7 +57,7 @@ type RecallAdapter interface {
 // reads/writes) and a ChatLLM callback (for plugins calling the LLM directly).
 // Call once at startup, after both managers exist and before plugins begin
 // handling messages.
-func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(prompt, systemPrompt string) (string, error)) {
+func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(prompt, systemPrompt string, imageURLs []string) (string, error)) {
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
 		CallAction: func(platformID, api string, params map[string]any) (map[string]any, error) {
 			adapter := pm.Get(platformID)
@@ -112,11 +114,27 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			return subMgr.SaveConfig(pluginName, cfg)
 		},
-		ChatLLM: func(prompt, systemPrompt string) (string, error) {
+		ChatLLM: func(prompt, systemPrompt string, imageURLs []string) (string, error) {
 			if chatLLM == nil {
 				return "", fmt.Errorf("ChatLLM not configured on this host")
 			}
-			return chatLLM(prompt, systemPrompt)
+			return chatLLM(prompt, systemPrompt, imageURLs)
+		},
+		React: func(platformID, sessionID, messageID, emoji string) error {
+			if pm == nil {
+				return fmt.Errorf("platform manager not available")
+			}
+			return pm.React(platformID, sessionID, messageID, emoji)
+		},
+		TextToImage: func(text, templateName string) (string, error) {
+			if text == "" {
+				return "", fmt.Errorf("空文本无法渲染")
+			}
+			data, err := t2i.RenderTextToPNG(text, t2i.ImageOptions{})
+			if err != nil {
+				return "", fmt.Errorf("t2i 渲染失败: %w", err)
+			}
+			return base64.StdEncoding.EncodeToString(data), nil
 		},
 	})
 }

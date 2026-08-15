@@ -45,11 +45,15 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		}
 		info := map[string]interface{}{
 			"name":                   inst.Name,
+			"display_name":           m.pluginDisplayName(inst, entryByID[inst.ID]),
+			"short_desc":             m.pluginShortDesc(inst, entryByID[inst.ID]),
 			"marketplace_name":       strings.ReplaceAll(inst.Name, "_", "-"),
 			"version":                inst.Version,
 			"description":            desc,
 			"path":                   inst.Binary,
 			"id":                     inst.ID,
+			"language":               inst.Language,
+			"logo":                   m.pluginLogoURL(inst.ID, inst.Name),
 			"loaded":                 true,
 			"enabled":                true,
 			"activated":              true,
@@ -86,11 +90,15 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		}
 		result = append(result, map[string]interface{}{
 			"name":                   e.Name,
+			"display_name":           m.pluginDisplayName(nil, &e),
+			"short_desc":             m.pluginShortDesc(nil, &e),
 			"marketplace_name":       strings.ReplaceAll(e.Name, "_", "-"),
 			"version":                e.Version,
 			"description":            "插件已禁用",
 			"path":                   e.Binary,
 			"id":                     e.ID,
+			"language":               e.Language,
+			"logo":                   m.pluginLogoURL(e.ID, e.Name),
 			"loaded":                 false,
 			"enabled":                false,
 			"activated":              false,
@@ -103,6 +111,66 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		})
 	}
 	return result
+}
+
+// pluginDisplayName resolves the display name shown in the WebUI: manifest
+// record > runtime instance > the config block written at install (legacy
+// entries) > plugin name.
+func (m *SubprocessManager) pluginDisplayName(inst *PluginInstance, e *ManifestEntry) string {
+	if e != nil && e.DisplayName != "" {
+		return e.DisplayName
+	}
+	if inst != nil && inst.DisplayName != "" {
+		return inst.DisplayName
+	}
+	name := ""
+	if inst != nil {
+		name = inst.Name
+	} else if e != nil {
+		name = e.Name
+	}
+	if name != "" {
+		if cfg := m.LoadConfig(name); cfg != nil {
+			if v, _ := cfg["display_name"].(string); v != "" {
+				return v
+			}
+		}
+	}
+	return name
+}
+
+// pluginShortDesc resolves the one-line short description (manifest > instance
+// > config block > "").
+func (m *SubprocessManager) pluginShortDesc(inst *PluginInstance, e *ManifestEntry) string {
+	if e != nil && e.ShortDesc != "" {
+		return e.ShortDesc
+	}
+	if inst != nil && inst.ShortDesc != "" {
+		return inst.ShortDesc
+	}
+	name := ""
+	if inst != nil {
+		name = inst.Name
+	} else if e != nil {
+		name = e.Name
+	}
+	if name != "" {
+		if cfg := m.LoadConfig(name); cfg != nil {
+			if v, _ := cfg["short_desc"].(string); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// pluginLogoURL returns the dashboard-relative URL of the plugin's cached
+// logo ("" when absent), consumed by the WebUI as <img src>.
+func (m *SubprocessManager) pluginLogoURL(id, name string) string {
+	if m.PluginLogoFile(name) == "" {
+		return ""
+	}
+	return "/api/v1/plugins/logo?plugin_id=" + url.QueryEscape(id)
 }
 
 // installSourceMap serializes the manifest entry into the dashboard's
@@ -199,7 +267,7 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 			// WebUI 启用请求被阻塞 15-30s。
 			loadCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			m.manifestMu.Unlock() // Load 会触发 on_plugin_loaded RPC，不能持锁
-			_, loadErr := m.Load(loadCtx, id, entry.Binary)
+			_, loadErr := m.LoadLang(loadCtx, id, entry.Binary, entry.Language)
 			cancel()
 			m.manifestMu.Lock()
 			if loadErr != nil {
@@ -376,6 +444,8 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 
 	// 二进制目录（始终删除）。
 	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id)))
+	// Python 插件源码目录（始终删除）。
+	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-src", sanitizeID(id)))
 
 	// 目录足迹：优先用安装时记录的 manifest 条目，旧版本安装则按 name 推导。
 	// name 与 manifest 子路径都先 sanitize/校验，防止路径穿越导致误删
@@ -560,6 +630,12 @@ func (m *SubprocessManager) writeMetadataConfig(name string, meta *PluginMetadat
 	od.Set("repo", meta.Repo)
 	if meta.Homepage != "" {
 		od.Set("homepage", meta.Homepage)
+	}
+	if meta.DisplayName != "" {
+		od.Set("display_name", meta.DisplayName)
+	}
+	if meta.ShortDesc != "" {
+		od.Set("short_desc", meta.ShortDesc)
 	}
 	od.Set("cgo", cgo)
 

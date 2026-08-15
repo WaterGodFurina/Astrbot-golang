@@ -145,7 +145,7 @@ func TestHostServiceReverseCalls(t *testing.T) {
 
 	// Install fake host hooks before launching the plugin client.
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
-		ChatLLM: func(prompt, systemPrompt string) (string, error) {
+		ChatLLM: func(prompt, systemPrompt string, imageURLs []string) (string, error) {
 			return "echo:" + prompt, nil
 		},
 		SetConfig: func(pluginName string, cfg map[string]any) error {

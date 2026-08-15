@@ -1,0 +1,17 @@
+{
+    "greeting": {
+        "description": "问候语",
+        "type": "str",
+        "default": "你好"
+    },
+    "max_count": {
+        "description": "最大计数",
+        "type": "int",
+        "default": 10
+    },
+    "enabled": {
+        "description": "是否启用",
+        "type": "bool",
+        "default": true
+    }
+}

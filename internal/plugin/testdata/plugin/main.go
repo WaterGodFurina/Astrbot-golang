@@ -42,7 +42,7 @@ func main() {
 			// back into the host (ChatLLM / SetConfig / GetConfig).
 			Name: "hosttest",
 			Handler: func(e *sdk.Event, args []string) (string, error) {
-				llm, _ := sdk.Host.ChatLLM("ping", "you are a test")
+				llm, _ := sdk.Host.ChatLLM("ping", "you are a test", nil)
 				if err := sdk.Host.SetConfig("testplugin", map[string]any{"k": "v"}); err != nil {
 					return "setcfg-error: " + err.Error(), nil
 				}

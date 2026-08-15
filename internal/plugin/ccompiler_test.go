@@ -65,6 +65,73 @@ func TestReadPluginMetadata(t *testing.T) {
 	}
 }
 
+// TestReadPluginMetadataYAML covers the Python ecosystem metadata.yaml
+// convention (name/display_name/short_desc/desc/version/author/repo).
+func TestReadPluginMetadataYAML(t *testing.T) {
+	dir := t.TempDir()
+	write := func(content string) {
+		if err := os.WriteFile(filepath.Join(dir, "metadata.yaml"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write(`name: meme_manager
+display_name: 表情包管理器
+short_desc: 集表情包管理、智能发送、语义检索与云端同步于一体
+desc: >-
+  为 AstrBot 提供 WebUI 表情包管理页面
+help: 功能：1. AI自动发送表情包
+version: 4.15.1
+author: anka
+repo: https://github.com/anka-afk/astrbot_plugin_meme_manager
+tags:
+  - 表情包
+`)
+	meta, err := ReadPluginMetadata(dir)
+	if err != nil {
+		t.Fatalf("ReadPluginMetadata(yaml): %v", err)
+	}
+	if meta.Name != "meme_manager" {
+		t.Errorf("Name = %q", meta.Name)
+	}
+	if meta.DisplayName != "表情包管理器" || meta.ShortDesc == "" {
+		t.Errorf("DisplayName/ShortDesc 解析失败: %+v", meta)
+	}
+	if meta.Version != "4.15.1" || meta.Author != "anka" {
+		t.Errorf("Version/Author 解析失败: %+v", meta)
+	}
+	if meta.Repo != "https://github.com/anka-afk/astrbot_plugin_meme_manager" {
+		t.Errorf("Repo = %q", meta.Repo)
+	}
+	if !strings.Contains(meta.Description, "WebUI 表情包管理页面") {
+		t.Errorf("Description 解析失败: %q", meta.Description)
+	}
+
+	// 未写 language 不影响解析（语言完全由入口文件推断）
+	write("name: x\nversion: 1.0.0\n")
+	meta, err = ReadPluginMetadata(dir)
+	if err != nil {
+		t.Fatalf("ReadPluginMetadata(yaml): %v", err)
+	}
+	if meta.Name != "x" {
+		t.Errorf("Name = %q", meta.Name)
+	}
+
+	// 缺失 name → 报错
+	write("desc: no name\n")
+	if _, err := ReadPluginMetadata(dir); err == nil || !strings.Contains(err.Error(), "name") {
+		t.Fatalf("expected missing name error, got %v", err)
+	}
+
+	// 两者都缺 → 报错提示两种文件
+	if err := os.Remove(filepath.Join(dir, "metadata.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadPluginMetadata(dir); err == nil || !strings.Contains(err.Error(), "metadata.yaml") {
+		t.Fatalf("expected missing metadata error, got %v", err)
+	}
+}
+
 // TestEnsureMainGo guards the main.go requirement.
 func TestEnsureMainGo(t *testing.T) {
 	dir := t.TempDir()
@@ -77,6 +144,38 @@ func TestEnsureMainGo(t *testing.T) {
 	empty := t.TempDir()
 	if err := ensureMainGo(empty); err == nil || !strings.Contains(err.Error(), "main.go") {
 		t.Fatalf("expected missing main.go error, got %v", err)
+	}
+}
+
+// TestResolveLanguage verifies language detection is purely entry-file based
+// (main.py / __init__.py → python, else go) and never consults metadata.
+func TestResolveLanguage(t *testing.T) {
+	newDir := func(files ...string) string {
+		dir := t.TempDir()
+		for _, f := range files {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+
+	cases := []struct {
+		name string
+		dir  string
+		want string
+	}{
+		{"main.py 推断 python", newDir("main.py"), "python"},
+		{"__init__.py 推断 python", newDir("__init__.py"), "python"},
+		{"main.py + main.go 共存 → python", newDir("main.py", "main.go"), "python"},
+		{"仅 main.go 默认 go", newDir("main.go"), "go"},
+		{"空目录默认 go", t.TempDir(), "go"},
+		{"无任何入口默认 go", newDir("README.md"), "go"},
+	}
+	for _, c := range cases {
+		if got := ResolveLanguage(c.dir); got != c.want {
+			t.Errorf("%s: ResolveLanguage = %q, want %q", c.name, got, c.want)
+		}
 	}
 }
 

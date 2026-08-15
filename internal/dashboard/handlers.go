@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
@@ -1955,6 +1956,13 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "readme":
 		s.handlePluginDocs(w, r, s.subPluginMgr.Readme)
+	case "extensions":
+		// WebUI plugin Web API proxy: /api/v1/plugins/extensions/<plugin_path>
+		// → plugin process (register_web_api). Mirrors Python's
+		// /plugins/extensions/{plugin_path:path}.
+		s.handlePluginWebProxy(w, r, strings.Join(parts[1:], "/"))
+	case "logo":
+		s.handlePluginLogo(w, r)
 	case "config-files":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"files": []interface{}{},
@@ -2387,6 +2395,159 @@ func (s *Server) handlePluginBindSource(w http.ResponseWriter, r *http.Request, 
 // handlePluginDocs serves plugin README/CHANGELOG content
 // (GET /api/v1/plugins/{id}/readme, /changelog and the query variants) from
 // the subprocess runtime's cached plugin docs.
+// handlePluginLogo serves a plugin's cached logo image (data/plugins/<name>/)
+// for the WebUI <img> tags. Returns 404 when the plugin has no logo.
+func (s *Server) handlePluginLogo(w http.ResponseWriter, r *http.Request) {
+	pluginID := r.URL.Query().Get("plugin_id")
+	if pluginID == "" {
+		writeJSON(w, http.StatusOK, apiError("缺少插件 ID"))
+		return
+	}
+	name := pluginID
+	if s.subPluginMgr != nil {
+		if pid, n, ok := s.resolveSubprocessPlugin(pluginID); ok {
+			_ = pid
+			name = n
+		}
+	} else {
+		// 子进程插件管理器不可用（未注入/独立模式）：无 logo 可提供。
+		http.NotFound(w, r)
+		return
+	}
+	path := s.subPluginMgr.PluginLogoFile(name)
+	if path == "" {
+		http.NotFound(w, r)
+		return
+	}
+	ct := "image/png"
+	switch {
+	case strings.HasSuffix(path, ".jpg"), strings.HasSuffix(path, ".jpeg"):
+		ct = "image/jpeg"
+	case strings.HasSuffix(path, ".gif"):
+		ct = "image/gif"
+	case strings.HasSuffix(path, ".svg"):
+		ct = "image/svg+xml"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	http.ServeFile(w, r, path)
+}
+
+// handlePluginWebProxy proxies a dashboard HTTP request to the plugin process
+// that registered the route (context.register_web_api). The first path segment
+// is the plugin name/id; the full sub-path (including the plugin segment) is
+// forwarded verbatim — the plugin matches its own route patterns (including
+// dynamic <param> segments) — and the response is written back to the client
+// (Go acts as a thin nginx-style gateway).
+func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pluginPath string) {
+	pluginPath = strings.TrimPrefix(pluginPath, "/")
+	if pluginPath == "" {
+		writeJSON(w, http.StatusOK, apiError("缺少插件路径"))
+		return
+	}
+	segments := strings.SplitN(pluginPath, "/", 2)
+	if len(segments) == 0 || segments[0] == "" {
+		writeJSON(w, http.StatusOK, apiError("缺少插件名"))
+		return
+	}
+	if s.subPluginMgr == nil {
+		writeJSON(w, http.StatusOK, apiError("插件运行时不可用"))
+		return
+	}
+	pid, _, ok := s.resolveSubprocessPlugin(segments[0])
+	if !ok {
+		logger.I18nWarn("plug proxy: 插件 %q 未找到", segments[0])
+		http.NotFound(w, r)
+		return
+	}
+	inst := s.subPluginMgr.Get(pid)
+	if inst == nil || inst.Client == nil {
+		logger.I18nWarn("plug proxy: 插件 %q 未加载", pid)
+		http.NotFound(w, r)
+		return
+	}
+	// 有没有注册 Web API？没有则 404（避免无谓 RPC）。
+	hasWebAPI := false
+	if inst.Meta != nil {
+		hasWebAPI = len(inst.Meta.WebApis) > 0
+	}
+	if !hasWebAPI {
+		logger.I18nWarn("plug proxy: 插件 %q 未注册 Web API (path=%s)", pid, pluginPath)
+		http.NotFound(w, r)
+		return
+	}
+
+	// 组装请求（query 多值 / headers / body / multipart 文件）
+	req := &sdkv1.HandleWebRequestRequest{
+		Method: r.Method,
+		Path:   "/" + pluginPath,
+	}
+	for k, vs := range r.URL.Query() {
+		for _, v := range vs {
+			req.Query = append(req.Query, &sdkv1.WebKV{Key: k, Value: v})
+		}
+	}
+	for k, vs := range r.Header {
+		for _, v := range vs {
+			if k == "Authorization" || k == "Cookie" {
+				continue // 内部头不转发
+			}
+			req.Headers = append(req.Headers, &sdkv1.WebKV{Key: k, Value: v})
+		}
+	}
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if err := r.ParseMultipartForm(64 << 20); err == nil {
+			if r.MultipartForm != nil {
+				for field, files := range r.MultipartForm.File {
+					for _, fh := range files {
+						f, err := fh.Open()
+						if err != nil {
+							continue
+						}
+						content, err := io.ReadAll(io.LimitReader(f, 64<<20))
+						f.Close()
+						if err != nil {
+							continue
+						}
+						req.Files = append(req.Files, &sdkv1.WebUploadFile{
+							Field:       field,
+							Filename:    fh.Filename,
+							ContentType: fh.Header.Get("Content-Type"),
+							Content:     content,
+						})
+					}
+				}
+				for k, vs := range r.MultipartForm.Value {
+					for _, v := range vs {
+						req.Query = append(req.Query, &sdkv1.WebKV{Key: k, Value: v})
+					}
+				}
+			}
+		}
+	} else {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+		req.Body = body
+	}
+
+	rpcCtx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	resp, err := inst.Client.HandleWebRequest(rpcCtx, req)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError("插件 Web API 调用失败: "+err.Error()))
+		return
+	}
+	status := int(resp.StatusCode)
+	if status <= 0 {
+		status = http.StatusNotFound
+	}
+	for _, kv := range resp.Headers {
+		w.Header().Set(kv.Key, kv.Value)
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(resp.Body)
+}
+
 func (s *Server) handlePluginDocs(w http.ResponseWriter, r *http.Request, subprocess func(string) string) {
 	pluginID := r.URL.Query().Get("plugin_id")
 	if pluginID == "" {

@@ -16,6 +16,7 @@ import (
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	goplugin "github.com/hashicorp/go-plugin"
 )
@@ -51,6 +52,13 @@ type PluginInstance struct {
 	Version   string
 	Binary    string
 	StartedAt time.Time
+
+	// Language is "go" (compiled binary) or "python" (source tree).
+	Language string
+	// DisplayName / ShortDesc are the plugin's display metadata (from the
+	// packaged metadata), surfaced to the WebUI.
+	DisplayName string
+	ShortDesc   string
 
 	// Client is the typed gRPC client used by the star bridge to invoke
 	// commands/filters/hooks.
@@ -100,6 +108,10 @@ type SubprocessManager struct {
 	// 配置后克隆 https://github.com/... 仓库时在 URL 前加该前缀。
 	githubProxy string
 
+	// pythonEnv 是 Python 插件子进程环境（解释器 + SDK 目录），首次启动
+	// Python 插件时惰性解析（可能创建 venv 安装依赖）。nil 表示尚未解析。
+	pythonEnv *pysdk.RuntimeEnv
+
 	// AutoRestart enables automatic restart of crashed plugins.
 	AutoRestart bool
 	// MaxRestarts caps the total number of start chances: the plugin gets 1
@@ -115,6 +127,12 @@ type SubprocessManager struct {
 	// OnInstancesChanged is invoked after a plugin instance is replaced
 	// (e.g. crash-restart) so the host can re-bridge handlers.
 	OnInstancesChanged func()
+	// MinPort / MaxPort bound the go-plugin handshake listener port range
+	// (default 10000-25000). Tests set an isolated range so a concurrently
+	// running real host (whose plugin subprocesses listen in the default
+	// range) cannot interfere with the test subprocess handshake.
+	MinPort int
+	MaxPort int
 }
 
 // NewSubprocessManager creates the subprocess plugin manager.
@@ -264,11 +282,16 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	}
 	defer os.RemoveAll(srcDir)
 
-	// Plugin packages must ship metadata.json (identity/source/cgo) and main.go
-	// (entrypoint) at their root.
+	// Plugin packages must ship metadata.json or metadata.yaml (identity) at
+	// their root. Go plugins additionally need main.go; Python plugins need
+	// main.py or a package __init__.py. 语言按入口文件判断（main.py/
+	// __init__.py → python，否则 go），不依赖 metadata 声明。
 	meta, err := ReadPluginMetadata(srcDir)
 	if err != nil {
 		return nil, err
+	}
+	if ResolveLanguage(srcDir) == "python" {
+		return m.installPythonSource(ctx, id, srcDir, source, meta, opts)
 	}
 	if err := ensureMainGo(srcDir); err != nil {
 		return nil, err
@@ -331,7 +354,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	unlock := m.lockOp(id)
 	defer unlock()
 
-	inst, err := m.loadLocked(ctx, id, artifact)
+	inst, err := m.loadLocked(ctx, id, artifact, "go")
 	if err != nil {
 		return nil, err
 	}
@@ -343,19 +366,120 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if meta.Version != "" {
 		inst.Version = meta.Version
 	}
+	inst.DisplayName = meta.DisplayName
+	inst.ShortDesc = meta.ShortDesc
+	// repo 回退：本地/URL 安装时 opts.Repo 为空，用 metadata 声明的 repo
+	//（Python 插件 metadata.yaml 必带 repo），避免 WebUI "在GitHub中查看仓库"
+	// 按钮指向本地安装路径。
+	if opts.Repo == "" && meta.Repo != "" {
+		opts.Repo = meta.Repo
+	}
 	if err := m.recordInstall(inst, source, artifact, opts); err != nil {
 		logger.I18nWarn("插件 %s 已安装但 manifest 持久化失败: %v", id, err)
 	}
-	m.cachePluginDocs(inst.Name, srcDir)
+	m.cachePluginDocs(inst.Name, srcDir, meta)
 	m.writeMetadataConfig(inst.Name, meta)
 	return inst, nil
 }
 
-// cachePluginDocs copies the plugin's README.md and CHANGELOG.md from the
-// fetched source into its config/data directory so the WebUI readme/changelog
-// endpoints can serve them without re-fetching (mirrors Python's
-// plugin_dir/README.md lookup).
-func (m *SubprocessManager) cachePluginDocs(name, srcDir string) {
+// installPythonSource installs a Python plugin: copies the source tree into
+// data/plugins-src/<id> (the "binary" the runtime launches), optionally
+// installs requirements.txt into the Python venv, then loads it.
+func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir, source string, meta *PluginMetadata, opts InstallOptions) (*PluginInstance, error) {
+	if err := ensurePythonEntry(srcDir); err != nil {
+		return nil, err
+	}
+	if opts.Stage != nil {
+		opts.Stage("准备 Python 插件…")
+	}
+	dest := filepath.Join(m.dataDir, "plugins-src", sanitizeID(id))
+	if err := os.RemoveAll(dest); err != nil {
+		return nil, err
+	}
+	if err := copyDir(srcDir, dest); err != nil {
+		return nil, fmt.Errorf("拷贝 Python 插件源码: %w", err)
+	}
+
+	// requirements.txt → pip install（使用 Python venv；失败仅告警，插件仍可加载）
+	req := filepath.Join(dest, "requirements.txt")
+	if _, err := os.Stat(req); err == nil {
+		if opts.Stage != nil {
+			opts.Stage("安装 Python 依赖 (requirements.txt)…")
+		}
+		if env, err := m.pythonRuntimeWithStage(opts.Stage); err == nil {
+			if err := m.pipInstall(env, dest, req); err != nil {
+				logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
+			}
+		}
+	}
+
+	unlock := m.lockOp(id)
+	defer unlock()
+
+	inst, err := m.loadLocked(ctx, id, dest, "python")
+	if err != nil {
+		return nil, err
+	}
+	if meta.Name != "" {
+		inst.Name = meta.Name
+	}
+	if meta.Version != "" {
+		inst.Version = meta.Version
+	}
+	inst.DisplayName = meta.DisplayName
+	inst.ShortDesc = meta.ShortDesc
+	// repo 回退：本地/URL 安装时 opts.Repo 为空，用 metadata 声明的 repo
+	//（Python 插件 metadata.yaml 必带 repo），避免 WebUI "在GitHub中查看仓库"
+	// 按钮指向本地安装路径。
+	if opts.Repo == "" && meta.Repo != "" {
+		opts.Repo = meta.Repo
+	}
+	if err := m.recordInstall(inst, source, dest, opts); err != nil {
+		logger.I18nWarn("插件 %s 已安装但 manifest 持久化失败: %v", id, err)
+	}
+	m.cachePluginDocs(inst.Name, srcDir, meta)
+	m.writeMetadataConfig(inst.Name, meta)
+	return inst, nil
+}
+
+// pipInstall runs `pip install -r requirements.txt` inside the plugin's source
+// directory so relative dependencies resolve; the pip index honors
+// ASTRBOT_PYPI_INDEX (or PIP_INDEX_URL). All paths are made absolute because
+// the subprocess cwd differs from the host's.
+func (m *SubprocessManager) pipInstall(env *pysdk.RuntimeEnv, pluginDir, req string) error {
+	if abs, err := filepath.Abs(req); err == nil {
+		req = abs
+	}
+	if abs, err := filepath.Abs(pluginDir); err == nil {
+		pluginDir = abs
+	}
+	args := []string{"-m", "pip", "install", "--disable-pip-version-check", "-q", "-r", req, "-i", pysdk.PyPIIndex()}
+	cmd := exec.Command(env.PythonBin, args...)
+	cmd.Dir = pluginDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ensurePythonEntry guards the requirement that Python plugin packages have a
+// loadable entry (main.py or a package __init__.py).
+func ensurePythonEntry(srcDir string) error {
+	if _, err := os.Stat(filepath.Join(srcDir, "main.py")); err == nil {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(srcDir, "__init__.py")); err == nil {
+		return nil
+	}
+	return fmt.Errorf("Python 插件源码缺少 main.py 或 __init__.py 入口")
+}
+
+// cachePluginDocs copies the plugin's README.md, CHANGELOG.md and logo image
+// from the fetched source into its config/data directory so the WebUI
+// readme/changelog endpoints and the plugin logo endpoint can serve them
+// without re-fetching (mirrors Python's plugin_dir/README.md lookup).
+func (m *SubprocessManager) cachePluginDocs(name, srcDir string, meta *PluginMetadata) {
 	dir := filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
 	_ = os.MkdirAll(dir, 0o755)
 	for _, src := range []string{"README.md", "readme.md", "CHANGELOG.md", "changelog.md"} {
@@ -368,6 +492,44 @@ func (m *SubprocessManager) cachePluginDocs(name, srcDir string) {
 			logger.I18nWarn("缓存插件 %s 的文档 %s 失败: %v", name, src, err)
 		}
 	}
+	// Logo：metadata 声明的 logo_path 优先，其次根目录常见文件名
+	// （Python AstrBot 插件惯例 logo.png）。文件拷入 plugins/<name>/ 目录，
+	// 由 dashboard /api/v1/plugins/logo 端点提供。
+	candidates := []string{}
+	if meta != nil && strings.TrimSpace(meta.LogoPath) != "" {
+		candidates = append(candidates, strings.TrimSpace(meta.LogoPath))
+	}
+	for _, n := range []string{"logo.png", "logo.jpg", "logo.jpeg", "logo.gif", "icon.png"} {
+		candidates = append(candidates, n)
+	}
+	for _, rel := range candidates {
+		if rel == "" || strings.Contains(rel, "..") || strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, "\\") {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(srcDir, filepath.FromSlash(rel)))
+		if err != nil {
+			continue
+		}
+		base := filepath.Base(rel)
+		if err := os.WriteFile(filepath.Join(dir, base), content, 0o644); err != nil {
+			logger.I18nWarn("缓存插件 %s 的 Logo %s 失败: %v", name, rel, err)
+			continue
+		}
+		break
+	}
+}
+
+// PluginLogoFile returns the cached logo file path for a plugin name ("" when
+// the plugin has no cached logo). The dashboard logo endpoint uses it.
+func (m *SubprocessManager) PluginLogoFile(name string) string {
+	dir := filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
+	for _, n := range []string{"logo.png", "logo.jpg", "logo.jpeg", "logo.gif", "icon.png"} {
+		p := filepath.Join(dir, n)
+		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+			return p
+		}
+	}
+	return ""
 }
 
 // recordInstall upserts the plugin into the persisted install manifest.
@@ -386,6 +548,9 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		Source:         source,
 		Binary:         artifact,
 		Enabled:        true,
+		Language:       inst.Language,
+		DisplayName:    inst.DisplayName,
+		ShortDesc:      inst.ShortDesc,
 		InstallMethod:  opts.InstallMethod,
 		RegistryURL:    opts.RegistryURL,
 		RegistryName:   opts.RegistryName,
@@ -405,22 +570,31 @@ func (m *SubprocessManager) manifestPath() string {
 	return filepath.Join(m.dataDir, "plugins-manifest.json")
 }
 
-// Load launches a compiled plugin binary as a child process and registers it
-// under id. Already-loaded ids return the existing instance. It holds the
-// per-plugin lifecycle lock so a concurrent Uninstall cannot unload/remove the
-// plugin in the middle of its registration window.
+// Load launches a compiled plugin binary (or Python source tree) as a child
+// process and registers it under id. Already-loaded ids return the existing
+// instance. It holds the per-plugin lifecycle lock so a concurrent Uninstall
+// cannot unload/remove the plugin in the middle of its registration window.
 func (m *SubprocessManager) Load(ctx context.Context, id, binary string) (*PluginInstance, error) {
+	return m.LoadLang(ctx, id, binary, "")
+}
+
+// LoadLang is Load with an explicit language ("go" / "python"; empty means
+// "go").
+func (m *SubprocessManager) LoadLang(ctx context.Context, id, binary, language string) (*PluginInstance, error) {
 	if id == "" {
 		return nil, fmt.Errorf("plugin id cannot be empty")
 	}
+	if language == "" {
+		language = "go"
+	}
 	unlock := m.lockOp(id)
 	defer unlock()
-	return m.loadLocked(ctx, id, binary)
+	return m.loadLocked(ctx, id, binary, language)
 }
 
 // loadLocked is Load's body; the caller must hold the per-plugin lifecycle lock
 // for id (m.lockOp).
-func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary string) (*PluginInstance, error) {
+func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language string) (*PluginInstance, error) {
 	m.mu.RLock()
 	if inst, ok := m.instances[id]; ok {
 		m.mu.RUnlock()
@@ -428,7 +602,7 @@ func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary string) (
 	}
 	m.mu.RUnlock()
 
-	inst, err := m.startInstance(ctx, id, binary)
+	inst, err := m.startInstance(ctx, id, binary, language)
 	if err != nil {
 		return nil, err
 	}
@@ -468,7 +642,7 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 		return fmt.Errorf("plugin %s not loaded", id)
 	}
 
-	newInst, err := m.startInstance(ctx, id, old.Binary)
+	newInst, err := m.startInstance(ctx, id, old.Binary, old.Language)
 	if err != nil {
 		return fmt.Errorf("reload plugin %s: %w", id, err)
 	}
@@ -601,11 +775,12 @@ func (m *SubprocessManager) SetAutoRestart(enabled bool) {
 	m.mu.Unlock()
 }
 
-// startInstance launches one plugin binary and performs the handshake + first
-// Register call. On any failure the process is killed and resources released.
+// startInstance launches one plugin subprocess (compiled Go binary or Python
+// source tree) and performs the handshake + first Register call. On any
+// failure the process is killed and resources released.
 // It holds startInstanceMu for its whole lifetime so the SDK-side process-global
 // hostPluginID cannot be clobbered by a concurrently loading plugin.
-func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string) (*PluginInstance, error) {
+func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, language string) (*PluginInstance, error) {
 	startInstanceMu.Lock()
 	defer startInstanceMu.Unlock()
 
@@ -613,7 +788,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 	if err != nil {
 		return nil, fmt.Errorf("resolve binary: %w", err)
 	}
-	if info, err := os.Stat(abs); err != nil || info.IsDir() {
+	if info, err := os.Stat(abs); err != nil || (info.IsDir() && language != "python") {
 		return nil, fmt.Errorf("plugin binary not found: %s", abs)
 	}
 
@@ -623,15 +798,62 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 	if err := os.MkdirAll(pluginDataRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create plugin data dir: %w", err)
 	}
+
+	// Python 插件：python3 -m astrbot._bridge.server <源码目录>
+	if language == "python" {
+		env, err := m.pythonRuntime()
+		if err != nil {
+			return nil, fmt.Errorf("python runtime: %w", err)
+		}
+		cmd := exec.Command(env.PythonBin, "-m", "astrbot._bridge.server", abs)
+		cmd.Dir = pluginDataRoot
+		cmd.Env = env.Env(abs, m.dataDir)
+		return m.dispensePlugin(ctx, id, abs, language, cmd)
+	}
+
 	cmd := exec.Command(abs)
 	cmd.Dir = pluginDataRoot
-	raw := goplugin.NewClient(&goplugin.ClientConfig{
+	return m.dispensePlugin(ctx, id, abs, language, cmd)
+}
+
+// pythonRuntime resolves (once) the Python subprocess environment: SDK
+// extraction + venv/grpcio preparation + (optionally) downloading a bundled
+// Python when the system has none. The first Python plugin load may take a
+// while (download / venv creation + pip install).
+func (m *SubprocessManager) pythonRuntime() (*pysdk.RuntimeEnv, error) {
+	return m.pythonRuntimeWithStage(nil)
+}
+
+// pythonRuntimeWithStage is pythonRuntime with a stage callback surfaced to
+// the WebUI install dialog (e.g. "下载 Python 解释器…").
+func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.RuntimeEnv, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pythonEnv != nil {
+		return m.pythonEnv, nil
+	}
+	env, err := pysdk.PrepareRuntimeWithStage(m.dataDir, stage)
+	if err != nil {
+		return nil, err
+	}
+	m.pythonEnv = env
+	return env, nil
+}
+
+// dispensePlugin runs the go-plugin handshake against a prepared command.
+func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, language string, cmd *exec.Cmd) (*PluginInstance, error) {
+	cfg := &goplugin.ClientConfig{
 		HandshakeConfig:  pluginsdk.Handshake,
 		Plugins:          pluginsdk.PluginMap,
 		Cmd:              cmd,
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 		Managed:          true,
-	})
+	}
+	if m.MinPort > 0 && m.MaxPort >= m.MinPort {
+		cfg.MinPort = uint(m.MinPort)
+		cfg.MaxPort = uint(m.MaxPort)
+	}
+	raw := goplugin.NewClient(cfg)
 
 	// go-plugin's handshake has no built-in timeout; enforce one.
 	type dispenseResult struct {
@@ -695,6 +917,8 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 	regCtx, cancel := context.WithTimeout(ctx, startTimeout)
 	defer cancel()
 	meta, err := pc.Register(regCtx)
+	logger.I18nInfo("startInstance %s: Register meta name=%q version=%q (pid=%d)", id,
+		meta.GetName(), meta.GetVersion(), cmd.Process.Pid)
 	if err != nil {
 		_ = pc.Close()
 		raw.Kill()
@@ -712,6 +936,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary string
 		Name:      meta.Name,
 		Version:   meta.Version,
 		Binary:    abs,
+		Language:  language,
 		Client:    pc,
 		Meta:      meta,
 		raw:       raw,
@@ -839,7 +1064,7 @@ func (m *SubprocessManager) restart(inst *PluginInstance) {
 	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	defer cancel()
 
-	newInst, err := m.startInstance(ctx, inst.ID, inst.Binary)
+	newInst, err := m.startInstance(ctx, inst.ID, inst.Binary, inst.Language)
 	if err != nil {
 		m.markFailed(inst, fmt.Errorf("restart plugin %s: %w", inst.ID, err))
 		return
@@ -884,7 +1109,11 @@ func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 		if !e.Enabled {
 			continue
 		}
-		if _, err := m.Load(ctx, e.ID, e.Binary); err != nil {
+		lang := e.Language
+		if lang == "" {
+			lang = "go"
+		}
+		if _, err := m.LoadLang(ctx, e.ID, e.Binary, lang); err != nil {
 			logger.I18nWarn("加载已安装插件 %s 失败: %v", e.ID, err)
 			continue
 		}

@@ -238,3 +238,27 @@ func TestFetchPluginMarketDecodeErrorReturnsError(t *testing.T) {
 		t.Fatal("expected error for decode failure with no cache")
 	}
 }
+
+// TestPluginLogoPublicWithoutToken: 插件 logo 端点必须对未认证请求放行
+// （WebUI 用 <img src> 直接加载，浏览器无法携带 Authorization header），
+// 而其他 plugins 端点仍要求认证。
+func TestPluginLogoPublicWithoutToken(t *testing.T) {
+	s := NewServer(0, filepath.Join(t.TempDir(), "cmd_config.json"))
+	defer s.Stop()
+
+	// 未认证访问 plugins/logo：放行（走到 handler，无插件时 404 而非 401）。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/plugins/logo?plugin_id=nonexistent", nil)
+	w := httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized {
+		t.Fatalf("plugins/logo must not require auth (img tags carry no header), got 401")
+	}
+
+	// 未认证访问其他 plugins 端点：仍 401。
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/plugins", nil)
+	w = httptest.NewRecorder()
+	s.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("plugins list must still require auth, got %d", w.Code)
+	}
+}

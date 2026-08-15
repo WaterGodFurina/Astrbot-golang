@@ -68,6 +68,10 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		s.handlePlugins(w, r, rest)
 	case "plugin-sources":
 		s.handlePluginSources(w, r, rest)
+	case "plug":
+		// Python-AstrBot-compatible plugin Web API proxy:
+		// /api/plug/<plugin_path> → plugin process (register_web_api).
+		s.handlePluginWebProxy(w, r, strings.Join(rest, "/"))
 
 	// ── Knowledge base ───────────────────────────────────
 	case "knowledge_base", "knowledge-bases":
@@ -214,6 +218,14 @@ func (s *Server) apiAuthAllowed(r *http.Request) bool {
 	case "unified-chat", "live-chat":
 		// WebSocket transport validates its own token query parameter.
 		return true
+	case "plugins":
+		// 插件 logo（GET /api/v1/plugins/logo）供 WebUI <img src> 直接加载：
+		// 浏览器 img 无法携带 Authorization header，而 logo 只是公开无害的
+		// 图片（与 Python 侧 file-token 公开提供 logo 语义一致），放行。
+		if len(parts) >= 2 && parts[1] == "logo" {
+			return true
+		}
+		return s.auth.IsAuthenticated(extractToken(r))
 	case "webhooks":
 		// 统一 webhook 回调入口 /api/v1/webhooks/platforms/{uuid}：外部平台
 		// 服务器回调不携带 dashboard token。uuid 本身不可猜测且各平台回调

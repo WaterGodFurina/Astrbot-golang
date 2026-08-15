@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "installed_packs": [
+    {
+      "id": "builtin-default",
+      "name": "Builtin Default Meme Pack",
+      "version": "1.0.0",
+      "enabled": true,
+      "installed_at": "2026-08-15T23:01:35.042625+00:00"
+    }
+  ]
+}

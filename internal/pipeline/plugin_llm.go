@@ -12,7 +12,8 @@ import (
 // host config (provider_settings.default_provider_id, else first enabled
 // provider) with the given prompt + system prompt, and returns the reply text.
 // Used to back sdk.Host.ChatLLM (plugins that need to call the LLM directly).
-func ChatLLMFromConfig(cfg map[string]interface{}, prompt, systemPrompt string) (string, error) {
+// imageURLs (may be nil) are appended as multimodal content parts.
+func ChatLLMFromConfig(cfg map[string]interface{}, prompt, systemPrompt string, imageURLs []string) (string, error) {
 	providerCfg, providerSettings, err := resolveProviderFromConfig(cfg)
 	if err != nil {
 		return "", err
@@ -36,6 +37,7 @@ func ChatLLMFromConfig(cfg map[string]interface{}, prompt, systemPrompt string) 
 	req := &provider.ProviderRequest{
 		Prompt:       prompt,
 		SystemPrompt: systemPrompt,
+		ImageURLs:    imageURLs,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()

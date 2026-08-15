@@ -1,0 +1,7 @@
+name: yaml_demo
+display_name: YAML演示
+short_desc: metadata.yaml 演示
+desc: 验证 metadata.yaml 解析
+version: 0.1.0
+author: test
+repo: https://github.com/test/yaml_demo

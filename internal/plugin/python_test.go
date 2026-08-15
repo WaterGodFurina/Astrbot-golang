@@ -1,0 +1,205 @@
+package plugin
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
+)
+
+// sdkEvent builds a *pluginsdk.Event from a raw map (used to simulate host
+// events crossing the RPC boundary).
+func sdkEvent(t *testing.T, m map[string]any) *pluginsdk.Event {
+	t.Helper()
+	b, _ := json.Marshal(m)
+	var e pluginsdk.Event
+	if err := json.Unmarshal(b, &e); err != nil {
+		t.Fatalf("unmarshal event: %v", err)
+	}
+	return &e
+}
+
+// TestPythonPluginEndToEnd loads a real Python plugin through the subprocess
+// runtime (go-plugin handshake + gRPC + the Python SDK bridge) and exercises
+// Register/HandleCommand/HandleFilter/HandleLLMRequest/HandleTool.
+//
+// It requires a Python interpreter with (or able to install) grpcio/protobuf;
+// the first run may create a venv and download packages.
+func TestPythonPluginEndToEnd(t *testing.T) {
+	// 跳过条件：未找到 python 解释器
+	if pysdk.DiscoverPythonBin() == "" {
+		t.Skip("python3 不可用")
+	}
+	pluginDir := filepath.Join("testdata", "python_plugin")
+	if _, err := os.Stat(pluginDir); err != nil {
+		t.Skipf("缺少 testdata/python_plugin: %v", err)
+	}
+
+	dataDir := t.TempDir()
+	ctx := context.Background()
+	m := NewSubprocessManager(nil, dataDir)
+	m.MaxRestarts = 2
+	m.RestartBaseDelay = 100 * time.Millisecond
+	// 独立端口区间：与真实宿主（10000-25000）隔离，避免握手/端口干扰。
+	m.MinPort = 50100
+	m.MaxPort = 50200
+	t.Cleanup(m.Shutdown)
+
+	// 预置插件配置 + 宿主 HostService（GetConfig/SetConfig 反向调用）
+	cfgDir := filepath.Join(dataDir, "plugins_config", "test_pyplugin")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(`{"greeting": "你好", "enabled": true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	SetHostService(nil, m, nil)
+
+	start := time.Now()
+	inst, err := m.LoadLang(ctx, "test_pyplugin", pluginDir, "python")
+	t.Logf("LoadLang 耗时 %v", time.Since(start))
+	if err != nil {
+		t.Fatalf("LoadLang: %v", err)
+	}
+	if inst == nil || inst.Meta == nil {
+		t.Fatal("inst/Meta 为空")
+	}
+	if inst.Language != "python" {
+		t.Fatalf("Language = %q, want python", inst.Language)
+	}
+	t.Logf("插件: name=%s version=%s", inst.Name, inst.Version)
+
+	// _conf_schema.json → config schema 上报
+	if len(inst.Meta.ConfigSchemaJson) == 0 {
+		t.Fatal("ConfigSchemaJson 为空（未读取 _conf_schema.json）")
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
+		t.Fatalf("ConfigSchemaJson 解析失败: %v", err)
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok || len(props) != 3 {
+		t.Fatalf("schema properties 异常: %v", schema)
+	}
+
+	// Register 元数据
+	found := map[string]bool{}
+	for _, c := range inst.Meta.Commands {
+		found["cmd:"+c.Name] = true
+		t.Logf("command: %s perm=%s", c.Name, c.Permission)
+	}
+	for _, f := range inst.Meta.Filters {
+		found["filter:"+f.Name] = true
+	}
+	for _, h := range inst.Meta.Hooks {
+		found["hook:"+h.Event] = true
+	}
+	for _, tl := range inst.Meta.Tools {
+		found["tool:"+tl.Name] = true
+		t.Logf("tool: %s params=%s", tl.Name, string(tl.ParamsJson))
+	}
+	for _, k := range []string{"cmd:pyhello", "cmd:pyadd", "filter:main_echo", "hook:on_llm_request", "tool:py_add_tool"} {
+		if !found[k] {
+			t.Errorf("缺少 %s（已注册: %v）", k, found)
+		}
+	}
+
+	ev := map[string]any{
+		"type": "message", "platform": "qq_official", "sender_id": "123",
+		"sender_name": "u", "conv_id": "c1", "is_group": false, "is_at_bot": true,
+		"is_admin": false, "message_str": "pyhello", "plain_text": "pyhello",
+		"timestamp": 0,
+		"chain":     []map[string]any{{"type": "Plain", "text": "pyhello"}},
+	}
+
+	// HandleCommand
+	cmdCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	text, chain, err := inst.Client.HandleCommand(cmdCtx, "pyhello", nil, sdkEvent(t, ev))
+	if err != nil {
+		t.Fatalf("HandleCommand: %v", err)
+	}
+	if len(chain) == 0 || chain[0].Text == "" || !strings.Contains(chain[0].Text, "Hello from Python") {
+		t.Fatalf("pyhello 回复异常: text=%q chain=%v", text, chain)
+	}
+	t.Logf("pyhello -> %s", chain[0].Text)
+
+	// 带参数命令
+	_, chain2, err := inst.Client.HandleCommand(cmdCtx, "pyadd", []string{"3", "4"}, sdkEvent(t, ev))
+	if err != nil {
+		t.Fatalf("pyadd: %v", err)
+	}
+	if len(chain2) == 0 || !strings.Contains(chain2[0].Text, "7") {
+		t.Fatalf("pyadd 回复异常: %v", chain2)
+	}
+	t.Logf("pyadd -> %s", chain2[0].Text)
+
+	// HostService 反向调用（GetConfig：插件经 broker 读取宿主配置）
+	_, chainCfg, err := inst.Client.HandleCommand(cmdCtx, "pycfg", nil, sdkEvent(t, ev))
+	if err != nil {
+		t.Fatalf("pycfg: %v", err)
+	}
+	if len(chainCfg) == 0 || !strings.Contains(chainCfg[0].Text, "你好") || !strings.Contains(chainCfg[0].Text, "enabled") {
+		t.Fatalf("pycfg 未读到宿主配置: %v", chainCfg)
+	}
+	t.Logf("pycfg -> %s", chainCfg[0].Text)
+
+	// HostService 反向调用（TextToImage：宿主 t2i 渲染返回 PNG）
+	_, chainT2I, err := inst.Client.HandleCommand(cmdCtx, "pyt2i", nil, sdkEvent(t, ev))
+	if err != nil {
+		t.Fatalf("pyt2i: %v", err)
+	}
+	if len(chainT2I) == 0 || !strings.Contains(chainT2I[0].Text, "t2i_len=") {
+		t.Fatalf("pyt2i 结果异常: %v", chainT2I)
+	}
+	t.Logf("pyt2i -> %s", chainT2I[0].Text)
+
+	// HandleFilter（正则匹配）
+	ev2 := map[string]any{
+		"type": "message", "platform": "qq_official", "sender_id": "123",
+		"conv_id": "c1", "is_group": false, "is_at_bot": true, "is_admin": false,
+		"message_str": "pyecho hello", "plain_text": "pyecho hello", "timestamp": 0,
+		"chain": []map[string]any{{"type": "Plain", "text": "pyecho hello"}},
+	}
+	allow, err := inst.Client.HandleFilter(cmdCtx, "main_echo", sdkEvent(t, ev2))
+	if err != nil {
+		t.Fatalf("HandleFilter: %v", err)
+	}
+	if !allow {
+		t.Fatal("pyecho 应命中过滤器")
+	}
+	allow2, _ := inst.Client.HandleFilter(cmdCtx, "main_echo", sdkEvent(t, ev))
+	if !allow2 {
+		t.Fatal("pyhello 不应命中过滤器（应放行）")
+	}
+
+	// HandleLLMRequest（on_llm_request 注入 system prompt）
+	sp, stop, err := inst.Client.HandleLLMRequest(cmdCtx, "main_llm_req", sdkEvent(t, ev), "SP", "hi")
+	if err != nil {
+		t.Fatalf("HandleLLMRequest: %v", err)
+	}
+	if stop || !strings.Contains(sp, "Python插件注入") {
+		t.Fatalf("llm_req 注入失败: sp=%q stop=%v", sp, stop)
+	}
+
+	// HandleTool
+	text2, isErr, err := inst.Client.HandleTool(cmdCtx, "py_add_tool", map[string]any{"a": 5, "b": 6}, sdkEvent(t, ev))
+	if err != nil {
+		t.Fatalf("HandleTool: %v", err)
+	}
+	if isErr || text2 != "11" {
+		t.Fatalf("py_add_tool 结果异常: text=%q err=%v", text2, isErr)
+	}
+
+	// Cleanup 后进程退出
+	m.Unload("test_pyplugin")
+	if m.Get("test_pyplugin") != nil {
+		t.Fatal("卸载后实例仍在")
+	}
+}
