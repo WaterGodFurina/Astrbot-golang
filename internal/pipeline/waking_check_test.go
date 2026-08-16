@@ -2,10 +2,13 @@ package pipeline
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -307,4 +310,49 @@ func TestWakingCheckAdminRole(t *testing.T) {
 	if normal.Source.IsAdmin {
 		t.Error("Source.IsAdmin should be false for a normal sender")
 	}
+}
+
+// TestBoxCommandMatchesFullPipeline: 真实 box 插件（Python）的 /盒 命令经
+// WakingCheck 剥离 + ProcessStage 命令匹配必须命中（回归：用户环境 /盒
+// 直接走 LLM）。
+func TestBoxCommandMatchesFullPipeline(t *testing.T) {
+	bin := plugin.BuildTestPlugin()
+	_ = bin
+	pm := plugin.NewSubprocessManager(toolchain.New(), t.TempDir())
+	ctx := context.Background()
+	inst, err := pm.LoadLang(ctx, "boxfull", "../../data/plugins-src/astrbot_plugin_box", "python")
+	if err != nil {
+		t.Skipf("box 插件不可用: %v", err)
+	}
+	defer func() { _ = pm.Unload("boxfull") }()
+
+	starMgr := star.NewManagerSimple()
+	star.RegisterSubprocessPlugin(starMgr, pm, inst)
+
+	s := &ProcessStage{pluginMgr: starMgr}
+	ev := &core.Event{
+		Type:              core.EventMessage,
+		MessageStr:        "/盒 3442359407",
+		PlainText:         "/盒 3442359407",
+		IsAtOrWakeCommand: false,
+	}
+	// 模拟 WakingCheckStage 的前缀剥离。
+	text := strings.TrimSpace(strings.TrimPrefix(ev.MessageStr, "/"))
+	ev.MessageStr = text
+	ev.PlainText = text
+	ev.IsAtOrWakeCommand = true
+
+	handlers, denied := s.findMatchingHandlers(ev)
+	if denied {
+		t.Fatal("box 命令不应触发权限拒绝")
+	}
+	if len(handlers) == 0 {
+		t.Fatal("box 的 /盒 命令未被 findMatchingHandlers 匹配（直接走 LLM）")
+	}
+	for _, h := range handlers {
+		if h.HandlerName == "盒" {
+			return
+		}
+	}
+	t.Fatalf("未找到 盒 命令 handler: %+v", handlers)
 }

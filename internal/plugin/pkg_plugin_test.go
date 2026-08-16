@@ -29,7 +29,7 @@ func TestPythonPluginPackageRelativeImport(t *testing.T) {
 		t.Fatalf("Language = %q", inst.Language)
 	}
 	// logo 缓存（metadata.yaml 无 logo_path，用根目录 logo.png 惯例）
-	if m.PluginLogoFile(inst.Name) == "" {
+	if m.PluginLogoFile(inst.ID) == "" {
 		t.Fatal("logo 未缓存")
 	}
 	// 相对导入的模块正常：命令执行返回 backend.util.greet()
@@ -38,7 +38,7 @@ func TestPythonPluginPackageRelativeImport(t *testing.T) {
 		"conv_id": "c", "is_group": false, "is_at_bot": true,
 		"message_str": "pkghello", "plain_text": "pkghello", "timestamp": 0,
 	}
-	_, chain, err := inst.Client.HandleCommand(context.Background(), "pkghello", nil, sdkEvent(t, ev))
+	_, chain, _, err := inst.Client.HandleCommand(context.Background(), "pkghello", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("HandleCommand: %v", err)
 	}

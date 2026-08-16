@@ -124,7 +124,8 @@
       "commands": "指令/指令组",
       "hooks": "钩子",
       "functionTools": "函数工具",
-      "eventListeners": "事件监听器"
+      "eventListeners": "事件监听器",
+      "sleep": "休眠策略"
     },
     "info": {
       "title": "信息",
@@ -137,6 +138,10 @@
       "supportPlatforms": "支持平台",
       "authorWebsite": "作者网站",
       "repository": "仓库"
+    },
+    "sleep": {
+      "globalLabel": "全局闲置自动休眠",
+      "pluginLabel": "允许本插件闲置自动休眠"
     }
   },
   "market": {
@@ -163,6 +168,7 @@
     "sourceName": "源名称",
     "sourceUrl": "源地址",
     "defaultSource": "默认插件源",
+    "defaultSourceHint": "内置市场（默认）",
     "removeSource": "删除插件源",
     "confirmRemoveSource": "确定要删除此插件源吗？",
     "sourceAdded": "插件源添加成功",

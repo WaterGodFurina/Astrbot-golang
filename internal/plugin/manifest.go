@@ -47,6 +47,10 @@ type ManifestEntry struct {
 	ConfigDir string `json:"config_dir,omitempty"` // plugins_config/<name>  (config.json + config_schema.json)
 	DataDir   string `json:"data_dir,omitempty"`   // plugins/<name>/data     (插件运行时数据)
 	DocsDir   string `json:"docs_dir,omitempty"`   // plugins/<name>          (README/CHANGELOG 缓存)
+
+	// IdleUnloadBlocked 表示该插件不允许被闲置自动休眠（WebUI 行为页可配置）。
+	// false（默认）= 允许休眠；true = 常驻，即使闲置也不卸载。
+	IdleUnloadBlocked bool `json:"idle_unload_blocked,omitempty"`
 }
 
 // LoadManifest reads a manifest file, tolerating absence.

@@ -1127,57 +1127,45 @@ const updateDialogPluginLogo = computed(() => {
 
         <v-list density="compact" nav class="pa-0">
           <v-list-item
-            rounded="md"
-            color="primary"
-            :active="selectedSource === null"
-            @click="selectPluginSource(null)"
-          >
-            <template v-slot:prepend>
-              <v-icon
-                icon="mdi-shield-check"
-                size="small"
-                class="mr-2"
-              ></v-icon>
-            </template>
-            <v-list-item-title>{{
-              tm("market.defaultSource")
-            }}</v-list-item-title>
-          </v-list-item>
-
-          <v-list-item
             v-for="source in customSources"
-            :key="source.url"
+            :key="source.url || 'default'"
             rounded="md"
             color="primary"
-            :active="selectedSource === source.url"
-            @click="selectPluginSource(source.url)"
+            :active="
+              source.url
+                ? selectedSource === source.url
+                : selectedSource === null || selectedSource === ''
+            "
+            @click="selectPluginSource(source.url || null)"
           >
             <template v-slot:prepend>
               <v-icon
-                icon="mdi-link-variant"
+                :icon="source.builtin ? 'mdi-shield-check' : 'mdi-link-variant'"
                 size="small"
                 class="mr-2"
               ></v-icon>
             </template>
             <v-list-item-title>{{ source.name }}</v-list-item-title>
             <v-list-item-subtitle class="text-caption">{{
-              source.url
+              source.url || tm("market.defaultSourceHint")
             }}</v-list-item-subtitle>
             <template v-slot:append>
-              <v-btn
-                icon="mdi-pencil-outline"
-                size="small"
-                variant="text"
-                color="medium-emphasis"
-                @click.stop="editCustomSource(source)"
-              ></v-btn>
-              <v-btn
-                icon="mdi-trash-can-outline"
-                size="small"
-                variant="text"
-                color="error"
-                @click.stop="removeCustomSource(source)"
-              ></v-btn>
+              <template v-if="!source.builtin">
+                <v-btn
+                  icon="mdi-pencil-outline"
+                  size="small"
+                  variant="text"
+                  color="medium-emphasis"
+                  @click.stop="editCustomSource(source)"
+                ></v-btn>
+                <v-btn
+                  icon="mdi-trash-can-outline"
+                  size="small"
+                  variant="text"
+                  color="error"
+                  @click.stop="removeCustomSource(source)"
+                ></v-btn>
+              </template>
             </template>
           </v-list-item>
         </v-list>

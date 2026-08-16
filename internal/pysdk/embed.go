@@ -1,54 +1,77 @@
-// Package pysdk embeds the Python plugin runtime (the astrbot-compatible
-// package + gRPC bridge) into the host binary and manages the Python
-// subprocess environment: SDK extraction, interpreter discovery and the
-// grpcio/protobuf dependency (installed into a dedicated venv).
+// Package pysdk manages the Python subprocess environment for plugins: the
+// Python SDK runtime (downloaded from the astrbot-python-sdk GitHub repo,
+// NOT embedded), interpreter discovery and the grpcio/protobuf dependency
+// (installed into a dedicated venv).
 package pysdk
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"archive/tar"
 	"compress/gzip"
-	"embed"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
-	"net/http"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
+	sdkfs "github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk/sdkfs"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
-//go:embed all:astrbot
-var sdkFS embed.FS
-
 var logger = log.GetDefault().WithComponent("PySDK")
 
-// SDKRootName is the relative directory (under the data dir) that the
-// embedded SDK is extracted to.
+// SDKRootName is the relative directory (under the data dir) that the SDK is
+// downloaded/extracted to.
 const SDKRootName = "python-sdk"
 
-// SDKVersion must be bumped whenever the embedded Python SDK (internal/pysdk/
-// astrbot) changes: Ensure() re-extracts the SDK when the on-disk version
-// differs, so a restarted host picks up SDK updates automatically.
-const SDKVersion = "14"
+// sdkRepoBase 是 Python SDK 的发布仓库：下载兜底 URL
+// https://github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk/archive/refs/tags/v<SDKVersion>.tar.gz
+// （模块解析不可用时才走网络下载）。githubProxyOverride 是 config github_proxy
+// 的加速前缀（SetSDKGitHubProxy 注入，与插件安装一致）。
+const sdkRepoBase = "https://github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
+
+var githubProxyOverride string
+
+// SetSDKGitHubProxy overrides the GitHub accelerator prefix used for the SDK
+// download (called by the host with config github_proxy; empty restores direct).
+func SetSDKGitHubProxy(prefix string) {
+	githubProxyOverride = strings.TrimRight(strings.TrimSpace(prefix), "/")
+}
+
+func sdkDownloadURL() string {
+	u := sdkRepoBase + "/archive/refs/tags/v" + SDKVersion + ".tar.gz"
+	if githubProxyOverride != "" {
+		return githubProxyOverride + "/" + u
+	}
+	return u
+}
 
 // Python 解释器自动下载（python-build-standalone，Astral 维护的独立发行版，
 // 与 uv 同源）。环境变量：
 //   - ASTRBOT_PYTHON_BIN       显式指定解释器路径（最高优先）
 //   - ASTRBOT_PYTHON_VERSION   python-build-standalone 版本 tag（默认 20260814）
 //   - ASTRBOT_PYTHON_MIRROR    下载镜像前缀（如 https://ghfast.top/），会拼在
-//                              官方 URL 之前
+//     官方 URL 之前
 //   - ASTRBOT_PYTHON_SKIP_VERIFY  跳过下载后的完整性检查
 const (
 	EnvPythonBin        = "ASTRBOT_PYTHON_BIN"
 	EnvPythonVersion    = "ASTRBOT_PYTHON_VERSION"
 	EnvPythonMirror     = "ASTRBOT_PYTHON_MIRROR"
 	EnvPythonSkipVerify = "ASTRBOT_PYTHON_SKIP_VERIFY"
+
+	// EnvPythonCacheDir overrides the per-user cache dir used for the Python
+	// venvs (EnsureVenv) and the bundled-Python download tree (pythonBaseDir).
+	// Tests set it to a t.TempDir() for isolation; embedded devices use it to
+	// pin a writable location.
+	EnvPythonCacheDir = "ASTRBOT_PYTHON_CACHE_DIR"
 
 	defaultPythonVersion = "20260814"
 	defaultPythonMinor   = "3.12"
@@ -59,9 +82,23 @@ const (
 	defaultPyPIIndex = "https://mirrors.aliyun.com/pypi/simple/"
 )
 
+// pyPIIndexOverride 是宿主注入的 pip 镜像（config pypi_index_url），优先于
+// 环境变量与默认镜像（EnsureVenv 宿主基础依赖安装与插件 requirements 安装共用）。
+var pyPIIndexOverride string
+
+// SetPyPIIndex overrides the pip index used for host-base-dependency
+// installation (called by the host with config pypi_index_url; empty restores
+// the env/default resolution).
+func SetPyPIIndex(url string) {
+	pyPIIndexOverride = strings.TrimSpace(url)
+}
+
 // PyPIIndex returns the pip index URL: ASTRBOT_PYPI_INDEX env wins, then
 // PIP_INDEX_URL, then the Aliyun mirror (fast inside mainland China).
 func PyPIIndex() string {
+	if pyPIIndexOverride != "" {
+		return pyPIIndexOverride
+	}
 	for _, env := range []string{"ASTRBOT_PYPI_INDEX", "PIP_INDEX_URL"} {
 		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
 			return v
@@ -70,10 +107,29 @@ func PyPIIndex() string {
 	return defaultPyPIIndex
 }
 
+// userCacheDir returns the per-user cache dir, overridable via
+// ASTRBOT_PYTHON_CACHE_DIR (venv 根目录、bundled python 下载目录都尊重它：
+// 测试各自 TempDir 隔离，避免共享 ~/.cache/astrbot-go 下的 venv 与 pip
+// 并发冲突；嵌入式设备可指定可写目录）。空串表示不可用（调用方兜底）。
+func userCacheDir() string {
+	if v := strings.TrimSpace(os.Getenv(EnvPythonCacheDir)); v != "" {
+		return v
+	}
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return dir
+}
+
 // pythonBaseDir returns the per-user directory holding downloaded Python
 // distributions (~/.local/share/astrbot-go/python), mirroring the Go
-// toolchain's ~/.local/share/astrbot-go/toolchain.
+// toolchain's ~/.local/share/astrbot-go/toolchain. ASTRBOT_PYTHON_CACHE_DIR
+// overrides the root (the python/ subdir is preserved).
 func pythonBaseDir() string {
+	if v := strings.TrimSpace(os.Getenv(EnvPythonCacheDir)); v != "" {
+		return filepath.Join(v, "astrbot-go", "python")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = "."
@@ -375,56 +431,162 @@ type RuntimeEnv struct {
 	PyPath string
 }
 
-// Ensure extracts the embedded SDK into <dataDir>/python-sdk (idempotent) and
-// returns the SDK root as an ABSOLUTE path (the subprocess cwd may differ, so
-// relative paths in PYTHONPATH would not resolve). A version marker file is
-// written next to the SDK; when the marker differs from the embedded
-// SDKVersion the stale copy is wiped and re-extracted (SDK updates otherwise
-// would never reach already-running data dirs).
+// sdkModuleDir resolves the Python SDK directory via the Go module graph
+// (`go list -m -f {{.Dir}} <module>` run from the working directory, which the
+// host shares with the module's go.mod). With a local replace in go.mod the
+// module resolves to the development checkout; in release builds it resolves
+// to the module cache (requires the module to have been downloaded, e.g. at
+// build time). Returns "" when the module cannot be resolved (no go.mod /
+// module graph) — the caller falls back to the GitHub download.
+func sdkModuleDir() string {
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", sdkfs.ModulePath).Output()
+	if err != nil {
+		return ""
+	}
+	dir := strings.TrimSpace(string(out))
+	if dir == "" {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(dir, "astrbot", "__init__.py")); err != nil {
+		return ""
+	}
+	return dir
+}
+
+// Ensure prepares the Python SDK at <dataDir>/python-sdk and returns the SDK
+// root as an ABSOLUTE path (the subprocess cwd may differ, so relative paths
+// in PYTHONPATH would not resolve). Resolution order:
+//  1. Go module dir (`go list -m`, honors the go.mod require/replace) — no
+//     copy needed, the versioned module source is used in place;
+//  2. otherwise the repo tarball is downloaded from GitHub at tag
+//     v<SDKVersion> and extracted (version marker written next to it; a
+//     marker mismatch wipes and re-fetches).
 func Ensure(dataDir string) (string, error) {
 	absData, err := filepath.Abs(dataDir)
 	if err != nil {
 		return "", fmt.Errorf("resolve data dir: %w", err)
 	}
 	root := filepath.Join(absData, SDKRootName)
+
+	// 1) Go 模块解析优先（require/replace 声明的版本化源码，无需落盘拷贝）。
+	if dir := sdkModuleDir(); dir != "" {
+		logger.Info("Python SDK 经 Go 模块解析: %s (v%s)", dir, SDKVersion)
+		return dir, nil
+	}
+
 	marker := filepath.Join(root, "astrbot", "__init__.py")
 	versionFile := filepath.Join(root, "VERSION")
-	needExtract := false
+	needFetch := false
 	if _, err := os.Stat(marker); err != nil {
-		needExtract = true
+		needFetch = true
 	} else if data, err := os.ReadFile(versionFile); err != nil || strings.TrimSpace(string(data)) != SDKVersion {
-		logger.Info("Python SDK 版本变化（磁盘 %q vs 嵌入 %q），重新解压…",
+		logger.Info("Python SDK 版本变化（磁盘 %q vs 期望 %q），重新下载…",
 			strings.TrimSpace(string(data)), SDKVersion)
-		needExtract = true
+		needFetch = true
 		_ = os.RemoveAll(root)
 	}
-	if !needExtract {
+	if !needFetch {
 		return root, nil
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", fmt.Errorf("创建 Python SDK 目录: %w", err)
 	}
-	if err := fs.WalkDir(sdkFS, "astrbot", func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		dst := filepath.Join(root, path)
-		if d.IsDir() {
-			return os.MkdirAll(dst, 0o755)
-		}
-		data, err := sdkFS.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(dst, data, 0o644)
-	}); err != nil {
+
+	// 2) 下载 SDK 仓库 tarball（GitHub 归档布局 <repo>-v<ver>/…，顶层目录剥离）。
+	url := sdkDownloadURL()
+	logger.Info("下载 Python SDK v%s（%s）…", SDKVersion, url)
+	tmp, err := os.CreateTemp("", "astrbot-pysdk-*.tar.gz")
+	if err != nil {
+		return "", fmt.Errorf("创建临时文件: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := downloadFile(url, tmpPath, nil); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("下载 Python SDK 失败（%s）: %w", url, err)
+	}
+	_ = tmp.Close()
+
+	if err := extractTarGzStripTop(tmpPath, root); err != nil {
+		_ = os.RemoveAll(root)
 		return "", fmt.Errorf("解压 Python SDK: %w", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		_ = os.RemoveAll(root)
+		return "", fmt.Errorf("Python SDK 下载内容缺少 astrbot/ 包（标记 %s 不存在）", marker)
 	}
 	if err := os.WriteFile(versionFile, []byte(SDKVersion+"\n"), 0o644); err != nil {
 		return "", fmt.Errorf("写入 Python SDK 版本标记: %w", err)
 	}
-	logger.Info("Python SDK 已解压到 %s (v%s)", root, SDKVersion)
+	logger.Info("Python SDK 已就绪 %s (v%s)", root, SDKVersion)
 	return root, nil
+}
+
+// extractTarGzStripTop unpacks a GitHub-style archive into dir, stripping a
+// single top-level directory ("<repo>-v<ver>/..." layout).
+func extractTarGzStripTop(src, dir string) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+
+	var top string
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		name := hdr.Name
+		if name == "" {
+			continue
+		}
+		parts := strings.SplitN(strings.TrimPrefix(name, "./"), "/", 2)
+		if top == "" && len(parts) > 0 {
+			top = parts[0]
+		}
+		rel := name
+		if top != "" && (name == top || strings.HasPrefix(name, top+"/")) {
+			rel = strings.TrimPrefix(strings.TrimPrefix(name, top), "/")
+		}
+		if rel == "" {
+			continue
+		}
+		target, err := safeJoin(dir, rel)
+		if err != nil {
+			return err
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			w, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(w, tr); err != nil {
+				w.Close()
+				return err
+			}
+			if err := w.Close(); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // EnsureVenv makes sure a venv with grpcio+protobuf exists (under the user
@@ -434,16 +596,42 @@ func Ensure(dataDir string) (string, error) {
 // The venv is bound to the interpreter: a different base interpreter gets its
 // own venv so switching between system Python and the bundled Python cannot
 // reuse a stale environment.
+//
+// A venv is considered ready when its READY marker and environment.json exist
+// and match the current interpreter / SDKVersion / baseDepsVersion; ready
+// venvs are reused without re-probing imports (fast startup). Missing or
+// mismatched markers trigger a host-deps reinstall under a cross-process lock
+// (pip 并发安全；见 venv_lock_*.go)。
 func EnsureVenv(dataDir string) string {
-	cacheDir, err := os.UserCacheDir()
+	venvPython, err := ensureVenvReady(dataDir)
 	if err != nil {
+		logger.Warn("Python venv 准备失败: %v（插件将无法启动）", err)
+		return ""
+	}
+	return venvPython
+}
+
+// venvLockTimeout bounds how long a provisioner waits for the cross-process
+// venv lock (a pip install normally finishes in a few minutes; 10 分钟超时
+// 防止死锁）。
+var venvLockTimeout = 10 * time.Minute
+
+// ensureVenvReady resolves a Python interpreter that has the host base deps
+// importable: a cached venv whose markers match is returned without probing;
+// incomplete venvs (marker missing/mismatched, or a legacy venv without
+// environment.json whose deps probe fails) are re-provisioned under the venv
+// lock. 返回 "" 语义由调用方（EnsureVenv）处理。
+func ensureVenvReady(dataDir string) (string, error) {
+	cacheDir := userCacheDir()
+	if cacheDir == "" {
 		cacheDir = filepath.Join(dataDir, SDKRootName)
 	}
 	base := DiscoverPythonBin()
 	if base == "" {
-		return ""
+		return "", errors.New("未找到 Python 解释器（请安装 python3 或设置 " + EnvPythonBin + "）")
 	}
-	// 解释器指纹：系统 Python 与 bundled Python 各用独立 venv
+	// 解释器指纹：系统 Python 与 bundled Python 各用独立 venv（保持原有
+	// fingerprint 算法不变，已有 venv 目录名不失效）。
 	sum := sha256.Sum256([]byte(base))
 	fingerprint := hex.EncodeToString(sum[:6])
 	root := filepath.Join(cacheDir, "astrbot-go", "python-venv-"+fingerprint)
@@ -451,31 +639,69 @@ func EnsureVenv(dataDir string) string {
 	if runtime.GOOS == "windows" {
 		venvPython = filepath.Join(root, "Scripts", "python.exe")
 	}
+
+	// 快速路径：venv python 存在 + READY + environment.json 三者一致 →
+	// 直接复用，不再跑 hasHostDeps import 探测。
+	if info, err := os.Stat(venvPython); err == nil && !info.IsDir() &&
+		venvMarkersMatch(root, base, SDKVersion, baseDepsVersion) {
+		return venvPython, nil
+	}
+
+	venvExists := false
 	if info, err := os.Stat(venvPython); err == nil && !info.IsDir() {
-		if hasGRPC(venvPython) {
-			return venvPython
+		venvExists = true
+		// 旧版 venv 迁移：无 environment.json 但有完整依赖 → 补写标记直接复用
+		//（避免已部署环境重新 pip 装一遍）。
+		if _, err := os.Stat(environmentPath(root)); os.IsNotExist(err) && hasHostDeps(venvPython) {
+			if werr := writeVenvMarkers(root, base, SDKVersion, baseDepsVersion); werr != nil {
+				logger.Warn("补写 venv 标记失败: %v", werr)
+			}
+			return venvPython, nil
 		}
-		logger.Warn("venv 缺少 grpcio，尝试安装…")
-		if err := installGRPC(venvPython); err != nil {
-			logger.Warn("venv 安装 grpcio 失败: %v", err)
-			return ""
+	}
+
+	// 宿主解释器本身已具备全部依赖 → 直接使用（无需 venv）。
+	if !venvExists && hasHostDeps(base) {
+		return base, nil
+	}
+
+	// 需要创建 venv 或修复：跨进程锁内进行（等锁期间他人可能已装好 →
+	// 锁内双重检查）。
+	lockPath := filepath.Join(cacheDir, "astrbot-go", ".venv-"+fingerprint+".lock")
+	release, err := acquireVenvLock(lockPath, venvLockTimeout)
+	if err != nil {
+		return "", fmt.Errorf("获取 venv 锁失败: %w", err)
+	}
+	defer release()
+
+	if info, err := os.Stat(venvPython); err == nil && !info.IsDir() {
+		// 等锁期间其他人已修复完成 → 直接复用。
+		if venvMarkersMatch(root, base, SDKVersion, baseDepsVersion) {
+			return venvPython, nil
 		}
-		return venvPython
+		if _, err := os.Stat(environmentPath(root)); os.IsNotExist(err) && hasHostDeps(venvPython) {
+			if werr := writeVenvMarkers(root, base, SDKVersion, baseDepsVersion); werr != nil {
+				logger.Warn("补写 venv 标记失败: %v", werr)
+			}
+			return venvPython, nil
+		}
+		logger.Warn("venv 宿主依赖不完整（标记缺失/不匹配），锁内重新安装…")
+	} else {
+		logger.Info("Python %s 缺少宿主基础依赖，创建独立 venv 安装…", base)
+		if err := exec.Command(base, "-m", "venv", root).Run(); err != nil {
+			logger.Warn("创建 venv 失败: %v（插件将无法启动）", err)
+			return "", fmt.Errorf("创建 venv 失败: %w", err)
+		}
 	}
-	if hasGRPC(base) {
-		return base
+	if err := installHostDeps(venvPython); err != nil {
+		// 安装失败：移除 READY，下次启动重试。
+		_ = os.Remove(readyPath(root))
+		return "", fmt.Errorf("venv 安装宿主依赖失败: %w", err)
 	}
-	logger.Info("Python %s 缺少 grpcio/protobuf，创建独立 venv 安装…", base)
-	venvDir := root
-	if err := exec.Command(base, "-m", "venv", venvDir).Run(); err != nil {
-		logger.Warn("创建 venv 失败: %v（插件将无法启动）", err)
-		return ""
+	if err := writeVenvMarkers(root, base, SDKVersion, baseDepsVersion); err != nil {
+		return "", fmt.Errorf("写入 venv 标记失败: %w", err)
 	}
-	if err := installGRPC(venvPython); err != nil {
-		logger.Warn("venv 安装 grpcio 失败: %v（插件将无法启动）", err)
-		return ""
-	}
-	return venvPython
+	return venvPython, nil
 }
 
 func hasGRPC(pythonBin string) bool {
@@ -485,17 +711,123 @@ func hasGRPC(pythonBin string) bool {
 
 // hostBaseDeps 是 Python AstrBot 本体的常驻依赖子集（插件不声明但依赖，
 // 因为在本体中天然存在）：Web 框架 / HTTP 客户端 / 序列化 / 图像 / 通用
-// 工具。安装在宿主 venv 里，使大量 Python 插件开箱可用。安装在首次创建
-// venv 时一次性执行（走默认 pip 镜像，见 PyPIIndex）。
+// 工具 / 平台 SDK。安装在宿主 venv 里，使大量 Python 插件开箱可用；安装在
+// 首次创建 venv 时一次性执行（走默认 pip 镜像，见 PyPIIndex）。
+// 对齐 Python AstrBot requirements.txt：aiocqhttp（OneBot）、apscheduler、
+// tenacity、openai/anthropic/dashscope（LLM）、qq-botpy、python-telegram-bot
+// 等为插件最常 import 的本体常驻库；重型（pandas/faiss/sqlmodel 等）留给
+// 插件 requirements.txt 自装。
 var hostBaseDeps = []string{
 	"grpcio", "protobuf",
 	"quart", "werkzeug", "jinja2",
 	"aiohttp", "httpx", "requests",
 	"pydantic", "pyyaml", "pillow",
 	"deprecated", "docstring-parser", "markdown", "psutil",
+	"websockets", "apscheduler", "tenacity",
+	"openai", "anthropic", "dashscope",
+	"qq-botpy", "python-telegram-bot",
+	"cryptography", "qrcode", "packaging",
+	"jieba", "rank-bm25", "pydub", "openpyxl", "pypdf",
+	"click", "aiofiles",
 }
 
-func installGRPC(pythonBin string) error {
+// hostDepProbes 是 hostBaseDeps 的关键模块探测表（import 名）：任一缺失即
+// 视为宿主依赖不完整，启动 Python 插件前自动补齐（EnsureVenv 检查用）。
+var hostDepProbes = []string{
+	"grpc", "google.protobuf",
+	"quart", "werkzeug", "jinja2",
+	"aiohttp", "httpx", "requests", "apscheduler", "tenacity",
+	"openai", "anthropic", "dashscope",
+	"pydantic", "yaml", "PIL", "deprecated", "docstring_parser", "markdown", "psutil",
+	"websockets", "cryptography", "qrcode", "packaging",
+	"jieba", "rank_bm25", "pydub", "openpyxl", "pypdf", "click", "aiofiles",
+	// qq-botpy 的 import 包名是 botpy；python-telegram-bot 是 telegram。
+	"botpy",
+}
+
+// baseDepsVersion 是宿主依赖清单（hostBaseDeps/hostDepProbes）的版本号：
+// 修改清单内容时手动 +1，触发既有 venv 的 environment.json 不匹配而重新
+// pip 安装（否则 venv 一旦 READY 就永久复用，清单变化不会生效）。
+const baseDepsVersion = 1
+
+const (
+	// envFileName 记录 venv 的供给来源（解释器 / SDK 版本 / 依赖清单版本）。
+	envFileName = "environment.json"
+	// readyFileName 是空文件标记：安装成功后才写入；安装失败时删除，
+	// 下次启动视为不完整而重新供给。
+	readyFileName = "READY"
+)
+
+// venvEnvironment 是 environment.json 的结构（venv 根目录下）。
+type venvEnvironment struct {
+	Interpreter     string `json:"interpreter"`
+	SDKVersion      string `json:"sdk_version"`
+	BaseDepsVersion int    `json:"base_deps_version"`
+}
+
+func environmentPath(venvRoot string) string { return filepath.Join(venvRoot, envFileName) }
+func readyPath(venvRoot string) string       { return filepath.Join(venvRoot, readyFileName) }
+
+// readVenvEnvironment reads and parses environment.json (error when missing
+// or malformed).
+func readVenvEnvironment(venvRoot string) (venvEnvironment, error) {
+	data, err := os.ReadFile(environmentPath(venvRoot))
+	if err != nil {
+		return venvEnvironment{}, err
+	}
+	var env venvEnvironment
+	if err := json.Unmarshal(data, &env); err != nil {
+		return venvEnvironment{}, err
+	}
+	return env, nil
+}
+
+// writeVenvMarkers atomically-ish writes environment.json and the READY marker
+// for a provisioned venv.
+func writeVenvMarkers(venvRoot, interpreter, sdkVersion string, depsVersion int) error {
+	env := venvEnvironment{Interpreter: interpreter, SDKVersion: sdkVersion, BaseDepsVersion: depsVersion}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(venvRoot, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(environmentPath(venvRoot), data, 0o644); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(readyPath(venvRoot), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// venvMarkersMatch reports whether the venv at venvRoot is marked READY with an
+// environment.json matching the given interpreter / SDK version / deps version
+// (快路径校验：只读两个文件，不跑 python import 探测）。
+func venvMarkersMatch(venvRoot, interpreter, sdkVersion string, depsVersion int) bool {
+	if info, err := os.Stat(readyPath(venvRoot)); err != nil || info.IsDir() {
+		return false
+	}
+	env, err := readVenvEnvironment(venvRoot)
+	if err != nil {
+		return false
+	}
+	return env.Interpreter == interpreter && env.SDKVersion == sdkVersion && env.BaseDepsVersion == depsVersion
+}
+
+// hasHostDeps reports whether all key host base dependencies are importable in
+// the given interpreter. Missing ones trigger a venv re-provisioning
+// (installHostDeps) so Python plugins that rely on Python-AstrBot's resident
+// deps (e.g. aiocqhttp) start without a module-not-found crash.
+func hasHostDeps(pythonBin string) bool {
+	script := "import importlib; mods=" + strconv.Quote(strings.Join(hostDepProbes, " ")) + "; missing=[m for m in mods.split() if importlib.util.find_spec(m) is None]; import sys; sys.exit(1 if missing else 0)"
+	cmd := exec.Command(pythonBin, "-c", script)
+	return cmd.Run() == nil
+}
+
+func installHostDeps(pythonBin string) error {
 	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, hostBaseDeps...)
 	args = append(args, "-i", PyPIIndex())
 	out, err := exec.Command(pythonBin, args...).CombinedOutput()
@@ -503,7 +835,7 @@ func installGRPC(pythonBin string) error {
 		logger.Warn("pip install 输出: %s", strings.TrimSpace(string(out)))
 		return err
 	}
-	logger.Info("venv 基础依赖安装完成（grpcio/protobuf + 本体常驻依赖）")
+	logger.Info("venv 宿主基础依赖安装完成（grpcio/protobuf + 本体常驻依赖）")
 	return nil
 }
 
@@ -526,11 +858,11 @@ func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, e
 	if err != nil {
 		return nil, err
 	}
-	if !hasGRPC(py) {
+	if !hasHostDeps(py) {
 		py = EnsureVenv(dataDir)
 	}
 	if py == "" {
-		return nil, fmt.Errorf("无法准备 Python 运行时（缺少 grpcio/protobuf 且无法自动安装）")
+		return nil, fmt.Errorf("无法准备 Python 运行时（缺少宿主基础依赖且无法自动安装）")
 	}
 	return &RuntimeEnv{
 		PythonBin: py,

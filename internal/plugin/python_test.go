@@ -36,6 +36,10 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	if pysdk.DiscoverPythonBin() == "" {
 		t.Skip("python3 不可用")
 	}
+	// 独立 venv/缓存目录：不共享 ~/.cache/astrbot-go 下的 venv，避免测试
+	// 环境污染与跨进程 pip 并发（t.Setenv 不可在并行测试中调用——本测试
+	// 不 t.Parallel()）。
+	t.Setenv("ASTRBOT_PYTHON_CACHE_DIR", t.TempDir())
 	pluginDir := filepath.Join("testdata", "python_plugin")
 	if _, err := os.Stat(pluginDir); err != nil {
 		t.Skipf("缺少 testdata/python_plugin: %v", err)
@@ -60,6 +64,9 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	SetHostService(nil, m, nil)
+	// SetHostService 是包级全局（pluginsdk host hooks）：测试结束恢复为空，
+	// 避免污染后续测试（如 runtime_test 的 TestHostServiceReverseCalls）。
+	defer pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{})
 
 	start := time.Now()
 	inst, err := m.LoadLang(ctx, "test_pyplugin", pluginDir, "python")
@@ -104,7 +111,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 		found["tool:"+tl.Name] = true
 		t.Logf("tool: %s params=%s", tl.Name, string(tl.ParamsJson))
 	}
-	for _, k := range []string{"cmd:pyhello", "cmd:pyadd", "filter:main_echo", "hook:on_llm_request", "tool:py_add_tool"} {
+	for _, k := range []string{"cmd:pyhello", "cmd:pyadd", "filter:python_plugin.main_echo", "hook:on_llm_request", "tool:py_add_tool"} {
 		if !found[k] {
 			t.Errorf("缺少 %s（已注册: %v）", k, found)
 		}
@@ -121,17 +128,20 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	// HandleCommand
 	cmdCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	text, chain, err := inst.Client.HandleCommand(cmdCtx, "pyhello", nil, sdkEvent(t, ev))
+	text, chain, result, err := inst.Client.HandleCommand(cmdCtx, "pyhello", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("HandleCommand: %v", err)
 	}
 	if len(chain) == 0 || chain[0].Text == "" || !strings.Contains(chain[0].Text, "Hello from Python") {
 		t.Fatalf("pyhello 回复异常: text=%q chain=%v", text, chain)
 	}
+	if result.GetSent() {
+		t.Fatal("pyhello 通过 Result 回复（非主动发送），sent 必须为 false")
+	}
 	t.Logf("pyhello -> %s", chain[0].Text)
 
 	// 带参数命令
-	_, chain2, err := inst.Client.HandleCommand(cmdCtx, "pyadd", []string{"3", "4"}, sdkEvent(t, ev))
+	_, chain2, _, err := inst.Client.HandleCommand(cmdCtx, "pyadd", []string{"3", "4"}, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("pyadd: %v", err)
 	}
@@ -141,7 +151,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	t.Logf("pyadd -> %s", chain2[0].Text)
 
 	// HostService 反向调用（GetConfig：插件经 broker 读取宿主配置）
-	_, chainCfg, err := inst.Client.HandleCommand(cmdCtx, "pycfg", nil, sdkEvent(t, ev))
+	_, chainCfg, _, err := inst.Client.HandleCommand(cmdCtx, "pycfg", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("pycfg: %v", err)
 	}
@@ -151,7 +161,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	t.Logf("pycfg -> %s", chainCfg[0].Text)
 
 	// HostService 反向调用（TextToImage：宿主 t2i 渲染返回 PNG）
-	_, chainT2I, err := inst.Client.HandleCommand(cmdCtx, "pyt2i", nil, sdkEvent(t, ev))
+	_, chainT2I, _, err := inst.Client.HandleCommand(cmdCtx, "pyt2i", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("pyt2i: %v", err)
 	}
@@ -167,20 +177,20 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 		"message_str": "pyecho hello", "plain_text": "pyecho hello", "timestamp": 0,
 		"chain": []map[string]any{{"type": "Plain", "text": "pyecho hello"}},
 	}
-	allow, err := inst.Client.HandleFilter(cmdCtx, "main_echo", sdkEvent(t, ev2))
+	allow, _, err := inst.Client.HandleFilter(cmdCtx, "python_plugin.main_echo", sdkEvent(t, ev2))
 	if err != nil {
 		t.Fatalf("HandleFilter: %v", err)
 	}
 	if !allow {
 		t.Fatal("pyecho 应命中过滤器")
 	}
-	allow2, _ := inst.Client.HandleFilter(cmdCtx, "main_echo", sdkEvent(t, ev))
+	allow2, _, _ := inst.Client.HandleFilter(cmdCtx, "python_plugin.main_echo", sdkEvent(t, ev))
 	if !allow2 {
 		t.Fatal("pyhello 不应命中过滤器（应放行）")
 	}
 
 	// HandleLLMRequest（on_llm_request 注入 system prompt）
-	sp, stop, err := inst.Client.HandleLLMRequest(cmdCtx, "main_llm_req", sdkEvent(t, ev), "SP", "hi")
+	sp, stop, _, err := inst.Client.HandleLLMRequest(cmdCtx, "python_plugin.main_llm_req", sdkEvent(t, ev), "SP", "hi")
 	if err != nil {
 		t.Fatalf("HandleLLMRequest: %v", err)
 	}
@@ -189,7 +199,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	}
 
 	// HandleTool
-	text2, isErr, err := inst.Client.HandleTool(cmdCtx, "py_add_tool", map[string]any{"a": 5, "b": 6}, sdkEvent(t, ev))
+	text2, isErr, _, err := inst.Client.HandleTool(cmdCtx, "py_add_tool", map[string]any{"a": 5, "b": 6}, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("HandleTool: %v", err)
 	}
@@ -201,5 +211,42 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	m.Unload("test_pyplugin")
 	if m.Get("test_pyplugin") != nil {
 		t.Fatal("卸载后实例仍在")
+	}
+}
+
+// TestPythonPluginSendMarksSent: 插件 handler 里 event.send（主动发送）后，
+// HandleCommand 必须返回 sent=true（对齐 Python _has_send_oper）——宿主管线
+// 据此不再走 LLM。
+func TestPythonPluginSendMarksSent(t *testing.T) {
+	// 独立 venv/缓存目录（同 EndToEnd，避免与真实宿主/其他测试共享
+	// ~/.cache/astrbot-go 下的 venv 与 pip 并发）。
+	t.Setenv("ASTRBOT_PYTHON_CACHE_DIR", t.TempDir())
+	m := newTestManager(t)
+	// 独立端口区间：与真实宿主默认范围（10000-25000）及其他测试隔离。
+	m.MinPort = 50900
+	m.MaxPort = 51000
+	ctx := context.Background()
+	inst, err := m.LoadLang(ctx, "pysend", filepath.Join("testdata", "python_plugin"), "python")
+	if err != nil {
+		t.Fatalf("LoadLang: %v", err)
+	}
+	defer func() { _ = m.Unload("pysend") }()
+
+	ev := map[string]any{
+		"type": "message", "platform": "qq_official", "sender_id": "123",
+		"conv_id": "c1", "is_group": false, "is_at_bot": true, "is_admin": true,
+		"message_str": "pysend", "plain_text": "pysend", "timestamp": 0,
+		"chain": []map[string]any{{"type": "Plain", "text": "pysend"}},
+	}
+	// pysend 不返回文本（Result 为空），只主动发送——sent 必须为 true。
+	text, _, result, err := inst.Client.HandleCommand(ctx, "pysend", nil, sdkEvent(t, ev))
+	if err != nil {
+		t.Fatalf("HandleCommand(pysend): %v", err)
+	}
+	if text != "" {
+		t.Fatalf("pysend 不应返回文本: %q", text)
+	}
+	if !result.GetSent() {
+		t.Fatal("event.send 后 HandleCommand 必须返回 sent=true（否则宿主继续走 LLM）")
 	}
 }

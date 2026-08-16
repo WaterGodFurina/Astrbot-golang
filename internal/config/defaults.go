@@ -7,6 +7,11 @@ func DefaultConfig() *SchemaNode {
 	return &SchemaNode{
 		Type: SchemaObject,
 		Children: map[string]*SchemaNode{
+			"plugin_idle_unload_minutes": {
+				Type:         SchemaInt,
+				DefaultValue: 0,
+				Optional:     true,
+			},
 			"platform": {
 				Type:     SchemaList,
 				Optional: true,

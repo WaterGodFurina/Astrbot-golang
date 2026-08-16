@@ -8,3 +8,6 @@ data/
 memory.md
 tmp/
 bug.md
+
+# Python 插件误写仓库根的数据目录（正确位置 data/plugin_data）
+plugin_data/

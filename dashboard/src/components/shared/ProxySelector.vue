@@ -56,6 +56,11 @@ import { statsApi } from '@/api/v1';
 import { useModuleI18n } from '@/i18n/composables';
 
 export default {
+    props: {
+        // github_proxy 配置值（config 持久化，优先于 localStorage）
+        modelValue: { type: String, default: "" },
+    },
+    emits: ["update:modelValue"],
     setup() {
         const { tm } = useModuleI18n('features/settings');
         return { tm };
@@ -99,10 +104,11 @@ export default {
                     proxy_url: proxy
                 });
                 console.log(response.data);
-                if (response.status === 200) {
+                const latency = Number(response.data.data?.latency);
+                if (response.status === 200 && Number.isFinite(latency) && latency >= 0) {
                     this.proxyStatus[idx] = {
                         available: true,
-                        latency: Math.round(response.data.data.latency)
+                        latency: Math.round(latency)
                     };
                 } else {
                     this.proxyStatus[idx] = {
@@ -134,7 +140,7 @@ export default {
     mounted() {
         this.initializing = true;
 
-        const savedProxy = localStorage.getItem('selectedGitHubProxy') || "";
+        const savedProxy = this.modelValue || localStorage.getItem('selectedGitHubProxy') || "";
         const savedRadio = localStorage.getItem('githubProxyRadioValue') || "0";
         const savedControl = String(localStorage.getItem('githubProxyRadioControl') || "0");
 
@@ -159,9 +165,10 @@ export default {
                 return;
             }
             if (!newVal) {
-                newVal = ""
+                newVal = "";
             }
             localStorage.setItem('selectedGitHubProxy', newVal);
+            this.$emit('update:modelValue', newVal);
         },
         radioValue: function (newVal) {
             if (this.initializing) {

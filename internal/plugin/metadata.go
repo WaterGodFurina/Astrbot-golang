@@ -73,6 +73,24 @@ func (m *PluginMetadata) RequiresCgo() bool {
 	return m != nil && m.Cgo != nil && *m.Cgo
 }
 
+// PluginIDFromMeta derives a stable, predictable plugin id from the packaged
+// metadata: <sanitized name>_<language>（如 astrbot_plugin_xxx_python）。
+// 与来源推导 id（astrbot-plugin-xxx-4.11.2-<commit>，随版本/commit 变化）
+// 不同：稳定 id 在插件更新重装后不变，保证配置（按 name 存储）与数据
+// 目录（按 id 存储）都能保留——用户卸载不勾"清除配置/数据"时重装不会
+// 变成全新配置/数据。name 为空（无 metadata 的插件）返回 ""（调用方回退
+// 来源 id）。
+func PluginIDFromMeta(meta *PluginMetadata, language string) string {
+	if meta == nil {
+		return ""
+	}
+	name := sanitizePluginName(meta.Name)
+	if name == "" {
+		return ""
+	}
+	return name + "_" + language
+}
+
 // validatePluginName rejects plugin names that could escape the per-plugin
 // directory layout when joined into file paths. 允许字母数字与 - _，拒绝
 // /、\、.、.. 与空白等目录穿越/歧义字符。

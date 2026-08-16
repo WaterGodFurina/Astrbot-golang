@@ -792,3 +792,47 @@ func copyDir(src, dest string) error {
 		return cerr
 	})
 }
+
+// copyDirMerge copies src into dest, merging with any existing content
+// (source files overwrite same-named targets). 迁移场景用：旧源码目录并入
+// 已被文档缓存占位的目标目录。
+func copyDirMerge(src, dest string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dest, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if d.Type()&fs.ModeSymlink != 0 {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		out, err := os.Create(target)
+		if err != nil {
+			in.Close()
+			return err
+		}
+		_, cerr := io.Copy(out, in)
+		ierr := in.Close()
+		oerr := out.Close()
+		if cerr != nil {
+			return cerr
+		}
+		if ierr != nil {
+			return ierr
+		}
+		return oerr
+	})
+}

@@ -33,8 +33,8 @@
       "note": "程序 CPU 占用"
     },
     "memory": {
-      "label": "进程内存",
-      "note": "系统内存 {systemMemory}"
+      "label": "总运存",
+      "note": "进程 {process} · 插件 {plugins} / 系统 {systemMemory}"
     },
     "uptime": {
       "label": "运行时间",

@@ -9,7 +9,7 @@ import (
 
 // TestNormalizeSchemaAndDefaults verifies FlatSchema normalizes the
 // {"type":"object","properties":{...}} layout (with nested object groups) into
-// the WebUI "items" shape, and LoadConfigWithDefaults fills nested defaults.
+// the WebUI "items" shape, and mergeSchemaDefaults fills nested defaults.
 func TestNormalizeSchemaAndDefaults(t *testing.T) {
 	schema := map[string]interface{}{
 		"type": "object",
@@ -58,9 +58,11 @@ func flatProps(schema map[string]interface{}) map[string]interface{} {
 	return props
 }
 
-// TestLoadConfigWithDefaults uses a real SubprocessManager against a temp dir
-// with a fake plugin instance carrying a ConfigSchemaJson.
-func TestLoadConfigWithDefaults(t *testing.T) {
+// TestResolvePluginConfig uses a real SubprocessManager against a temp dir
+// with a fake plugin instance carrying a ConfigSchemaJson: the resolver
+// (single entry for HostService/dashboard/direct reads) merges schema
+// defaults under the stored config, while LoadConfig stays a pure stored read.
+func TestResolvePluginConfig(t *testing.T) {
 	m := NewSubprocessManager(nil, t.TempDir())
 	schema := map[string]interface{}{
 		"type": "object",
@@ -73,7 +75,7 @@ func TestLoadConfigWithDefaults(t *testing.T) {
 		Meta: &sdkv1.RegisterResponse{ConfigSchemaJson: raw},
 	}
 
-	cfg := m.LoadConfigWithDefaults("test")
+	cfg := m.ConfigResolver().ResolvePluginConfig("test")
 	if cfg["foo"] != "bar" {
 		t.Fatalf("default not merged: %+v", cfg)
 	}

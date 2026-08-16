@@ -232,6 +232,8 @@ interface BaseStatsResponse {
   message_time_series: Array<[number, number]>
   memory: {
     process: number
+    plugins?: number
+    total?: number
     system: number
   }
   cpu_percent: number
@@ -461,8 +463,10 @@ const overviewCards = computed(() => [
   },
   {
     label: t('overviewCards.memory.label'),
-    value: formatMemory(baseStats.value?.memory?.process ?? 0),
+    value: formatMemory(baseStats.value?.memory?.total ?? baseStats.value?.memory?.process ?? 0),
     note: t('overviewCards.memory.note', {
+      process: formatMemory(baseStats.value?.memory?.process ?? 0),
+      plugins: formatMemory(baseStats.value?.memory?.plugins ?? 0),
       systemMemory: formatMemory(baseStats.value?.memory?.system ?? 0)
     }),
     icon: 'mdi-memory'

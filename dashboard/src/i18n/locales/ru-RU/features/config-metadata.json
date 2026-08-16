@@ -1085,12 +1085,12 @@
         "hint": "Ротация при достижении размера. По умолчанию 20МБ."
       },
       "pip_install_arg": {
-        "description": "Дополнительные аргументы установки pip",
-        "hint": "При установке зависимостей можно указать аргументы pip, напр. --break-system-package."
+        "description": "Дополнительные аргументы pip",
+        "hint": "Дополнительные аргументы pip при установке зависимостей Python-плагинов, например --break-system-packages"
       },
       "pypi_index_url": {
-        "description": "URL репозитория PyPI",
-        "hint": "URL репозитория PyPI. По умолчанию: [https://mirrors.aliyun.com/pypi/simple/](https://mirrors.aliyun.com/pypi/simple/)"
+        "description": "Адрес репозитория Python-пакетов (PyPI)",
+        "hint": "PyPI-индекс для установки зависимостей Python-плагинов. По умолчанию https://mirrors.aliyun.com/pypi/simple/"
       },
       "callback_api_base": {
         "description": "Внешний адрес для Callback API",

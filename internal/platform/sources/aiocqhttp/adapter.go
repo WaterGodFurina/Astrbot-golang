@@ -11,12 +11,15 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -65,7 +68,13 @@ type Adapter struct {
 
 // New creates an aiocqhttp adapter from config.
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
+	id, _ := config["id"].(string)
 	a := &Adapter{
+		// BaseAdapter 必须初始化（id/platform）：PlatformManager 按
+		// ID()/Type() 注册与解析（Send/React/resolveAdapter 回退按 Type），
+		// 缺失会导致插件经 HostService.SendMessage 发送时
+		// "platform %q not found"（box 等 OneBot 插件回发失败）。
+		BaseAdapter: *platform.NewBaseAdapter(id, "aiocqhttp"),
 		EventBus:    eventBus,
 		conns:       make(map[*websocket.Conn]struct{}),
 		connWriteMu: make(map[*websocket.Conn]*sync.Mutex),
@@ -92,7 +101,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	} else if n, ok := config["ws_reverse_max_conns"].(int); ok && n > 0 {
 		a.maxReverseWSConns = n
 	}
-	if id, ok := config["id"].(string); ok {
+	if id != "" {
 		a.SelfID = id
 	}
 	a.quotedParser = resolveQuotedParserSettings(settings)
@@ -157,19 +166,63 @@ func (a *Adapter) Start(ctx context.Context) error {
 	mux.HandleFunc("/", a.handleHTTP)
 	mux.HandleFunc("/ws", a.handleWebSocket)
 
-	a.server = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", a.Host, a.Port),
-		Handler: mux,
+	addr := fmt.Sprintf("%s:%d", a.Host, a.Port)
+	// 监听带重试（对齐 dashboard.listenWithRetry）：WebUI 重启（Restart）时
+	// 新实例先启动、旧实例后 Stop，旧实例仍占着端口 → bind EADDRINUSE；
+	// 失败不重试会让适配器从此无监听（OneBot 客户端 connect ECONNREFUSED，
+	// 如 snowluma 连 192.168.3.9:6190 被拒）。旧实例退出释放端口后自动绑上。
+	ln, err := listenWithRetry(ctx, addr)
+	if err != nil {
+		return err
 	}
+	a.server = &http.Server{Handler: mux}
 
 	go func() {
-		logger.I18nInfo("aiocqhttp(OneBot v11) 适配器正在监听 %s:%d", a.Host, a.Port)
-		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.I18nInfo("aiocqhttp(OneBot v11) 适配器正在监听 %s", addr)
+		if err := a.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			logger.Error("aiocqhttp server error: %v", err)
 		}
 	}()
 
 	return nil
+}
+
+// listenWithRetry binds addr, retrying while the address is in use (the
+// previous host instance may still be releasing the port during a restart).
+func listenWithRetry(ctx context.Context, addr string) (net.Listener, error) {
+	const (
+		maxAttempts  = 40
+		retryBackoff = 500 * time.Millisecond
+	)
+	for attempt := 1; ; attempt++ {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		if !isAddrInUse(err) {
+			return nil, fmt.Errorf("bind aiocqhttp %s: %w", addr, err)
+		}
+		if attempt >= maxAttempts {
+			return nil, fmt.Errorf("bind aiocqhttp %s: port still in use after %d attempts: %w", addr, maxAttempts, err)
+		}
+		logger.I18nWarn("aiocqhttp 监听端口 %s 仍被占用，等待释放后重试（%d/%d）", addr, attempt, maxAttempts)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(retryBackoff):
+		}
+	}
+}
+
+func isAddrInUse(err error) bool {
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return errors.Is(opErr.Err, syscall.EADDRINUSE)
+	}
+	return false
 }
 
 // Stop stops the adapter, shutting down the HTTP server and closing all
@@ -730,7 +783,7 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 	if a.getSelfID() == "" {
 		if self, ok := raw["self"].(map[string]interface{}); ok {
 			if id, ok := self["user_id"]; ok {
-				a.setSelfID(fmt.Sprintf("%v", id))
+				a.setSelfID(toString(id))
 			}
 		}
 	}
@@ -773,7 +826,7 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 
 	var senderID, senderName, convID string
 	if sender, ok := raw["sender"].(map[string]interface{}); ok {
-		senderID = fmt.Sprintf("%v", sender["user_id"])
+		senderID = toString(sender["user_id"])
 		if name, ok := sender["card"].(string); ok && name != "" {
 			senderName = name
 		} else if nick, ok := sender["nickname"].(string); ok {
@@ -781,11 +834,11 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 		}
 	}
 	if senderID == "" {
-		senderID = fmt.Sprintf("%v", raw["user_id"])
+		senderID = toString(raw["user_id"])
 	}
 
 	if isGroup {
-		convID = fmt.Sprintf("%v", raw["group_id"])
+		convID = toString(raw["group_id"])
 	} else {
 		convID = senderID
 	}
@@ -849,11 +902,11 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 	convID := ""
 	if gid, ok := raw["group_id"]; ok {
 		isGroup = true
-		convID = fmt.Sprintf("%v", gid)
+		convID = toString(gid)
 	}
-	senderID := fmt.Sprintf("%v", raw["operator_id"])
+	senderID := toString(raw["operator_id"])
 	if senderID == "<nil>" || senderID == "" {
-		senderID = fmt.Sprintf("%v", raw["user_id"])
+		senderID = toString(raw["user_id"])
 	}
 	if !isGroup {
 		convID = senderID

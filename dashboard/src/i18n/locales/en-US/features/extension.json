@@ -124,7 +124,8 @@
       "commands": "Commands / Command Groups",
       "hooks": "Hooks",
       "functionTools": "Function Tools",
-      "eventListeners": "Event Listeners"
+      "eventListeners": "Event Listeners",
+      "sleep": "Sleep Policy"
     },
     "info": {
       "title": "Info",
@@ -137,6 +138,10 @@
       "supportPlatforms": "Supported Platforms",
       "authorWebsite": "Author Website",
       "repository": "Repository"
+    },
+    "sleep": {
+      "globalLabel": "Global idle auto-sleep",
+      "pluginLabel": "Allow this plugin to idle-sleep"
     }
   },
   "market": {
@@ -163,6 +168,7 @@
     "sourceName": "Source Name",
     "sourceUrl": "Source URL",
     "defaultSource": "Default Source",
+    "defaultSourceHint": "Built-in market (default)",
     "removeSource": "Remove Source",
     "confirmRemoveSource": "Are you sure you want to remove this source?",
     "sourceAdded": "Source added successfully",

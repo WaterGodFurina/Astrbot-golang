@@ -1265,6 +1265,20 @@ export const pluginApi = {
       }),
     );
   },
+  setIdleSleep(pluginId: string, allowSleep: boolean) {
+    return typed<OpenConfig>(
+      openApiV1.setPluginIdleSleepById({
+        body: { plugin_id: pluginId, allow_sleep: allowSleep },
+      }),
+    );
+  },
+  setGlobalIdleSleep(minutes: number) {
+    return typed<OpenConfig>(
+      openApiV1.setPluginIdleSleepGlobal({
+        body: { minutes },
+      }),
+    );
+  },
   update(pluginId: string, body?: OpenConfig) {
     return typed<OpenConfig>(
       openApiV1.updatePlugins({

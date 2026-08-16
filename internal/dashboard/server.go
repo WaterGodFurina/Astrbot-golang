@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -151,10 +152,6 @@ func (s *Server) webhookUUIDs() []string {
 	}
 	return uuids
 }
-
-// defaultPluginMarketURL is the default plugin marketplace registry served by
-// the AstrBot-Go community market (GitHub Pages).
-const defaultPluginMarketURL = "https://astrbotgomarket.350430.xyz/package.json"
 
 // marketCacheEntry is one cached registry snapshot.
 type marketCacheEntry struct {
@@ -674,17 +671,31 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 			"start_time": s.startTime.Unix(),
 		}))
 	case "restart-core":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "restart not supported",
-		}))
+		// 对齐 Python stat_service.restart_core：前端"重启"按钮经
+		// /api/stat/restart-core 触发核心自重启。异步执行，先返回响应，
+		// 前端 WaitingForRestart 轮询 start-time 检测重启完成并刷新。
+		if s.restartFunc != nil {
+			go s.restartFunc()
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"message": "重启中...",
+			}))
+		} else {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"message": "重启功能不可用",
+			}))
+		}
 	case "first-notice":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"notice": "",
 		}))
-	case "test-ghproxy-connection":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"ok": false,
-		}))
+	case "test-ghproxy-connection", "ghproxy":
+		// 前端 openapi 路径为 /api/v1/stats/ghproxy/test（parts=[ghproxy,test]）；
+		// 旧路径 /api/v1/stat/test-ghproxy-connection 也兼容。
+		if parts[0] == "ghproxy" && (len(parts) < 2 || parts[1] != "test") {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		s.handleGhproxyTest(w, r)
 	case "storage":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"total": 0,
@@ -704,6 +715,46 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// handleGhproxyTest 测 GitHub 加速地址连通性（对齐 Python
+// stat_service.test_ghproxy_connection）：GET <proxy>/https://github.com/...
+// 的测试文件测延迟（毫秒）。proxy_url 支持 query 与 POST body 两种传参。
+func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
+	proxyURL := strings.TrimSpace(r.URL.Query().Get("proxy_url"))
+	if proxyURL == "" {
+		var body struct {
+			ProxyURL string `json:"proxy_url"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		proxyURL = strings.TrimSpace(body.ProxyURL)
+	}
+	if proxyURL == "" {
+		writeJSON(w, http.StatusBadRequest, apiError("proxy_url is required"))
+		return
+	}
+	testURL := strings.TrimRight(proxyURL, "/") +
+		"/https://github.com/AstrBotDevs/AstrBot/raw/refs/heads/master/.python-version"
+	start := time.Now()
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(testURL)
+	if err != nil {
+		logger.I18nWarn("ghproxy 测速失败 %s: %v", proxyURL, err)
+		writeJSON(w, http.StatusBadGateway, apiError("ghproxy 测速失败: "+err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logger.I18nWarn("ghproxy 测速失败 %s: HTTP %d", proxyURL, resp.StatusCode)
+		writeJSON(w, http.StatusBadGateway, apiError(fmt.Sprintf("ghproxy 测速失败: HTTP %d", resp.StatusCode)))
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	latency := float64(time.Since(start).Microseconds()) / 1000.0
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"ok":      true,
+		"latency": math.Round(latency*100) / 100,
+	}))
 }
 
 // getBaseStats returns the dashboard statistics consumed by StatsPage.vue.
@@ -727,13 +778,19 @@ func (s *Server) getBaseStats(offsetSec int) map[string]interface{} {
 	if timeSeries == nil {
 		timeSeries = [][]int{}
 	}
+	// 总运存 = 主进程 RSS + 全部子进程（gRPC 插件子进程：Go 二进制与
+	// Python 解释器）RSS。直接扫描 /proc 的父子关系，不依赖 go-plugin。
+	processMB := processMemoryMB()
+	pluginMB := childProcessMemoryMB()
 	return map[string]interface{}{
 		"message_count":       messageCount,
 		"platform_count":      len(s.getBotList()),
 		"platform":            platformRank,
 		"message_time_series": timeSeries,
 		"memory": map[string]interface{}{
-			"process": processMemoryMB(),
+			"process": processMB,
+			"plugins": pluginMB,
+			"total":   processMB + pluginMB,
 			"system":  systemMemoryMB(),
 		},
 		"cpu_percent":  processCPUPercent(),
@@ -754,41 +811,10 @@ func runningComponents(d time.Duration) map[string]interface{} {
 	}
 }
 
-// processMemoryMB returns the process resident set size in MB (Linux /proc).
-func processMemoryMB() int {
-	data, err := os.ReadFile("/proc/self/statm")
-	if err != nil {
-		return 0
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) < 2 {
-		return 0
-	}
-	pages, err := strconv.ParseInt(fields[1], 10, 64)
-	if err != nil {
-		return 0
-	}
-	return int(pages * 4096 >> 20)
-}
-
-// systemMemoryMB returns total system RAM in MB (Linux /proc/meminfo).
-func systemMemoryMB() int {
-	data, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "MemTotal:") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 {
-				if kb, err := strconv.ParseInt(fields[1], 10, 64); err == nil {
-					return int(kb >> 10)
-				}
-			}
-		}
-	}
-	return 0
-}
+// processMemoryMB / systemMemoryMB / childProcessMemoryMB 为平台相关实现，
+// 见 proc_mem_linux.go（/proc）、proc_mem_darwin.go（sysctl + ps）、
+// proc_mem_windows.go（Toolhelp32Snapshot + NtQueryInformationProcess）与
+// proc_mem_other.go（不支持时返回 0）。
 
 // processCPUPercent returns the process CPU usage percentage (Linux /proc).
 // It samples the process utime+stime vs total CPU over a 300ms window and
@@ -1877,8 +1903,8 @@ func (s *Server) pluginByID(id string) map[string]interface{} {
 			if name, _ := m["name"].(string); name == id {
 				// WebUI "行为" 详情页需要 commands/tools/hooks 组件；从插件
 				// Register 元数据填充（否则显示"未知"）。
-				if _, pname, ok2 := s.resolveSubprocessPlugin(id); ok2 && s.subPluginMgr != nil {
-					if comps := s.subPluginMgr.Components(pname); comps != nil {
+				if pid, _, ok2 := s.resolveSubprocessPlugin(id); ok2 && s.subPluginMgr != nil {
+					if comps := s.subPluginMgr.Components(pid); comps != nil {
 						m["components"] = comps
 					}
 				}
@@ -1919,6 +1945,15 @@ func (s *Server) resolveSubprocessPlugin(id string) (string, string, bool) {
 	return "", "", false
 }
 
+// levelOrGlobal renders a log level for human-readable logging: the level
+// name, or "global" when following the host's global level.
+func levelOrGlobal(level string) string {
+	if level == "" {
+		return "global"
+	}
+	return level
+}
+
 func (s *Server) pluginSetEnabled(id string, enabled bool) {
 	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
 		if err := s.subPluginMgr.SetEnabled(pid, enabled); err != nil {
@@ -1954,8 +1989,8 @@ func (s *Server) pluginUninstall(id string, deleteConfig, deleteData bool) {
 }
 
 func (s *Server) pluginConfigSchema(id string) map[string]interface{} {
-	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
-		return s.subPluginMgr.ConfigSchema(name)
+	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
+		return s.subPluginMgr.ConfigSchema(pid)
 	}
 	return map[string]interface{}{}
 }
@@ -1966,33 +2001,57 @@ func (s *Server) pluginConfigSchema(id string) map[string]interface{} {
 // ("items"), matching the Python reference (config_service.get_plugin_config).
 func (s *Server) pluginConfigPayload(id string) map[string]interface{} {
 	name := id
+	pid := ""
 	sub := false
-	if _, n, ok := s.resolveSubprocessPlugin(id); ok {
-		name = n
+	if p, n, ok := s.resolveSubprocessPlugin(id); ok {
+		pid, name = p, n
 		sub = true
 	}
 
 	items := map[string]interface{}{}
 	if sub && s.subPluginMgr != nil {
-		items = s.subPluginMgr.FlatSchema(name)
+		// 优先按实例 id 取 schema：同名插件（如 Python 版与旧 Go 版同名）
+		// 不会被互相遮蔽，配置对话框显示用户所点那个插件的完整
+		// description/hint。回退到按 name（未加载/禁用时用磁盘缓存）。
+		items = s.subPluginMgr.FlatSchemaByID(pid)
+		if len(items) == 0 {
+			items = s.subPluginMgr.FlatSchema(pid)
+		}
 	}
-	metadata := map[string]interface{}{}
+	// 无配置项时 metadata 必须为 null（而非 {}）——前端以
+	// `v-if="extension_config.metadata"` 判断是否有配置，空对象是 JS
+	// 真值，会渲染出空白配置面板；null 则走 noConfig 提示（对齐 Python
+	// get_plugin_config 返回 metadata=None）。
+	var metadata map[string]interface{}
 	if len(items) > 0 {
-		metadata[name] = map[string]interface{}{
-			"description": name + " 配置",
-			"type":        "object",
-			"items":       items,
+		// metadata 键用请求 id（= 前端 metadataKey/curr_namespace），
+		// 前端传 name 或 id 都能对应上。
+		metadata = map[string]interface{}{
+			id: map[string]interface{}{
+				"description": name + " 配置",
+				"type":        "object",
+				"items":       items,
+			},
 		}
 	}
 
 	cfg := s.pluginLoadConfig(id)
 	if sub && s.subPluginMgr != nil {
-		cfg = s.subPluginMgr.LoadConfigWithDefaults(name)
+		cfg = s.subPluginMgr.ConfigResolver().ResolvePluginConfig(pid)
+	}
+
+	// per-plugin 日志级别覆盖（无覆盖 = null = 跟随全局），对齐 Python
+	// get_plugin_config 返回 LogManager.get_plugin_log_level(plugin_id)。
+	var logLevel interface{}
+	if sub && s.subPluginMgr != nil {
+		if lvl := s.subPluginMgr.GetPluginLogLevel(pid); lvl != "" {
+			logLevel = lvl
+		}
 	}
 
 	return map[string]interface{}{
 		"plugin_name": id,
-		"log_level":   nil,
+		"log_level":   logLevel,
 		"metadata":    metadata,
 		"config":      cfg,
 		"i18n":        map[string]interface{}{},
@@ -2000,16 +2059,16 @@ func (s *Server) pluginConfigPayload(id string) map[string]interface{} {
 }
 
 func (s *Server) pluginLoadConfig(id string) map[string]interface{} {
-	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
-		return s.subPluginMgr.LoadConfig(name)
+	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
+		return s.subPluginMgr.LoadConfig(pid)
 	}
 	return map[string]interface{}{}
 }
 
 func (s *Server) pluginSaveConfig(id string, cfg map[string]interface{}) {
-	if _, name, ok := s.resolveSubprocessPlugin(id); ok {
+	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
 		if cfg != nil {
-			if err := s.subPluginMgr.SaveConfig(name, cfg); err != nil {
+			if err := s.subPluginMgr.SaveConfig(pid, cfg); err != nil {
 				logger.I18nWarn("保存插件 %s 配置失败: %v", id, err)
 			}
 		}

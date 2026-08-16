@@ -1835,6 +1835,27 @@ export type SetPluginEnabledByIdResponse = (SuccessEnvelope);
 
 export type SetPluginEnabledByIdError = unknown;
 
+export type SetPluginIdleSleepByIdData = {
+    body: {
+        plugin_id: string;
+        allow_sleep: boolean;
+    };
+};
+
+export type SetPluginIdleSleepByIdResponse = (SuccessEnvelope);
+
+export type SetPluginIdleSleepByIdError = unknown;
+
+export type SetPluginIdleSleepGlobalData = {
+    body: {
+        minutes: number;
+    };
+};
+
+export type SetPluginIdleSleepGlobalResponse = (SuccessEnvelope);
+
+export type SetPluginIdleSleepGlobalError = unknown;
+
 export type ListPluginPagesByIdData = {
     query: {
         plugin_id: string;

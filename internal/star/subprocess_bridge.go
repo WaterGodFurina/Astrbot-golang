@@ -61,21 +61,59 @@ func hookEventType(name string) (EventType, bool) {
 }
 
 // RegisterSubprocessPlugins bridges a batch of running subprocess plugins.
-func RegisterSubprocessPlugins(starMgr *Manager, insts []*plugin.PluginInstance) {
+// mgr is the subprocess runtime used for lazy reload (idle-unloaded plugins are
+// brought back on demand) and activity tracking.
+func RegisterSubprocessPlugins(starMgr *Manager, mgr *plugin.SubprocessManager, insts []*plugin.PluginInstance) {
 	for _, inst := range insts {
-		RegisterSubprocessPlugin(starMgr, inst)
+		RegisterSubprocessPlugin(starMgr, mgr, inst)
 	}
+}
+
+// resolveActive returns the current running instance for id, lazily reloading
+// it when it was unloaded by the idle sweep, and marks it active. Returns nil
+// when the plugin cannot be brought up (disabled/uninstalled/load error).
+// 命令 handler 专用：懒加载 + 活动标记（用户主动使用）。
+func resolveActive(mgr *plugin.SubprocessManager, id string) *plugin.PluginInstance {
+	if mgr == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+	defer cancel()
+	inst, err := mgr.EnsureLoaded(ctx, id)
+	if err != nil {
+		logger.I18nWarn("唤醒插件 %s 失败: %v", id, err)
+		return nil
+	}
+	inst.Touch()
+	return inst
+}
+
+// currentActive returns the running instance for id WITHOUT touching its
+// activity timestamp and WITHOUT lazy-reloading it. 过滤器/钩子等被动广播
+// 专用：每条消息都会触发它们，若计入活动时间则带 filter/hook 的插件永远
+// 不会闲置休眠。插件已休眠时静默跳过（不唤醒），由命令/工具唤醒。
+func currentActive(mgr *plugin.SubprocessManager, id string) *plugin.PluginInstance {
+	if mgr == nil {
+		return nil
+	}
+	inst := mgr.Get(id)
+	if inst == nil || inst.Client == nil {
+		return nil
+	}
+	return inst
 }
 
 // RegisterSubprocessPlugin bridges one subprocess plugin's commands, filters
 // and hooks into the star registry. Uses the same `plugin_` prefixes as the
 // legacy .so bridge, so RemovePluginCommands/Filters/Hooks clean them up.
-func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
+// Handlers resolve the live instance via mgr so idle-unloaded plugins are
+// lazily re-loaded on first use (embedded-friendly process pool semantics).
+func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, inst *plugin.PluginInstance) {
 	if starMgr == nil || inst == nil || inst.Client == nil || inst.Meta == nil {
 		return
 	}
-	client := inst.Client
 	meta := inst.Meta
+	pluginID := inst.ID
 
 	for _, cmd := range meta.Commands {
 		cmd := cmd
@@ -91,6 +129,13 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if !ok {
 					return nil
 				}
+				// 懒加载 + 活动标记：idle 卸载的插件在此自动唤醒。
+				cur := resolveActive(mgr, pluginID)
+				if cur == nil || cur.Client == nil {
+					e.Result = message.NewMessageEventResult()
+					e.Result.Chain = []message.Component{&message.Plain{Text: "插件未就绪，请稍后重试"}}
+					return nil
+				}
 				parts := strings.Fields(e.MessageStr)
 				var args []string
 				if len(parts) > 1 {
@@ -98,11 +143,21 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				}
 				logger.Debug("plugin RPC HandleCommand: name=%s args=%v", cmd.Name, args)
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				text, chain, err := client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDK(e))
+				text, chain, result, err := cur.Client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDK(e))
 				rpcCancel()
 				if err != nil {
 					text = "插件执行失败: " + err.Error()
 					chain = nil
+				} else if result.GetSent() {
+					// 插件在 handler 中主动发送过回复（_has_send_oper 语义）：
+					// 事件已处理，不再走 LLM。
+					e.HasSendOper = true
+				}
+				// 插件 handler 调用了 event.stop_event()（无 Result 的主动
+				// 回复场景，如 box 的 recall_task 路径）：事件处理完毕，
+				// 管线停止，不得继续走 LLM 兜底。
+				if result.GetStopPropagation() {
+					e.Stop()
 				}
 				if len(chain) > 0 {
 					e.Result = message.NewMessageEventResult()
@@ -139,11 +194,20 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if !ok {
 					return nil
 				}
+				// 过滤器是被动广播：不懒加载、不刷新活动时间（否则带过滤器的
+				// 插件永不休眠）；插件已休眠时静默跳过。
+				cur := currentActive(mgr, pluginID)
+				if cur == nil || cur.Client == nil {
+					return nil
+				}
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				allow, err := client.HandleFilter(rpcCtx, f.Name, CoreEventToSDK(e))
+				allow, result, err := cur.Client.HandleFilter(rpcCtx, f.Name, CoreEventToSDK(e))
 				rpcCancel()
 				if err != nil {
 					return nil
+				}
+				if result.GetSent() {
+					e.HasSendOper = true
 				}
 				if !allow {
 					e.Stop()
@@ -184,9 +248,17 @@ func RegisterSubprocessPlugin(starMgr *Manager, inst *plugin.PluginInstance) {
 				if !ok {
 					return nil
 				}
+				// 钩子是被动广播：不懒加载、不刷新活动时间（同过滤器）。
+				cur := currentActive(mgr, pluginID)
+				if cur == nil || cur.Client == nil {
+					return nil
+				}
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				_, _, err := client.HandleHook(rpcCtx, h.Name, CoreEventToSDK(e), nil)
+				_, _, result, err := cur.Client.HandleHook(rpcCtx, h.Name, CoreEventToSDK(e), nil)
 				rpcCancel()
+				if result.GetSent() {
+					e.HasSendOper = true
+				}
 				return err
 			},
 			EventType:    et,

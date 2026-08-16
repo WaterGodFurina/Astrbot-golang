@@ -83,7 +83,9 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request, part
 			}))
 			return
 		}
-		cfg := s.getConfigData("default")
+		// 深合并默认值（Python DEFAULT_CONFIG 语义）：新配置键（pypi_index_url/
+		// pip_install_arg 等）在旧 cmd_config.json 中缺失时也能返回，前端可显示。
+		cfg := s.getConfigSnapshot()
 		redactDashboardSecrets(cfg)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"config":   cfg,
@@ -1910,6 +1912,51 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		s.pluginSetEnabled(body.PluginID, body.Enabled)
 		writeJSON(w, http.StatusOK, apiOKMsg("插件状态已更新", map[string]interface{}{}))
+	case "idle-unload":
+		// 单插件休眠开关：POST {plugin_id, allow_sleep: bool}。allow_sleep=true
+		// 表示该插件允许闲置自动休眠；false = 常驻（不参与清扫）。
+		var body struct {
+			PluginID  string `json:"plugin_id"`
+			AllowSleep bool  `json:"allow_sleep"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if s.subPluginMgr != nil {
+			if _, _, ok := s.resolveSubprocessPlugin(body.PluginID); ok {
+				if err := s.subPluginMgr.SetIdleUnloadBlocked(body.PluginID, !body.AllowSleep); err != nil {
+					writeJSON(w, http.StatusOK, apiError(err.Error()))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOKMsg("休眠策略已更新", map[string]interface{}{}))
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, apiError("插件不存在或不可用"))
+	case "idle-unload-global":
+		// 全局闲置自动休眠：GET 返回当前阈值（分钟）；POST {minutes} 设置
+		// （0 = 关闭）。
+		if r.Method == http.MethodGet {
+			minutes := 0
+			if s.subPluginMgr != nil {
+				minutes = s.subPluginMgr.IdleUnloadMinutes()
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"minutes": minutes}))
+			return
+		}
+		var body struct {
+			Minutes int `json:"minutes"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Minutes < 0 {
+			body.Minutes = 0
+		}
+		if err := s.setConfigData("plugin_idle_unload_minutes", body.Minutes); err != nil {
+			writeJSON(w, http.StatusOK, apiError("保存配置失败: "+err.Error()))
+			return
+		}
+		if s.subPluginMgr != nil {
+			s.subPluginMgr.SetIdleUnload(time.Duration(body.Minutes) * time.Minute)
+		}
+		writeJSON(w, http.StatusOK, apiOKMsg("全局休眠策略已更新", map[string]interface{}{"minutes": body.Minutes}))
 	case "failed":
 		writeJSON(w, http.StatusOK, apiOK(s.pluginFailed()))
 	case "reload":
@@ -2011,29 +2058,56 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		if len(parts) > 1 {
 			switch parts[1] {
 			case "log-level":
-				// 前端将 plugin_id 作为占位，实际设置全局日志级别
+				// per-plugin 日志级别：null/空 = 跟随全局（移除覆盖），
+				// 合法级别 = 持久化覆盖。与 Python LogManager 一致——
+				// 不碰全局日志级别。
 				if r.Method != http.MethodPut {
 					writeJSON(w, http.StatusOK, apiError("仅支持 PUT 请求"))
 					return
 				}
 				var body struct {
-					Level string `json:"level"`
+					Level *string `json:"level"`
 				}
 				_ = json.NewDecoder(r.Body).Decode(&body)
-				level := strings.ToUpper(strings.TrimSpace(body.Level))
-				switch level {
-				case "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL":
-				default:
-					writeJSON(w, http.StatusOK, apiError("无效的日志级别: "+body.Level))
+				var level string
+				if body.Level != nil {
+					level = strings.ToUpper(strings.TrimSpace(*body.Level))
+				}
+				pid, _, ok := s.resolveSubprocessPlugin(pluginID)
+				if !ok || s.subPluginMgr == nil {
+					writeJSON(w, http.StatusOK, apiError("插件不存在: "+pluginID))
 					return
 				}
-				log.GetDefault().SetLevel(log.ParseLevel(level))
-				if err := s.setConfigData("log_level", level); err != nil {
-					logger.I18nWarn("保存日志级别失败: %v", err)
-					writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+				if level != "" && level != "DEBUG" && level != "INFO" &&
+					level != "WARNING" && level != "ERROR" && level != "CRITICAL" {
+					writeJSON(w, http.StatusOK, apiError("无效的日志级别: "+level))
 					return
 				}
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"log_level": level}))
+				if !s.subPluginMgr.SetPluginLogLevel(pid, level) {
+					writeJSON(w, http.StatusOK, apiError("保存插件日志级别失败"))
+					return
+				}
+				// 动态应用到运行中的子进程（旧插件未实现 SetLogLevel RPC
+				// 时返回 UNIMPLEMENTED，容忍）。无覆盖时传全局级别，让
+				// Python 桥即时切到"跟随全局"而非回退 INFO。
+				effective := level
+				if effective == "" {
+					effective = s.subPluginMgr.EffectivePluginLogLevel(pid)
+				}
+				if inst := s.subPluginMgr.Get(pid); inst != nil && inst.Client != nil {
+					ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+					err := inst.Client.SetLogLevel(ctx, effective)
+					cancel()
+					if err != nil {
+						logger.I18nWarn("向插件 %s 应用日志级别失败: %v", pid, err)
+					}
+				}
+				logger.I18nInfo("插件 %s 日志级别已设置为 %s", pid, levelOrGlobal(level))
+				var respLevel interface{}
+				if level != "" {
+					respLevel = level
+				}
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"log_level": respLevel}))
 				return
 			case "config":
 				if r.Method == http.MethodPost || r.Method == http.MethodPut {
@@ -2403,18 +2477,16 @@ func (s *Server) handlePluginLogo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, apiError("缺少插件 ID"))
 		return
 	}
-	name := pluginID
 	if s.subPluginMgr != nil {
-		if pid, n, ok := s.resolveSubprocessPlugin(pluginID); ok {
-			_ = pid
-			name = n
+		if pid, _, ok := s.resolveSubprocessPlugin(pluginID); ok {
+			pluginID = pid
 		}
 	} else {
 		// 子进程插件管理器不可用（未注入/独立模式）：无 logo 可提供。
 		http.NotFound(w, r)
 		return
 	}
-	path := s.subPluginMgr.PluginLogoFile(name)
+	path := s.subPluginMgr.PluginLogoFile(pluginID)
 	if path == "" {
 		http.NotFound(w, r)
 		return
@@ -6063,9 +6135,50 @@ func (s *Server) handleBotRegistration(w http.ResponseWriter, r *http.Request, b
 }
 
 func (s *Server) handlePluginSources(w http.ResponseWriter, r *http.Request, parts []string) {
-	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-		"sources": []interface{}{},
-	}))
+	switch r.Method {
+	case http.MethodPost, http.MethodPut:
+		// 保存自定义插件源（内置源不可编辑，忽略同名内置条目）。
+		var body struct {
+			Sources []map[string]interface{} `json:"sources"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
+		custom := make([]map[string]interface{}, 0, len(body.Sources))
+		for _, src := range body.Sources {
+			if b, _ := src["builtin"].(bool); b {
+				continue
+			}
+			custom = append(custom, src)
+		}
+		if err := s.setConfigData("plugin_sources", custom); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("保存插件源失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOKMsg("插件源已保存", map[string]interface{}{}))
+	default:
+		// 可用源 = 内置源（默认 golang / 默认 Python，与 AstrBot 官方市场
+		// 并列）+ 用户自定义源。golang 内置源 url 为空 = 默认市场。
+		sources := defaultPluginSources()
+		if custom := s.storedPluginSources(); len(custom) > 0 {
+			sources = append(sources, custom...)
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"sources": sources}))
+	}
+}
+
+// storedPluginSources 读回用户保存的自定义插件源（config plugin_sources）。
+func (s *Server) storedPluginSources() []map[string]interface{} {
+	all := s.getConfigData("default")
+	raw, _ := all["plugin_sources"].([]interface{})
+	out := make([]map[string]interface{}, 0, len(raw))
+	for _, item := range raw {
+		if m, ok := item.(map[string]interface{}); ok {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleConfigProfiles(w http.ResponseWriter, r *http.Request, parts []string) {

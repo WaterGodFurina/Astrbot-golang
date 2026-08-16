@@ -250,6 +250,26 @@ func startTestAdapter(t *testing.T, respond func(action string, params map[strin
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
+	// Dial 返回成功 ≠ 服务端已完成 addConn：HTTP 101 升级响应发出后，服务端
+	// handleWebSocket 还要在锁内把连接注册进 a.conns 才可用。立即发起 CallAction
+	// 会命中注册前的窗口，遍历 conns 为空 → "no active WebSocket connection"
+	// 快速失败（TestResolveForwardPlaceholdersMultiple 偶发 flaky 根因）。
+	// 轮询等待连接真正注册完成后再返回。
+	registered := false
+	for i := 0; i < 100; i++ {
+		a.mu.Lock()
+		n := len(a.conns)
+		a.mu.Unlock()
+		if n > 0 {
+			registered = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !registered {
+		t.Fatalf("连接注册进适配器超时（服务端未完成 addConn）")
+	}
+
 	go func() {
 		for {
 			_, data, err := conn.ReadMessage()

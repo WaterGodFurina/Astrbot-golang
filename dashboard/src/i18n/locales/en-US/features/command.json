@@ -24,7 +24,8 @@
   "type": {
     "command": "Command",
     "group": "Group",
-    "subCommand": "Sub-command"
+    "subCommand": "Sub-command",
+    "sleep": "Sleep Policy"
   },
   "status": {
     "enabled": "Enabled",
@@ -91,5 +92,15 @@
     "byStatus": "Filter by status",
     "showSystemPlugins": "Show system plugins commands",
     "systemPluginConflictHint": "System plugin conflicts detected. Resolve conflicts to hide."
+  },
+  "sleep": {
+    "globalLabel": "Global idle auto-sleep",
+    "globalDesc": "When enabled, plugin processes idle for over 10 minutes are unloaded (memory reclaimed) and lazily reloaded on next use",
+    "columnPlugin": "Plugin",
+    "columnAllow": "Allow sleep",
+    "noPlugins": "No enabled plugins",
+    "globalSaved": "Global sleep policy updated",
+    "pluginSaved": "Plugin sleep policy updated",
+    "warning": "A sleeping plugin can no longer receive messages proactively. Be cautious when sleeping plugins that use filters/hooks."
   }
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	_ "github.com/WaterGodFurina/Astrbot-golang/internal/provider/sources"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
@@ -207,6 +208,23 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.syncSandboxBooter()
 	logger.I18nInfo("沙盒管理器已初始化")
 
+	// 9.5. Resolve the plugin build toolchain (bundled Go). This only locates
+	// an existing toolchain — no network download happens at startup; the
+	// compiler provisions it lazily on first plugin build.
+	l.toolchain = toolchain.New()
+	if bin, err := l.toolchain.GoBin(); err != nil {
+		logger.I18nWarn("Go 构建工具链不可用（插件编译已禁用）: %v", err)
+	} else {
+		logger.I18nInfo("插件构建工具链: %s (GOROOT=%s, GOPATH=%s)", bin, l.toolchain.GOROOT(), l.toolchain.GOPATH())
+	}
+
+	// 9.6a. Subprocess plugin runtime 的**对象**必须在管线构建前创建：
+	// ProcessStage 经 PipelineContext.SubPlugins 收集插件 LLM 函数工具，
+	// 若此时为 nil，collectPluginTools 直接返回空，插件工具不会注入 LLM
+	// （只有后续 ReloadPipelineScheduler 重建管线才恢复）。实例的 LoadInstalled
+	// 仍在 9.6 处（管线之后）执行。
+	l.subPluginMgr = plugin.NewSubprocessManager(l.toolchain, "data")
+
 	// 7.5. Build pipeline schedulers
 	for _, confID := range l.configMgr.IDs() {
 		if err := l.buildPipelineScheduler(confID); err != nil {
@@ -262,29 +280,30 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.backupExporter = backup.NewExporter("data")
 	logger.I18nInfo("备份导出器已初始化")
 
-	// 9.5. Resolve the plugin build toolchain (bundled Go). This only locates
-	// an existing toolchain — no network download happens at startup; the
-	// compiler provisions it lazily on first plugin build.
-	l.toolchain = toolchain.New()
-	if bin, err := l.toolchain.GoBin(); err != nil {
-		logger.I18nWarn("Go 构建工具链不可用（插件编译已禁用）: %v", err)
-	} else {
-		logger.I18nInfo("插件构建工具链: %s (GOROOT=%s, GOPATH=%s)", bin, l.toolchain.GOROOT(), l.toolchain.GOPATH())
-	}
-
 	// 9.6. Subprocess plugin runtime (go-plugin child processes). Loads
 	// installed plugins from the manifest, bridges their handlers into the
 	// star pipeline, and re-bridges after a crash-restart swaps an instance.
-	l.subPluginMgr = plugin.NewSubprocessManager(l.toolchain, "data")
+	// 对象已在 9.6a（管线构建前）创建；此处只做配置接线与实例装载。
 	l.subPluginMgr.OnInstancesChanged = func() { l.RebridgePlugins() }
 	l.subPluginMgr.SetGitHubProxy(cfg.GetString("github_proxy"))
 	l.subPluginMgr.SetGoConfig(cfg.GetString("goproxy"), cfg.GetString("goflags"))
+	// Python 插件依赖安装的 PyPI 镜像与额外 pip 参数（config pypi_index_url /
+	// pip_install_arg），供插件 requirements.txt 与宿主 venv 基础依赖安装使用。
+	l.subPluginMgr.SetPipConfig(cfg.GetString("pypi_index_url"), cfg.GetString("pip_install_arg"))
+	// Python SDK（非嵌入，从 astrbot-python-sdk 仓库下载）的 GitHub 加速前缀。
+	pysdk.SetSDKGitHubProxy(cfg.GetString("github_proxy"))
+	// 嵌入式/低内存设备：插件闲置自动卸载（进程内存回收），触发时懒加载唤醒。
+	l.syncIdleUnload()
 	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
 	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
 	// back into the host.
 	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins)
+	// 能力接线：先注入固定能力集（平台尚未加载，All() 为空），插件进程
+	// 启动时即带 ASTRBOT_HOST_CAPABILITIES 环境变量；loadPlatforms 完成后
+	// 再同步一次（含平台 ID），供后续懒加载/重载的插件使用。
+	l.syncHostCapabilities()
 	l.subPluginMgr.LoadInstalled(runCtx)
-	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr.List())
+	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.List())
 
 	// (已舍弃 legacy .so 方案：不再加载/桥接 .so 插件)
 
@@ -292,7 +311,9 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	if err := l.loadPlatforms(runCtx); err != nil {
 		logger.Error("Failed to load platforms: %v", err)
 	}
-
+	// 平台就绪后刷新能力集（平台适配器 ID 加入），已运行插件的 env 不会
+	// 被追溯更新，但后续 reload/闲置唤醒/新装插件会拿到完整能力集。
+	l.syncHostCapabilities()
 	// 12. Start dashboard API server
 	managers := map[string]interface{}{
 		"config":            l.configMgr,
@@ -331,6 +352,10 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		l.RebridgePlugins()
 	})
 	l.dashboard.SetOnConfigChanged(func() {
+		// 同步插件休眠阈值：用户在系统配置页直接改 plugin_idle_unload_minutes
+		// （非休眠策略 API）时，运行时清扫必须立即生效——否则配置已关（0）
+		// 但 sweep 仍按旧阈值继续休眠插件。
+		l.syncIdleUnload()
 		// Rebuild the pipeline so provider/platform settings changes (e.g. the
 		// default chat model) take effect immediately instead of on restart.
 		if err := l.ReloadPipelineScheduler("default"); err != nil {
@@ -638,6 +663,8 @@ func (l *Lifecycle) ReloadPlatforms(ctx context.Context) {
 	if l.dashboard != nil && l.dashboard.ChatAdapter() != nil {
 		l.platformMgr.Register(l.dashboard.ChatAdapter())
 	}
+	// 平台集合变化后刷新宿主能力集（已运行插件在下次重启时生效）。
+	l.syncHostCapabilities()
 }
 
 // umoAliasResolver returns the display name a user set for a session (config
@@ -782,6 +809,61 @@ func personaSkillsResolver(personaID string) []string {
 	return nil
 }
 
+// syncIdleUnload reads plugin_idle_unload_minutes from the default config and
+// applies it to the subprocess runtime (0 = 全局休眠关闭，所有插件常驻）。
+// 启动与配置热更新共用，保证配置与运行时清扫行为一致。
+func (l *Lifecycle) syncIdleUnload() {
+	if l.subPluginMgr == nil || l.configMgr == nil {
+		return
+	}
+	cfg := l.configMgr.Get("default")
+	if cfg == nil {
+		return
+	}
+	idleMin := cfg.GetInt("plugin_idle_unload_minutes")
+	if idleMin < 0 {
+		idleMin = 0
+	}
+	l.subPluginMgr.SetIdleUnload(time.Duration(idleMin) * time.Minute)
+}
+
+// fixedHostCapabilities 是宿主无条件公开的固定能力（与 Python AstrBot 的
+// 宿主能力一致）：llm（ChatLLM 反向调用）、send_message（SendMessage）、
+// recall_message（RecallMessage）、react（React）、t2i（TextToImage）、
+// config（GetConfig/SetConfig）、web（Web API 网关）。
+var fixedHostCapabilities = []string{
+	"llm", "send_message", "recall_message", "react", "t2i", "config", "web",
+}
+
+// syncHostCapabilities 计算宿主向 Python 插件公开的能力集合（已注册平台
+// 适配器 ID + 固定能力），并推给子进程插件管理器（经 ASTRBOT_HOST_CAPABILITIES
+// 环境变量注入插件进程）。启动与平台重载后调用；平台 ID 来自
+// platformMgr.All()（如 aiocqhttp/qq_official/telegram/slack…）。
+func (l *Lifecycle) syncHostCapabilities() {
+	if l.subPluginMgr == nil {
+		return
+	}
+	caps := append([]string(nil), fixedHostCapabilities...)
+	seen := make(map[string]struct{}, len(caps))
+	for _, c := range caps {
+		seen[c] = struct{}{}
+	}
+	if l.platformMgr != nil {
+		for _, a := range l.platformMgr.All() {
+			id := a.ID()
+			if id == "" {
+				continue
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			caps = append(caps, id)
+		}
+	}
+	l.subPluginMgr.SetHostCapabilities(caps)
+}
+
 // RebridgePlugins re-registers plugin commands/filters/hooks after plugin
 // changes (enable/disable/reload/install/unload) so the pipeline picks up the
 // latest set. 全面采用子进程插件运行时（legacy .so 已舍弃）。
@@ -793,7 +875,7 @@ func (l *Lifecycle) RebridgePlugins() {
 	star.RemovePluginFilters(l.starMgr)
 	star.RemovePluginHooks(l.starMgr)
 	if l.subPluginMgr != nil {
-		star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr.List())
+		star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.List())
 	}
 }
 

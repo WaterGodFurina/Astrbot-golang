@@ -1,6 +1,8 @@
 package pysdk
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -108,3 +110,148 @@ func TestDownloadURLMirror(t *testing.T) {
 	}
 }
 
+// setupFakeVenv 构造一个"伪 venv"（bin/python + 内容匹配的 READY +
+// environment.json），绑定到一个必然失败的假解释器（脚本 exit 1）：
+// 任何误触发的 venv 创建 / pip 安装 / import 探测都会失败，从而在断言
+// EnsureVenv 直接复用标记就绪 venv 时，能确定性地发现回归。cacheDir 为空时
+// 自动创建 TempDir 并设置 ASTRBOT_PYTHON_CACHE_DIR。返回假解释器路径与
+// 期望的 venv python 路径。
+func setupFakeVenv(t *testing.T, cacheDir string) (fakePy, wantVenvPython string) {
+	t.Helper()
+	if cacheDir == "" {
+		cacheDir = t.TempDir()
+		t.Setenv(EnvPythonCacheDir, cacheDir)
+	}
+
+	fakePy = filepath.Join(t.TempDir(), "fake-python3")
+	if err := os.WriteFile(fakePy, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvPythonBin, fakePy)
+	if got := DiscoverPythonBin(); got != fakePy {
+		t.Fatalf("DiscoverPythonBin = %q, want %q", got, fakePy)
+	}
+
+	// 与 ensureVenvReady 相同的指纹算法（解释器路径原文，保持已有 venv 目录名兼容）
+	sum := sha256.Sum256([]byte(fakePy))
+	fp := hex.EncodeToString(sum[:6])
+	venvRoot := filepath.Join(cacheDir, "astrbot-go", "python-venv-"+fp)
+	binDir := filepath.Join(venvRoot, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "python"), []byte("fake"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVenvMarkers(venvRoot, fakePy, SDKVersion, baseDepsVersion); err != nil {
+		t.Fatal(err)
+	}
+	return fakePy, filepath.Join(binDir, "python")
+}
+
+// TestVenvReadyMarker: venv 首次创建时写 READY + environment.json；再次
+// EnsureVenv 时标记匹配 → 直接复用，不再跑 import 探测 / pip（用必失败的
+// 假解释器证明没有触发任何供给动作）。依赖清单版本变化 → 视为不完整 →
+// 触发重装（假解释器装不上 → 返回空串）。
+func TestVenvReadyMarker(t *testing.T) {
+	_, want := setupFakeVenv(t, "")
+
+	// 标记匹配：必须直接返回 venv python（任何供给尝试都会因假解释器
+	// exit 1 而失败，若返回非 want 即断言失败）。
+	if got := EnsureVenv(t.TempDir()); got != want {
+		t.Fatalf("标记匹配时应直接复用 venv: got %q, want %q", got, want)
+	}
+	// 二次调用（重启场景）同样直接复用。
+	if got := EnsureVenv(t.TempDir()); got != want {
+		t.Fatalf("二次调用未复用: got %q, want %q", got, want)
+	}
+
+	// 宿主依赖清单版本变化（baseDepsVersion+1）→ 标记不匹配 → 重新供给。
+	// 假解释器装不上依赖 → EnsureVenv 返回空串（"安装失败"路径）。
+	root := filepath.Dir(filepath.Dir(want))
+	if err := writeVenvMarkers(root, os.Getenv(EnvPythonBin), SDKVersion, baseDepsVersion+1); err != nil {
+		t.Fatal(err)
+	}
+	if got := EnsureVenv(t.TempDir()); got != "" {
+		t.Fatalf("标记不匹配时应重新供给（返回空串），got %q", got)
+	}
+	// 安装失败路径必须移除 READY，下次启动重试。
+	if _, err := os.Stat(readyPath(root)); !os.IsNotExist(err) {
+		t.Fatalf("安装失败后 READY 应被删除, stat err=%v", err)
+	}
+}
+
+// TestEnvironmentJSONRoundtrip: environment.json 写读往返与一致性判定
+// （interpreter/sdk_version/base_deps_version 任一不一致、READY 缺失、
+// JSON 损坏均判为不匹配）。
+func TestEnvironmentJSONRoundtrip(t *testing.T) {
+	root := t.TempDir()
+	interpreter := "/usr/bin/python3"
+
+	if err := writeVenvMarkers(root, interpreter, SDKVersion, baseDepsVersion); err != nil {
+		t.Fatalf("writeVenvMarkers: %v", err)
+	}
+	env, err := readVenvEnvironment(root)
+	if err != nil {
+		t.Fatalf("readVenvEnvironment: %v", err)
+	}
+	if env.Interpreter != interpreter || env.SDKVersion != SDKVersion || env.BaseDepsVersion != baseDepsVersion {
+		t.Fatalf("environment.json 往返不一致: %+v", env)
+	}
+	if !venvMarkersMatch(root, interpreter, SDKVersion, baseDepsVersion) {
+		t.Fatal("一致时应匹配")
+	}
+
+	cases := []struct {
+		name string
+		run  func()
+	}{
+		{"interpreter 不一致", func() { _ = writeVenvMarkers(root, "/other/python3", SDKVersion, baseDepsVersion) }},
+		{"sdk_version 不一致", func() { _ = writeVenvMarkers(root, interpreter, "999", baseDepsVersion) }},
+		{"base_deps_version 不一致", func() { _ = writeVenvMarkers(root, interpreter, SDKVersion, baseDepsVersion+1) }},
+		{"READY 缺失", func() { _ = os.Remove(readyPath(root)) }},
+	}
+	for _, c := range cases {
+		c.run()
+		if venvMarkersMatch(root, interpreter, SDKVersion, baseDepsVersion) {
+			t.Errorf("%s: 不应匹配", c.name)
+		}
+	}
+
+	// JSON 损坏
+	if err := writeVenvMarkers(root, interpreter, SDKVersion, baseDepsVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(environmentPath(root), []byte("{not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if venvMarkersMatch(root, interpreter, SDKVersion, baseDepsVersion) {
+		t.Error("损坏的 environment.json 不应匹配")
+	}
+	if _, err := readVenvEnvironment(root); err == nil {
+		t.Error("损坏的 environment.json 读取应报错")
+	}
+}
+
+// TestCacheDirEnvOverride: ASTRBOT_PYTHON_CACHE_DIR 指向 TempDir 时，
+// EnsureVenv 的 venv 与 pythonBaseDir 都落在该目录下（测试隔离 / 嵌入式
+// 设备指定可写目录）。
+func TestCacheDirEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvPythonCacheDir, dir)
+
+	if got := userCacheDir(); got != dir {
+		t.Fatalf("userCacheDir() = %q, want %q", got, dir)
+	}
+	if got := pythonBaseDir(); got != filepath.Join(dir, "astrbot-go", "python") {
+		t.Fatalf("pythonBaseDir() = %q, want %q", got, filepath.Join(dir, "astrbot-go", "python"))
+	}
+
+	_, want := setupFakeVenv(t, dir)
+	if !filepath.HasPrefix(want, filepath.Join(dir, "astrbot-go", "python-venv-")) {
+		t.Fatalf("venv 未落在 ASTRBOT_PYTHON_CACHE_DIR 下: %q", want)
+	}
+	if got := EnsureVenv(t.TempDir()); got != want {
+		t.Fatalf("EnsureVenv = %q, want %q", got, want)
+	}
+}

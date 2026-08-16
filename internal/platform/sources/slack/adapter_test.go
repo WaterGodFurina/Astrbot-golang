@@ -458,6 +458,14 @@ func runStartStopRace(t *testing.T, a *Adapter, start func()) {
 		}
 	}
 	wg.Wait()
+	// start goroutine 可能在 50 次 Stop 之后才完成赋值（调度延迟），此时
+	// socketCancel 是 start 刚写入的值、从未被 Stop 消费——最终断言会误报
+	// "Stop 后 socketCancel 应被置 nil"。补一次收尾 Stop，保证断言前
+	// 最后一次 Stop 发生在 start 赋值之后（竞态覆盖不受影响：上面 50 次
+	// Stop 已与 start 并发执行）。
+	if err := a.Stop(); err != nil {
+		t.Fatalf("收尾 Stop 返回错误: %v", err)
+	}
 }
 
 // TestSocketModeStartStopConcurrent verifies that assigning a.socket and

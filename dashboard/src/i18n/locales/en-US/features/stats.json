@@ -33,8 +33,8 @@
       "note": "AstrBot CPU usage"
     },
     "memory": {
-      "label": "Process Memory",
-      "note": "System memory {systemMemory}"
+      "label": "Total Memory",
+      "note": "Process {process} · Plugins {plugins} / System {systemMemory}"
     },
     "uptime": {
       "label": "Uptime",

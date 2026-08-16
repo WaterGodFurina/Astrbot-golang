@@ -12,7 +12,8 @@
  * - components/RenameDialog.vue: 重命名对话框
  * - components/DetailsDialog.vue: 详情对话框
  */
-import { onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
+import { useTheme } from 'vuetify';
 import { useModuleI18n } from '@/i18n/composables';
 
 // Composables
@@ -25,6 +26,7 @@ import { useToolActions } from './composables/useToolActions';
 import CommandFilters from './components/CommandFilters.vue';
 import CommandTable from './components/CommandTable.vue';
 import ToolTable from './components/ToolTable.vue';
+import SleepPanel from './components/SleepPanel.vue';
 import RenameDialog from './components/RenameDialog.vue';
 import DetailsDialog from './components/DetailsDialog.vue';
 
@@ -39,7 +41,12 @@ const props = withDefaults(defineProps<{ active?: boolean }>(), {
 const { tm } = useModuleI18n('features/command');
 const { tm: tmTool } = useModuleI18n('features/tooluse');
 
-const viewMode = ref<'commands' | 'tools'>('commands');
+const viewMode = ref<'commands' | 'tools' | 'sleep'>('commands');
+
+// 💤 emoji 明暗适配：项目主题名是 PurpleTheme/PurpleThemeDark（非 v-theme--dark
+// 类），用 Vuetify useTheme 动态判断。
+const theme = useTheme();
+const isDarkTheme = computed(() => theme.global.current.value.dark);
 
 // 数据管理
 const { 
@@ -133,7 +140,7 @@ watch(() => props.active, async (isActive) => {
 watch(viewMode, async (mode) => {
   if (mode === 'commands') {
     await fetchCommands(tm('messages.loadFailed'));
-  } else {
+  } else if (mode === 'tools') {
     await fetchTools(tmTool('messages.getToolsError', { error: '' }));
   }
 });
@@ -153,6 +160,15 @@ watch(viewMode, async (mode) => {
               <v-btn value="tools">
                 <v-icon size="18" class="mr-1">mdi-function-variant</v-icon>
                 {{ tmTool('functionTools.title') }}
+              </v-btn>
+              <v-btn value="sleep">
+                <span
+                  class="sleep-emoji mr-1"
+                  :class="{ 'sleep-emoji--dark': isDarkTheme }"
+                  aria-hidden="true"
+                  >💤</span
+                >
+                {{ tm('type.sleep') }}
               </v-btn>
             </v-btn-toggle>
             <v-progress-linear
@@ -235,6 +251,10 @@ watch(viewMode, async (mode) => {
               @view-details="openDetailsDialog"
               @update-permission="handleUpdatePermission"
             />
+          </div>
+
+          <div v-else-if="viewMode === 'sleep'">
+            <SleepPanel :active="props.active" />
           </div>
 
           <div v-else>
@@ -326,5 +346,16 @@ watch(viewMode, async (mode) => {
 
 .builtin-tools-checkbox :deep(.v-selection-control) {
   min-height: auto;
+}
+
+/* 💤 emoji 明暗适配：亮色模式呈黑色，暗色模式呈白色（useTheme 动态 class） */
+.sleep-emoji {
+  font-size: 16px;
+  line-height: 1;
+  filter: grayscale(1) brightness(0);
+}
+
+.sleep-emoji--dark {
+  filter: grayscale(1) brightness(0) invert(1);
 }
 </style>

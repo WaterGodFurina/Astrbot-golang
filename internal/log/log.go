@@ -220,6 +220,31 @@ func (l *Logger) SetLevel(level Level) {
 	l.mu.Unlock()
 }
 
+// GetLevel returns the minimum log level.
+func (l *Logger) GetLevel() Level {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.level
+}
+
+// LevelString returns the canonical config name of a level
+// (DEBUG/INFO/WARNING/ERROR/CRITICAL), as used by the WebUI and the Python
+// bridge's ASTRBOT_PLUGIN_LOG_LEVEL.
+func LevelString(level Level) string {
+	switch level {
+	case LevelDebug:
+		return "DEBUG"
+	case LevelWarn:
+		return "WARNING"
+	case LevelError:
+		return "ERROR"
+	case LevelCritical:
+		return "CRITICAL"
+	default:
+		return "INFO"
+	}
+}
+
 // SetOutput sets the output writer.
 func (l *Logger) SetOutput(w io.Writer) {
 	l.mu.Lock()

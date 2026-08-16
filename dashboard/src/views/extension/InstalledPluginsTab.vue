@@ -369,12 +369,12 @@ const togglePinnedExtension = (extension) => {
               style="background-color: rgb(var(--v-theme-mcpCardBg))"
               @click="openPluginDetail(extension)"
               @toggle-pin="togglePinnedExtension(extension)"
-              @configure="openExtensionConfig(extension.name)"
+              @configure="openExtensionConfig(extension.id ?? extension.name)"
               @uninstall="
-                (ext, options) => uninstallExtension(ext.name, options)
+                (ext, options) => uninstallExtension(ext.id ?? ext.name, options)
               "
-              @update="updateExtension(extension.name)"
-              @reload="reloadPlugin(extension.name)"
+              @update="updateExtension(extension.id ?? extension.name)"
+              @reload="reloadPlugin(extension.id ?? extension.name)"
               @toggle-activation="
                 extension.activated ? pluginOff(extension) : pluginOn(extension)
               "

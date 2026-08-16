@@ -53,13 +53,14 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"path":                   inst.Binary,
 			"id":                     inst.ID,
 			"language":               inst.Language,
-			"logo":                   m.pluginLogoURL(inst.ID, inst.Name),
+			"logo":                   m.pluginLogoURL(inst.ID),
 			"loaded":                 true,
 			"enabled":                true,
 			"activated":              true,
 			"reserved":               false,
 			"author":                 "",
 			"repo":                   "",
+			"idle_unload_blocked":    m.IdleUnloadBlocked(inst.ID),
 			"install_source":         nil,
 			"updates_enabled":        true,
 			"update_disabled_reason": "",
@@ -77,10 +78,9 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		}
 		result = append(result, info)
 	}
+	// manifest 中已启用但当前未加载的插件：可能是闲置自动卸载（idle sweep）
+	// 后处于休眠状态——插件仍启用，触发时会自动唤醒。
 	for _, e := range man.Plugins {
-		if e.Enabled {
-			continue
-		}
 		if m.Get(e.ID) != nil {
 			continue
 		}
@@ -88,23 +88,31 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		if repo == "" {
 			repo = e.Source
 		}
+		desc := "插件已禁用"
+		enabled := false
+		if e.Enabled {
+			// 已启用但进程不在：闲置自动卸载后的休眠状态（懒加载会自动唤醒）。
+			desc = "插件已休眠（闲置自动卸载，使用时自动唤醒）"
+			enabled = true
+		}
 		result = append(result, map[string]interface{}{
 			"name":                   e.Name,
 			"display_name":           m.pluginDisplayName(nil, &e),
 			"short_desc":             m.pluginShortDesc(nil, &e),
 			"marketplace_name":       strings.ReplaceAll(e.Name, "_", "-"),
 			"version":                e.Version,
-			"description":            "插件已禁用",
+			"description":            desc,
 			"path":                   e.Binary,
 			"id":                     e.ID,
 			"language":               e.Language,
-			"logo":                   m.pluginLogoURL(e.ID, e.Name),
+			"logo":                   m.pluginLogoURL(e.ID),
 			"loaded":                 false,
-			"enabled":                false,
+			"enabled":                enabled,
 			"activated":              false,
 			"reserved":               false,
 			"author":                 "",
 			"repo":                   repo,
+			"idle_unload_blocked":    e.IdleUnloadBlocked,
 			"install_source":         e.installSourceMap(),
 			"updates_enabled":        updatesEnabled(e.InstallMethod),
 			"update_disabled_reason": "",
@@ -114,8 +122,8 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 }
 
 // pluginDisplayName resolves the display name shown in the WebUI: manifest
-// record > runtime instance > the config block written at install (legacy
-// entries) > plugin name.
+// record > runtime instance > the standalone metadata file (legacy entries) >
+// plugin name.
 func (m *SubprocessManager) pluginDisplayName(inst *PluginInstance, e *ManifestEntry) string {
 	if e != nil && e.DisplayName != "" {
 		return e.DisplayName
@@ -124,14 +132,17 @@ func (m *SubprocessManager) pluginDisplayName(inst *PluginInstance, e *ManifestE
 		return inst.DisplayName
 	}
 	name := ""
+	id := ""
 	if inst != nil {
 		name = inst.Name
+		id = inst.ID
 	} else if e != nil {
 		name = e.Name
+		id = e.ID
 	}
-	if name != "" {
-		if cfg := m.LoadConfig(name); cfg != nil {
-			if v, _ := cfg["display_name"].(string); v != "" {
+	if name != "" && id != "" {
+		if meta := m.readPluginMetadataFile(id); meta != nil {
+			if v, _ := meta["display_name"].(string); v != "" {
 				return v
 			}
 		}
@@ -140,7 +151,7 @@ func (m *SubprocessManager) pluginDisplayName(inst *PluginInstance, e *ManifestE
 }
 
 // pluginShortDesc resolves the one-line short description (manifest > instance
-// > config block > "").
+// > standalone metadata file > "").
 func (m *SubprocessManager) pluginShortDesc(inst *PluginInstance, e *ManifestEntry) string {
 	if e != nil && e.ShortDesc != "" {
 		return e.ShortDesc
@@ -149,14 +160,17 @@ func (m *SubprocessManager) pluginShortDesc(inst *PluginInstance, e *ManifestEnt
 		return inst.ShortDesc
 	}
 	name := ""
+	id := ""
 	if inst != nil {
 		name = inst.Name
+		id = inst.ID
 	} else if e != nil {
 		name = e.Name
+		id = e.ID
 	}
-	if name != "" {
-		if cfg := m.LoadConfig(name); cfg != nil {
-			if v, _ := cfg["short_desc"].(string); v != "" {
+	if name != "" && id != "" {
+		if meta := m.readPluginMetadataFile(id); meta != nil {
+			if v, _ := meta["short_desc"].(string); v != "" {
 				return v
 			}
 		}
@@ -166,8 +180,8 @@ func (m *SubprocessManager) pluginShortDesc(inst *PluginInstance, e *ManifestEnt
 
 // pluginLogoURL returns the dashboard-relative URL of the plugin's cached
 // logo ("" when absent), consumed by the WebUI as <img src>.
-func (m *SubprocessManager) pluginLogoURL(id, name string) string {
-	if m.PluginLogoFile(name) == "" {
+func (m *SubprocessManager) pluginLogoURL(id string) string {
+	if m.PluginLogoFile(id) == "" {
 		return ""
 	}
 	return "/api/v1/plugins/logo?plugin_id=" + url.QueryEscape(id)
@@ -401,15 +415,14 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 // Uninstall removes an installed plugin: unloads it, drops the manifest entry,
 // deletes its compiled binary directory and optionally its config directory.
 // Uninstall removes a plugin. deleteConfig 是否删除插件配置
-// (data/plugins_config/<name>)，deleteData 是否删除插件运行时数据
-// (data/plugins/<name>/data)。二进制与文档缓存始终清理。
+// (data/plugins_config/<id>)，deleteData 是否删除插件运行时数据
+// (data/plugins_data/<id>)。二进制与文档缓存始终清理。
 func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) error {
 	// 持 per-plugin 生命周期锁：与 Load/InstallFromSource 尾段互斥，防止并发
 	// 安装/卸载交错导致"卸载后条目被重建"或"删除已重新安装插件的二进制"。
 	unlock := m.lockOp(id)
 	defer unlock()
 
-	name := id
 	var entry *ManifestEntry
 	// 串行化 manifest 读→改→写：先读取条目，Unload 之后在锁内 Remove+Save。
 	m.manifestMu.Lock()
@@ -419,12 +432,11 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 		return err
 	}
 	if e := man.Get(id); e != nil {
-		name = e.Name
 		entry = e
 	}
 	if m.Get(id) != nil {
 		m.manifestMu.Unlock()
-		if err := m.unloadLocked(id); err != nil {
+		if err := m.unloadLocked(id, true); err != nil {
 			return err
 		}
 		m.manifestMu.Lock()
@@ -444,14 +456,14 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 
 	// 二进制目录（始终删除）。
 	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id)))
-	// Python 插件源码目录（始终删除）。
-	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-src", sanitizeID(id)))
+	// 插件本体源码目录（Go/Python 统一在 plugins/<id>，始终删除）。
+	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins", sanitizeID(id)))
 
-	// 目录足迹：优先用安装时记录的 manifest 条目，旧版本安装则按 name 推导。
-	// name 与 manifest 子路径都先 sanitize/校验，防止路径穿越导致误删
-	// dataDir 之外目录。
-	cfgDir := filepath.Join(m.dataDir, "plugins_config", sanitizePluginName(name))
-	docsDir := filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
+	// 目录足迹：优先用安装时记录的 manifest 条目，旧版本安装则按 id 推导。
+	// manifest 子路径都先 sanitize/校验，防止路径穿越导致误删 dataDir 之外
+	// 目录。
+	cfgDir := filepath.Join(m.dataDir, "plugins_config", sanitizeID(id))
+	docsDir := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
 	dataRoot := filepath.Join(m.dataDir, "plugins_data", sanitizeID(id))
 	if entry != nil {
 		if p, err := m.safeDataDirPath(entry.ConfigDir); err == nil {
@@ -518,18 +530,19 @@ func (m *SubprocessManager) instanceByName(name string) *PluginInstance {
 }
 
 // ConfigSchema returns the plugin's config schema exported via Register().
-func (m *SubprocessManager) ConfigSchema(name string) map[string]interface{} {
-	inst := m.instanceByName(name)
+// id 为插件实例 id（name_language）：同名 Go/Python 插件的 schema 完全隔离。
+func (m *SubprocessManager) ConfigSchema(id string) map[string]interface{} {
+	inst := m.instanceByName(id)
 	if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
 		var schema map[string]interface{}
 		if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
-			logger.I18nWarn("ConfigSchema(%s): %v", name, err)
+			logger.I18nWarn("ConfigSchema(%s): %v", id, err)
 		} else {
 			return schema
 		}
 	}
 	// 插件已禁用/未加载时回退到落盘的 schema 缓存，保证配置对话框仍可渲染。
-	if data, err := os.ReadFile(m.schemaCachePath(name)); err == nil {
+	if data, err := os.ReadFile(m.schemaCachePath(id)); err == nil {
 		var schema map[string]interface{}
 		if json.Unmarshal(data, &schema) == nil {
 			return schema
@@ -539,27 +552,27 @@ func (m *SubprocessManager) ConfigSchema(name string) map[string]interface{} {
 }
 
 // schemaCachePath returns the persisted config-schema cache for a plugin
-// (under plugins_config/<name>/ alongside config.json).
-func (m *SubprocessManager) schemaCachePath(name string) string {
-	return filepath.Join(m.dataDir, "plugins_config", sanitizePluginName(name), "config_schema.json")
+// (under plugins_config/<id>/ alongside config.json).
+func (m *SubprocessManager) schemaCachePath(id string) string {
+	return filepath.Join(m.dataDir, "plugins_config", sanitizeID(id), "config_schema.json")
 }
 
 // cacheConfigSchema persists a loaded plugin's config schema so the WebUI can
 // render its config dialog even while the plugin is disabled (unloaded).
-func (m *SubprocessManager) cacheConfigSchema(name string, meta *sdkv1.RegisterResponse) {
+func (m *SubprocessManager) cacheConfigSchema(id string, meta *sdkv1.RegisterResponse) {
 	if meta == nil || len(meta.ConfigSchemaJson) == 0 {
 		return
 	}
-	path := m.schemaCachePath(name)
+	path := m.schemaCachePath(id)
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	_ = os.WriteFile(path, meta.ConfigSchemaJson, 0o644)
 }
 
 // Components returns the plugin's behavior components (commands / llm tools /
 // hooks) consumed by the WebUI "行为" detail page. Empty map when the plugin
-// is not loaded.
-func (m *SubprocessManager) Components(name string) map[string]interface{} {
-	inst := m.instanceByName(name)
+// is not loaded. id 为插件实例 id（name_language）。
+func (m *SubprocessManager) Components(id string) map[string]interface{} {
+	inst := m.instanceByName(id)
 	if inst == nil || inst.Meta == nil {
 		return nil
 	}
@@ -594,28 +607,54 @@ func (m *SubprocessManager) Components(name string) map[string]interface{} {
 	if len(hooks) > 0 {
 		out["hook"] = hooks
 	}
+	// 休眠策略：与指令/函数工具同列的行为配置项。global_* 反映全局闲置
+	// 自动休眠开关；blocked 表示本插件是否被排除在休眠之外（常驻）。
+	out["sleep"] = []interface{}{map[string]interface{}{
+		"name":          "idle_sleep",
+		"handler_name":  "idle_sleep",
+		"desc":          "插件闲置自动休眠（回收空闲插件进程内存，触发时自动唤醒）",
+		"type":          "休眠策略",
+		"global_enabled": m.IdleUnloadEnabled(),
+		"global_minutes": m.IdleUnloadMinutes(),
+		"blocked":        m.IdleUnloadBlocked(inst.ID),
+	}}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
 }
 
-// configPath returns plugins_config/<name>/config.json. 插件配置项统一存放在
-// data/plugins_config/ 下、按插件名分文件夹，与源码/运行时数据(data/plugins/)
-// 分开，方便用户直接编辑配置文件。
-func (m *SubprocessManager) configPath(name string) string {
-	return filepath.Join(m.dataDir, "plugins_config", sanitizePluginName(name), "config.json")
+// configPath returns plugins_config/<id>/config.json. 插件配置项统一存放在
+// data/plugins_config/ 下、按插件实例 id（name_language）分文件夹——同名
+// Go/Python 插件的配置完全隔离；与源码/运行时数据(data/plugins/)分开，方便
+// 用户直接编辑配置文件。config 文件只保存真实配置项，插件元数据
+// （name/desc/version 等）存独立的 metadata.json（见 metadataPath）。
+func (m *SubprocessManager) configPath(id string) string {
+	return filepath.Join(m.dataDir, "plugins_config", sanitizeID(id), "config.json")
 }
 
-// writeMetadataConfig writes the plugin's metadata.json content to the top of
-// its plugins_config/<name>/config.json so the WebUI/config editor can display
-// the packaged plugin info (name/desc/author/version/repo/cgo) alongside the
-// runtime config. Existing config keys (if any) are preserved underneath.
-func (m *SubprocessManager) writeMetadataConfig(name string, meta *PluginMetadata) {
+// metadataPath returns plugins_config/<id>/metadata.json —— 插件打包元数据
+// 的独立存储文件，与 config.json 分离（不进入 WebUI 配置对话框）。
+func (m *SubprocessManager) metadataPath(id string) string {
+	return filepath.Join(m.dataDir, "plugins_config", sanitizeID(id), "metadata.json")
+}
+
+// metadataConfigKeys 是历史上被 writeMetadataConfig 混入 config.json 的插件
+// 身份键。它们属于元数据而非可配置项，读取配置时必须剥离（并做一次性迁移）。
+var metadataConfigKeys = []string{
+	"name", "desc", "author", "version", "repo", "homepage",
+	"display_name", "short_desc", "cgo",
+}
+
+// writeMetadataConfig writes the plugin's metadata.json content to the
+// standalone plugins_config/<id>/metadata.json file. 元数据与配置彻底分离：
+// config.json 只保存用户可编辑的配置项，插件信息（name/desc/author/version/
+// repo/cgo）全部落在独立的 metadata 文件，供详情展示，不再污染配置对话框。
+func (m *SubprocessManager) writeMetadataConfig(id string, meta *PluginMetadata) {
 	if meta == nil {
 		return
 	}
-	path := m.configPath(name)
+	path := m.metadataPath(id)
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 
 	od := config.NewOrderedJSON()
@@ -639,33 +678,83 @@ func (m *SubprocessManager) writeMetadataConfig(name string, meta *PluginMetadat
 	}
 	od.Set("cgo", cgo)
 
-	// Preserve any pre-existing config (e.g. from a previous install) after the
-	// metadata block.
-	if data, err := os.ReadFile(path); err == nil {
-		if existing, err := config.ParseOrderedJSON(data); err == nil {
-			for _, k := range existing.Keys() {
-				if od.Has(k) {
-					continue
-				}
-				if v, ok := existing.Get(k); ok {
-					od.Set(k, v)
-				}
-			}
-		}
-	}
 	out, err := json.MarshalIndent(od, "", "  ")
 	if err != nil {
-		logger.I18nWarn("writeMetadataConfig(%s): %v", name, err)
+		logger.I18nWarn("writeMetadataConfig(%s): %v", id, err)
 		return
 	}
 	if err := os.WriteFile(path, out, 0o644); err != nil {
-		logger.I18nWarn("writeMetadataConfig(%s): %v", name, err)
+		logger.I18nWarn("writeMetadataConfig(%s): %v", id, err)
 	}
 }
 
-// LoadConfig reads the plugin config from plugins_config/<name>/config.json.
-func (m *SubprocessManager) LoadConfig(name string) map[string]interface{} {
-	data, err := os.ReadFile(m.configPath(name))
+// readPluginMetadataFile reads the standalone metadata file
+// (plugins_config/<id>/metadata.json), returning nil when absent.
+func (m *SubprocessManager) readPluginMetadataFile(id string) map[string]interface{} {
+	data, err := os.ReadFile(m.metadataPath(id))
+	if err != nil {
+		return nil
+	}
+	var meta map[string]interface{}
+	if json.Unmarshal(data, &meta) != nil {
+		return nil
+	}
+	return meta
+}
+
+// stripMetadataKeys removes packaged-metadata keys from a loaded config map.
+// 旧版本安装会把元数据键混入 config.json；发现残留时一次性迁移：元数据写入
+// 独立 metadata 文件、config.json 重写为纯配置，让磁盘立即收敛。
+func (m *SubprocessManager) stripMetadataKeys(id string, cfg map[string]interface{}) map[string]interface{} {
+	if cfg == nil {
+		return cfg
+	}
+	removed := map[string]interface{}{}
+	for _, k := range metadataConfigKeys {
+		if v, ok := cfg[k]; ok {
+			removed[k] = v
+			delete(cfg, k)
+		}
+	}
+	if len(removed) == 0 {
+		return cfg
+	}
+	// 元数据迁移到独立文件（与既有内容合并，键值以本次为准）。
+	m.mergeMetadataFile(id, removed)
+	// 重写 config.json（不含元数据键）。
+	if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+		_ = os.WriteFile(m.configPath(id), data, 0o644)
+	}
+	return cfg
+}
+
+// mergeMetadataFile merges key-values into the standalone metadata file.
+func (m *SubprocessManager) mergeMetadataFile(id string, kv map[string]interface{}) {
+	if len(kv) == 0 {
+		return
+	}
+	path := m.metadataPath(id)
+	od := config.NewOrderedJSON()
+	if data, err := os.ReadFile(path); err == nil {
+		if existing, err := config.ParseOrderedJSON(data); err == nil {
+			od = existing
+		}
+	}
+	for k, v := range kv {
+		od.Set(k, v)
+	}
+	out, err := json.MarshalIndent(od, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, out, 0o644)
+}
+
+// LoadConfig reads the plugin config from plugins_config/<id>/config.json.
+// 打包元数据键（name/desc/version 等）会被剥离——config 文件只承载真实配置项。
+func (m *SubprocessManager) LoadConfig(id string) map[string]interface{} {
+	data, err := os.ReadFile(m.configPath(id))
 	if err != nil {
 		return map[string]interface{}{}
 	}
@@ -673,7 +762,7 @@ func (m *SubprocessManager) LoadConfig(name string) map[string]interface{} {
 	if json.Unmarshal(data, &cfg) != nil {
 		return map[string]interface{}{}
 	}
-	return cfg
+	return m.stripMetadataKeys(id, cfg)
 }
 
 // FlatSchema returns the plugin's config schema as a flat {key: {type,...}}
@@ -682,8 +771,29 @@ func (m *SubprocessManager) LoadConfig(name string) map[string]interface{} {
 // ConfigSchema) to the properties map, and recursively converts nested
 // "properties" into "items" (the shape the WebUI AstrBotConfig renders for
 // object groups), so both flat and grouped layouts work.
-func (m *SubprocessManager) FlatSchema(name string) map[string]interface{} {
-	schema := m.ConfigSchema(name)
+func (m *SubprocessManager) FlatSchema(id string) map[string]interface{} {
+	schema := m.ConfigSchema(id)
+	if props, ok := schema["properties"].(map[string]interface{}); ok {
+		schema = props
+	}
+	return normalizeSchema(schema)
+}
+
+// FlatSchemaByID returns the FlatSchema for a specific plugin instance,
+// reading the Register metadata of that exact instance (by id). Same-name
+// plugins must not shadow each other: e.g. a freshly installed Python plugin
+// with a versioned id (astrbot-plugin-xxx-4.11.2-<commit>) sharing the same
+// name as an older Go plugin — the WebUI config dialog for the Python one
+// would otherwise show the Go plugin's schema (fewer/no hints).
+func (m *SubprocessManager) FlatSchemaByID(id string) map[string]interface{} {
+	inst := m.Get(id)
+	if inst == nil || inst.Meta == nil || len(inst.Meta.ConfigSchemaJson) == 0 {
+		return map[string]interface{}{}
+	}
+	var schema map[string]interface{}
+	if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
+		return map[string]interface{}{}
+	}
 	if props, ok := schema["properties"].(map[string]interface{}); ok {
 		schema = props
 	}
@@ -731,51 +841,14 @@ var jsonSchemaToAstrBotType = map[string]string{
 	"array":   "list",
 }
 
-// LoadConfigWithDefaults returns the plugin config merged with its schema
-// defaults, so the WebUI config dialog shows every field (with defaults) even
-// before the user saves anything.
-func (m *SubprocessManager) LoadConfigWithDefaults(name string) map[string]interface{} {
-	cfg := m.LoadConfig(name)
+// SaveConfig persists the plugin config to plugins_config/<id>/config.json.
+// 防御性剥离元数据键：config 文件只允许真实配置项（防止旧路径把元数据写回）。
+func (m *SubprocessManager) SaveConfig(id string, cfg map[string]interface{}) error {
 	if cfg == nil {
 		cfg = map[string]interface{}{}
 	}
-	mergeSchemaDefaults(cfg, m.FlatSchema(name))
-	return cfg
-}
-
-// mergeSchemaDefaults fills cfg with each schema key's "default" value (and
-// recurses into object groups) when the key is absent.
-func mergeSchemaDefaults(cfg, schema map[string]interface{}) {
-	for key, metaAny := range schema {
-		meta, ok := metaAny.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if def, ok := meta["default"]; ok {
-			if _, exists := cfg[key]; !exists {
-				cfg[key] = def
-			}
-			continue
-		}
-		if itemsAny, ok := meta["items"].(map[string]interface{}); ok {
-			cur, _ := cfg[key].(map[string]interface{})
-			if cur == nil {
-				cur = map[string]interface{}{}
-			}
-			mergeSchemaDefaults(cur, itemsAny)
-			if len(cur) > 0 {
-				cfg[key] = cur
-			}
-		}
-	}
-}
-
-// SaveConfig persists the plugin config to plugins/<name>/config.json.
-func (m *SubprocessManager) SaveConfig(name string, cfg map[string]interface{}) error {
-	if cfg == nil {
-		cfg = map[string]interface{}{}
-	}
-	path := m.configPath(name)
+	cfg = m.stripMetadataKeys(id, cfg)
+	path := m.configPath(id)
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
@@ -791,6 +864,30 @@ func (m *SubprocessManager) pluginDataRoot(id string) string {
 	return filepath.Join(m.dataDir, "plugins_data", sanitizeID(id))
 }
 
+// migratePluginData moves a plugin's data directory from oldID to newID when
+// the latter does not exist yet. Used at install time: the source-derived id
+// (astrbot-plugin-xxx-4.11.2-<commit>) is replaced by the stable id
+// (<name>_<language>); migrating the data directory preserves the plugin's
+// runtime data across reinstalls (uninstall without clearing data).
+func (m *SubprocessManager) migratePluginData(oldID, newID string) {
+	if oldID == "" || oldID == newID {
+		return
+	}
+	oldDir := m.pluginDataRoot(oldID)
+	newDir := m.pluginDataRoot(newID)
+	if info, err := os.Stat(oldDir); err != nil || !info.IsDir() {
+		return
+	}
+	if _, err := os.Stat(newDir); err == nil {
+		return // 新目录已存在（可能是残留），不覆盖
+	}
+	if err := os.Rename(oldDir, newDir); err != nil {
+		logger.I18nWarn("插件数据目录迁移失败 %s → %s: %v", oldDir, newDir, err)
+		return
+	}
+	logger.I18nInfo("插件数据目录已迁移 %s → %s", oldDir, newDir)
+}
+
 // PluginDataDir returns the per-plugin data directory (data/plugins_data/<id>),
 // creating it if needed.
 func (m *SubprocessManager) PluginDataDir(id string) string {
@@ -799,10 +896,10 @@ func (m *SubprocessManager) PluginDataDir(id string) string {
 	return dir
 }
 
-// docsPath returns the per-plugin docs directory (plugins/<name>) where
-// README.md/CHANGELOG.md are cached at install time.
-func (m *SubprocessManager) docsPath(name string) string {
-	return filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
+// docsPath returns the per-plugin docs directory (plugins/<id>) where
+// README.md/CHANGELOG.md are cached at install time（与源码本体同目录）。
+func (m *SubprocessManager) docsPath(id string) string {
+	return filepath.Join(m.dataDir, "plugins", sanitizeID(id))
 }
 
 // Readme returns the plugin's README content, reading from the locally cached
@@ -810,31 +907,23 @@ func (m *SubprocessManager) docsPath(name string) string {
 // before caching was added) it falls back to fetching from the plugin's repo
 // URL. Returns an empty string when no README is available.
 func (m *SubprocessManager) Readme(id string) string {
-	name := m.resolveName(id)
-	if name == "" {
-		return ""
-	}
 	for _, file := range []string{"README.md", "readme.md"} {
-		if content := m.readCachedDoc(name, file); content != "" {
+		if content := m.readCachedDoc(id, file); content != "" {
 			return content
 		}
 	}
-	return m.fetchRepoDoc(name, []string{"README.md", "readme.md"})
+	return m.fetchRepoDoc(id, []string{"README.md", "readme.md"})
 }
 
 // Changelog returns the plugin's CHANGELOG content with the same cache-first,
 // repo-fallback semantics as Readme.
 func (m *SubprocessManager) Changelog(id string) string {
-	name := m.resolveName(id)
-	if name == "" {
-		return ""
-	}
 	for _, file := range []string{"CHANGELOG.md", "changelog.md"} {
-		if content := m.readCachedDoc(name, file); content != "" {
+		if content := m.readCachedDoc(id, file); content != "" {
 			return content
 		}
 	}
-	return m.fetchRepoDoc(name, []string{"CHANGELOG.md", "changelog.md"})
+	return m.fetchRepoDoc(id, []string{"CHANGELOG.md", "changelog.md"})
 }
 
 // resolveName maps a plugin id/name to the canonical plugin name (used for the
@@ -855,11 +944,11 @@ func (m *SubprocessManager) resolveName(id string) string {
 	return ""
 }
 
-// readCachedDoc reads a cached doc file from the plugin docs directory.
-// name 再次经 sanitizePluginName 归一化（拒绝 /、\、.、.. 等穿越字符），
-// 即使上游传入异常值也不会逃逸 data/plugins 目录。
-func (m *SubprocessManager) readCachedDoc(name, file string) string {
-	content, err := os.ReadFile(filepath.Join(m.docsPath(sanitizePluginName(name)), file))
+// readCachedDoc reads a cached doc file from the plugin docs directory
+// (plugins/<id>，与源码本体同目录). id 再次经 sanitizeID 归一化（拒绝 /、
+// \、.、.. 等穿越字符），即使上游传入异常值也不会逃逸 data/plugins 目录。
+func (m *SubprocessManager) readCachedDoc(id, file string) string {
+	content, err := os.ReadFile(filepath.Join(m.docsPath(id), file))
 	if err != nil {
 		return ""
 	}
@@ -875,7 +964,30 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 		return ""
 	}
 	rawURLs := rawRepoDocURLs(repo, candidates)
-	client := &http.Client{Timeout: 15 * time.Second}
+	// GitHub 加速前缀（config github_proxy，与市场拉取/插件 git clone 一致）；
+	// 未配置加速且网络不通时直连会拖住详情页 README 数十秒，因此：
+	// ① 每 URL 只给 5s；② 失败结果负面缓存（docFetchCache）避免每次打开
+	// 详情都重试。
+	if proxy := m.githubProxy; proxy != "" {
+		for i, u := range rawURLs {
+			if strings.HasPrefix(u, "https://raw.githubusercontent.com/") {
+				rawURLs[i] = strings.TrimRight(proxy, "/") + "/" + u
+			}
+		}
+	}
+	cacheKey := name + "|" + strings.Join(candidates, ",")
+	m.docMu.Lock()
+	if hit, ok := m.docFetchCache[cacheKey]; ok {
+		// 5 分钟 TTL 内的结果（成功或负面）直接复用；过期删除（重新拉取）。
+		if time.Since(hit.ts) < docFetchCacheTTL {
+			m.docMu.Unlock()
+			return hit.content
+		}
+		delete(m.docFetchCache, cacheKey)
+	}
+	m.docMu.Unlock()
+
+	client := &http.Client{Timeout: 5 * time.Second}
 	for _, rawURL := range rawURLs {
 		resp, err := client.Get(rawURL)
 		if err != nil {
@@ -884,9 +996,17 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 		content, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK && len(content) > 0 {
+			m.docMu.Lock()
+			m.docFetchCache[cacheKey] = docCacheEntry{content: string(content), ts: time.Now()}
+			m.docMu.Unlock()
 			return string(content)
 		}
 	}
+	// 负面缓存：本次未取到（网络不通/无 README）也记录（TTL 内不再重试），
+	// 前端立即得到"没有 README"而非长时间转圈。
+	m.docMu.Lock()
+	m.docFetchCache[cacheKey] = docCacheEntry{content: "", ts: time.Now()}
+	m.docMu.Unlock()
 	return ""
 }
 

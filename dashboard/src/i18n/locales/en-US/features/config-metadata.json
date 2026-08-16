@@ -1085,12 +1085,12 @@
         "hint": "Rotate when exceeding this size; default 20MB."
       },
       "pip_install_arg": {
-        "description": "Additional pip Installation Arguments",
-        "hint": "When installing plugin dependencies, Python's pip tool will be used. Additional arguments can be provided here, such as `--break-system-package`."
+        "description": "Extra pip install arguments",
+        "hint": "Extra arguments passed to pip when installing Python plugin dependencies, e.g. --break-system-packages"
       },
       "pypi_index_url": {
-        "description": "PyPI Repository URL",
-        "hint": "PyPI repository URL for installing Python dependencies. Defaults to [https://mirrors.aliyun.com/pypi/simple/](https://mirrors.aliyun.com/pypi/simple/)"
+        "description": "Python package index (PyPI) URL",
+        "hint": "PyPI index used when installing Python plugin dependencies. Default: https://mirrors.aliyun.com/pypi/simple/"
       },
       "callback_api_base": {
         "description": "Externally Accessible Callback API Address",

@@ -124,7 +124,8 @@
       "commands": "Команды / группы команд",
       "hooks": "Хуки",
       "functionTools": "Функциональные инструменты",
-      "eventListeners": "Слушатели событий"
+      "eventListeners": "Слушатели событий",
+      "sleep": "Политика сна"
     },
     "info": {
       "title": "Информация",
@@ -137,6 +138,10 @@
       "supportPlatforms": "Поддерживаемые платформы",
       "authorWebsite": "Сайт автора",
       "repository": "Репозиторий"
+    },
+    "sleep": {
+      "globalLabel": "Глобальный авто-сон при простое",
+      "pluginLabel": "Разрешить этому плагину засыпать при простое"
     }
   },
   "market": {
@@ -162,6 +167,7 @@
     "sourceName": "Имя",
     "sourceUrl": "Исходный URL",
     "defaultSource": "Источник по умолчанию",
+    "defaultSourceHint": "Встроенный рынок (по умолчанию)",
     "removeSource": "Удалить источник",
     "confirmRemoveSource": "Вы уверены, что хотите удалить этот источник плагинов?",
     "sourceAdded": "Источник успешно добавлен",

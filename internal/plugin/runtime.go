@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
@@ -66,13 +69,33 @@ type PluginInstance struct {
 	// Meta is the plugin's Register() metadata (handlers + config schema).
 	Meta *sdkv1.RegisterResponse
 
-	mu       sync.Mutex
-	raw      *goplugin.Client // go-plugin process client
-	stopped  bool             // set before intentional kill (suppresses restart)
-	restarts int              // consecutive crash-restart count for this instance
+	// toolsMu 保护 toolsCache/toolsLoaded：LLM 函数工具的"实时快照"。
+	// 插件工具在实例化阶段（Context.add_llm_tools）注册，晚于 Register 的
+	// Meta.Tools 快照——宿主经 ListTools RPC 拉取最新列表并缓存（插件
+	// reload 后新实例缓存为空，重新拉取）。
+	toolsMu     sync.Mutex
+	toolsCache  []*sdkv1.ToolDesc
+	toolsLoaded bool
+
+	mu  sync.Mutex
+	raw *goplugin.Client // go-plugin process client
+	// pgid 是插件子进程的进程组 id（Setpgid 后 = 直接子进程 pid）。>0 时
+	// teardown/失败路径按组回收整棵进程树（含 Python 桥再拉起的子进程），
+	// 防宿主退出后插件孤儿化；0 = 未记录（如 exec 未成功启动）。
+	pgid     int
+	stopped  bool // set before intentional kill (suppresses restart)
+	restarts int  // consecutive crash-restart count for this instance
 	// lastRestartAt 记录上一次崩溃重启的时间，用于 restart 预算的基于时间衰减。
 	lastRestartAt time.Time
 	failed        error // set when the plugin is marked failed
+
+	// lastActiveNano 是插件最后一次被调用（命令/过滤器/钩子/工具 RPC）的
+	// UnixNano 时间戳，供闲置自动卸载（idle unload）判定使用。
+	lastActiveNano atomic.Int64
+
+	// owner 是插件所属的 SubprocessManager（RefreshTools 成功后回写工具
+	// 注册表用；由 startInstance 赋值）。
+	owner *SubprocessManager
 }
 
 // SubprocessManager manages plugins running as isolated child processes
@@ -95,6 +118,8 @@ type SubprocessManager struct {
 	toolchain *toolchain.Toolchain
 	compiler  *Compiler
 	dataDir   string
+	// logLevels 是 per-plugin 日志级别覆盖存储（data/plugin_log_levels.json）。
+	logLevels *logLevels
 	ctx       context.Context
 	cancel    context.CancelFunc
 	// gen 是"实例表代际"标记：Shutdown 换新表时自增。restart 在 startInstance
@@ -104,9 +129,28 @@ type SubprocessManager struct {
 	// BindSource/ReinstallSource/Uninstall），防止并发修改丢条目。与 m.mu 职责
 	// 分离：m.mu 保护内存 map，manifestMu 保护磁盘文件的一致性。
 	manifestMu sync.Mutex
+	// docMu 保护 docFetchCache（README/CHANGELOG 的远程拉取结果缓存，
+	// 成功与失败（负面）都记录，TTL docFetchCacheTTL，避免 GitHub 不通时
+	// 每次打开详情页都重试，同时不永久阻挡后续（配置加速后）的重新拉取）。
+	docMu         sync.Mutex
+	docFetchCache map[string]docCacheEntry
+
 	// githubProxy 是插件 git clone 的 GitHub 加速地址（如 https://ghfast.top/），
 	// 配置后克隆 https://github.com/... 仓库时在 URL 前加该前缀。
 	githubProxy string
+
+	// pipIndex / pipArgs 是 Python 插件依赖安装的 PyPI 镜像与额外 pip 参数
+	//（config pypi_index_url / pip_install_arg）。pipIndex 空时回退
+	// pysdk.PyPIIndex()（env/默认镜像）。
+	pipIndex string
+	pipArgs  []string
+
+	// toolRegMu 保护 toolRegistry：LLM 工具名 → 所属插件 id + 工具描述。
+	// 插件闲置休眠（UnloadIdle）时实例被移出 instances 表，但其工具仍留在
+	// 注册表——LLM 调用该工具时宿主按名查注册表并 EnsureLoaded 唤醒插件；
+	// 仅真实卸载/禁用（unloadLocked notify=true）时清除该插件的条目。
+	toolRegMu    sync.RWMutex
+	toolRegistry map[string]toolRegEntry
 
 	// pythonEnv 是 Python 插件子进程环境（解释器 + SDK 目录），首次启动
 	// Python 插件时惰性解析（可能创建 venv 安装依赖）。nil 表示尚未解析。
@@ -133,6 +177,148 @@ type SubprocessManager struct {
 	// range) cannot interfere with the test subprocess handshake.
 	MinPort int
 	MaxPort int
+
+	// idleUnload 是闲置自动卸载阈值（0 = 关闭）。启用后，超过该时长没有
+	// 任何 RPC 活动的插件进程会被自动卸载（OS 回收内存），下次被触发时
+	// 懒加载唤醒。嵌入式/低内存设备的"进程池"语义：进程按需创建、闲置回收。
+	idleUnload   time.Duration
+	scanInterval time.Duration // idle 清扫间隔（默认 1 分钟；测试可注入）
+
+	// hostCapabilities 是宿主向 Python 插件公开的能力集合（平台适配器 ID +
+	// 固定能力 llm/send_message/recall_message/react/t2i/config/web），经
+	// ASTRBOT_HOST_CAPABILITIES 环境变量注入 Python 插件子进程（插件侧
+	// HostBridge.has() 查询）。由宿主生命周期在启动与重载平台后设置。
+	hostCapabilities []string
+}
+
+// Touch marks the plugin as active (called before/after every RPC into the
+// plugin). 供闲置卸载判定使用。
+func (inst *PluginInstance) Touch() {
+	inst.lastActiveNano.Store(time.Now().UnixNano())
+}
+
+// LastActive returns the last activity time (zero if never touched).
+func (inst *PluginInstance) LastActive() time.Time {
+	return time.Unix(0, inst.lastActiveNano.Load())
+}
+
+// IsIdle reports whether the plugin has been inactive for longer than idle.
+func (inst *PluginInstance) IsIdle(now time.Time, idle time.Duration) bool {
+	last := inst.LastActive()
+	return !last.IsZero() && now.Sub(last) > idle
+}
+
+// RefreshTools 经 ListTools RPC 拉取插件当前的 LLM 函数工具列表并缓存。
+// 插件工具在实例化阶段注册（Context.add_llm_tools），晚于 Register 的
+// Meta.Tools 快照——宿主在首次 collectPluginTools 时调用本方法刷新。
+// RPC 失败时保留旧缓存（nil 则回退 Meta.Tools）。成功后同步更新管理器的
+// 工具注册表（工具名 → 插件），供休眠插件按名唤醒分发。
+func (inst *PluginInstance) RefreshTools(ctx context.Context) {
+	if inst.Client == nil {
+		return
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	tools, err := inst.Client.ListTools(rpcCtx)
+	cancel()
+	if err != nil {
+		logger.I18nWarn("插件 %s ListTools 失败: %v", inst.ID, err)
+		return
+	}
+	inst.toolsMu.Lock()
+	inst.toolsCache = tools
+	inst.toolsLoaded = true
+	inst.toolsMu.Unlock()
+	if m := inst.owner; m != nil {
+		m.setPluginTools(inst.ID, tools)
+	}
+}
+
+// ToolsSnapshot 返回插件当前的 LLM 工具列表：优先使用 ListTools 缓存
+// （RefreshTools 拉取）；未拉取过则回退 Register 元数据快照（Meta.Tools）。
+// 返回的切片不可修改。
+func (inst *PluginInstance) ToolsSnapshot() []*sdkv1.ToolDesc {
+	inst.toolsMu.Lock()
+	defer inst.toolsMu.Unlock()
+	if inst.toolsLoaded && inst.toolsCache != nil {
+		return inst.toolsCache
+	}
+	if inst.Meta != nil {
+		return inst.Meta.Tools
+	}
+	return nil
+}
+
+// docFetchCacheTTL 是远程文档拉取结果（含负面）的缓存时长。
+const docFetchCacheTTL = 5 * time.Minute
+
+// toolRegEntry 是工具注册表条目：工具名 → 所属插件 + 最新描述。
+type toolRegEntry struct {
+	PluginID string
+	Desc     *sdkv1.ToolDesc
+}
+
+// setPluginTools 用插件的最新工具列表整体替换该插件在注册表中的条目
+//（RefreshTools 成功后调用；同一插件旧工具名被清除）。
+func (m *SubprocessManager) setPluginTools(id string, tools []*sdkv1.ToolDesc) {
+	m.toolRegMu.Lock()
+	defer m.toolRegMu.Unlock()
+	if m.toolRegistry == nil {
+		m.toolRegistry = make(map[string]toolRegEntry)
+	}
+	// 先清掉该插件旧条目（工具可能被插件动态增删）
+	for name, e := range m.toolRegistry {
+		if e.PluginID == id {
+			delete(m.toolRegistry, name)
+		}
+	}
+	for _, t := range tools {
+		if t == nil || t.Name == "" {
+			continue
+		}
+		m.toolRegistry[t.Name] = toolRegEntry{PluginID: id, Desc: t}
+	}
+}
+
+// removePluginTools 清除某插件的全部注册表条目（真实卸载/禁用时调用；
+// 闲置休眠保留，保证工具调用能按名唤醒）。
+func (m *SubprocessManager) removePluginTools(id string) {
+	m.toolRegMu.Lock()
+	defer m.toolRegMu.Unlock()
+	for name, e := range m.toolRegistry {
+		if e.PluginID == id {
+			delete(m.toolRegistry, name)
+		}
+	}
+}
+
+// ToolOwner 返回注册了工具 name 的插件 id（running 或休眠中），未注册返回
+// ("", false)。
+func (m *SubprocessManager) ToolOwner(name string) (string, bool) {
+	m.toolRegMu.RLock()
+	defer m.toolRegMu.RUnlock()
+	e, ok := m.toolRegistry[name]
+	if !ok {
+		return "", false
+	}
+	return e.PluginID, true
+}
+
+// AllPluginTools 返回全部已注册插件工具（含休眠插件；running 插件的条目
+// 由 RefreshTools 保持最新）。供 collectPluginTools 注入 LLM 工具列表。
+func (m *SubprocessManager) AllPluginTools() []toolRegEntry {
+	m.toolRegMu.RLock()
+	defer m.toolRegMu.RUnlock()
+	out := make([]toolRegEntry, 0, len(m.toolRegistry))
+	for _, e := range m.toolRegistry {
+		out = append(out, e)
+	}
+	return out
+}
+
+// docCacheEntry 是一次远程文档拉取的结果（成功为内容，失败为空串）。
+type docCacheEntry struct {
+	content string
+	ts      time.Time
 }
 
 // NewSubprocessManager creates the subprocess plugin manager.
@@ -141,6 +327,9 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 	return &SubprocessManager{
 		instances:        make(map[string]*PluginInstance),
 		failures:         make(map[string]error),
+		docFetchCache:    make(map[string]docCacheEntry),
+		toolRegistry:     make(map[string]toolRegEntry),
+		logLevels:        newLogLevels(dataDir),
 		toolchain:        tc,
 		compiler:         NewCompiler(tc),
 		dataDir:          dataDir,
@@ -166,6 +355,36 @@ func (m *SubprocessManager) lockOp(id string) func() {
 // SetGitHubProxy 设置插件 git clone 的 GitHub 加速地址（config github_proxy）。
 func (m *SubprocessManager) SetGitHubProxy(url string) {
 	m.githubProxy = url
+}
+
+// SetPipConfig 注入 Python 插件依赖安装的 PyPI 镜像（pypi_index_url）与
+// 额外 pip 参数（pip_install_arg）。空 index 回退 pysdk.PyPIIndex()（env/
+// 默认镜像）；args 按空白拆分为多个参数。
+func (m *SubprocessManager) SetPipConfig(indexURL, extraArgs string) {
+	m.pipIndex = strings.TrimSpace(indexURL)
+	if t := strings.TrimSpace(extraArgs); t != "" {
+		m.pipArgs = strings.Fields(t)
+	} else {
+		m.pipArgs = nil
+	}
+}
+
+// SetHostCapabilities 设置宿主向 Python 插件公开的能力集合（平台适配器 ID
+// + 固定能力）。传入的能力在 Python 插件子进程启动时经
+// ASTRBOT_HOST_CAPABILITIES 环境变量注入，插件侧用 HostBridge.has() 查询。
+// 启动与平台重载后由宿主调用；对已运行中的插件进程，能力在其下次重启
+// （reload/崩溃重启/闲置唤醒）时生效。
+func (m *SubprocessManager) SetHostCapabilities(caps []string) {
+	m.mu.Lock()
+	m.hostCapabilities = append([]string(nil), caps...)
+	m.mu.Unlock()
+}
+
+// hostCapabilitiesSnapshot 返回当前宿主能力集合的副本（空 slice = 未设置）。
+func (m *SubprocessManager) hostCapabilitiesSnapshot() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]string(nil), m.hostCapabilities...)
 }
 
 // SetGoConfig 注入插件编译的 Go 包仓库地址（goproxy）与额外构建参数（goflags），
@@ -290,7 +509,22 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if err != nil {
 		return nil, err
 	}
-	if ResolveLanguage(srcDir) == "python" {
+	lang := ResolveLanguage(srcDir)
+
+	// 稳定 id：插件名 + language（PluginIDFromMeta）。来源推导 id（带版本/
+	// commit，如 astrbot-plugin-xxx-4.11.2-<commit>）在更新后变化，导致重装
+	// （不勾清除配置/数据）时数据目录变成全新的。稳定 id 让重装后配置
+	// （按 name）与数据目录（按 id）都能保留。
+	if stableID := PluginIDFromMeta(meta, lang); stableID != "" && stableID != id {
+		if m.Get(stableID) != nil {
+			return nil, fmt.Errorf("plugin %s already installed (reload or uninstall first)", stableID)
+		}
+		// 旧来源 id 的数据目录迁移到稳定 id：重装已装插件时保留运行时数据。
+		m.migratePluginData(id, stableID)
+		id = stableID
+	}
+
+	if lang == "python" {
 		return m.installPythonSource(ctx, id, srcDir, source, meta, opts)
 	}
 	if err := ensureMainGo(srcDir); err != nil {
@@ -321,10 +555,20 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if opts.Stage != nil {
 		opts.Stage("准备编译插件…")
 	}
-	if err := m.compiler.Prepare(srcDir, goModuleNameOf(srcDir, meta)); err != nil {
+	// 插件本体（源码树）持久化到 data/plugins/<id>：与 Python 插件同布局
+	// （本体/文档/logo 统一位置，按 id = name_language 隔离），后续编译与
+	// 文档缓存都从这里取。
+	srcDest := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
+	if err := os.RemoveAll(srcDest); err != nil {
+		return nil, err
+	}
+	if err := copyDir(srcDir, srcDest); err != nil {
+		return nil, fmt.Errorf("拷贝插件源码: %w", err)
+	}
+	if err := m.compiler.Prepare(srcDest, goModuleNameOf(srcDest, meta)); err != nil {
 		return nil, fmt.Errorf("prepare module: %w", err)
 	}
-	if err := m.compiler.Vet(ctx, srcDir); err != nil {
+	if err := m.compiler.Vet(ctx, srcDest); err != nil {
 		return nil, fmt.Errorf("go vet: %w", err)
 	}
 
@@ -345,7 +589,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 			opts.Stage(line)
 		}
 	}
-	if err := m.compiler.BuildWithProgressOut(ctx, srcDir, artifact, opts.Progress, cc, cxx, lineCb); err != nil {
+	if err := m.compiler.BuildWithProgressOut(ctx, srcDest, artifact, opts.Progress, cc, cxx, lineCb); err != nil {
 		return nil, fmt.Errorf("build plugin %s: %w", id, err)
 	}
 
@@ -377,13 +621,13 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if err := m.recordInstall(inst, source, artifact, opts); err != nil {
 		logger.I18nWarn("插件 %s 已安装但 manifest 持久化失败: %v", id, err)
 	}
-	m.cachePluginDocs(inst.Name, srcDir, meta)
-	m.writeMetadataConfig(inst.Name, meta)
+	m.cachePluginDocs(inst.ID, srcDest, meta)
+	m.writeMetadataConfig(inst.ID, meta)
 	return inst, nil
 }
 
 // installPythonSource installs a Python plugin: copies the source tree into
-// data/plugins-src/<id> (the "binary" the runtime launches), optionally
+// data/plugins/<id> (the "binary" the runtime launches), optionally
 // installs requirements.txt into the Python venv, then loads it.
 func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir, source string, meta *PluginMetadata, opts InstallOptions) (*PluginInstance, error) {
 	if err := ensurePythonEntry(srcDir); err != nil {
@@ -392,7 +636,7 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	if opts.Stage != nil {
 		opts.Stage("准备 Python 插件…")
 	}
-	dest := filepath.Join(m.dataDir, "plugins-src", sanitizeID(id))
+	dest := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
 	if err := os.RemoveAll(dest); err != nil {
 		return nil, err
 	}
@@ -437,8 +681,8 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	if err := m.recordInstall(inst, source, dest, opts); err != nil {
 		logger.I18nWarn("插件 %s 已安装但 manifest 持久化失败: %v", id, err)
 	}
-	m.cachePluginDocs(inst.Name, srcDir, meta)
-	m.writeMetadataConfig(inst.Name, meta)
+	m.cachePluginDocs(inst.ID, srcDir, meta)
+	m.writeMetadataConfig(inst.ID, meta)
 	return inst, nil
 }
 
@@ -453,7 +697,16 @@ func (m *SubprocessManager) pipInstall(env *pysdk.RuntimeEnv, pluginDir, req str
 	if abs, err := filepath.Abs(pluginDir); err == nil {
 		pluginDir = abs
 	}
-	args := []string{"-m", "pip", "install", "--disable-pip-version-check", "-q", "-r", req, "-i", pysdk.PyPIIndex()}
+	args := []string{"-m", "pip", "install", "--disable-pip-version-check", "-q", "-r", req}
+	// config pip_install_arg（额外参数）→ 追加；config pypi_index_url 或默认镜像。
+	if len(m.pipArgs) > 0 {
+		args = append(args, m.pipArgs...)
+	}
+	index := m.pipIndex
+	if index == "" {
+		index = pysdk.PyPIIndex()
+	}
+	args = append(args, "-i", index)
 	cmd := exec.Command(env.PythonBin, args...)
 	cmd.Dir = pluginDir
 	out, err := cmd.CombinedOutput()
@@ -476,11 +729,11 @@ func ensurePythonEntry(srcDir string) error {
 }
 
 // cachePluginDocs copies the plugin's README.md, CHANGELOG.md and logo image
-// from the fetched source into its config/data directory so the WebUI
-// readme/changelog endpoints and the plugin logo endpoint can serve them
-// without re-fetching (mirrors Python's plugin_dir/README.md lookup).
-func (m *SubprocessManager) cachePluginDocs(name, srcDir string, meta *PluginMetadata) {
-	dir := filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
+// from the fetched source into its 本体目录（data/plugins/<id>，与源码同目录）
+// so the WebUI readme/changelog endpoints and the plugin logo endpoint can
+// serve them (mirrors Python's plugin_dir/README.md lookup).
+func (m *SubprocessManager) cachePluginDocs(id, srcDir string, meta *PluginMetadata) {
+	dir := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
 	_ = os.MkdirAll(dir, 0o755)
 	for _, src := range []string{"README.md", "readme.md", "CHANGELOG.md", "changelog.md"} {
 		content, err := os.ReadFile(filepath.Join(srcDir, src))
@@ -489,7 +742,7 @@ func (m *SubprocessManager) cachePluginDocs(name, srcDir string, meta *PluginMet
 		}
 		dst := filepath.Join(dir, src)
 		if err := os.WriteFile(dst, content, 0o644); err != nil {
-			logger.I18nWarn("缓存插件 %s 的文档 %s 失败: %v", name, src, err)
+			logger.I18nWarn("缓存插件 %s 的文档 %s 失败: %v", id, src, err)
 		}
 	}
 	// Logo：metadata 声明的 logo_path 优先，其次根目录常见文件名
@@ -512,17 +765,17 @@ func (m *SubprocessManager) cachePluginDocs(name, srcDir string, meta *PluginMet
 		}
 		base := filepath.Base(rel)
 		if err := os.WriteFile(filepath.Join(dir, base), content, 0o644); err != nil {
-			logger.I18nWarn("缓存插件 %s 的 Logo %s 失败: %v", name, rel, err)
+			logger.I18nWarn("缓存插件 %s 的 Logo %s 失败: %v", id, rel, err)
 			continue
 		}
 		break
 	}
 }
 
-// PluginLogoFile returns the cached logo file path for a plugin name ("" when
+// PluginLogoFile returns the cached logo file path for a plugin id ("" when
 // the plugin has no cached logo). The dashboard logo endpoint uses it.
-func (m *SubprocessManager) PluginLogoFile(name string) string {
-	dir := filepath.Join(m.dataDir, "plugins", sanitizePluginName(name))
+func (m *SubprocessManager) PluginLogoFile(id string) string {
+	dir := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
 	for _, n := range []string{"logo.png", "logo.jpg", "logo.jpeg", "logo.gif", "icon.png"} {
 		p := filepath.Join(dir, n)
 		if info, err := os.Stat(p); err == nil && !info.IsDir() {
@@ -557,10 +810,12 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		MarketPluginID: opts.MarketPluginID,
 		Repo:           opts.Repo,
 		DownloadURL:    opts.DownloadURL,
-		// 记录插件在 data 下创建的目录，供卸载时精确清理。
-		ConfigDir: filepath.Join("plugins_config", sanitizePluginName(inst.Name)),
+		// 记录插件在 data 下创建的目录，供卸载时精确清理。目录一律按插件
+		// 实例 id（name_language）分键：同名 Go/Python 插件的本体（plugins/）、
+		// 配置（plugins_config/）、数据（plugins_data/）完全隔离。
+		ConfigDir: filepath.Join("plugins_config", sanitizeID(inst.ID)),
 		DataDir:   filepath.Join("plugins_data", sanitizeID(inst.ID)),
-		DocsDir:   filepath.Join("plugins", sanitizePluginName(inst.Name)),
+		DocsDir:   filepath.Join("plugins", sanitizeID(inst.ID)),
 	})
 	return man.Save(m.manifestPath())
 }
@@ -608,7 +863,7 @@ func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language
 	}
 	// 落盘 config schema 缓存，供插件禁用后仍能渲染配置对话框。
 	if inst.Meta != nil {
-		m.cacheConfigSchema(inst.Name, inst.Meta)
+		m.cacheConfigSchema(inst.ID, inst.Meta)
 	}
 
 	m.mu.Lock()
@@ -674,12 +929,24 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 func (m *SubprocessManager) Unload(id string) error {
 	unlock := m.lockOp(id)
 	defer unlock()
-	return m.unloadLocked(id)
+	return m.unloadLocked(id, true)
 }
 
-// unloadLocked is Unload's body; the caller must hold the per-plugin lifecycle
-// lock for id (m.lockOp).
-func (m *SubprocessManager) unloadLocked(id string) error {
+// UnloadIdle stops an idle-sleeping plugin process but KEEPS its star-pipeline
+// handlers registered: the handlers lazily re-load the plugin on the next
+// triggered call (resolveActive → EnsureLoaded), so a sleeping plugin always
+// wakes up. 手动卸载/禁用走 Unload（notifyChanged 移除 handler）。
+func (m *SubprocessManager) UnloadIdle(id string) error {
+	unlock := m.lockOp(id)
+	defer unlock()
+	return m.unloadLocked(id, false)
+}
+
+// unloadLocked is Unload/UnloadIdle's body; the caller must hold the
+// per-plugin lifecycle lock for id (m.lockOp). notify=true fires
+// OnInstancesChanged so the host re-bridges (removes) the handlers; false
+// keeps them for lazy reload.
+func (m *SubprocessManager) unloadLocked(id string, notify bool) error {
 	m.mu.Lock()
 	inst, ok := m.instances[id]
 	if !ok {
@@ -697,8 +964,14 @@ func (m *SubprocessManager) unloadLocked(id string) error {
 	inst.stopped = true
 	inst.mu.Unlock()
 	m.teardownInstance(inst)
-	logger.I18nInfo("插件 %s 已卸载", id)
-	m.notifyChanged()
+	if notify {
+		// 真实卸载/禁用：工具注册表条目一并清除（休眠则保留，供按名唤醒）。
+		m.removePluginTools(id)
+		logger.I18nInfo("插件 %s 已卸载", id)
+		m.notifyChanged()
+	} else {
+		logger.I18nInfo("插件 %s 已休眠（闲置卸载，触发时自动唤醒）", id)
+	}
 	return nil
 }
 
@@ -707,6 +980,161 @@ func (m *SubprocessManager) Get(id string) *PluginInstance {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.instances[id]
+}
+
+// SetIdleUnload enables the idle-unload sweep: plugin processes with no RPC
+// activity for longer than idle are unloaded so the OS reclaims their memory
+// (lazy reload happens on the next triggered call via EnsureLoaded).
+// idle <= 0 disables the sweep. Cross-platform: works with any plugin process
+// (Go binary / Python interpreter) since it only manages process lifecycles.
+func (m *SubprocessManager) SetIdleUnload(idle time.Duration) {
+	m.mu.Lock()
+	prev := m.idleUnload
+	m.idleUnload = idle
+	start := prev <= 0 && idle > 0
+	m.mu.Unlock()
+	if start {
+		go m.idleSweepLoop()
+		logger.I18nInfo("插件闲置自动卸载已启用（闲置 %v 后回收进程内存）", idle)
+	}
+}
+
+// IdleUnloadEnabled reports whether the idle-unload sweep is enabled (global
+// switch), consumed by the WebUI behavior page.
+func (m *SubprocessManager) IdleUnloadEnabled() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.idleUnload > 0
+}
+
+// IdleUnloadMinutes returns the configured idle threshold in minutes (0 =
+// disabled), consumed by the WebUI behavior page.
+func (m *SubprocessManager) IdleUnloadMinutes() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return int(m.idleUnload / time.Minute)
+}
+
+// SetIdleUnloadBlocked marks a plugin as exempt from the idle sweep (blocked =
+// true keeps it resident; false re-allows idle sleep). Persisted in the
+// manifest so the setting survives restarts.
+func (m *SubprocessManager) SetIdleUnloadBlocked(id string, blocked bool) error {
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return err
+	}
+	e := man.Get(id)
+	if e == nil {
+		return fmt.Errorf("插件 %s 未安装", id)
+	}
+	e.IdleUnloadBlocked = blocked
+	if err := man.Save(m.manifestPath()); err != nil {
+		return err
+	}
+	if blocked {
+		logger.I18nInfo("插件 %s 已设置为常驻（不参与闲置自动休眠）", id)
+	} else {
+		logger.I18nInfo("插件 %s 已允许闲置自动休眠", id)
+	}
+	return nil
+}
+
+// IdleUnloadBlocked reports whether the plugin is exempt from the idle sweep.
+func (m *SubprocessManager) IdleUnloadBlocked(id string) bool {
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return false
+	}
+	if e := man.Get(id); e != nil {
+		return e.IdleUnloadBlocked
+	}
+	return false
+}
+
+// idleSweepLoop periodically unloads idle plugin processes.
+func (m *SubprocessManager) idleSweepLoop() {
+	interval := m.scanInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.sweepIdlePlugins()
+		}
+	}
+}
+
+// SweepIdle immediately runs the idle-unload sweep once (also invoked by the
+// background loop). Exported for tests and dashboard-triggered sweeps.
+func (m *SubprocessManager) SweepIdle() {
+	m.sweepIdlePlugins()
+}
+
+// sweepIdlePlugins unloads every loaded plugin that has been idle longer than
+// the configured threshold. Unload marks the instance stopped (no crash
+// restart) and triggers OnInstancesChanged so the host re-bridges handlers.
+func (m *SubprocessManager) sweepIdlePlugins() {
+	m.mu.RLock()
+	idle := m.idleUnload
+	insts := make([]*PluginInstance, 0, len(m.instances))
+	for _, inst := range m.instances {
+		insts = append(insts, inst)
+	}
+	m.mu.RUnlock()
+	if idle <= 0 {
+		return
+	}
+	now := time.Now()
+	for _, inst := range insts {
+		if m.IdleUnloadBlocked(inst.ID) {
+			continue // 常驻插件（WebUI 行为页勾选"不允许休眠"）不参与清扫
+		}
+		if inst.IsIdle(now, idle) {
+			logger.I18nInfo("插件 %s 已闲置 %v，自动休眠（内存已回收，下次触发时自动唤醒）",
+				inst.ID, now.Sub(inst.LastActive()).Round(time.Second))
+			if err := m.UnloadIdle(inst.ID); err != nil && err.Error() != fmt.Sprintf("plugin %s not loaded", inst.ID) {
+				logger.I18nWarn("闲置休眠插件 %s 失败: %v", inst.ID, err)
+			}
+		}
+	}
+}
+
+// EnsureLoaded returns the running instance for id, lazily re-loading it from
+// the manifest when it was previously unloaded (idle sweep or manual unload).
+// This is the lazy-load half of the process-pool lifecycle: a triggered plugin
+// that is not running is brought back on demand. On success it fires
+// OnInstancesChanged so the host re-bridges the handlers.
+func (m *SubprocessManager) EnsureLoaded(ctx context.Context, id string) (*PluginInstance, error) {
+	if inst := m.Get(id); inst != nil {
+		return inst, nil
+	}
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return nil, fmt.Errorf("读取插件清单: %w", err)
+	}
+	e := man.Get(id)
+	if e == nil || !e.Enabled {
+		return nil, fmt.Errorf("插件 %s 未安装或已被禁用", id)
+	}
+	lang := e.Language
+	if lang == "" {
+		lang = "go"
+	}
+	inst, err := m.LoadLang(ctx, id, e.Binary, lang)
+	if err != nil {
+		return nil, fmt.Errorf("唤醒插件 %s: %w", id, err)
+	}
+	// 注意：不触发 OnInstancesChanged——闲置休眠保留着 star handler，
+	// 调用方（resolveActive）直接用返回的新实例 RPC，handler 无需重建；
+	// 避免在 handler 执行中并发重建 handler 表。
+	return inst, nil
 }
 
 // List returns all running plugin instances.
@@ -756,6 +1184,9 @@ func (m *SubprocessManager) Shutdown() {
 	// 新实例并 teardown，避免实例落入无人回收的新表。
 	m.gen++
 	m.mu.Unlock()
+	m.toolRegMu.Lock()
+	m.toolRegistry = make(map[string]toolRegEntry)
+	m.toolRegMu.Unlock()
 
 	for _, inst := range insts {
 		inst.mu.Lock()
@@ -779,6 +1210,57 @@ func (m *SubprocessManager) SetAutoRestart(enabled bool) {
 // source tree) and performs the handshake + first Register call. On any
 // failure the process is killed and resources released.
 // It holds startInstanceMu for its whole lifetime so the SDK-side process-global
+// go-plugin 握手端口全局分配器：为每个插件实例分配独占单端口。
+// 背景：go-plugin 默认端口范围（10000-25000）下多个插件进程会尝试绑定同一
+// 起始端口，而 gRPC 的 SO_REUSEPORT 允许双绑 → 宿主连接可能被内核路由到
+// 错误的插件进程（Register 元数据串台，如 box 返回 meme_manager）。分配器
+// 必须是进程级全局（不能 per-manager），否则并发实例/测试管理器会重复分配。
+var (
+	globalPortMu   sync.Mutex
+	globalPortUsed = map[int]struct{}{}
+)
+
+// allocPluginPort 分配一个全局唯一的握手端口（min=max=单端口），从 base
+// 起向上扫描第一个未使用端口。base<=0 时用 go-plugin 默认起始值 10000。
+// 除进程内已分配记录外，还会检测端口当前是否被监听（孤儿插件进程、其他
+// 服务的残留监听），占用则跳过——否则 SO_REUSEPORT 双绑会让宿主连接被
+// 内核路由到错误的进程（Register 元数据串台）。
+func allocPluginPort(base int) (uint, uint) {
+	globalPortMu.Lock()
+	defer globalPortMu.Unlock()
+	if base <= 0 {
+		base = 10000
+	}
+	p := base
+	for {
+		if _, used := globalPortUsed[p]; !used && !portInUse(p) {
+			globalPortUsed[p] = struct{}{}
+			return uint(p), uint(p)
+		}
+		p++
+	}
+}
+
+// portInUse 探测 127.0.0.1:p 是否已被监听（绑定成功=空闲；失败=被占）。
+func portInUse(p int) bool {
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+	if err != nil {
+		return true
+	}
+	_ = l.Close()
+	return false
+}
+
+// allocPortRange 从配置的 MinPort 起分配（测试/显式端口范围场景）。
+func (m *SubprocessManager) allocPortRange() (uint, uint) {
+	return allocPluginPort(m.MinPort)
+}
+
+// allocPortRangeDefault 从默认起始端口（10000）起分配（生产默认）。
+func (m *SubprocessManager) allocPortRangeDefault() (uint, uint) {
+	return allocPluginPort(0)
+}
+
 // hostPluginID cannot be clobbered by a concurrently loading plugin.
 func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, language string) (*PluginInstance, error) {
 	startInstanceMu.Lock()
@@ -808,12 +1290,26 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 		cmd := exec.Command(env.PythonBin, "-m", "astrbot._bridge.server", abs)
 		cmd.Dir = pluginDataRoot
 		cmd.Env = env.Env(abs, m.dataDir)
-		return m.dispensePlugin(ctx, id, abs, language, cmd)
+		// 宿主能力注入：Python 插件经 HostBridge.has() 查询宿主公开了哪些
+		// 平台/能力（ASTRBOT_HOST_CAPABILITIES）。未设置能力（空集）时不注入
+		// 变量，插件侧容错为空集。
+		if caps := m.hostCapabilitiesSnapshot(); len(caps) > 0 {
+			cmd.Env = append(cmd.Env, "ASTRBOT_HOST_CAPABILITIES="+strings.Join(caps, ","))
+		}
+		// per-plugin 日志级别：Python 桥启动时经 ASTRBOT_PLUGIN_LOG_LEVEL
+		// 设置 root logger 过滤级别（对齐 Python effective = 覆盖 || 全局）。
+		if lvl := m.logLevels.EffectivePluginLogLevel(id); lvl != "" {
+			cmd.Env = append(cmd.Env, "ASTRBOT_PLUGIN_LOG_LEVEL="+lvl)
+		}
+		// Python 插件的 stderr 走 [ASTRBOT] 协议解析器（go-plugin 逐行转发
+		// 到 cfg.Stderr）：启动失败时能把 go-plugin 笼统的握手错误提升为
+		// phase 化的清晰错误。Go 插件保持 go-plugin 默认行为（parser=nil）。
+		return m.dispensePlugin(ctx, id, abs, language, cmd, newAstrbotStartupParser())
 	}
 
 	cmd := exec.Command(abs)
 	cmd.Dir = pluginDataRoot
-	return m.dispensePlugin(ctx, id, abs, language, cmd)
+	return m.dispensePlugin(ctx, id, abs, language, cmd, nil)
 }
 
 // pythonRuntime resolves (once) the Python subprocess environment: SDK
@@ -832,6 +1328,8 @@ func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.R
 	if m.pythonEnv != nil {
 		return m.pythonEnv, nil
 	}
+	// 宿主 venv 基础依赖安装（pysdk 内部 pip）也用 config 的 PyPI 镜像。
+	pysdk.SetPyPIIndex(m.pipIndex)
 	env, err := pysdk.PrepareRuntimeWithStage(m.dataDir, stage)
 	if err != nil {
 		return nil, err
@@ -841,7 +1339,12 @@ func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.R
 }
 
 // dispensePlugin runs the go-plugin handshake against a prepared command.
-func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, language string, cmd *exec.Cmd) (*PluginInstance, error) {
+// stderrParser is non-nil for Python plugins: their stderr lines are routed
+// through the [ASTRBOT] protocol parser and phase-aware startup errors.
+func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, language string, cmd *exec.Cmd, stderrParser *astrbotStartupParser) (*PluginInstance, error) {
+	// 进程组隔离（Linux 附加 Pdeathsig）：宿主死亡/退出时内核自动回收插件，
+	// teardown 时按组杀整棵进程树（见 process_*.go）。
+	setupChildProcess(cmd)
 	cfg := &goplugin.ClientConfig{
 		HandshakeConfig:  pluginsdk.Handshake,
 		Plugins:          pluginsdk.PluginMap,
@@ -849,15 +1352,24 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 		Managed:          true,
 	}
-	if m.MinPort > 0 && m.MaxPort >= m.MinPort {
-		cfg.MinPort = uint(m.MinPort)
-		cfg.MaxPort = uint(m.MaxPort)
+	if stderrParser != nil {
+		cfg.Stderr = stderrParser
+	}
+	// 每个插件分配独占握手端口（见 portAllocMu 注释）：避免 SO_REUSEPORT
+	// 同端口双绑导致宿主连接路由到错误的插件进程。
+	if m.MaxPort > 0 && m.MinPort > 0 {
+		minp, maxp := m.allocPortRange()
+		cfg.MinPort, cfg.MaxPort = minp, maxp
+	} else {
+		minp, maxp := m.allocPortRangeDefault()
+		cfg.MinPort, cfg.MaxPort = minp, maxp
 	}
 	raw := goplugin.NewClient(cfg)
 
 	// go-plugin's handshake has no built-in timeout; enforce one.
 	type dispenseResult struct {
 		pc  *pluginsdk.Client
+		pid int // direct child pid once the process has started (0 = not started)
 		err error
 	}
 	resCh := make(chan dispenseResult, 1)
@@ -871,47 +1383,60 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		// BindHostServiceName 把身份更新为注册名，二者对齐后隔离校验才能通过。
 		pluginsdk.SetCurrentHostPluginID(id)
 		defer pluginsdk.SetCurrentHostPluginID("")
+		var pid int
 		proto, err := raw.Client()
+		if cmd.Process != nil {
+			pid = cmd.Process.Pid
+		}
 		if err != nil {
-			resCh <- dispenseResult{err: err}
+			resCh <- dispenseResult{pid: pid, err: err}
 			return
 		}
 		rpcClient, err := proto.Dispense("plugin_service")
 		if err != nil {
-			resCh <- dispenseResult{err: err}
+			resCh <- dispenseResult{pid: pid, err: err}
 			return
 		}
 		pc, ok := rpcClient.(*pluginsdk.Client)
 		if !ok {
-			resCh <- dispenseResult{err: fmt.Errorf("unexpected plugin client type %T", rpcClient)}
+			resCh <- dispenseResult{pid: pid, err: fmt.Errorf("unexpected plugin client type %T", rpcClient)}
 			return
 		}
-		resCh <- dispenseResult{pc: pc}
+		resCh <- dispenseResult{pc: pc, pid: pid}
 	}()
 
 	var pc *pluginsdk.Client
+	var pid int
 	select {
 	case res := <-resCh:
 		if res.err != nil {
 			raw.Kill()
-			return nil, fmt.Errorf("start plugin %s: %w", id, res.err)
+			// 握手失败时直接子进程可能已退出（killProcessGroup 对 ESRCH 视为
+			// 完成），但 Python 桥可能已拉起子进程：按组回收兜底。
+			killProcessGroup(&PluginInstance{pgid: res.pid})
+			return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: %w", id, res.err))
 		}
 		pc = res.pc
+		pid = res.pid
 	case <-time.After(startTimeout):
 		// 杀进程先让 dispense goroutine 结束，再取回可能已创建的
 		// *pluginsdk.Client（持有 gRPC conn + HostService server）并关闭，
 		// 避免反复 Load 泄漏连接与 goroutine。
 		raw.Kill()
-		if res := <-resCh; res.pc != nil {
+		res := <-resCh
+		killProcessGroup(&PluginInstance{pgid: res.pid})
+		if res.pc != nil {
 			_ = res.pc.Close()
 		}
-		return nil, fmt.Errorf("start plugin %s: handshake timed out after %v", id, startTimeout)
+		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: handshake timed out after %v", id, startTimeout))
 	case <-m.ctx.Done():
 		raw.Kill()
-		if res := <-resCh; res.pc != nil {
+		res := <-resCh
+		killProcessGroup(&PluginInstance{pgid: res.pid})
+		if res.pc != nil {
 			_ = res.pc.Close()
 		}
-		return nil, fmt.Errorf("start plugin %s: manager shutting down", id)
+		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: manager shutting down", id))
 	}
 
 	regCtx, cancel := context.WithTimeout(ctx, startTimeout)
@@ -922,7 +1447,8 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 	if err != nil {
 		_ = pc.Close()
 		raw.Kill()
-		return nil, fmt.Errorf("plugin %s Register: %w", id, err)
+		killProcessGroup(&PluginInstance{pgid: pid})
+		return nil, m.wrapStartError(stderrParser, fmt.Errorf("plugin %s Register: %w", id, err))
 	}
 	// 用 Register 返回的注册名更新 HostService 连接身份（accept 时只绑定
 	// manifest id，name 与 id 可能不同）。之后插件 GetConfig/SetConfig 传的
@@ -931,7 +1457,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		pluginsdk.BindHostServiceName(id, meta.Name)
 	}
 
-	return &PluginInstance{
+	inst := &PluginInstance{
 		ID:        id,
 		Name:      meta.Name,
 		Version:   meta.Version,
@@ -940,8 +1466,35 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		Client:    pc,
 		Meta:      meta,
 		raw:       raw,
+		pgid:      pid, // Setpgid 后进程组 id = 直接子进程 pid
 		StartedAt: time.Now(),
-	}, nil
+		owner:     m,
+	}
+	inst.Touch() // 新加载实例视为活跃，避免被闲置清扫立刻回收
+	// Register 快照里的工具（Go 插件在 Register 元数据中声明）先入注册表；
+	// Python 插件工具晚于 Register 注册，由首次 RefreshTools 回写。
+	if len(meta.Tools) > 0 {
+		m.setPluginTools(id, meta.Tools)
+	}
+	return inst, nil
+}
+
+// wrapStartError 提升 Python 插件启动失败的错误：若 stderr 的 [ASTRBOT]
+// 协议捕获了 STARTUP_ERROR 行，则把 go-plugin 笼统的握手错误替换为
+// phase 化的清晰错误（原始 go-plugin 错误拼接在后）。没有捕获到
+// STARTUP_ERROR（或 parser 为 nil，即 Go 插件）时原样返回。
+func (m *SubprocessManager) wrapStartError(parser *astrbotStartupParser, err error) error {
+	if parser == nil || err == nil {
+		return err
+	}
+	// go-plugin 在 Kill 时已排空 stderr 管道，STARTUP_ERROR 行通常已落地；
+	// 给 1s 兜底等 stderr 转发协程完成，避免竞态丢掉错误行。
+	se := parser.WaitError(1 * time.Second)
+	if se == nil {
+		return err
+	}
+	return fmt.Errorf("Python 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
+		se.Phase, se.Plugin, se.Error, err)
 }
 
 // startWatch polls the child process for exit and triggers crash handling.
@@ -1099,6 +1652,11 @@ func (m *SubprocessManager) restart(inst *PluginInstance) {
 // LoadInstalled loads all enabled plugins from the persisted install manifest
 // (their cached compiled binaries). Called at startup.
 func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
+	// 旧布局一次性迁移：plugins-src/<id> → plugins/<id>（Python 源码本体）、
+	// plugins_config/<name> → plugins_config/<id>（配置按实例 id 隔离）、
+	// plugins/<name> 文档并入 plugins/<id>。
+	m.migratePluginLayout()
+
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
 		logger.I18nWarn("LoadInstalled: %v", err)
@@ -1122,6 +1680,241 @@ func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 	if len(man.Plugins) > 0 {
 		logger.I18nInfo("已从 manifest 加载 %d/%d 个已安装子进程插件", loaded, len(man.Plugins))
 	}
+	// 一次性迁移：旧版本会把打包元数据混入 config.json，启动时对全部已安装
+	// 插件执行剥离（元数据归位独立文件、config 只留真实配置项）。
+	m.migrateLegacyMetadataConfigs(man)
+}
+
+// migrateLegacyMetadataConfigs strips packaged-metadata keys from every
+// installed plugin's config.json (moving them into the standalone
+// metadata.json file) so the WebUI config dialog and the on-disk config only
+// ever carry real config items.
+func (m *SubprocessManager) migrateLegacyMetadataConfigs(man *Manifest) {
+	if man == nil {
+		return
+	}
+	for _, e := range man.Plugins {
+		if e.ID == "" {
+			continue
+		}
+		_ = m.LoadConfig(e.ID)
+	}
+}
+
+// migratePluginLayout 把旧版目录布局迁移到"统一 plugins/ + 按实例 id
+//（name_language）分键"的新布局：
+//
+//	plugins-src/<id>      → plugins/<id>        （Python 源码本体）
+//	plugins_config/<name> → plugins_config/<id> （配置/元数据/schema，Go/Python 隔离）
+//	plugins/<name>        → 并入 plugins/<id>   （旧文档缓存）
+//
+// 同时更新 manifest 的 Binary（plugins-src 前缀）与 ConfigDir/DocsDir/DataDir
+// 足迹字段。幂等：新旧路径相同或目标已存在时跳过。
+func (m *SubprocessManager) migratePluginLayout() {
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil || man == nil {
+		return
+	}
+	changed := false
+	for i, e := range man.Plugins {
+		sid := sanitizeID(e.ID)
+		if sid == "" {
+			continue
+		}
+		// 1) Python 源码：plugins-src/<id> → plugins/<id>
+		oldSrc := filepath.Join(m.dataDir, "plugins-src", sid)
+		newSrc := filepath.Join(m.dataDir, "plugins", sid)
+		if _, err := os.Stat(oldSrc); err == nil {
+			_ = os.MkdirAll(filepath.Dir(newSrc), 0o755)
+			if _, err := os.Stat(newSrc); err == nil {
+				// 目标已被旧文档缓存目录占位：源码合并进去（源码文件优先），
+				// 再删旧源码目录——绝不能直接删源码。
+				copyDirMerge(oldSrc, newSrc)
+				_ = os.RemoveAll(oldSrc)
+			} else {
+				if rerr := os.Rename(oldSrc, newSrc); rerr == nil {
+					logger.I18nInfo("迁移插件 %s 源码: plugins-src → plugins", e.ID)
+				}
+			}
+			changed = true
+		}
+		// 2) 配置：plugins_config/<name> → plugins_config/<id>
+		oldCfg := filepath.Join(m.dataDir, "plugins_config", sanitizePluginName(e.Name))
+		newCfg := filepath.Join(m.dataDir, "plugins_config", sid)
+		if oldCfg != newCfg {
+			if _, err := os.Stat(oldCfg); err == nil {
+				if _, err := os.Stat(newCfg); err != nil {
+					if rerr := os.Rename(oldCfg, newCfg); rerr == nil {
+						logger.I18nInfo("迁移插件 %s 配置: %s → %s", e.ID, oldCfg, newCfg)
+					}
+				} else {
+					_ = os.RemoveAll(oldCfg)
+				}
+				changed = true
+			}
+		}
+		// 3) 旧文档缓存 plugins/<name>：并入 plugins/<id>（源码树自带 README）
+		oldDocs := filepath.Join(m.dataDir, "plugins", sanitizePluginName(e.Name))
+		if oldDocs != newSrc {
+			if _, err := os.Stat(oldDocs); err == nil {
+				if _, err := os.Stat(newSrc); err != nil {
+					if rerr := os.Rename(oldDocs, newSrc); rerr == nil {
+						logger.I18nInfo("迁移插件 %s 文档缓存: plugins/<name> → plugins/<id>", e.ID)
+					} else {
+						_ = os.RemoveAll(oldDocs)
+					}
+				} else {
+					// 源码目录已存在（如 Python 源码刚迁移过来）：把缺失的
+					// 文档文件拷入（不覆盖源码树内同名文件），再删旧目录。
+					copyMissingDocs(oldDocs, newSrc)
+					_ = os.RemoveAll(oldDocs)
+				}
+				changed = true
+			}
+		}
+		// 4) legacy id 归一化：id → sanitizePluginName(name)_language。
+		// 语言经插件入口文件推断（main.py/__init__.py → python，否则 go），
+		// 不猜路径。稳定 id 让同名 Go/Python 插件的本体/配置/数据完全隔离；
+		// 目标 id 已被占用（真冲突）时跳过，不合并两个插件。
+		lang := e.Language
+		if lang != "go" && lang != "python" {
+			srcProbe := filepath.Join(m.dataDir, "plugins", sid)
+			if _, err := os.Stat(filepath.Join(srcProbe, "main.py")); err == nil {
+				lang = "python"
+			} else if _, err := os.Stat(filepath.Join(srcProbe, "__init__.py")); err == nil {
+				lang = "python"
+			} else {
+				lang = "go"
+			}
+		}
+		name := e.Name
+		if name == "" {
+			name = e.ID
+		}
+		stableID := sanitizePluginName(name) + "_" + lang
+		if stableID != e.ID {
+			if man.Get(stableID) == nil {
+				// 移动四个目录（本体/二进制/配置/数据），旧路径不存在则跳过。
+				moved := m.movePluginDir(filepath.Join("plugins", sid), filepath.Join("plugins", sanitizeID(stableID)))
+				m.movePluginDir(filepath.Join("plugins-bin", sid), filepath.Join("plugins-bin", sanitizeID(stableID)))
+				m.movePluginDir(filepath.Join("plugins_config", sid), filepath.Join("plugins_config", sanitizeID(stableID)))
+				m.movePluginDir(filepath.Join("plugins_data", sid), filepath.Join("plugins_data", sanitizeID(stableID)))
+				if moved {
+					logger.I18nInfo("插件 %s 归一化为稳定 id %s（语言 %s）", e.ID, stableID, lang)
+				}
+				oldID := e.ID
+				e.ID = stableID
+				e.Language = lang
+				sid = sanitizeID(stableID)
+				e.Binary = rewritePluginIDPath(e.Binary, oldID, stableID)
+				changed = true
+			} else {
+				logger.I18nWarn("插件 %s 归一化 id 冲突（%s 已存在），保留原 id", e.ID, stableID)
+			}
+		} else if e.Language != lang {
+			e.Language = lang
+			changed = true
+		}
+		// 5) manifest 足迹与 Binary 路径更新（按最终 id）。
+		newBinary := e.Binary
+		if strings.Contains(newBinary, "plugins-src") {
+			newBinary = strings.Replace(newBinary, "plugins-src", "plugins", 1)
+		}
+		if newBinary != e.Binary || e.ConfigDir != filepath.Join("plugins_config", sid) ||
+			e.DocsDir != filepath.Join("plugins", sid) || e.DataDir != filepath.Join("plugins_data", sid) {
+			e.Binary = newBinary
+			e.ConfigDir = filepath.Join("plugins_config", sid)
+			e.DocsDir = filepath.Join("plugins", sid)
+			e.DataDir = filepath.Join("plugins_data", sid)
+			man.Plugins[i] = e
+			changed = true
+		}
+	}
+	if changed {
+		_ = man.Save(m.manifestPath())
+	}
+	// 清理已空的旧目录（Rename 后 plugins-src 应为空；若有残余仅删空目录）。
+	_ = os.Remove(filepath.Join(m.dataDir, "plugins-src"))
+}
+
+// movePluginDir moves a dataDir-relative directory (old → new), creating the
+// parent as needed. Reports whether anything moved.
+func (m *SubprocessManager) movePluginDir(oldSub, newSub string) bool {
+	old := filepath.Join(m.dataDir, filepath.FromSlash(oldSub))
+	new := filepath.Join(m.dataDir, filepath.FromSlash(newSub))
+	if old == new {
+		return false
+	}
+	if _, err := os.Stat(old); err != nil {
+		return false
+	}
+	if _, err := os.Stat(new); err == nil {
+		_ = os.RemoveAll(old)
+		return true
+	}
+	_ = os.MkdirAll(filepath.Dir(new), 0o755)
+	if err := os.Rename(old, new); err != nil {
+		logger.I18nWarn("迁移目录 %s → %s 失败: %v", old, new, err)
+		return false
+	}
+	return true
+}
+
+// rewritePluginIDPath rewrites a manifest-recorded path whose <oldID> path
+// SEGMENT became <newID> (e.g. "data/plugins-bin/box/box-linux-amd64" →
+// "data/plugins-bin/box_go/box-linux-amd64"). 只匹配完整路径段（前后为 /
+// 或串首尾），避免把以 id 为前缀的产物文件名（box-linux-amd64）一并改写
+//（磁盘上的文件并未改名，只是目录被移动）。
+func rewritePluginIDPath(path, oldID, newID string) string {
+	if path == "" {
+		return path
+	}
+	out := path
+	for _, seg := range []string{oldID, sanitizeID(oldID)} {
+		if seg == "" {
+			continue
+		}
+		re := regexp.MustCompile(`(^|/)` + regexp.QuoteMeta(seg) + `(/|$)`)
+		out = re.ReplaceAllString(out, "${1}"+newID+"${2}")
+	}
+	return out
+}
+
+// copyMissingDocs copies doc files (README.md/logo 等) from src into dst,
+// skipping files that already exist in dst. 用于旧文档缓存目录并入源码目录
+//（源码树内同名文件优先保留）。
+func copyMissingDocs(src, dst string) {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(dst, 0o755)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !isDocFileName(name) {
+			continue
+		}
+		target := filepath.Join(dst, name)
+		if _, err := os.Stat(target); err == nil {
+			continue
+		}
+		if data, err := os.ReadFile(filepath.Join(src, name)); err == nil {
+			_ = os.WriteFile(target, data, 0o644)
+		}
+	}
+}
+
+// isDocFileName reports whether the file is a cached plugin doc/logo name
+//（旧文档缓存目录只放这些文件）。
+func isDocFileName(name string) bool {
+	switch strings.ToLower(name) {
+	case "readme.md", "changelog.md", "logo.png", "logo.jpg", "logo.jpeg", "logo.gif", "icon.png", "config_schema.json":
+		return true
+	}
+	return false
 }
 
 // TriggerHook fires payload-less lifecycle hooks (e.g. "startup"/"shutdown") on
@@ -1149,7 +1942,7 @@ func (m *SubprocessManager) TriggerHookPayload(ctx context.Context, event string
 				hookCtx = context.Background()
 			}
 			rpcCtx, cancel := context.WithTimeout(hookCtx, pluginHookRPCTimeout)
-			_, _, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, &pluginsdk.Event{}, nil, payload)
+			_, _, _, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, &pluginsdk.Event{}, nil, payload)
 			cancel()
 			if err != nil {
 				logger.I18nWarn("钩子 %s (%s) 在插件 %s 上执行失败: %v", h.Name, h.Event, inst.ID, err)
@@ -1211,8 +2004,9 @@ var (
 	lastReclaimAt time.Time
 )
 
-// teardownInstance gracefully asks the plugin to clean up, kills the process,
-// then releases the RPC client (gRPC conn + HostService server) so repeated
+// teardownInstance gracefully asks the plugin to clean up, kills the process
+// (its whole process group, so anything the plugin spawned dies too), then
+// releases the RPC client (gRPC conn + HostService server) so repeated
 // reloads do not leak connections/goroutines. Safe to call multiple times.
 func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	if inst == nil || inst.raw == nil {
@@ -1225,6 +2019,12 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 			cancel()
 		}
 	}
+	// 先按进程组回收（SIGTERM → 宽限 → SIGKILL，含 Python 桥再拉起的
+	// 子进程）；killProcessGroup 返回 false（未记录 pgid / 非 unix 平台）
+	// 或进程已被组信号杀死后，raw.Kill() 兜底回收直接子进程并完成
+	// go-plugin 的簿记（reap）。顺序不可反：raw.Kill() 只杀直接子进程，
+	// 先组杀保证整棵进程树被回收。
+	killProcessGroup(inst)
 	inst.raw.Kill()
 	if inst.Client != nil {
 		_ = inst.Client.Close()

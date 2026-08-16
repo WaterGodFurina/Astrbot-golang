@@ -5,7 +5,8 @@ go 1.26
 require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.0.4
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.2.0
+	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.0.0-00010101000000-000000000000
 	github.com/blusewang/wx v1.3.3
 	github.com/bwmarrin/discordgo v0.25.1
 	github.com/dobest1024/go-weixin-ilink v0.2.0
@@ -29,6 +30,7 @@ require (
 	golang.org/x/image v0.0.0-20190802002840-cff245a6509b
 	golang.org/x/mod v0.37.0
 	golang.org/x/net v0.26.0
+	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.56.0
 )
@@ -75,7 +77,6 @@ require (
 	github.com/youkale/go-querystruct v1.0.0 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
 	go4.org v0.0.0-20230225012048-214862532bf5 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240318140521-94a12d6c2237 // indirect
 	google.golang.org/grpc v1.64.1 // indirect
@@ -88,3 +89,6 @@ require (
 // nanovec 上游未修复 Windows 编译（flat.go 直接用 unix.Mmap 且无 build tag）；
 // 使用 fork（含 Windows mmap 平台封装补丁，内容与上游 956786fcfa80 一致）。
 replace github.com/hungpdn/nanovec => github.com/WaterGodFurina/nanovec v1.0.1
+
+// Python SDK（非嵌入，经 Go 模块解析，本地 replace 开发态）
+replace github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk => /home/xiaowei/astrbot-golang-plugin-python-sdk

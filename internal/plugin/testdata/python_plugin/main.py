@@ -20,6 +20,15 @@ class TestPlugin(Star):
         self.counter += 1
         yield event.plain_result(f"Hello from Python! count={self.counter}")
 
+    @filter.command("pysend")
+    async def pysend(self, event: AstrMessageEvent):
+        """主动发送（不设置 Result）：宿主必须据此跳过 LLM（_has_send_oper）。"""
+        from astrbot.api.event import MessageChain
+        from astrbot.api.message_components import Plain
+
+        await event.send(MessageChain([Plain("已发送")]))
+        return None
+
     @filter.command("pycfg")
     async def cfg(self, event: AstrMessageEvent):
         cfg = self.context.get_config() if self.context else {}

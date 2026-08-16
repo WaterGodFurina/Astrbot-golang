@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -28,19 +29,38 @@ func TestInstallPythonPluginYAMLMetadata(t *testing.T) {
 	if inst.Name != "yaml_demo" {
 		t.Fatalf("Name = %q", inst.Name)
 	}
-	// 配置目录里应写入 metadata 块（display_name/short_desc）
-	cfg := m.LoadConfig(inst.Name)
+	// 元数据写入独立 metadata.json：config.json 只含真实配置（不含元数据键）。
+	meta := m.readPluginMetadataFile(inst.ID)
+	if meta == nil {
+		t.Fatal("独立 metadata.json 未写入")
+	}
+	if meta["display_name"] != "YAML演示" {
+		t.Fatalf("metadata.json 缺 display_name: %v", meta)
+	}
+	cfg := m.LoadConfig(inst.ID)
 	if cfg == nil {
 		t.Fatal("LoadConfig 返回 nil")
 	}
-	if cfg["display_name"] != "YAML演示" {
-		t.Fatalf("config 缺 display_name: %v", cfg)
+	for _, k := range []string{"display_name", "short_desc", "desc", "version", "author", "repo", "cgo", "name"} {
+		if _, exists := cfg[k]; exists {
+			t.Fatalf("config.json 不得含元数据键 %q: %v", k, cfg)
+		}
+	}
+	// 迁移语义：即使 config.json 被旧版本混入元数据，LoadConfig 也会剥离。
+	if err := os.WriteFile(m.configPath(inst.ID), []byte(`{"display_name":"残留","real_key":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.LoadConfig(inst.ID); got["display_name"] != nil {
+		t.Fatalf("残留元数据键必须被剥离: %v", got)
+	}
+	if got := m.LoadConfig(inst.ID); got["real_key"] != true {
+		t.Fatalf("真实配置键必须保留: %v", got)
 	}
 	// Logo 缓存 + 列表 URL
-	if logo := m.PluginLogoFile(inst.Name); logo == "" {
+	if logo := m.PluginLogoFile(inst.ID); logo == "" {
 		t.Fatal("logo 未缓存")
 	}
-	url := m.pluginLogoURL(inst.ID, inst.Name)
+	url := m.pluginLogoURL(inst.ID)
 	if url == "" || !strings.Contains(url, "plugins/logo") {
 		t.Fatalf("logo URL 异常: %q", url)
 	}

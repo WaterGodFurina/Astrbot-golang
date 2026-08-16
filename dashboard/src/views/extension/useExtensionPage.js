@@ -764,7 +764,11 @@ export const useExtensionPage = (initialTab = "installed") => {
 
   const getInstalledExtensionByName = (extensionName) => {
     const data = Array.isArray(extension_data?.data) ? extension_data.data : [];
-    return data.find((extension) => extension.name === extensionName) || null;
+    return (
+      data.find((extension) => extension.id === extensionName) ||
+      data.find((extension) => extension.name === extensionName) ||
+      null
+    );
   };
 
   const findMarketPluginForExtension = (extension) => {
@@ -1155,7 +1159,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     if (extension.__toggle_pending) return;
     extension.__toggle_pending = true;
     try {
-      const res = await pluginApi.setEnabled(extension.name, true);
+      const res = await pluginApi.setEnabled(extension.id ?? extension.name, true);
       if (res.data.status === "error") {
         toast(res.data.message, "error");
         return;
@@ -1176,7 +1180,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     if (extension.__toggle_pending) return;
     extension.__toggle_pending = true;
     try {
-      const res = await pluginApi.setEnabled(extension.name, false);
+      const res = await pluginApi.setEnabled(extension.id ?? extension.name, false);
       if (res.data.status === "error") {
         toast(res.data.message, "error");
         return;
@@ -1542,13 +1546,12 @@ export const useExtensionPage = (initialTab = "installed") => {
     }
 
     await loadCustomSources();
-    const sources = [
-      { name: tm("market.defaultSource"), url: null },
-      ...customSources.value.map((source) => ({
-        name: source.name,
-        url: source.url,
-      })),
-    ];
+    // customSources 含内置源（默认golang插件源 url 为空 = 默认市场）与
+    // 用户自定义源；不再额外硬编码"默认源"（避免与内置 golang 源重复）。
+    const sources = customSources.value.map((source) => ({
+      name: source.name,
+      url: source.url || null,
+    }));
     const currentMarketPluginId = String(
       extension.install_source?.market_plugin_id || "",
     ).trim();
@@ -1713,7 +1716,7 @@ export const useExtensionPage = (initialTab = "installed") => {
               registry_url: candidate.registry_url,
               market_plugin_id: candidate.market_plugin_id,
             };
-      const res = await pluginApi.bindSource(extension.name, payload);
+      const res = await pluginApi.bindSource(extension.id ?? extension.name, payload);
       if (res.data.status === "error") {
         toast(res.data.message, "error");
         return;

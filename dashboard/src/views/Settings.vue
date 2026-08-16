@@ -186,7 +186,10 @@
                                     <div class="settings-item__subtitle">{{ tm('network.githubProxy.subtitle') }}</div>
                                 </div>
                                 <div class="settings-item__control settings-item__control--proxy">
-                                    <ProxySelector />
+                                    <ProxySelector
+                                        :model-value="systemConfigData.github_proxy"
+                                        @update:model-value="(v) => { systemConfigData.github_proxy = v || ''; }"
+                                    />
                                 </div>
                             </div>
                         </div>
@@ -756,7 +759,7 @@ const systemConfigGroups = computed(() => {
 
     return [
         createGroup('runtime', ['timezone', 'callback_api_base']),
-        createGroup('network', ['http_proxy', 'no_proxy', 'goproxy', 'goflags']),
+        createGroup('network', ['http_proxy', 'no_proxy', 'goproxy', 'goflags', 'pypi_index_url', 'pip_install_arg']),
         createGroup('webuiSecurity', [
             'dashboard.trust_proxy_headers',
             'dashboard.ssl.enable',

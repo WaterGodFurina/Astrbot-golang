@@ -160,8 +160,10 @@ const categoryDisplay = computed(() => {
   if (!category) return "";
 
   const normalized = category.toLowerCase().replace(/\s+/g, "_");
+  // tm 找不到 key 时返回 "[MISSING: ...]"（而非 key 本身），需显式判断；
+  // 未翻译的分类（如中文"其他"）回退显示原文。
   const label = tm(`market.categories.${normalized}`);
-  return label === `market.categories.${normalized}` ? category : label;
+  return label && !label.includes("[MISSING:") ? label : category;
 });
 
 const authorWebsite = computed(() => {
@@ -655,20 +657,33 @@ const fetchReadme = async () => {
   }
 
   try {
-    const res = await pluginApi.readme(plugin.name);
+    // 10s 超时兜底：后端 README 拉取（GitHub 远程兜底）在无加速/网络不通
+    // 时应快速失败，但极端情况下不阻塞详情页——超时按"无 README"处理。
+    const TIMEOUT = "__README_TIMEOUT__";
+    const content = await Promise.race([
+      pluginApi.readme(plugin.name).then((res) => {
+        if (res.data.status !== "ok") {
+          readmeError.value =
+            res.data.message || tm("messages.operationFailed");
+          return null;
+        }
+        return res.data.data?.content || "";
+      }),
+      new Promise((resolve) => setTimeout(() => resolve(TIMEOUT), 10000)),
+    ]);
 
-    if (res.data.status !== "ok") {
-      readmeError.value = res.data.message || tm("messages.operationFailed");
-      return;
-    }
-
-    const content = res.data.data?.content || "";
-    if (!content) {
+    if (content === TIMEOUT) {
       readmeEmpty.value = true;
       return;
     }
+    if (content === null) return;
 
-    renderedReadme.value = renderMarkdown(content);
+    const text = String(content || "");
+    if (!text) {
+      readmeEmpty.value = true;
+      return;
+    }
+    renderedReadme.value = renderMarkdown(text);
   } catch (err) {
     readmeError.value = err?.message || String(err);
   } finally {

@@ -37,6 +37,7 @@ import (
 	"unicode/utf8"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/agent"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/contentsafety"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
@@ -1138,6 +1139,19 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 		if event.Result != nil {
 			return &StageResult{Continue: true}, nil
 		}
+		// 插件 handler 主动发送过回复（对齐 Python _has_send_oper）：事件已
+		// 处理，不得再走 LLM（box 等"主动发图回复"的插件命令）。
+		if event.HasSendOper {
+			logger.Debug("ProcessStage: plugin 已发送回复，跳过 LLM")
+			return &StageResult{Continue: true}, nil
+		}
+		// 插件 handler 调用了 event.stop_event()（stop_propagation，无
+		// Result/send 的主动回复路径，如 box recall_task）：事件已处理，
+		// 停止管线，不得走 LLM 兜底。
+		if event.IsStopped() {
+			logger.Debug("ProcessStage: plugin 已停止事件，跳过 LLM")
+			return &StageResult{Continue: false}, nil
+		}
 	}
 
 	// If not woken, stop — unless an active reply was requested by the group
@@ -1188,6 +1202,7 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 	result := []*star.StarHandlerMetadata{}
 	denied := false
 
+	logger.Debug("[dbg] findMatchingHandlers: %d 个 filter handler, msg=%q wake=%v", len(all), event.MessageStr, event.IsAtOrWakeCommand)
 	for _, handler := range all {
 		if !handler.Enabled {
 			continue
@@ -1226,6 +1241,7 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 			denied = true
 			continue
 		}
+		logger.Debug("[dbg] 命中 handler: %s", handler.HandlerFullName)
 		result = append(result, handler)
 	}
 
@@ -2208,11 +2224,16 @@ func dispatchSubprocessHooksPayload(sub *plugin.SubprocessManager, event *core.E
 			if h.Event != hookEvent {
 				continue
 			}
+			// 钩子为被动广播，不计入活动时间（否则带钩子插件永不休眠）。
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-			_, _, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, sdkEvent, nil, payload)
+			_, _, res, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, sdkEvent, nil, payload)
 			rpcCancel()
 			if err != nil {
 				logger.I18nWarn("插件 %s 钩子 %s (%s) 执行失败: %v", inst.Name, h.Name, hookEvent, err)
+			}
+			if res.Sent && event != nil {
+				// 插件在钩子中主动发送过（对齐 Python _has_send_oper）。
+				event.HasSendOper = true
 			}
 		}
 	}
@@ -2233,12 +2254,16 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 			if h.Event != "on_llm_request" {
 				continue
 			}
+			// on_llm_request 是被动广播，不计入活动时间。
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-			sp, stop, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
+			sp, stop, res, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
 			rpcCancel()
 			if err != nil {
 				logger.I18nWarn("插件 %s 的 on_llm_request 钩子 %s 执行失败: %v", inst.Name, h.Name, err)
 				continue
+			}
+			if res.Sent {
+				event.HasSendOper = true
 			}
 			systemPrompt = sp
 			if stop {
@@ -2255,29 +2280,40 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 	if s.subPlugins == nil {
 		return nil
 	}
-	var out []map[string]interface{}
+	// 先刷新运行中插件的实时工具列表（插件工具在实例化阶段注册，晚于
+	// Register 快照；RefreshTools 成功后回写管理器工具注册表）。
 	for _, inst := range s.subPlugins.List() {
 		if inst.Meta == nil {
 			continue
 		}
-		for _, t := range inst.Meta.Tools {
-			params := map[string]interface{}{}
-			if len(t.ParamsJson) > 0 {
-				_ = json.Unmarshal(t.ParamsJson, &params)
-			}
-			safeName := pluginToolSafeName(t.Name)
-			if safeName == "" {
-				continue
-			}
-			out = append(out, map[string]interface{}{
-				"type": "function",
-				"function": map[string]interface{}{
-					"name":        safeName,
-					"description": t.Description,
-					"parameters":  params,
-				},
-			})
+		inst.RefreshTools(context.Background())
+	}
+	// 注入全部已注册工具（含闲置休眠插件：其工具保留在注册表中，LLM 调用
+	// 时按名唤醒——避免休眠导致 LLM 工具集收缩）。
+	seen := make(map[string]bool, len(s.subPlugins.List()))
+	var out []map[string]interface{}
+	for _, e := range s.subPlugins.AllPluginTools() {
+		t := e.Desc
+		if t == nil || seen[t.Name] {
+			continue
 		}
+		seen[t.Name] = true
+		params := map[string]interface{}{}
+		if len(t.ParamsJson) > 0 {
+			_ = json.Unmarshal(t.ParamsJson, &params)
+		}
+		safeName := pluginToolSafeName(t.Name)
+		if safeName == "" {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        safeName,
+				"description": t.Description,
+				"parameters":  params,
+			},
+		})
 	}
 	return out
 }
@@ -2289,28 +2325,58 @@ func (s *ProcessStage) executePluginTool(event *core.Event, name string, args ma
 		return "", false
 	}
 	sdkEvent := star.CoreEventToSDK(event)
+	// 1) 运行中实例直接命中。
 	for _, inst := range s.subPlugins.List() {
 		if inst.Client == nil || inst.Meta == nil {
 			continue
 		}
-		for _, t := range inst.Meta.Tools {
+		for _, t := range inst.ToolsSnapshot() {
 			// LLM calls use the sanitized name; the plugin RPC uses the original.
 			if pluginToolSafeName(t.Name) != name {
 				continue
 			}
-			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-			text, isErr, err := inst.Client.HandleTool(rpcCtx, t.Name, args, sdkEvent)
-			rpcCancel()
-			if err != nil {
-				return fmt.Sprintf("插件工具 %s 执行失败: %v", name, err), true
+			return s.dispatchPluginTool(inst, t, event, name, args, sdkEvent)
+		}
+	}
+	// 2) 注册表兜底：工具属于闲置休眠的插件 → EnsureLoaded 唤醒后再分发。
+	if id, ok := s.subPlugins.ToolOwner(name); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+		inst, err := s.subPlugins.EnsureLoaded(ctx, id)
+		cancel()
+		if err != nil {
+			return fmt.Sprintf("插件工具 %s 所属插件 %s 唤醒失败: %v", name, id, err), true
+		}
+		if inst == nil || inst.Client == nil {
+			return fmt.Sprintf("插件工具 %s 所属插件 %s 未就绪", name, id), true
+		}
+		inst.Touch()
+		inst.RefreshTools(context.Background())
+		for _, t := range inst.ToolsSnapshot() {
+			if pluginToolSafeName(t.Name) != name {
+				continue
 			}
-			if isErr {
-				return "插件工具 " + name + " 返回错误: " + text, true
-			}
-			return text, true
+			return s.dispatchPluginTool(inst, t, event, name, args, sdkEvent)
 		}
 	}
 	return "", false
+}
+
+// dispatchPluginTool invokes one plugin tool RPC and formats the result.
+func (s *ProcessStage) dispatchPluginTool(inst *plugin.PluginInstance, t *sdkv1.ToolDesc, event *core.Event, name string, args map[string]interface{}, sdkEvent *pluginsdk.Event) (string, bool) {
+	inst.Touch() // 活动标记：参与闲置卸载判定
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+	text, isErr, res, err := inst.Client.HandleTool(rpcCtx, t.Name, args, sdkEvent)
+	rpcCancel()
+	if err != nil {
+		return fmt.Sprintf("插件工具 %s 执行失败: %v", name, err), true
+	}
+	if res.Sent {
+		event.HasSendOper = true
+	}
+	if isErr {
+		return "插件工具 " + name + " 返回错误: " + text, true
+	}
+	return text, true
 }
 
 // collectTools builds the OpenAI tool schema for all active tools
@@ -3898,13 +3964,16 @@ func (s *ResultDecorateStage) applyResultHooks(event *core.Event, chain *[]plugi
 			}
 			hookName := h.Name
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-			newChain, stop, err := inst.Client.HandleHook(rpcCtx, hookName, sdkEvent, cur)
+			newChain, stop, res, err := inst.Client.HandleHook(rpcCtx, hookName, sdkEvent, cur)
 			rpcCancel()
 			if err != nil {
 				logger.I18nWarn("插件 %s 的结果钩子 %s 执行失败: %v", inst.Name, hookName, err)
 				continue
 			}
 			cur = newChain
+			if res.Sent {
+				event.HasSendOper = true
+			}
 			if stop {
 				return true, nil
 			}

@@ -52,6 +52,41 @@ type RecallAdapter interface {
 	RecallMessage(messageID string) error
 }
 
+// pluginConfigID 把 HostService 反调用携带的插件注册名解析为实例 id
+//（配置目录按 id = name_language 分键）。先查运行中实例（RPC 调用者必然
+// 是运行中的），未命中回退 manifest 首条同名条目；都没有则返回原名作为
+// 目录键兜底（兼容无 manifest 的测试/旧布局）。
+func (m *SubprocessManager) pluginConfigID(name string) string {
+	if m == nil {
+		return name
+	}
+	if inst := m.instanceByName(name); inst != nil {
+		if inst.ID != "" {
+			return inst.ID
+		}
+		// 实例缺 ID（构造型测试/边缘状态）→ 用 name 作为目录键兜底。
+		return name
+	}
+	if man, err := LoadManifest(m.manifestPath()); err == nil {
+		for _, e := range man.Plugins {
+			if e.Name == name {
+				return e.ID
+			}
+		}
+	}
+	return name
+}
+
+// resolvePluginConfig returns the merged plugin config for the HostService
+// GetConfig hook (nil manager → empty config). Testable seam: the hook body is
+// kept as a plain function so paths can be verified without an RPC broker.
+func resolvePluginConfig(m *SubprocessManager, name string) map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return m.ConfigResolver().ResolvePluginConfig(m.pluginConfigID(name))
+}
+
 // SetHostService installs the HostService hooks (reverse plugin -> host RPCs)
 // backed by the platform manager, the subprocess plugin manager (for config
 // reads/writes) and a ChatLLM callback (for plugins calling the LLM directly).
@@ -82,6 +117,9 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			if len(comps) == 0 {
 				return nil
 			}
+			if pm == nil {
+				return fmt.Errorf("platform manager not available")
+			}
 			return pm.Send(platformID, sessionID, message.NewMessageChain(comps...))
 		},
 		RecallMessage: func(platformID, messageID string) error {
@@ -99,10 +137,10 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			return fmt.Errorf("platform adapter %q does not support RecallMessage", platformID)
 		},
 		GetConfig: func(pluginName string) (map[string]any, error) {
-			if subMgr == nil {
-				return map[string]any{}, nil
-			}
-			cfg := subMgr.LoadConfig(pluginName)
+			// 合并 schema 默认值：Python 插件的 __init__/get_config 依赖配置
+			// 带全量默认键（Python AstrBot 语义），裸配置缺键会让插件
+			// KeyError（如 box 的 config["protect_ids"]）。
+			cfg := resolvePluginConfig(subMgr, pluginName)
 			if cfg == nil {
 				return map[string]any{}, nil
 			}
@@ -112,7 +150,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			if subMgr == nil {
 				return fmt.Errorf("plugin manager not available")
 			}
-			return subMgr.SaveConfig(pluginName, cfg)
+			return subMgr.SaveConfig(subMgr.pluginConfigID(pluginName), cfg)
 		},
 		ChatLLM: func(prompt, systemPrompt string, imageURLs []string) (string, error) {
 			if chatLLM == nil {

@@ -1085,12 +1085,12 @@
         "hint": "超过大小后自动轮转，默认 20MB。"
       },
       "pip_install_arg": {
-        "description": "pip 安装额外参数",
-        "hint": "安装插件依赖时,会使用 Python 的 pip 工具。这里可以填写额外的参数,如 `--break-system-package` 等。"
+        "description": "pip 额外安装参数",
+        "hint": "安装 Python 插件依赖时附加给 pip 的参数，如 --break-system-packages"
       },
       "pypi_index_url": {
-        "description": "PyPI 软件仓库地址",
-        "hint": "安装 Python 依赖时请求的 PyPI 软件仓库地址。默认为 [https://mirrors.aliyun.com/pypi/simple/](https://mirrors.aliyun.com/pypi/simple/)"
+        "description": "Python 库仓库地址（PyPI）",
+        "hint": "安装 Python 插件依赖时使用的 PyPI 仓库地址，默认 https://mirrors.aliyun.com/pypi/simple/"
       },
       "callback_api_base": {
         "description": "对外可达的回调接口地址",

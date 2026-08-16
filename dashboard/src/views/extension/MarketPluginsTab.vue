@@ -151,7 +151,8 @@ const {
 
 const currentSourceName = computed(() => {
   if (!selectedSource.value) {
-    return tm("market.defaultSource");
+    const def = customSources.value.find((s) => !s.url);
+    return def?.name || tm("market.defaultSource");
   }
   const matched = customSources.value.find(
     (s) => s.url === selectedSource.value,
