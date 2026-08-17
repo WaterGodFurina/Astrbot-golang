@@ -1326,7 +1326,16 @@ func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.R
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.pythonEnv != nil {
-		return m.pythonEnv, nil
+		// 缓存校验：venv/解释器可能被外部清理（如 ~/.cache 被系统回收、
+		// 用户手动删除），缓存命中但解释器/SDK 目录已不存在时丢弃缓存
+		// 重新准备——否则插件闲置休眠后唤醒（EnsureLoaded → startInstance）
+		// 会拿一个不存在的解释器启动子进程（"python-venv-xxx/bin/python
+		// 路径不存在"），LLM 工具调用（executePluginTool）随之失败。
+		if pythonEnvUsable(m.pythonEnv) {
+			return m.pythonEnv, nil
+		}
+		logger.I18nWarn("Python 运行时缓存失效（解释器/SDK 目录不存在），重新准备…")
+		m.pythonEnv = nil
 	}
 	// 宿主 venv 基础依赖安装（pysdk 内部 pip）也用 config 的 PyPI 镜像。
 	pysdk.SetPyPIIndex(m.pipIndex)
@@ -1336,6 +1345,24 @@ func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.R
 	}
 	m.pythonEnv = env
 	return env, nil
+}
+
+// pythonEnvUsable 校验缓存的 Python 运行时仍可用：解释器文件与 SDK 目录
+// 必须存在。只做轻量 stat 检查（不跑 import 探测），覆盖 venv 缓存被外部
+// 清理的场景；不通过时调用方丢弃缓存走 PrepareRuntimeWithStage 全量重建
+//（EnsureVenv 会重建 venv 并重装宿主依赖）。
+func pythonEnvUsable(env *pysdk.RuntimeEnv) bool {
+	if env == nil {
+		return false
+	}
+	info, err := os.Stat(env.PythonBin)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if sdk, err := os.Stat(env.SDKDir); err != nil || !sdk.IsDir() {
+		return false
+	}
+	return true
 }
 
 // dispensePlugin runs the go-plugin handshake against a prepared command.
