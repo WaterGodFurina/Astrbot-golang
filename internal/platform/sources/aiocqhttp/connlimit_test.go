@@ -66,7 +66,7 @@ func TestMaxReverseWSConns(t *testing.T) {
 
 	// 关闭一个连接后，新连接被接受（服务端异步回收，先等待计数下降）。
 	conns[0].Close()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(2 * time.Second)
 	for a.connCount() != limit-1 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
