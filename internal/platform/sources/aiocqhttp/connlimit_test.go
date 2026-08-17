@@ -45,6 +45,17 @@ func TestMaxReverseWSConns(t *testing.T) {
 		conns = append(conns, c)
 	}
 
+	// 客户端收到 101 时服务端可能尚未执行该连接的 addConn（计数未及时
+	// 上升）。若此时立即拨下一个连接，pre-check 可能看到计数不足而放行
+	// 造成误判，故先轮询等服务端计数达到上限。
+	deadline := time.Now().Add(2 * time.Second)
+	for a.connCount() != limit && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if a.connCount() != limit {
+		t.Fatalf("服务端应计数 %d 个连接，当前 %d", limit, a.connCount())
+	}
+
 	// 第 N+1 个连接被拒绝：503，且未建立 WS（Upgrade 之前即被拒绝）。
 	if c, status := dial(); status != http.StatusServiceUnavailable {
 		if c != nil {

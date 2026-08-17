@@ -34,7 +34,7 @@ jobs:
           python-version: '3.12'
 
       - name: 安装中文字体（t2i 测试需要）
-        run: sudo apt-get update -q && sudo apt-get install -y -q fonts-noto-cjk
+        run: sudo apt-get update -q && sudo apt-get install -y -q fonts-droid-fallback
 
       - name: 配置 Go 环境（代理与模块）
         env:
