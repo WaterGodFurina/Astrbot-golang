@@ -33,8 +33,19 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: apt 缓存（字体安装加速）
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt/archives/*.deb
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/test.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
       - name: 安装中文字体（t2i 测试需要）
-        run: sudo apt-get update -q && sudo apt-get install -y -q fonts-droid-fallback
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q fonts-droid-fallback
 
       - name: 配置 Go 环境（代理与模块）
         env:
@@ -68,3 +79,43 @@ jobs:
             **/test*.log
             **/TEST-*.xml
           if-no-files-found: ignore
+
+  frontend:
+    name: 前端构建
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+
+      - name: 启用 pnpm
+        run: corepack enable
+
+      - name: pnpm store 缓存
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store/v3
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('dashboard/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+        working-directory: dashboard
+
+      - name: 前端构建（含 t2i shiki runtime）
+        run: pnpm build && pnpm build:t2i-shiki-runtime
+        working-directory: dashboard
+
+      - name: 校验构建产物
+        run: |
+          ls -la dist/ | head
+          ls -la scripts/t2i/shiki_runtime.iife.js 2>/dev/null || find . -name "shiki_runtime.iife.js" | head
+        working-directory: dashboard
