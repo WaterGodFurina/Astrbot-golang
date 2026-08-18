@@ -88,4 +88,4 @@ require (
 
 // nanovec 上游未修复 Windows 编译（flat.go 直接用 unix.Mmap 且无 build tag）；
 // 使用 fork（含 Windows mmap 平台封装补丁，内容与上游 956786fcfa80 一致）。
- replace github.com/hungpdn/nanovec => github.com/WaterGodFurina/nanovec v1.0.1
+replace github.com/hungpdn/nanovec => github.com/WaterGodFurina/nanovec v1.0.1
