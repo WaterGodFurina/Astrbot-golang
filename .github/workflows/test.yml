@@ -12,44 +12,11 @@ on:
       - test
 
 jobs:
-  update-go-sum:
-    name: 重建 go.sum（goproxy.cn）
+  go-test:
+    name: Go 测试
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: 设置 Go 版本（自动跟随 go.mod）
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
-      - name: 用 goproxy.cn 重建 go.sum
-        env:
-          GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
-        run: go mod tidy
-
-      - name: 有变更则提交回仓库
-        run: |
-          if ! git diff --quiet go.mod go.sum; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add go.mod go.sum
-            git commit -m "chore: rebuild go.sum"
-            git push origin HEAD
-            echo "已提交新的 go.sum"
-          else
-            echo "go.sum 与 goproxy.cn 一致，无变更"
-          fi
-
-  test:
-    name: Go 测试
-    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -62,6 +29,24 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+
+      - name: 用 goproxy.cn 重建 go.sum（有变更则提交回仓库）
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GOFLAGS: -mod=mod
+        run: |
+          go mod tidy
+          if ! git diff --quiet go.mod go.sum; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add go.mod go.sum
+            git commit -m "chore: rebuild go.sum"
+            git push origin HEAD
+            echo "已提交新的 go.sum"
+          else
+            echo "go.sum 与 goproxy.cn 一致，无变更"
+          fi
 
       - name: 安装 Python（插件子进程测试需要）
         uses: actions/setup-python@v5
@@ -121,6 +106,25 @@ jobs:
             **/TEST-*.xml
           if-no-files-found: ignore
 
+      - name: 编译 AstrBot（linux amd64 gnu，纯 Go 无 CGO）
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: go build -trimpath -ldflags="-s -w" -o astrbot-linux-amd64 ./cmd/astrbot
+
+      - name: 校验编译产物
+        run: |
+          ls -la astrbot-linux-amd64
+          file astrbot-linux-amd64
+
+      - name: 上传编译产物
+        uses: actions/upload-artifact@v5
+        with:
+          name: astrbot-linux-amd64
+          path: astrbot-linux-amd64
+          if-no-files-found: error
+
   frontend:
     name: 前端构建
     runs-on: ubuntu-latest
@@ -160,47 +164,3 @@ jobs:
           ls -la dist/ | head
           ls -la scripts/t2i/shiki_runtime.iife.js 2>/dev/null || find . -name "shiki_runtime.iife.js" | head
         working-directory: dashboard
-
-  build:
-    name: 编译二进制（linux amd64 gnu）
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-          fetch-depth: 0
-
-      - name: 设置 Go 版本（自动跟随 go.mod）
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: 配置 Go 环境（代理与模块）
-        env:
-          GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
-          GOFLAGS: -mod=mod
-        run: |
-          go env -w GOPROXY="https://goproxy.cn,direct"
-          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
-
-      - name: 编译 AstrBot（linux amd64 gnu，纯 Go 无 CGO）
-        env:
-          CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: amd64
-        run: go build -trimpath -ldflags="-s -w" -o astrbot-linux-amd64 ./cmd/astrbot
-
-      - name: 校验产物
-        run: |
-          ls -la astrbot-linux-amd64
-          file astrbot-linux-amd64
-
-      - name: 上传编译产物
-        uses: actions/upload-artifact@v5
-        with:
-          name: astrbot-linux-amd64
-          path: astrbot-linux-amd64
-          if-no-files-found: error
