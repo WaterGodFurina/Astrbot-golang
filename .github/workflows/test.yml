@@ -12,6 +12,41 @@ on:
       - test
 
 jobs:
+  update-go-sum:
+    name: 重建 go.sum（goproxy.cn）
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: 用 goproxy.cn 重建 go.sum
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+        run: go mod tidy
+
+      - name: 有变更则提交回仓库
+        run: |
+          if ! git diff --quiet go.mod go.sum; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add go.mod go.sum
+            git commit -m "chore: rebuild go.sum"
+            git push origin HEAD
+            echo "已提交新的 go.sum"
+          else
+            echo "go.sum 与 goproxy.cn 一致，无变更"
+          fi
+
   test:
     name: Go 测试
     runs-on: ubuntu-latest
