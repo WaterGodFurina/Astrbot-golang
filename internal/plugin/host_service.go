@@ -402,7 +402,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				conv = convMgr.GetConversation(umo)
 			}
 			if conv == nil && createIfNotExists {
-				conv = convMgr.GetOrCreateConversation(umo, platformID)
+				conv = convMgr.GetOrCreateConversation(umo, "")
 			}
 			return serializeConversation(conv)
 		},
