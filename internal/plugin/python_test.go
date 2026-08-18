@@ -63,7 +63,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(`{"greeting": "你好", "enabled": true}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	SetHostService(nil, m, nil)
+	SetHostService(nil, m, nil, nil, nil, nil)
 	// SetHostService 是包级全局（pluginsdk host hooks）：测试结束恢复为空，
 	// 避免污染后续测试（如 runtime_test 的 TestHostServiceReverseCalls）。
 	defer pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{})
@@ -211,6 +211,69 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	m.Unload("test_pyplugin")
 	if m.Get("test_pyplugin") != nil {
 		t.Fatal("卸载后实例仍在")
+	}
+}
+
+// TestPythonRuntimeCacheSelfHeals: Python 运行时缓存（m.pythonEnv）持有的
+// venv 被外部清理（如 ~/.cache 被系统回收、用户手动删除）后，再次解析必须
+// 丢弃失效缓存并重建 venv——否则插件闲置休眠后工具调用唤醒（EnsureLoaded →
+// startInstance → pythonRuntime）会拿一个不存在的解释器启动子进程
+//（"python-venv-xxx/bin/python 路径不存在"），LLM 工具调用随之失败。
+func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
+	if pysdk.DiscoverPythonBin() == "" {
+		t.Skip("python3 不可用")
+	}
+	// 独立 venv/缓存目录：不共享 ~/.cache/astrbot-go 下的 venv，避免污染
+	// 真实宿主缓存与跨进程 pip 并发；pip 缓存也隔离到临时目录（沙箱内
+	// ~/.cache/pip 可能不可写导致 wheel 构建失败）。
+	t.Setenv("ASTRBOT_PYTHON_CACHE_DIR", t.TempDir())
+	t.Setenv("PIP_CACHE_DIR", t.TempDir())
+	m := newTestManager(t)
+	defer m.Shutdown()
+
+	env1, err := m.pythonRuntimeWithStage(nil)
+	if err != nil {
+		t.Fatalf("首次准备 Python 运行时: %v", err)
+	}
+	if _, err := os.Stat(env1.PythonBin); err != nil {
+		t.Fatalf("首次 PythonBin 不存在: %v", err)
+	}
+	// 缓存命中：再次解析返回同一指针（不重建）。
+	envHit, err := m.pythonRuntimeWithStage(nil)
+	if err != nil {
+		t.Fatalf("缓存命中解析失败: %v", err)
+	}
+	if envHit != env1 {
+		t.Fatal("缓存命中应返回同一 RuntimeEnv 指针（未走重建）")
+	}
+
+	// 模拟外部清理：删除 venv 根目录（.../python-venv-xxx）。系统 Python
+	// 自带依赖（无 venv）时删除步骤跳过，该场景缓存校验自然通过。
+	venvRoot := filepath.Dir(filepath.Dir(env1.PythonBin))
+	if strings.HasPrefix(filepath.Base(venvRoot), "python-venv-") {
+		if err := os.RemoveAll(venvRoot); err != nil {
+			t.Fatalf("删除 venv 失败: %v", err)
+		}
+		if _, err := os.Stat(env1.PythonBin); err == nil {
+			t.Fatal("venv 删除后解释器仍存在（前置条件失效）")
+		}
+	}
+
+	// 关键断言：缓存失效后再次解析必须自愈重建（而非返回失效缓存）。
+	env2, err := m.pythonRuntimeWithStage(nil)
+	if err != nil {
+		t.Fatalf("缓存失效后重建失败: %v", err)
+	}
+	if _, err := os.Stat(env2.PythonBin); err != nil {
+		t.Fatalf("重建后 PythonBin 仍不存在: %v", err)
+	}
+	// 重建结果再次进入缓存：命中返回同一指针。
+	envHit2, err := m.pythonRuntimeWithStage(nil)
+	if err != nil {
+		t.Fatalf("重建后缓存命中失败: %v", err)
+	}
+	if envHit2 != env2 {
+		t.Fatal("重建后应缓存新的 RuntimeEnv 指针")
 	}
 }
 

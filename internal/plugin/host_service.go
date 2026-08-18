@@ -1,11 +1,19 @@
 package plugin
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"os"
+	"reflect"
+	"sync"
+	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
@@ -87,12 +95,203 @@ func resolvePluginConfig(m *SubprocessManager, name string) map[string]any {
 	return m.ConfigResolver().ResolvePluginConfig(m.pluginConfigID(name))
 }
 
+// serializeConversation 把会话对象序列化为 SDK 约定的 map（对齐 Python
+// conversation_manager 返回的 JSON 结构），供 GetConversation/GetConversations
+// hooks 使用。
+func serializeConversation(conv *conversation.Conversation) map[string]any {
+	if conv == nil {
+		return nil
+	}
+	return map[string]any{
+		"cid":                 conv.CID,
+		"user_id":             conv.UserID,
+		"platform_id":         conv.PlatformID,
+		"unified_msg_origin":  conv.UnifiedMsgOrigin,
+		"persona_id":          conv.Persona,
+		"title":               conv.Title,
+		"created_at":          conv.CreatedAt,
+		"updated_at":          conv.UpdatedAt,
+		"is_deleted":          conv.IsDeleted,
+	}
+}
+
+// ── 人格数据源（data/personas.json）──
+//
+// lifecycle 包内的 loadPersonas 首字母小写不可跨包访问，此处按同一实现
+// 维护一份本地副本（参照 internal/lifecycle/lifecycle.go），供 HostService
+// 人格管理 hooks 使用。字段约定：persona_id/name/system_prompt/folder_id/
+// is_default，由 dashboard 人格存储写入。
+
+// personaFileCache 缓存 data/personas.json 的解析结果，避免每次调用都读盘。
+// 通过文件 mtime 判断内容是否变化，仅在有变更时重新读取。
+type personaFileCache struct {
+	mu      sync.Mutex
+	content []byte
+	modTime time.Time
+}
+
+var personaCache personaFileCache
+
+// loadPersonas 返回 data/personas.json 解析后的 persona 列表。
+// mtime 未变化时直接返回缓存内容，变化时才重读文件。
+func loadPersonas() []map[string]any {
+	info, err := os.Stat("data/personas.json")
+	if err != nil {
+		return nil
+	}
+	personaCache.mu.Lock()
+	defer personaCache.mu.Unlock()
+	if personaCache.content != nil && personaCache.modTime.Equal(info.ModTime()) {
+		return parsePersonas(personaCache.content)
+	}
+	data, err := os.ReadFile("data/personas.json")
+	if err != nil {
+		return nil
+	}
+	personaCache.content = data
+	personaCache.modTime = info.ModTime()
+	return parsePersonas(data)
+}
+
+// parsePersonas 解析 personas.json 的 personas 数组。
+func parsePersonas(data []byte) []map[string]any {
+	var store struct {
+		Personas []map[string]any `json:"personas"`
+	}
+	if json.Unmarshal(data, &store) != nil {
+		return nil
+	}
+	return store.Personas
+}
+
+// personaByID 按 persona_id 在人格列表里查找；未找到返回 nil。
+func personaByID(id string) map[string]any {
+	for _, p := range loadPersonas() {
+		if pid, _ := p["persona_id"].(string); pid == id {
+			return p
+		}
+	}
+	return nil
+}
+
+// defaultPersona 返回默认人格：优先 is_default 标记为真者，其次取列表
+// 第一条兜底；未配置任何人格时返回 nil。
+func defaultPersona() map[string]any {
+	ps := loadPersonas()
+	for _, p := range ps {
+		if d, _ := p["is_default"].(bool); d {
+			return p
+		}
+	}
+	if len(ps) > 0 {
+		return ps[0]
+	}
+	return nil
+}
+
+// StarManagerLike 抽象 Star 管理器对 HostService 需要的最小能力（遍历插件
+// 元数据）。用函数值而非 *star.Manager 是为了避免导入环：internal/star 经
+// subprocess_bridge.go 已依赖 internal/plugin，plugin 再依赖 star 会构成
+// import cycle。由调用方（lifecycle）构造闭包传入：闭包返回的元数据条目
+// 是 *star.StarMetadata（字段 Name/Author/Desc/Version/StarModulePath/
+// Activated/Repo），hooks 内按字段名反射读取。
+type StarManagerLike interface {
+	// StarMetadataList 返回全部插件元数据（*star.StarMetadata 的 any 包装）。
+	StarMetadataList() []any
+}
+
+// StarManagerLikeFunc 是 StarManagerLike 的函数式适配器，供调用方用闭包
+// 便捷构造（避免在 plugin 包内匿名 struct 样板）。
+type StarManagerLikeFunc func() []any
+
+// StarMetadataList implements StarManagerLike.
+func (f StarManagerLikeFunc) StarMetadataList() []any {
+	if f == nil {
+		return nil
+	}
+	return f()
+}
+
+// StarMetadata 是插件元数据的只读视图（镜像 internal/star.StarMetadata 字段，
+// 避免 plugin 包直接依赖 star 包造成导入环）。
+type StarMetadata struct {
+	Name           string
+	Author         string
+	Desc           string
+	Version        string
+	Repo           string
+	StarModulePath string
+	Activated      bool
+	// PluginID 是 internal/star.StarMetadata 的指针接收者方法（Name/Author
+	// 拼接的插件 ID），反射调用取得，供 GetStar 按插件 ID 匹配。
+	PluginID string
+}
+
+// starMetadataFromAny 把 star 注册表返回的元数据条目（*star.StarMetadata）
+// 转换为本包只读视图；类型不符时返回 nil（调用方自行跳过）。
+func starMetadataFromAny(v any) *StarMetadata {
+	s, ok := v.(*StarMetadata)
+	if ok {
+		return s
+	}
+	// 反射读取字段（镜像 internal/star.StarMetadata），避免硬编码依赖。
+	get := func(name string) string {
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Pointer {
+			rv = rv.Elem()
+		}
+		if !rv.IsValid() || rv.Kind() != reflect.Struct {
+			return ""
+		}
+		f := rv.FieldByName(name)
+		if !f.IsValid() {
+			return ""
+		}
+		return f.String()
+	}
+	getBool := func(name string) bool {
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Pointer {
+			rv = rv.Elem()
+		}
+		if !rv.IsValid() || rv.Kind() != reflect.Struct {
+			return false
+		}
+		f := rv.FieldByName(name)
+		if !f.IsValid() {
+			return false
+		}
+		return f.Bool()
+	}
+	// PluginID 是指针接收者方法（值上取不到），须在指针值上反射调用。
+	pluginID := ""
+	if rv := reflect.ValueOf(v); rv.IsValid() && rv.Kind() == reflect.Pointer {
+		if m := rv.MethodByName("PluginID"); m.IsValid() {
+			if out := m.Call(nil); len(out) > 0 && out[0].Kind() == reflect.String {
+				pluginID = out[0].String()
+			}
+		}
+	}
+	return &StarMetadata{
+		Name:           get("Name"),
+		Author:         get("Author"),
+		Desc:           get("Desc"),
+		Version:        get("Version"),
+		Repo:           get("Repo"),
+		StarModulePath: get("StarModulePath"),
+		Activated:      getBool("Activated"),
+		PluginID:       pluginID,
+	}
+}
+
 // SetHostService installs the HostService hooks (reverse plugin -> host RPCs)
 // backed by the platform manager, the subprocess plugin manager (for config
-// reads/writes) and a ChatLLM callback (for plugins calling the LLM directly).
-// Call once at startup, after both managers exist and before plugins begin
+// reads/writes), a ChatLLM callback (for plugins calling the LLM directly),
+// plus the conversation/provider managers and a star metadata source (closure
+// over star.Registry().All() via StarManagerLike，规避 star→plugin 导入环).
+// Call once at startup, after all managers exist and before plugins begin
 // handling messages.
-func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(prompt, systemPrompt string, imageURLs []string) (string, error)) {
+func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(prompt, systemPrompt string, imageURLs []string) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike) {
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
 		CallAction: func(platformID, api string, params map[string]any) (map[string]any, error) {
 			adapter := pm.Get(platformID)
@@ -173,6 +372,300 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				return "", fmt.Errorf("t2i 渲染失败: %w", err)
 			}
 			return base64.StdEncoding.EncodeToString(data), nil
+		},
+
+		// ── 会话管理（对齐 Python conversation_manager）──
+		GetCurrConversationID: func(umo string) string {
+			if convMgr == nil {
+				return ""
+			}
+			return convMgr.GetCurrConversationID(umo)
+		},
+		NewConversation: func(umo, platformID, personaID string) string {
+			if convMgr == nil {
+				return ""
+			}
+			conv := convMgr.NewConversation(umo, platformID)
+			if personaID != "" {
+				convMgr.SetPersonaByCID(conv.CID, personaID)
+			}
+			return conv.CID
+		},
+		GetConversation: func(umo, cid string, createIfNotExists bool) map[string]any {
+			if convMgr == nil {
+				return nil
+			}
+			var conv *conversation.Conversation
+			if cid != "" {
+				conv = convMgr.GetConversationSnapshot(cid)
+			} else {
+				conv = convMgr.GetConversation(umo)
+			}
+			if conv == nil && createIfNotExists {
+				conv = convMgr.GetOrCreateConversation(umo, "")
+			}
+			return serializeConversation(conv)
+		},
+		GetConversations: func(umo string) []map[string]any {
+			if convMgr == nil {
+				return nil
+			}
+			var out []map[string]any
+			for _, c := range convMgr.AllConversations() {
+				if umo != "" && c.UnifiedMsgOrigin != umo {
+					continue
+				}
+				out = append(out, serializeConversation(c))
+			}
+			return out
+		},
+		DeleteConversation: func(umo, cid string) error {
+			if convMgr == nil {
+				return fmt.Errorf("conversation manager not available")
+			}
+			if cid != "" {
+				if !convMgr.DeleteConversationByCID(cid) {
+					return fmt.Errorf("conversation %q not found", cid)
+				}
+				return nil
+			}
+			convMgr.DeleteConversation(umo)
+			return nil
+		},
+		SwitchConversation: func(umo, cid string) error {
+			if convMgr == nil {
+				return fmt.Errorf("conversation manager not available")
+			}
+			// 校验会话存在（GetConversationSnapshot 非 nil）后切换为当前
+			// 会话；具体校验与切换逻辑在 Manager 内实现。
+			return convMgr.SwitchConversation(umo, cid)
+		},
+		UpdateConversationTitle: func(umo, cid, title string) error {
+			if convMgr == nil {
+				return fmt.Errorf("conversation manager not available")
+			}
+			if cid == "" {
+				cid = convMgr.GetCurrConversationID(umo)
+			}
+			if !convMgr.SetTitleByCID(cid, title) {
+				return fmt.Errorf("conversation %q not found", cid)
+			}
+			return nil
+		},
+		UpdateConversationPersonaID: func(umo, cid, personaID string) error {
+			if convMgr == nil {
+				return fmt.Errorf("conversation manager not available")
+			}
+			if cid == "" {
+				cid = convMgr.GetCurrConversationID(umo)
+			}
+			if !convMgr.SetPersonaByCID(cid, personaID) {
+				return fmt.Errorf("conversation %q not found", cid)
+			}
+			return nil
+		},
+
+		// ── 人格管理（对齐 Python persona_manager，数据源 data/personas.json）──
+		GetPersonas: func() []map[string]any {
+			return loadPersonas()
+		},
+		GetDefaultPersona: func(umo string) map[string]any {
+			// umo 维度不区分默认人格（全局默认），按 is_default 标记或
+			// 首条人格兜底返回。
+			return defaultPersona()
+		},
+		GetPersonaTree: func() (folders []map[string]any, personas []map[string]any) {
+			ps := loadPersonas()
+			// 按 folder_id 聚合出文件夹结构；无 folder_id 的人格只出现在
+			// personas 全量列表（对齐 Python persona_manager）。
+			byFolder := map[string][]map[string]any{}
+			for _, p := range ps {
+				fid, _ := p["folder_id"].(string)
+				if fid == "" {
+					continue
+				}
+				byFolder[fid] = append(byFolder[fid], p)
+			}
+			for fid, items := range byFolder {
+				folders = append(folders, map[string]any{
+					"folder_id": fid,
+					"name":      fid,
+					"children":  items,
+				})
+			}
+			return folders, ps
+		},
+		ResolveSelectedPersona: func(umo, conversationPersonaID, platformName string, providerSettings map[string]any) (string, string, string, string, bool) {
+			// 优先级：会话绑定人格 → Provider 默认人格 → 全局默认人格 → 无。
+			if conversationPersonaID != "" && conversationPersonaID != "[%None]" {
+				if p := personaByID(conversationPersonaID); p != nil {
+					id, _ := p["persona_id"].(string)
+					name, _ := p["name"].(string)
+					prompt, _ := p["system_prompt"].(string)
+					return id, name, prompt, "", false
+				}
+			}
+			if ps, ok := providerSettings["default_personality"].(string); ok && ps != "" && ps != "[%None]" {
+				if p := personaByID(ps); p != nil {
+					id, _ := p["persona_id"].(string)
+					name, _ := p["name"].(string)
+					prompt, _ := p["system_prompt"].(string)
+					return id, name, prompt, "", true
+				}
+			}
+			if def := defaultPersona(); def != nil {
+				id, _ := def["persona_id"].(string)
+				name, _ := def["name"].(string)
+				prompt, _ := def["system_prompt"].(string)
+				return id, name, prompt, "", true
+			}
+			return "[%None]", "", "", "", false
+		},
+
+		// ── Provider 管理（对齐 Python provider_manager）──
+		ListProviders: func(capability string) []map[string]any {
+			if providerMgr == nil {
+				return nil
+			}
+			var out []map[string]any
+			for _, id := range providerMgr.All() {
+				p := providerMgr.Get(id)
+				if p == nil {
+					continue
+				}
+				meta := p.Meta()
+				if capability != "" && string(meta.ProviderType) != capability {
+					continue
+				}
+				out = append(out, map[string]any{
+					"id":            meta.ID,
+					"model":         meta.Model,
+					"type":          meta.Type,
+					"provider_type": string(meta.ProviderType),
+				})
+			}
+			return out
+		},
+		GetUsingProvider: func(umo, capability string) map[string]any {
+			if providerMgr == nil {
+				return nil
+			}
+			if capability == "" || capability == "chat_completion" {
+				p := providerMgr.GetChatProvider()
+				if p != nil {
+					meta := p.Meta()
+					return map[string]any{
+						"id":            meta.ID,
+						"model":         meta.Model,
+						"type":          meta.Type,
+						"provider_type": string(meta.ProviderType),
+					}
+				}
+			}
+			if capability == "text_to_speech" {
+				p := providerMgr.GetTTSProvider()
+				if p != nil {
+					meta := p.Meta()
+					return map[string]any{"id": meta.ID, "model": meta.Model, "type": meta.Type, "provider_type": string(meta.ProviderType)}
+				}
+			}
+			if capability == "speech_to_text" {
+				p := providerMgr.GetSTTProvider()
+				if p != nil {
+					meta := p.Meta()
+					return map[string]any{"id": meta.ID, "model": meta.Model, "type": meta.Type, "provider_type": string(meta.ProviderType)}
+				}
+			}
+			return nil
+		},
+		SetProvider: func(umo, providerID, capability string) error {
+			if providerMgr == nil {
+				return fmt.Errorf("provider manager not available")
+			}
+			if providerMgr.Get(providerID) == nil {
+				return fmt.Errorf("provider %q not found", providerID)
+			}
+			if capability == "" || capability == "chat_completion" {
+				providerMgr.SetDefaultChatProvider(providerID)
+			} else if capability == "text_to_speech" {
+				providerMgr.SetDefaultTTSProvider(providerID)
+			} else if capability == "speech_to_text" {
+				providerMgr.SetDefaultSTTProvider(providerID)
+			} else {
+				return fmt.Errorf("unsupported capability %q", capability)
+			}
+			return nil
+		},
+		GetProviderModels: func(providerID string) []string {
+			// 模型列表需要 provider 具体实现，宿主暂不实现，返回 nil。
+			return nil
+		},
+
+		// ── 插件/Star 管理（对齐 Python star_manager）──
+		ListStars: func() []map[string]any {
+			if starMgr == nil {
+				return nil
+			}
+			var out []map[string]any
+			for _, raw := range starMgr.StarMetadataList() {
+				m := starMetadataFromAny(raw)
+				if m == nil {
+					continue
+				}
+				out = append(out, map[string]any{
+					"name":        m.Name,
+					"author":      m.Author,
+					"desc":        m.Desc,
+					"version":     m.Version,
+					"module_path": m.StarModulePath,
+					"activated":   m.Activated,
+					"repo":        m.Repo,
+				})
+			}
+			return out
+		},
+		GetStar: func(name string) map[string]any {
+			if starMgr == nil {
+				return nil
+			}
+			for _, raw := range starMgr.StarMetadataList() {
+				m := starMetadataFromAny(raw)
+				// 按插件名或插件 ID（Name/Author 拼接）匹配。
+				if m == nil || (m.Name != name && m.PluginID != name) {
+					continue
+				}
+				return map[string]any{
+					"name":        m.Name,
+					"author":      m.Author,
+					"desc":        m.Desc,
+					"version":     m.Version,
+					"module_path": m.StarModulePath,
+					"activated":   m.Activated,
+					"repo":        m.Repo,
+				}
+			}
+			return nil
+		},
+		SetPluginEnabled: func(pluginName string, enabled bool) error {
+			if subMgr == nil {
+				return fmt.Errorf("plugin manager not available")
+			}
+			id := subMgr.pluginConfigID(pluginName)
+			return subMgr.SetEnabled(id, enabled)
+		},
+		InstallPlugin: func(repo string) error {
+			if subMgr == nil {
+				return fmt.Errorf("plugin manager not available")
+			}
+			_, err := subMgr.InstallFromSource(context.Background(), "", repo, InstallOptions{})
+			return err
+		},
+		UninstallPlugin: func(pluginName string) error {
+			if subMgr == nil {
+				return fmt.Errorf("plugin manager not available")
+			}
+			id := subMgr.pluginConfigID(pluginName)
+			return subMgr.Uninstall(id, false, false)
 		},
 	})
 }

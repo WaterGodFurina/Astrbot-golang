@@ -92,3 +92,7 @@ replace github.com/hungpdn/nanovec => github.com/WaterGodFurina/nanovec v1.0.1
 
 // Python SDK（非嵌入，经 Go 模块解析，本地 replace 开发态）
 replace github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk => /home/xiaowei/astrbot-golang-plugin-python-sdk
+
+// Go 插件 SDK（本地 replace 开发态：host.go 新增 HostServiceHooks 会话/人格/
+// Provider/Star 管理字段，GitHub 版 v1.2.0 尚未发布）。
+replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => /home/xiaowei/astrbot-go-plugin-sdk

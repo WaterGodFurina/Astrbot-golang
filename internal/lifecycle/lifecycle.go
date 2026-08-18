@@ -296,8 +296,20 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.syncIdleUnload()
 	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
 	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
-	// back into the host.
-	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins)
+	// back into the host. 同时注入会话/人格/Provider/Star 管理器，供插件
+	// 反向调用会话管理、人格解析、Provider 选择与插件安装等管理能力。
+	// starMgr 以闭包（StarManagerLike）传入，规避 star→plugin 的导入环。
+	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins, l.conversationMgr, l.providerMgr, plugin.StarManagerLikeFunc(func() []any {
+		if l.starMgr == nil {
+			return nil
+		}
+		metas := l.starMgr.Registry().All()
+		out := make([]any, 0, len(metas))
+		for _, m := range metas {
+			out = append(out, m)
+		}
+		return out
+	}))
 	// 能力接线：先注入固定能力集（平台尚未加载，All() 为空），插件进程
 	// 启动时即带 ASTRBOT_HOST_CAPABILITIES 环境变量；loadPlatforms 完成后
 	// 再同步一次（含平台 ID），供后续懒加载/重载的插件使用。

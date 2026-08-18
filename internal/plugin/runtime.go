@@ -1287,6 +1287,19 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 		if err != nil {
 			return nil, fmt.Errorf("python runtime: %w", err)
 		}
+		// venv 可能刚被重建（缓存失效/外部清理）：宿主基础依赖重装后，插件
+		// 自身 requirements.txt 不会自动重装。每次启动前若源码目录有
+		// requirements.txt 则尝试安装——装过时 pip 命中缓存秒回，开销可忽略；
+		// 缺依赖插件也能加载（加载失败会清晰报 ModuleNotFoundError 而非
+		// 挂死）。失败仅告警，不阻止启动（与安装路径 installPythonSource 一致）。
+		if req := filepath.Join(abs, "requirements.txt"); func() bool {
+			_, err := os.Stat(req)
+			return err == nil
+		}() {
+			if err := m.pipInstall(env, abs, req); err != nil {
+				logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
+			}
+		}
 		cmd := exec.Command(env.PythonBin, "-m", "astrbot._bridge.server", abs)
 		cmd.Dir = pluginDataRoot
 		cmd.Env = env.Env(abs, m.dataDir)
