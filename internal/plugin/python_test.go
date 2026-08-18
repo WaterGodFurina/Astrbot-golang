@@ -283,13 +283,6 @@ func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
 func TestPythonPluginSendMarksSent(t *testing.T) {
 	// 独立 venv/缓存目录（同 EndToEnd，避免与真实宿主/其他测试共享
 	// ~/.cache/astrbot-go 下的 venv 与 pip 并发）。
-
-// TestPythonPluginSendMarksSent: 插件 handler 里 event.send（主动发送）后，
-// HandleCommand 必须返回 sent=true（对齐 Python _has_send_oper）——宿主管线
-// 据此不再走 LLM。
-func TestPythonPluginSendMarksSent(t *testing.T) {
-	// 独立 venv/缓存目录（同 EndToEnd，避免与真实宿主/其他测试共享
-	// ~/.cache/astrbot-go 下的 venv 与 pip 并发）。
 	t.Setenv("ASTRBOT_PYTHON_CACHE_DIR", t.TempDir())
 	m := newTestManager(t)
 	// 独立端口区间：与真实宿主默认范围（10000-25000）及其他测试隔离。
