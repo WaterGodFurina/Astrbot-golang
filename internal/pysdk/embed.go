@@ -550,6 +550,12 @@ func extractTarGzStripTop(src, dir string) error {
 		if name == "" {
 			continue
 		}
+		// GitHub 生成的 tar.gz 首条是 pax_global_header 元数据伪条目（非目录，
+		// 无任何文件内容）。若把它当作顶层目录，后续真实路径（<repo>-v<ver>/…）
+		// 全部无法剥离，解压结果会错位/丢失。必须跳过。
+		if name == "pax_global_header" {
+			continue
+		}
 		parts := strings.SplitN(strings.TrimPrefix(name, "./"), "/", 2)
 		if top == "" && len(parts) > 0 {
 			top = parts[0]
