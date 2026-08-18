@@ -42,21 +42,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-apt-
 
-      - name: 切换 apt 源为阿里云镜像（加速 update）
-        run: |
-          set -e
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            # Ubuntu 24.04+ deb822 格式
-            sudo sed -i -E 's|https?://[^ ]*archive\.ubuntu\.com|http://mirrors.aliyun.com|g; s|https?://security\.ubuntu\.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources
-            sudo sed -i -E 's|https?://ports\.ubuntu\.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources
-          fi
-          if [ -f /etc/apt/sources.list ]; then
-            sudo sed -i -E 's|https?://[^ ]*archive\.ubuntu\.com|http://mirrors.aliyun.com|g; s|https?://security\.ubuntu\.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list
-          fi
-          sudo apt-get update -q
-
       - name: 安装中文字体（t2i 测试需要）
-        run: sudo apt-get install -y -q fonts-droid-fallback
+        # runner 在 Azure 云端，azure.archive.ubuntu.com 即本地镜像（最快），
+        # 不要切国内源（跨国际网络反而更慢）。加超时+重试防偶发网络抖动。
+        run: |
+          sudo apt-get update -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
+          sudo apt-get install -y -q fonts-droid-fallback
 
       - name: 配置 Go 环境（代理与模块）
         env:
