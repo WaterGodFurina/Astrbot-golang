@@ -6,7 +6,7 @@ require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
 	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.2.0
-	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.1.0
+	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.0.0-00010101000000-000000000000
 	github.com/blusewang/wx v1.3.3
 	github.com/bwmarrin/discordgo v0.25.1
 	github.com/dobest1024/go-weixin-ilink v0.2.0
@@ -89,3 +89,10 @@ require (
 // nanovec 上游未修复 Windows 编译（flat.go 直接用 unix.Mmap 且无 build tag）；
 // 使用 fork（含 Windows mmap 平台封装补丁，内容与上游 956786fcfa80 一致）。
 replace github.com/hungpdn/nanovec => github.com/WaterGodFurina/nanovec v1.0.1
+
+// Python SDK（非嵌入，经 Go 模块解析，本地 replace 开发态）
+replace github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk => /home/xiaowei/astrbot-golang-plugin-python-sdk
+
+// Go 插件 SDK（本地 replace 开发态：host.go 新增 HostServiceHooks 会话/人格/
+// Provider/Star 管理字段，GitHub 版 v1.2.0 尚未发布）。
+replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => /home/xiaowei/astrbot-go-plugin-sdk

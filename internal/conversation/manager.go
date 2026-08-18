@@ -412,6 +412,24 @@ func (m *Manager) UpdateConversation(conv *Conversation) {
 	m.persist(conv)
 }
 
+// SwitchConversation 把 unifiedMsgOrigin 的当前会话切换到 cid（对齐 Python
+// conversation_manager.switch_conversation）。cid 不存在（快照校验非 nil）
+// 时返回错误；切换会刷新 updated_at 并持久化，重启后 loadFromDB 仍能按
+// 更新时间恢复为当前会话。
+func (m *Manager) SwitchConversation(unifiedMsgOrigin, cid string) error {
+	snap := m.GetConversationSnapshot(cid)
+	if snap == nil {
+		return fmt.Errorf("conversation %q not found", cid)
+	}
+	m.mu.Lock()
+	snap.UpdatedAt = time.Now()
+	m.byCID[snap.CID] = snap
+	m.current[unifiedMsgOrigin] = snap.CID
+	m.mu.Unlock()
+	m.persist(snap)
+	return nil
+}
+
 // DeleteConversation removes the current conversation of a session (persisted).
 func (m *Manager) DeleteConversation(unifiedMsgOrigin string) {
 	m.mu.Lock()
