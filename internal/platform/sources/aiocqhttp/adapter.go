@@ -865,6 +865,7 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "aiocqhttp",
+			PlatformID: a.ID(),
 			SelfID:     selfID,
 			SenderID:   senderID,
 			SenderName: senderName,
@@ -929,11 +930,12 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 	event := &core.Event{
 		Type: core.EventNotice,
 		Source: core.EventSource{
-			Platform: "aiocqhttp",
-			SelfID:   selfID,
-			SenderID: senderID,
-			ConvID:   convID,
-			IsGroup:  isGroup,
+			Platform:   "aiocqhttp",
+			PlatformID: a.ID(),
+			SelfID:     selfID,
+			SenderID:   senderID,
+			ConvID:     convID,
+			IsGroup:    isGroup,
 		},
 		MessageStr: "",
 		RawMessage: rawJSON(raw),

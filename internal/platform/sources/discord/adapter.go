@@ -302,6 +302,7 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "discord",
+			PlatformID: a.ID(),
 			SelfID:     a.botSelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,
@@ -516,6 +517,7 @@ func (a *Adapter) handleInteraction(s *discordgo.Session, i *discordgo.Interacti
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "discord",
+			PlatformID: a.ID(),
 			SelfID:     a.botSelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

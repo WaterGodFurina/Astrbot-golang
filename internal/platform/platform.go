@@ -574,6 +574,7 @@ func (b *BaseAdapter) PublishEvent(msgStr string, msgObj *AstrBotMessage) error 
 		},
 		Source: core.EventSource{
 			Platform:   b.platform,
+			PlatformID: b.ID(),
 			SelfID:     selfID,
 			SenderID:   msgObj.Sender.UserID,
 			SenderName: msgObj.Sender.Nickname,

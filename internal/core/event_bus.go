@@ -29,6 +29,7 @@ const (
 // EventSource identifies where an event came from.
 type EventSource struct {
 	Platform   string
+	PlatformID string // platform_id (adapter instance id, config.id), first segment of Python unified_msg_origin
 	SelfID     string
 	SenderID   string
 	SenderName string
@@ -86,6 +87,46 @@ type Event struct {
 // UnifiedMsgOrigin returns platform:conversation_id.
 func (e *Event) UnifiedMsgOrigin() string {
 	return fmt.Sprintf("%s:%s", e.Source.Platform, e.Source.ConvID)
+}
+
+// pythonMessageType maps the host message-type value to the Python
+// MessageType enum value used in the three-part unified_msg_origin
+// ("GroupMessage"/"FriendMessage"/"OtherMessage"). OneBot adapters store the
+// raw "group"/"private" values; most others store the platform AstrBotMessage
+// type string directly. Falls back to FriendMessage.
+func pythonMessageType(messageType string, isGroup bool) string {
+	if messageType != "" {
+		switch messageType {
+		case "GroupMessage", "FriendMessage", "OtherMessage":
+			return messageType
+		case "group", "Group", "GROUP":
+			return "GroupMessage"
+		case "private", "Private", "PRIVATE", "friend":
+			return "FriendMessage"
+		}
+	}
+	if isGroup {
+		return "GroupMessage"
+	}
+	return "FriendMessage"
+}
+
+// PythonUMO returns the Python-sdk style three-part unified_msg_origin
+// "platform_id:MessageType:session_id" (mirrors MessageSession.__str__ in the
+// original AstrBot). It is used wherever an event must align with the
+// Python plugin's unified_msg_origin key (SessionWaitStage, CoreEventToSDK).
+// The two-part UnifiedMsgOrigin() is kept for host-internal session keys.
+func (e *Event) PythonUMO() string {
+	platformID := e.Source.PlatformID
+	if platformID == "" {
+		platformID = e.Source.Platform
+	}
+	mt := ""
+	if e.MessageObj != nil {
+		mt = e.MessageObj.MessageType
+	}
+	msgType := pythonMessageType(mt, e.Source.IsGroup)
+	return fmt.Sprintf("%s:%s:%s", platformID, msgType, e.Source.ConvID)
 }
 
 // GetUnifiedMsgOrigin returns platform:conversation_id (alias).

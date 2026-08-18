@@ -282,21 +282,23 @@ func CoreEventToSDK(e *core.Event) *pluginsdk.Event {
 		return &pluginsdk.Event{}
 	}
 	out := &pluginsdk.Event{
-		Type:       coreEventTypeName(e.Type),
-		Platform:   e.Source.Platform,
-		SelfID:     e.Source.SelfID,
-		SenderID:   e.Source.SenderID,
-		SenderName: e.Source.SenderName,
-		ConvID:     e.Source.ConvID,
-		GroupName:  e.Source.GroupName,
-		IsGroup:    e.Source.IsGroup,
-		IsAtBot:    e.Source.IsAtBot,
-		IsAdmin:    e.Source.IsAdmin,
-		MessageStr: e.MessageStr,
-		PlainText:  e.PlainText,
-		RawMessage: e.RawMessage,
-		Timestamp:  e.Timestamp.Unix(),
-		Metadata:   e.Metadata,
+		Type:        coreEventTypeName(e.Type),
+		Platform:    e.Source.Platform,
+		PlatformID:  eventPlatformID(e),
+		MessageType: eventMessageType(e),
+		SelfID:      e.Source.SelfID,
+		SenderID:    e.Source.SenderID,
+		SenderName:  e.Source.SenderName,
+		ConvID:      e.Source.ConvID,
+		GroupName:   e.Source.GroupName,
+		IsGroup:     e.Source.IsGroup,
+		IsAtBot:     e.Source.IsAtBot,
+		IsAdmin:     e.Source.IsAdmin,
+		MessageStr:  e.MessageStr,
+		PlainText:   e.PlainText,
+		RawMessage:  e.RawMessage,
+		Timestamp:   e.Timestamp.Unix(),
+		Metadata:    e.Metadata,
 	}
 	if e.MessageObj != nil {
 		out.MessageID = e.MessageObj.MessageID
@@ -321,6 +323,48 @@ func coreEventTypeName(t core.EventType) string {
 		return s
 	}
 	return "message"
+}
+
+// eventPlatformID 返回 Python 侧 unified_msg_origin 第一段：优先平台实例 ID
+// （PlatformID，对应 Python MessageSession 的 platform_id），为空时回退平台
+// 类型名（Platform，保持向后兼容）。
+func eventPlatformID(e *core.Event) string {
+	if e.Source.PlatformID != "" {
+		return e.Source.PlatformID
+	}
+	return e.Source.Platform
+}
+
+// sdkMessageType 将宿主消息类型映射为 Python 驼峰消息类型
+// （GroupMessage/FriendMessage/OtherMessage），供插件 SDK 事件 JSON 使用。
+// 与 internal/core/event_bus.go 的 pythonMessageType 语义一致：优先取
+// e.MessageObj.MessageType（OneBot 适配器存 "group"/"private" 原始值），
+// 为空或无法识别时按 IsGroup 兜底判定。
+func sdkMessageType(messageType string, isGroup bool) string {
+	if messageType != "" {
+		switch messageType {
+		case "GroupMessage", "FriendMessage", "OtherMessage":
+			return messageType
+		case "group", "Group", "GROUP":
+			return "GroupMessage"
+		case "private", "Private", "PRIVATE", "friend":
+			return "FriendMessage"
+		}
+	}
+	if isGroup {
+		return "GroupMessage"
+	}
+	return "FriendMessage"
+}
+
+// eventMessageType 返回插件 SDK 事件携带的消息类型：优先 e.MessageObj.
+// MessageType（已映射驼峰），为空时按 IsGroup 判定。
+func eventMessageType(e *core.Event) string {
+	mt := ""
+	if e.MessageObj != nil {
+		mt = e.MessageObj.MessageType
+	}
+	return sdkMessageType(mt, e.Source.IsGroup)
 }
 
 // componentToSDK flattens a host message component into the SDK's serializable

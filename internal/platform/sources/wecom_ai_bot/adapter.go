@@ -659,6 +659,7 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "wecom_ai_bot",
+			PlatformID: a.ID(),
 			SelfID:     abm.SelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

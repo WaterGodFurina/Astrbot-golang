@@ -545,6 +545,7 @@ func (a *Adapter) commit(abm *platform.AstrBotMessage) {
 		},
 		Source: core.EventSource{
 			Platform:   a.Type(),
+			PlatformID: a.ID(),
 			SelfID:     abm.SelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

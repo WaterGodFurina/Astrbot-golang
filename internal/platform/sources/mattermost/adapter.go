@@ -589,6 +589,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 		},
 		Source: core.EventSource{
 			Platform:   a.Type(),
+			PlatformID: a.ID(),
 			SelfID:     a.botSelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

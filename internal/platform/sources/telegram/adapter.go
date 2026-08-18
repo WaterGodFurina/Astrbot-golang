@@ -345,6 +345,7 @@ func (a *Adapter) handleUpdate(update map[string]interface{}) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "telegram",
+			PlatformID: a.ID(),
 			SelfID:     a.SelfID,
 			SenderID:   senderID,
 			SenderName: senderName,

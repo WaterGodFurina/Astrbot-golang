@@ -261,7 +261,10 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 	if a.EventBus == nil {
 		return
 	}
-	if err := a.EventBus.Publish(messageToEvent(msg, fromUser, components)); err != nil {
+	ev := messageToEvent(msg, fromUser, components)
+	// 覆盖为 config.id（适配器实例 id），messageToEvent 为纯函数无 a 访问权。
+	ev.Source.PlatformID = a.ID()
+	if err := a.EventBus.Publish(ev); err != nil {
 		logger.Error("发布事件失败: %v", err)
 	}
 }
@@ -283,6 +286,7 @@ func messageToEvent(msg *ilink.Message, fromUser string, components []message.Co
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "weixin_oc",
+			PlatformID: "weixin_oc", // 默认平台实例 id，调用处会用 a.ID()（config.id）覆盖
 			SelfID:     msg.ToUserID,
 			SenderID:   fromUser,
 			SenderName: fromUser,

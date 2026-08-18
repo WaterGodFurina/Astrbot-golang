@@ -46,7 +46,15 @@ func (s *SessionWaitStage) Process(ctx context.Context, event *core.Event) (*Sta
 	if umo == "" {
 		return &StageResult{Continue: true}, nil
 	}
-	targets := s.subPlugins.SessionWaitForUmo(umo)
+	// Python SDK 的 unified_msg_origin 是三段式
+	// "platform_id:message_type:session_id"（MessageSession.__str__：
+	// 好友=FriendMessage、群聊=GroupMessage、其他=OtherMessage），
+	// 插件注册等待时用的就是这个格式。宿主 UnifiedMsgOrigin() 只有
+	// 两段式 "platform:conversation_id"，故查询注册表用 PythonUMO()
+	// 还原插件侧完整键（平台实例 id + 消息类型 + 会话 id）。
+	pythonUMO := event.PythonUMO()
+	targets := s.subPlugins.SessionWaitForUmo(pythonUMO)
+	logger.I18nInfo("SessionWaitStage umo=%s（Python=%s）命中等待 %d 条", umo, pythonUMO, len(targets))
 	if len(targets) == 0 {
 		return &StageResult{Continue: true}, nil
 	}
@@ -66,6 +74,7 @@ func (s *SessionWaitStage) Process(ctx context.Context, event *core.Event) (*Sta
 		rpcCtx, rpcCancel := context.WithTimeout(ctx, pluginRPCTimeout)
 		handled, err := inst.Client.FeedSessionWait(rpcCtx, eventJSON)
 		rpcCancel()
+		logger.I18nInfo("SessionWaitStage 推送 %s 到 %s: handled=%v err=%v", t.WaitID, t.PluginName, handled, err)
 		if err != nil {
 			// UNIMPLEMENTED：旧版插件（编译时不带 FeedSessionWait RPC）
 			// 视为无等待，静默跳过。

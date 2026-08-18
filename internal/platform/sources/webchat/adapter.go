@@ -208,6 +208,7 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "webchat",
+			PlatformID: a.ID(),
 			SelfID:     "webchat",
 			SenderID:   req.SenderID,
 			SenderName: req.SenderID,

@@ -645,6 +645,7 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "kook",
+			PlatformID: a.ID(),
 			SelfID:     a.client.BotID(),
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,
