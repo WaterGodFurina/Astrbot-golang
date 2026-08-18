@@ -92,10 +92,10 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
 
-      - name: 设置 Node.js
+      - name: 设置 Node.js（与本地一致 v24，pnpm11 需 Node≥22.5）
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: 启用 pnpm
         run: corepack enable
