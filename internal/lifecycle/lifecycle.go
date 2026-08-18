@@ -531,7 +531,7 @@ func (l *Lifecycle) chatLLMForPlugins(prompt, systemPrompt string, imageURLs []s
 	return pipeline.ChatLLMFromConfig(cfgMap, prompt, systemPrompt, imageURLs)
 }
 
-// buildPipelineScheduler assembles the full 9-stage pipeline for a config ID
+// buildPipelineScheduler assembles the full 10-stage pipeline for a config ID
 // and registers it with the event bus.
 func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 	scheduler := core.NewPipelineScheduler(confID)
@@ -566,6 +566,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 	}
 
 	stageFactory := []func() core.PipelineStage{
+		func() core.PipelineStage { return pipeline.NewSessionWaitStage() },
 		func() core.PipelineStage { return pipeline.NewWakingCheckStage() },
 		func() core.PipelineStage { return pipeline.NewWhitelistCheckStage() },
 		func() core.PipelineStage { return pipeline.NewSessionStatusCheckStage() },
@@ -590,7 +591,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 
 	l.pipelineMapping[confID] = scheduler
 	l.eventBus.RegisterScheduler(confID, scheduler)
-	logger.I18nInfo("已为 %s 构建管线调度器（9 个阶段）", confID)
+	logger.I18nInfo("已为 %s 构建管线调度器（10 个阶段）", confID)
 	return nil
 }
 

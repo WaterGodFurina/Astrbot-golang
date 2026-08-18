@@ -189,6 +189,12 @@ type SubprocessManager struct {
 	// ASTRBOT_HOST_CAPABILITIES 环境变量注入 Python 插件子进程（插件侧
 	// HostBridge.has() 查询）。由宿主生命周期在启动与重载平台后设置。
 	hostCapabilities []string
+
+	// sessionWaitMu 保护 sessionWaitReg：跨进程会话等待注册表（waitID →
+	// 插件/umo），由 HostService.RegisterSessionWait hook 写入、管线
+	// SessionWaitStage 查询消费（见 session_wait.go）。
+	sessionWaitMu  sync.Mutex
+	sessionWaitReg map[string]*sessionWaitEntry
 }
 
 // Touch marks the plugin as active (called before/after every RPC into the
@@ -329,6 +335,7 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 		failures:         make(map[string]error),
 		docFetchCache:    make(map[string]docCacheEntry),
 		toolRegistry:     make(map[string]toolRegEntry),
+		sessionWaitReg:   make(map[string]*sessionWaitEntry),
 		logLevels:        newLogLevels(dataDir),
 		toolchain:        tc,
 		compiler:         NewCompiler(tc),
@@ -964,6 +971,9 @@ func (m *SubprocessManager) unloadLocked(id string, notify bool) error {
 	inst.stopped = true
 	inst.mu.Unlock()
 	m.teardownInstance(inst)
+	// 子进程已终止，其 Python 侧 SessionWaiter 状态随之丢失：注销该插件
+	// 的全部会话等待（休眠卸载与真实卸载都适用，防止向死进程反复推送）。
+	m.unregisterPluginWaits(inst.Name)
 	if notify {
 		// 真实卸载/禁用：工具注册表条目一并清除（休眠则保留，供按名唤醒）。
 		m.removePluginTools(id)
@@ -2015,6 +2025,10 @@ func (m *SubprocessManager) markFailed(inst *PluginInstance, err error) {
 
 	// Release the process and RPC client resources.
 	go m.teardownInstance(inst)
+
+	// 插件已永久失效：注销其全部会话等待（子进程已死，残留条目只会
+	// 反复推送失败）。
+	m.unregisterPluginWaits(inst.Name)
 
 	// 通知宿主清理 star 注册表里的命令/过滤器/钩子闭包，否则残留 handler
 	// 会继续对已关闭的 conn 发 RPC。

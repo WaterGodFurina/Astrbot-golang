@@ -1,16 +1,17 @@
 // Package pipeline implements the message processing stages.
 // Ported from astrbot/core/pipeline/
 //
-// The pipeline processes events through 9 ordered stages:
-//  1. WakingCheckStage      - Check wake conditions
-//  2. WhitelistCheckStage   - Check whitelist/blacklist
-//  3. SessionStatusCheckStage - Check session enabled
-//  4. RateLimitStage         - Check rate limit
-//  5. ContentSafetyCheckStage - Check content safety
-//  6. PreProcessStage        - Preprocess media, STT, path mapping
-//  7. ProcessStage           - Plugin handler execution + LLM agent
-//  8. ResultDecorateStage    - Decorate result (prefix, T2I, TTS, etc.)
-//  9. RespondStage           - Send message chain to platform
+// The pipeline processes events through 10 ordered stages:
+//  1. SessionWaitStage      - Feed events to session-waiting plugins (SessionWaiter)
+//  2. WakingCheckStage      - Check wake conditions
+//  3. WhitelistCheckStage   - Check whitelist/blacklist
+//  4. SessionStatusCheckStage - Check session enabled
+//  5. RateLimitStage         - Check rate limit
+//  6. ContentSafetyCheckStage - Check content safety
+//  7. PreProcessStage        - Preprocess media, STT, path mapping
+//  8. ProcessStage           - Plugin handler execution + LLM agent
+//  9. ResultDecorateStage    - Decorate result (prefix, T2I, TTS, etc.)
+//  10. RespondStage           - Send message chain to platform
 package pipeline
 
 import (
@@ -4360,9 +4361,10 @@ func DurationFromSeconds(sec int) time.Duration {
 	return time.Duration(sec) * time.Second
 }
 
-// BuildDefaultPipeline creates the default 9-stage pipeline matching Python.
+// BuildDefaultPipeline creates the default 10-stage pipeline matching Python.
 func BuildDefaultPipeline(pctx *PipelineContext) ([]PipelineStage, error) {
 	stages := []PipelineStage{
+		NewSessionWaitStage(),
 		NewWakingCheckStage(),
 		NewWhitelistCheckStage(),
 		NewSessionStatusCheckStage(),

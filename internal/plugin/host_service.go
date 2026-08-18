@@ -667,5 +667,22 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			id := subMgr.pluginConfigID(pluginName)
 			return subMgr.Uninstall(id, false, false)
 		},
+
+		// ── 会话等待（SessionWaiter 跨进程喂入）──
+		RegisterSessionWait: func(pluginName, umo string, timeoutSeconds int32) string {
+			// 插件注册"等待 umo 的下一条消息"：宿主记录到等待注册表并返回
+			// wait_id；管线 SessionWaitStage 收到该 umo 消息时经
+			// FeedSessionWait RPC 推送事件（subMgr 未就绪视为宿主不支持）。
+			if subMgr == nil {
+				return ""
+			}
+			return subMgr.RegisterSessionWait(pluginName, umo, timeoutSeconds)
+		},
+		UnregisterSessionWait: func(waitID string) {
+			if subMgr == nil {
+				return
+			}
+			subMgr.UnregisterSessionWait(waitID)
+		},
 	})
 }
