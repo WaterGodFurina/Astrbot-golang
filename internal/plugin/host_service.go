@@ -353,6 +353,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
 					var schema map[string]any
 					if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err == nil && schema != nil {
+						logger.Debug("[diag] GetConfig: %s 附带 __schema__", pluginName)
 						cfg["__schema__"] = schema
 					}
 				}
@@ -650,6 +651,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 						"reserved":     reserved,
 					})
 				}
+				logger.Debug("[diag] ListStars: 返回 %d 个插件", len(out))
 				return out
 			}
 			if starMgr == nil {
