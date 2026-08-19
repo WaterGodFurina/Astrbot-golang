@@ -256,6 +256,20 @@ func (a *Adapter) Stop() error {
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	a.mu.Lock()
 	isGroup := a.groupConvs[sessionID]
+	// unique_session 开启时会话 ID 被宿主拼接为 "{sender_id}_{group_id}"
+	//（buildUniqueSessionID: aiocqhttp → sender+"_"+group），而 groupConvs
+	// 的 key 是原始会话 ID。此时从拼接串解析出末段群号回退判定群/私聊，
+	// 否则会话被误判为私聊导致 send_msg 携带非数字 user_id 被 NapCat 拒绝
+	//（retcode 1400 "user_id: expected a positive integer"）。
+	if !isGroup && strings.Contains(sessionID, "_") {
+		if idx := strings.LastIndex(sessionID, "_"); idx > 0 && idx < len(sessionID)-1 {
+			if g, ok := a.groupConvs[sessionID[idx+1:]]; ok && g {
+				isGroup = true
+				// 用解析出的纯群号发送（拼接串会导致 NapCat 拒绝）。
+				sessionID = sessionID[idx+1:]
+			}
+		}
+	}
 	a.mu.Unlock()
 
 	// Forward nodes cannot be mixed with normal segments: send each node via
@@ -409,7 +423,7 @@ func (a *Adapter) observeSendAction(action, echo string, ch chan map[string]inte
 			return
 		}
 		if _, err := parseActionResult(resp); err != nil {
-			logger.Warn("aiocqhttp: %s 返回失败: %v", action, err)
+			logger.Warn("aiocqhttp: %s 返回失败: %v (resp=%v)", action, err, resp)
 		}
 	case <-time.After(actionTimeout):
 		a.pendingMu.Lock()
@@ -536,6 +550,20 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logger.I18nInfo("反向 WebSocket 客户端已连接 (%s)", conn.RemoteAddr())
+
+	// 查询 bot 自身信息（get_login_info）以得到真实 QQ 号，供 @ 唤醒匹配
+	// （事件 self 字段缺失/占位为 config.id 时自愈）。
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if resp, err := a.CallActionCtx(ctx, "get_login_info", map[string]interface{}{}); err == nil {
+			if data, ok := resp["data"].(map[string]interface{}); ok {
+				if uid := toString(data["user_id"]); uid != "" {
+					a.setSelfID(uid)
+				}
+			}
+		}
+	}()
 
 	defer func() {
 		a.removeConn(conn)
@@ -779,11 +807,13 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 	}
 
 	// Track the bot's own ID from the event's self field so @-mentions of the
-	// bot can be detected by WakingCheckStage.
-	if a.getSelfID() == "" {
-		if self, ok := raw["self"].(map[string]interface{}); ok {
-			if id, ok := self["user_id"]; ok {
-				a.setSelfID(toString(id))
+	// bot can be detected by WakingCheckStage. Always override the config
+	// instance id placeholder with the real bot id when the event carries it
+	// (self.user_id), so @-wake compares like-for-like (QQ number vs number).
+	if self, ok := raw["self"].(map[string]interface{}); ok {
+		if id, ok := self["user_id"]; ok {
+			if sid := toString(id); sid != "" {
+				a.setSelfID(sid)
 			}
 		}
 	}

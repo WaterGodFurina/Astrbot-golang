@@ -732,7 +732,7 @@ var hostBaseDeps = []string{
 	"websockets", "apscheduler", "tenacity",
 	"openai", "anthropic", "dashscope",
 	"qq-botpy", "python-telegram-bot",
-	"cryptography", "qrcode", "packaging",
+"cryptography", "qrcode", "packaging", "pyjwt",
 	"jieba", "rank-bm25", "pydub", "openpyxl", "pypdf",
 	"click", "aiofiles",
 }
@@ -745,7 +745,7 @@ var hostDepProbes = []string{
 	"aiohttp", "httpx", "requests", "apscheduler", "tenacity",
 	"openai", "anthropic", "dashscope",
 	"pydantic", "yaml", "PIL", "deprecated", "docstring_parser", "markdown", "psutil",
-	"websockets", "cryptography", "qrcode", "packaging",
+	"websockets", "cryptography", "qrcode", "packaging", "jwt",
 	"jieba", "rank_bm25", "pydub", "openpyxl", "pypdf", "click", "aiofiles",
 	// qq-botpy 的 import 包名是 botpy；python-telegram-bot 是 telegram。
 	"botpy",
@@ -754,7 +754,7 @@ var hostDepProbes = []string{
 // baseDepsVersion 是宿主依赖清单（hostBaseDeps/hostDepProbes）的版本号：
 // 修改清单内容时手动 +1，触发既有 venv 的 environment.json 不匹配而重新
 // pip 安装（否则 venv 一旦 READY 就永久复用，清单变化不会生效）。
-const baseDepsVersion = 1
+const baseDepsVersion = 2
 
 const (
 	// envFileName 记录 venv 的供给来源（解释器 / SDK 版本 / 依赖清单版本）。
