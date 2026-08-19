@@ -13,12 +13,11 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
 var logger = log.GetDefault().WithComponent("BuiltinCommands")
-
-const version = "4.27.2-go"
 
 // Deps carries the dependencies needed by built-in commands.
 type Deps struct {
@@ -110,7 +109,7 @@ func reply(e *core.Event, text string) {
 
 func helpCmd(deps Deps, e *core.Event) {
 	lines := []string{
-		i18n.Get("AstrBot v%s(WebUI: 1.0.0-go)", version),
+		i18n.Get("AstrBot v%s(WebUI: 1.0.0-go)", version.Version),
 		i18n.Get("/help - 显示帮助"),
 		i18n.Get("/sid - 获取会话 ID 信息"),
 		i18n.Get("/reset - 重置 LLM 会话"),

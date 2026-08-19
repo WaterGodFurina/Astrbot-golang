@@ -7,6 +7,10 @@ on:
         description: '测试的 git 引用（分支/tag/SHA）。留空 = 当前分支'
         required: false
         default: ''
+      python_version:
+        description: 'AstrBot（Python）源版本号（跟随的 Python 版本，留空 = 4.27.3）'
+        required: false
+        default: ''
   push:
     branches:
       - test
@@ -96,17 +100,32 @@ jobs:
             **/TEST-*.xml
           if-no-files-found: ignore
 
+      - name: 计算版本号（version tag + python version）
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VER="${GITHUB_REF_NAME}"
+          else
+            VER="$(git describe --tags --abbrev=0 2>/dev/null || echo 'dev')"
+          fi
+          echo "version_tag=${VER}" >> "$GITHUB_OUTPUT"
+          echo "python_version=${PYTHON_VERSION:-4.27.3}" >> "$GITHUB_OUTPUT"
+          echo "构建版本: ${VER} / Python ${PYTHON_VERSION:-4.27.3}"
+        env:
+          PYTHON_VERSION: ${{ inputs.python_version }}
+
       - name: 编译 AstrBot（linux amd64 gnu，纯 Go 无 CGO）
         env:
           CGO_ENABLED: '0'
           GOOS: linux
           GOARCH: amd64
-        run: go build -trimpath -ldflags="-s -w" -o astrbot-linux-amd64 ./cmd/astrbot
+        run: go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ steps.ver.outputs.version_tag }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ steps.ver.outputs.python_version }}" -o astrbot-linux-amd64 ./cmd/astrbot
 
       - name: 校验编译产物
         run: |
           ls -la astrbot-linux-amd64
           file astrbot-linux-amd64
+          ./astrbot-linux-amd64 -h 2>&1 | grep "AstrBot Go"
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v5

@@ -27,6 +27,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
 // 上传/解压大小上限：防止认证用户通过超大 multipart 上传或高压缩比 zip
@@ -5539,8 +5540,8 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []st
 	switch sub {
 	case "check":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"version":        "4.27.2-go",
-			"latest_version": "4.27.2-go",
+			"version":        version.Version,
+			"latest_version": version.Version,
 			"has_update":     false,
 		}))
 	case "releases":

@@ -12,6 +12,7 @@ import (
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/lifecycle"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
 const logo = `
@@ -35,7 +36,7 @@ func main() {
 	log.GetDefault().SetLevel(log.ParseLevel(logLevel))
 
 	fmt.Print(logo)
-	fmt.Println("AstrBot Go - v1.0.0 (port from Python v4.27.2)")
+	fmt.Printf("AstrBot Go - %s (port from Python v%s)\n", version.Version, version.PythonVersion)
 	fmt.Println()
 
 	if *resetPassword {
