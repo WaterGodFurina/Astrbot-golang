@@ -125,7 +125,13 @@ jobs:
         run: |
           ls -la astrbot-linux-amd64
           file astrbot-linux-amd64
-          ./astrbot-linux-amd64 -h 2>&1 | grep "AstrBot Go"
+          ./astrbot-linux-amd64 > /tmp/astrbot-ver.txt 2>&1 &
+          PID=$!
+          sleep 3
+          kill "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+          cat /tmp/astrbot-ver.txt
+          grep "AstrBot Go" /tmp/astrbot-ver.txt
 
       - name: 上传编译产物
         uses: actions/upload-artifact@v5
