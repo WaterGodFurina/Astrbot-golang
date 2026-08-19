@@ -343,6 +343,20 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			if cfg == nil {
 				return map[string]any{}, nil
 			}
+			// 附带配置 schema（if available），SDK 侧 AstrBotConfig 提取
+			// __schema__ 挂到自身 schema 属性，使插件 __init__ 里
+			// self.config.schema 可访问（update_manager 等依赖此属性
+			// 动态填充 options/labels）。
+			if subMgr != nil {
+				id := subMgr.pluginConfigID(pluginName)
+				inst := subMgr.Get(id)
+				if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
+					var schema map[string]any
+					if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err == nil && schema != nil {
+						cfg["__schema__"] = schema
+					}
+				}
+			}
 			return cfg, nil
 		},
 		SetConfig: func(pluginName string, cfg map[string]any) error {

@@ -785,9 +785,36 @@ func (m *SubprocessManager) FlatSchema(id string) map[string]interface{} {
 // with a versioned id (astrbot-plugin-xxx-4.11.2-<commit>) sharing the same
 // name as an older Go plugin — the WebUI config dialog for the Python one
 // would otherwise show the Go plugin's schema (fewer/no hints).
+//
+// It first tries to pull the plugin's CURRENT config schema via the
+// GetConfigSchema RPC (plugins like update_manager refresh options/labels
+// at runtime). Falls back to the Register snapshot when the RPC is
+// unimplemented, times out, or returns empty.
 func (m *SubprocessManager) FlatSchemaByID(id string) map[string]interface{} {
 	inst := m.Get(id)
-	if inst == nil || inst.Meta == nil || len(inst.Meta.ConfigSchemaJson) == 0 {
+	if inst == nil {
+		return map[string]interface{}{}
+	}
+
+	// Try live schema from the plugin via GetConfigSchema RPC.
+	// Use a short timeout so a hung plugin does not block the UI.
+	if inst.Client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		raw, err := inst.Client.GetConfigSchema(ctx)
+		cancel()
+		if err == nil && len(raw) > 0 {
+			var schema map[string]interface{}
+			if json.Unmarshal(raw, &schema) == nil && schema != nil {
+				if props, ok := schema["properties"].(map[string]interface{}); ok {
+					schema = props
+				}
+				return normalizeSchema(schema)
+			}
+		}
+	}
+
+	// Fallback to the Register snapshot.
+	if inst.Meta == nil || len(inst.Meta.ConfigSchemaJson) == 0 {
 		return map[string]interface{}{}
 	}
 	var schema map[string]interface{}
