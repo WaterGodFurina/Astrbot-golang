@@ -69,6 +69,7 @@ jobs:
       - name: 安装中文字体（t2i 测试需要）
         # runner 在 Azure 云端，azure.archive.ubuntu.com 即本地镜像（最快），
         # 不要切国内源（跨国际网络反而更慢）。加超时+重试防偶发网络抖动。
+        timeout-minutes: 3
         run: |
           sudo apt-get update -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
           sudo apt-get install -y -q fonts-droid-fallback
