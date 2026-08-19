@@ -39,53 +39,15 @@ astrbot-go/
 
 本项目在基于AstrBot上，加入了一些opencode的Agent特性，使模型在执行Agent操作时不会重复执行
 
-## 插件 SDK
+## 插件方案
 
-SDK 是独立 module `github.com/WaterGodFurina/Astrbot-go-plugin-sdk`（作为依赖从 GitHub 拉取；开发时本地 clone 到 `~/astrbot-go-plugin-sdk`）。插件作者只需写一个 `main`，实现命令/过滤器/钩子。插件身份信息（名称/版本/描述/作者/仓库/是否 cgo）统一放在包根目录的 `metadata.json`，`main.go` 只保留代码逻辑：
+插件系统已全面采用子进程方案（go-plugin + gRPC），旧 `.so` 插件方案及其 `legacy_plugin_mode` 配置项已彻底移除，不再提供 `.so` 加载路径。
 
-```go
-package main
+为了兼容原项目AstrBot的插件，本项目通过gRPC+Python SDK实现了对原项目AstrBot插件的兼容（已知问题：一个插件占用运存80MB，因为gRPC方案是让插件相互独立）
 
-import (
-    sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-)
+通过zip包内的main.go / main.py进行插件类型识别，利用插件id将Python插件和Go插件进行区分
 
-func main() {
-    sdk.Serve(&sdk.Plugin{
-        OnLoad: setup, // 启动钩子，可在里面动态注册
-    })
-}
-```
-
-```json
-{
-  "name": "echo",
-  "desc": "Echoes your message back",
-  "author": "AstrBot Devs",
-  "version": "1.0.0",
-  "repo": "https://github.com/AstrBotDevs/AstrBot",
-  "cgo": false
-}
-```
-
-插件包（zip/Git 仓库）根目录**必须**包含 `metadata.json` 与 `main.go`，缺任一即安装失败。`cgo` 字段声明该插件是否需要 C 编译器：为空/缺省视为 `false`（纯 Go，`CGO_ENABLED=0`）。
-
-命令处理函数可以拆到独立文件，通过 `setup()`（OnLoad 钩子）或 `init()` 注册：
-
-```go
-func setup() error {
-    sdk.RegisterCommand(sdk.Command{
-        Name:    "echo",
-        Aliases: []string{"repeat"},
-        Handler: func(e *sdk.Event, args []string) (string, error) {
-            return strings.Join(args, " "), nil
-        },
-    })
-    return nil
-}
-```
-
-SDK 也支持声明式写法（直接在 `sdk.Plugin{Commands: []sdk.Command{...}}` 里声明），两者等价。
+## Go 插件 SDK
 
 ### 自带 Go 工具链
 
@@ -125,17 +87,21 @@ cgo 插件的 C 编译器（zig/clang/GCC）也存放在同一私有目录下（
 5. **Termux（Android）**：官方没有 Android 的 Go 包，需先 `pkg install golang` 再设 `ASTRBOT_GO_BIN` 指向它，或手动安装 Go；cgo 插件需 `pkg install clang`（Termux 无官方 zig 包）。
 6. **cgo 编译器下载中断安全**：下载缓存于 `~/.local/share/astrbot-go/clang-download/`，支持断点续传（HTTP Range）；解压前写 `.install-lock`，若上次安装被中断，下次会自动丢弃半成品并重新下载。
 
+## Python 插件 SDK
+
+为兼容 AstrBot 生态，Python 插件经独立 module `github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk` 通过 gRPC 桥接进宿主（`data/plugins/<id>/` 存本体、`data/plugins-src/` 源码、`python-venv-*` 运行时环境）：
+
+- **插件兼容**：直接安装 AstrBot 市场的 Python 插件（zip/Git 源），`requirements.txt` 自动装依赖，`_conf_schema.json` 配置 schema 渲染 WebUI 配置面板
+- **API 对齐**：`astrbot.api.*`（star/filter/event/message_components/sp）、`astrbot.core.*`（Context 管理器 / Provider / star_manager / session_waiter / version_comparator 等）对齐 Python AstrBot v4.27.3
+- **能力桥接**：`Context.get_all_stars/get_all_providers` 等经宿主 RPC 反向调用；`session_waiter` 跨进程喂入（宿主 `SessionWaitStage` → `FeedSessionWait` → `try_trigger`）
+
 ### 安装与热重载
 
 - WebUI「安装插件」支持上传 `.zip` 归档或填 Git/归档 URL
-- 插件包根目录须含 `metadata.json`（身份/cgo 声明）与 `main.go`（入口），缺任一安装失败
-- 安装 = 下载源码 → 校验 metadata.json + main.go → 静态扫描 → （如需 cgo 则选择/下载 C 编译器）→ 编译 → 启动子进程 → 桥接进管线
-- 安装后把 metadata.json 内容写入 `data/plugins_config/<name>/config.json` 开头，供 WebUI 展示插件信息
+- 插件包根目录须含 `metadata.json`（身份/cgo 声明） / `metadata.yaml`（Python插件信息） 与 `main.go` / `main.py` （入口），缺任一安装失败
+- 安装 = 下载源码 → 校验 metadata 文件 + main 文件 → 静态扫描 → （如需 cgo 则选择/下载 C 编译器）→ 编译 （Python插件直接安装）→ 启动子进程 → 桥接进管线
+- 安装后把 metadata 内容写入 `data/plugins_config/<name>/config.json` 开头，供 WebUI 展示插件信息
 - 崩溃自动重启（带退避与次数上限）；重载零停机（先起新进程再杀旧进程）
-
-## 插件方案
-
-插件系统已全面采用子进程方案（go-plugin + gRPC），旧 `.so` 插件方案及其 `legacy_plugin_mode` 配置项已彻底移除，不再提供 `.so` 加载路径。
 
 ## 平台适配器
 
@@ -206,7 +172,7 @@ go test ./... -v
 
 ## 代码规模
 
-- 317 个 Go 文件（非测试 203，测试 114，56 个包）
-- 约 97,900 行（核心代码 ~73,900 行 + 测试 ~24,000 行）
-- 18 个平台适配器 + 14 类 LLM Provider 能力
+- 341 个 Go 文件（非测试 216，测试 125，53 个包）
+- 约 107,154 行（核心代码 ~79,701 行 + 测试 ~27,453 行）
+- 18 个平台适配器 + 14 类 LLM Provider 能力（Chat 14 / TTS 9 / STT 2 / Embedding 5 / Rerank 5）
 - 对齐 Python AstrBot v4.27.3 全平台全核心架构

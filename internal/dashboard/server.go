@@ -34,6 +34,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
 //go:embed web/dist/*
@@ -313,7 +314,7 @@ func (s *Server) setupRoutes() {
 func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "ok",
-		"version": "1.0.0-go",
+		"version": version.Version,
 	})
 }
 
@@ -658,9 +659,9 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 	switch parts[0] {
 	case "version":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"version":           "4.27.2-go",
-			"dashboard_version": "1.0.0-go",
-			"python_version":    "go1.23",
+			"version":           version.Version,
+			"dashboard_version": version.Version,
+			"python_version":    version.PythonVersion,
 		}))
 	case "versions":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{

@@ -11,6 +11,10 @@ on:
         description: '覆盖 Go 版本（留空 = 自动读取 go.mod，保持同步）'
         required: false
         default: ''
+      python_version:
+        description: 'AstrBot（Python）源版本号（跟随的 Python 版本，留空 = 4.27.3）'
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
@@ -63,7 +67,8 @@ jobs:
       kind: ${{ steps.meta.outputs.kind }}
       ref: ${{ steps.meta.outputs.ref }}
       version: ${{ steps.meta.outputs.version }}
-      go_version: ${{ steps.meta.outputs.go_version }}
+      go_version: ${{ steps.gomod.outputs.go_version }}
+      python_version: ${{ steps.pymeta.outputs.python_version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -77,6 +82,15 @@ jobs:
           ver=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' go.mod | head -1)
           echo "go_version=${ver}" >> "$GITHUB_OUTPUT"
           echo "go.mod Go 版本: ${ver}"
+
+      - name: 读取 AstrBot（Python）源版本
+        id: pymeta
+        run: |
+          ver="${PYTHON_VERSION:-4.27.3}"
+          echo "python_version=${ver}" >> "$GITHUB_OUTPUT"
+          echo "AstrBot Python 源版本: ${ver}"
+        env:
+          PYTHON_VERSION: ${{ inputs.python_version }}
 
       - name: 探测最新 release 版本（GitHub API，不绑定特定版本号）
         id: meta
@@ -153,7 +167,7 @@ jobs:
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
-        run: go build -trimpath -ldflags="-s -w" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
+        run: go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ needs.release-meta.outputs.version }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ needs.release-meta.outputs.python_version }}" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
 
       - name: 打包 zip（Windows）
         if: runner.os == 'Windows'
