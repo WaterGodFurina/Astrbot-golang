@@ -191,6 +191,9 @@ jobs:
           go env -w GOPROXY="https://goproxy.cn,direct"
           go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
 
+      - name: 重建 go.sum（引用最新 Go SDK，与 go.mod 对齐）
+        run: go mod tidy
+
       - name: 安装静态分析工具
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@latest
@@ -245,6 +248,18 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
+
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: 重建 go.sum（引用最新 Go SDK，CodeQL autobuild 依赖）
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GOFLAGS: -mod=mod
+        run: go mod tidy
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
