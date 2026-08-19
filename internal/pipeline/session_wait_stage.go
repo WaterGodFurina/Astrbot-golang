@@ -54,7 +54,6 @@ func (s *SessionWaitStage) Process(ctx context.Context, event *core.Event) (*Sta
 	// 还原插件侧完整键（平台实例 id + 消息类型 + 会话 id）。
 	pythonUMO := event.PythonUMO()
 	targets := s.subPlugins.SessionWaitForUmo(pythonUMO)
-	logger.I18nInfo("SessionWaitStage umo=%s（Python=%s）命中等待 %d 条", umo, pythonUMO, len(targets))
 	if len(targets) == 0 {
 		return &StageResult{Continue: true}, nil
 	}
@@ -74,7 +73,6 @@ func (s *SessionWaitStage) Process(ctx context.Context, event *core.Event) (*Sta
 		rpcCtx, rpcCancel := context.WithTimeout(ctx, pluginRPCTimeout)
 		handled, err := inst.Client.FeedSessionWait(rpcCtx, eventJSON)
 		rpcCancel()
-		logger.I18nInfo("SessionWaitStage 推送 %s 到 %s: handled=%v err=%v", t.WaitID, t.PluginName, handled, err)
 		if err != nil {
 			// UNIMPLEMENTED：旧版插件（编译时不带 FeedSessionWait RPC）
 			// 视为无等待，静默跳过。
@@ -85,7 +83,6 @@ func (s *SessionWaitStage) Process(ctx context.Context, event *core.Event) (*Sta
 			continue
 		}
 		if handled {
-			logger.I18nInfo("插件 %s 的会话等待 %s 已消费事件 %q", t.PluginName, t.WaitID, event.MessageStr)
 			// 事件已被会话等待消费：停止管线（插件已在等待回调中处理）。
 			return &StageResult{Continue: false}, nil
 		}
