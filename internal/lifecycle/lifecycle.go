@@ -887,6 +887,7 @@ func (l *Lifecycle) RebridgePlugins() {
 	star.RemovePluginCommands(l.starMgr)
 	star.RemovePluginFilters(l.starMgr)
 	star.RemovePluginHooks(l.starMgr)
+	star.RemovePluginMetadata(l.starMgr)
 	if l.subPluginMgr != nil {
 		star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.List())
 	}

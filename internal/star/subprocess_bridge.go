@@ -273,6 +273,25 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 		logger.I18nInfo("子进程插件 %s 已注册到流水线（%d 个命令，%d 个过滤器，%d 个钩子）",
 			inst.Name, len(meta.Commands), len(meta.Filters), len(meta.Hooks))
 	}
+
+	// 把插件元数据注册进 star 注册表，使其能被宿主插件管理 RPC（如
+	// HostService.ListStars / Context.get_all_stars）枚举到——否则
+	// update_manager 等依赖 get_all_stars 的管理类插件拿到空列表。
+	// 幂等：reload 时按 module path 查找，已存在则跳过（避免重复条目）。
+	modulePath := "data.plugins." + inst.ID
+	if starMgr.Registry().Get(modulePath) == nil {
+		starMgr.Registry().Register(&StarMetadata{
+			Name:               inst.Name,
+			Author:             meta.Author,
+			Desc:               meta.Description,
+			ShortDesc:          meta.Description,
+			Version:            meta.Version,
+			Repo:               "",
+			StarModulePath:     modulePath,
+			Activated:          true,
+			SupportedPlatforms: nil,
+		})
+	}
 }
 
 // CoreEventToSDK converts a host core.Event into the SDK's serializable Event
@@ -427,6 +446,16 @@ func RemovePluginCommands(starMgr *Manager) {
 			starMgr.Handlers().Remove(h.HandlerFullName)
 		}
 	}
+}
+
+// RemovePluginMetadata removes all subprocess-plugin StarMetadata entries
+// (module path prefix "data.plugins.") so re-bridging starts from a clean
+// registry.
+func RemovePluginMetadata(starMgr *Manager) {
+	if starMgr == nil || starMgr.Registry() == nil {
+		return
+	}
+	starMgr.Registry().RemoveByPrefix("data.plugins.")
 }
 
 // RemovePluginFilters removes all subprocess-plugin filter handlers from the
