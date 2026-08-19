@@ -1916,8 +1916,8 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		// 单插件休眠开关：POST {plugin_id, allow_sleep: bool}。allow_sleep=true
 		// 表示该插件允许闲置自动休眠；false = 常驻（不参与清扫）。
 		var body struct {
-			PluginID  string `json:"plugin_id"`
-			AllowSleep bool  `json:"allow_sleep"`
+			PluginID   string `json:"plugin_id"`
+			AllowSleep bool   `json:"allow_sleep"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if s.subPluginMgr != nil {

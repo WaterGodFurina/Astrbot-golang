@@ -264,7 +264,7 @@ type toolRegEntry struct {
 }
 
 // setPluginTools 用插件的最新工具列表整体替换该插件在注册表中的条目
-//（RefreshTools 成功后调用；同一插件旧工具名被清除）。
+// （RefreshTools 成功后调用；同一插件旧工具名被清除）。
 func (m *SubprocessManager) setPluginTools(id string, tools []*sdkv1.ToolDesc) {
 	m.toolRegMu.Lock()
 	defer m.toolRegMu.Unlock()
@@ -1373,7 +1373,7 @@ func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.R
 // pythonEnvUsable 校验缓存的 Python 运行时仍可用：解释器文件与 SDK 目录
 // 必须存在。只做轻量 stat 检查（不跑 import 探测），覆盖 venv 缓存被外部
 // 清理的场景；不通过时调用方丢弃缓存走 PrepareRuntimeWithStage 全量重建
-//（EnsureVenv 会重建 venv 并重装宿主依赖）。
+// （EnsureVenv 会重建 venv 并重装宿主依赖）。
 func pythonEnvUsable(env *pysdk.RuntimeEnv) bool {
 	if env == nil {
 		return false
@@ -1752,7 +1752,7 @@ func (m *SubprocessManager) migrateLegacyMetadataConfigs(man *Manifest) {
 }
 
 // migratePluginLayout 把旧版目录布局迁移到"统一 plugins/ + 按实例 id
-//（name_language）分键"的新布局：
+// （name_language）分键"的新布局：
 //
 //	plugins-src/<id>      → plugins/<id>        （Python 源码本体）
 //	plugins_config/<name> → plugins_config/<id> （配置/元数据/schema，Go/Python 隔离）
@@ -1914,7 +1914,7 @@ func (m *SubprocessManager) movePluginDir(oldSub, newSub string) bool {
 // SEGMENT became <newID> (e.g. "data/plugins-bin/box/box-linux-amd64" →
 // "data/plugins-bin/box_go/box-linux-amd64"). 只匹配完整路径段（前后为 /
 // 或串首尾），避免把以 id 为前缀的产物文件名（box-linux-amd64）一并改写
-//（磁盘上的文件并未改名，只是目录被移动）。
+// （磁盘上的文件并未改名，只是目录被移动）。
 func rewritePluginIDPath(path, oldID, newID string) string {
 	if path == "" {
 		return path
@@ -1932,7 +1932,7 @@ func rewritePluginIDPath(path, oldID, newID string) string {
 
 // copyMissingDocs copies doc files (README.md/logo 等) from src into dst,
 // skipping files that already exist in dst. 用于旧文档缓存目录并入源码目录
-//（源码树内同名文件优先保留）。
+// （源码树内同名文件优先保留）。
 func copyMissingDocs(src, dst string) {
 	entries, err := os.ReadDir(src)
 	if err != nil {
@@ -1958,7 +1958,7 @@ func copyMissingDocs(src, dst string) {
 }
 
 // isDocFileName reports whether the file is a cached plugin doc/logo name
-//（旧文档缓存目录只放这些文件）。
+// （旧文档缓存目录只放这些文件）。
 func isDocFileName(name string) bool {
 	switch strings.ToLower(name) {
 	case "readme.md", "changelog.md", "logo.png", "logo.jpg", "logo.jpeg", "logo.gif", "icon.png", "config_schema.json":

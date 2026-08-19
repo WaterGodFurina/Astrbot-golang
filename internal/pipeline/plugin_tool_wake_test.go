@@ -46,7 +46,7 @@ func TestPluginToolWakesIdlePlugin(t *testing.T) {
 
 	s := &ProcessStage{subPlugins: m}
 	event := &core.Event{
-		Source: core.EventSource{Platform: "test", ConvID: "c1", SenderID: "u1"},
+		Source:     core.EventSource{Platform: "test", ConvID: "c1", SenderID: "u1"},
 		MessageStr: "x",
 	}
 	text, handled := s.executePluginTool(event, "echo_tool", map[string]interface{}{"text": "hi"})

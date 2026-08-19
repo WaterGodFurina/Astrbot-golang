@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	sdkfs "github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk/sdkfs"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	sdkfs "github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk/sdkfs"
 )
 
 var logger = log.GetDefault().WithComponent("PySDK")
@@ -732,7 +732,7 @@ var hostBaseDeps = []string{
 	"websockets", "apscheduler", "tenacity",
 	"openai", "anthropic", "dashscope",
 	"qq-botpy", "python-telegram-bot",
-"cryptography", "qrcode", "packaging", "pyjwt",
+	"cryptography", "qrcode", "packaging", "pyjwt",
 	"jieba", "rank-bm25", "pydub", "openpyxl", "pypdf",
 	"click", "aiofiles",
 }

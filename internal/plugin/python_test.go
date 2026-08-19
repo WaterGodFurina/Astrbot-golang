@@ -218,7 +218,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 // venv 被外部清理（如 ~/.cache 被系统回收、用户手动删除）后，再次解析必须
 // 丢弃失效缓存并重建 venv——否则插件闲置休眠后工具调用唤醒（EnsureLoaded →
 // startInstance → pythonRuntime）会拿一个不存在的解释器启动子进程
-//（"python-venv-xxx/bin/python 路径不存在"），LLM 工具调用随之失败。
+// （"python-venv-xxx/bin/python 路径不存在"），LLM 工具调用随之失败。
 func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
 	if pysdk.DiscoverPythonBin() == "" {
 		t.Skip("python3 不可用")

@@ -74,12 +74,12 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		// ID()/Type() 注册与解析（Send/React/resolveAdapter 回退按 Type），
 		// 缺失会导致插件经 HostService.SendMessage 发送时
 		// "platform %q not found"（box 等 OneBot 插件回发失败）。
-		BaseAdapter: *platform.NewBaseAdapter(id, "aiocqhttp"),
-		EventBus:    eventBus,
-		conns:       make(map[*websocket.Conn]struct{}),
-		connWriteMu: make(map[*websocket.Conn]*sync.Mutex),
-		groupConvs:  make(map[string]bool),
-		pending:     make(map[string]chan map[string]interface{}),
+		BaseAdapter:    *platform.NewBaseAdapter(id, "aiocqhttp"),
+		EventBus:       eventBus,
+		conns:          make(map[*websocket.Conn]struct{}),
+		connWriteMu:    make(map[*websocket.Conn]*sync.Mutex),
+		groupConvs:     make(map[string]bool),
+		pending:        make(map[string]chan map[string]interface{}),
 		allowedOrigins: parseOriginList(config["ws_reverse_origins"]),
 	}
 	a.upgrader = websocket.Upgrader{

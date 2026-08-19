@@ -61,7 +61,7 @@ type RecallAdapter interface {
 }
 
 // pluginConfigID 把 HostService 反调用携带的插件注册名解析为实例 id
-//（配置目录按 id = name_language 分键）。先查运行中实例（RPC 调用者必然
+// （配置目录按 id = name_language 分键）。先查运行中实例（RPC 调用者必然
 // 是运行中的），未命中回退 manifest 首条同名条目；都没有则返回原名作为
 // 目录键兜底（兼容无 manifest 的测试/旧布局）。
 func (m *SubprocessManager) pluginConfigID(name string) string {
@@ -103,15 +103,15 @@ func serializeConversation(conv *conversation.Conversation) map[string]any {
 		return nil
 	}
 	return map[string]any{
-		"cid":                 conv.CID,
-		"user_id":             conv.UserID,
-		"platform_id":         conv.PlatformID,
-		"unified_msg_origin":  conv.UnifiedMsgOrigin,
-		"persona_id":          conv.Persona,
-		"title":               conv.Title,
-		"created_at":          conv.CreatedAt,
-		"updated_at":          conv.UpdatedAt,
-		"is_deleted":          conv.IsDeleted,
+		"cid":                conv.CID,
+		"user_id":            conv.UserID,
+		"platform_id":        conv.PlatformID,
+		"unified_msg_origin": conv.UnifiedMsgOrigin,
+		"persona_id":         conv.Persona,
+		"title":              conv.Title,
+		"created_at":         conv.CreatedAt,
+		"updated_at":         conv.UpdatedAt,
+		"is_deleted":         conv.IsDeleted,
 	}
 }
 

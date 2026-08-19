@@ -15,17 +15,17 @@ import (
 
 // vmCounters mirrors PROCESS_MEMORY_COUNTERS_EX (x64 layout).
 type vmCounters struct {
-	PeakVirtualSize              uintptr
-	VirtualSize                  uintptr
-	PageFaultCount               uint32
-	PeakWorkingSetSize           uintptr
-	WorkingSetSize               uintptr
-	QuotaPeakPagedPoolUsage      uintptr
-	QuotaPagedPoolUsage          uintptr
-	QuotaPeakNonPagedPoolUsage   uintptr
-	QuotaNonPagedPoolUsage       uintptr
-	PagefileUsage                uintptr
-	PeakPagefileUsage            uintptr
+	PeakVirtualSize            uintptr
+	VirtualSize                uintptr
+	PageFaultCount             uint32
+	PeakWorkingSetSize         uintptr
+	WorkingSetSize             uintptr
+	QuotaPeakPagedPoolUsage    uintptr
+	QuotaPagedPoolUsage        uintptr
+	QuotaPeakNonPagedPoolUsage uintptr
+	QuotaNonPagedPoolUsage     uintptr
+	PagefileUsage              uintptr
+	PeakPagefileUsage          uintptr
 }
 
 // processRSSBytes returns the working set size of the given process in bytes,

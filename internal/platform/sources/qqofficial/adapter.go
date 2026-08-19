@@ -782,7 +782,7 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 			sessionID = groupOpenID
 		}
 	}
-a.mu.Unlock()
+	a.mu.Unlock()
 	plainText, imageRef, fileRef, fileName, fileType := extractSendParts(chain)
 
 	switch scene {
