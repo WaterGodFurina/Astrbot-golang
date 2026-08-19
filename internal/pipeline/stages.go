@@ -230,6 +230,11 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 			apiKeyAllowAdminRole = b
 		}
 	}
+	// 平台已标记管理员（如 QQ 群 owner/admin member_role）时直接保留，
+	// 不依赖 admins_id 配置。
+	if apiKeyAllowAdminRole && event.Source.IsAdmin {
+		event.Role = "admin"
+	}
 	if apiKeyAllowAdminRole {
 		for _, adminID := range s.adminsID {
 			if event.Source.SenderID == adminID {

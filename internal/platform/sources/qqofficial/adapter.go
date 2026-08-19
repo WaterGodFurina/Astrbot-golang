@@ -528,7 +528,7 @@ func (a *Adapter) handleMessage(d map[string]interface{}, scene string) {
 	chain = append(chain, a.parseAttachments(d)...)
 
 	a.remember(scene, senderOpenID, msgID)
-	a.publish(senderOpenID, senderName, senderOpenID, false, plain, msgID, chain, d)
+	a.publish(senderOpenID, senderName, senderOpenID, false, plain, msgID, chain, d, "")
 }
 
 // handleGroupMessage parses and publishes a group message.
@@ -538,10 +538,14 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 	msgID, _ := d["id"].(string)
 	msgType, _ := d["message_type"].(float64)
 
-	var memberOpenID, senderName string
+	var memberOpenID, senderName, memberRole string
 	if author, ok := d["author"].(map[string]interface{}); ok {
 		memberOpenID, _ = author["member_openid"].(string)
 		senderName, _ = author["username"].(string)
+		// member_role identifies the sender's group role
+		// ("member"/"admin"/"owner") so the host can mark group admins and
+		// owners as admin without a preconfigured admins_id entry.
+		memberRole, _ = author["member_role"].(string)
 	}
 
 	// extract bot mentions
@@ -591,7 +595,7 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 	chain = append(chain, a.parseAttachments(d)...)
 
 	a.remember("group", groupOpenID, msgID)
-	a.publish(memberOpenID, senderName, groupOpenID, true, plain, msgID, chain, d)
+	a.publish(memberOpenID, senderName, groupOpenID, true, plain, msgID, chain, d, memberRole)
 }
 
 // handleChannelMessage parses and publishes a guild (@) message.
@@ -619,7 +623,7 @@ func (a *Adapter) handleChannelMessage(d map[string]interface{}) {
 	chain = append(chain, &message.Plain{Text: plain})
 
 	a.remember("channel", channelID, msgID)
-	a.publish(authorID, authorName, channelID, true, plain, msgID, chain, d)
+	a.publish(authorID, authorName, channelID, true, plain, msgID, chain, d, "")
 }
 
 // handleDirectMessage parses and publishes a direct (DM) message.
@@ -638,7 +642,7 @@ func (a *Adapter) handleDirectMessage(d map[string]interface{}) {
 	chain = append(chain, &message.Plain{Text: plain})
 
 	a.remember("friend", authorID, msgID)
-	a.publish(authorID, authorName, authorID, false, plain, msgID, chain, d)
+	a.publish(authorID, authorName, authorID, false, plain, msgID, chain, d, "")
 }
 
 // buildQuotedReply builds a Reply component from a quoted message (message_type 103).
@@ -694,7 +698,7 @@ func (a *Adapter) remember(scene, convID, msgID string) {
 	a.mu.Unlock()
 }
 
-func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}) {
+func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}, role string) {
 	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q (msg_id=%s)", convID, isGroup, msgStr, msgID)
 	// Deduplicate identical msg_id re-deliveries within a short window (the QQ
 	// official WS may redeliver the same event after a reconnect/retry).
@@ -732,6 +736,10 @@ func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msg
 	msgObj.Message = chain
 	msgObj.MessageStr = msgStr
 	msgObj.RawMessage = raw
+	// owner/admin 群角色标记为管理员（无须预配置 admins_id）。
+	if isGroup && (role == "owner" || role == "admin") {
+		msgObj.IsAdmin = true
+	}
 	_ = a.PublishEvent(msgStr, msgObj)
 }
 
