@@ -11,7 +11,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 -- sha1 为企业微信 msg_signature 签名（协议要求），非密码学哈希用途
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -75,6 +75,7 @@ func decodeAESKey(s string) ([]byte, error) {
 func (c *WXBizMsgCrypt) GetSignature(timestamp, nonce, encrypt string) string {
 	arr := []string{c.token, timestamp, nonce, encrypt}
 	sort.Strings(arr)
+	// #nosec G401 -- sha1 为企业微信签名协议要求的签名算法（msg_signature），非密码学哈希用途
 	sum := sha1.Sum([]byte(strings.Join(arr, "")))
 	return hex.EncodeToString(sum[:])
 }
@@ -89,6 +90,8 @@ func (c *WXBizMsgCrypt) Encrypt(raw string) (string, error) {
 	buf := make([]byte, 0, 16+4+len(content)+len(c.receiveID))
 	buf = append(buf, random...)
 	var lenBytes [4]byte
+	// 明文长度写入 4 字节网络字节序字段（协议要求 uint32）。明文为普通
+	// 回调消息，远小于 4GiB，uint32 转换不可能溢出，故无需边界校验。
 	binary.BigEndian.PutUint32(lenBytes[:], uint32(len(content)))
 	buf = append(buf, lenBytes[:]...)
 	buf = append(buf, content...)
@@ -100,6 +103,7 @@ func (c *WXBizMsgCrypt) Encrypt(raw string) (string, error) {
 		return "", err
 	}
 	out := make([]byte, len(padded))
+	// #nosec G407 -- IV 为企业微信协议固定的"密钥前 16 字节"派生值，非可配置的硬编码 IV
 	cipher.NewCBCEncrypter(block, c.key[:16]).CryptBlocks(out, padded)
 	return base64.StdEncoding.EncodeToString(out), nil
 }
@@ -135,6 +139,7 @@ func (c *WXBizMsgCrypt) Decrypt(encrypted string) (string, error) {
 		return "", ErrBadPadding
 	}
 	contentLenUint := binary.BigEndian.Uint32(pt[16:20])
+	// 对端声明的明文长度必须落在剩余字节范围内（len(pt)-20 已确保非负）。
 	if contentLenUint > uint32(len(pt)-20) {
 		return "", ErrBadPadding
 	}
@@ -200,5 +205,6 @@ func pkcs7Encode(data []byte, blockSize int) []byte {
 	if amount == 0 {
 		amount = blockSize
 	}
+	// amount 取值范围为 [1, blockSize]（此处 blockSize=32），byte(amount) 不会溢出。
 	return append(data, bytes.Repeat([]byte{byte(amount)}, amount)...)
 }

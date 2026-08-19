@@ -167,7 +167,7 @@ func resolveComponentFile(path, file, url, b64, suffix string) (string, error) {
 			return "", fmt.Errorf("base64 解码媒体失败: %w", err)
 		}
 		tmp := fmt.Sprintf("%s/astrbot_wecom_%d%s", os.TempDir(), time.Now().UnixNano(), suffix)
-		if err := os.WriteFile(tmp, raw, 0644); err != nil {
+		if err := os.WriteFile(tmp, raw, 0600); err != nil {
 			return "", err
 		}
 		return tmp, nil
@@ -202,5 +202,5 @@ func downloadToFile(ctx context.Context, url, dest string) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dest, data, 0644)
+	return os.WriteFile(dest, data, 0600)
 }

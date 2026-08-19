@@ -88,9 +88,11 @@ func (l *logLevels) SetPluginLogLevel(id, level string) bool {
 	if err != nil {
 		return false
 	}
+	// #nosec G301 -- 插件日志级别状态目录
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
 		return false
 	}
+	// #nosec G306 -- 日志级别配置非常规敏感信息
 	if err := os.WriteFile(l.path, out, 0o644); err != nil {
 		return false
 	}

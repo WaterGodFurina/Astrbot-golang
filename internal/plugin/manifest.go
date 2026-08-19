@@ -55,7 +55,7 @@ type ManifestEntry struct {
 
 // LoadManifest reads a manifest file, tolerating absence.
 func LoadManifest(path string) (*Manifest, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- 读取插件自身 manifest（安装时写入的固定路径）
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &Manifest{Version: 1}, nil
@@ -88,15 +88,15 @@ func (m *Manifest) Save(path string) error {
 	committed := false
 	defer func() {
 		if !committed {
-			os.Remove(tmpName)
+			_ = os.Remove(tmpName)
 		}
 	}()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("write temp: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("sync temp: %w", err)
 	}
 	if err := tmp.Close(); err != nil {

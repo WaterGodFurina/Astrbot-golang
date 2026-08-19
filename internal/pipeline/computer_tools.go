@@ -158,17 +158,6 @@ func sandboxGrep(ctx context.Context, mgr *sandbox.Manager, pattern, path string
 // When provider_settings.computer_use_runtime == "local", these tools are
 // injected into the LLM request so skills can actually be executed on the host.
 
-// localToolNames lists the tools exposed by the local computer-use runtime.
-var localToolNames = []string{
-	"astrbot_execute_shell",
-	"astrbot_shell_session",
-	"astrbot_execute_python",
-	"astrbot_file_read_tool",
-	"astrbot_file_write_tool",
-	"astrbot_file_edit_tool",
-	"astrbot_grep_tool",
-}
-
 // workspaceRoot returns the per-conversation workspace directory used as the
 // cwd for shell/python tools and the base for relative file paths.
 //
@@ -181,7 +170,7 @@ func workspaceRoot(umo string) string {
 	if abs, err := filepath.Abs(dir); err == nil {
 		dir = abs
 	}
-	_ = os.MkdirAll(dir, 0755)
+	_ = os.MkdirAll(dir, 0o750)
 	return dir
 }
 
@@ -650,7 +639,7 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 		return "Error executing command: `command` must be a non-empty string."
 	}
 	ws := workspaceRoot(umo)
-	_ = os.MkdirAll(ws, 0755)
+	_ = os.MkdirAll(ws, 0o750)
 
 	if timeout <= 0 {
 		timeout = 300
@@ -666,9 +655,9 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 
 	if background {
 		logDir := filepath.Join(ws, ".astrbot")
-		_ = os.MkdirAll(logDir, 0755)
+		_ = os.MkdirAll(logDir, 0o750)
 		outFile := filepath.Join(logDir, "astrbot_shell_stdout_"+randHex(4)+".log")
-		f, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		f, err := os.OpenFile(outFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
 			return "Error executing command: " + err.Error()
 		}
@@ -676,9 +665,9 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 		cmd.Stderr = f
 		stdin, stdinErr := cmd.StdinPipe()
 		if err := cmd.Start(); err != nil {
-			f.Close()
+			_ = f.Close()
 			if stdin != nil {
-				stdin.Close()
+				_ = stdin.Close()
 			}
 			return "Error executing command: " + err.Error()
 		}
@@ -705,7 +694,7 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 			if stdin != nil {
 				_ = stdin.Close()
 			}
-			f.Close()
+			_ = f.Close()
 			ses.exitMu.Lock()
 			ses.done = true
 			ses.success = err == nil
@@ -943,10 +932,10 @@ func executeFileWrite(path, content, umo string) string {
 	if err != nil {
 		return "Error writing file: " + err.Error()
 	}
-	if err := os.MkdirAll(filepath.Dir(resolved), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(resolved), 0o750); err != nil {
 		return "Error writing file: " + err.Error()
 	}
-	if err := os.WriteFile(resolved, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(resolved, []byte(content), 0o600); err != nil {
 		return "Error writing file: " + err.Error()
 	}
 	return "File written successfully: " + resolved
@@ -977,7 +966,7 @@ func executeFileEdit(path, old, new string, replaceAll bool, umo string) string 
 		replacements = 1
 		content = content[:idx] + new + content[idx+len(old):]
 	}
-	if err := os.WriteFile(resolved, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(resolved, []byte(content), 0o600); err != nil {
 		return "Error editing file: " + err.Error()
 	}
 	modeText := "first match"

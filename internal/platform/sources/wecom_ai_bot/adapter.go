@@ -189,7 +189,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 			logger.I18nInfo("企业微信智能机器人 已启用统一 Webhook 模式, webhook_uuid=%s", webhookUUID)
 		} else {
 			if a.server == nil {
-				return fmt.Errorf("Webhook 服务器未初始化")
+				return fmt.Errorf("webhook 服务器未初始化")
 			}
 			logger.I18nInfo("启动企业微信智能机器人适配器，监听 %s:%d", a.host, a.port)
 			if err := a.server.Start(); err != nil {
@@ -528,7 +528,7 @@ func (a *Adapter) convertMessage(payload *QueueItem) *platform.AstrBotMessage {
 
 	// 需要下载解密的图片 URL 列表
 	var imgURLs [][2]string
-	msgItems := []interface{}{}
+	var msgItems []interface{}
 
 	if msgtype == MSGTypeText {
 		content = (WecomAIBotMessageParser{}).ParseTextMessage(messageData)
@@ -659,6 +659,7 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "wecom_ai_bot",
+			PlatformID: a.ID(),
 			SelfID:     abm.SelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

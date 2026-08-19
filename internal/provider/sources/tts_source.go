@@ -93,11 +93,14 @@ func (s *OpenAITTSSource) GetAudio(ctx context.Context, text string) (string, er
 		return "", err
 	}
 	if _, err := io.Copy(f, resp.Body); err != nil {
-		f.Close()
-		os.Remove(path)
+		_ = f.Close()
+		_ = os.Remove(path)
 		return "", err
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
 	return path, nil
 }
 

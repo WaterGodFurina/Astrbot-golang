@@ -645,6 +645,7 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "kook",
+			PlatformID: a.ID(),
 			SelfID:     a.client.BotID(),
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,
@@ -861,11 +862,11 @@ func saveBase64ToTemp(b64 string) string {
 	}
 	name := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(name)
+		_ = tmp.Close()
+		_ = os.Remove(name)
 		return ""
 	}
-	tmp.Close()
+	_ = tmp.Close()
 	return name
 }
 

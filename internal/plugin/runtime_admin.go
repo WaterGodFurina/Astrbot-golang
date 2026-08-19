@@ -564,8 +564,8 @@ func (m *SubprocessManager) cacheConfigSchema(id string, meta *sdkv1.RegisterRes
 		return
 	}
 	path := m.schemaCachePath(id)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, meta.ConfigSchemaJson, 0o644)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)           // #nosec G301 -- 配置 schema 缓存目录（WebUI 需读取）
+	_ = os.WriteFile(path, meta.ConfigSchemaJson, 0o644) // #nosec G306 -- schema 缓存非常规敏感信息
 }
 
 // Components returns the plugin's behavior components (commands / llm tools /
@@ -610,10 +610,10 @@ func (m *SubprocessManager) Components(id string) map[string]interface{} {
 	// 休眠策略：与指令/函数工具同列的行为配置项。global_* 反映全局闲置
 	// 自动休眠开关；blocked 表示本插件是否被排除在休眠之外（常驻）。
 	out["sleep"] = []interface{}{map[string]interface{}{
-		"name":          "idle_sleep",
-		"handler_name":  "idle_sleep",
-		"desc":          "插件闲置自动休眠（回收空闲插件进程内存，触发时自动唤醒）",
-		"type":          "休眠策略",
+		"name":           "idle_sleep",
+		"handler_name":   "idle_sleep",
+		"desc":           "插件闲置自动休眠（回收空闲插件进程内存，触发时自动唤醒）",
+		"type":           "休眠策略",
 		"global_enabled": m.IdleUnloadEnabled(),
 		"global_minutes": m.IdleUnloadMinutes(),
 		"blocked":        m.IdleUnloadBlocked(inst.ID),
@@ -655,7 +655,7 @@ func (m *SubprocessManager) writeMetadataConfig(id string, meta *PluginMetadata)
 		return
 	}
 	path := m.metadataPath(id)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755) // #nosec G301 -- 插件元数据目录（用户态）
 
 	od := config.NewOrderedJSON()
 	cgo := "no"
@@ -683,6 +683,7 @@ func (m *SubprocessManager) writeMetadataConfig(id string, meta *PluginMetadata)
 		logger.I18nWarn("writeMetadataConfig(%s): %v", id, err)
 		return
 	}
+	// #nosec G306 -- 插件元数据非常规敏感信息
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		logger.I18nWarn("writeMetadataConfig(%s): %v", id, err)
 	}
@@ -723,7 +724,7 @@ func (m *SubprocessManager) stripMetadataKeys(id string, cfg map[string]interfac
 	m.mergeMetadataFile(id, removed)
 	// 重写 config.json（不含元数据键）。
 	if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-		_ = os.WriteFile(m.configPath(id), data, 0o644)
+		_ = os.WriteFile(m.configPath(id), data, 0o644) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
 	}
 	return cfg
 }
@@ -735,6 +736,7 @@ func (m *SubprocessManager) mergeMetadataFile(id string, kv map[string]interface
 	}
 	path := m.metadataPath(id)
 	od := config.NewOrderedJSON()
+	// #nosec G304 -- 读取插件元数据（安装时写入的固定路径）
 	if data, err := os.ReadFile(path); err == nil {
 		if existing, err := config.ParseOrderedJSON(data); err == nil {
 			od = existing
@@ -747,8 +749,8 @@ func (m *SubprocessManager) mergeMetadataFile(id string, kv map[string]interface
 	if err != nil {
 		return
 	}
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, out, 0o644)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755) // #nosec G301 -- 插件元数据目录（用户态）
+	_ = os.WriteFile(path, out, 0o644)         // #nosec G306 -- 插件元数据非常规敏感信息
 }
 
 // LoadConfig reads the plugin config from plugins_config/<id>/config.json.
@@ -785,9 +787,36 @@ func (m *SubprocessManager) FlatSchema(id string) map[string]interface{} {
 // with a versioned id (astrbot-plugin-xxx-4.11.2-<commit>) sharing the same
 // name as an older Go plugin — the WebUI config dialog for the Python one
 // would otherwise show the Go plugin's schema (fewer/no hints).
+//
+// It first tries to pull the plugin's CURRENT config schema via the
+// GetConfigSchema RPC (plugins like update_manager refresh options/labels
+// at runtime). Falls back to the Register snapshot when the RPC is
+// unimplemented, times out, or returns empty.
 func (m *SubprocessManager) FlatSchemaByID(id string) map[string]interface{} {
 	inst := m.Get(id)
-	if inst == nil || inst.Meta == nil || len(inst.Meta.ConfigSchemaJson) == 0 {
+	if inst == nil {
+		return map[string]interface{}{}
+	}
+
+	// Try live schema from the plugin via GetConfigSchema RPC.
+	// Use a short timeout so a hung plugin does not block the UI.
+	if inst.Client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		raw, err := inst.Client.GetConfigSchema(ctx)
+		cancel()
+		if err == nil && len(raw) > 0 {
+			var schema map[string]interface{}
+			if json.Unmarshal(raw, &schema) == nil && schema != nil {
+				if props, ok := schema["properties"].(map[string]interface{}); ok {
+					schema = props
+				}
+				return normalizeSchema(schema)
+			}
+		}
+	}
+
+	// Fallback to the Register snapshot.
+	if inst.Meta == nil || len(inst.Meta.ConfigSchemaJson) == 0 {
 		return map[string]interface{}{}
 	}
 	var schema map[string]interface{}
@@ -849,12 +878,12 @@ func (m *SubprocessManager) SaveConfig(id string, cfg map[string]interface{}) er
 	}
 	cfg = m.stripMetadataKeys(id, cfg)
 	path := m.configPath(id)
-	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = os.MkdirAll(filepath.Dir(path), 0755) // #nosec G301 -- 插件配置目录（用户态）
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0644) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
 }
 
 // pluginDataRoot returns the unified per-plugin data root directory
@@ -892,7 +921,7 @@ func (m *SubprocessManager) migratePluginData(oldID, newID string) {
 // creating it if needed.
 func (m *SubprocessManager) PluginDataDir(id string) string {
 	dir := m.pluginDataRoot(id)
-	_ = os.MkdirAll(dir, 0o755)
+	_ = os.MkdirAll(dir, 0o755) // #nosec G301 -- 插件数据目录（用户态）
 	return dir
 }
 
@@ -926,29 +955,11 @@ func (m *SubprocessManager) Changelog(id string) string {
 	return m.fetchRepoDoc(id, []string{"CHANGELOG.md", "changelog.md"})
 }
 
-// resolveName maps a plugin id/name to the canonical plugin name (used for the
-// docs directory). 查不到实例/manifest 条目时返回空字符串，避免把调用方传入的
-// 原始 id（可能含路径穿越字符）当作文档目录名使用。
-func (m *SubprocessManager) resolveName(id string) string {
-	if inst := m.instanceByName(id); inst != nil {
-		return inst.Name
-	}
-	if man, err := LoadManifest(m.manifestPath()); err == nil {
-		if e := man.Get(id); e != nil {
-			if e.Name != "" {
-				return e.Name
-			}
-			return e.ID
-		}
-	}
-	return ""
-}
-
 // readCachedDoc reads a cached doc file from the plugin docs directory
 // (plugins/<id>，与源码本体同目录). id 再次经 sanitizeID 归一化（拒绝 /、
 // \、.、.. 等穿越字符），即使上游传入异常值也不会逃逸 data/plugins 目录。
 func (m *SubprocessManager) readCachedDoc(id, file string) string {
-	content, err := os.ReadFile(filepath.Join(m.docsPath(id), file))
+	content, err := os.ReadFile(filepath.Join(m.docsPath(id), file)) // #nosec G304 -- id 经 sanitizeID 归一化防穿越
 	if err != nil {
 		return ""
 	}
@@ -994,7 +1005,7 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 			continue
 		}
 		content, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusOK && len(content) > 0 {
 			m.docMu.Lock()
 			m.docFetchCache[cacheKey] = docCacheEntry{content: string(content), ts: time.Now()}

@@ -74,6 +74,7 @@ type Adapter struct {
 	sessionScene   map[string]string    // convID -> "group"/"friend"/"channel"
 	recentMsg      map[string]time.Time // msgID -> received at (dedupe)
 	sessionLastMsg map[string]string    // convID -> last message id
+	memberGroup    map[string]string    // member_openid/senderID -> group_openid
 	stopCh         chan struct{}
 	stopped        bool
 	httpClient     *http.Client
@@ -91,6 +92,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		BaseAdapter:    *platform.NewBaseAdapter(configID(config), "qq_official"),
 		sessionScene:   make(map[string]string),
 		sessionLastMsg: make(map[string]string),
+		memberGroup:    make(map[string]string),
 		stopCh:         make(chan struct{}),
 		httpClient:     &http.Client{Timeout: 30 * time.Second},
 	}
@@ -528,7 +530,7 @@ func (a *Adapter) handleMessage(d map[string]interface{}, scene string) {
 	chain = append(chain, a.parseAttachments(d)...)
 
 	a.remember(scene, senderOpenID, msgID)
-	a.publish(senderOpenID, senderName, senderOpenID, false, plain, msgID, chain, d)
+	a.publish(senderOpenID, senderName, senderOpenID, false, plain, msgID, chain, d, "")
 }
 
 // handleGroupMessage parses and publishes a group message.
@@ -538,10 +540,14 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 	msgID, _ := d["id"].(string)
 	msgType, _ := d["message_type"].(float64)
 
-	var memberOpenID, senderName string
+	var memberOpenID, senderName, memberRole string
 	if author, ok := d["author"].(map[string]interface{}); ok {
 		memberOpenID, _ = author["member_openid"].(string)
 		senderName, _ = author["username"].(string)
+		// member_role identifies the sender's group role
+		// ("member"/"admin"/"owner") so the host can mark group admins and
+		// owners as admin without a preconfigured admins_id entry.
+		memberRole, _ = author["member_role"].(string)
 	}
 
 	// extract bot mentions
@@ -571,7 +577,14 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 	if int(msgType) == 103 {
 		chain = append(chain, a.buildQuotedReply(d))
 	}
-	selfID := "qq_official"
+	a.mu.Lock()
+	selfID := a.SelfID
+	a.mu.Unlock()
+	if selfID == "" {
+		// 尚未从 READY 事件拿到 bot openid：回退固定类型名（与历史行为
+		// 一致，仅影响 @ 组件展示，不影响唤醒）。
+		selfID = "qq_official"
+	}
 	if len(botMentionIDs) > 0 {
 		selfID = botMentionIDs[0]
 		a.mu.Lock()
@@ -591,7 +604,16 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 	chain = append(chain, a.parseAttachments(d)...)
 
 	a.remember("group", groupOpenID, msgID)
-	a.publish(memberOpenID, senderName, groupOpenID, true, plain, msgID, chain, d)
+	// 记录 群成员 openid → 群 openid 映射：unique_session 开启时会话
+	// ConvID 会被宿主改为发送者成员 id（原版 build_unique_session_id：
+	// qq_official → get_sender_id），发送时按该 id 查 scene 会落空（群消息
+	// 被误发到 C2C）。此映射让 Send 在 scene 为空时仍能把群消息发回群里。
+	if memberOpenID != "" {
+		a.mu.Lock()
+		a.memberGroup[memberOpenID] = groupOpenID
+		a.mu.Unlock()
+	}
+	a.publish(memberOpenID, senderName, groupOpenID, true, plain, msgID, chain, d, memberRole)
 }
 
 // handleChannelMessage parses and publishes a guild (@) message.
@@ -619,7 +641,7 @@ func (a *Adapter) handleChannelMessage(d map[string]interface{}) {
 	chain = append(chain, &message.Plain{Text: plain})
 
 	a.remember("channel", channelID, msgID)
-	a.publish(authorID, authorName, channelID, true, plain, msgID, chain, d)
+	a.publish(authorID, authorName, channelID, true, plain, msgID, chain, d, "")
 }
 
 // handleDirectMessage parses and publishes a direct (DM) message.
@@ -638,7 +660,7 @@ func (a *Adapter) handleDirectMessage(d map[string]interface{}) {
 	chain = append(chain, &message.Plain{Text: plain})
 
 	a.remember("friend", authorID, msgID)
-	a.publish(authorID, authorName, authorID, false, plain, msgID, chain, d)
+	a.publish(authorID, authorName, authorID, false, plain, msgID, chain, d, "")
 }
 
 // buildQuotedReply builds a Reply component from a quoted message (message_type 103).
@@ -694,8 +716,8 @@ func (a *Adapter) remember(scene, convID, msgID string) {
 	a.mu.Unlock()
 }
 
-func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}) {
-	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q (msg_id=%s)", convID, isGroup, msgStr, msgID)
+func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}, role string) {
+	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q", convID, isGroup, msgStr)
 	// Deduplicate identical msg_id re-deliveries within a short window (the QQ
 	// official WS may redeliver the same event after a reconnect/retry).
 	a.mu.Lock()
@@ -732,6 +754,10 @@ func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msg
 	msgObj.Message = chain
 	msgObj.MessageStr = msgStr
 	msgObj.RawMessage = raw
+	// owner/admin 群角色标记为管理员（无须预配置 admins_id）。
+	if isGroup && (role == "owner" || role == "admin") {
+		msgObj.IsAdmin = true
+	}
 	_ = a.PublishEvent(msgStr, msgObj)
 }
 
@@ -747,8 +773,16 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	a.mu.Lock()
 	scene := a.sessionScene[sessionID]
 	lastMsgID := a.sessionLastMsg[sessionID]
+	// scene 为空时回退查找 群成员 openid → 群 openid 映射：unique_session
+	// 把会话 ConvID 改成了发送者成员 id，消息仍应发回原群。
+	if scene == "" {
+		if groupOpenID, ok := a.memberGroup[sessionID]; ok && groupOpenID != "" {
+			scene = "group"
+			lastMsgID = a.sessionLastMsg[groupOpenID]
+			sessionID = groupOpenID
+		}
+	}
 	a.mu.Unlock()
-
 	plainText, imageRef, fileRef, fileName, fileType := extractSendParts(chain)
 
 	switch scene {

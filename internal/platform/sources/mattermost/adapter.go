@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,21 +102,21 @@ func (a *Adapter) Type() string { return "mattermost" }
 // Start 启动适配器：先做认证测试（GET /users/me），随后进入 WebSocket 监听循环。
 func (a *Adapter) Start(ctx context.Context) error {
 	if a.baseURL == "" {
-		return fmt.Errorf("Mattermost URL 是必需的")
+		return fmt.Errorf("mattermost URL 是必需的")
 	}
 	if a.token == "" {
-		return fmt.Errorf("Mattermost bot token 是必需的")
+		return fmt.Errorf("mattermost bot token 是必需的")
 	}
 
 	// 认证测试（对应 run() 中的 get_me）
 	me, err := a.client.GetMe(ctx)
 	if err != nil {
-		return fmt.Errorf("Mattermost 认证失败: %w", err)
+		return fmt.Errorf("mattermost 认证失败: %w", err)
 	}
 	a.botSelfID = stringVal(me["id"])
 	a.botUsername = stringVal(me["username"])
 	if a.botSelfID == "" {
-		return fmt.Errorf("Mattermost 认证成功但返回了空 user id")
+		return fmt.Errorf("mattermost 认证成功但返回了空 user id")
 	}
 	logger.I18nInfo("Mattermost 认证测试通过. Bot: @%s (%s)", a.botUsername, a.botSelfID)
 
@@ -203,7 +202,7 @@ func (a *Adapter) wsConnectAndListen(ctx context.Context) error {
 		a.mu.Lock()
 		a.wsConn = nil
 		a.mu.Unlock()
-		conn.Close()
+		_ = conn.Close()
 	}()
 
 	// 收到 pong 时刷新读超时（gorilla 的读超时是绝对时间，控制帧不会自动重置）
@@ -482,16 +481,6 @@ func isUsernameBoundaryChar(c byte) bool {
 		c == '_' || c == '.' || c == '-'
 }
 
-// buildMentionPattern 保留为兼容性别名（直接委托给 findMentionSpans 的用法已移除）。
-// 仅用于判断 botUsername 是否可用。
-func buildMentionPattern(botUsername string) *regexp.Regexp {
-	if botUsername == "" {
-		return nil
-	}
-	// 仅作为可用性校验；实际匹配使用 findMentionSpans
-	return regexp.MustCompile(`@` + regexp.QuoteMeta(botUsername))
-}
-
 // buildMessageStr 从组件生成消息文本（对应 _build_message_str）。
 // 开头的自我提及（且其前无文本）会被跳过。
 func buildMessageStr(components []message.Component, fallback, selfID string) string {
@@ -589,6 +578,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 		},
 		Source: core.EventSource{
 			Platform:   a.Type(),
+			PlatformID: a.ID(),
 			SelfID:     a.botSelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

@@ -241,7 +241,8 @@ func TestTriggerPassesContext(t *testing.T) {
 
 	ev := &mockEvent{origin: "aiocqhttp:g", senderID: "u", messages: &message.MessageChain{Chain: []message.Component{}}}
 
-	base := context.WithValue(context.Background(), "marker", "x")
+	type ctxKey string
+	base := context.WithValue(context.Background(), ctxKey("marker"), "x")
 	ctx, cancel := context.WithCancel(base)
 	defer cancel()
 	if err := reg.Trigger(ctx, sw.ID, ev); err != nil {
@@ -251,7 +252,7 @@ func TestTriggerPassesContext(t *testing.T) {
 	if got == context.Background() {
 		t.Fatal("handler must receive the caller's context, not context.Background()")
 	}
-	if v := got.Value("marker"); v != "x" {
+	if v := got.Value(ctxKey("marker")); v != "x" {
 		t.Fatalf("handler context lost caller value: %v", v)
 	}
 	select {

@@ -185,10 +185,10 @@ func (a *Adapter) sendMedia(sessionID, method, field, fileID, url, path, file, b
 		tmpName := tmp.Name()
 		defer os.Remove(tmpName)
 		if _, err := tmp.Write(raw); err != nil {
-			tmp.Close()
+			_ = tmp.Close()
 			return err
 		}
-		tmp.Close()
+		_ = tmp.Close()
 		return a.sendMediaUpload(ctx, sessionID, method, field, tmpName)
 	}
 	// 4. local path / file.
@@ -345,6 +345,7 @@ func (a *Adapter) handleUpdate(update map[string]interface{}) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "telegram",
+			PlatformID: a.ID(),
 			SelfID:     a.SelfID,
 			SenderID:   senderID,
 			SenderName: senderName,
@@ -400,17 +401,4 @@ func (a *Adapter) apiCall(ctx context.Context, method string, params map[string]
 	}
 
 	return result, nil
-}
-
-func extractPlainText(mc *message.MessageChain) string {
-	if mc == nil {
-		return ""
-	}
-	var result string
-	for _, comp := range mc.Chain {
-		if plain, ok := comp.(*message.Plain); ok {
-			result += plain.Text
-		}
-	}
-	return result
 }

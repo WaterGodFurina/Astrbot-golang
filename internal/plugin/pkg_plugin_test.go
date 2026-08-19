@@ -45,5 +45,5 @@ func TestPythonPluginPackageRelativeImport(t *testing.T) {
 	if len(chain) == 0 || !strings.Contains(chain[0].Text, "pkg relative import ok") {
 		t.Fatalf("相对导入结果异常: %v", chain)
 	}
-	m.Uninstall(inst.ID, true, true)
+	_ = m.Uninstall(inst.ID, true, true)
 }

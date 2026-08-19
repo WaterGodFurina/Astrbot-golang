@@ -225,10 +225,7 @@ func (s *ProcessStage) compressImageForProvider(urlOrPath string) string {
 	if !enabled {
 		return urlOrPath
 	}
-	path := urlOrPath
-	if strings.HasPrefix(path, "file://") {
-		path = strings.TrimPrefix(path, "file://")
-	}
+	path := strings.TrimPrefix(urlOrPath, "file://")
 	if !fileExists(path) {
 		return urlOrPath
 	}
@@ -257,12 +254,12 @@ func (s *ProcessStage) compressImageForProvider(urlOrPath string) string {
 		return urlOrPath
 	}
 	name := tmp.Name()
-	tmp.Close()
+	_ = tmp.Close()
 	dc := gg.NewContext(img.Bounds().Dx(), img.Bounds().Dy())
 	dc.DrawImage(img, 0, 0)
 	if err := encodeJPEG(dc.Image(), name, quality); err != nil {
 		logger.I18nWarn("图片压缩失败(编码): %v", err)
-		os.Remove(name)
+		_ = os.Remove(name)
 		return urlOrPath
 	}
 	return name

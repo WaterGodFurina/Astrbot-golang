@@ -65,11 +65,11 @@ func New(dbPath string) (*Database, error) {
 
 	d := &Database{db: db, path: dbPath}
 	if err := d.initSchema(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 	if err := d.quickCheck(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return d, nil
@@ -782,6 +782,8 @@ func (d *Database) UpdateCronJob(jobID string, fields map[string]interface{}) er
 	}
 	set += ", updated_at = CURRENT_TIMESTAMP"
 	args = append(args, jobID)
+	// #nosec G202 -- `set` is assembled only from keys validated against the
+	// cronJobWritableFields whitelist; all values go through placeholders.
 	query := `UPDATE cron_jobs SET ` + set + ` WHERE job_id = ?`
 	return d.withRetry(func() error {
 		_, err := d.db.Exec(query, args...)

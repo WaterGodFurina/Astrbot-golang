@@ -256,7 +256,7 @@ func (tc *Toolchain) verifyChecksum(dest, archive string) error {
 	}
 	want := strings.TrimSpace(fields[0])
 
-	f, err := os.Open(dest)
+	f, err := os.Open(dest) // #nosec G304 -- dest is the just-downloaded archive under the private BaseDir
 	if err != nil {
 		return err
 	}
@@ -365,7 +365,7 @@ func downloadFile(url, dest string, progress ProgressFunc) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	f, err := os.Create(dest)
+	f, err := os.Create(dest) // #nosec G304 -- dest is the private BaseDir archive path constructed from tc.Version
 	if err != nil {
 		return err
 	}
@@ -431,7 +431,7 @@ func extractArchive(src, dir string) error {
 }
 
 func extractTarGz(src, dir string) error {
-	f, err := os.Open(src)
+	f, err := os.Open(src) // #nosec G304 -- src is the verified archive under the private BaseDir
 	if err != nil {
 		return err
 	}
@@ -464,15 +464,15 @@ func extractTarGz(src, dir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode)&0o755)
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(uint32(hdr.Mode&0o755))) // #nosec G304 -- target validated by safeJoin
 			if err != nil {
 				return err
 			}
 			if _, err := io.Copy(out, tr); err != nil {
-				out.Close()
+				_ = out.Close()
 				return err
 			}
-			out.Close()
+			_ = out.Close()
 		}
 	}
 }
@@ -501,18 +501,18 @@ func extractZip(src, dir string) error {
 		if err != nil {
 			return err
 		}
-		out, err := os.Create(target)
+		out, err := os.Create(target) // #nosec G304 -- target validated by safeJoin
 		if err != nil {
-			rc.Close()
+			_ = rc.Close()
 			return err
 		}
 		if _, err := io.Copy(out, rc); err != nil {
-			out.Close()
-			rc.Close()
+			_ = out.Close()
+			_ = rc.Close()
 			return err
 		}
-		out.Close()
-		rc.Close()
+		_ = out.Close()
+		_ = rc.Close()
 	}
 	return nil
 }

@@ -44,16 +44,12 @@ type FilterContext struct {
 
 // CommandFilter matches a single command name.
 type CommandFilter struct {
-	mu                sync.RWMutex
-	commandName       string
-	originalName      string
-	alias             map[string]struct{}
-	parentGroup       *CommandGroupFilter
-	parentCmdNames    []string // cached
-	cmplCmdNames      []string // cached complete names
-	customFilters     []CustomFilter
-	subCommandFilters []HandlerFilter
-	handlerMetadata   *StarHandlerMetadata
+	mu           sync.RWMutex
+	commandName  string
+	originalName string
+	alias        map[string]struct{}
+	parentGroup  *CommandGroupFilter
+	cmplCmdNames []string // cached complete names
 }
 
 // NewCommandFilter creates a command filter.
@@ -180,7 +176,6 @@ type CommandGroupFilter struct {
 	originalName      string
 	alias             map[string]struct{}
 	subCommandFilters []HandlerFilter
-	customFilters     []CustomFilter
 	parentGroup       *CommandGroupFilter
 	cmplCmdNames      []string
 }
@@ -331,9 +326,6 @@ func (gf *CommandGroupFilter) Match(ctx *FilterContext) bool {
 
 // FilterType returns the filter type name.
 func (gf *CommandGroupFilter) FilterType() string { return "command_group" }
-
-// CustomFilter is a user-defined filter function.
-type CustomFilter func(ctx *FilterContext) bool
 
 // HandlerRegistry stores all registered handlers.
 type HandlerRegistry struct {

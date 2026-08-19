@@ -38,7 +38,7 @@ func TestIssue9512_DictKeysNotCleared(t *testing.T) {
 	}
 
 	// Run integrity check - this should NOT remove user keys
-	changed := checkConfigIntegrity(defaults, userConfig, "")
+	_ = checkConfigIntegrity(defaults, userConfig, "")
 
 	// Verify user keys are preserved
 	pluginCfg, ok := userConfig["plugin_config"].(map[string]interface{})
@@ -59,12 +59,6 @@ func TestIssue9512_DictKeysNotCleared(t *testing.T) {
 	}
 	if _, exists := provCfg["custom_setting"]; !exists {
 		t.Error("BUG #9512: user key 'custom_setting' was cleared from provider_settings!")
-	}
-
-	// changed should be false because no new default keys were added
-	if changed {
-		// This is OK if the integrity check added missing defaults
-		// but it should not have removed anything
 	}
 
 	_ = cfgPath      // used for potential file operations

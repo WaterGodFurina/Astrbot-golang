@@ -1,16 +1,17 @@
 // Package pipeline implements the message processing stages.
 // Ported from astrbot/core/pipeline/
 //
-// The pipeline processes events through 9 ordered stages:
-//  1. WakingCheckStage      - Check wake conditions
-//  2. WhitelistCheckStage   - Check whitelist/blacklist
-//  3. SessionStatusCheckStage - Check session enabled
-//  4. RateLimitStage         - Check rate limit
-//  5. ContentSafetyCheckStage - Check content safety
-//  6. PreProcessStage        - Preprocess media, STT, path mapping
-//  7. ProcessStage           - Plugin handler execution + LLM agent
-//  8. ResultDecorateStage    - Decorate result (prefix, T2I, TTS, etc.)
-//  9. RespondStage           - Send message chain to platform
+// The pipeline processes events through 10 ordered stages:
+//  1. SessionWaitStage      - Feed events to session-waiting plugins (SessionWaiter)
+//  2. WakingCheckStage      - Check wake conditions
+//  3. WhitelistCheckStage   - Check whitelist/blacklist
+//  4. SessionStatusCheckStage - Check session enabled
+//  5. RateLimitStage         - Check rate limit
+//  6. ContentSafetyCheckStage - Check content safety
+//  7. PreProcessStage        - Preprocess media, STT, path mapping
+//  8. ProcessStage           - Plugin handler execution + LLM agent
+//  9. ResultDecorateStage    - Decorate result (prefix, T2I, TTS, etc.)
+//  10. RespondStage           - Send message chain to platform
 package pipeline
 
 import (
@@ -229,6 +230,11 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 			apiKeyAllowAdminRole = b
 		}
 	}
+	// 平台已标记管理员（如 QQ 群 owner/admin member_role）时直接保留，
+	// 不依赖 admins_id 配置。
+	if apiKeyAllowAdminRole && event.Source.IsAdmin {
+		event.Role = "admin"
+	}
 	if apiKeyAllowAdminRole {
 		for _, adminID := range s.adminsID {
 			if event.Source.SenderID == adminID {
@@ -304,6 +310,10 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 	if s.wakeByAt && event.Message != nil {
 		for _, comp := range event.Message.Chain {
 			if at, ok := comp.(*message.At); ok {
+				if at.TargetID != event.Source.SelfID {
+					logger.Debug("WakingCheck: @ mention target=%q != selfID=%q platform=%s conv=%s",
+						at.TargetID, event.Source.SelfID, event.Source.Platform, event.Source.ConvID)
+				}
 				if at.TargetID == event.Source.SelfID {
 					event.IsAtOrWakeCommand = true
 					// Group @-wake also supports prefix chat: "@bot /你好" triggers LLM.
@@ -929,7 +939,6 @@ type ProcessStage struct {
 	// collection; full tool name = "<sanitized_server>.<tool_name>".
 	mcpMu      sync.Mutex
 	mcpLoaded  bool
-	mcpSig     string
 	mcpClients map[string]*agent.MCPClient       // sanitized server name -> client
 	mcpSchemas map[string]map[string]interface{} // full tool name -> OpenAI tool schema
 
@@ -976,14 +985,6 @@ func (s *ProcessStage) SetPersonaResolver(fn func(umo, personaID string) string)
 // skill allow-list (persona id -> allowed skill names).
 func (s *ProcessStage) SetPersonaSkillsResolver(fn func(personaID string) []string) {
 	s.personaSkills = fn
-}
-
-// personaID extracts the persona id from the provider settings.
-func personaID(settings map[string]interface{}) string {
-	if p, ok := settings["persona"].(string); ok {
-		return p
-	}
-	return ""
 }
 
 func (s *ProcessStage) Name() string { return "process" }
@@ -2402,9 +2403,7 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	// MCP server tools (enabled servers from data/mcp_server.json). Loading is
 	// async so a slow MCP server never blocks the LLM call.
 	s.ensureMCPTools()
-	for _, schema := range s.mcpSchemasSnapshot() {
-		tools = append(tools, schema)
-	}
+	tools = append(tools, s.mcpSchemasSnapshot()...)
 	// Subprocess plugin LLM function tools.
 	tools = append(tools, s.collectPluginTools()...)
 
@@ -3559,7 +3558,6 @@ type ResultDecorateStage struct {
 	replyPrefix      string
 	replyWithMention bool
 	replyWithQuote   bool
-	maxSegmentLength int
 	subPlugins       *plugin.SubprocessManager
 
 	// t2i (text-to-image) settings from the top-level config.
@@ -4350,9 +4348,7 @@ func normalizeImagePath(img *message.Image) {
 	if img.File == "" {
 		return
 	}
-	if strings.HasPrefix(img.File, "file://") {
-		img.File = strings.TrimPrefix(img.File, "file://")
-	}
+	img.File = strings.TrimPrefix(img.File, "file://")
 }
 
 // DurationFromSeconds creates a duration from seconds.
@@ -4360,9 +4356,10 @@ func DurationFromSeconds(sec int) time.Duration {
 	return time.Duration(sec) * time.Second
 }
 
-// BuildDefaultPipeline creates the default 9-stage pipeline matching Python.
+// BuildDefaultPipeline creates the default 10-stage pipeline matching Python.
 func BuildDefaultPipeline(pctx *PipelineContext) ([]PipelineStage, error) {
 	stages := []PipelineStage{
+		NewSessionWaitStage(),
 		NewWakingCheckStage(),
 		NewWhitelistCheckStage(),
 		NewSessionStatusCheckStage(),

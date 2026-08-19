@@ -85,7 +85,7 @@ func TestNewSDKCapabilities(t *testing.T) {
 	if _, err := m.Load(context.Background(), id, testPluginBin); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	defer m.Unload(id)
+	defer func() { _ = m.Unload(id) }()
 
 	inst := m.Get(id)
 	if inst == nil || inst.Meta == nil {
@@ -171,7 +171,7 @@ func TestHostServiceReverseCalls(t *testing.T) {
 	if _, err := m.Load(context.Background(), id, testPluginBin); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	defer m.Unload(id)
+	defer func() { _ = m.Unload(id) }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -747,7 +747,7 @@ func TestUninstallSerializesWithInstallTail(t *testing.T) {
 	if _, err := m.InstallFromSource(ctx, "racey", src, InstallOptions{}); err != nil {
 		t.Fatalf("install: %v", err)
 	}
-	defer m.Unload("racey")
+	defer func() { _ = m.Unload("racey") }()
 
 	// Hold the lifecycle lock as an in-flight install tail would.
 	release := m.lockOp("racey")

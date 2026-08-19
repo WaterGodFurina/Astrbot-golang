@@ -157,9 +157,7 @@ func (r *ProviderRequest) AssembleContext() map[string]interface{} {
 		})
 	}
 
-	for _, part := range r.ExtraUserContentParts {
-		contentBlocks = append(contentBlocks, part)
-	}
+	contentBlocks = append(contentBlocks, r.ExtraUserContentParts...)
 
 	for _, imgURL := range r.ImageURLs {
 		contentBlocks = append(contentBlocks, map[string]interface{}{

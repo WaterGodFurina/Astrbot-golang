@@ -32,16 +32,6 @@ func (f *fakeEventBus) Publish(e *core.Event) error {
 	return nil
 }
 
-func newTestAdapter() *Adapter {
-	return New(map[string]interface{}{
-		"id":                    "satori_test",
-		"satori_api_base_url":   "http://127.0.0.1:5140/satori/v1",
-		"satori_token":          "test-token",
-		"satori_endpoint":       "ws://127.0.0.1:5140/satori/v1/events",
-		"satori_auto_reconnect": false,
-	}, nil, nil)
-}
-
 // ---------------------------------------------------------------------------
 // 事件解析
 // ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ func TestPythonPluginRelativeDataDir(t *testing.T) {
 	if err := os.Chdir(root); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chdir(oldWd) })
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
 
 	m := NewSubprocessManager(nil, "data")
 	m.MinPort = 50700

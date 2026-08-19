@@ -57,6 +57,7 @@ func buildTestPlugin() string {
 	var src []byte
 	if _, srcFile, _, ok := runtime.Caller(0); ok {
 		pkgDir := filepath.Dir(srcFile)
+		// #nosec G304 -- 读取包内 testdata 固定路径
 		if data, err := os.ReadFile(filepath.Join(pkgDir, "testdata", "plugin", "main.go")); err == nil {
 			src = data
 		}
@@ -71,6 +72,7 @@ func buildTestPlugin() string {
 		return ""
 	}
 	defer os.RemoveAll(tmp)
+	// #nosec G306 -- 临时测试模块源码
 	if err := os.WriteFile(filepath.Join(tmp, "main.go"), src, 0o644); err != nil {
 		logger.I18nWarn("BuildTestPlugin: %v", err)
 		return ""
@@ -83,12 +85,13 @@ require github.com/WaterGodFurina/Astrbot-go-plugin-sdk v0.0.0
 
 replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => %s
 `, sdkDir)
+	// #nosec G306 -- 临时测试模块 go.mod
 	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte(goMod), 0o644); err != nil {
 		logger.I18nWarn("BuildTestPlugin: %v", err)
 		return ""
 	}
 
-	cmd := exec.Command("go", "build", "-o", bin, ".")
+	cmd := exec.Command("go", "build", "-o", bin, ".") // #nosec G204 -- 测试辅助：编译固定测试插件模块
 	cmd.Dir = tmp
 	cmd.Env = append(os.Environ(),
 		"CGO_ENABLED=0",

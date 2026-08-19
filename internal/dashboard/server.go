@@ -1331,7 +1331,7 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(cleanPath, "assets/") {
 				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			}
-			w.Write(data)
+			_, _ = w.Write(data)
 			return
 		}
 	}
@@ -1356,7 +1356,7 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(cleanPath, "assets/") {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
-	w.Write(data)
+	_, _ = w.Write(data)
 }
 
 // contentTypeFor returns the MIME type for a file path.
@@ -1494,16 +1494,6 @@ func (s *Server) injectAuthFields(dash map[string]interface{}) {
 	// 快照看不到 dashboard.totp；保存 dashboard 是整体替换，必须从
 	// PasswordManager 回填，否则任意一次配置保存都会清掉双因素认证。
 	dash["totp"] = s.auth.TOTPConfig()
-}
-
-// getProviderList returns the provider list from config.
-func (s *Server) getProviderList() []interface{} {
-	cfg := s.getConfigData("default")
-	providers, ok := cfg["provider"].([]interface{})
-	if !ok {
-		return []interface{}{}
-	}
-	return providers
 }
 
 // getBotList returns the bot/platform list from config.
@@ -2092,18 +2082,4 @@ func (s *Server) getSkillList() []interface{} {
 		result[i] = sk
 	}
 	return result
-}
-
-// getPersonaList returns all personas.
-func (s *Server) getPersonaList() []interface{} {
-	if s.personaMgr == nil {
-		return []interface{}{}
-	}
-	pm, ok := s.personaMgr.(interface {
-		All() []interface{}
-	})
-	if !ok {
-		return []interface{}{}
-	}
-	return pm.All()
 }

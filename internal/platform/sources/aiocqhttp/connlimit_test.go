@@ -38,7 +38,7 @@ func TestMaxReverseWSConns(t *testing.T) {
 		c, status := dial()
 		if status != http.StatusSwitchingProtocols {
 			if c != nil {
-				c.Close()
+				_ = c.Close()
 			}
 			t.Fatalf("第 %d 个连接应成功（101 Switching Protocols），实际状态码 %d", i+1, status)
 		}
@@ -48,13 +48,13 @@ func TestMaxReverseWSConns(t *testing.T) {
 	// 第 N+1 个连接被拒绝：503，且未建立 WS（Upgrade 之前即被拒绝）。
 	if c, status := dial(); status != http.StatusServiceUnavailable {
 		if c != nil {
-			c.Close()
+			_ = c.Close()
 		}
 		t.Fatalf("超出上限的连接应返回 503，实际状态码 %d", status)
 	}
 
 	// 关闭一个连接后，新连接被接受（服务端异步回收，先等待计数下降）。
-	conns[0].Close()
+	_ = conns[0].Close()
 	deadline := time.Now().Add(2 * time.Second)
 	for a.connCount() != limit-1 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
@@ -65,14 +65,14 @@ func TestMaxReverseWSConns(t *testing.T) {
 	c, status := dial()
 	if status != http.StatusSwitchingProtocols {
 		if c != nil {
-			c.Close()
+			_ = c.Close()
 		}
 		t.Fatalf("关闭一个连接后新连接应被接受，实际状态码 %d", status)
 	}
 	conns = append(conns[1:], c)
 
 	for _, c := range conns {
-		c.Close()
+		_ = c.Close()
 	}
 }
 

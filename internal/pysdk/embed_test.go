@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -15,20 +16,20 @@ func TestDiscoverBundledPython(t *testing.T) {
 	oldBin := os.Getenv(EnvPythonBin)
 	oldHome := os.Getenv("HOME")
 	t.Cleanup(func() {
-		os.Setenv("PATH", oldPath)
-		os.Setenv("HOME", oldHome)
+		_ = os.Setenv("PATH", oldPath)
+		_ = os.Setenv("HOME", oldHome)
 		if oldBin == "" {
-			os.Unsetenv(EnvPythonBin)
+			_ = os.Unsetenv(EnvPythonBin)
 		} else {
-			os.Setenv(EnvPythonBin, oldBin)
+			_ = os.Setenv(EnvPythonBin, oldBin)
 		}
 	})
 
 	// 临时 HOME + 空 PATH（无系统 python）
 	home := t.TempDir()
-	os.Setenv("HOME", home)
-	os.Setenv("PATH", t.TempDir())
-	os.Unsetenv(EnvPythonBin)
+	_ = os.Setenv("HOME", home)
+	_ = os.Setenv("PATH", t.TempDir())
+	_ = os.Unsetenv(EnvPythonBin)
 
 	if os.Getenv("ASTRBOT_PYTHON_DOWNLOAD_TEST") != "1" {
 		t.Skip("ASTRBOT_PYTHON_DOWNLOAD_TEST=1 时执行真实下载验证")
@@ -98,12 +99,12 @@ func TestDownloadURLMirror(t *testing.T) {
 	old := os.Getenv(EnvPythonMirror)
 	t.Cleanup(func() {
 		if old == "" {
-			os.Unsetenv(EnvPythonMirror)
+			_ = os.Unsetenv(EnvPythonMirror)
 		} else {
-			os.Setenv(EnvPythonMirror, old)
+			_ = os.Setenv(EnvPythonMirror, old)
 		}
 	})
-	os.Setenv(EnvPythonMirror, "https://ghfast.top/")
+	_ = os.Setenv(EnvPythonMirror, "https://ghfast.top/")
 	u := pyDownloadURL("cpython-x.tar.gz")
 	if u != "https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download/"+pyVersion()+"/cpython-x.tar.gz" {
 		t.Fatalf("mirror URL 异常: %s", u)
@@ -248,7 +249,7 @@ func TestCacheDirEnvOverride(t *testing.T) {
 	}
 
 	_, want := setupFakeVenv(t, dir)
-	if !filepath.HasPrefix(want, filepath.Join(dir, "astrbot-go", "python-venv-")) {
+	if !strings.HasPrefix(want, filepath.Join(dir, "astrbot-go", "python-venv-")) {
 		t.Fatalf("venv 未落在 ASTRBOT_PYTHON_CACHE_DIR 下: %q", want)
 	}
 	if got := EnsureVenv(t.TempDir()); got != want {

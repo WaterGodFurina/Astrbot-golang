@@ -32,7 +32,7 @@ func TestExtractSendPartsMediaType(t *testing.T) {
 	}
 
 	// 视频（Video）→ fileTypeVideo
-	_, _, fileRef, _, fileType = extractSendParts(&message.MessageChain{
+	_, _, _, _, fileType = extractSendParts(&message.MessageChain{
 		Chain: []message.Component{&message.Video{URL: "https://x.com/v.mp4"}},
 	})
 	if fileType != fileTypeVideo {
@@ -40,7 +40,7 @@ func TestExtractSendPartsMediaType(t *testing.T) {
 	}
 
 	// 文件（File）→ fileTypeFile 且保留文件名
-	_, _, fileRef, fileName, fileType := extractSendParts(&message.MessageChain{
+	_, _, _, fileName, fileType := extractSendParts(&message.MessageChain{
 		Chain: []message.Component{&message.File{Name: "doc.pdf", URL: "https://x.com/d.pdf"}},
 	})
 	if fileName != "doc.pdf" || fileType != fileTypeFile {

@@ -84,7 +84,6 @@ type Adapter struct {
 	botUsername string
 	userCache   map[string]map[string]interface{}
 
-	mu       sync.Mutex
 	stopCh   chan struct{}
 	stopOnce sync.Once
 }
@@ -162,16 +161,20 @@ func (a *Adapter) Type() string { return "misskey" }
 // Start 启动适配器：初始化 API 客户端、获取当前用户信息，随后启动 WebSocket 连接循环。
 func (a *Adapter) Start(ctx context.Context) error {
 	if a.instanceURL == "" || a.accessToken == "" {
-		return fmt.Errorf("Misskey 配置不完整，无法启动")
+		return fmt.Errorf("misskey 配置不完整，无法启动")
 	}
-	a.api = NewMisskeyAPI(a.instanceURL, a.accessToken, a.allowInsecureDownloads, a.downloadTimeout, a.downloadChunkSize, a.maxDownloadBytes)
+	api, err := NewMisskeyAPI(a.instanceURL, a.accessToken, a.allowInsecureDownloads, a.downloadTimeout, a.downloadChunkSize, a.maxDownloadBytes)
+	if err != nil {
+		return fmt.Errorf("misskey 初始化 API 客户端失败: %w", err)
+	}
+	a.api = api
 	a.running.Store(true)
 
 	// 获取当前用户信息（对应 run() 中的 get_current_user）
 	userInfo, err := a.api.GetCurrentUser(ctx)
 	if err != nil {
 		a.running.Store(false)
-		return fmt.Errorf("Misskey 获取用户信息失败: %w", err)
+		return fmt.Errorf("misskey 获取用户信息失败: %w", err)
 	}
 	a.botSelfID = userInfo.ID
 	a.botUsername = userInfo.Username
@@ -194,7 +197,7 @@ func (a *Adapter) Stop() error {
 // React 对指定 note 添加表情回应（notes/reactions/create）。
 func (a *Adapter) React(sessionID, messageID, emoji string) error {
 	if a.api == nil {
-		return fmt.Errorf("Misskey API 客户端未初始化")
+		return fmt.Errorf("misskey API 客户端未初始化")
 	}
 	return a.api.client.Notes().Reactions().Create(reactions.CreateRequest{
 		NoteID:   messageID,
@@ -745,6 +748,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 		},
 		Source: core.EventSource{
 			Platform:   a.Type(),
+			PlatformID: a.ID(),
 			SelfID:     a.botSelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

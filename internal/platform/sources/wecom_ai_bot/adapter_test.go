@@ -144,8 +144,9 @@ func TestAIBotCallbackTextMessage(t *testing.T) {
 	if respBody == "success" {
 		t.Fatal("应返回加密的初始响应")
 	}
-	ret, decrypted := crypt.DecryptMsg([]byte(respBody), "", "", "")
-	_ = decrypted
+	var decrypted string
+	// 先以无效签名调用解密，验证其优雅失败（不 panic），结果无需使用。
+	_, _ = crypt.DecryptMsg([]byte(respBody), "", "", "")
 	// 重新用响应中的签名验证
 	_, sig2 := crypt.GetSHA1("1700000001", "nonce1", extractEncryptField(t, respBody))
 	ret, decrypted = crypt.DecryptMsg([]byte(respBody), sig2, "1700000001", "nonce1")

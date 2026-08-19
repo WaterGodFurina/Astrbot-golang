@@ -3,7 +3,7 @@
 package wecom_ai_bot
 
 import (
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- md5 用于图片内容指纹（协议要求），非密码学用途
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -33,6 +33,7 @@ func GenerateRandomString(length int) string {
 
 // CalculateImageMD5 计算图片数据的 MD5 值（对应 calculate_image_md5）。
 func CalculateImageMD5(imageData []byte) string {
+	// #nosec G401 -- md5 仅作为图片内容指纹/校验（协议要求字段），不用于密码学场景。
 	sum := md5.Sum(imageData)
 	return hex.EncodeToString(sum[:])
 }

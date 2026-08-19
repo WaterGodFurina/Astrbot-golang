@@ -207,7 +207,7 @@ func (s *AzureTTSProvider) refreshToken(ctx context.Context) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("Azure token获取失败 %d: %s", resp.StatusCode, string(data))
+		return fmt.Errorf("azure token获取失败 %d: %s", resp.StatusCode, string(data))
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -239,7 +239,7 @@ func (s *AzureTTSProvider) getNativeAudio(ctx context.Context, text string) (str
 	token := s.token
 	s.mu.Unlock()
 	if token == "" {
-		return "", fmt.Errorf("Azure token 为空")
+		return "", fmt.Errorf("azure token 为空")
 	}
 	ssml := azureBuildSSML(s.voice, s.style, s.role, s.rate, s.volume, text)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader([]byte(ssml)))
@@ -257,7 +257,7 @@ func (s *AzureTTSProvider) getNativeAudio(ctx context.Context, text string) (str
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return "", fmt.Errorf("Azure TTS API error %d: %s", resp.StatusCode, string(data))
+		return "", fmt.Errorf("azure TTS API error %d: %s", resp.StatusCode, string(data))
 	}
 	return ttsSaveAudio(resp.Body, "azure_tts", "wav")
 }

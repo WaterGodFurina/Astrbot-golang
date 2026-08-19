@@ -91,7 +91,7 @@ func (c *Compiler) Prepare(srcDir, moduleName string) error {
 	}
 
 	modPath := filepath.Join(srcDir, "go.mod")
-	data, err := os.ReadFile(modPath)
+	data, err := os.ReadFile(modPath) // #nosec G304 -- 读取插件模块自身 go.mod（srcDir 已归一化）
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
@@ -130,7 +130,7 @@ func (c *Compiler) Prepare(srcDir, moduleName string) error {
 	if err != nil {
 		return fmt.Errorf("format go.mod: %w", err)
 	}
-	return os.WriteFile(modPath, out, 0o644)
+	return os.WriteFile(modPath, out, 0o644) // #nosec G306 -- go.mod 常规权限即可
 }
 
 // Vet runs `go vet ./...` in the plugin module.
@@ -139,7 +139,7 @@ func (c *Compiler) Vet(ctx context.Context, srcDir string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, goBin, "vet", "./...")
+	cmd := exec.CommandContext(ctx, goBin, "vet", "./...") // #nosec G204 -- 编译插件模块（核心），args 固定
 	cmd.Dir = srcDir
 	cmd.Env = c.tc.BuildEnv(map[string]string{"GOPROXY": c.goproxyEnv(), "GOFLAGS": c.goflagsEnv()})
 	out, err := cmd.CombinedOutput()
@@ -188,6 +188,7 @@ func (c *Compiler) build(ctx context.Context, srcDir, outputPath string, progres
 	if err != nil {
 		return fmt.Errorf("resolve output path: %w", err)
 	}
+	// #nosec G301 -- 插件构建产物目录（用户态）
 	if err := os.MkdirAll(filepath.Dir(absOut), 0o755); err != nil {
 		return err
 	}
@@ -196,7 +197,7 @@ func (c *Compiler) build(ctx context.Context, srcDir, outputPath string, progres
 		args = append(args, "-v")
 	}
 	args = append(args, "-o", absOut, "-ldflags=-s -w", "./...")
-	cmd := exec.CommandContext(ctx, goBin, args...)
+	cmd := exec.CommandContext(ctx, goBin, args...) // #nosec G204 -- 编译插件模块（核心），args 由固定 flag 拼装
 	cmd.Dir = srcDir
 	extra := map[string]string{
 		"GOPROXY": c.goproxyEnv(),
@@ -275,6 +276,7 @@ func findSDKDirWithGo(goBin string) (string, error) {
 		return "", err
 	}
 	for {
+		// #nosec G304 -- 向上查找宿主 go.mod 定位 SDK
 		if data, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
 			if sdk := sdkReplaceFromGoMod(data); sdk != "" {
 				p := sdk

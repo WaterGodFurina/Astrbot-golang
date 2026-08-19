@@ -567,11 +567,11 @@ func storeTempContent(contentType, messageID string, content []byte, suffix, ori
 	}
 	name := tmp.Name()
 	if _, err := tmp.Write(content); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		_ = os.Remove(name)
 		return ""
 	}
-	tmp.Close()
+	_ = tmp.Close()
 	scheduleLineTempCleanup(name)
 	if resolved, err := filepath.Abs(name); err == nil {
 		return resolved
@@ -677,6 +677,7 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "line",
+			PlatformID: a.ID(),
 			SelfID:     abm.SelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

@@ -61,7 +61,7 @@ type RecallAdapter interface {
 }
 
 // pluginConfigID 把 HostService 反调用携带的插件注册名解析为实例 id
-//（配置目录按 id = name_language 分键）。先查运行中实例（RPC 调用者必然
+// （配置目录按 id = name_language 分键）。先查运行中实例（RPC 调用者必然
 // 是运行中的），未命中回退 manifest 首条同名条目；都没有则返回原名作为
 // 目录键兜底（兼容无 manifest 的测试/旧布局）。
 func (m *SubprocessManager) pluginConfigID(name string) string {
@@ -103,15 +103,15 @@ func serializeConversation(conv *conversation.Conversation) map[string]any {
 		return nil
 	}
 	return map[string]any{
-		"cid":                 conv.CID,
-		"user_id":             conv.UserID,
-		"platform_id":         conv.PlatformID,
-		"unified_msg_origin":  conv.UnifiedMsgOrigin,
-		"persona_id":          conv.Persona,
-		"title":               conv.Title,
-		"created_at":          conv.CreatedAt,
-		"updated_at":          conv.UpdatedAt,
-		"is_deleted":          conv.IsDeleted,
+		"cid":                conv.CID,
+		"user_id":            conv.UserID,
+		"platform_id":        conv.PlatformID,
+		"unified_msg_origin": conv.UnifiedMsgOrigin,
+		"persona_id":         conv.Persona,
+		"title":              conv.Title,
+		"created_at":         conv.CreatedAt,
+		"updated_at":         conv.UpdatedAt,
+		"is_deleted":         conv.IsDeleted,
 	}
 }
 
@@ -342,6 +342,20 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			cfg := resolvePluginConfig(subMgr, pluginName)
 			if cfg == nil {
 				return map[string]any{}, nil
+			}
+			// 附带配置 schema（if available），SDK 侧 AstrBotConfig 提取
+			// __schema__ 挂到自身 schema 属性，使插件 __init__ 里
+			// self.config.schema 可访问（update_manager 等依赖此属性
+			// 动态填充 options/labels）。
+			if subMgr != nil {
+				id := subMgr.pluginConfigID(pluginName)
+				inst := subMgr.Get(id)
+				if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
+					var schema map[string]any
+					if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err == nil && schema != nil {
+						cfg["__schema__"] = schema
+					}
+				}
 			}
 			return cfg, nil
 		},
@@ -603,6 +617,41 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 
 		// ── 插件/Star 管理（对齐 Python star_manager）──
 		ListStars: func() []map[string]any {
+			// 用子进程插件的静态清单（含已安装但休眠/禁用的插件），对齐
+			// Python 原版 star_registry 语义（原版插件全常驻、注册表含全部
+			// 插件）：update_manager 等依赖 get_all_stars 枚举全部插件以
+			// 填充黑/白名单选项的管理类插件，不能只看到运行中插件。
+			if subMgr != nil {
+				var out []map[string]any
+				for _, info := range subMgr.ListInfo() {
+					name, _ := info["name"].(string)
+					displayName, _ := info["display_name"].(string)
+					if displayName == "" {
+						displayName = name
+					}
+					desc, _ := info["description"].(string)
+					if desc == "" {
+						desc, _ = info["short_desc"].(string)
+					}
+					author, _ := info["author"].(string)
+					version, _ := info["version"].(string)
+					repo, _ := info["repo"].(string)
+					activated, _ := info["activated"].(bool)
+					reserved, _ := info["reserved"].(bool)
+					out = append(out, map[string]any{
+						"name":         name,
+						"display_name": displayName,
+						"author":       author,
+						"desc":         desc,
+						"version":      version,
+						"module_path":  "data.plugins." + name,
+						"activated":    activated,
+						"repo":         repo,
+						"reserved":     reserved,
+					})
+				}
+				return out
+			}
 			if starMgr == nil {
 				return nil
 			}
@@ -625,6 +674,40 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			return out
 		},
 		GetStar: func(name string) map[string]any {
+			// 与 ListStars 一致：从静态插件清单查找（含休眠/禁用插件）。
+			if subMgr != nil {
+				for _, info := range subMgr.ListInfo() {
+					instName, _ := info["name"].(string)
+					if instName != name {
+						continue
+					}
+					displayName, _ := info["display_name"].(string)
+					if displayName == "" {
+						displayName = instName
+					}
+					desc, _ := info["description"].(string)
+					if desc == "" {
+						desc, _ = info["short_desc"].(string)
+					}
+					author, _ := info["author"].(string)
+					version, _ := info["version"].(string)
+					repo, _ := info["repo"].(string)
+					activated, _ := info["activated"].(bool)
+					reserved, _ := info["reserved"].(bool)
+					return map[string]any{
+						"name":         instName,
+						"display_name": displayName,
+						"author":       author,
+						"desc":         desc,
+						"version":      version,
+						"module_path":  "data.plugins." + instName,
+						"activated":    activated,
+						"repo":         repo,
+						"reserved":     reserved,
+					}
+				}
+				return nil
+			}
 			if starMgr == nil {
 				return nil
 			}
@@ -666,6 +749,23 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			id := subMgr.pluginConfigID(pluginName)
 			return subMgr.Uninstall(id, false, false)
+		},
+
+		// ── 会话等待（SessionWaiter 跨进程喂入）──
+		RegisterSessionWait: func(pluginName, umo string, timeoutSeconds int32) string {
+			// 插件注册"等待 umo 的下一条消息"：宿主记录到等待注册表并返回
+			// wait_id；管线 SessionWaitStage 收到该 umo 消息时经
+			// FeedSessionWait RPC 推送事件（subMgr 未就绪视为宿主不支持）。
+			if subMgr == nil {
+				return ""
+			}
+			return subMgr.RegisterSessionWait(pluginName, umo, timeoutSeconds)
+		},
+		UnregisterSessionWait: func(waitID string) {
+			if subMgr == nil {
+				return
+			}
+			subMgr.UnregisterSessionWait(waitID)
 		},
 	})
 }

@@ -325,7 +325,7 @@ func (c *AstrBotConfig) save(indent int) error {
 	committed := false
 	defer func() {
 		if !committed {
-			os.Remove(tmpName)
+			_ = os.Remove(tmpName)
 		}
 	}()
 
@@ -333,14 +333,14 @@ func (c *AstrBotConfig) save(indent int) error {
 	enc.SetIndent("", repeatSpace(indent))
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(ordered); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("encode: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return fmt.Errorf("sync: %w", err)
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()

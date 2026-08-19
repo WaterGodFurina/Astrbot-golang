@@ -531,7 +531,7 @@ func (l *Lifecycle) chatLLMForPlugins(prompt, systemPrompt string, imageURLs []s
 	return pipeline.ChatLLMFromConfig(cfgMap, prompt, systemPrompt, imageURLs)
 }
 
-// buildPipelineScheduler assembles the full 9-stage pipeline for a config ID
+// buildPipelineScheduler assembles the full 10-stage pipeline for a config ID
 // and registers it with the event bus.
 func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 	scheduler := core.NewPipelineScheduler(confID)
@@ -566,6 +566,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 	}
 
 	stageFactory := []func() core.PipelineStage{
+		func() core.PipelineStage { return pipeline.NewSessionWaitStage() },
 		func() core.PipelineStage { return pipeline.NewWakingCheckStage() },
 		func() core.PipelineStage { return pipeline.NewWhitelistCheckStage() },
 		func() core.PipelineStage { return pipeline.NewSessionStatusCheckStage() },
@@ -590,7 +591,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 
 	l.pipelineMapping[confID] = scheduler
 	l.eventBus.RegisterScheduler(confID, scheduler)
-	logger.I18nInfo("已为 %s 构建管线调度器（9 个阶段）", confID)
+	logger.I18nInfo("已为 %s 构建管线调度器（10 个阶段）", confID)
 	return nil
 }
 
@@ -603,7 +604,7 @@ func (l *Lifecycle) Stop() {
 		l.cancel()
 	}
 	if l.sandboxMgr != nil {
-		l.sandboxMgr.Stop()
+		_ = l.sandboxMgr.Stop()
 	}
 	if l.subPluginMgr != nil {
 		l.subPluginMgr.Shutdown()
@@ -641,6 +642,8 @@ func (l *Lifecycle) Restart() {
 		logger.Error("Restart: resolve executable: %v", err)
 		return
 	}
+	// #nosec G204 -- restart spawns this same executable with the original
+	// command-line arguments passed at launch; not user-controlled input.
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Stdin = nil
 	cmd.Stdout = os.Stdout
@@ -886,6 +889,7 @@ func (l *Lifecycle) RebridgePlugins() {
 	star.RemovePluginCommands(l.starMgr)
 	star.RemovePluginFilters(l.starMgr)
 	star.RemovePluginHooks(l.starMgr)
+	star.RemovePluginMetadata(l.starMgr)
 	if l.subPluginMgr != nil {
 		star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.List())
 	}

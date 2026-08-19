@@ -9,7 +9,7 @@ package wecom_ai_bot
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- md5 用于图片消息内容指纹（协议要求），非密码学用途
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -150,6 +150,8 @@ func (c *WecomAIBotWebhookClient) SendImageBase64(ctx context.Context, imageBase
 	if err != nil {
 		return err
 	}
+	// #nosec G401 -- md5 是企业微信智能机器人图片消息协议的必填字段（用于
+	// 服务端校验图片内容，非安全用途），仅作内容指纹，不用于密码学场景。
 	sum := md5.Sum(imageBytes)
 	return c.SendPayload(ctx, map[string]interface{}{
 		"msgtype": "image",
@@ -172,6 +174,8 @@ func (c *WecomAIBotWebhookClient) UploadMedia(ctx context.Context, filePath, med
 	if err != nil {
 		return "", err
 	}
+	// #nosec G304 -- filePath 为调用方指定的待上传素材路径（bot 管理员/插件控制），
+	// 用于上传企业微信素材，属预期功能而非任意文件包含。
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "", err
@@ -337,6 +341,8 @@ func componentImageBase64(img *message.Image) (string, error) {
 		path = strings.TrimSpace(img.File)
 	}
 	if path != "" {
+		// #nosec G304 -- path 为消息图片组件指定的本地文件路径（由 bot 管理员/插件提供），
+		// 用于读取后以 base64 发送，属预期功能而非任意文件包含。
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return "", err
@@ -395,7 +401,7 @@ func componentFilePath(path, url string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if err := os.WriteFile(tmp, data, 0644); err != nil {
+		if err := os.WriteFile(tmp, data, 0600); err != nil {
 			return "", err
 		}
 		return tmp, nil

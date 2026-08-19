@@ -127,16 +127,6 @@ func providerString(cfg map[string]interface{}, key string) string {
 	return strings.TrimSpace(s)
 }
 
-// providerBool reads a bool provider_settings key.
-func providerBool(cfg map[string]interface{}, key string) bool {
-	ps, _ := cfg["provider_settings"].(map[string]interface{})
-	if ps == nil {
-		return false
-	}
-	b, _ := ps[key].(bool)
-	return b
-}
-
 // ---------------------------------------------------------------------------
 // Tavily
 // ---------------------------------------------------------------------------

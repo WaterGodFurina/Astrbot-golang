@@ -613,7 +613,7 @@ func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
 	// 模拟 Listen 安装的 pong 处理器
 	streaming.conn.SetPongHandler(keepalivePongHandler(streaming.conn))
 	// 先将读超时设到 300ms 后，然后由 pong 续期
-	streaming.conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	_ = streaming.conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 
 	readResult := make(chan error, 1)
 	go func() {
@@ -633,7 +633,7 @@ func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
 		// 仍在阻塞读取，说明 pong 已将读超时续期
 	}
 	// 关闭连接以解除阻塞中的读 goroutine
-	streaming.conn.Close()
+	_ = streaming.conn.Close()
 }
 
 func TestStreamingStaysAliveWithPongs(t *testing.T) {
@@ -704,7 +704,10 @@ func TestConnectClearsChannels(t *testing.T) {
 // ---------- M-49：SSRF 校验 ----------
 
 func TestValidateDownloadURL(t *testing.T) {
-	api := NewMisskeyAPI("https://misskey.example", "t", false, 15, 64*1024, 0)
+	api, err := NewMisskeyAPI("https://misskey.example", "t", false, 15, 64*1024, 0)
+	if err != nil {
+		t.Fatalf("创建 misskey API: %v", err)
+	}
 
 	// 非 http(s) scheme 拒绝
 	if err := api.validateDownloadURL("ftp://example.com/a.png"); err == nil {
@@ -729,7 +732,10 @@ func TestValidateDownloadURL(t *testing.T) {
 }
 
 func TestDownloadRedirectGuard(t *testing.T) {
-	api := NewMisskeyAPI("https://misskey.example", "t", false, 15, 64*1024, 0)
+	api, err := NewMisskeyAPI("https://misskey.example", "t", false, 15, 64*1024, 0)
+	if err != nil {
+		t.Fatalf("创建 misskey API: %v", err)
+	}
 	client := api.downloadClient(true)
 	if client.CheckRedirect == nil {
 		t.Fatal("下载客户端应配置重定向校验")

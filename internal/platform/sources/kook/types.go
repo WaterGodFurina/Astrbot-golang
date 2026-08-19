@@ -183,16 +183,6 @@ type kookUserMeData struct {
 	Status   int    `json:"status"`
 }
 
-// kookApiResponseBase 对应 Python 的 KookApiResponseBase (统一响应结构)。
-type kookApiResponseBase struct {
-	Code    int             `json:"code"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data"`
-}
-
-// success 判断接口调用是否成功 (code == 0)。
-func (r *kookApiResponseBase) success() bool { return r.Code == 0 }
-
 // kookGatewayIndexData 对应 Python 的 KookGatewayIndexData。
 type kookGatewayIndexData struct {
 	URL string `json:"url"`

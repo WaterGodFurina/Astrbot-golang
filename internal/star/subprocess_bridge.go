@@ -273,6 +273,25 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 		logger.I18nInfo("子进程插件 %s 已注册到流水线（%d 个命令，%d 个过滤器，%d 个钩子）",
 			inst.Name, len(meta.Commands), len(meta.Filters), len(meta.Hooks))
 	}
+
+	// 把插件元数据注册进 star 注册表，使其能被宿主插件管理 RPC（如
+	// HostService.ListStars / Context.get_all_stars）枚举到——否则
+	// update_manager 等依赖 get_all_stars 的管理类插件拿到空列表。
+	// 幂等：reload 时按 module path 查找，已存在则跳过（避免重复条目）。
+	modulePath := "data.plugins." + inst.ID
+	if starMgr.Registry().Get(modulePath) == nil {
+		starMgr.Registry().Register(&StarMetadata{
+			Name:               inst.Name,
+			Author:             meta.Author,
+			Desc:               meta.Description,
+			ShortDesc:          meta.Description,
+			Version:            meta.Version,
+			Repo:               "",
+			StarModulePath:     modulePath,
+			Activated:          true,
+			SupportedPlatforms: nil,
+		})
+	}
 }
 
 // CoreEventToSDK converts a host core.Event into the SDK's serializable Event
@@ -282,21 +301,23 @@ func CoreEventToSDK(e *core.Event) *pluginsdk.Event {
 		return &pluginsdk.Event{}
 	}
 	out := &pluginsdk.Event{
-		Type:       coreEventTypeName(e.Type),
-		Platform:   e.Source.Platform,
-		SelfID:     e.Source.SelfID,
-		SenderID:   e.Source.SenderID,
-		SenderName: e.Source.SenderName,
-		ConvID:     e.Source.ConvID,
-		GroupName:  e.Source.GroupName,
-		IsGroup:    e.Source.IsGroup,
-		IsAtBot:    e.Source.IsAtBot,
-		IsAdmin:    e.Source.IsAdmin,
-		MessageStr: e.MessageStr,
-		PlainText:  e.PlainText,
-		RawMessage: e.RawMessage,
-		Timestamp:  e.Timestamp.Unix(),
-		Metadata:   e.Metadata,
+		Type:        coreEventTypeName(e.Type),
+		Platform:    e.Source.Platform,
+		PlatformID:  eventPlatformID(e),
+		MessageType: eventMessageType(e),
+		SelfID:      e.Source.SelfID,
+		SenderID:    e.Source.SenderID,
+		SenderName:  e.Source.SenderName,
+		ConvID:      e.Source.ConvID,
+		GroupName:   e.Source.GroupName,
+		IsGroup:     e.Source.IsGroup,
+		IsAtBot:     e.Source.IsAtBot,
+		IsAdmin:     e.Source.IsAdmin,
+		MessageStr:  e.MessageStr,
+		PlainText:   e.PlainText,
+		RawMessage:  e.RawMessage,
+		Timestamp:   e.Timestamp.Unix(),
+		Metadata:    e.Metadata,
 	}
 	if e.MessageObj != nil {
 		out.MessageID = e.MessageObj.MessageID
@@ -321,6 +342,48 @@ func coreEventTypeName(t core.EventType) string {
 		return s
 	}
 	return "message"
+}
+
+// eventPlatformID 返回 Python 侧 unified_msg_origin 第一段：优先平台实例 ID
+// （PlatformID，对应 Python MessageSession 的 platform_id），为空时回退平台
+// 类型名（Platform，保持向后兼容）。
+func eventPlatformID(e *core.Event) string {
+	if e.Source.PlatformID != "" {
+		return e.Source.PlatformID
+	}
+	return e.Source.Platform
+}
+
+// sdkMessageType 将宿主消息类型映射为 Python 驼峰消息类型
+// （GroupMessage/FriendMessage/OtherMessage），供插件 SDK 事件 JSON 使用。
+// 与 internal/core/event_bus.go 的 pythonMessageType 语义一致：优先取
+// e.MessageObj.MessageType（OneBot 适配器存 "group"/"private" 原始值），
+// 为空或无法识别时按 IsGroup 兜底判定。
+func sdkMessageType(messageType string, isGroup bool) string {
+	if messageType != "" {
+		switch messageType {
+		case "GroupMessage", "FriendMessage", "OtherMessage":
+			return messageType
+		case "group", "Group", "GROUP":
+			return "GroupMessage"
+		case "private", "Private", "PRIVATE", "friend":
+			return "FriendMessage"
+		}
+	}
+	if isGroup {
+		return "GroupMessage"
+	}
+	return "FriendMessage"
+}
+
+// eventMessageType 返回插件 SDK 事件携带的消息类型：优先 e.MessageObj.
+// MessageType（已映射驼峰），为空时按 IsGroup 判定。
+func eventMessageType(e *core.Event) string {
+	mt := ""
+	if e.MessageObj != nil {
+		mt = e.MessageObj.MessageType
+	}
+	return sdkMessageType(mt, e.Source.IsGroup)
 }
 
 // componentToSDK flattens a host message component into the SDK's serializable
@@ -383,6 +446,16 @@ func RemovePluginCommands(starMgr *Manager) {
 			starMgr.Handlers().Remove(h.HandlerFullName)
 		}
 	}
+}
+
+// RemovePluginMetadata removes all subprocess-plugin StarMetadata entries
+// (module path prefix "data.plugins.") so re-bridging starts from a clean
+// registry.
+func RemovePluginMetadata(starMgr *Manager) {
+	if starMgr == nil || starMgr.Registry() == nil {
+		return
+	}
+	starMgr.Registry().RemoveByPrefix("data.plugins.")
 }
 
 // RemovePluginFilters removes all subprocess-plugin filter handlers from the

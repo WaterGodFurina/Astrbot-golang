@@ -196,7 +196,7 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 	}
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 

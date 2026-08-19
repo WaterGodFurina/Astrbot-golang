@@ -417,6 +417,7 @@ func (a *Adapter) processEvent(abm *platform.AstrBotMessage) {
 		Type: core.EventMessage,
 		Source: core.EventSource{
 			Platform:   "weixin_official_account",
+			PlatformID: a.ID(),
 			SelfID:     abm.SelfID,
 			SenderID:   abm.Sender.UserID,
 			SenderName: abm.Sender.Nickname,

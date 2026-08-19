@@ -114,7 +114,7 @@ func TestLocalBooterExec(t *testing.T) {
 	}
 
 	// Non-zero exit is surfaced, not treated as an error.
-	stdout, _, code, err = b.Exec(ctx, "sh", []string{"-c", "exit 3"}, SandboxWorkdir)
+	_, _, code, err = b.Exec(ctx, "sh", []string{"-c", "exit 3"}, SandboxWorkdir)
 	if err != nil {
 		t.Fatalf("exec non-zero: %v", err)
 	}

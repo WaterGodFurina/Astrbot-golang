@@ -5,6 +5,7 @@ package star
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -158,6 +159,23 @@ func (r *StarRegistry) All() []*StarMetadata {
 	result := make([]*StarMetadata, len(r.stars))
 	copy(result, r.stars)
 	return result
+}
+
+// RemoveByPrefix removes all stars whose StarModulePath starts with prefix
+// (used when re-bridging subprocess plugins: clean out stale metadata before
+// re-registering the current set).
+func (r *StarRegistry) RemoveByPrefix(prefix string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := r.stars[:0]
+	for _, meta := range r.stars {
+		if strings.HasPrefix(meta.StarModulePath, prefix) {
+			delete(r.starMap, meta.StarModulePath)
+			continue
+		}
+		kept = append(kept, meta)
+	}
+	r.stars = kept
 }
 
 // StarHandlerRegistry maintains all registered handlers.

@@ -48,17 +48,21 @@ type MisskeyAPI struct {
 }
 
 // NewMisskeyAPI 创建 Misskey API 客户端。
-func NewMisskeyAPI(instanceURL, accessToken string, allowInsecureDownloads bool, downloadTimeout, chunkSize int, maxDownloadBytes int64) *MisskeyAPI {
+func NewMisskeyAPI(instanceURL, accessToken string, allowInsecureDownloads bool, downloadTimeout, chunkSize int, maxDownloadBytes int64) (*MisskeyAPI, error) {
 	baseURL := strings.TrimRight(instanceURL, "/")
 	instanceHost := ""
 	if u, err := url.Parse(baseURL); err == nil {
 		instanceHost = strings.ToLower(u.Hostname())
 	}
+	client, err := misskey.NewClientWithOptions(misskey.WithSimpleConfig(baseURL, accessToken))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create misskey client: %w", err)
+	}
 	return &MisskeyAPI{
 		instanceURL:            baseURL,
 		instanceHost:           instanceHost,
 		accessToken:            accessToken,
-		client:                 misskey.NewClient(baseURL, accessToken),
+		client:                 client,
 		allowInsecureDownloads: allowInsecureDownloads,
 		downloadTimeout:        downloadTimeout,
 		chunkSize:              chunkSize,
@@ -66,7 +70,7 @@ func NewMisskeyAPI(instanceURL, accessToken string, allowInsecureDownloads bool,
 		httpClient: &http.Client{
 			Timeout: time.Duration(downloadTimeout) * time.Second,
 		},
-	}
+	}, nil
 }
 
 // Close 关闭 streaming 连接与 HTTP 客户端（对应 close）。
@@ -153,10 +157,10 @@ func (a *MisskeyAPI) uploadAndFindFile(ctx context.Context, urlStr, name, folder
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 	if _, err := tmp.Write(tmpBytes); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return "", err
 	}
-	tmp.Close()
+	_ = tmp.Close()
 
 	fileID, err := a.UploadFile(tmpPath, name, folderID)
 	if err != nil {
@@ -400,7 +404,7 @@ func (a *MisskeyAPI) apiRequest(ctx context.Context, endpoint string, data map[s
 			apiLogger.Error("Misskey API HTTP 请求错误: %v", err)
 		} else {
 			result, procErr := a.processResponse(resp, endpoint)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if procErr != nil {
 				lastErr = procErr
 			} else {
@@ -423,7 +427,7 @@ func (a *MisskeyAPI) processResponse(resp *http.Response, endpoint string) (map[
 		var result map[string]interface{}
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			apiLogger.Error("Misskey API 响应格式错误: %v", err)
-			return nil, fmt.Errorf("Invalid JSON response")
+			return nil, fmt.Errorf("invalid JSON response")
 		}
 		apiLogger.Debug("Misskey API 请求成功: %s", endpoint)
 		return result, nil
@@ -437,25 +441,25 @@ func (a *MisskeyAPI) processResponse(resp *http.Response, endpoint string) (map[
 func handleResponseStatus(status int, endpoint string) error {
 	switch status {
 	case http.StatusBadRequest:
-		return fmt.Errorf("Bad request for %s", endpoint)
+		return fmt.Errorf("bad request for %s", endpoint)
 	case http.StatusUnauthorized:
-		return fmt.Errorf("Unauthorized access for %s", endpoint)
+		return fmt.Errorf("unauthorized access for %s", endpoint)
 	case http.StatusForbidden:
-		return fmt.Errorf("Forbidden access for %s", endpoint)
+		return fmt.Errorf("forbidden access for %s", endpoint)
 	case http.StatusNotFound:
-		return fmt.Errorf("Resource not found for %s", endpoint)
+		return fmt.Errorf("resource not found for %s", endpoint)
 	case http.StatusRequestEntityTooLarge:
-		return fmt.Errorf("Request entity too large for %s", endpoint)
+		return fmt.Errorf("request entity too large for %s", endpoint)
 	case http.StatusTooManyRequests:
-		return fmt.Errorf("Rate limit exceeded for %s", endpoint)
+		return fmt.Errorf("rate limit exceeded for %s", endpoint)
 	case http.StatusInternalServerError:
-		return fmt.Errorf("Internal server error for %s", endpoint)
+		return fmt.Errorf("internal server error for %s", endpoint)
 	case http.StatusBadGateway:
-		return fmt.Errorf("Bad gateway for %s", endpoint)
+		return fmt.Errorf("bad gateway for %s", endpoint)
 	case http.StatusServiceUnavailable:
-		return fmt.Errorf("Service unavailable for %s", endpoint)
+		return fmt.Errorf("service unavailable for %s", endpoint)
 	case http.StatusGatewayTimeout:
-		return fmt.Errorf("Gateway timeout for %s", endpoint)
+		return fmt.Errorf("gateway timeout for %s", endpoint)
 	}
 	return fmt.Errorf("HTTP %d for %s", status, endpoint)
 }

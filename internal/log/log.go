@@ -142,7 +142,7 @@ func newSegmentedWriter(path string, maxBytes int64, keepSegs int) (*segmentedWr
 		keepSegs = 3
 	}
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return nil, err
 		}
 	}
@@ -154,7 +154,7 @@ func newSegmentedWriter(path string, maxBytes int64, keepSegs int) (*segmentedWr
 }
 
 func (w *segmentedWriter) open() error {
-	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(w.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -333,7 +333,7 @@ func (l *Logger) log(level Level, component, format string, args ...interface{})
 	}
 	line := fmt.Sprintf("%s[%s] [%s] [%s] %s%s\n",
 		color, ts, levelNames[level], entry.Component, entry.Message, reset)
-	fmt.Fprint(out, line)
+	_, _ = fmt.Fprint(out, line)
 
 	if fileOut != nil {
 		// Plain (no color) line for the segmented log file.

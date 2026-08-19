@@ -218,11 +218,11 @@ func (a *Adapter) downloadFileToTemp(ctx context.Context, messageID, fileKey, re
 	}
 	name := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		_ = os.Remove(name)
 		return ""
 	}
-	tmp.Close()
+	_ = tmp.Close()
 	scheduleTempCleanup(name)
 	return name
 }
@@ -556,10 +556,10 @@ func writeTempBase64(b64, prefix string) string {
 	}
 	name := tmp.Name()
 	if _, err := tmp.Write(raw); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return ""
 	}
-	tmp.Close()
+	_ = tmp.Close()
 	return name
 }
 

@@ -65,7 +65,6 @@ type RetrievalResult struct {
 type KBHelper struct {
 	KB        *KnowledgeBase
 	InitError string
-	mu        sync.RWMutex
 }
 
 // UploadFromURL uploads a document from a URL to this KB.

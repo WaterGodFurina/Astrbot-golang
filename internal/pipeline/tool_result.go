@@ -31,7 +31,7 @@ func materializeToolResult(result, toolCallID string) string {
 	}
 	preview := truncateRunes(result, maxPreviewChars)
 	dir := filepath.Join("data", "temp", "tool_results")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return preview + "\n\n[工具结果过长，且无法写入溢出文件]"
 	}
 	safeID := toolResultIDRe.ReplaceAllString(toolCallID, "_")
@@ -40,7 +40,7 @@ func materializeToolResult(result, toolCallID string) string {
 	}
 	name := fmt.Sprintf("%s_%s.txt", safeID, fmt.Sprintf("%x", time.Now().UnixNano()))
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, []byte(result), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(result), 0o600); err != nil {
 		return preview + "\n\n[工具结果过长，且无法写入溢出文件]"
 	}
 	notice := fmt.Sprintf(

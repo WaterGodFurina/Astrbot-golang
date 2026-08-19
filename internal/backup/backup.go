@@ -31,7 +31,7 @@ func NewExporter(dataDir string) *Exporter {
 
 // Export creates a zip archive of the data directory.
 func (e *Exporter) Export(destPath string) error {
-	zipFile, err := os.Create(destPath)
+	zipFile, err := os.Create(destPath) // #nosec G304 -- destPath is the caller-chosen export destination
 	if err != nil {
 		return fmt.Errorf("create zip: %w", err)
 	}
@@ -75,19 +75,19 @@ func (e *Exporter) Export(destPath string) error {
 			return nil
 		}
 
-		file, err := os.Open(path)
+		file, err := os.Open(path) // #nosec G304 -- path originates from filepath.Walk of the local dataDir
 		if err != nil {
 			return err
 		}
 
 		writer, err := zw.Create(relPath)
 		if err != nil {
-			file.Close()
+			_ = file.Close()
 			return err
 		}
 
 		_, err = io.Copy(writer, file)
-		file.Close()
+		_ = file.Close()
 		return err
 	})
 	if err != nil {
@@ -97,17 +97,17 @@ func (e *Exporter) Export(destPath string) error {
 	// Zip the consistent DB snapshot (only present when a live database was
 	// found under the data dir).
 	if snapshot != "" {
-		snap, err := os.Open(snapshot)
+		snap, err := os.Open(snapshot) // #nosec G304 -- snapshot is a temp file created via os.CreateTemp in snapshotDB
 		if err != nil {
 			return err
 		}
 		writer, err := zw.Create("astrbot.db")
 		if err != nil {
-			snap.Close()
+			_ = snap.Close()
 			return err
 		}
 		_, err = io.Copy(writer, snap)
-		snap.Close()
+		_ = snap.Close()
 		if err != nil {
 			return err
 		}
@@ -131,19 +131,19 @@ func (e *Exporter) snapshotDB() (string, error) {
 		return "", fmt.Errorf("create db snapshot temp: %w", err)
 	}
 	tmpName := tmp.Name()
-	tmp.Close()
+	_ = tmp.Close()
 
 	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(30000)", dbPath)
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("open db for snapshot: %w", err)
 	}
 	defer conn.Close()
 
 	sql := fmt.Sprintf("VACUUM INTO '%s'", strings.ReplaceAll(tmpName, "'", "''"))
 	if _, err := conn.Exec(sql); err != nil {
-		os.Remove(tmpName)
+		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("snapshot db: %w", err)
 	}
 	return tmpName, nil
@@ -168,14 +168,16 @@ func (i *Importer) Import(srcPath string) error {
 	defer reader.Close()
 
 	for _, file := range reader.File {
-		// Prevent zip slip (path traversal)
-		if strings.Contains(file.Name, "..") {
+		// Prevent zip slip (path traversal): reject absolute paths and any
+		// entry that escapes the data dir once joined.
+		rel := filepath.Clean(file.Name)
+		if rel == ".." || filepath.IsAbs(rel) || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			logger.Warn("Skipping suspicious path in backup: %s", file.Name)
 			continue
 		}
 
-		destPath := filepath.Join(i.dataDir, file.Name)
-		if !strings.HasPrefix(destPath, i.dataDir) {
+		destPath := filepath.Join(i.dataDir, rel)
+		if destPath != i.dataDir && !strings.HasPrefix(destPath, i.dataDir+string(filepath.Separator)) {
 			logger.Warn("Skipping path outside data dir: %s", file.Name)
 			continue
 		}
@@ -191,20 +193,20 @@ func (i *Importer) Import(srcPath string) error {
 			return err
 		}
 
-		dstFile, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		dstFile, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode()) // #nosec G304 -- destPath validated against traversal above
 		if err != nil {
 			return err
 		}
 
 		srcFile, err := file.Open()
 		if err != nil {
-			dstFile.Close()
+			_ = dstFile.Close()
 			return err
 		}
 
 		_, err = io.Copy(dstFile, srcFile)
-		dstFile.Close()
-		srcFile.Close()
+		_ = dstFile.Close()
+		_ = srcFile.Close()
 		if err != nil {
 			return err
 		}

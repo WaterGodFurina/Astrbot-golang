@@ -31,7 +31,7 @@ type VecDB struct {
 
 // OpenVecDB opens (or creates) the vector index for a knowledge base.
 func OpenVecDB(dir, kbID string, dimension int) (*VecDB, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, err
 	}
 	path := filepath.Join(dir, kbID+".vec.db")

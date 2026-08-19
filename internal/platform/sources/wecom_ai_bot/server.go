@@ -66,6 +66,8 @@ func (s *WecomAIBotServer) handleVerify(w http.ResponseWriter, r *http.Request) 
 	logger.I18nInfo("收到企业微信智能机器人 WebHook URL 验证请求。")
 	result := s.apiClient.VerifyURL(msgSignature, timestamp, nonce, echostr)
 	w.Header().Set("Content-Type", "text/plain")
+	// #nosec G705 -- 响应类型为 text/plain，写回的是解密后的 echostr 明文，
+	// 非 HTML 上下文，不构成反射型 XSS。
 	_, _ = io.WriteString(w, result)
 }
 
@@ -132,8 +134,9 @@ func (s *WecomAIBotServer) Start() error {
 		return fmt.Errorf("企业微信智能机器人服务器监听 %s:%d 失败: %w", s.host, s.port, err)
 	}
 	s.httpSrv = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", s.host, s.port),
-		Handler: s.Handler(),
+		Addr:              fmt.Sprintf("%s:%d", s.host, s.port),
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	logger.I18nInfo("启动企业微信智能机器人服务器，监听 %s:%d", s.host, s.port)
 	go func() {

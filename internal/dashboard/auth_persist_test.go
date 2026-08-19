@@ -103,7 +103,7 @@ func TestInjectAuthFieldsTotpDisabledClearsSection(t *testing.T) {
 	s := NewServer(0, filepath.Join(t.TempDir(), "cmd_config.json"))
 	defer s.Stop()
 
-	s.auth.SetupTOTP()
+	_, _, _, _ = s.auth.SetupTOTP()
 	s.auth.DisableTOTP()
 
 	dash := map[string]interface{}{}

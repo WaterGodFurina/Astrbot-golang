@@ -28,11 +28,11 @@ const marketCacheTTL = 5 * time.Minute
 // 结构为 {"<插件名>": {display_name, desc, author, repo, tags, version, ...}}，
 // 前端市场解析已兼容。
 const (
-	defaultPythonMarketURL          = "https://api.soulter.top/astrbot/plugins"
-	defaultPythonMarketFallbackURL  = "https://github.com/AstrBotDevs/AstrBot_Plugins_Collection/raw/refs/heads/main/plugin_cache_original.json"
-	defaultPluginMarketURL          = "https://astrbotgomarket.350430.xyz/package.json"
-	marketDiskCacheDir              = "plugins_market_cache"
-	marketDiskCacheTTL              = 10 * time.Minute
+	defaultPythonMarketURL         = "https://api.soulter.top/astrbot/plugins"
+	defaultPythonMarketFallbackURL = "https://github.com/AstrBotDevs/AstrBot_Plugins_Collection/raw/refs/heads/main/plugin_cache_original.json"
+	defaultPluginMarketURL         = "https://astrbotgomarket.350430.xyz/package.json"
+	marketDiskCacheDir             = "plugins_market_cache"
+	marketDiskCacheTTL             = 10 * time.Minute
 )
 
 // defaultPluginSources returns the built-in plugin market sources shown in the
@@ -168,11 +168,11 @@ func (s *Server) fetchPluginMarket(registryURL string, forceRefresh bool) (inter
 		if resp.StatusCode != http.StatusOK {
 			log.GetDefault().Info("plugin market fetch failed (%s): HTTP %d", u, resp.StatusCode)
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			continue
 		}
 		data, decErr := decodeMarketBody(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decErr != nil {
 			log.GetDefault().Info("plugin market decode failed (%s): %v", u, decErr)
 			lastErr = decErr

@@ -126,7 +126,7 @@ func (s *Server) fetchProviderSourceModels(sourceID string) ([]string, map[strin
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
-	models := []string{}
+	var models []string
 
 	switch providerType {
 	case "ollama":

@@ -114,6 +114,10 @@ type AstrBotMessage struct {
 	MessageStr string              `json:"message_str"`
 	RawMessage interface{}         `json:"raw_message,omitempty"`
 	Timestamp  int64               `json:"timestamp"`
+	// IsAdmin marks the sender as a platform-known admin (e.g. QQ group
+	// owner/admin member_role) so the host can set Source.IsAdmin without a
+	// preconfigured admins_id entry.
+	IsAdmin bool `json:"is_admin,omitempty"`
 }
 
 // GroupID returns the group ID or empty string.
@@ -574,11 +578,13 @@ func (b *BaseAdapter) PublishEvent(msgStr string, msgObj *AstrBotMessage) error 
 		},
 		Source: core.EventSource{
 			Platform:   b.platform,
+			PlatformID: b.ID(),
 			SelfID:     selfID,
 			SenderID:   msgObj.Sender.UserID,
 			SenderName: msgObj.Sender.Nickname,
 			ConvID:     convID,
 			IsGroup:    isGroup,
+			IsAdmin:    msgObj.IsAdmin,
 		},
 		Timestamp: time.Now(),
 		Metadata:  make(map[string]interface{}),

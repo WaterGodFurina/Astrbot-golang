@@ -196,8 +196,12 @@ func (g *GroupChatContext) HandleMessage(event *core.Event) {
 	finalMessage := g.formatMessage(event, c)
 
 	lock := g.getLock(umo)
+	g.mu.Lock()
 	lock.Lock()
-	defer lock.Unlock()
+	defer func() {
+		lock.Unlock()
+		g.mu.Unlock()
+	}()
 	records := g.rawRecords[umo]
 	if records == nil {
 		records = list.New()
@@ -229,10 +233,14 @@ func (g *GroupChatContext) OnReqLLM(event *core.Event, req *provider.ProviderReq
 	promptIdx, _ := event.GetExtra("_group_context_raw_idx").(int)
 
 	lock := g.getLock(umo)
+	g.mu.Lock()
 	lock.Lock()
+	defer func() {
+		lock.Unlock()
+		g.mu.Unlock()
+	}()
 	records := g.rawRecords[umo]
 	if records == nil {
-		lock.Unlock()
 		return
 	}
 	ids := g.recordIDs[umo]
@@ -250,7 +258,6 @@ func (g *GroupChatContext) OnReqLLM(event *core.Event, req *provider.ProviderReq
 		}
 	}
 	if idx < 0 || idx >= records.Len() {
-		lock.Unlock()
 		return
 	}
 
@@ -296,7 +303,6 @@ func (g *GroupChatContext) OnReqLLM(event *core.Event, req *provider.ProviderReq
 	for _, v := range remainingIDs {
 		ids.PushBack(v)
 	}
-	lock.Unlock()
 
 	if len(toInject) > 0 {
 		req.ExtraUserContentParts = append(req.ExtraUserContentParts, map[string]interface{}{

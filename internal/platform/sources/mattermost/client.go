@@ -74,11 +74,11 @@ func (c *MattermostClient) getJSON(ctx context.Context, path string) (map[string
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Mattermost GET %s 失败: %d %s", path, resp.StatusCode, body)
+		return nil, fmt.Errorf("mattermost GET %s 失败: %d %s", path, resp.StatusCode, body)
 	}
 	data, err := decodeJSONObject(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("Mattermost GET %s 返回了非对象 JSON: %w", path, err)
+		return nil, fmt.Errorf("mattermost GET %s 返回了非对象 JSON: %w", path, err)
 	}
 	return data, nil
 }
@@ -102,11 +102,11 @@ func (c *MattermostClient) postJSON(ctx context.Context, path string, payload ma
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Mattermost POST %s 失败: %d %s", path, resp.StatusCode, body)
+		return nil, fmt.Errorf("mattermost POST %s 失败: %d %s", path, resp.StatusCode, body)
 	}
 	data, err := decodeJSONObject(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("Mattermost POST %s 返回了非对象 JSON: %w", path, err)
+		return nil, fmt.Errorf("mattermost POST %s 返回了非对象 JSON: %w", path, err)
 	}
 	return data, nil
 }
@@ -150,7 +150,7 @@ func (c *MattermostClient) DownloadFile(ctx context.Context, fileID string) ([]b
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Mattermost 下载文件 %s 失败: %d %s", fileID, resp.StatusCode, body)
+		return nil, fmt.Errorf("mattermost 下载文件 %s 失败: %d %s", fileID, resp.StatusCode, body)
 	}
 	return io.ReadAll(resp.Body)
 }
@@ -188,7 +188,7 @@ func (c *MattermostClient) UploadFile(ctx context.Context, channelID string, fil
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Mattermost 上传文件失败: %d %s", resp.StatusCode, raw)
+		return "", fmt.Errorf("mattermost 上传文件失败: %d %s", resp.StatusCode, raw)
 	}
 	var data map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
@@ -196,15 +196,15 @@ func (c *MattermostClient) UploadFile(ctx context.Context, channelID string, fil
 	}
 	fileInfos, _ := data["file_infos"].([]interface{})
 	if len(fileInfos) == 0 {
-		return "", fmt.Errorf("Mattermost 上传文件未返回 file_infos")
+		return "", fmt.Errorf("mattermost 上传文件未返回 file_infos")
 	}
 	first, ok := fileInfos[0].(map[string]interface{})
 	if !ok {
-		return "", fmt.Errorf("Mattermost 上传文件返回格式异常")
+		return "", fmt.Errorf("mattermost 上传文件返回格式异常")
 	}
 	fileID, _ := first["id"].(string)
 	if fileID == "" {
-		return "", fmt.Errorf("Mattermost 上传文件返回了空的 file id")
+		return "", fmt.Errorf("mattermost 上传文件返回了空的 file id")
 	}
 	return fileID, nil
 }
@@ -409,12 +409,12 @@ func (c *MattermostClient) ParsePostAttachments(ctx context.Context, fileIDs []s
 		}
 		filePath := tmp.Name()
 		if _, err := tmp.Write(fileBytes); err != nil {
-			tmp.Close()
+			_ = tmp.Close()
 			_ = os.Remove(filePath)
 			logger.I18nWarn("Mattermost 写入附件失败 %s -> %s: %v", fileID, filePath, err)
 			continue
 		}
-		tmp.Close()
+		_ = tmp.Close()
 		scheduleAttachmentCleanup(filePath)
 		tempPaths = append(tempPaths, filePath)
 

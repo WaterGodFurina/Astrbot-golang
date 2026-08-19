@@ -3,7 +3,7 @@
 package dashboard
 
 import (
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- 遗留 MD5 密码哈希的迁移兼容，见 md5Hash
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -82,7 +82,7 @@ func NewPasswordManager(configPath string) *PasswordManager {
 	// Check for --reset-password flag via env
 	if os.Getenv("ASTRBOT_RESET_DASHBOARD_PASSWORD") == "1" {
 		needGenerate = true
-		os.Unsetenv("ASTRBOT_RESET_DASHBOARD_PASSWORD")
+		_ = os.Unsetenv("ASTRBOT_RESET_DASHBOARD_PASSWORD")
 	}
 
 	// Load existing config to check if password exists
@@ -387,15 +387,15 @@ func writeConfigFile(path string, data []byte) error {
 	defer func() { _ = os.Remove(tmpName) }()
 
 	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -524,6 +524,8 @@ func hashPBKDF2(password string) string {
 }
 
 // md5Hash returns the MD5 hex digest of a password.
+// #nosec G401 -- 仅用于校验历史遗留的 MD5 密码哈希（迁移兼容）；新密码一律
+// 使用 PBKDF2 哈希，MD5 不作为新凭据的哈希算法。
 func md5Hash(password string) string {
 	h := md5.Sum([]byte(password))
 	return fmt.Sprintf("%x", h)
@@ -563,6 +565,8 @@ func cryptoRandInt(n int) int {
 		mustRandRead(b[:])
 		v := uint64(b[0])<<24 | uint64(b[1])<<16 | uint64(b[2])<<8 | uint64(b[3])
 		if v < limit {
+			// #nosec G115 -- v%uint64(n) < n，而 n 为字符集长度或切片长度
+			// （int 正小值），结果恒远小于 int 上限，无溢出风险。
 			return int(v % uint64(n))
 		}
 	}
@@ -586,7 +590,7 @@ func (pm *PasswordManager) PrintStartupBanner(port int, ipAddrs []string) {
 	var sb strings.Builder
 	sb.WriteString("\n")
 	sb.WriteString(" ========================================\n")
-	sb.WriteString(fmt.Sprintf("  AstrBot Go - Dashboard Ready\n"))
+	sb.WriteString("  AstrBot Go - Dashboard Ready\n")
 	sb.WriteString(" ========================================\n")
 	sb.WriteString(fmt.Sprintf("  Username: %s\n", pm.username))
 	sb.WriteString(fmt.Sprintf("  Local:   http://localhost:%d\n", port))
@@ -1090,12 +1094,6 @@ func recoveryCodeHashFor(code string, hashes []string) string {
 		}
 	}
 	return ""
-}
-
-// verifyRecoveryCode 模糊校验恢复码：忽略大小写、空格与连字符（前端输入的
-// 恢复码为 4 位一组并用连字符分隔），比对 SHA-256 哈希是否命中任一已存哈希。
-func verifyRecoveryCode(code string, hashes []string) bool {
-	return recoveryCodeHashFor(code, hashes) != ""
 }
 
 // parseRecoveryCodeHashes 解析 config 中保存的恢复码哈希：优先当作 JSON

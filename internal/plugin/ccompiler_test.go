@@ -359,7 +359,7 @@ func TestExtractClangArchiveSinglePass(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	zf.Close()
+	_ = zf.Close()
 
 	if err := extractClangArchive(context.Background(), src, root, "triple"); err != nil {
 		t.Fatalf("extractClangArchive: %v", err)
@@ -407,7 +407,7 @@ func TestExtractClangArchiveTarXz(t *testing.T) {
 	if err := tw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	if out, err := exec.Command("xz", "-k", tarPath).CombinedOutput(); err != nil {
 		t.Skipf("xz not available, skipping: %v %s", err, out)
@@ -422,24 +422,18 @@ func TestExtractClangArchiveTarXz(t *testing.T) {
 	}
 }
 
-func f2(t *testing.T, path string) *os.File {
-	t.Helper()
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return f
-}
-
 // TestClangLockFileDiscardsInterruptedInstall verifies that a leftover// .install-lock makes downloadAndSetupClang discard the cached root and
 // re-download instead of trusting a half-extracted Clang. It serves a fake zig
 // archive from a local httptest server so the test needs no network.
 func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
+	if _, _, ok := detectSystemClang(); ok {
+		t.Skip("system clang present; download path not exercised")
+	}
 	old := os.Getenv("ASTRBOT_CLANG_BIN")
 	oldMirror := os.Getenv("ASTRBOT_CLANG_MIRROR")
 	t.Cleanup(func() {
-		os.Setenv("ASTRBOT_CLANG_BIN", old)
-		os.Setenv("ASTRBOT_CLANG_MIRROR", oldMirror)
+		_ = os.Setenv("ASTRBOT_CLANG_BIN", old)
+		_ = os.Setenv("ASTRBOT_CLANG_MIRROR", oldMirror)
 	})
 	root := t.TempDir()
 	if err := os.Setenv("ASTRBOT_CLANG_BIN", root); err != nil {
@@ -450,10 +444,10 @@ func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
 	var fakeZip bytes.Buffer
 	zw := zip.NewWriter(&fakeZip)
 	w, _ := zw.Create("zig-x86_64-linux-0.16.0/zig")
-	w.Write([]byte("#!/bin/sh\nexit 0\n"))
-	zw.Close()
+	_, _ = w.Write([]byte("#!/bin/sh\nexit 0\n"))
+	_ = zw.Close()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(fakeZip.Bytes())
+		_, _ = w.Write(fakeZip.Bytes())
 	}))
 	defer srv.Close()
 	if err := os.Setenv("ASTRBOT_CLANG_MIRROR", srv.URL); err != nil {
@@ -505,7 +499,7 @@ func TestClangExtractFailureKeepsLockAndClearsCache(t *testing.T) {
 	t.Setenv("ASTRBOT_CLANG_BIN", t.TempDir())
 	// Serve a non-archive body so download succeeds but extraction fails.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("this is definitely not a zip or tar archive"))
+		_, _ = w.Write([]byte("this is definitely not a zip or tar archive"))
 	}))
 	defer srv.Close()
 	t.Setenv("ASTRBOT_CLANG_MIRROR", srv.URL)
@@ -554,7 +548,7 @@ func TestExtractAbortsOnCancel(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	zf.Close()
+	_ = zf.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -570,7 +564,7 @@ func TestResumeDownload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rng := r.Header.Get("Range"); rng != "" {
 			var from int64
-			fmt.Sscanf(rng, "bytes=%d-", &from)
+			_, _ = fmt.Sscanf(rng, "bytes=%d-", &from)
 			if from >= int64(len(full)) {
 				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 				return
@@ -578,10 +572,10 @@ func TestResumeDownload(t *testing.T) {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", from, len(full)-1, len(full)))
 			w.Header().Set("Accept-Ranges", "bytes")
 			w.WriteHeader(http.StatusPartialContent)
-			w.Write(full[from:])
+			_, _ = w.Write(full[from:])
 			return
 		}
-		w.Write(full)
+		_, _ = w.Write(full)
 	}))
 	defer srv.Close()
 

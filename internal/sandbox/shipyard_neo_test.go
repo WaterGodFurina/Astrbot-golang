@@ -33,7 +33,7 @@ func newBayServer(t *testing.T) *httptest.Server {
 				status = "ready"
 			}
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"id":"sb-1","status":%q,"profile":"python-default"}`, status)
+			_, _ = fmt.Fprintf(w, `{"id":"sb-1","status":%q,"profile":"python-default"}`, status)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandboxes/sb-1/shell/exec":
 			var body map[string]interface{}
 			_ = json.NewDecoder(r.Body).Decode(&body)

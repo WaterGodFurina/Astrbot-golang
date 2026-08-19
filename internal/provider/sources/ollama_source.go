@@ -111,7 +111,7 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 	ch := make(chan *provider.LLMResponse, 100)
@@ -193,9 +193,7 @@ func (s *OllamaSource) buildRequestBody(req *provider.ProviderRequest, stream bo
 			"content": req.SystemPrompt,
 		})
 	}
-	for _, msg := range req.Contexts {
-		messages = append(messages, msg)
-	}
+	messages = append(messages, req.Contexts...)
 	messages = append(messages, map[string]interface{}{
 		"role":    "user",
 		"content": req.Prompt,
