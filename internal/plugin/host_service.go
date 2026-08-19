@@ -603,6 +603,41 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 
 		// ── 插件/Star 管理（对齐 Python star_manager）──
 		ListStars: func() []map[string]any {
+			// 用子进程插件的静态清单（含已安装但休眠/禁用的插件），对齐
+			// Python 原版 star_registry 语义（原版插件全常驻、注册表含全部
+			// 插件）：update_manager 等依赖 get_all_stars 枚举全部插件以
+			// 填充黑/白名单选项的管理类插件，不能只看到运行中插件。
+			if subMgr != nil {
+				var out []map[string]any
+				for _, info := range subMgr.ListInfo() {
+					name, _ := info["name"].(string)
+					displayName, _ := info["display_name"].(string)
+					if displayName == "" {
+						displayName = name
+					}
+					desc, _ := info["description"].(string)
+					if desc == "" {
+						desc, _ = info["short_desc"].(string)
+					}
+					author, _ := info["author"].(string)
+					version, _ := info["version"].(string)
+					repo, _ := info["repo"].(string)
+					activated, _ := info["activated"].(bool)
+					reserved, _ := info["reserved"].(bool)
+					out = append(out, map[string]any{
+						"name":         name,
+						"display_name": displayName,
+						"author":       author,
+						"desc":         desc,
+						"version":      version,
+						"module_path":  "data.plugins." + name,
+						"activated":    activated,
+						"repo":         repo,
+						"reserved":     reserved,
+					})
+				}
+				return out
+			}
 			if starMgr == nil {
 				return nil
 			}
@@ -625,6 +660,40 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			return out
 		},
 		GetStar: func(name string) map[string]any {
+			// 与 ListStars 一致：从静态插件清单查找（含休眠/禁用插件）。
+			if subMgr != nil {
+				for _, info := range subMgr.ListInfo() {
+					instName, _ := info["name"].(string)
+					if instName != name {
+						continue
+					}
+					displayName, _ := info["display_name"].(string)
+					if displayName == "" {
+						displayName = instName
+					}
+					desc, _ := info["description"].(string)
+					if desc == "" {
+						desc, _ = info["short_desc"].(string)
+					}
+					author, _ := info["author"].(string)
+					version, _ := info["version"].(string)
+					repo, _ := info["repo"].(string)
+					activated, _ := info["activated"].(bool)
+					reserved, _ := info["reserved"].(bool)
+					return map[string]any{
+						"name":         instName,
+						"display_name": displayName,
+						"author":       author,
+						"desc":         desc,
+						"version":      version,
+						"module_path":  "data.plugins." + instName,
+						"activated":    activated,
+						"repo":         repo,
+						"reserved":     reserved,
+					}
+				}
+				return nil
+			}
 			if starMgr == nil {
 				return nil
 			}
