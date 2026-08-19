@@ -802,11 +802,9 @@ func (m *SubprocessManager) FlatSchemaByID(id string) map[string]interface{} {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		raw, err := inst.Client.GetConfigSchema(ctx)
 		cancel()
-		logger.Debug("[diag] FlatSchemaByID: %s GetConfigSchema RPC err=%v raw_len=%d schema=%v", id, err, len(raw), schema != nil)
 		if err == nil && len(raw) > 0 {
 			var schema map[string]interface{}
 			if json.Unmarshal(raw, &schema) == nil && schema != nil {
-				logger.Debug("[diag] FlatSchemaByID: RPC schema keys=%v", schemaKeys(schema))
 				if props, ok := schema["properties"].(map[string]interface{}); ok {
 					schema = props
 				}
