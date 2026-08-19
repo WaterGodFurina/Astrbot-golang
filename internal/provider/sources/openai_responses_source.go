@@ -189,7 +189,7 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 	}
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
@@ -378,10 +378,10 @@ func (s *OpenAIResponsesSource) parseResponse(resp *responsesResponse, mapFuncti
 		if message == "" {
 			message = "Responses API request failed"
 		}
-		return nil, fmt.Errorf("Responses API request failed: %s: %s. response_id=%s", code, message, resp.ID)
+		return nil, fmt.Errorf("responses API request failed: %s: %s. response_id=%s", code, message, resp.ID)
 	}
 	if resp.IncompleteDetails.Reason == "content_filter" {
-		return nil, fmt.Errorf("Responses API output was rejected by the provider content filter. response_id=%s", resp.ID)
+		return nil, fmt.Errorf("responses API output was rejected by the provider content filter. response_id=%s", resp.ID)
 	}
 
 	llmResp := &provider.LLMResponse{
@@ -478,7 +478,7 @@ func (s *OpenAIResponsesSource) parseResponse(resp *responsesResponse, mapFuncti
 	hasText := strings.TrimSpace(llmResp.CompletionText) != ""
 	hasReasoning := strings.TrimSpace(llmResp.ReasoningContent) != ""
 	if !hasText && !hasReasoning && len(llmResp.ToolsCallArgs) == 0 {
-		return nil, fmt.Errorf("Responses API returned no usable output. response_id=%s, status=%s", resp.ID, resp.Status)
+		return nil, fmt.Errorf("responses API returned no usable output. response_id=%s, status=%s", resp.ID, resp.Status)
 	}
 	return llmResp, nil
 }

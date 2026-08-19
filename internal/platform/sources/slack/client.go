@@ -77,7 +77,7 @@ func (s *SlackWebhookServer) Start(ctx context.Context, host string, port int) e
 	addr := fmt.Sprintf("%s:%d", host, port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("Slack Webhook 服务器绑定 %s 失败: %w", addr, err)
+		return fmt.Errorf("slack webhook 服务器绑定 %s 失败: %w", addr, err)
 	}
 	s.srv = &http.Server{Handler: mux}
 	go func() {

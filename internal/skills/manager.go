@@ -102,7 +102,7 @@ func NewSkillManager(skillsRoot, pluginsRoot, dataDir string) *SkillManager {
 	if pluginsRoot == "" {
 		pluginsRoot = filepath.Join(dataDir, "plugins")
 	}
-	os.MkdirAll(skillsRoot, 0755)
+	_ = os.MkdirAll(skillsRoot, 0750)
 	return &SkillManager{
 		skillsRoot:             skillsRoot,
 		pluginsRoot:            pluginsRoot,
@@ -195,7 +195,9 @@ func NormalizeSkillMarkdownPath(skillDir string) string {
 		// Rename legacy to canonical
 		legacy := filepath.Join(skillDir, "skill.md")
 		canonical := filepath.Join(skillDir, "SKILL.md")
-		os.Rename(legacy, canonical)
+		if err := os.Rename(legacy, canonical); err != nil {
+			return legacy
+		}
 		return canonical
 	}
 	return ""
@@ -243,6 +245,9 @@ func (sm *SkillManager) ListSkills(activeOnly bool, runtime string) []*SkillInfo
 				continue
 			}
 			desc := ""
+			// #nosec G304 -- skillMd is a filepath.Join under the local skills
+			// root or plugin skills dir; entry names come from os.ReadDir of
+			// those roots, so the path stays contained.
 			if content, err := os.ReadFile(skillMd); err == nil {
 				desc = ParseFrontmatterDescription(string(content))
 			}
@@ -533,15 +538,17 @@ func (sm *SkillManager) saveConfig(cfg skillsConfig) error {
 	committed := false
 	defer func() {
 		if !committed {
-			os.Remove(tmpName)
+			if err := os.Remove(tmpName); err != nil {
+				logger.Debug("cleanup temp config %s failed: %v", tmpName, err)
+			}
 		}
 	}()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -573,7 +580,11 @@ func (sm *SkillManager) saveSandboxCache(cache SandboxCache) {
 	cache.Version = SandboxCacheVersion
 	cache.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	data, _ := json.MarshalIndent(cache, "", "  ")
-	os.WriteFile(sm.sandboxSkillsCachePath, data, 0644)
+	// #nosec G306 -- cache file stores non-sensitive skill metadata; 0600 keeps
+	// other local users from reading it.
+	if err := os.WriteFile(sm.sandboxSkillsCachePath, data, 0600); err != nil {
+		logger.Debug("write sandbox skills cache failed: %v", err)
+	}
 }
 
 func (sm *SkillManager) loadSandboxCacheMaps() (map[string]string, map[string]string) {
@@ -643,6 +654,9 @@ func (sm *SkillManager) scanPluginSkills(
 				continue
 			}
 			desc := ""
+			// #nosec G304 -- skillMd is a filepath.Join under the plugin skills
+			// dir; entry names come from os.ReadDir of that root, so the path
+			// stays contained.
 			if content, err := os.ReadFile(skillMd); err == nil {
 				desc = ParseFrontmatterDescription(string(content))
 			}

@@ -18,7 +18,7 @@ func acquireVenvLock(lockPath string, timeout time.Duration) (release func(), er
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create lock dir: %w", err)
 	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600) // #nosec G304 -- lockPath is host-controlled under the cache dir
 	if err != nil {
 		return nil, fmt.Errorf("open lock file: %w", err)
 	}

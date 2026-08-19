@@ -119,7 +119,7 @@ func (s *EdgeTTSSource) GetAudio(ctx context.Context, text string) (string, erro
 	go func() {
 		select {
 		case <-ctx.Done():
-			conn.Close()
+			_ = conn.Close()
 		case <-stop:
 		}
 	}()

@@ -188,7 +188,7 @@ func containsStr(list []string, s string) bool {
 
 // lineAt returns the trimmed text of the given 1-based line, or "".
 func lineAt(path string, line int) string {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- path 为插件源码本地路径（安装/报错定位用）
 	if err != nil {
 		return ""
 	}
@@ -212,7 +212,7 @@ func (m *SubprocessManager) fetchSource(ctx context.Context, id, source string) 
 		return "", err
 	}
 	cleanup := func(err error) (string, error) {
-		os.RemoveAll(tmp)
+		_ = os.RemoveAll(tmp)
 		return "", err
 	}
 	dst := filepath.Join(tmp, "src")
@@ -477,7 +477,7 @@ func gitClone(ctx context.Context, url, dest string) error {
 	if err != nil {
 		return fmt.Errorf("git not found on PATH (required to clone %s): %w", url, err)
 	}
-	cmd := exec.CommandContext(ctx, gitBin, "clone", "--depth", "1", "--quiet", url, dest)
+	cmd := exec.CommandContext(ctx, gitBin, "clone", "--depth", "1", "--quiet", url, dest) // #nosec G204 -- git 参数固定，URL 已拒绝 "-" 前缀防注入
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w\n%s", err, out)
 	}
@@ -524,7 +524,7 @@ func downloadFileWithProgress(ctx context.Context, url, dest string, progress fu
 	if resp.ContentLength > maxDownloadSize {
 		return fmt.Errorf("download %s exceeds size limit (%d bytes)", url, maxDownloadSize)
 	}
-	f, err := os.Create(dest)
+	f, err := os.Create(dest) // #nosec G304 -- dest 为插件下载的目标临时路径
 	if err != nil {
 		return err
 	}
@@ -599,6 +599,7 @@ func moveContentsUp(src, dest string) error {
 			return err
 		}
 	}
+	// #nosec G301 -- 插件目录需可被子进程/前端读取
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
@@ -624,6 +625,7 @@ func extractZip(src, dest string) error {
 		if total >= maxExtractSize {
 			return fmt.Errorf("archive exceeds total size limit (%d bytes)", maxExtractSize)
 		}
+		// #nosec G115 -- 上一行已保证 total < maxExtractSize，差值为正
 		if zf.UncompressedSize64 > uint64(maxExtractSize-total) {
 			return fmt.Errorf("archive exceeds total size limit (%d bytes)", maxExtractSize)
 		}
@@ -632,11 +634,13 @@ func extractZip(src, dest string) error {
 			return err
 		}
 		if zf.FileInfo().IsDir() {
+			// #nosec G301 -- target 经 safeJoin 校验
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
 			continue
 		}
+		// #nosec G301 -- target 经 safeJoin 校验
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
@@ -644,14 +648,14 @@ func extractZip(src, dest string) error {
 		if err != nil {
 			return err
 		}
-		out, err := os.Create(target)
+		out, err := os.Create(target) // #nosec G304 -- target 经 safeJoin 校验防穿越
 		if err != nil {
-			rc.Close()
+			_ = rc.Close()
 			return err
 		}
 		n, err := io.Copy(out, io.LimitReader(rc, maxExtractSize-total+1))
 		cerr := out.Close()
-		rc.Close()
+		_ = rc.Close()
 		if err != nil {
 			return err
 		}
@@ -667,7 +671,7 @@ func extractZip(src, dest string) error {
 }
 
 func extractTarGz(src, dest string) error {
-	f, err := os.Open(src)
+	f, err := os.Open(src) // #nosec G304 -- src 为插件下载归档的本地路径
 	if err != nil {
 		return err
 	}
@@ -701,14 +705,16 @@ func extractTarGz(src, dest string) error {
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
+			// #nosec G301 -- target 经 safeJoin 校验
 			if err := os.MkdirAll(target, 0o755); err != nil {
 				return err
 			}
 		case tar.TypeReg:
+			// #nosec G301 -- target 经 safeJoin 校验
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			out, err := os.Create(target)
+			out, err := os.Create(target) // #nosec G304 -- target 经 safeJoin 校验防穿越
 			if err != nil {
 				return err
 			}
@@ -767,20 +773,21 @@ func copyDir(src, dest string) error {
 		}
 		target := filepath.Join(dest, rel)
 		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			return os.MkdirAll(target, 0o755) // #nosec G301 -- 拷贝用户提供的插件源码目录
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
 			return nil
 		}
+		// #nosec G301 -- 拷贝用户提供的插件源码目录
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		in, err := os.Open(path)
+		in, err := os.Open(path) // #nosec G304 -- 遍历用户提供的插件源码目录
 		if err != nil {
 			return err
 		}
 		defer in.Close()
-		out, err := os.Create(target)
+		out, err := os.Create(target) // #nosec G304 -- target 由 WalkDir 相对路径拼装，未穿越 dest
 		if err != nil {
 			return err
 		}
@@ -807,21 +814,22 @@ func copyDirMerge(src, dest string) error {
 		}
 		target := filepath.Join(dest, rel)
 		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			return os.MkdirAll(target, 0o755) // #nosec G301 -- 迁移合并插件源码目录
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
 			return nil
 		}
+		// #nosec G301 -- 迁移合并插件源码目录
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
-		in, err := os.Open(path)
+		in, err := os.Open(path) // #nosec G304 -- 遍历迁移的插件源码目录
 		if err != nil {
 			return err
 		}
-		out, err := os.Create(target)
+		out, err := os.Create(target) // #nosec G304 -- target 由 WalkDir 相对路径拼装，未穿越 dest
 		if err != nil {
-			in.Close()
+			_ = in.Close()
 			return err
 		}
 		_, cerr := io.Copy(out, in)

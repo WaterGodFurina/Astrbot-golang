@@ -338,7 +338,7 @@ func (a *Adapter) convertMessage(msg *WecomMessage) {
 			return
 		}
 		path := filepath.Join(os.TempDir(), fmt.Sprintf("wecom_%s.amr", msg.MediaID))
-		if err := os.WriteFile(path, data, 0644); err != nil {
+		if err := os.WriteFile(path, data, 0600); err != nil {
 			logger.I18nError("保存企业微信语音素材失败: %v", err)
 			return
 		}
@@ -402,7 +402,7 @@ func (a *Adapter) convertKFMessage(msg map[string]interface{}) {
 		mimeType := http.DetectContentType(data)
 		suffix := mimeExt(mimeType)
 		path := filepath.Join(os.TempDir(), fmt.Sprintf("weixinkefu_%s%s", mediaID, suffix))
-		if err := os.WriteFile(path, data, 0644); err != nil {
+		if err := os.WriteFile(path, data, 0600); err != nil {
 			logger.I18nError("保存微信客服图片素材失败: %v", err)
 			return
 		}
@@ -415,7 +415,7 @@ func (a *Adapter) convertKFMessage(msg map[string]interface{}) {
 			return
 		}
 		path := filepath.Join(os.TempDir(), fmt.Sprintf("weixinkefu_%s.amr", mediaID))
-		if err := os.WriteFile(path, data, 0644); err != nil {
+		if err := os.WriteFile(path, data, 0600); err != nil {
 			logger.I18nError("保存微信客服语音素材失败: %v", err)
 			return
 		}
@@ -437,7 +437,7 @@ func (a *Adapter) convertKFMessage(msg map[string]interface{}) {
 			fileName = fmt.Sprintf("weixinkefu_%s.bin", mediaID)
 		}
 		path := filepath.Join(os.TempDir(), fmt.Sprintf("weixinkefu_%s_%s", randomHex(16), fileName))
-		if err := os.WriteFile(path, data, 0644); err != nil {
+		if err := os.WriteFile(path, data, 0600); err != nil {
 			logger.I18nError("保存微信客服文件素材失败: %v", err)
 			return
 		}
@@ -584,8 +584,9 @@ func (s *WecomServer) Start(ctx context.Context, host string, port int) error {
 		return fmt.Errorf("企业微信回调服务器监听 %s:%d 失败: %w", host, port, err)
 	}
 	s.httpSrv = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", host, port),
-		Handler: mux,
+		Addr:              fmt.Sprintf("%s:%d", host, port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	logger.I18nInfo("企业微信回调服务器开始监听 %s:%d", host, port)
 	go func() {

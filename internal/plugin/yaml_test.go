@@ -75,7 +75,7 @@ func TestInstallPythonPluginYAMLMetadata(t *testing.T) {
 		t.Fatalf("yamlhello 命令未注册: %+v", inst.Meta.Commands)
 	}
 	// 卸载清理
-	m.Uninstall(inst.ID, true, true)
+	_ = m.Uninstall(inst.ID, true, true)
 	if m.Get(inst.ID) != nil {
 		t.Fatal("卸载后实例仍在")
 	}

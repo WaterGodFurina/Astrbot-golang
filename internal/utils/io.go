@@ -46,6 +46,7 @@ func NewHTTPClient(proxyURL, caCertPath string, timeout time.Duration) (*HTTPCli
 	}
 
 	if caCertPath != "" {
+		// #nosec G304 -- caCertPath is an admin-configured CA bundle path.
 		pemData, err := os.ReadFile(caCertPath)
 		if err != nil {
 			return nil, fmt.Errorf("read CA cert: %w", err)
@@ -121,10 +122,11 @@ func (h *HTTPClient) DownloadFile(ctx context.Context, urlStr, destPath string, 
 		return fmt.Errorf("destPath is empty")
 	}
 
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(destPath), 0750); err != nil {
 		return fmt.Errorf("create dir: %w", err)
 	}
 
+	// #nosec G304 -- destPath is the caller-supplied download destination.
 	out, err := os.Create(destPath)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
@@ -132,7 +134,9 @@ func (h *HTTPClient) DownloadFile(ctx context.Context, urlStr, destPath string, 
 	defer out.Close()
 
 	if _, err := io.Copy(out, resp.Body); err != nil {
-		os.Remove(destPath) // Cleanup partial file
+		if err := os.Remove(destPath); err != nil {
+			logger.Debug("cleanup partial file %s failed: %v", destPath, err)
+		}
 		return fmt.Errorf("write file: %w", err)
 	}
 
@@ -211,7 +215,7 @@ func EnsureDir(dirPath string) error {
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat path: %w", err)
 	}
-	return os.MkdirAll(dirPath, 0755)
+	return os.MkdirAll(dirPath, 0750)
 }
 
 // RemoveDir removes a file or directory tree.
@@ -226,12 +230,13 @@ func PortChecker(port int, host string) bool {
 	if err != nil {
 		return false
 	}
-	conn.Close()
+	defer conn.Close()
 	return true
 }
 
 // FileToBase64 reads a file and returns its base64-encoded content with prefix.
 func FileToBase64(path string) (string, error) {
+	// #nosec G304 -- generic utility; the path is provided by the caller.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err

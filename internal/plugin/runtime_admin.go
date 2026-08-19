@@ -564,8 +564,8 @@ func (m *SubprocessManager) cacheConfigSchema(id string, meta *sdkv1.RegisterRes
 		return
 	}
 	path := m.schemaCachePath(id)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, meta.ConfigSchemaJson, 0o644)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)           // #nosec G301 -- 配置 schema 缓存目录（WebUI 需读取）
+	_ = os.WriteFile(path, meta.ConfigSchemaJson, 0o644) // #nosec G306 -- schema 缓存非常规敏感信息
 }
 
 // Components returns the plugin's behavior components (commands / llm tools /
@@ -655,7 +655,7 @@ func (m *SubprocessManager) writeMetadataConfig(id string, meta *PluginMetadata)
 		return
 	}
 	path := m.metadataPath(id)
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755) // #nosec G301 -- 插件元数据目录（用户态）
 
 	od := config.NewOrderedJSON()
 	cgo := "no"
@@ -683,6 +683,7 @@ func (m *SubprocessManager) writeMetadataConfig(id string, meta *PluginMetadata)
 		logger.I18nWarn("writeMetadataConfig(%s): %v", id, err)
 		return
 	}
+	// #nosec G306 -- 插件元数据非常规敏感信息
 	if err := os.WriteFile(path, out, 0o644); err != nil {
 		logger.I18nWarn("writeMetadataConfig(%s): %v", id, err)
 	}
@@ -723,7 +724,7 @@ func (m *SubprocessManager) stripMetadataKeys(id string, cfg map[string]interfac
 	m.mergeMetadataFile(id, removed)
 	// 重写 config.json（不含元数据键）。
 	if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-		_ = os.WriteFile(m.configPath(id), data, 0o644)
+		_ = os.WriteFile(m.configPath(id), data, 0o644) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
 	}
 	return cfg
 }
@@ -735,6 +736,7 @@ func (m *SubprocessManager) mergeMetadataFile(id string, kv map[string]interface
 	}
 	path := m.metadataPath(id)
 	od := config.NewOrderedJSON()
+	// #nosec G304 -- 读取插件元数据（安装时写入的固定路径）
 	if data, err := os.ReadFile(path); err == nil {
 		if existing, err := config.ParseOrderedJSON(data); err == nil {
 			od = existing
@@ -747,8 +749,8 @@ func (m *SubprocessManager) mergeMetadataFile(id string, kv map[string]interface
 	if err != nil {
 		return
 	}
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, out, 0o644)
+	_ = os.MkdirAll(filepath.Dir(path), 0o755) // #nosec G301 -- 插件元数据目录（用户态）
+	_ = os.WriteFile(path, out, 0o644)         // #nosec G306 -- 插件元数据非常规敏感信息
 }
 
 // LoadConfig reads the plugin config from plugins_config/<id>/config.json.
@@ -876,12 +878,12 @@ func (m *SubprocessManager) SaveConfig(id string, cfg map[string]interface{}) er
 	}
 	cfg = m.stripMetadataKeys(id, cfg)
 	path := m.configPath(id)
-	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = os.MkdirAll(filepath.Dir(path), 0755) // #nosec G301 -- 插件配置目录（用户态）
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0644) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
 }
 
 // pluginDataRoot returns the unified per-plugin data root directory
@@ -919,7 +921,7 @@ func (m *SubprocessManager) migratePluginData(oldID, newID string) {
 // creating it if needed.
 func (m *SubprocessManager) PluginDataDir(id string) string {
 	dir := m.pluginDataRoot(id)
-	_ = os.MkdirAll(dir, 0o755)
+	_ = os.MkdirAll(dir, 0o755) // #nosec G301 -- 插件数据目录（用户态）
 	return dir
 }
 
@@ -957,7 +959,7 @@ func (m *SubprocessManager) Changelog(id string) string {
 // (plugins/<id>，与源码本体同目录). id 再次经 sanitizeID 归一化（拒绝 /、
 // \、.、.. 等穿越字符），即使上游传入异常值也不会逃逸 data/plugins 目录。
 func (m *SubprocessManager) readCachedDoc(id, file string) string {
-	content, err := os.ReadFile(filepath.Join(m.docsPath(id), file))
+	content, err := os.ReadFile(filepath.Join(m.docsPath(id), file)) // #nosec G304 -- id 经 sanitizeID 归一化防穿越
 	if err != nil {
 		return ""
 	}
@@ -1003,7 +1005,7 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 			continue
 		}
 		content, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode == http.StatusOK && len(content) > 0 {
 			m.docMu.Lock()
 			m.docFetchCache[cacheKey] = docCacheEntry{content: string(content), ts: time.Now()}

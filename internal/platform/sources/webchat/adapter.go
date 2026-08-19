@@ -75,8 +75,9 @@ func (a *Adapter) Start(ctx context.Context) error {
 	mux.HandleFunc("/poll", a.handlePoll)
 
 	a.server = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", a.Host, a.Port),
-		Handler: mux,
+		Addr:              fmt.Sprintf("%s:%d", a.Host, a.Port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	go func() {
@@ -108,8 +109,8 @@ func (a *Adapter) Type() string { return "webchat" }
 // Send sends a message to a web chat client.
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	a.mu.Lock()
-	ch, _ := a.clients[sessionID]
-	pch, _ := a.pollClients[sessionID]
+	ch := a.clients[sessionID]
+	pch := a.pollClients[sessionID]
 	a.mu.Unlock()
 	if ch == nil && pch == nil {
 		return fmt.Errorf("client %s not connected", sessionID)
@@ -236,13 +237,13 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 	select {
 	case resp := <-replyCh:
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"session_id": req.SessionID,
 			"reply":      extractPlainText(resp),
 		})
 	case <-time.After(60 * time.Second):
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"session_id": req.SessionID,
 			"reply":      "Timeout waiting for response",
 		})
@@ -285,14 +286,14 @@ func (a *Adapter) handlePoll(w http.ResponseWriter, r *http.Request) {
 	select {
 	case resp := <-ch:
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"reply": extractPlainText(resp),
 		})
 	case <-r.Context().Done():
 		// 客户端断开连接：直接返回，由 defer 清理轮询通道。
 	case <-time.After(30 * time.Second):
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"reply": nil,
 		})
 	}

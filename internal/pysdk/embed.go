@@ -293,10 +293,10 @@ func downloadFile(url, dest string, stage func(string)) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("download %s: HTTP %d", url, resp.StatusCode)
 	}
-	out, err := os.Create(dest)
+	out, err := os.Create(dest) // #nosec G304 -- dest is the caller-chosen download destination under the cache dir
 	if err != nil {
 		return err
 	}
@@ -350,7 +350,7 @@ func humanSize(n int64) string {
 // extractTarGzKeepTop unpacks a tar.gz into dir, preserving the leading "python/"
 // component (python-build-standalone install_only layout: python/bin/python3).
 func extractTarGzKeepTop(src, dir string) error {
-	f, err := os.Open(src)
+	f, err := os.Open(src) // #nosec G304 -- src is the just-downloaded archive under the cache dir
 	if err != nil {
 		return err
 	}
@@ -388,12 +388,12 @@ func extractTarGzKeepTop(src, dir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			w, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
+			w, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(uint32(hdr.Mode&0o777))) // #nosec G304 -- target validated by safeJoin
 			if err != nil {
 				return err
 			}
 			if _, err := io.Copy(w, tr); err != nil {
-				w.Close()
+				_ = w.Close()
 				return err
 			}
 			if err := w.Close(); err != nil {
@@ -479,7 +479,7 @@ func Ensure(dataDir string) (string, error) {
 	needFetch := false
 	if _, err := os.Stat(marker); err != nil {
 		needFetch = true
-	} else if data, err := os.ReadFile(versionFile); err != nil || strings.TrimSpace(string(data)) != SDKVersion {
+	} else if data, err := os.ReadFile(versionFile); err != nil || strings.TrimSpace(string(data)) != SDKVersion { // #nosec G304 -- versionFile is a host-controlled marker under root
 		logger.Info("Python SDK 版本变化（磁盘 %q vs 期望 %q），重新下载…",
 			strings.TrimSpace(string(data)), SDKVersion)
 		needFetch = true
@@ -513,9 +513,9 @@ func Ensure(dataDir string) (string, error) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		_ = os.RemoveAll(root)
-		return "", fmt.Errorf("Python SDK 下载内容缺少 astrbot/ 包（标记 %s 不存在）", marker)
+		return "", fmt.Errorf("python SDK 下载内容缺少 astrbot/ 包（标记 %s 不存在）", marker)
 	}
-	if err := os.WriteFile(versionFile, []byte(SDKVersion+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(versionFile, []byte(SDKVersion+"\n"), 0o600); err != nil {
 		return "", fmt.Errorf("写入 Python SDK 版本标记: %w", err)
 	}
 	logger.Info("Python SDK 已就绪 %s (v%s)", root, SDKVersion)
@@ -525,7 +525,7 @@ func Ensure(dataDir string) (string, error) {
 // extractTarGzStripTop unpacks a GitHub-style archive into dir, stripping a
 // single top-level directory ("<repo>-v<ver>/..." layout).
 func extractTarGzStripTop(src, dir string) error {
-	f, err := os.Open(src)
+	f, err := os.Open(src) // #nosec G304 -- src is the just-downloaded SDK archive (temp file)
 	if err != nil {
 		return err
 	}
@@ -580,12 +580,12 @@ func extractTarGzStripTop(src, dir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			w, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
+			w, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(uint32(hdr.Mode&0o777))) // #nosec G304 -- target validated by safeJoin
 			if err != nil {
 				return err
 			}
 			if _, err := io.Copy(w, tr); err != nil {
-				w.Close()
+				_ = w.Close()
 				return err
 			}
 			if err := w.Close(); err != nil {
@@ -794,10 +794,10 @@ func writeVenvMarkers(venvRoot, interpreter, sdkVersion string, depsVersion int)
 	if err := os.MkdirAll(venvRoot, 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(environmentPath(venvRoot), data, 0o644); err != nil {
+	if err := os.WriteFile(environmentPath(venvRoot), data, 0o600); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(readyPath(venvRoot), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(readyPath(venvRoot), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}

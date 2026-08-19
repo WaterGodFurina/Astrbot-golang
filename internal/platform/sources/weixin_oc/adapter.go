@@ -332,11 +332,11 @@ func (a *Adapter) saveMedia(data []byte, kind, suffix string) string {
 		return ""
 	}
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return ""
 	}
 	name := tmp.Name()
-	tmp.Close()
+	_ = tmp.Close()
 	return name
 }
 

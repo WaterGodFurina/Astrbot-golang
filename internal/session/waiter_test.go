@@ -241,7 +241,8 @@ func TestTriggerPassesContext(t *testing.T) {
 
 	ev := &mockEvent{origin: "aiocqhttp:g", senderID: "u", messages: &message.MessageChain{Chain: []message.Component{}}}
 
-	base := context.WithValue(context.Background(), "marker", "x")
+	type ctxKey string
+	base := context.WithValue(context.Background(), ctxKey("marker"), "x")
 	ctx, cancel := context.WithCancel(base)
 	defer cancel()
 	if err := reg.Trigger(ctx, sw.ID, ev); err != nil {

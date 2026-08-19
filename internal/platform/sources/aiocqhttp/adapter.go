@@ -175,7 +175,10 @@ func (a *Adapter) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	a.server = &http.Server{Handler: mux}
+	a.server = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 
 	go func() {
 		logger.I18nInfo("aiocqhttp(OneBot v11) 适配器正在监听 %s", addr)
@@ -390,7 +393,7 @@ func (a *Adapter) sendAction(action string, params map[string]interface{}) error
 			continue
 		}
 		mu.Lock()
-		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		err := c.WriteMessage(websocket.TextMessage, payload)
 		mu.Unlock()
 		if err != nil {
@@ -546,7 +549,7 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		// 预检之后、addConn 之前有并发连接涌入，addConn 在锁内再次校验上限
 		// 并拒绝。连接此时已升级，直接关闭。
 		logger.I18nWarn("反向 WebSocket 连接数已达上限，拒绝: %v", err)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	logger.I18nInfo("反向 WebSocket 客户端已连接 (%s)", conn.RemoteAddr())
@@ -567,15 +570,14 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		a.removeConn(conn)
-		conn.Close()
+		_ = conn.Close()
 		logger.I18nInfo("反向 WebSocket 客户端已断开")
 	}()
 
 	// Heartbeat: respond to ping, and respect the peer's close/ping timeouts.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-		return nil
+		return conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	})
 
 	// Events are handled on a single per-connection goroutine so a slow
@@ -691,7 +693,7 @@ func (a *Adapter) CallAction(api string, params map[string]any) (map[string]any,
 		// The write lock is released before waiting for the echo so a slow
 		// action never blocks other writers on the same connection.
 		mu.Lock()
-		c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		err := c.WriteMessage(websocket.TextMessage, payload)
 		mu.Unlock()
 		if err != nil {

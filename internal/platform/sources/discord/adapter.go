@@ -125,7 +125,7 @@ func (a *Adapter) Type() string { return "discord" }
 // Start connects to the Discord gateway and registers handlers.
 func (a *Adapter) Start(ctx context.Context) error {
 	if a.token == "" {
-		return fmt.Errorf("discord: Bot token is not configured. Please set a valid token in the config file.")
+		return fmt.Errorf("discord: bot token is not configured, please set a valid token in the config file")
 	}
 
 	session, err := discordgo.New("Bot " + a.token)
@@ -188,7 +188,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 	logger.I18nInfo("Discord 适配器启动中...")
 	if err := session.Open(); err != nil {
 		if isLoginFailure(err) {
-			return fmt.Errorf("discord: Login failed. Please check whether the bot token is correct.")
+			return fmt.Errorf("discord: login failed, please check whether the bot token is correct")
 		}
 		return err
 	}

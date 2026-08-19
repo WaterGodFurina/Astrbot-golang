@@ -88,7 +88,7 @@ func (b *LocalBooter) Start(ctx context.Context) error {
 	if b.root == "" {
 		b.root = filepath.Join("data", "sandbox", "workspace")
 	}
-	if err := os.MkdirAll(b.root, 0755); err != nil {
+	if err := os.MkdirAll(b.root, 0o750); err != nil {
 		return err
 	}
 	b.running = true
@@ -194,7 +194,7 @@ func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workd
 	if err != nil {
 		return "", "", -1, err
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", "", -1, err
 	}
 	c := exec.CommandContext(ctx, cmd, args...)
@@ -257,7 +257,12 @@ func (b *LocalBooter) ListSkills(ctx context.Context) ([]skills.SandboxCacheEntr
 			return nil
 		}
 		dir := filepath.Base(filepath.Dir(p))
-		content, _ := os.ReadFile(p)
+		// #nosec G304 -- p comes from filepath.WalkDir over the sandbox skills
+		// root (managed local directory), matching SKILL.md entries.
+		content, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
 		entries = append(entries, skills.SandboxCacheEntry{
 			Name:        dir,
 			Description: skills.ParseFrontmatterDescription(string(content)),
@@ -279,6 +284,8 @@ func (b *LocalBooter) ReadFile(ctx context.Context, path string) (string, error)
 	if err != nil {
 		return "", err
 	}
+	// #nosec G304 -- host is the result of mapPath, which confines reads to the
+	// sandbox workspace root.
 	data, err := os.ReadFile(host)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -300,10 +307,10 @@ func (b *LocalBooter) WriteFile(ctx context.Context, path, content string) error
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(host), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(host), 0o750); err != nil {
 		return err
 	}
-	return os.WriteFile(host, []byte(content), 0644)
+	return os.WriteFile(host, []byte(content), 0o600)
 }
 
 // SandboxWorkdir is the sandbox workspace directory used as the cwd for
@@ -577,6 +584,9 @@ func dockerRun(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 	if bin == "" {
 		bin = "docker"
 	}
+	// #nosec G204 -- docker CLI invocation is the sandbox's core purpose; the
+	// sandbox workspaces are isolated containers, and args are constructed by
+	// the Booter from sandbox operations.
 	cmd := exec.CommandContext(ctx, bin, args...)
 	if stdin != nil {
 		cmd.Stdin = stdin
@@ -618,7 +628,9 @@ func (m *Manager) SetBooter(b Booter) {
 	// 旧 booter 的 Stop 可能阻塞较久（docker rm 最长 30s），必须在锁外执行，
 	// 否则期间所有 Exec/读写操作都会被写锁卡住。
 	if old != nil {
-		old.Stop()
+		if err := old.Stop(); err != nil {
+			logger.Error("停止旧 sandbox booter 失败: %v", err)
+		}
 	}
 }
 

@@ -341,7 +341,7 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, p
 // sendSSE writes one SSE data frame.
 func sendSSE(w http.ResponseWriter, flusher http.Flusher, payload map[string]interface{}) {
 	data, _ := json.Marshal(payload)
-	fmt.Fprintf(w, "data: %s\n\n", data)
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
 }
 
@@ -476,9 +476,9 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 	defer wsCancel()
 	defer conn.Close()
 
-	conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
+		_ = conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
 		return nil
 	})
 

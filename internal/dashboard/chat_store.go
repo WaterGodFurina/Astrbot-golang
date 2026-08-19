@@ -75,15 +75,15 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	tmpName := tmp.Name()
 	defer func() {
 		if tmpName != "" {
-			os.Remove(tmpName)
+			_ = os.Remove(tmpName)
 		}
 	}()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -212,9 +212,7 @@ func (cs *chatStore) sessionDetail(id string) map[string]interface{} {
 	}
 	cs.mu.Lock()
 	messages := make([]map[string]interface{}, len(s.Messages))
-	for i, m := range s.Messages {
-		messages[i] = m
-	}
+	copy(messages, s.Messages)
 	cs.mu.Unlock()
 	return map[string]interface{}{
 		"session_id":  s.SessionID,

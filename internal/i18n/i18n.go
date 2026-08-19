@@ -34,6 +34,8 @@ func NewTranslator(defaultLocale string) *Translator {
 
 // LoadLocale loads translations from a JSON file.
 func (t *Translator) LoadLocale(locale, path string) error {
+	// #nosec G304 -- path is a caller-supplied locale file path (admin config),
+	// not derived from remote input.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err

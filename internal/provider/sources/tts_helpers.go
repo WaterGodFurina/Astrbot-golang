@@ -109,12 +109,12 @@ func ttsSaveAudio(r io.Reader, prefix, ext string) (string, error) {
 		return "", err
 	}
 	if _, err := io.Copy(f, r); err != nil {
-		f.Close()
-		os.Remove(path)
+		_ = f.Close()
+		_ = os.Remove(path)
 		return "", err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		return "", err
 	}
 	return path, nil

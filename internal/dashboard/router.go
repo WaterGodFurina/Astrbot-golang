@@ -18,10 +18,7 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, apiError("未认证"))
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/api/")
-	if strings.HasPrefix(path, "v1/") {
-		path = strings.TrimPrefix(path, "v1/")
-	}
+	path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/"), "v1/")
 	parts := strings.Split(path, "/")
 	if len(parts) == 0 || parts[0] == "" {
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -188,10 +185,7 @@ func (s *Server) apiAuthAllowed(r *http.Request) bool {
 	if s.auth == nil {
 		return true
 	}
-	p := strings.TrimPrefix(r.URL.Path, "/api/")
-	if strings.HasPrefix(p, "v1/") {
-		p = strings.TrimPrefix(p, "v1/")
-	}
+	p := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/"), "v1/")
 	parts := strings.Split(p, "/")
 	if len(parts) == 0 || parts[0] == "" {
 		return false

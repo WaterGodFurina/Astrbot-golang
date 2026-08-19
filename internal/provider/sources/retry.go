@@ -210,8 +210,8 @@ func DoWithRetry(
 				return resp, nil
 			}
 			// Retryable error status: consume body and retry.
-			io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_, _ = io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
 			lastResp = resp
 			lastErr = fmt.Errorf("HTTP %d", status)
 			retryLogger.Warn("[%s] Retryable status %d (attempt %d/%d): %s",

@@ -168,11 +168,11 @@ func (s *Server) fetchPluginMarket(registryURL string, forceRefresh bool) (inter
 		if resp.StatusCode != http.StatusOK {
 			log.GetDefault().Info("plugin market fetch failed (%s): HTTP %d", u, resp.StatusCode)
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			continue
 		}
 		data, decErr := decodeMarketBody(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decErr != nil {
 			log.GetDefault().Info("plugin market decode failed (%s): %v", u, decErr)
 			lastErr = decErr

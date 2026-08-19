@@ -208,7 +208,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	}
 
 	// Cleanup 后进程退出
-	m.Unload("test_pyplugin")
+	_ = m.Unload("test_pyplugin")
 	if m.Get("test_pyplugin") != nil {
 		t.Fatal("卸载后实例仍在")
 	}

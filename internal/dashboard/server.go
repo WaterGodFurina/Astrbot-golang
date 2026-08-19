@@ -1331,7 +1331,7 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(cleanPath, "assets/") {
 				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			}
-			w.Write(data)
+			_, _ = w.Write(data)
 			return
 		}
 	}
@@ -1356,7 +1356,7 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(cleanPath, "assets/") {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
-	w.Write(data)
+	_, _ = w.Write(data)
 }
 
 // contentTypeFor returns the MIME type for a file path.

@@ -433,8 +433,10 @@ func TestLoginRateLimit(t *testing.T) {
 		t.Fatal("login limiter not initialized")
 	}
 	// burst=3: first three attempts pass, the fourth is throttled.
-	if !limiter.Allow("1.2.3.4", 1.0, 3.0) || !limiter.Allow("1.2.3.4", 1.0, 3.0) || !limiter.Allow("1.2.3.4", 1.0, 3.0) {
-		t.Fatal("first three attempts within burst should be allowed")
+	for i := 0; i < 3; i++ {
+		if !limiter.Allow("1.2.3.4", 1.0, 3.0) {
+			t.Fatal("first three attempts within burst should be allowed")
+		}
 	}
 	if limiter.Allow("1.2.3.4", 1.0, 3.0) {
 		t.Fatal("fourth attempt beyond burst should be throttled")

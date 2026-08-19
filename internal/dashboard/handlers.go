@@ -2229,11 +2229,11 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			return
 		}
 		if _, err := io.Copy(out, file); err != nil {
-			out.Close()
+			_ = out.Close()
 			writeJSON(w, http.StatusOK, apiError("保存上传文件失败: "+err.Error()))
 			return
 		}
-		out.Close()
+		_ = out.Close()
 		source = archive
 		id = idFromSource(fh.Filename)
 		ignoreRisk = r.FormValue("ignore_risk") == "true"
@@ -2578,7 +2578,7 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 							continue
 						}
 						content, err := io.ReadAll(io.LimitReader(f, 64<<20))
-						f.Close()
+						_ = f.Close()
 						if err != nil {
 							continue
 						}
@@ -3214,18 +3214,18 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 				dst := filepath.Join(dir, sanitizePath(name))
 				out, err := os.Create(dst)
 				if err != nil {
-					src.Close()
+					_ = src.Close()
 					continue
 				}
 				n, err := io.Copy(out, io.LimitReader(src, maxKBDocFileSize+1))
 				if err != nil {
-					out.Close()
-					src.Close()
+					_ = out.Close()
+					_ = src.Close()
 					_ = os.Remove(dst)
 					continue
 				}
-				out.Close()
-				src.Close()
+				_ = out.Close()
+				_ = src.Close()
 				if n > maxKBDocFileSize {
 					_ = os.Remove(dst)
 					continue
@@ -4933,7 +4933,7 @@ func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request, serverNam
 				result["success"] = false
 				result["error"] = err.Error()
 			} else {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 		}
 	default:
@@ -5013,7 +5013,7 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			data, _ := json.Marshal(payload)
-			fmt.Fprintf(w, "id: %d\ndata: %s\n\n", entry.Timestamp.UnixMilli(), data)
+			_, _ = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", entry.Timestamp.UnixMilli(), data)
 			flusher.Flush()
 		}
 	}
@@ -6724,7 +6724,7 @@ func (s *Server) uploadSkillsBatch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		skillName, installErr := installSkillFromZip(src, fh.Size, skillsRoot, strings.TrimSuffix(filename, ".zip"))
-		src.Close()
+		_ = src.Close()
 		if installErr != nil {
 			if strings.Contains(installErr.Error(), "already exists") {
 				skipped = append(skipped, map[string]interface{}{
@@ -6778,12 +6778,12 @@ func installSkillFromZip(src io.ReaderAt, size int64, skillsRoot, nameHint strin
 		}
 		out, err := os.Create(dest)
 		if err != nil {
-			rc.Close()
+			_ = rc.Close()
 			return "", err
 		}
 		n, copyErr := io.Copy(out, io.LimitReader(rc, maxSkillFileSize+1))
-		out.Close()
-		rc.Close()
+		_ = out.Close()
+		_ = rc.Close()
 		if copyErr != nil {
 			return "", copyErr
 		}
@@ -6831,7 +6831,7 @@ func installSkillFromZip(src io.ReaderAt, size int64, skillsRoot, nameHint strin
 
 	dest := filepath.Join(skillsRoot, name)
 	if _, err := os.Stat(dest); err == nil {
-		return "", fmt.Errorf("Skill already exists")
+		return "", fmt.Errorf("skill already exists")
 	}
 	_ = os.MkdirAll(skillsRoot, 0755)
 	if err := os.Rename(skillDir, dest); err != nil {

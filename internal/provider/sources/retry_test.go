@@ -161,7 +161,7 @@ func TestDoWithRetrySuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer server.Close()
 
@@ -172,7 +172,7 @@ func TestDoWithRetrySuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if calls != 1 {
 		t.Errorf("calls = %d, want 1", calls)
 	}
@@ -188,7 +188,7 @@ func TestDoWithRetryRetries429(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer server.Close()
 
@@ -201,7 +201,7 @@ func TestDoWithRetryRetries429(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if calls != 3 {
 		t.Errorf("calls = %d, want 3", calls)
 	}
@@ -229,7 +229,7 @@ func TestDoWithRetryRetries500(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if calls != 2 {
 		t.Errorf("calls = %d, want 2", calls)
 	}
@@ -272,7 +272,7 @@ func TestDoWithRetryNonRetryableError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
@@ -303,7 +303,7 @@ func TestDoWithRetryNetworkErrorRetries(t *testing.T) {
 		t.Logf("request failed (may be race): %v", err)
 		return
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if calls < 1 {
 		t.Errorf("calls = %d, want >= 1", calls)
 	}
@@ -355,7 +355,7 @@ func TestDoWithRetryRetryAfterHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	_ = delays
 	if calls != 2 {
 		t.Errorf("calls = %d, want 2", calls)
@@ -408,7 +408,7 @@ func TestDoWithRetryExponentialBackoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if len(timestamps) != 4 {
 		t.Fatalf("got %d timestamps, want 4", len(timestamps))
 	}
@@ -441,6 +441,6 @@ func BenchmarkDoWithRetry(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}
 }

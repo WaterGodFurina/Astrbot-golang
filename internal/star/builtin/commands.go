@@ -331,8 +331,7 @@ func providerCmd(deps Deps, e *core.Event) {
 		return
 	}
 	idx := 0
-	fmt.Sscanf(al[0], "%d", &idx)
-	if idx < 1 || idx > len(providers) {
+	if _, err := fmt.Sscanf(al[0], "%d", &idx); err != nil || idx < 1 || idx > len(providers) {
 		reply(e, i18n.Get("❌ Invalid provider index."))
 		return
 	}

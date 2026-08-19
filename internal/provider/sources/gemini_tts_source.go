@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -97,7 +98,7 @@ func (s *GeminiTTSSource) GetAudio(ctx context.Context, text string) (string, er
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return "", fmt.Errorf("Gemini TTS API error %d: %s", resp.StatusCode, string(data))
+		return "", fmt.Errorf("gemini TTS API error %d: %s", resp.StatusCode, string(data))
 	}
 
 	var result struct {
@@ -155,23 +156,32 @@ func writePCMWavFile(path string, pcm []byte, sampleRate int) error {
 		channels      = 1
 		bitsPerSample = 16
 	)
+	if sampleRate <= 0 || sampleRate > math.MaxUint32 {
+		return fmt.Errorf("invalid sample rate: %d", sampleRate)
+	}
 	byteRate := sampleRate * channels * bitsPerSample / 8
+	if byteRate > math.MaxUint32 {
+		return fmt.Errorf("invalid byte rate: %d", byteRate)
+	}
 	blockAlign := channels * bitsPerSample / 8
+	if len(pcm) > math.MaxUint32-36 {
+		return fmt.Errorf("PCM data too large for WAV format: %d bytes", len(pcm))
+	}
 
 	var buf bytes.Buffer
 	buf.WriteString("RIFF")
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(36+len(pcm)))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(36+len(pcm))) // #nosec G115 -- len(pcm) 已在上方校验 ≤ math.MaxUint32-36
 	buf.WriteString("WAVE")
 	buf.WriteString("fmt ")
 	_ = binary.Write(&buf, binary.LittleEndian, uint32(16))
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(channels))
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(byteRate))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate)) // #nosec G115 -- sampleRate 已校验 ∈ (0, math.MaxUint32]
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(byteRate))   // #nosec G115 -- byteRate 已校验 ≤ math.MaxUint32
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(blockAlign))
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(bitsPerSample))
 	buf.WriteString("data")
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(pcm)))
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(len(pcm))) // #nosec G115 -- len(pcm) 已在上方校验 ≤ math.MaxUint32-36
 	buf.Write(pcm)
 	return os.WriteFile(path, buf.Bytes(), 0644)
 }

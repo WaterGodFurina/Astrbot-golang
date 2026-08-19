@@ -223,6 +223,8 @@ func (c *WeChatClient) UploadMedia(ctx context.Context, mediaType, filePath stri
 	}
 	query.Set("access_token", token)
 
+	// #nosec G304 -- filePath 为调用方指定的待上传素材路径（bot 管理员/插件控制），
+	// 用于上传企业微信素材，属预期功能而非任意文件包含。
 	f, err := os.Open(filePath)
 	if err != nil {
 		return "", err

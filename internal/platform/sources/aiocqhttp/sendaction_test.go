@@ -78,7 +78,7 @@ func sendActionWS(t *testing.T, wantStatus string) (*Adapter, *httptest.Server) 
 		}
 	}()
 	t.Cleanup(func() {
-		conn.Close()
+		_ = conn.Close()
 		srv.Close()
 	})
 	return a, srv

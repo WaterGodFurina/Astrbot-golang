@@ -408,7 +408,7 @@ func (m *SubprocessManager) SetGoConfig(goproxy, goflags string) {
 // "@latest" is appended when absent. It returns the combined command output.
 func (m *SubprocessManager) GoInstall(ctx context.Context, pkg, goproxy string) (string, error) {
 	if m.toolchain == nil {
-		return "", fmt.Errorf("Go 工具链不可用")
+		return "", fmt.Errorf("go 工具链不可用")
 	}
 	bin, err := m.toolchain.GoBin()
 	if err != nil {
@@ -424,7 +424,7 @@ func (m *SubprocessManager) GoInstall(ctx context.Context, pkg, goproxy string) 
 	if strings.TrimSpace(goproxy) != "" {
 		extra["GOPROXY"] = strings.TrimSpace(goproxy)
 	}
-	cmd := exec.CommandContext(ctx, bin, "install", pkg)
+	cmd := exec.CommandContext(ctx, bin, "install", pkg) // #nosec G204 -- 运行 go install 安装用户指定模块（插件安装核心）
 	cmd.Env = m.toolchain.BuildEnv(extra)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -714,7 +714,7 @@ func (m *SubprocessManager) pipInstall(env *pysdk.RuntimeEnv, pluginDir, req str
 		index = pysdk.PyPIIndex()
 	}
 	args = append(args, "-i", index)
-	cmd := exec.Command(env.PythonBin, args...)
+	cmd := exec.Command(env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）
 	cmd.Dir = pluginDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -732,7 +732,7 @@ func ensurePythonEntry(srcDir string) error {
 	if _, err := os.Stat(filepath.Join(srcDir, "__init__.py")); err == nil {
 		return nil
 	}
-	return fmt.Errorf("Python 插件源码缺少 main.py 或 __init__.py 入口")
+	return fmt.Errorf("python 插件源码缺少 main.py 或 __init__.py 入口")
 }
 
 // cachePluginDocs copies the plugin's README.md, CHANGELOG.md and logo image
@@ -741,13 +741,14 @@ func ensurePythonEntry(srcDir string) error {
 // serve them (mirrors Python's plugin_dir/README.md lookup).
 func (m *SubprocessManager) cachePluginDocs(id, srcDir string, meta *PluginMetadata) {
 	dir := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
-	_ = os.MkdirAll(dir, 0o755)
+	_ = os.MkdirAll(dir, 0o755) // #nosec G301 -- 插件文档缓存目录（WebUI 需读取）
 	for _, src := range []string{"README.md", "readme.md", "CHANGELOG.md", "changelog.md"} {
-		content, err := os.ReadFile(filepath.Join(srcDir, src))
+		content, err := os.ReadFile(filepath.Join(srcDir, src)) // #nosec G304 -- 读取插件源码内固定文件名文档
 		if err != nil {
 			continue
 		}
 		dst := filepath.Join(dir, src)
+		// #nosec G306 -- 文档缓存非常规敏感信息
 		if err := os.WriteFile(dst, content, 0o644); err != nil {
 			logger.I18nWarn("缓存插件 %s 的文档 %s 失败: %v", id, src, err)
 		}
@@ -759,18 +760,17 @@ func (m *SubprocessManager) cachePluginDocs(id, srcDir string, meta *PluginMetad
 	if meta != nil && strings.TrimSpace(meta.LogoPath) != "" {
 		candidates = append(candidates, strings.TrimSpace(meta.LogoPath))
 	}
-	for _, n := range []string{"logo.png", "logo.jpg", "logo.jpeg", "logo.gif", "icon.png"} {
-		candidates = append(candidates, n)
-	}
+	candidates = append(candidates, []string{"logo.png", "logo.jpg", "logo.jpeg", "logo.gif", "icon.png"}...)
 	for _, rel := range candidates {
 		if rel == "" || strings.Contains(rel, "..") || strings.HasPrefix(rel, "/") || strings.HasPrefix(rel, "\\") {
 			continue
 		}
-		content, err := os.ReadFile(filepath.Join(srcDir, filepath.FromSlash(rel)))
+		content, err := os.ReadFile(filepath.Join(srcDir, filepath.FromSlash(rel))) // #nosec G304 -- rel 已过滤 "../" 与绝对路径
 		if err != nil {
 			continue
 		}
 		base := filepath.Base(rel)
+		// #nosec G306 -- Logo 缓存非常规敏感信息
 		if err := os.WriteFile(filepath.Join(dir, base), content, 0o644); err != nil {
 			logger.I18nWarn("缓存插件 %s 的 Logo %s 失败: %v", id, rel, err)
 			continue
@@ -1245,7 +1245,7 @@ func allocPluginPort(base int) (uint, uint) {
 	for {
 		if _, used := globalPortUsed[p]; !used && !portInUse(p) {
 			globalPortUsed[p] = struct{}{}
-			return uint(p), uint(p)
+			return uint(p), uint(p) // #nosec G115 -- 端口从 base(≥1) 起向上扫描，int→uint 不溢出
 		}
 		p++
 	}
@@ -1287,6 +1287,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 	// 插件子进程工作目录设为统一数据根目录 data/plugins_data/<id>，插件写相对
 	// 路径的运行时数据（修仙存档、表情库等）自动落盘于此，便于管理/备份/卸载。
 	pluginDataRoot := m.pluginDataRoot(id)
+	// #nosec G301 -- 插件数据目录（用户态）
 	if err := os.MkdirAll(pluginDataRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create plugin data dir: %w", err)
 	}
@@ -1310,7 +1311,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 				logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
 			}
 		}
-		cmd := exec.Command(env.PythonBin, "-m", "astrbot._bridge.server", abs)
+		cmd := exec.Command(env.PythonBin, "-m", "astrbot._bridge.server", abs) // #nosec G204 -- 启动插件进程（插件系统核心）
 		cmd.Dir = pluginDataRoot
 		cmd.Env = env.Env(abs, m.dataDir)
 		// 宿主能力注入：Python 插件经 HostBridge.has() 查询宿主公开了哪些
@@ -1330,7 +1331,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 		return m.dispensePlugin(ctx, id, abs, language, cmd, newAstrbotStartupParser())
 	}
 
-	cmd := exec.Command(abs)
+	cmd := exec.Command(abs) // #nosec G204 -- 启动 Go 插件可执行文件（插件系统核心）
 	cmd.Dir = pluginDataRoot
 	return m.dispensePlugin(ctx, id, abs, language, cmd, nil)
 }
@@ -1543,7 +1544,7 @@ func (m *SubprocessManager) wrapStartError(parser *astrbotStartupParser, err err
 	if se == nil {
 		return err
 	}
-	return fmt.Errorf("Python 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
+	return fmt.Errorf("python 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
 		se.Phase, se.Plugin, se.Error, err)
 }
 
@@ -1775,11 +1776,13 @@ func (m *SubprocessManager) migratePluginLayout() {
 		oldSrc := filepath.Join(m.dataDir, "plugins-src", sid)
 		newSrc := filepath.Join(m.dataDir, "plugins", sid)
 		if _, err := os.Stat(oldSrc); err == nil {
-			_ = os.MkdirAll(filepath.Dir(newSrc), 0o755)
+			_ = os.MkdirAll(filepath.Dir(newSrc), 0o755) // #nosec G301 -- 迁移建目录
 			if _, err := os.Stat(newSrc); err == nil {
 				// 目标已被旧文档缓存目录占位：源码合并进去（源码文件优先），
 				// 再删旧源码目录——绝不能直接删源码。
-				copyDirMerge(oldSrc, newSrc)
+				if err := copyDirMerge(oldSrc, newSrc); err != nil {
+					logger.I18nWarn("迁移插件 %s 源码合并失败: %v", e.ID, err)
+				}
 				_ = os.RemoveAll(oldSrc)
 			} else {
 				if rerr := os.Rename(oldSrc, newSrc); rerr == nil {
@@ -1867,9 +1870,7 @@ func (m *SubprocessManager) migratePluginLayout() {
 		}
 		// 5) manifest 足迹与 Binary 路径更新（按最终 id）。
 		newBinary := e.Binary
-		if strings.Contains(newBinary, "plugins-src") {
-			newBinary = strings.Replace(newBinary, "plugins-src", "plugins", 1)
-		}
+		newBinary = strings.Replace(newBinary, "plugins-src", "plugins", 1)
 		if newBinary != e.Binary || e.ConfigDir != filepath.Join("plugins_config", sid) ||
 			e.DocsDir != filepath.Join("plugins", sid) || e.DataDir != filepath.Join("plugins_data", sid) {
 			e.Binary = newBinary
@@ -1902,7 +1903,7 @@ func (m *SubprocessManager) movePluginDir(oldSub, newSub string) bool {
 		_ = os.RemoveAll(old)
 		return true
 	}
-	_ = os.MkdirAll(filepath.Dir(new), 0o755)
+	_ = os.MkdirAll(filepath.Dir(new), 0o755) // #nosec G301 -- 迁移建目录
 	if err := os.Rename(old, new); err != nil {
 		logger.I18nWarn("迁移目录 %s → %s 失败: %v", old, new, err)
 		return false
@@ -1938,7 +1939,7 @@ func copyMissingDocs(src, dst string) {
 	if err != nil {
 		return
 	}
-	_ = os.MkdirAll(dst, 0o755)
+	_ = os.MkdirAll(dst, 0o755) // #nosec G301 -- 文档缓存目录
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -1951,7 +1952,9 @@ func copyMissingDocs(src, dst string) {
 		if _, err := os.Stat(target); err == nil {
 			continue
 		}
+		// #nosec G304 -- 读取旧文档缓存目录内固定文件名
 		if data, err := os.ReadFile(filepath.Join(src, name)); err == nil {
+			// #nosec G306 -- 文档缓存非常规敏感信息
 			_ = os.WriteFile(target, data, 0o644)
 		}
 	}

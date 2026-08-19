@@ -171,7 +171,7 @@ func TestOpenAIWhisperSourceRemoteURL(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chdir(old) })
 
 	audioSrv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("downloadedaudio"))
+		_, _ = w.Write([]byte("downloadedaudio"))
 	})
 	transcribeSrv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -2403,9 +2403,7 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	// MCP server tools (enabled servers from data/mcp_server.json). Loading is
 	// async so a slow MCP server never blocks the LLM call.
 	s.ensureMCPTools()
-	for _, schema := range s.mcpSchemasSnapshot() {
-		tools = append(tools, schema)
-	}
+	tools = append(tools, s.mcpSchemasSnapshot()...)
 	// Subprocess plugin LLM function tools.
 	tools = append(tools, s.collectPluginTools()...)
 
@@ -4350,9 +4348,7 @@ func normalizeImagePath(img *message.Image) {
 	if img.File == "" {
 		return
 	}
-	if strings.HasPrefix(img.File, "file://") {
-		img.File = strings.TrimPrefix(img.File, "file://")
-	}
+	img.File = strings.TrimPrefix(img.File, "file://")
 }
 
 // DurationFromSeconds creates a duration from seconds.

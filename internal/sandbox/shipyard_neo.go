@@ -400,7 +400,7 @@ func (b *ShipyardNeoBooter) do(ctx context.Context, client *http.Client, ep, met
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("Bay HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return nil, fmt.Errorf("bay HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	return data, nil
 }
@@ -480,6 +480,7 @@ func discoverBayCredentials() string {
 		if p == "" {
 			continue
 		}
+		// #nosec G304 -- p is one of a fixed list of local credential paths.
 		data, err := os.ReadFile(p)
 		if err != nil {
 			continue

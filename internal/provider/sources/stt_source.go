@@ -155,16 +155,16 @@ func (s *OpenAIWhisperSource) fetchAudio(ctx context.Context, audioURL string) (
 		return "", noop, err
 	}
 	n, err := io.Copy(f, io.LimitReader(resp.Body, maxAudioBytes+1))
-	f.Close()
+	_ = f.Close()
 	if err != nil {
-		os.Remove(path)
+		_ = os.Remove(path)
 		return "", noop, err
 	}
 	if n > maxAudioBytes {
-		os.Remove(path)
+		_ = os.Remove(path)
 		return "", noop, fmt.Errorf("audio exceeds %d bytes", maxAudioBytes)
 	}
-	return path, func() { os.Remove(path) }, nil
+	return path, func() { _ = os.Remove(path) }, nil
 }
 
 // Test verifies the provider by listing models.

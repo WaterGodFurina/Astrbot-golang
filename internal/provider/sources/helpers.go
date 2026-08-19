@@ -89,10 +89,7 @@ func fetchMediaData(raw string) ([]byte, string, error) {
 	if strings.HasPrefix(trimmed, "data:") {
 		return decodeDataURL(trimmed)
 	}
-	path := trimmed
-	if strings.HasPrefix(path, "file://") {
-		path = strings.TrimPrefix(path, "file://")
-	}
+	path := strings.TrimPrefix(trimmed, "file://")
 	if info, err := os.Stat(path); err == nil && !info.IsDir() {
 		data, err := os.ReadFile(path)
 		if err != nil {

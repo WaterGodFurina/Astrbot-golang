@@ -78,7 +78,7 @@ func (s *FishAudioTTSSource) lookupReferenceID(ctx context.Context) (string, err
 			} `json:"items"`
 		}
 		decodeErr := json.NewDecoder(resp.Body).Decode(&data)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decodeErr != nil {
 			return "", decodeErr
 		}
@@ -153,7 +153,7 @@ func (s *FishAudioTTSSource) GetAudio(ctx context.Context, text string) (string,
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "audio/") {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return "", fmt.Errorf("Fish Audio API error %d: %s", resp.StatusCode, string(data))
+		return "", fmt.Errorf("fish audio API error %d: %s", resp.StatusCode, string(data))
 	}
 	return ttsSaveAudio(resp.Body, "fishaudio_tts_api", "wav")
 }

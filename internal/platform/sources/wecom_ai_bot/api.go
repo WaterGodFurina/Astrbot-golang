@@ -9,7 +9,7 @@ package wecom_ai_bot
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- md5 用于图片流消息内容指纹（协议要求），非密码学用途
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -220,6 +220,7 @@ func (WecomAIBotStreamMessageBuilder) MakeTextStream(streamID, content string, f
 
 // MakeImageStream 构建图片流消息（对应 make_image_stream）。
 func (WecomAIBotStreamMessageBuilder) MakeImageStream(streamID string, imageData []byte, finish bool) string {
+	// #nosec G401 -- md5 为图片流消息协议要求的内容指纹字段，非密码学用途。
 	imageMD5 := md5.Sum(imageData)
 	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 	plain := map[string]interface{}{

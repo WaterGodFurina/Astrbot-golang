@@ -1,7 +1,7 @@
 // LINE Messaging API 客户端。
 // 1:1 移植自 astrbot/core/platform/sources/line/line_api.py。
 // 使用官方 SDK github.com/line/line-bot-sdk-go/v8（v8.22.0）：
-//   - 签名校验：linebot.ValidateSignature
+//   - 签名校验：linebot/webhook 的 ValidateSignature
 //   - 发送消息：linebot/messaging_api（ReplyMessage / PushMessage）
 //   - 下载消息内容：linebot/messaging_api blob API（GetMessageContent）
 package line
@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	linebot "github.com/line/line-bot-sdk-go/v8/linebot"
 	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
+	"github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
@@ -81,7 +81,7 @@ func (c *LineAPIClient) WithEndpointOverride(endpoint string) {
 // VerifySignature 校验 Webhook 请求的 X-Line-Signature 签名。
 // 对应 Python 的 verify_signature（HMAC-SHA256 + Base64）。
 func (c *LineAPIClient) VerifySignature(rawBody []byte, signature string) bool {
-	return linebot.ValidateSignature(c.channelSecret, strings.TrimSpace(signature), rawBody)
+	return webhook.ValidateSignature(c.channelSecret, strings.TrimSpace(signature), rawBody)
 }
 
 // ReplyMessage 发送回复消息（replyToken 仅 1 分钟有效）。

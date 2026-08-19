@@ -152,7 +152,7 @@ func detectSystemGCC() (cc, cxx, version string, ok bool) {
 		if p == "" {
 			continue
 		}
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() { // #nosec G703 -- read-only stat on locally resolved compiler path
 			cc = p
 			cxx = siblingCompiler(p, "g++")
 			if _, err := os.Stat(cxx); err != nil {
@@ -183,7 +183,7 @@ func detectSystemClang() (cc, cxx string, ok bool) {
 		if p == "" {
 			continue
 		}
-		if info, err := os.Stat(p); err == nil && !info.IsDir() {
+		if info, err := os.Stat(p); err == nil && !info.IsDir() { // #nosec G703 -- read-only stat on locally resolved compiler path
 			return p, siblingCompiler(p, "clang++"), true
 		}
 	}
@@ -264,6 +264,7 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 	// Download cache lives next to the toolchain (NOT the volatile tmp dir),
 	// so an interrupted download can be resumed via Range requests.
 	cacheDir := filepath.Join(toolchainUserStateDir(), "clang-download")
+	// #nosec G301 -- 工具链缓存目录（用户态）
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return "", "", err
 	}
@@ -287,12 +288,14 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 	if options.Stage != nil {
 		options.Stage("解压 C 编译器 (zig)…")
 	}
+	// #nosec G301 -- 工具链安装目录（用户态）
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", "", err
 	}
 	// Mark the install as in progress: a leftover lock on a later run means the
 	// extract never finished, so it is discarded and retried from scratch.
 	lockPath := filepath.Join(root, clangLockFile)
+	// #nosec G306 -- 安装锁仅记录时间戳，无需收紧权限
 	if err := os.WriteFile(lockPath, []byte(time.Now().Format(time.RFC3339)), 0o644); err != nil {
 		return "", "", fmt.Errorf("创建 Clang 安装锁失败: %w", err)
 	}
@@ -381,7 +384,7 @@ func zigUnsupportedHint() error {
 		if prefix == "" {
 			prefix = "/data/data/com.termux/files/usr"
 		}
-		return fmt.Errorf("Termux (Android) 没有官方 Zig 包。请在 Termux 中执行：\n"+
+		return fmt.Errorf("termux (Android) 没有官方 Zig 包。请在 Termux 中执行：\n"+
 			"  pkg update && pkg install clang\n"+
 			"安装后即可自动检测到（或设置环境变量 ASTRBOT_CC=%s/bin/clang），然后重新安装插件。", prefix)
 	}
@@ -466,7 +469,7 @@ func resumeDownload(ctx context.Context, client *http.Client, url, dest string, 
 	} else {
 		flag |= os.O_TRUNC
 	}
-	f, err := os.OpenFile(dest, flag, 0o644)
+	f, err := os.OpenFile(dest, flag, 0o644) // #nosec G302,G304 -- dest 为工具链下载缓存路径，0o644 供同用户进程读取
 	if err != nil {
 		return err
 	}
@@ -517,23 +520,24 @@ func zigMirrorBases() []string {
 // cancellation between members so an aborted install leaves the lock file
 // behind (the next run discards root and retries).
 func extractClangArchive(ctx context.Context, archive, root, triple string) error {
-	f, err := os.Open(archive)
+	f, err := os.Open(archive) // #nosec G304 -- 已下载的工具链归档路径
 	if err != nil {
 		return err
 	}
 	format, stream, err := archives.Identify(ctx, archive, f)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return fmt.Errorf("识别归档格式失败: %w", err)
 	}
 	ex, ok := format.(archives.Extractor)
 	if !ok {
-		f.Close()
+		_ = f.Close()
 		return fmt.Errorf("不支持的归档格式: %s", archive)
 	}
 
+	// #nosec G301 -- 工具链解压目录（用户态）
 	if err := os.MkdirAll(root, 0o755); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	topSeen := false
@@ -555,8 +559,9 @@ func extractClangArchive(ctx context.Context, archive, root, triple string) erro
 			return err
 		}
 		if fi.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			return os.MkdirAll(target, 0o755) // #nosec G301 -- target 经 safeJoin 校验
 		}
+		// #nosec G301 -- target 经 safeJoin 校验
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
 		}
@@ -565,7 +570,7 @@ func extractClangArchive(ctx context.Context, archive, root, triple string) erro
 			return err
 		}
 		defer src.Close()
-		out, err := os.Create(target)
+		out, err := os.Create(target) // #nosec G304 -- target 经 safeJoin 校验防穿越
 		if err != nil {
 			return err
 		}
@@ -573,7 +578,7 @@ func extractClangArchive(ctx context.Context, archive, root, triple string) erro
 		_, err = io.Copy(out, src)
 		return err
 	})
-	f.Close()
+	_ = f.Close()
 	if err != nil {
 		return err
 	}

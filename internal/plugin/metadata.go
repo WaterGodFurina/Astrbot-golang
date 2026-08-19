@@ -151,7 +151,7 @@ func ReadPluginMetadata(srcDir string) (*PluginMetadata, error) {
 // readMetadataJSON parses metadata.json, returning nil (no error) when the
 // file is absent.
 func readMetadataJSON(path string) (*PluginMetadata, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- 读取插件源码目录下的 metadata.json
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -169,7 +169,7 @@ func readMetadataJSON(path string) (*PluginMetadata, error) {
 // YAML field names are snake_case: name/display_name/short_desc/desc/version/
 // author/repo/language.
 func readMetadataYAML(path string) (*PluginMetadata, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- 读取插件源码目录下的 metadata.yaml
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -234,6 +234,7 @@ func ensureMainGo(srcDir string) error {
 // source tree; falls back to a generated module path based on the metadata
 // name when there is no go.mod.
 func goModuleNameOf(srcDir string, meta *PluginMetadata) string {
+	// #nosec G304 -- 读取插件自身 go.mod（srcDir 已归一化）
 	if data, err := os.ReadFile(filepath.Join(srcDir, "go.mod")); err == nil {
 		if f, err := modfile.Parse("go.mod", data, nil); err == nil && f.Module != nil && f.Module.Mod.Path != "" {
 			return f.Module.Mod.Path

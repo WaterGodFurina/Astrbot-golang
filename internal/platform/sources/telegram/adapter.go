@@ -185,10 +185,10 @@ func (a *Adapter) sendMedia(sessionID, method, field, fileID, url, path, file, b
 		tmpName := tmp.Name()
 		defer os.Remove(tmpName)
 		if _, err := tmp.Write(raw); err != nil {
-			tmp.Close()
+			_ = tmp.Close()
 			return err
 		}
-		tmp.Close()
+		_ = tmp.Close()
 		return a.sendMediaUpload(ctx, sessionID, method, field, tmpName)
 	}
 	// 4. local path / file.

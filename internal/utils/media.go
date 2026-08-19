@@ -55,9 +55,10 @@ func DownloadFile(ctx context.Context, urlStr, destPath string) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
 	}
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(destPath), 0750); err != nil {
 		return err
 	}
+	// #nosec G304 -- destPath is the caller-supplied download destination.
 	f, err := os.Create(destPath)
 	if err != nil {
 		return err
@@ -99,6 +100,7 @@ func DownloadToBase64(ctx context.Context, urlStr string) (string, error) {
 
 // ReadFileToBase64 reads a local file and returns base64-encoded data.
 func ReadFileToBase64(path string) (string, error) {
+	// #nosec G304 -- generic utility; the path is provided by the caller.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
@@ -146,10 +148,10 @@ func SaveBase64ToFile(b64, path string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644)
+	return os.WriteFile(path, data, 0600)
 }
 
 // BytesToBase64 converts bytes to base64 string.

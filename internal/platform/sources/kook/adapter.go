@@ -862,11 +862,11 @@ func saveBase64ToTemp(b64 string) string {
 	}
 	name := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(name)
+		_ = tmp.Close()
+		_ = os.Remove(name)
 		return ""
 	}
-	tmp.Close()
+	_ = tmp.Close()
 	return name
 }
 

@@ -173,17 +173,17 @@ func downloadMediaToTemp(rawURL string) (string, error) {
 	name := f.Name()
 	written, err := io.Copy(f, io.LimitReader(resp.Body, int64(maxMediaDownloadSize)+1))
 	if err != nil {
-		f.Close()
-		os.Remove(name)
+		_ = f.Close()
+		_ = os.Remove(name)
 		return "", err
 	}
 	if written > int64(maxMediaDownloadSize) {
-		f.Close()
-		os.Remove(name)
+		_ = f.Close()
+		_ = os.Remove(name)
 		return "", fmt.Errorf("媒体超过 %d 字节", maxMediaDownloadSize)
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(name)
+		_ = os.Remove(name)
 		return "", err
 	}
 	return name, nil

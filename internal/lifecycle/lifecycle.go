@@ -604,7 +604,7 @@ func (l *Lifecycle) Stop() {
 		l.cancel()
 	}
 	if l.sandboxMgr != nil {
-		l.sandboxMgr.Stop()
+		_ = l.sandboxMgr.Stop()
 	}
 	if l.subPluginMgr != nil {
 		l.subPluginMgr.Shutdown()
@@ -642,6 +642,8 @@ func (l *Lifecycle) Restart() {
 		logger.Error("Restart: resolve executable: %v", err)
 		return
 	}
+	// #nosec G204 -- restart spawns this same executable with the original
+	// command-line arguments passed at launch; not user-controlled input.
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Stdin = nil
 	cmd.Stdout = os.Stdout

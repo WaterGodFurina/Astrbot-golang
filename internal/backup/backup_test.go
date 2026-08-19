@@ -82,8 +82,8 @@ func TestExportConsistentDBSnapshot(t *testing.T) {
 	if _, err = io.Copy(out, src); err != nil {
 		t.Fatal(err)
 	}
-	out.Close()
-	src.Close()
+	_ = out.Close()
+	_ = src.Close()
 
 	snapDB, err := sql.Open("sqlite", snapPath)
 	if err != nil {

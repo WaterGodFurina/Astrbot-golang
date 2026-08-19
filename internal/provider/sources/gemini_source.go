@@ -144,7 +144,7 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 	}
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
 	}
 	ch := make(chan *provider.LLMResponse, 100)
