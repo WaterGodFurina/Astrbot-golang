@@ -953,24 +953,6 @@ func (m *SubprocessManager) Changelog(id string) string {
 	return m.fetchRepoDoc(id, []string{"CHANGELOG.md", "changelog.md"})
 }
 
-// resolveName maps a plugin id/name to the canonical plugin name (used for the
-// docs directory). 查不到实例/manifest 条目时返回空字符串，避免把调用方传入的
-// 原始 id（可能含路径穿越字符）当作文档目录名使用。
-func (m *SubprocessManager) resolveName(id string) string {
-	if inst := m.instanceByName(id); inst != nil {
-		return inst.Name
-	}
-	if man, err := LoadManifest(m.manifestPath()); err == nil {
-		if e := man.Get(id); e != nil {
-			if e.Name != "" {
-				return e.Name
-			}
-			return e.ID
-		}
-	}
-	return ""
-}
-
 // readCachedDoc reads a cached doc file from the plugin docs directory
 // (plugins/<id>，与源码本体同目录). id 再次经 sanitizeID 归一化（拒绝 /、
 // \、.、.. 等穿越字符），即使上游传入异常值也不会逃逸 data/plugins 目录。

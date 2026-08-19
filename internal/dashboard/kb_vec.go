@@ -3,7 +3,6 @@ package dashboard
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,11 +26,6 @@ func kbVecLock(kbID string) *sync.Mutex {
 // kbVecDir returns the vector index directory for a knowledge base.
 func (s *Server) kbVecDir(kbID string) string {
 	return filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID))
-}
-
-// kbVecPath returns the nanovec base path (nanovec appends .store/.idx).
-func (s *Server) kbVecPath(kbID string) string {
-	return filepath.Join(s.kbVecDir(kbID), kbID)
 }
 
 // kbEmbeddingProvider builds an embedding provider instance from the KB's
@@ -169,69 +163,6 @@ func (s *Server) indexKBFile(kbID, docID, docName string, content []byte, chunkS
 	}
 	succeeded = true
 	return len(vecChunks), nil
-}
-
-// syncKBVecDB reconciles the nanovec index with the SQLite chunk records
-// (source of truth). If they disagree, it deletes the .idx file so nanovec's
-// Open-time self-healing rebuilds from its own bbolt store, then re-inserts
-// any chunks missing from the vector index.
-func (s *Server) syncKBVecDB(kbID string) error {
-	if s.database == nil {
-		return nil
-	}
-	sqliteChunks, err := s.database.ListKBChunks(kbID, "")
-	if err != nil {
-		return err
-	}
-	if len(sqliteChunks) == 0 {
-		return nil
-	}
-	ep, dim, err := s.kbEmbeddingProvider(kbID)
-	if err != nil {
-		return err
-	}
-
-	lock := kbVecLock(kbID)
-	lock.Lock()
-	defer lock.Unlock()
-
-	vdb, err := knowledgebase.OpenVecDB(s.kbVecDir(kbID), kbID, dim)
-	if err != nil {
-		// Index file is corrupt; drop it and let nanovec rebuild from bbolt.
-		_ = os.Remove(s.kbVecPath(kbID) + ".idx")
-		return nil
-	}
-	defer vdb.Close()
-
-	// nanovec's Delete + Open self-healing keeps the .store (bbolt) in sync with
-	// the .idx, so a version mismatch auto-rebuilds. For SQLite ↔ nanovec drift,
-	// we re-insert chunks that are missing from the index by re-embedding.
-	count, err := vdb.Count()
-	if err != nil || count < len(sqliteChunks) {
-		// Index is missing chunks (e.g. nanovec insert failed after SQLite
-		// succeeded). Re-embed from SQLite records.
-		var missing []knowledgebase.VectorChunk
-		var vecs [][]float32
-		for _, c := range sqliteChunks {
-			v, err := s.embedChunk(ep, c.Content)
-			if err != nil {
-				continue
-			}
-			missing = append(missing, knowledgebase.VectorChunk{
-				ChunkID:  c.ChunkID,
-				DocID:    c.DocID,
-				DocName:  c.DocName,
-				KBID:     c.KBID,
-				ChunkIdx: c.ChunkIdx,
-				Content:  c.Content,
-			})
-			vecs = append(vecs, v)
-		}
-		if len(missing) > 0 {
-			_ = vdb.InsertBatch(missing, vecs)
-		}
-	}
-	return nil
 }
 
 // kbRetrieve runs a vector similarity search against a knowledge base.

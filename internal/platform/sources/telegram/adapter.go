@@ -402,16 +402,3 @@ func (a *Adapter) apiCall(ctx context.Context, method string, params map[string]
 
 	return result, nil
 }
-
-func extractPlainText(mc *message.MessageChain) string {
-	if mc == nil {
-		return ""
-	}
-	var result string
-	for _, comp := range mc.Chain {
-		if plain, ok := comp.(*message.Plain); ok {
-			result += plain.Text
-		}
-	}
-	return result
-}

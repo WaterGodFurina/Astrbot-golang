@@ -710,11 +710,6 @@ func ensureVenvReady(dataDir string) (string, error) {
 	return venvPython, nil
 }
 
-func hasGRPC(pythonBin string) bool {
-	cmd := exec.Command(pythonBin, "-c", "import grpc, google.protobuf")
-	return cmd.Run() == nil
-}
-
 // hostBaseDeps 是 Python AstrBot 本体的常驻依赖子集（插件不声明但依赖，
 // 因为在本体中天然存在）：Web 框架 / HTTP 客户端 / 序列化 / 图像 / 通用
 // 工具 / 平台 SDK。安装在宿主 venv 里，使大量 Python 插件开箱可用；安装在

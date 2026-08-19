@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"path"
 	"strings"
-	"time"
 )
 
 // WecomMessage 企业微信回调消息（对应 wechatpy 的 BaseMessage 及其子类）。
@@ -184,6 +183,3 @@ func SplitPlain(plain string) []string {
 func (m *WecomMessage) IsKFMsgOrEvent() bool {
 	return m.Type == "event" && m.Event == "kf_msg_or_event"
 }
-
-// nowUnix 供内部使用（便于测试替换）。
-func nowUnix() int64 { return time.Now().Unix() }

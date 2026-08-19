@@ -483,7 +483,7 @@ func isUsernameBoundaryChar(c byte) bool {
 }
 
 // buildMentionPattern 保留为兼容性别名（直接委托给 findMentionSpans 的用法已移除）。
-// 仅用于判断 botUsername 是否可用。
+// kept: 兼容性别名，仅用于判断 botUsername 是否可用。
 func buildMentionPattern(botUsername string) *regexp.Regexp {
 	if botUsername == "" {
 		return nil

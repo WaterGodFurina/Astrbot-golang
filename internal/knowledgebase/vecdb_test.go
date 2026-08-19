@@ -12,7 +12,6 @@ func TestChunkTextNoGapAtNewlineTruncation(t *testing.T) {
 	// chunkSize=512, overlap=50 → step=462. The newline sits at rune 300
 	// (> chunkSize/2 but < step): the old code truncated at 300 while advancing
 	// by 462, losing runes [300, 462).
-	const chunkSize = 512
 	// Newline sits at rune 300 (> chunkSize/2 but < step): the old code
 	// truncated at 300 while advancing by 462, losing runes [300, 462).
 	text := strings.Repeat("a", 300) + "\n" + "SENTINEL_MARKER" + strings.Repeat("b", 2000)
@@ -45,7 +44,6 @@ func TestChunkTextNoGapAtNewlineTruncation(t *testing.T) {
 // TestChunkTextNoGapMidWindow exercises the same guarantee for newlines placed
 // throughout the whole chunk window to catch regressions at the boundaries.
 func TestChunkTextNoGapMidWindow(t *testing.T) {
-	const chunkSize = 512
 	for _, nlPos := range []int{257, 300, 400, 461} {
 		text := strings.Repeat("x", nlPos) + "\n" + "Y" + strings.Repeat("z", 3000)
 		chunks := ChunkText(text, 512, 50)

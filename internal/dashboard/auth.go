@@ -1092,12 +1092,6 @@ func recoveryCodeHashFor(code string, hashes []string) string {
 	return ""
 }
 
-// verifyRecoveryCode 模糊校验恢复码：忽略大小写、空格与连字符（前端输入的
-// 恢复码为 4 位一组并用连字符分隔），比对 SHA-256 哈希是否命中任一已存哈希。
-func verifyRecoveryCode(code string, hashes []string) bool {
-	return recoveryCodeHashFor(code, hashes) != ""
-}
-
 // parseRecoveryCodeHashes 解析 config 中保存的恢复码哈希：优先当作 JSON
 // 字符串数组；解析失败时若为单个哈希值则按单元素列表返回。
 func parseRecoveryCodeHashes(raw string) []string {

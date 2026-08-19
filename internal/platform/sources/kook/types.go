@@ -184,6 +184,8 @@ type kookUserMeData struct {
 }
 
 // kookApiResponseBase 对应 Python 的 KookApiResponseBase (统一响应结构)。
+// kept: 从 AstrBot Python 原版 kook_types.py 移植的统一响应基类（原版由
+// KookUserMeResponse/KookUserViewResponse/KookGatewayIndexResponse 继承）。
 type kookApiResponseBase struct {
 	Code    int             `json:"code"`
 	Message string          `json:"message"`
@@ -191,6 +193,7 @@ type kookApiResponseBase struct {
 }
 
 // success 判断接口调用是否成功 (code == 0)。
+// kept: 对应原版基类方法，供未来响应解析复用。
 func (r *kookApiResponseBase) success() bool { return r.Code == 0 }
 
 // kookGatewayIndexData 对应 Python 的 KookGatewayIndexData。

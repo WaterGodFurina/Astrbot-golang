@@ -46,12 +46,6 @@ func (ps *personaStore) load() {
 	}
 }
 
-func (ps *personaStore) save() error {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	return ps.saveLocked()
-}
-
 func nowStr() string {
 	return time.Now().Format("2006-01-02T15:04:05.000Z")
 }

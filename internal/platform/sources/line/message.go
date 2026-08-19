@@ -13,7 +13,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -519,13 +518,4 @@ func randomHex(n int) string {
 		return strconv.FormatInt(time.Now().UnixNano(), 16)
 	}
 	return hex.EncodeToString(buf)
-}
-
-// marshalMessage 将消息对象序列化为 JSON（测试辅助）。
-func marshalMessage(m messaging_api.MessageInterface) (string, error) {
-	data, err := json.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
 }

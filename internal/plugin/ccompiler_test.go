@@ -422,24 +422,10 @@ func TestExtractClangArchiveTarXz(t *testing.T) {
 	}
 }
 
-func f2(t *testing.T, path string) *os.File {
-	t.Helper()
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return f
-}
-
 // TestClangLockFileDiscardsInterruptedInstall verifies that a leftover// .install-lock makes downloadAndSetupClang discard the cached root and
 // re-download instead of trusting a half-extracted Clang. It serves a fake zig
 // archive from a local httptest server so the test needs no network.
 func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
-	// 系统 clang 存在时 downloadAndSetupClang 直接返回系统编译器，
-	// 不走 zig 下载路径，本测试（验证下载侧 lock 清理）不适用。
-	if _, _, ok := detectSystemClang(); ok {
-		t.Skip("system clang present; download path not exercised")
-	}
 	old := os.Getenv("ASTRBOT_CLANG_BIN")
 	oldMirror := os.Getenv("ASTRBOT_CLANG_MIRROR")
 	t.Cleanup(func() {

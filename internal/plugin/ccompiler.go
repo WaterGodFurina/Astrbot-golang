@@ -602,11 +602,3 @@ func stripTopDir(rel string) (string, bool) {
 func toolchainUserStateDir() string {
 	return toolchain.UserStateDir()
 }
-
-// exe returns name with a .exe suffix on Windows.
-func exe(name string) string {
-	if runtime.GOOS == "windows" {
-		return name + ".exe"
-	}
-	return name
-}

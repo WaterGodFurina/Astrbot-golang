@@ -1496,16 +1496,6 @@ func (s *Server) injectAuthFields(dash map[string]interface{}) {
 	dash["totp"] = s.auth.TOTPConfig()
 }
 
-// getProviderList returns the provider list from config.
-func (s *Server) getProviderList() []interface{} {
-	cfg := s.getConfigData("default")
-	providers, ok := cfg["provider"].([]interface{})
-	if !ok {
-		return []interface{}{}
-	}
-	return providers
-}
-
 // getBotList returns the bot/platform list from config.
 func (s *Server) getBotList() []interface{} {
 	cfg := s.getConfigData("default")
@@ -2092,18 +2082,4 @@ func (s *Server) getSkillList() []interface{} {
 		result[i] = sk
 	}
 	return result
-}
-
-// getPersonaList returns all personas.
-func (s *Server) getPersonaList() []interface{} {
-	if s.personaMgr == nil {
-		return []interface{}{}
-	}
-	pm, ok := s.personaMgr.(interface {
-		All() []interface{}
-	})
-	if !ok {
-		return []interface{}{}
-	}
-	return pm.All()
 }

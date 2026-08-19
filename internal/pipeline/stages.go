@@ -310,6 +310,10 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 	if s.wakeByAt && event.Message != nil {
 		for _, comp := range event.Message.Chain {
 			if at, ok := comp.(*message.At); ok {
+				if at.TargetID != event.Source.SelfID {
+					logger.Debug("WakingCheck: @ mention target=%q != selfID=%q platform=%s conv=%s",
+						at.TargetID, event.Source.SelfID, event.Source.Platform, event.Source.ConvID)
+				}
 				if at.TargetID == event.Source.SelfID {
 					event.IsAtOrWakeCommand = true
 					// Group @-wake also supports prefix chat: "@bot /你好" triggers LLM.
@@ -935,7 +939,6 @@ type ProcessStage struct {
 	// collection; full tool name = "<sanitized_server>.<tool_name>".
 	mcpMu      sync.Mutex
 	mcpLoaded  bool
-	mcpSig     string
 	mcpClients map[string]*agent.MCPClient       // sanitized server name -> client
 	mcpSchemas map[string]map[string]interface{} // full tool name -> OpenAI tool schema
 
@@ -982,14 +985,6 @@ func (s *ProcessStage) SetPersonaResolver(fn func(umo, personaID string) string)
 // skill allow-list (persona id -> allowed skill names).
 func (s *ProcessStage) SetPersonaSkillsResolver(fn func(personaID string) []string) {
 	s.personaSkills = fn
-}
-
-// personaID extracts the persona id from the provider settings.
-func personaID(settings map[string]interface{}) string {
-	if p, ok := settings["persona"].(string); ok {
-		return p
-	}
-	return ""
 }
 
 func (s *ProcessStage) Name() string { return "process" }
@@ -3565,7 +3560,6 @@ type ResultDecorateStage struct {
 	replyPrefix      string
 	replyWithMention bool
 	replyWithQuote   bool
-	maxSegmentLength int
 	subPlugins       *plugin.SubprocessManager
 
 	// t2i (text-to-image) settings from the top-level config.

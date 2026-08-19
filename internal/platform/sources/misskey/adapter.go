@@ -84,7 +84,6 @@ type Adapter struct {
 	botUsername string
 	userCache   map[string]map[string]interface{}
 
-	mu       sync.Mutex
 	stopCh   chan struct{}
 	stopOnce sync.Once
 }

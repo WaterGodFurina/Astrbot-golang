@@ -158,17 +158,6 @@ func sandboxGrep(ctx context.Context, mgr *sandbox.Manager, pattern, path string
 // When provider_settings.computer_use_runtime == "local", these tools are
 // injected into the LLM request so skills can actually be executed on the host.
 
-// localToolNames lists the tools exposed by the local computer-use runtime.
-var localToolNames = []string{
-	"astrbot_execute_shell",
-	"astrbot_shell_session",
-	"astrbot_execute_python",
-	"astrbot_file_read_tool",
-	"astrbot_file_write_tool",
-	"astrbot_file_edit_tool",
-	"astrbot_grep_tool",
-}
-
 // workspaceRoot returns the per-conversation workspace directory used as the
 // cwd for shell/python tools and the base for relative file paths.
 //
