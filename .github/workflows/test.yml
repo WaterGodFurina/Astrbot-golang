@@ -155,6 +155,31 @@ jobs:
           ls -la scripts/t2i/shiki_runtime.iife.js 2>/dev/null || find . -name "shiki_runtime.iife.js" | head
         working-directory: dashboard
 
+      - name: 同步 dist 到内嵌目录并推送（[skip ci] 防递归触发）
+        # 前端构建产物嵌入 internal/dashboard/web/dist（//go:embed），由本 job
+        # 在 runner 上构建后推回仓库，服务器无需 pnpm 编译。
+        run: |
+          rm -rf internal/dashboard/web/dist
+          mkdir -p internal/dashboard/web/dist
+          cp -r dashboard/dist/. internal/dashboard/web/dist/
+          if ! git diff --quiet internal/dashboard/web/dist; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add internal/dashboard/web/dist
+            git commit -m "chore: 更新前端构建产物 [skip ci]"
+            git push origin HEAD
+            echo "已推送前端构建产物"
+          else
+            echo "前端产物无变更"
+          fi
+
+      - name: 上传前端构建产物
+        uses: actions/upload-artifact@v5
+        with:
+          name: astrbot-frontend-dist
+          path: internal/dashboard/web/dist/
+          if-no-files-found: error
+
   static-analysis:
     name: 静态分析
     runs-on: ubuntu-latest
