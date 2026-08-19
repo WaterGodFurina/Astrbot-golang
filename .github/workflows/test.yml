@@ -30,23 +30,12 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: 用 goproxy.cn 重建 go.sum（有变更则提交回仓库）
+      - name: 用 goproxy.cn 重建 go.sum（本地对齐，不提交回仓库）
         env:
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
-        run: |
-          go mod tidy
-          if ! git diff --quiet go.mod go.sum; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add go.mod go.sum
-            git commit -m "chore: rebuild go.sum"
-            git push origin HEAD
-            echo "已提交新的 go.sum"
-          else
-            echo "go.sum 与 goproxy.cn 一致，无变更"
-          fi
+        run: go mod tidy
 
       - name: 安装 Python（插件子进程测试需要）
         uses: actions/setup-python@v5
