@@ -76,7 +76,7 @@ func (c *WXBizJsonMsgCrypt) GetSHA1(timestamp, nonce, encrypt string) (int, stri
 	arr := []string{c.token, timestamp, nonce, encrypt}
 	sort.Strings(arr)
 	// #nosec G401 -- sha1 为企业微信智能机器人签名协议要求的签名算法，非密码学哈希用途
-	sum := sha1.Sum([]byte(strings.Join(arr, "")))
+	sum := sha1.Sum([]byte(strings.Join(arr, ""))) // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-sha1
 	return MsgCryptOK, hex.EncodeToString(sum[:])
 }
 

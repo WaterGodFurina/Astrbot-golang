@@ -221,7 +221,7 @@ func (WecomAIBotStreamMessageBuilder) MakeTextStream(streamID, content string, f
 // MakeImageStream 构建图片流消息（对应 make_image_stream）。
 func (WecomAIBotStreamMessageBuilder) MakeImageStream(streamID string, imageData []byte, finish bool) string {
 	// #nosec G401 -- md5 为图片流消息协议要求的内容指纹字段，非密码学用途。
-	imageMD5 := md5.Sum(imageData)
+	imageMD5 := md5.Sum(imageData) // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
 	imageBase64 := base64.StdEncoding.EncodeToString(imageData)
 	plain := map[string]interface{}{
 		"msgtype": MSGTypeStream,

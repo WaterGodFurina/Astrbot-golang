@@ -392,7 +392,9 @@ func extractTarGzKeepTop(src, dir string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(w, tr); err != nil {
+			// #nosec decompression_bomb -- Python SDK/CPython 归档来自受信任的固定 URL（宿主自控下载源，
+			// 版本固定），safeJoin 已防路径穿越。
+			if _, err := io.Copy(w, tr); err != nil { // nosemgrep: go.lang.security.decompression_bomb.potential-dos-via-decompression-bomb
 				_ = w.Close()
 				return err
 			}
@@ -584,7 +586,9 @@ func extractTarGzStripTop(src, dir string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(w, tr); err != nil {
+			// #nosec decompression_bomb -- Python SDK/CPython 归档来自受信任的固定 URL（宿主自控下载源，
+			// 版本固定），safeJoin 已防路径穿越。
+			if _, err := io.Copy(w, tr); err != nil { // nosemgrep: go.lang.security.decompression_bomb.potential-dos-via-decompression-bomb
 				_ = w.Close()
 				return err
 			}
@@ -694,7 +698,7 @@ func ensureVenvReady(dataDir string) (string, error) {
 		logger.Warn("venv 宿主依赖不完整（标记缺失/不匹配），锁内重新安装…")
 	} else {
 		logger.Info("Python %s 缺少宿主基础依赖，创建独立 venv 安装…", base)
-		if err := exec.Command(base, "-m", "venv", root).Run(); err != nil {
+		if err := exec.Command(base, "-m", "venv", root).Run(); err != nil { // #nosec G204 -- Python SDK venv 初始化核心：base 为宿主探测到的解释器，root 为宿主生成的目录路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 			logger.Warn("创建 venv 失败: %v（插件将无法启动）", err)
 			return "", fmt.Errorf("创建 venv 失败: %w", err)
 		}
@@ -824,14 +828,14 @@ func venvMarkersMatch(venvRoot, interpreter, sdkVersion string, depsVersion int)
 // deps (e.g. aiocqhttp) start without a module-not-found crash.
 func hasHostDeps(pythonBin string) bool {
 	script := "import importlib; mods=" + strconv.Quote(strings.Join(hostDepProbes, " ")) + "; missing=[m for m in mods.split() if importlib.util.find_spec(m) is None]; import sys; sys.exit(1 if missing else 0)"
-	cmd := exec.Command(pythonBin, "-c", script)
+	cmd := exec.Command(pythonBin, "-c", script) // #nosec G204 -- 宿主依赖探测脚本：script 由固定常量 hostDepProbes 拼装并经 strconv.Quote 转义，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	return cmd.Run() == nil
 }
 
 func installHostDeps(pythonBin string) error {
 	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, hostBaseDeps...)
 	args = append(args, "-i", PyPIIndex())
-	out, err := exec.Command(pythonBin, args...).CombinedOutput()
+	out, err := exec.Command(pythonBin, args...).CombinedOutput() // #nosec G204 -- pip 安装插件宿主基础依赖：args 由固定常量 hostBaseDeps + 固定 pip 参数组成，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	if err != nil {
 		logger.Warn("pip install 输出: %s", strings.TrimSpace(string(out)))
 		return err

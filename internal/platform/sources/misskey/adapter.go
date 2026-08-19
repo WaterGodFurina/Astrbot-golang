@@ -6,7 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	"math/rand" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- #nosec G404: 仅用于 WS 重连退避抖动，非安全随机
 	"os"
 	"strings"
 	"sync"
@@ -253,7 +253,7 @@ func (a *Adapter) startWebSocketConnection(ctx context.Context) {
 		}
 
 		if a.running.Load() {
-			jitter := rand.Float64()
+			jitter := rand.Float64() // #nosec G404 -- WS 重连退避抖动，非安全随机
 			sleepTime := backoffDelay + jitter
 			logger.I18nInfo("Misskey %.1f秒后重连 (下次尝试 #%d)", sleepTime, connectionAttempts+1)
 			select {

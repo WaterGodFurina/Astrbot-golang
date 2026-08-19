@@ -4,7 +4,7 @@ import (
 	"container/list"
 	"context"
 	"fmt"
-	"math/rand"
+	"math/rand" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- #nosec G404: 仅用于 AR 概率抽取与记录 ID 后缀（非安全场景）
 	"strings"
 	"sync"
 	"time"
@@ -156,7 +156,7 @@ func (g *GroupChatContext) NeedActiveReply(event *core.Event) bool {
 	}
 	switch c.arMethod {
 	case "possibility_reply":
-		return rand.Float64() < c.arPossibility
+		return rand.Float64() < c.arPossibility // #nosec G404 -- AR 概率抽取，非安全场景
 	}
 	return false
 }
@@ -212,7 +212,7 @@ func (g *GroupChatContext) HandleMessage(event *core.Event) {
 		ids = list.New()
 		g.recordIDs[umo] = ids
 	}
-	recordID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63())
+	recordID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), rand.Int63()) // #nosec G404 -- 群聊上下文记录 ID，仅作内部去重/定位，非安全令牌
 	records.PushBack(finalMessage)
 	ids.PushBack(recordID)
 	for records.Len() > c.groupMessageMaxCnt {

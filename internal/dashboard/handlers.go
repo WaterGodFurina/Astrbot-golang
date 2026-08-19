@@ -2617,7 +2617,9 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 		w.Header().Set(kv.Key, kv.Value)
 	}
 	w.WriteHeader(status)
-	_, _ = w.Write(resp.Body)
+	// #nosec no-direct-write-to-responsewriter -- 插件 Web API 代理：原样透传插件
+	//（管理员安装的受信任扩展）的响应头与响应体，对应 Python register_web_api，非未转义用户输入。
+	_, _ = w.Write(resp.Body) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
 }
 
 func (s *Server) handlePluginDocs(w http.ResponseWriter, r *http.Request, subprocess func(string) string) {
@@ -5013,7 +5015,9 @@ func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			data, _ := json.Marshal(payload)
-			_, _ = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", entry.Timestamp.UnixMilli(), data)
+			// #nosec no-fprintf-to-responsewriter -- 日志 SSE 流：data 帧为 JSON 序列化日志
+			// 负载，text/event-stream 由客户端按 JSON 消费，非 HTML 上下文，无 XSS。
+			_, _ = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", entry.Timestamp.UnixMilli(), data) // nosemgrep: go.lang.security.audit.xss.no-fprintf-to-responsewriter.no-fprintf-to-responsewriter
 			flusher.Flush()
 		}
 	}
@@ -6781,7 +6785,9 @@ func installSkillFromZip(src io.ReaderAt, size int64, skillsRoot, nameHint strin
 			_ = rc.Close()
 			return "", err
 		}
-		n, copyErr := io.Copy(out, io.LimitReader(rc, maxSkillFileSize+1))
+		// #nosec decompression_bomb -- 已有双重限制：单文件 io.LimitReader(maxSkillFileSize+1) +
+		// totalExtracted 累计校验（maxSkillExtractTotal），且路径穿越已拒绝，防 zip 炸弹。
+		n, copyErr := io.Copy(out, io.LimitReader(rc, maxSkillFileSize+1)) // nosemgrep: go.lang.security.decompression_bomb.potential-dos-via-decompression-bomb
 		_ = out.Close()
 		_ = rc.Close()
 		if copyErr != nil {

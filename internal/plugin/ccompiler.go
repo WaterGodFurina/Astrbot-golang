@@ -205,7 +205,7 @@ func siblingCompiler(cc, base string) string {
 func compilerVersion(cc string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, cc, "--version").Output()
+	out, err := exec.CommandContext(ctx, cc, "--version").Output() // #nosec G204 -- 插件编译核心：探测随附/系统 C 编译器版本，cc 由 clangRoot/detectSystemGCC 解析得出，参数固定为 "--version"; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	if err != nil {
 		return ""
 	}

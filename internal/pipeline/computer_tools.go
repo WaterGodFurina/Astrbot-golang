@@ -647,9 +647,9 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("powershell", "-NoProfile", "-Command", command)
+		cmd = exec.Command("powershell", "-NoProfile", "-Command", command) // #nosec G204 -- astrbot_execute_shell 工具核心：执行 AI 指令给定的 shell 命令（host 本地运行，功能明确，前端已警示）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	} else {
-		cmd = exec.Command("sh", "-c", command)
+		cmd = exec.Command("sh", "-c", command) // #nosec G204 -- astrbot_execute_shell 工具核心：执行 AI 指令给定的 shell 命令（host 本地运行，功能明确，前端已警示）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	}
 	cmd.Dir = ws
 
@@ -719,7 +719,7 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
-	cmd = exec.CommandContext(ctx, shellPath(), "-c", command)
+	cmd = exec.CommandContext(ctx, shellPath(), "-c", command) // #nosec G204 -- astrbot_execute_shell 工具核心（前端同步执行路径）：执行 AI 指令给定的 shell 命令; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = ws
 	// Run the shell in its own process group so a timeout kills the whole
 	// group: sh -c "a; b &" leaves grandchildren running otherwise (L-22).
@@ -877,7 +877,7 @@ func executeLocalPython(umo, code string, timeout int) string {
 	ws := workspaceRoot(umo)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", "-c", code)
+	cmd := exec.CommandContext(ctx, "python3", "-c", code) // #nosec G204 -- astrbot_execute_python 工具核心：执行 AI 指令给定的 Python 代码（host 本地运行，功能明确，前端已警示）
 	cmd.Dir = ws
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {

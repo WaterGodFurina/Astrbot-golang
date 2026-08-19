@@ -547,6 +547,7 @@ const renderMarkdown = (source) => {
   const rawHtml = markdown.render(normalizedSource);
   const cleanHtml = DOMPurify.sanitize(rawHtml, MARKDOWN_SANITIZE_OPTIONS);
   const container = document.createElement("div");
+  // nosemgrep: innerhtml, document-method
   container.innerHTML = cleanHtml;
 
   container.querySelectorAll("a").forEach((link) => {
@@ -1025,6 +1026,7 @@ onBeforeUnmount(() => {
           <div v-else-if="readmeEmpty" class="text-medium-emphasis">
             {{ tm("detail.docsEmpty") }}
           </div>
+          <!-- nosemgrep: avoid-v-html -->
           <div v-else class="docs-markdown" v-html="renderedReadme"></div>
         </v-card-text>
       </v-card>
@@ -1045,6 +1047,7 @@ onBeforeUnmount(() => {
           <div v-else-if="changelogEmpty" class="text-medium-emphasis">
             {{ tm("detail.changelogEmpty") }}
           </div>
+          <!-- nosemgrep: avoid-v-html -->
           <div v-else class="docs-markdown" v-html="renderedChangelog"></div>
         </v-card-text>
       </v-card>

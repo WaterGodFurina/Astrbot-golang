@@ -197,7 +197,9 @@ func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workd
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", "", -1, err
 	}
-	c := exec.CommandContext(ctx, cmd, args...)
+	// #nosec G204 -- 本地沙箱执行核心：cmd/args 由 Booter 从沙箱操作（LLM 给定的工具调用）构造，
+	// 环境变量已最小化（localBooterEnv 剔除敏感变量），工作目录限定在沙箱映射路径内。
+	c := exec.CommandContext(ctx, cmd, args...) // nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	c.Dir = dir
 	// 显式设置最小化环境：只保留 PATH（嵌套子进程找命令）、HOME 与本地化变量。
 	// 默认 exec 会继承宿主全部环境变量，沙箱内 `env` 可读到 ASTRBOT_*/API key
@@ -587,7 +589,7 @@ func dockerRun(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 	// #nosec G204 -- docker CLI invocation is the sandbox's core purpose; the
 	// sandbox workspaces are isolated containers, and args are constructed by
 	// the Booter from sandbox operations.
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.CommandContext(ctx, bin, args...) // nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	if stdin != nil {
 		cmd.Stdin = stdin
 	}

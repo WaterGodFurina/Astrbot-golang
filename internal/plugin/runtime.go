@@ -424,7 +424,7 @@ func (m *SubprocessManager) GoInstall(ctx context.Context, pkg, goproxy string) 
 	if strings.TrimSpace(goproxy) != "" {
 		extra["GOPROXY"] = strings.TrimSpace(goproxy)
 	}
-	cmd := exec.CommandContext(ctx, bin, "install", pkg) // #nosec G204 -- 运行 go install 安装用户指定模块（插件安装核心）
+	cmd := exec.CommandContext(ctx, bin, "install", pkg) // #nosec G204 -- 运行 go install 安装用户指定模块（插件安装核心）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Env = m.toolchain.BuildEnv(extra)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
@@ -714,7 +714,7 @@ func (m *SubprocessManager) pipInstall(env *pysdk.RuntimeEnv, pluginDir, req str
 		index = pysdk.PyPIIndex()
 	}
 	args = append(args, "-i", index)
-	cmd := exec.Command(env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）
+	cmd := exec.Command(env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = pluginDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1311,7 +1311,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 				logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
 			}
 		}
-		cmd := exec.Command(env.PythonBin, "-m", "astrbot._bridge.server", abs) // #nosec G204 -- 启动插件进程（插件系统核心）
+		cmd := exec.Command(env.PythonBin, "-m", "astrbot._bridge.server", abs) // #nosec G204 -- 启动插件进程（插件系统核心）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 		cmd.Dir = pluginDataRoot
 		cmd.Env = env.Env(abs, m.dataDir)
 		// 宿主能力注入：Python 插件经 HostBridge.has() 查询宿主公开了哪些
@@ -1331,7 +1331,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 		return m.dispensePlugin(ctx, id, abs, language, cmd, newAstrbotStartupParser())
 	}
 
-	cmd := exec.Command(abs) // #nosec G204 -- 启动 Go 插件可执行文件（插件系统核心）
+	cmd := exec.Command(abs) // #nosec G204 -- 启动 Go 插件可执行文件（插件系统核心）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = pluginDataRoot
 	return m.dispensePlugin(ctx, id, abs, language, cmd, nil)
 }

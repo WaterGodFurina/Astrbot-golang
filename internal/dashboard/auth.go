@@ -527,7 +527,7 @@ func hashPBKDF2(password string) string {
 // #nosec G401 -- 仅用于校验历史遗留的 MD5 密码哈希（迁移兼容）；新密码一律
 // 使用 PBKDF2 哈希，MD5 不作为新凭据的哈希算法。
 func md5Hash(password string) string {
-	h := md5.Sum([]byte(password))
+	h := md5.Sum([]byte(password)) // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
 	return fmt.Sprintf("%x", h)
 }
 

@@ -23,12 +23,12 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: 设置 Go 版本（自动跟随 go.mod）
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
 
@@ -66,7 +66,7 @@ jobs:
       go_version: ${{ steps.meta.outputs.go_version }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
@@ -82,13 +82,15 @@ jobs:
         id: meta
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+          GITHUB_REPO: ${{ github.repository }}
         run: |
           KIND="release"
-          REF="${{ inputs.ref }}"
+          REF="$INPUT_REF"
           VERSION=""
           if [ -z "$REF" ]; then
             # 自动取 GitHub 最新 release 的 tag（非特定版本号）
-            if TAG=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null); then
+            if TAG=$(gh api "repos/$GITHUB_REPO/releases/latest" --jq .tag_name 2>/dev/null); then
               REF="$TAG"
               VERSION="$TAG"
               echo "已自动定位到最新 release: ${TAG}"
@@ -133,12 +135,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ needs.release-meta.outputs.ref }}
 
       - name: 设置 Go 版本（自动跟随 go.mod）
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -180,7 +182,7 @@ jobs:
 
       - name: 上传 Artifact（Release 不存在时兜底）
         if: steps.release_upload.outputs.uploaded != 'true'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}
           path: astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip

@@ -139,7 +139,7 @@ func (c *Compiler) Vet(ctx context.Context, srcDir string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, goBin, "vet", "./...") // #nosec G204 -- 编译插件模块（核心），args 固定
+	cmd := exec.CommandContext(ctx, goBin, "vet", "./...") // #nosec G204 -- 编译插件模块（核心），args 固定; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = srcDir
 	cmd.Env = c.tc.BuildEnv(map[string]string{"GOPROXY": c.goproxyEnv(), "GOFLAGS": c.goflagsEnv()})
 	out, err := cmd.CombinedOutput()
@@ -197,7 +197,7 @@ func (c *Compiler) build(ctx context.Context, srcDir, outputPath string, progres
 		args = append(args, "-v")
 	}
 	args = append(args, "-o", absOut, "-ldflags=-s -w", "./...")
-	cmd := exec.CommandContext(ctx, goBin, args...) // #nosec G204 -- 编译插件模块（核心），args 由固定 flag 拼装
+	cmd := exec.CommandContext(ctx, goBin, args...) // #nosec G204 -- 编译插件模块（核心），args 由固定 flag 拼装; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = srcDir
 	extra := map[string]string{
 		"GOPROXY": c.goproxyEnv(),
@@ -344,7 +344,7 @@ func sdkInModCache(goBin, workDir, version string) (string, error) {
 	if goBin == "" {
 		goBin = "go"
 	}
-	cmd := exec.Command(goBin, "list", "-m", "-f", "{{.Dir}}", sdkModulePath)
+	cmd := exec.Command(goBin, "list", "-m", "-f", "{{.Dir}}", sdkModulePath) // #nosec G204 -- 插件编译核心：`go list -m` 定位 SDK 模块缓存，参数全为固定常量，无注入面; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = workDir
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	out, err := cmd.Output()

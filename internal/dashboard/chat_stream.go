@@ -341,7 +341,9 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, p
 // sendSSE writes one SSE data frame.
 func sendSSE(w http.ResponseWriter, flusher http.Flusher, payload map[string]interface{}) {
 	data, _ := json.Marshal(payload)
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+	// #nosec no-fprintf-to-responsewriter -- SSE 流：data 帧内容为 JSON 序列化负载，
+	// Content-Type 为 text/event-stream，客户端按 JSON 解析，非 HTML 渲染上下文，无 XSS。
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", data) // nosemgrep: go.lang.security.audit.xss.no-fprintf-to-responsewriter.no-fprintf-to-responsewriter
 	flusher.Flush()
 }
 

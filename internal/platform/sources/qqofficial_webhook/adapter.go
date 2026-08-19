@@ -16,7 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- #nosec G404: 仅用于 msg_seq 消息序号（对齐 Python random.randint(1,10000)），非安全随机
 	"net/http"
 	"os"
 	"strconv"
@@ -767,7 +767,7 @@ func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType in
 // sendC2C 向 C2C 用户发送消息。
 func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string) error {
 	payload := map[string]interface{}{"content": plainText}
-	payload["msg_seq"] = rand.Intn(10000) + 1
+	payload["msg_seq"] = rand.Intn(10000) + 1 // #nosec G404 -- QQ 官方 API msg_seq 消息序号（对齐 Python random.randint(1,10000)），非安全随机
 	if msgID != "" {
 		payload["msg_id"] = msgID
 	}
@@ -795,7 +795,7 @@ func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName 
 	if msgID != "" {
 		payload["msg_id"] = msgID
 	}
-	payload["msg_seq"] = rand.Intn(10000) + 1
+	payload["msg_seq"] = rand.Intn(10000) + 1 // #nosec G404 -- QQ 官方 API msg_seq 消息序号（对齐 Python random.randint(1,10000)），非安全随机
 	if imageRef != "" {
 		media, err := a.uploadFile("group", groupOpenID, imageRef, fileTypeImage, "")
 		if err != nil {
