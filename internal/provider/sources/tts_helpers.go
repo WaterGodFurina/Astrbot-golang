@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math/rand/v2"
+	"math/rand/v2" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- #nosec G404: 仅在 crypto/rand 失败时的 TTS nonce 降级路径使用
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,11 +77,21 @@ func ttsOptFloat(config map[string]interface{}, key string) (float64, bool) {
 }
 
 // ttsRandomNonce returns a random alphanumeric string of length n.
+// 与 Python 原版 secrets.choice 对齐，使用 crypto/rand 生成。
 func ttsRandomNonce(n int) string {
 	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	charset := []byte(chars)
 	b := make([]byte, n)
+	tmp := make([]byte, n)
+	if _, err := cryptorand.Read(tmp); err != nil {
+		// crypto/rand 失败属极端情况，退回 math/rand 避免 TTS 不可用
+		for i := range b {
+			b[i] = charset[rand.IntN(len(charset))] // #nosec G404 -- 仅在 crypto/rand 失败时的降级路径
+		}
+		return string(b)
+	}
 	for i := range b {
-		b[i] = chars[rand.IntN(len(chars))]
+		b[i] = charset[int(tmp[i])%len(charset)]
 	}
 	return string(b)
 }

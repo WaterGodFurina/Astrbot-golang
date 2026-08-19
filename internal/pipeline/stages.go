@@ -22,7 +22,7 @@ import (
 	"html"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- #nosec G404: 仅用于 emoji 随机选择、TTS 触发概率与延时抖动（非安全场景）
 	"net"
 	"net/http"
 	"net/netip"

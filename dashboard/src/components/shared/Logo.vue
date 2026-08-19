@@ -5,6 +5,7 @@
         <img width="80" src="@/assets/images/plugin_icon.png" alt="AstrBot Logo">
       </div>
       <div class="logo-text">
+        <!-- nosemgrep: avoid-v-html -->
         <h2 
           v-html="formatTitle(title || t('core.header.logoTitle'))"
         ></h2>

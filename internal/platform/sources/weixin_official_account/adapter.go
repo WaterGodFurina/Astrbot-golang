@@ -227,7 +227,10 @@ func (a *Adapter) verify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "err", http.StatusBadRequest)
 		return
 	}
-	_, _ = io.WriteString(w, q.Get("echostr"))
+	// 显式 text/plain：避免 Go 对 echostr 做内容嗅探（若含 HTML 会按
+	// text/html 响应，构成反射型 XSS）；签名已在上面用 PrivateToken 校验。
+	w.Header().Set("Content-Type", "text/plain")
+	_, _ = io.WriteString(w, q.Get("echostr")) // nosemgrep: go.lang.security.audit.xss.no-io-writestring-to-responsewriter.no-io-writestring-to-responsewriter
 }
 
 // callbackCommand handles the POST callback. Signature validation, timestamp
@@ -363,7 +366,8 @@ func computeSHA1(parts ...string) string {
 	cp := make([]string, len(parts))
 	copy(cp, parts)
 	sort.Strings(cp)
-	sum := sha1.Sum([]byte(strings.Join(cp, "")))
+	// #nosec G401 -- sha1 为微信公众号/服务号签名协议要求（check_signature 校验），非密码学哈希用途
+	sum := sha1.Sum([]byte(strings.Join(cp, ""))) // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-sha1
 	return hex.EncodeToString(sum[:])
 }
 

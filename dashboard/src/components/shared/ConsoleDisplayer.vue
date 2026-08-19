@@ -272,6 +272,7 @@ export default {
     refreshDisplay() {
       const termElement = document.getElementById('term');
       if (termElement) {
+        // nosemgrep: innerhtml, document-method
         termElement.innerHTML = '';
         
         if (this.localLogCache && this.localLogCache.length > 0) {

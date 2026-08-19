@@ -275,7 +275,9 @@ func (s *Server) cachedMarketDisk(url string, freshOnly bool) (interface{}, bool
 	if freshOnly && time.Since(time.Unix(payload.FetchedAt, 0)) >= marketDiskCacheTTL {
 		return nil, false
 	}
-	var data interface{}
+	// #nosec unsafe-deserialization-interface -- 市场缓存数据：由宿主自己的缓存文件写入
+	//（fetchMarketBody 已限流 maxMarketBodySize），结构动态故用 interface{}，非攻击面。
+	var data interface{} // nosemgrep: go.lang.security.deserialization.unsafe-deserialization-interface.go-unsafe-deserialization-interface
 	if err := json.Unmarshal(payload.Data, &data); err != nil {
 		return nil, false
 	}

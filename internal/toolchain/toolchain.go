@@ -468,7 +468,9 @@ func extractTarGz(src, dir string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(out, tr); err != nil {
+			// #nosec decompression_bomb -- Go SDK 工具链归档来自受信任的固定下载源（golang.org dl / 镜像，
+			// 版本固定且下载时经 checksum 校验），safeJoin 已防穿越。
+			if _, err := io.Copy(out, tr); err != nil { // nosemgrep: go.lang.security.decompression_bomb.potential-dos-via-decompression-bomb
 				_ = out.Close()
 				return err
 			}
@@ -506,7 +508,8 @@ func extractZip(src, dir string) error {
 			_ = rc.Close()
 			return err
 		}
-		if _, err := io.Copy(out, rc); err != nil {
+		// #nosec decompression_bomb -- Go SDK 工具链归档来自受信任的固定下载源（版本固定，下载时校验），safeJoin 已防穿越
+		if _, err := io.Copy(out, rc); err != nil { // nosemgrep: go.lang.security.decompression_bomb.potential-dos-via-decompression-bomb
 			_ = out.Close()
 			_ = rc.Close()
 			return err

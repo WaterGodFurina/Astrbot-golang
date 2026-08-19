@@ -76,7 +76,7 @@ func (c *WXBizMsgCrypt) GetSignature(timestamp, nonce, encrypt string) string {
 	arr := []string{c.token, timestamp, nonce, encrypt}
 	sort.Strings(arr)
 	// #nosec G401 -- sha1 为企业微信签名协议要求的签名算法（msg_signature），非密码学哈希用途
-	sum := sha1.Sum([]byte(strings.Join(arr, "")))
+	sum := sha1.Sum([]byte(strings.Join(arr, ""))) // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-sha1
 	return hex.EncodeToString(sum[:])
 }
 

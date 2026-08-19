@@ -499,5 +499,6 @@ func backoffDelay(attempt int) time.Duration {
 
 // insecureTLSConfig 返回关闭 SSL 验证的 TLS 配置。
 func insecureTLSConfig() *tls.Config {
-	return &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- 用户显式开启的不安全下载选项
+	// #nosec G402 -- 用户显式开启的不安全下载选项（配置开关）；MinVersion 显式钳制 TLS 1.2 下限
+	return &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12} // nosemgrep: problem-based-packs.insecure-transport.go-stdlib.bypass-tls-verification.bypass-tls-verification
 }

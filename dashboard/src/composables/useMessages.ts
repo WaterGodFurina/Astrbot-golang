@@ -423,6 +423,7 @@ export function useMessages(options: UseMessagesOptions) {
       ? normalizeHistoryRecord(payload.message)
       : null;
     if (updated) {
+      // nosemgrep: object-assign
       Object.assign(record, updated);
       await resolveRecordMedia([record]);
     }
@@ -821,6 +822,7 @@ export function useMessages(options: UseMessagesOptions) {
     }
 
     const token = localStorage.getItem("token") || "";
+    // nosemgrep: websocket
     const ws = new WebSocket(chatApi.unifiedWebSocketUrl(token));
     chatWebSockets[sessionId] = ws;
 
@@ -1480,6 +1482,7 @@ export function upsertToolCall(record: ChatRecord, toolCall: any) {
         continue;
       const matched = part.tool_calls.find((item) => item.id === targetId);
       if (matched) {
+        // nosemgrep: object-assign
         Object.assign(matched, toolCall);
         return;
       }

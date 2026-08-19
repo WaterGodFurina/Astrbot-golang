@@ -68,7 +68,7 @@ func (s *WecomAIBotServer) handleVerify(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/plain")
 	// #nosec G705 -- 响应类型为 text/plain，写回的是解密后的 echostr 明文，
 	// 非 HTML 上下文，不构成反射型 XSS。
-	_, _ = io.WriteString(w, result)
+	_, _ = io.WriteString(w, result) // nosemgrep: go.lang.security.audit.xss.no-io-writestring-to-responsewriter.no-io-writestring-to-responsewriter
 }
 
 // handleCallback 处理消息回调（POST）。
@@ -121,7 +121,9 @@ func (s *WecomAIBotServer) handleCallback(w http.ResponseWriter, r *http.Request
 
 	w.Header().Set("Content-Type", "text/plain")
 	if response != "" {
-		_, _ = io.WriteString(w, response)
+		// #nosec no-io-writestring-to-responsewriter -- 回调响应为企业微信智能机器人协议的
+		// 文本应答（非 HTML，响应对象是企微服务器），Content-Type 已固定为 text/plain。
+		_, _ = io.WriteString(w, response) // nosemgrep: go.lang.security.audit.xss.no-io-writestring-to-responsewriter.no-io-writestring-to-responsewriter
 		return
 	}
 	_, _ = io.WriteString(w, "success")

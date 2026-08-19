@@ -235,7 +235,9 @@ func (a *Adapter) handleVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.I18nInfo("验证请求有效性成功。")
 	w.Header().Set("Content-Type", "text/plain")
-	_, _ = io.WriteString(w, echoStr)
+	// #nosec no-io-writestring-to-responsewriter -- 企业微信 URL 验证回调：回显解密后的 echostr
+	//（签名已用 msg_signature 校验），Content-Type 为 text/plain，响应对象是企业微信服务器而非浏览器。
+	_, _ = io.WriteString(w, echoStr) // nosemgrep: go.lang.security.audit.xss.no-io-writestring-to-responsewriter.no-io-writestring-to-responsewriter
 }
 
 // handleCallback 处理消息回调（POST）：解密 → 解析 → 分发。

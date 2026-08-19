@@ -477,7 +477,7 @@ func gitClone(ctx context.Context, url, dest string) error {
 	if err != nil {
 		return fmt.Errorf("git not found on PATH (required to clone %s): %w", url, err)
 	}
-	cmd := exec.CommandContext(ctx, gitBin, "clone", "--depth", "1", "--quiet", url, dest) // #nosec G204 -- git 参数固定，URL 已拒绝 "-" 前缀防注入
+	cmd := exec.CommandContext(ctx, gitBin, "clone", "--depth", "1", "--quiet", url, dest) // #nosec G204 -- git 参数固定，URL 已拒绝 "-" 前缀防注入; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w\n%s", err, out)
 	}
@@ -653,7 +653,9 @@ func extractZip(src, dest string) error {
 			_ = rc.Close()
 			return err
 		}
-		n, err := io.Copy(out, io.LimitReader(rc, maxExtractSize-total+1))
+		// #nosec decompression_bomb -- 已有双重解压限制：逐文件 io.LimitReader(maxExtractSize-total+1)
+		// + 循环内 total 累计校验（maxExtractSize=300MB、maxExtractFiles=10000），防止 zip 炸弹。
+		n, err := io.Copy(out, io.LimitReader(rc, maxExtractSize-total+1)) // nosemgrep: go.lang.security.decompression_bomb.potential-dos-via-decompression-bomb
 		cerr := out.Close()
 		_ = rc.Close()
 		if err != nil {
@@ -718,7 +720,8 @@ func extractTarGz(src, dest string) error {
 			if err != nil {
 				return err
 			}
-			n, err := io.Copy(out, io.LimitReader(tr, maxExtractSize-total+1))
+			// #nosec decompression_bomb -- 同上：io.LimitReader + total 累计校验限制解压总量
+			n, err := io.Copy(out, io.LimitReader(tr, maxExtractSize-total+1)) // nosemgrep: go.lang.security.decompression_bomb.potential-dos-via-decompression-bomb
 			cerr := out.Close()
 			if err != nil {
 				return err

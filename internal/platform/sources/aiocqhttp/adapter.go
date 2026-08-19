@@ -540,7 +540,10 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := a.upgrader.Upgrade(w, r, nil)
+	// #nosec websocket-missing-origin-check -- 已双重防护：a.upgrader.CheckOrigin
+	// 校验 Origin 白名单（ws_reverse_origins，非浏览器客户端无 Origin 则放行），
+	// 且上方 authValid 要求 ws_reverse_token 令牌（Bearer/access_token 常量时间比较）。
+	conn, err := a.upgrader.Upgrade(w, r, nil) // nosemgrep: go.gorilla.security.audit.websocket-missing-origin-check.websocket-missing-origin-check
 	if err != nil {
 		logger.Error("WebSocket upgrade failed: %v", err)
 		return

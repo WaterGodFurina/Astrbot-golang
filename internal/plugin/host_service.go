@@ -243,7 +243,9 @@ func starMetadataFromAny(v any) *StarMetadata {
 		if !rv.IsValid() || rv.Kind() != reflect.Struct {
 			return ""
 		}
-		f := rv.FieldByName(name)
+		// #nosec unsafe-reflect-by-name -- name 均为本函数内硬编码的编译期常量（"Name"/"Author"/…），
+		// 用于规避 star→plugin 导入环，非用户可控的字段名。
+		f := rv.FieldByName(name) // nosemgrep: go.lang.security.audit.unsafe-reflect-by-name.unsafe-reflect-by-name
 		if !f.IsValid() {
 			return ""
 		}
@@ -257,7 +259,7 @@ func starMetadataFromAny(v any) *StarMetadata {
 		if !rv.IsValid() || rv.Kind() != reflect.Struct {
 			return false
 		}
-		f := rv.FieldByName(name)
+		f := rv.FieldByName(name) // nosemgrep: go.lang.security.audit.unsafe-reflect-by-name.unsafe-reflect-by-name -- #nosec unsafe-reflect-by-name: name 为本函数硬编码的编译期常量，非用户输入
 		if !f.IsValid() {
 			return false
 		}

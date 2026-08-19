@@ -644,7 +644,7 @@ func (l *Lifecycle) Restart() {
 	}
 	// #nosec G204 -- restart spawns this same executable with the original
 	// command-line arguments passed at launch; not user-controlled input.
-	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd := exec.Command(exe, os.Args[1:]...) // nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Stdin = nil
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

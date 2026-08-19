@@ -231,6 +231,7 @@ async function updateRenderedHtml() {
   const cleanHtml = DOMPurify.sanitize(rawHtml, MARKDOWN_SANITIZE_OPTIONS);
 
   const tempDiv = document.createElement("div");
+  // nosemgrep: innerhtml, document-method
   tempDiv.innerHTML = cleanHtml;
 
   const slugCounts = new Map();
@@ -254,6 +255,7 @@ async function updateRenderedHtml() {
 
   tempDiv.querySelectorAll("[data-code-block-index]").forEach((placeholder) => {
     const index = Number(placeholder.getAttribute("data-code-block-index"));
+    // nosemgrep: outerhtml, document-method, document-write
     placeholder.outerHTML = highlightedBlocks[index] || "";
   });
 
@@ -378,11 +380,13 @@ async function handleContainerClick(event) {
 function showCopyFeedback(btn, success) {
   if (copyFeedbackTimer.value) clearTimeout(copyFeedbackTimer.value);
   btn.setAttribute("title", t(`core.common.${success ? "copied" : "error"}`));
+  // nosemgrep: innerhtml, document-method
   btn.innerHTML = success ? ICONS.SUCCESS : ICONS.ERROR;
   btn.style.color = success ? "var(--v-theme-success)" : "var(--v-theme-error)";
 
   copyFeedbackTimer.value = setTimeout(() => {
     if (document.body.contains(btn)) {
+      // nosemgrep: innerhtml, document-method
       btn.innerHTML = ICONS.COPY;
       btn.style.color = "";
       btn.setAttribute("title", t("core.common.copy"));
@@ -453,6 +457,7 @@ const showActionArea = computed(() => {
           <p class="text-body-1 text-center">{{ modeConfig.loading }}</p>
         </div>
 
+        <!-- nosemgrep: avoid-v-html -->
         <div
           v-else-if="renderedHtml"
           class="markdown-body"

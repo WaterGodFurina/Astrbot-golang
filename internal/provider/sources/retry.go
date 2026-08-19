@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand/v2"
+	"math/rand/v2" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- #nosec G404: 仅用于退避重试抖动（防惊群），非安全随机
 	"net/http"
 	"strings"
 	"time"
@@ -126,7 +126,7 @@ func backoffDelay(attempt int, cfg RetryConfig) time.Duration {
 	}
 	delay := cfg.MinDelay * time.Duration(1<<exp)
 	// 抖动: 以 [0.8, 1.2) 随机缩放延迟, 打散并发客户端的同步重试。
-	delay = time.Duration(float64(delay) * (0.8 + 0.4*rand.Float64()))
+	delay = time.Duration(float64(delay) * (0.8 + 0.4*rand.Float64())) // #nosec G404 -- 重试退避抖动（打散惊群），非安全场景，无需 crypto/rand
 	if delay > cfg.MaxDelay || delay <= 0 {
 		return cfg.MaxDelay
 	}

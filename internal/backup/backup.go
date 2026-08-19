@@ -141,8 +141,9 @@ func (e *Exporter) snapshotDB() (string, error) {
 	}
 	defer conn.Close()
 
+	// #nosec gosql-sqli -- tmpName 是 os.CreateTemp 生成的宿主临时文件路径（非用户输入），单引号已转义；SQLite VACUUM INTO 目标不支持绑定参数
 	sql := fmt.Sprintf("VACUUM INTO '%s'", strings.ReplaceAll(tmpName, "'", "''"))
-	if _, err := conn.Exec(sql); err != nil {
+	if _, err := conn.Exec(sql); err != nil { // nosemgrep: go.lang.security.audit.sqli.gosql-sqli.gosql-sqli
 		_ = os.Remove(tmpName)
 		return "", fmt.Errorf("snapshot db: %w", err)
 	}
@@ -204,7 +205,9 @@ func (i *Importer) Import(srcPath string) error {
 			return err
 		}
 
-		_, err = io.Copy(dstFile, srcFile)
+		// #nosec decompression_bomb -- 备份恢复由管理员在 dashboard（需鉴权）发起，归档为宿主
+		// 自身 Export 生成的备份（可信来源）；条目数/路径穿越已校验，保持与原 Python 行为一致。
+		_, err = io.Copy(dstFile, srcFile) // nosemgrep: go.lang.security.decompression_bomb.potential-dos-via-decompression-bomb
 		_ = dstFile.Close()
 		_ = srcFile.Close()
 		if err != nil {

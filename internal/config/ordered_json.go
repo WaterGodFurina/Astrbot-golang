@@ -134,7 +134,9 @@ func parseOrderedJSONValue(raw json.RawMessage) (interface{}, error) {
 		}
 		return out, nil
 	default:
-		var v interface{}
+		// #nosec unsafe-deserialization-interface -- 配置文件解析：OrderedJSON 需保留任意 JSON 值
+		//（字符串/数字/布尔/空），无法用具体结构体；数据来自受信任的本地配置文件。
+		var v interface{} // nosemgrep: go.lang.security.deserialization.unsafe-deserialization-interface.go-unsafe-deserialization-interface
 		if err := json.Unmarshal(trimmed, &v); err != nil {
 			return nil, err
 		}

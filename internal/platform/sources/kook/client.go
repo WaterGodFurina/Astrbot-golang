@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- #nosec G404: 仅用于心跳间隔抖动（±5 秒防惊群），非安全随机
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -427,7 +427,7 @@ func (c *KookClient) handleResumeAck(data *kookResumeAckEventData) {
 func (c *KookClient) heartbeatLoop(ctx context.Context) {
 	for c.IsRunning() {
 		// 随机化心跳间隔 (±5秒)
-		interval := c.config.HeartbeatInterval + rand.Intn(11) - 5
+		interval := c.config.HeartbeatInterval + rand.Intn(11) - 5 // #nosec G404 -- 心跳间隔抖动（防惊群），非安全随机
 		if interval < 1 {
 			interval = 1
 		}

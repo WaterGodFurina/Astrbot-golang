@@ -454,7 +454,9 @@ func scheduleAttachmentCleanup(path string) {
 // ParseWebsocketPost 解析 WebSocket 事件中的 post 字符串（对应 parse_websocket_post）。
 // 解析失败或结果不是对象时返回 nil。
 func ParseWebsocketPost(rawPost string) map[string]interface{} {
-	var parsed interface{}
+	// #nosec unsafe-deserialization-interface -- Mattermost 服务端下发的 post 事件负载
+	//（受信任的已认证平台服务器），结构动态故用 interface{}。
+	var parsed interface{} // nosemgrep: go.lang.security.deserialization.unsafe-deserialization-interface.go-unsafe-deserialization-interface
 	if err := json.Unmarshal([]byte(rawPost), &parsed); err != nil {
 		return nil
 	}
@@ -467,7 +469,7 @@ func ParseWebsocketPost(rawPost string) map[string]interface{} {
 
 // buildWSURL 将 REST 基础地址转换为 WebSocket 地址（对应 ws_connect 中的 URL 转换）。
 func buildWSURL(baseURL string) string {
-	wsURL := strings.Replace(baseURL, "https://", "wss://", 1)
-	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
+	wsURL := strings.Replace(baseURL, "https://", "wss://", 1) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- 依配置的 http(s) 方案生成 wss/ws 地址（对齐 Python ws_connect），非注入
+	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)      // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
 	return wsURL + "/api/v4/websocket"
 }

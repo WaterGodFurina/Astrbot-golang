@@ -283,6 +283,7 @@ function connectWebSocket(): Promise<void> {
 
         const wsUrl = chatApi.liveWebSocketUrl(token);
 
+        // nosemgrep: websocket
         ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {

@@ -737,7 +737,10 @@ func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
 		"/https://github.com/AstrBotDevs/AstrBot/raw/refs/heads/master/.python-version"
 	start := time.Now()
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(testURL)
+	// #nosec tainted-url-host -- 测速端点需 dashboard 登录鉴权（apiAuthAllowed），仅管理员可调用；
+	// 目标路径固定为 GitHub raw 文件（对齐 Python stat_service.test_ghproxy_connection），
+	// 响应体被丢弃（只上报延迟/状态码），非通用 SSRF 探测原语。
+	resp, err := client.Get(testURL) // nosemgrep: go.lang.security.injection.tainted-url-host.tainted-url-host
 	if err != nil {
 		logger.I18nWarn("ghproxy 测速失败 %s: %v", proxyURL, err)
 		writeJSON(w, http.StatusBadGateway, apiError("ghproxy 测速失败: "+err.Error()))
@@ -1331,7 +1334,9 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 			if strings.HasPrefix(cleanPath, "assets/") {
 				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 			}
-			_, _ = w.Write(data)
+			// #nosec no-direct-write-to-responsewriter -- 静态资源服务：内容为 WebUI 自身构建产物（embed/外部目录），
+			// 路径经穿越校验，Content-Type 按扩展名设置，非用户输入内容。
+			_, _ = w.Write(data) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
 			return
 		}
 	}
@@ -1356,7 +1361,9 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(cleanPath, "assets/") {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
-	_, _ = w.Write(data)
+	// #nosec no-direct-write-to-responsewriter -- 静态资源服务：内容为 WebUI 自身构建产物（embed/web/dist），
+	// Content-Type 按扩展名设置，非用户输入内容。
+	_, _ = w.Write(data) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
 }
 
 // contentTypeFor returns the MIME type for a file path.

@@ -3,7 +3,7 @@ package sources
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- md5 用于 Azure 在线 TTS（OTTS）签名字段，属厂商协议强制要求，非密码学用途
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -189,7 +189,7 @@ func (s *AzureTTSProvider) generateSignature(ctx context.Context) (string, error
 	if u, err := url.Parse(s.otts.apiURL); err == nil && u.Path != "" {
 		path = u.Path
 	}
-	digest := md5.Sum([]byte(fmt.Sprintf("%s-%d-%s-0-%s", path, timestamp, nonce, s.otts.skey)))
+	digest := md5.Sum([]byte(fmt.Sprintf("%s-%d-%s-0-%s", path, timestamp, nonce, s.otts.skey))) // #nosec G401 -- Azure OTTS 协议规定的签名字符串格式（对应 Python 原版实现），非密码学哈希用途; nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
 	return fmt.Sprintf("%d-%s-0-%s", timestamp, nonce, hex.EncodeToString(digest[:])), nil
 }
 

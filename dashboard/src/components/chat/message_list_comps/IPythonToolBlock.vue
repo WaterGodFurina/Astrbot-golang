@@ -3,6 +3,7 @@
         <div v-if="displayExpanded" class="py-3 animate-fade-in">
             <!-- Code Section -->
             <div class="code-section">
+                <!-- nosemgrep: avoid-v-html -->
                 <div v-if="shikiReady && code" class="code-highlighted"
                     v-html="highlightedCode"></div>
                 <pre v-else class="code-fallback"

@@ -34,7 +34,7 @@ func GenerateRandomString(length int) string {
 // CalculateImageMD5 计算图片数据的 MD5 值（对应 calculate_image_md5）。
 func CalculateImageMD5(imageData []byte) string {
 	// #nosec G401 -- md5 仅作为图片内容指纹/校验（协议要求字段），不用于密码学场景。
-	sum := md5.Sum(imageData)
+	sum := md5.Sum(imageData) // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
 	return hex.EncodeToString(sum[:])
 }
 
@@ -61,7 +61,9 @@ func ParseSessionID(formattedSessionID string) (string, string) {
 
 // SafeJSONLoads 安全解析 JSON 字符串，失败返回默认值（对应 safe_json_loads）。
 func SafeJSONLoads(jsonStr string, def interface{}) interface{} {
-	var out interface{}
+	// #nosec unsafe-deserialization-interface -- 通用 JSON 解析辅助：输入为会话/消息负载中的
+	// 字符串字段（企业微信服务端回调），结构动态故用 interface{}，解析后仅读字段。
+	var out interface{} // nosemgrep: go.lang.security.deserialization.unsafe-deserialization-interface.go-unsafe-deserialization-interface
 	if err := json.Unmarshal([]byte(jsonStr), &out); err != nil {
 		logger.I18nWarn("JSON 解析失败: %v, 原始字符串: %s", err, jsonStr)
 		return def

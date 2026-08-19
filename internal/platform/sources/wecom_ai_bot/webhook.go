@@ -152,7 +152,7 @@ func (c *WecomAIBotWebhookClient) SendImageBase64(ctx context.Context, imageBase
 	}
 	// #nosec G401 -- md5 是企业微信智能机器人图片消息协议的必填字段（用于
 	// 服务端校验图片内容，非安全用途），仅作内容指纹，不用于密码学场景。
-	sum := md5.Sum(imageBytes)
+	sum := md5.Sum(imageBytes) // nosemgrep: go.lang.security.audit.crypto.use_of_weak_crypto.use-of-md5
 	return c.SendPayload(ctx, map[string]interface{}{
 		"msgtype": "image",
 		"image": map[string]interface{}{

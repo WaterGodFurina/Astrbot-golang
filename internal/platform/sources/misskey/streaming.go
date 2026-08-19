@@ -45,8 +45,8 @@ func NewStreamingClient(instanceURL, accessToken string) *StreamingClient {
 
 // streamURL 构造 streaming WebSocket 地址（对应 Python connect 中的 URL 拼接）。
 func streamURL(instanceURL, token string) string {
-	wsURL := strings.Replace(instanceURL, "https://", "wss://", 1)
-	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
+	wsURL := strings.Replace(instanceURL, "https://", "wss://", 1) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket -- 依实例配置的 http(s) 方案对应生成 wss/ws 地址（对齐 Python），非注入
+	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)          // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
 	return wsURL + "/streaming?i=" + token
 }
 

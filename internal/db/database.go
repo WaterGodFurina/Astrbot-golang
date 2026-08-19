@@ -415,7 +415,7 @@ func (d *Database) initSchema() error {
 		return fmt.Errorf("read user_version: %w", err)
 	}
 	if version < schemaVersion {
-		if _, err := d.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		if _, err := d.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil { // nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query -- #nosec G201: schemaVersion 为编译期常量，非用户输入
 			return fmt.Errorf("set user_version: %w", err)
 		}
 		logger.Info("SQLite schema migrated from version %d to %d", version, schemaVersion)
@@ -784,7 +784,7 @@ func (d *Database) UpdateCronJob(jobID string, fields map[string]interface{}) er
 	args = append(args, jobID)
 	// #nosec G202 -- `set` is assembled only from keys validated against the
 	// cronJobWritableFields whitelist; all values go through placeholders.
-	query := `UPDATE cron_jobs SET ` + set + ` WHERE job_id = ?`
+	query := `UPDATE cron_jobs SET ` + set + ` WHERE job_id = ?` // nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query
 	return d.withRetry(func() error {
 		_, err := d.db.Exec(query, args...)
 		return err

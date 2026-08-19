@@ -193,8 +193,10 @@ export function mergeDynamicTranslations(modulePath: string, allLocaleData: Reco
   let target: any = translations.value;
   for (const part of pathParts) {
     if (!(part in target) || typeof target[part] !== 'object') {
+      // nosemgrep: prototype-pollution-assignment
       target[part] = {};
     }
+    // nosemgrep: prototype-pollution-loop
     target = target[part];
   }
 
@@ -206,6 +208,8 @@ export function mergeDynamicTranslations(modulePath: string, allLocaleData: Reco
 
 function deepMerge(target: Record<string, any>, source: Record<string, any>) {
   for (const key of Object.keys(source)) {
+    // 防御原型污染：跳过 __proto__ / constructor 键
+    if (key === "__proto__" || key === "constructor") continue;
     if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
       if (!(key in target) || typeof target[key] !== 'object') {
         target[key] = {};

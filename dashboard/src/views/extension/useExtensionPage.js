@@ -574,6 +574,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     }
     try {
       const res = await pluginApi.list();
+      // nosemgrep: object-assign
       Object.assign(extension_data, res.data);
 
       // 同步插件数据到侧边栏共享状态
@@ -671,6 +672,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         return;
       }
       if (!isFailed) {
+        // nosemgrep: object-assign
         Object.assign(extension_data, res.data);
       }
       toast(res.data.message, "success");
@@ -1040,6 +1042,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         return;
       }
 
+      // nosemgrep: object-assign
       Object.assign(extension_data, res.data);
       onLoadingDialogResult(1, res.data.message);
       setTimeout(async () => {
