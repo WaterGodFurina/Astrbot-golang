@@ -25,8 +25,8 @@ github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5 h1:bBmmB7he0i
 github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5/go.mod h1:0UcFaCkhp6vZw6l5Dpq0Dp673CoF9GdvA8lTfst0GiU=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=
 github.com/STARRY-S/zip v0.2.3/go.mod h1:lqJ9JdeRipyOQJrYSOtpNAiaesFO6zVDsE8GIGFaoSk=
-github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.2.6-0.20260819091959-e1375af5e6ed h1:t79kAxH+l46m9mSq0zjq43gHQfXi4Dh/ppbhXEEYZVk=
-github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.2.6-0.20260819091959-e1375af5e6ed/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.2.0 h1:1ErGOtC+kWo/ItFIuqUmZnouPv0wI8dpBD9+LVwc+Xo=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.2.0/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
 github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.3.5 h1:AJqbKAwXUXu2ChUm6qxttGYaDu35DjtL6sIM2by5bqk=
 github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.3.5/go.mod h1:Ici1h1XuueS5HROwbsEkd+Q99MB303WmmLKQzgS1v6c=
 github.com/WaterGodFurina/nanovec v1.0.1 h1:ooxW9HHgubXg5Sw/LakyBZDca3EK3x2ia7XhSWyC9uI=
