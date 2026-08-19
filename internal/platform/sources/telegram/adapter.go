@@ -20,6 +20,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -29,6 +30,7 @@ var logger = log.GetDefault().WithComponent("Telegram")
 type Adapter struct {
 	Token    string
 	apiBase  string
+	fileBase string
 	client   *http.Client
 	EventBus *core.EventBus
 	SelfID   string
@@ -46,7 +48,16 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		stopCh: make(chan struct{}),
 	}
 	a.Token, _ = config["token"].(string)
-	a.apiBase = "https://api.telegram.org/bot" + a.Token
+	if base, ok := config["telegram_api_base_url"].(string); ok && base != "" {
+		a.apiBase = base + a.Token
+	} else {
+		a.apiBase = "https://api.telegram.org/bot" + a.Token
+	}
+	if base, ok := config["telegram_file_base_url"].(string); ok && base != "" {
+		a.fileBase = base + a.Token
+	} else {
+		a.fileBase = "https://api.telegram.org/file/bot" + a.Token
+	}
 	return a
 }
 
@@ -93,9 +104,10 @@ func (a *Adapter) ID() string { return "telegram" }
 func (a *Adapter) Type() string { return "telegram" }
 
 // Send sends a message chain to a Telegram chat. Supports text, images
-// (sendPhoto), voice (sendVoice), documents (sendDocument) and video
-// (sendVideo). FileID / public https URLs are passed through directly;
-// local paths and base64 payloads are uploaded as multipart/form-data.
+// (sendPhoto), voice (sendVoice) / audio (sendAudio, decided by Record.Format),
+// documents (sendDocument) and video (sendVideo). FileID / public https URLs
+// are passed through directly; local paths and base64 payloads are uploaded as
+// multipart/form-data.
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	if chain == nil {
 		return nil
@@ -110,7 +122,12 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 				return err
 			}
 		case *message.Record:
-			if err := a.sendMedia(sessionID, "sendVoice", "voice", c.FileID, c.URL, c.Path, c.File, c.Base64); err != nil {
+			// 语音（ogg/opus）走 sendVoice，其余音频格式（mp3/m4a/flac/wav）走 sendAudio。
+			method, field := "sendVoice", "voice"
+			if !isVoiceFormat(c.Format) {
+				method, field = "sendAudio", "audio"
+			}
+			if err := a.sendMedia(sessionID, method, field, c.FileID, c.URL, c.Path, c.File, c.Base64); err != nil {
 				return err
 			}
 		case *message.File:
@@ -289,13 +306,13 @@ func (a *Adapter) pollLoop(ctx context.Context) {
 			if updateID, ok := updateMap["update_id"].(float64); ok {
 				offset = int(updateID) + 1
 			}
-			a.handleUpdate(updateMap)
+			a.handleUpdate(ctx, updateMap)
 		}
 	}
 }
 
 // handleUpdate processes a single Telegram update.
-func (a *Adapter) handleUpdate(update map[string]interface{}) {
+func (a *Adapter) handleUpdate(ctx context.Context, update map[string]interface{}) {
 	msg, ok := update["message"].(map[string]interface{})
 	if !ok {
 		return
@@ -337,8 +354,24 @@ func (a *Adapter) handleUpdate(update map[string]interface{}) {
 	}
 
 	// Build message chain
-	chain := &message.MessageChain{
-		Chain: []message.Component{&message.Plain{Text: text}},
+	chain := &message.MessageChain{Chain: []message.Component{}}
+	if text != "" {
+		chain.Chain = append(chain.Chain, &message.Plain{Text: text})
+	}
+
+	// 语音/音频消息：下载文件并按内容识别真实格式，转换为 Record 组件。
+	// 语音无文本；音频可携带 caption（作为 Plain 追加，对齐 4.27.4 的 _apply_caption）。
+	if _, ok := msg["voice"]; ok {
+		if record := a.handleAudioMessage(ctx, msg, "voice"); record != nil {
+			chain.Chain = append(chain.Chain, record)
+		}
+	} else if _, ok := msg["audio"]; ok {
+		if record := a.handleAudioMessage(ctx, msg, "audio"); record != nil {
+			chain.Chain = append(chain.Chain, record)
+		}
+		if caption, ok := msg["caption"].(string); ok && caption != "" {
+			chain.Chain = append(chain.Chain, &message.Plain{Text: caption})
+		}
 	}
 
 	event := &core.Event{
@@ -362,6 +395,137 @@ func (a *Adapter) handleUpdate(update map[string]interface{}) {
 
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.Error("Failed to publish event: %v", err)
+	}
+}
+
+// handleAudioMessage 处理 Telegram 语音/音频消息：下载文件后优先使用 mime_type 识别格式，
+// 缺失/不可靠（如 application/octet-stream）时按文件头 magic bytes 判断真实格式，
+// 构造带正确扩展名/format 的 message.Record。下载失败时仅告警并返回 nil，不阻断消息处理。
+func (a *Adapter) handleAudioMessage(ctx context.Context, msg map[string]interface{}, field string) *message.Record {
+	info, ok := msg[field].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	fileID, _ := info["file_id"].(string)
+	if fileID == "" {
+		logger.Warn("Telegram %s 消息缺少 file_id", field)
+		return nil
+	}
+	mimeType, _ := info["mime_type"].(string)
+
+	resp, err := a.apiCall(ctx, "getFile", map[string]interface{}{"file_id": fileID})
+	if err != nil {
+		logger.Warn("Telegram getFile 失败 (%s): %v", field, err)
+		return nil
+	}
+	result, ok := resp["result"].(map[string]interface{})
+	if !ok {
+		logger.Warn("Telegram getFile 返回异常 (%s)", field)
+		return nil
+	}
+	filePath, _ := result["file_path"].(string)
+	if filePath == "" {
+		logger.Warn("Telegram getFile 缺少 file_path (%s)", field)
+		return nil
+	}
+
+	tmp, err := os.CreateTemp("", "astrbot-tg-"+field+"-*")
+	if err != nil {
+		logger.Warn("创建 Telegram 音频临时文件失败 (%s): %v", field, err)
+		return nil
+	}
+	tmpName := tmp.Name()
+	_ = tmp.Close()
+
+	if err := utils.DownloadFile(ctx, a.fileBase+"/"+filePath, tmpName); err != nil {
+		logger.Warn("Telegram 音频文件下载失败 (%s): %v", field, err)
+		_ = os.Remove(tmpName)
+		return nil
+	}
+
+	// 识别音频格式：优先已有 mime_type，缺失/不可靠时按文件内容 magic bytes 判断。
+	format := formatFromMime(mimeType)
+	if format == "" {
+		format = utils.DetectAudioFormat(tmpName)
+	}
+	if format == "" {
+		// 识别失败回退：使用默认 ogg。
+		format = "ogg"
+		logger.Warn("Telegram %s 音频格式识别失败 (mime=%s)，回退为 ogg", field, mimeType)
+	}
+
+	// 补上正确扩展名，便于 Telegram 识别语音/音频格式。
+	finalName := tmpName + audioExt(format)
+	if finalName != tmpName {
+		if err := os.Rename(tmpName, finalName); err != nil {
+			logger.Warn("重命名 Telegram 音频临时文件失败 (%s): %v", field, err)
+			finalName = tmpName
+		}
+	}
+	scheduleAudioCleanup(finalName)
+
+	return &message.Record{
+		File:   finalName,
+		URL:    finalName,
+		Path:   finalName,
+		Format: format,
+		Mime:   mimeType,
+	}
+}
+
+// tempAudioCleanupDelay 是临时音频文件的清理延迟：消息在事件总线中异步处理，
+// 延迟清理保证文件在消费/转发期间可用。
+const tempAudioCleanupDelay = 30 * time.Minute
+
+// scheduleAudioCleanup 在延迟后删除临时音频文件。
+func scheduleAudioCleanup(path string) {
+	if path == "" {
+		return
+	}
+	time.AfterFunc(tempAudioCleanupDelay, func() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			logger.Debug("清理 Telegram 临时音频文件失败 %s: %v", path, err)
+		}
+	})
+}
+
+// isVoiceFormat 判断音频格式是否作为语音（sendVoice）发送。Telegram 语音仅支持
+// ogg/opus；格式为空时保持向后兼容（默认按语音处理）。
+func isVoiceFormat(format string) bool {
+	switch strings.ToLower(format) {
+	case "", "ogg", "opus":
+		return true
+	}
+	return false
+}
+
+// formatFromMime 从 mime_type 推断音频格式；mime 缺失或不可靠（如
+// application/octet-stream）时返回空字符串，交由文件内容识别。
+func formatFromMime(mime string) string {
+	switch strings.ToLower(mime) {
+	case "audio/ogg", "application/ogg", "audio/opus":
+		return "ogg"
+	case "audio/mpeg", "audio/mp3", "audio/x-mp3":
+		return "mp3"
+	case "audio/mp4", "audio/x-m4a", "audio/m4a", "video/mp4":
+		return "m4a"
+	case "audio/flac", "audio/x-flac":
+		return "flac"
+	case "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave":
+		return "wav"
+	}
+	return ""
+}
+
+// audioExt 返回音频格式对应的文件扩展名；opus 使用 ogg 容器。
+func audioExt(format string) string {
+	switch strings.ToLower(format) {
+	case "ogg", "opus":
+		return ".ogg"
+	case "m4a", "mp4":
+		return ".m4a"
+	default:
+		return "." + format
 	}
 }
 

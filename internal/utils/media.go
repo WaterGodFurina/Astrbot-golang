@@ -118,6 +118,49 @@ func EnsureJPEG(path string) (string, error) {
 	return path, nil
 }
 
+// DetectAudioFormat 通过文件头 magic bytes 识别音频格式（对应
+// astrbot/core/utils/media_utils.py 的 _get_audio_magic_type）。
+// 返回 wav/amr/opus/ogg/flac/mp3/m4a/silk 之一；无法识别时返回空字符串。
+func DetectAudioFormat(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	header := make([]byte, 64)
+	n, _ := io.ReadFull(f, header)
+	header = header[:n]
+	if len(header) < 12 {
+		return ""
+	}
+
+	if bytes.Equal(header[:4], []byte("RIFF")) && bytes.Equal(header[8:12], []byte("WAVE")) {
+		return "wav"
+	}
+	if bytes.Equal(header[:4], []byte("#!AM")) {
+		return "amr"
+	}
+	if bytes.Equal(header[:4], []byte("OggS")) {
+		if bytes.Contains(header, []byte("OpusHead")) {
+			return "opus"
+		}
+		return "ogg"
+	}
+	if bytes.Equal(header[:4], []byte("fLaC")) {
+		return "flac"
+	}
+	if bytes.Equal(header[:3], []byte("ID3")) || (header[0] == 0xff && header[1] == 0xfb) {
+		return "mp3"
+	}
+	if bytes.Equal(header[:4], []byte("ftyp")) {
+		return "m4a"
+	}
+	if bytes.HasPrefix(header, []byte("#!SILK_V3")) || bytes.HasPrefix(header, []byte{0x02, '#', '!', 'S', 'I', 'L', 'K', '_', 'V', '3'}) {
+		return "silk"
+	}
+	return ""
+}
+
 // EnsureWAV converts audio to WAV format (placeholder — returns original path).
 func EnsureWAV(path string) (string, error) {
 	if _, err := os.Stat(path); err != nil {

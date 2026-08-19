@@ -1304,6 +1304,8 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 			}
 			providers = filtered
 		}
+		// 推理元数据与供应商配置分离：剔除遗留的 reasoning 字段（对齐 4.27.4 #9699）。
+		stripProvidersReasoningMetadata(providers)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"providers":      providers,
 			"model_metadata": map[string]interface{}{},
@@ -1312,6 +1314,7 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 		cfg := s.getConfigSnapshot()
 		providers, _ := cfg["provider"].([]interface{})
 		providerTemplates := s.getProviderTemplates()
+		stripProvidersReasoningMetadata(providers)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"config_schema": map[string]interface{}{
 				"provider": map[string]interface{}{
@@ -1472,8 +1475,33 @@ func (s *Server) testProvider(providerID string) map[string]interface{} {
 	return result
 }
 
+// stripLegacyReasoningMetadata removes reasoning metadata accidentally stored
+// as provider configuration. 对齐 4.27.4 #9699（将推理元数据与供应商配置分离）：
+// 来自 provider source 的配置中遗留的 "reasoning" 字段被剔除，避免推理元数据
+// 混入供应商配置随请求体发送。
+func stripLegacyReasoningMetadata(pc map[string]interface{}) map[string]interface{} {
+	if pc != nil {
+		if sid, _ := pc["provider_source_id"].(string); sid != "" {
+			delete(pc, "reasoning")
+		}
+	}
+	return pc
+}
+
+// stripProvidersReasoningMetadata applies stripLegacyReasoningMetadata to every
+// provider in the slice. 调用方传入的 provider 均来自 getConfigSnapshot 的深拷贝，
+// 就地删除安全，不会污染持久化配置（对齐 4.27.4 get_provider_schema 的深拷贝后剥离）。
+func stripProvidersReasoningMetadata(providers []interface{}) {
+	for _, p := range providers {
+		if m, ok := p.(map[string]interface{}); ok {
+			stripLegacyReasoningMetadata(m)
+		}
+	}
+}
+
 // upsertProvider inserts or replaces a provider config in the default config and persists it.
 func (s *Server) upsertProvider(config map[string]interface{}) error {
+	config = stripLegacyReasoningMetadata(config)
 	id, _ := config["id"].(string)
 	if id == "" {
 		return fmt.Errorf("缺少提供商 ID")
@@ -1503,7 +1531,7 @@ func (s *Server) getProviderByID(id string) map[string]interface{} {
 	for _, p := range providers {
 		if m, ok := p.(map[string]interface{}); ok {
 			if pid, _ := m["id"].(string); pid == id {
-				return m
+				return stripLegacyReasoningMetadata(m)
 			}
 		}
 	}

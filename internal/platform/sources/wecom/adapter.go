@@ -370,7 +370,17 @@ func (a *Adapter) convertMessage(msg *WecomMessage) {
 func (a *Adapter) convertKFMessage(msg map[string]interface{}) {
 	msgtype, _ := msg["msgtype"].(string)
 	externalUserID, _ := msg["external_userid"].(string)
+	// open_kfid 仅用于客服回复路由（kf/send_msg 必填字段）；同步消息缺失/为空时
+	// 降级处理：仅告警并跳过客服回复路由，消息仍正常进入消息管线（对齐 4.27.4）。
 	openKFID, _ := msg["open_kfid"].(string)
+	if openKFID == "" {
+		if v, ok := msg["OpenKfId"].(string); ok {
+			openKFID = v
+		}
+	}
+	if openKFID == "" {
+		logger.I18nWarn("微信客服同步消息缺少 open_kfid，已跳过客服回复路由，消息仍将正常进入消息管线。external_userid=%s", externalUserID)
+	}
 
 	abm := platform.NewAstrBotMessage()
 	abm.RawMessage = msg
