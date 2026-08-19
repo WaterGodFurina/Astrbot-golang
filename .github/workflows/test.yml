@@ -165,3 +165,94 @@ jobs:
           ls -la dist/ | head
           ls -la scripts/t2i/shiki_runtime.iife.js 2>/dev/null || find . -name "shiki_runtime.iife.js" | head
         working-directory: dashboard
+
+  static-analysis:
+    name: 静态分析
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: 配置 Go 环境（代理与模块）
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GOFLAGS: -mod=mod
+        run: |
+          go env -w GOPROXY="https://goproxy.cn,direct"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
+
+      - name: 安装静态分析工具
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install github.com/kisielk/errcheck@latest
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: gofmt 格式检查
+        run: |
+          FILES=$(gofmt -l .)
+          if [ -n "$FILES" ]; then
+            echo "以下文件未通过 gofmt："
+            echo "$FILES"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./... 2>&1 | grep -v "copies lock value" || true
+
+      - name: staticcheck
+        run: staticcheck ./... 2>&1 | grep -v "copies lock value" || true
+
+      - name: errcheck
+        run: errcheck ./... 2>&1 || true
+
+      - name: golangci-lint
+        run: golangci-lint run ./... 2>&1 || true
+
+      - name: govulncheck（依赖漏洞）
+        run: govulncheck ./... 2>&1 || true
+
+      - name: gosec（Go 安全规则）
+        run: gosec -quiet -exclude=G402,G304 ./... 2>&1 || true
+
+      - name: 安装并运行 semgrep（污点分析）
+        run: |
+          pip install semgrep
+          semgrep --config=auto --error 2>&1 || true
+        env:
+          PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
