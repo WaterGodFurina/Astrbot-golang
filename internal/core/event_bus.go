@@ -541,7 +541,7 @@ func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
 		schedulers = append(schedulers, scheduler)
 	}
 	bus.mu.RUnlock()
-	logger.I18nInfo("EventBus: 正在分发消息 %q（调度器=%d）", event.MessageStr, len(schedulers))
+	logger.Debug("EventBus: 正在分发消息 %q（调度器=%d）", event.MessageStr, len(schedulers))
 
 	for _, scheduler := range schedulers {
 		result, err := scheduler.Process(ctx, event)
@@ -619,7 +619,7 @@ func (s *PipelineScheduler) Process(ctx context.Context, event *Event) (result *
 			return nil, fmt.Errorf("stage %s: %w", stage.Name(), err)
 		}
 		if result != nil && !result.Continue {
-			logger.I18nInfo("流水线: 阶段 %s 拦截了事件 %q", stage.Name(), event.MessageStr)
+			logger.Debug("流水线: 阶段 %s 拦截了事件 %q", stage.Name(), event.MessageStr)
 			return result, nil
 		}
 	}
