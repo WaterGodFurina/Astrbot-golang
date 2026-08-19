@@ -426,6 +426,9 @@ func TestExtractClangArchiveTarXz(t *testing.T) {
 // re-download instead of trusting a half-extracted Clang. It serves a fake zig
 // archive from a local httptest server so the test needs no network.
 func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
+	if _, _, ok := detectSystemClang(); ok {
+		t.Skip("system clang present; download path not exercised")
+	}
 	old := os.Getenv("ASTRBOT_CLANG_BIN")
 	oldMirror := os.Getenv("ASTRBOT_CLANG_MIRROR")
 	t.Cleanup(func() {

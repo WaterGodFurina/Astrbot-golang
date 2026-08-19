@@ -1544,7 +1544,7 @@ func (m *SubprocessManager) wrapStartError(parser *astrbotStartupParser, err err
 	if se == nil {
 		return err
 	}
-	return fmt.Errorf("python 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
+	return fmt.Errorf("Python 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
 		se.Phase, se.Plugin, se.Error, err)
 }
 

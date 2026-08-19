@@ -252,7 +252,7 @@ func TestTriggerPassesContext(t *testing.T) {
 	if got == context.Background() {
 		t.Fatal("handler must receive the caller's context, not context.Background()")
 	}
-	if v := got.Value("marker"); v != "x" {
+	if v := got.Value(ctxKey("marker")); v != "x" {
 		t.Fatalf("handler context lost caller value: %v", v)
 	}
 	select {
