@@ -85,6 +85,58 @@ func NewLLMResponse(role string, completionText string) *LLMResponse {
 	}
 }
 
+// HasReasoning reports whether the response carries reasoning metadata
+// (reasoning_content or reasoning_signature non-empty). 回退取值接口：所有读取
+// reasoning/元数据的地方统一走该方法，避免对缺失/空值处理不一致（对齐 4.27.4
+// tool_loop_agent_runner 中 `reasoning_content is not None or
+// reasoning_signature` 的判空语义，空串视为缺失）。
+func (r *LLMResponse) HasReasoning() bool {
+	return r.ReasoningContent != "" || r.ReasoningSignature != ""
+}
+
+// GetReasoningContent safely returns the reasoning content; empty string when
+// absent, so callers never need to guard against a missing value.
+func (r *LLMResponse) GetReasoningContent() string {
+	return r.ReasoningContent
+}
+
+// GetReasoningSignature safely returns the reasoning signature; empty string
+// when absent.
+func (r *LLMResponse) GetReasoningSignature() string {
+	return r.ReasoningSignature
+}
+
+// GetUsage safely returns the token usage; nil when the provider returned none.
+// 调用方应通过 UsageInput / UsageOutput 等回退取值，避免直接解引用空指针。
+func (r *LLMResponse) GetUsage() *TokenUsage {
+	return r.Usage
+}
+
+// UsageInput safely returns the total input tokens (cached + uncached); 0 when
+// no usage is available. 回退取值：usage 缺失时返回 0，避免 nil 解引用崩溃。
+func (r *LLMResponse) UsageInput() int {
+	if r.Usage == nil {
+		return 0
+	}
+	return r.Usage.InputOther + r.Usage.InputCached
+}
+
+// UsageOutput safely returns the output tokens; 0 when no usage is available.
+func (r *LLMResponse) UsageOutput() int {
+	if r.Usage == nil {
+		return 0
+	}
+	return r.Usage.Output
+}
+
+// UsageTotal safely returns the total token consumption; 0 when none available.
+func (r *LLMResponse) UsageTotal() int {
+	if r.Usage == nil {
+		return 0
+	}
+	return r.Usage.Total()
+}
+
 // ToOpenAIToolCalls converts tool calls to OpenAI format.
 // The three parallel slices may have inconsistent lengths; the conversion only
 // iterates over their shared prefix to avoid an out-of-range access.

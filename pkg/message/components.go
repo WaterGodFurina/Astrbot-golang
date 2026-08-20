@@ -146,13 +146,15 @@ type Record struct {
 	File   string `json:"file,omitempty"`
 	Base64 string `json:"base64,omitempty"`
 	FileID string `json:"file_id,omitempty"`
-	Text   string `json:"text,omitempty"` // text representation for TTS
+	Text   string `json:"text,omitempty"`   // text representation for TTS
+	Format string `json:"format,omitempty"` // 音频格式（ogg/mp3/m4a/flac/wav），用于选择 sendVoice/sendAudio
+	Mime   string `json:"mime,omitempty"`   // 原始 mime_type
 }
 
 func (r *Record) Type() ComponentType { return CompRecord }
 func (r *Record) String() string      { return "[语音]" }
 func (r *Record) Clone() Component {
-	return &Record{URL: r.URL, Path: r.Path, File: r.File, Base64: r.Base64, FileID: r.FileID, Text: r.Text}
+	return &Record{URL: r.URL, Path: r.Path, File: r.File, Base64: r.Base64, FileID: r.FileID, Text: r.Text, Format: r.Format, Mime: r.Mime}
 }
 
 // File represents a file component.

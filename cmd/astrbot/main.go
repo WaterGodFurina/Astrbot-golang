@@ -6,9 +6,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/lifecycle"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -22,6 +25,21 @@ const logo = `
  / ___ |/ /_/ / / / / /_/ (__  )/ _, _/ /_/ / / / / / / /_/ / / / /
 /_/  |_|\__,_/_/ /_/\__,_/____/_/ |_|\__,_/_/_/ /_/_/ /_/_/ /_/_/ /
 `
+
+func init() {
+	// Android 没有 /etc/resolv.conf，Go 纯 resolver（CGO_ENABLED=0）会回退到
+	// [::1]:53，而 Android 的 DNS 由 netd 提供、只监听 127.0.0.1:53（IPv4），
+	// 导致所有域名解析报 "connection refused"。统一把解析指向 netd。
+	if runtime.GOOS == "android" {
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 5 * time.Second}
+				return d.DialContext(ctx, "udp", "127.0.0.1:53")
+			},
+		}
+	}
+}
 
 func main() {
 	webuiDir := flag.String("webui-dir", "", "Directory path for external WebUI static files (optional; empty = use the embedded dist)")

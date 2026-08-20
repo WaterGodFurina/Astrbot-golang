@@ -532,8 +532,14 @@ func (s *OpenAIResponsesSource) buildRequestBody(req *provider.ProviderRequest, 
 		}
 	}
 	if _, has := body["reasoning"]; !has {
-		if re, ok := s.Config()["reasoning_effort"]; ok {
+		// Reasoning effort is resolved through ReasoningEffort(): generic
+		// custom_extra_body.reasoning_effort first, then the provider's own
+		// reasoning_effort, then the default "high" (aligned with 4.27.4 #9699).
+		// The raw reasoning_effort key is consumed and converted into
+		// reasoning.effort (mirrors 4.27.4 extra_body.pop("reasoning_effort")).
+		if re := s.ReasoningEffort(); re != "" {
 			body["reasoning"] = map[string]interface{}{"effort": re}
+			delete(body, "reasoning_effort")
 		}
 	}
 	return body

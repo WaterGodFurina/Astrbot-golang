@@ -3,6 +3,7 @@ package pipeline
 import (
 	"container/list"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/rand" // nosemgrep: go.lang.security.audit.crypto.math_random.math-random-used -- #nosec G404: 仅用于 AR 概率抽取与记录 ID 后缀（非安全场景）
 	"strings"
@@ -350,9 +351,68 @@ func (g *GroupChatContext) formatMessage(event *core.Event, c groupContextCfg) s
 			b.WriteString(" [Video]")
 		case *message.File:
 			fmt.Fprintf(&b, " [File: %s]", v.Name)
+		case *message.Json:
+			b.WriteString(renderJsonCard(v))
 		}
 	}
 	return b.String()
+}
+
+// maxReplyTextLength mirrors _MAX_REPLY_TEXT_LENGTH: 过长的引用回复与卡片文本
+// 会被截断，保持上下文记录紧凑。
+const maxReplyTextLength = 200
+
+// truncateReplyText mirrors _truncate_reply_text（按字符截断，避免切断多字节字符）。
+func truncateReplyText(text string) string {
+	runes := []rune(text)
+	if len(runes) <= maxReplyTextLength {
+		return text
+	}
+	return string(runes[:maxReplyTextLength]) + "..."
+}
+
+// renderJsonCard 将 JSON 卡片（share_info / 富文本卡片）渲染为纯文本，
+// 使 LLM 能看到卡片的标题/描述/链接（对齐 4.27.4 _format_message 的 Json 分支）。
+func renderJsonCard(j *message.Json) string {
+	cardData := j.Data
+	if raw, ok := cardData["data"].(string); ok {
+		var nested map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &nested); err == nil {
+			cardData = nested
+		}
+	}
+
+	detail := map[string]interface{}{}
+	if meta, ok := cardData["meta"].(map[string]interface{}); ok {
+		if candidate, ok := meta["detail_1"].(map[string]interface{}); ok {
+			detail = candidate
+		} else if candidate, ok := meta["news"].(map[string]interface{}); ok {
+			detail = candidate
+		}
+	}
+
+	fields := []string{}
+	appendField := func(label string, rawValue interface{}) {
+		value, _ := rawValue.(string)
+		value = strings.Join(strings.Fields(value), " ")
+		if value == "" {
+			return
+		}
+		fields = append(fields, fmt.Sprintf("%s: %s", label, truncateReplyText(value)))
+	}
+	appendField("Title", detail["title"])
+	appendField("Description", detail["desc"])
+	url := detail["qqdocurl"]
+	if s, _ := url.(string); s == "" {
+		url = detail["jumpUrl"]
+	}
+	appendField("URL", url)
+
+	suffix := ""
+	if len(fields) > 0 {
+		suffix = ": " + strings.Join(fields, "; ")
+	}
+	return fmt.Sprintf(" [Shared Card%s]", suffix)
 }
 
 // imageCaption invokes the configured image-caption provider to describe an

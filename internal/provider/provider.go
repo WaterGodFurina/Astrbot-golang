@@ -106,6 +106,28 @@ func (b *BaseProvider) Config() map[string]interface{} {
 	return b.providerConfig
 }
 
+// ReasoningEffort returns the effective reasoning effort for the provider.
+// 推理配置与供应商配置分离（对齐 4.27.4 #9699）：统一走通用配置读取，供应商
+// 特有配置回退，找不到用默认值。
+//
+// 回退顺序：
+//  1. 通用配置 custom_extra_body.reasoning_effort（provider schema 通用模板字段）；
+//  2. 供应商自身配置 reasoning_effort；
+//  3. 默认值 "high"。
+func (b *BaseProvider) ReasoningEffort() string {
+	if cfg := b.providerConfig; cfg != nil {
+		if extra, ok := cfg["custom_extra_body"].(map[string]interface{}); ok {
+			if v, ok := extra["reasoning_effort"].(string); ok && v != "" {
+				return v
+			}
+		}
+		if v, ok := cfg["reasoning_effort"].(string); ok && v != "" {
+			return v
+		}
+	}
+	return "high"
+}
+
 // Settings returns the provider settings.
 func (b *BaseProvider) Settings() map[string]interface{} {
 	return b.providerSettings

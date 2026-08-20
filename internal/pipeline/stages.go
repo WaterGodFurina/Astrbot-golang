@@ -1812,7 +1812,7 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 		}
 		if chunk.IsChunk {
 			content.WriteString(chunk.CompletionText)
-			reasoning.WriteString(chunk.ReasoningContent)
+			reasoning.WriteString(chunk.GetReasoningContent())
 			// Suppress model control markup (XML tool calls, advisor/reasoning
 			// tags) from the user-facing stream; parsed/handled at completion.
 			// A marker split across chunks is caught by holding back the suffix
@@ -1832,9 +1832,10 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 			// Display the reasoning content when provider_settings.
 			// display_reasoning_text is enabled (mirrors the Python
 			// `chain.type == "reasoning" and not show_reasoning: continue`).
+			// 通过回退取值接口 GetReasoningContent 读取，空值返回空串，不显示。
 			if s.providerConf != nil && s.providerConf.DisplayReasoningText &&
-				chunk.ReasoningContent != "" {
-				streamer.push(chunk.ReasoningContent)
+				chunk.GetReasoningContent() != "" {
+				streamer.push(chunk.GetReasoningContent())
 			}
 			continue
 		}
@@ -1843,8 +1844,8 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 			full.ToolsCallArgs = chunk.ToolsCallArgs
 			full.ToolsCallIDs = chunk.ToolsCallIDs
 		}
-		if chunk.Usage != nil {
-			full.Usage = chunk.Usage
+		if u := chunk.GetUsage(); u != nil {
+			full.Usage = u
 		}
 		if chunk.CompletionText != "" && !chunk.IsChunk {
 			// The final consolidated chunk carries the authoritative full text;
@@ -2112,12 +2113,9 @@ func (s *ProcessStage) recordProviderCall(providerCfg map[string]interface{}, um
 	}
 	providerID, _ := providerCfg["id"].(string)
 	model, _ := providerCfg["model"].(string)
-	input := 0
-	output := 0
-	if resp.Usage != nil {
-		input = resp.Usage.InputOther + resp.Usage.InputCached
-		output = resp.Usage.Output
-	}
+	// 通过回退取值接口读取 usage，缺失时返回 0，避免 nil 解引用。
+	input := resp.UsageInput()
+	output := resp.UsageOutput()
 	now := float64(time.Now().UnixMilli()) / 1000
 	_ = s.database.RecordProviderCall(umo, providerID, model, input, 0, output, now, now)
 }
