@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
@@ -293,7 +294,7 @@ func starMetadataFromAny(v any) *StarMetadata {
 // over star.Registry().All() via StarManagerLike，规避 star→plugin 导入环).
 // Call once at startup, after all managers exist and before plugins begin
 // handling messages.
-func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(prompt, systemPrompt string, imageURLs []string) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike) {
+func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(prompt, systemPrompt string, imageURLs []string) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager) {
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
 		CallAction: func(platformID, api string, params map[string]any) (map[string]any, error) {
 			adapter := pm.Get(platformID)
@@ -388,6 +389,37 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				return "", fmt.Errorf("t2i 渲染失败: %w", err)
 			}
 			return base64.StdEncoding.EncodeToString(data), nil
+		},
+		HtmlRender: func(template, data, options string) (string, error) {
+			// 优先远程 t2i：配置了 t2i_endpoint 时调用 RenderCustomTemplate
+			// （HTML 模板 + 数据 → 图片），失败回退本地 gg 渲染。
+			endpoint := ""
+			if cfgMgr != nil {
+				if cfg := cfgMgr.Get("default"); cfg != nil {
+					endpoint = cfg.GetString("t2i_endpoint")
+				}
+			}
+			if endpoint != "" {
+				img, err := t2i.RenderCustomTemplate(endpoint, template, data, options)
+				if err == nil {
+					return base64.StdEncoding.EncodeToString(img), nil
+				}
+				// 远程失败 → 回退本地渲染。
+				logger.Warn("html_render 远程 t2i 渲染失败（%v），回退本地渲染", err)
+			}
+			// 本地 gg 兜底：模板为空时用 data 作为渲染文本。
+			text := template
+			if text == "" {
+				text = data
+			}
+			if text == "" {
+				return "", fmt.Errorf("html_render: 模板与数据均为空，无法渲染")
+			}
+			img, err := t2i.RenderTextToPNG(text, t2i.ImageOptions{})
+			if err != nil {
+				return "", fmt.Errorf("html_render 本地渲染失败: %w", err)
+			}
+			return base64.StdEncoding.EncodeToString(img), nil
 		},
 
 		// ── 会话管理（对齐 Python conversation_manager）──

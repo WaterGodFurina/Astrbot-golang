@@ -4609,32 +4609,39 @@ func (s *Server) listTools() []interface{} {
 		}
 	}
 
-	// Plugin LLM function tools (subprocess plugins' registered tools).
+	// Plugin LLM function tools (subprocess plugins' registered tools). 遍历
+	// AllPluginTools（含休眠插件）：休眠插件的工具在 Dashboard 照常展示，
+	// LLM 注入层本就保留休眠工具，调用时按名查注册表自动唤醒。
 	if s.subPluginMgr != nil {
-		for _, inst := range s.subPluginMgr.List() {
-			if inst.Meta == nil {
+		// 插件 id → 显示名（运行实例用 inst.Name，休眠占位实例用注册名）
+		nameByID := map[string]string{}
+		for _, inst := range s.subPluginMgr.RegisteredPlugins() {
+			if inst.Name != "" {
+				nameByID[inst.ID] = inst.Name
+			}
+		}
+		for _, entry := range s.subPluginMgr.AllPluginTools() {
+			if entry.Desc == nil {
 				continue
 			}
-			for _, t := range inst.Meta.Tools {
-				params := map[string]interface{}{}
-				if len(t.ParamsJson) > 0 {
-					_ = json.Unmarshal(t.ParamsJson, &params)
-				}
-				display := inst.Name
-				if display == "" {
-					display = "plugin"
-				}
-				result = append(result, map[string]interface{}{
-					"name":                t.Name,
-					"description":         t.Description,
-					"parameters":          params,
-					"active":              true,
-					"origin":              "plugin",
-					"origin_name":         display,
-					"origin_display_name": display,
-					"readonly":            false,
-				})
+			params := map[string]interface{}{}
+			if len(entry.Desc.ParamsJson) > 0 {
+				_ = json.Unmarshal(entry.Desc.ParamsJson, &params)
 			}
+			display := nameByID[entry.PluginID]
+			if display == "" {
+				display = "plugin"
+			}
+			result = append(result, map[string]interface{}{
+				"name":                entry.Desc.Name,
+				"description":         entry.Desc.Description,
+				"parameters":          params,
+				"active":              true,
+				"origin":              "plugin",
+				"origin_name":         display,
+				"origin_display_name": display,
+				"readonly":            false,
+			})
 		}
 	}
 	return result

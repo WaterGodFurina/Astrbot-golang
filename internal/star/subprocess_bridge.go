@@ -108,8 +108,10 @@ func currentActive(mgr *plugin.SubprocessManager, id string) *plugin.PluginInsta
 // legacy .so bridge, so RemovePluginCommands/Filters/Hooks clean them up.
 // Handlers resolve the live instance via mgr so idle-unloaded plugins are
 // lazily re-loaded on first use (embedded-friendly process pool semantics).
+// inst 可以是休眠占位实例（Client 为 nil）：handler 经 resolveActive 懒加载
+// 唤醒，不直接依赖 inst.Client，故仅需 Meta 即可完成注册。
 func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, inst *plugin.PluginInstance) {
-	if starMgr == nil || inst == nil || inst.Client == nil || inst.Meta == nil {
+	if starMgr == nil || inst == nil || inst.Meta == nil {
 		return
 	}
 	meta := inst.Meta
