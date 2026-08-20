@@ -11,6 +11,8 @@ import (
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
@@ -286,6 +288,19 @@ func starMetadataFromAny(v any) *StarMetadata {
 	}
 }
 
+// ChatLLMCmd 承载插件 ChatLLM 反向调用的完整参数（含多模态音频/工具/
+// 多轮上下文/指定 provider），由 Go SDK HostServiceHooks.ChatLLM hook
+// 从 sdkv1.ChatLLMRequest 解出后传给宿主回调。
+type ChatLLMCmd struct {
+	Prompt       string
+	SystemPrompt string
+	ImageURLs    []string
+	AudioURLs    []string
+	Tools        []map[string]interface{}
+	Contexts     []map[string]interface{}
+	ProviderID   string
+}
+
 // SetHostService installs the HostService hooks (reverse plugin -> host RPCs)
 // backed by the platform manager, the subprocess plugin manager (for config
 // reads/writes), a ChatLLM callback (for plugins calling the LLM directly),
@@ -293,7 +308,7 @@ func starMetadataFromAny(v any) *StarMetadata {
 // over star.Registry().All() via StarManagerLike，规避 star→plugin 导入环).
 // Call once at startup, after all managers exist and before plugins begin
 // handling messages.
-func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(prompt, systemPrompt string, imageURLs []string) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike) {
+func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(cmd ChatLLMCmd) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager) {
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
 		CallAction: func(platformID, api string, params map[string]any) (map[string]any, error) {
 			adapter := pm.Get(platformID)
@@ -367,11 +382,53 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			return subMgr.SaveConfig(subMgr.pluginConfigID(pluginName), cfg)
 		},
-		ChatLLM: func(prompt, systemPrompt string, imageURLs []string) (string, error) {
+		RegisterBridgeHook: func(pluginName, hookName string) error {
+			if subMgr == nil {
+				return fmt.Errorf("plugin manager not available")
+			}
+			id := subMgr.pluginConfigID(pluginName)
+			if inst := subMgr.Get(id); inst == nil {
+				// 找不到运行实例：不破坏插件启动，告警后忽略。
+				logger.I18nWarn("插件 %s 注册桥接钩子 %s 失败：实例不存在", pluginName, hookName)
+				return nil
+			}
+			subMgr.RegisterBridgeHook(id, hookName)
+			return nil
+		},
+		UnregisterBridgeHook: func(pluginName, hookName string) error {
+			if subMgr == nil {
+				return fmt.Errorf("plugin manager not available")
+			}
+			id := subMgr.pluginConfigID(pluginName)
+			if inst := subMgr.Get(id); inst == nil {
+				logger.I18nWarn("插件 %s 注销桥接钩子 %s 失败：实例不存在", pluginName, hookName)
+				return nil
+			}
+			subMgr.UnregisterBridgeHook(id, hookName)
+			return nil
+		},
+		ChatLLM: func(req *sdkv1.ChatLLMRequest) (string, error) {
 			if chatLLM == nil {
 				return "", fmt.Errorf("ChatLLM not configured on this host")
 			}
-			return chatLLM(prompt, systemPrompt, imageURLs)
+			cmd := ChatLLMCmd{
+				Prompt:       req.Prompt,
+				SystemPrompt: req.SystemPrompt,
+				ImageURLs:    req.ImageUrls,
+				AudioURLs:    req.AudioUrls,
+				ProviderID:   req.ProviderId,
+			}
+			if len(req.ToolsJson) > 0 {
+				if err := json.Unmarshal(req.ToolsJson, &cmd.Tools); err != nil {
+					return "", fmt.Errorf("ChatLLM tools_json 解析失败: %w", err)
+				}
+			}
+			if len(req.ContextsJson) > 0 {
+				if err := json.Unmarshal(req.ContextsJson, &cmd.Contexts); err != nil {
+					return "", fmt.Errorf("ChatLLM contexts_json 解析失败: %w", err)
+				}
+			}
+			return chatLLM(cmd)
 		},
 		React: func(platformID, sessionID, messageID, emoji string) error {
 			if pm == nil {
@@ -388,6 +445,37 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				return "", fmt.Errorf("t2i 渲染失败: %w", err)
 			}
 			return base64.StdEncoding.EncodeToString(data), nil
+		},
+		HtmlRender: func(template, data, options string) (string, error) {
+			// 优先远程 t2i：配置了 t2i_endpoint 时调用 RenderCustomTemplate
+			// （HTML 模板 + 数据 → 图片），失败回退本地 gg 渲染。
+			endpoint := ""
+			if cfgMgr != nil {
+				if cfg := cfgMgr.Get("default"); cfg != nil {
+					endpoint = cfg.GetString("t2i_endpoint")
+				}
+			}
+			if endpoint != "" {
+				img, err := t2i.RenderCustomTemplate(endpoint, template, data, options)
+				if err == nil {
+					return base64.StdEncoding.EncodeToString(img), nil
+				}
+				// 远程失败 → 回退本地渲染。
+				logger.Warn("html_render 远程 t2i 渲染失败（%v），回退本地渲染", err)
+			}
+			// 本地 gg 兜底：模板为空时用 data 作为渲染文本。
+			text := template
+			if text == "" {
+				text = data
+			}
+			if text == "" {
+				return "", fmt.Errorf("html_render: 模板与数据均为空，无法渲染")
+			}
+			img, err := t2i.RenderTextToPNG(text, t2i.ImageOptions{})
+			if err != nil {
+				return "", fmt.Errorf("html_render 本地渲染失败: %w", err)
+			}
+			return base64.StdEncoding.EncodeToString(img), nil
 		},
 
 		// ── 会话管理（对齐 Python conversation_manager）──

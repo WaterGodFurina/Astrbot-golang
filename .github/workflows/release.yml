@@ -40,7 +40,19 @@ jobs:
         env:
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
-        run: go mod tidy
+        run: |
+          # goproxy.cn 与 GitHub runner 偶发 HTTP/2 抖动（DATA after END_STREAM），
+          # 重试 5 次避免一次网络抖动废掉整个发布。
+          for i in 1 2 3 4 5; do
+            if go mod tidy; then
+              echo "go.sum 重建成功"
+              exit 0
+            fi
+            echo "go mod tidy 失败（第 $i/5 次，goproxy.cn 网络抖动），8s 后重试" >&2
+            sleep 8
+          done
+          echo "go mod tidy 重试 5 次仍失败" >&2
+          exit 1
 
       - name: 有变更则提交回仓库并同步 tag
         run: |
@@ -51,10 +63,10 @@ jobs:
             git checkout -B main
             git add go.mod go.sum
             git commit -m "chore: rebuild go.sum"
-            git push origin main --force
+            git push origin main --force-with-lease
             # 同步发布 tag，触发 tag 事件自动跑完整构建
             git tag -f 1.0.1 HEAD
-            git push origin 1.0.1 --force
+            git push origin 1.0.1 --force-with-lease
             echo "已提交新的 go.sum 并同步 tag"
           else
             echo "go.sum 与 goproxy.cn 一致，无变更"

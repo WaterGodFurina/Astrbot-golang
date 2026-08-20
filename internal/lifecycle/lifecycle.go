@@ -309,13 +309,13 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			out = append(out, m)
 		}
 		return out
-	}))
+	}), l.configMgr)
 	// 能力接线：先注入固定能力集（平台尚未加载，All() 为空），插件进程
 	// 启动时即带 ASTRBOT_HOST_CAPABILITIES 环境变量；loadPlatforms 完成后
 	// 再同步一次（含平台 ID），供后续懒加载/重载的插件使用。
 	l.syncHostCapabilities()
 	l.subPluginMgr.LoadInstalled(runCtx)
-	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.List())
+	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.RegisteredPlugins())
 
 	// (已舍弃 legacy .so 方案：不再加载/桥接 .so 插件)
 
@@ -522,13 +522,13 @@ func mustJSON(v interface{}) []byte {
 
 // chatLLMForPlugins backs sdk.Host.ChatLLM: calls the host's default chat LLM
 // provider with the given prompt + system prompt (+ optional image URLs).
-func (l *Lifecycle) chatLLMForPlugins(prompt, systemPrompt string, imageURLs []string) (string, error) {
+func (l *Lifecycle) chatLLMForPlugins(cmd plugin.ChatLLMCmd) (string, error) {
 	cfg := l.configMgr.Get("default")
 	cfgMap := map[string]interface{}{}
 	if cfg != nil {
 		cfgMap = cfg.All()
 	}
-	return pipeline.ChatLLMFromConfig(cfgMap, prompt, systemPrompt, imageURLs)
+	return pipeline.ChatLLMFromConfig(cfgMap, cmd.Prompt, cmd.SystemPrompt, cmd.ImageURLs, cmd.AudioURLs, cmd.Tools, cmd.Contexts, cmd.ProviderID)
 }
 
 // buildPipelineScheduler assembles the full 10-stage pipeline for a config ID
@@ -891,7 +891,9 @@ func (l *Lifecycle) RebridgePlugins() {
 	star.RemovePluginHooks(l.starMgr)
 	star.RemovePluginMetadata(l.starMgr)
 	if l.subPluginMgr != nil {
-		star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.List())
+		// RegisteredPlugins 含休眠插件（占位实例），Rebridge 后休眠插件的
+		// 命令/过滤器/钩子 handler 依然注册，触发时由 resolveActive 唤醒。
+		star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.RegisteredPlugins())
 	}
 }
 

@@ -63,7 +63,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(`{"greeting": "你好", "enabled": true}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	SetHostService(nil, m, nil, nil, nil, nil)
+	SetHostService(nil, m, nil, nil, nil, nil, nil)
 	// SetHostService 是包级全局（pluginsdk host hooks）：测试结束恢复为空，
 	// 避免污染后续测试（如 runtime_test 的 TestHostServiceReverseCalls）。
 	defer pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{})

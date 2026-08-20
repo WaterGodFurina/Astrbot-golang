@@ -47,7 +47,7 @@ func (c *KeywordChecker) Check(text string) (bool, string) {
 			continue
 		}
 		if strings.Contains(lower, strings.ToLower(kw)) {
-			return false, "keyword matched: " + kw
+			return false, "content blocked by keyword filter"
 		}
 	}
 	return true, ""

@@ -152,6 +152,14 @@ type SubprocessManager struct {
 	toolRegMu    sync.RWMutex
 	toolRegistry map[string]toolRegEntry
 
+	// handlerMetaMu 保护 handlerMeta：插件 id → Register 元数据（handler 表
+	// 快照）。插件闲置休眠时实例被移出 instances 表，但元数据仍保留，供
+	// RebridgePlugins 重建休眠插件的 star handler（命令/过滤器/钩子），保证
+	// 休眠插件指令在 Dashboard 可见、Rebridge 后依然注册、调用时自动唤醒；
+	// 仅真实卸载/禁用（unloadLocked notify=true）时清除该插件的条目。
+	handlerMetaMu sync.RWMutex
+	handlerMeta   map[string]*sdkv1.RegisterResponse
+
 	// pythonEnv 是 Python 插件子进程环境（解释器 + SDK 目录），首次启动
 	// Python 插件时惰性解析（可能创建 venv 安装依赖）。nil 表示尚未解析。
 	pythonEnv *pysdk.RuntimeEnv
@@ -195,6 +203,14 @@ type SubprocessManager struct {
 	// SessionWaitStage 查询消费（见 session_wait.go）。
 	sessionWaitMu  sync.Mutex
 	sessionWaitReg map[string]*sessionWaitEntry
+
+	// bridgeHooksMu 保护 bridgeHooks：实例 ID → 桥接钩子名集合。桥接钩子
+	// 由 Python SDK 的 botpy/telegram 兼容层经 HostService.RegisterBridgeHook
+	// 注册，宿主管线每收到入站消息时向注册过的插件推送序列化事件（见
+	// pipeline.dispatchBridgeHooks）。注册表为空是常见路径，管线快速返回，
+	// 不产生任何额外 RPC 开销。
+	bridgeHooksMu sync.RWMutex
+	bridgeHooks   map[string]map[string]struct{}
 }
 
 // Touch marks the plugin as active (called before/after every RPC into the
@@ -297,6 +313,100 @@ func (m *SubprocessManager) removePluginTools(id string) {
 	}
 }
 
+// RegisterBridgeHook 幂等注册实例 instID 的一个桥接钩子（botpy/telegram
+// 兼容层经 HostService.RegisterBridgeHook 调用）。注册后宿主管线每收到入站
+// 消息即向该钩子推送序列化事件。
+func (m *SubprocessManager) RegisterBridgeHook(instID, hookName string) {
+	if m == nil || instID == "" || hookName == "" {
+		return
+	}
+	m.bridgeHooksMu.Lock()
+	set := m.bridgeHooks[instID]
+	if set == nil {
+		set = make(map[string]struct{})
+		m.bridgeHooks[instID] = set
+	}
+	set[hookName] = struct{}{}
+	m.bridgeHooksMu.Unlock()
+}
+
+// UnregisterBridgeHook 幂等注销实例 instID 的一个桥接钩子；该实例无剩余
+// 钩子时移除其键。
+func (m *SubprocessManager) UnregisterBridgeHook(instID, hookName string) {
+	if m == nil || instID == "" || hookName == "" {
+		return
+	}
+	m.bridgeHooksMu.Lock()
+	if set := m.bridgeHooks[instID]; set != nil {
+		delete(set, hookName)
+		if len(set) == 0 {
+			delete(m.bridgeHooks, instID)
+		}
+	}
+	m.bridgeHooksMu.Unlock()
+}
+
+// BridgeHookSnapshot 返回桥接钩子注册表的快照（实例 ID → hook 名切片）。
+// 注册表为空时返回 nil，调用方可据此快速返回，零额外开销。
+func (m *SubprocessManager) BridgeHookSnapshot() map[string][]string {
+	if m == nil {
+		return nil
+	}
+	m.bridgeHooksMu.RLock()
+	defer m.bridgeHooksMu.RUnlock()
+	if len(m.bridgeHooks) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(m.bridgeHooks))
+	for instID, set := range m.bridgeHooks {
+		names := make([]string, 0, len(set))
+		for name := range set {
+			names = append(names, name)
+		}
+		out[instID] = names
+	}
+	return out
+}
+
+// removePluginBridgeHooks 清除某实例的全部桥接钩子条目（真实卸载/禁用时
+// 调用，防止向已终止进程推送）。
+func (m *SubprocessManager) removePluginBridgeHooks(id string) {
+	if m == nil || id == "" {
+		return
+	}
+	m.bridgeHooksMu.Lock()
+	delete(m.bridgeHooks, id)
+	m.bridgeHooksMu.Unlock()
+}
+
+// setHandlerMeta 记录插件 id → Register 元数据（startInstance 注册成功时
+// 调用；reload/唤醒/崩溃重启的新实例会覆盖旧条目）。meta 为 nil 时删除。
+func (m *SubprocessManager) setHandlerMeta(id string, meta *sdkv1.RegisterResponse) {
+	m.handlerMetaMu.Lock()
+	defer m.handlerMetaMu.Unlock()
+	if meta == nil {
+		delete(m.handlerMeta, id)
+		return
+	}
+	m.handlerMeta[id] = meta
+}
+
+// removeHandlerMeta 清除某插件的 handler 元数据（真实卸载/禁用时调用；
+// 闲置休眠保留，供 RebridgePlugins 重建休眠插件 handler）。
+func (m *SubprocessManager) removeHandlerMeta(id string) {
+	m.handlerMetaMu.Lock()
+	defer m.handlerMetaMu.Unlock()
+	delete(m.handlerMeta, id)
+}
+
+// HandlerMetaByID 返回插件 id 的 Register 元数据（含休眠插件），未加载过
+// 或已真实卸载返回 nil。
+func (m *SubprocessManager) HandlerMetaByID(id string) *sdkv1.RegisterResponse {
+	m.handlerMetaMu.RLock()
+	defer m.handlerMetaMu.RUnlock()
+	return m.handlerMeta[id]
+}
+
 // ToolOwner 返回注册了工具 name 的插件 id（running 或休眠中），未注册返回
 // ("", false)。
 func (m *SubprocessManager) ToolOwner(name string) (string, bool) {
@@ -335,7 +445,9 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 		failures:         make(map[string]error),
 		docFetchCache:    make(map[string]docCacheEntry),
 		toolRegistry:     make(map[string]toolRegEntry),
+		handlerMeta:      make(map[string]*sdkv1.RegisterResponse),
 		sessionWaitReg:   make(map[string]*sessionWaitEntry),
+		bridgeHooks:      make(map[string]map[string]struct{}),
 		logLevels:        newLogLevels(dataDir),
 		toolchain:        tc,
 		compiler:         NewCompiler(tc),
@@ -975,8 +1087,11 @@ func (m *SubprocessManager) unloadLocked(id string, notify bool) error {
 	// 的全部会话等待（休眠卸载与真实卸载都适用，防止向死进程反复推送）。
 	m.unregisterPluginWaits(inst.Name)
 	if notify {
-		// 真实卸载/禁用：工具注册表条目一并清除（休眠则保留，供按名唤醒）。
+		// 真实卸载/禁用：工具注册表条目与 handler 元数据一并清除（休眠则
+		// 保留，前者供按名唤醒、后者供 Rebridge 重建休眠插件 handler）。
 		m.removePluginTools(id)
+		m.removeHandlerMeta(id)
+		m.removePluginBridgeHooks(id)
 		logger.I18nInfo("插件 %s 已卸载", id)
 		m.notifyChanged()
 	} else {
@@ -1158,6 +1273,45 @@ func (m *SubprocessManager) List() []*PluginInstance {
 	return out
 }
 
+// RegisteredPlugins 返回所有已加载过（含闲置休眠）的插件：运行中的返回
+// 真实实例；休眠插件返回仅含 ID+Meta 的占位实例（Client 为 nil，由 star
+// handler 经 resolveActive 懒加载唤醒，不依赖 inst.Client）。供
+// RebridgePlugins 一次性重建全部插件 handler，保证休眠插件指令/过滤器/钩子
+// 在任意一次 Rebridge（启用/卸载/重载其它插件）后依然注册。
+func (m *SubprocessManager) RegisteredPlugins() []*PluginInstance {
+	m.mu.RLock()
+	running := make(map[string]*PluginInstance, len(m.instances))
+	for id, inst := range m.instances {
+		running[id] = inst
+	}
+	m.mu.RUnlock()
+
+	m.handlerMetaMu.RLock()
+	ids := make([]string, 0, len(m.handlerMeta))
+	for id := range m.handlerMeta {
+		ids = append(ids, id)
+	}
+	m.handlerMetaMu.RUnlock()
+
+	out := make([]*PluginInstance, 0, len(ids))
+	for _, id := range ids {
+		if inst, ok := running[id]; ok {
+			out = append(out, inst)
+			continue
+		}
+		meta := m.HandlerMetaByID(id)
+		if meta == nil {
+			continue
+		}
+		out = append(out, &PluginInstance{
+			ID:   id,
+			Name: meta.Name,
+			Meta: meta,
+		})
+	}
+	return out
+}
+
 // Clients returns the RPC client of every running plugin (for the star bridge).
 func (m *SubprocessManager) Clients() map[string]*pluginsdk.Client {
 	m.mu.RLock()
@@ -1197,6 +1351,9 @@ func (m *SubprocessManager) Shutdown() {
 	m.toolRegMu.Lock()
 	m.toolRegistry = make(map[string]toolRegEntry)
 	m.toolRegMu.Unlock()
+	m.bridgeHooksMu.Lock()
+	m.bridgeHooks = make(map[string]map[string]struct{})
+	m.bridgeHooksMu.Unlock()
 
 	for _, inst := range insts {
 		inst.mu.Lock()
@@ -1521,6 +1678,9 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		StartedAt: time.Now(),
 		owner:     m,
 	}
+	// 登记 handler 元数据：休眠后实例被移出 instances 表，但元数据保留，
+	// 供 RebridgePlugins 重建休眠插件的 star handler（命令/过滤器/钩子）。
+	m.setHandlerMeta(id, meta)
 	inst.Touch() // 新加载实例视为活跃，避免被闲置清扫立刻回收
 	// Register 快照里的工具（Go 插件在 Register 元数据中声明）先入注册表；
 	// Python 插件工具晚于 Register 注册，由首次 RefreshTools 回写。

@@ -21,6 +21,7 @@ import AboutPage from "@/views/AboutPage.vue";
 import { authApi, isLegacyFallbackError, statsApi, updatesApi } from "@/api/v1";
 import { getDesktopRuntimeInfo } from "@/utils/desktopRuntime";
 import ProviderModelMenu from "@/components/chat/ProviderModelMenu.vue";
+import ProxySelector from "@/components/shared/ProxySelector.vue";
 
 enableKatex();
 enableMermaid();
@@ -61,9 +62,7 @@ const showPreReleases = ref(
     ? false
     : localStorage.getItem(SHOW_PRE_RELEASES_KEY) === "true",
 );
-let updatingDashboardLoading = ref(false);
 let installLoading = ref(false);
-let showAdvancedUpdateSettings = ref(false);
 let restartWaiting = ref(false);
 let restartStartTime = ref<number | string | null>(null);
 let restartPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -172,6 +171,20 @@ const getSelectedGitHubProxy = () => {
     ? localStorage.getItem("selectedGitHubProxy") || ""
     : "";
 };
+
+// 切换版本前先弹出代理选择窗口，让用户自由决定是否走代理下载。
+let switchProxyDialog = ref(false);
+let pendingSwitchVersion = ref("");
+
+function openSwitchProxyDialog(tag: string) {
+  pendingSwitchVersion.value = tag;
+  switchProxyDialog.value = true;
+}
+
+function confirmSwitchVersion() {
+  switchProxyDialog.value = false;
+  switchVersion(pendingSwitchVersion.value);
+}
 
 // Release Notes Modal
 let releaseNotesDialog = ref(false);
@@ -848,28 +861,6 @@ async function switchVersion(targetVersion: string) {
     })
     .finally(() => {
       installLoading.value = false;
-    });
-}
-
-function updateDashboard() {
-  updatingDashboardLoading.value = true;
-  updateStatus.value = t("core.header.updateDialog.status.updating");
-  updatesApi
-    .dashboard()
-    .then((res) => {
-      updateStatus.value = res.data.message || "";
-      if (res.data.status == "ok") {
-        setTimeout(() => {
-          reloadWithCacheBuster();
-        }, 1000);
-      }
-    })
-    .catch((err) => {
-      console.log(err);
-      updateStatus.value = err;
-    })
-    .finally(() => {
-      updatingDashboardLoading.value = false;
     });
 }
 
@@ -1650,7 +1641,7 @@ onMounted(async () => {
                   v-slot:item.switch="{ item }: { item: { tag_name: string } }"
                 >
                   <v-btn
-                    @click="switchVersion(item.tag_name)"
+                    @click="openSwitchProxyDialog(item.tag_name)"
                     variant="tonal"
                     color="primary"
                     size="small"
@@ -1660,68 +1651,6 @@ onMounted(async () => {
                   </v-btn>
                 </template>
               </v-data-table>
-            </div>
-
-            <div v-if="!installLoading" class="advanced-update-settings mt-5">
-              <button
-                class="advanced-settings-toggle"
-                type="button"
-                @click="
-                  showAdvancedUpdateSettings = !showAdvancedUpdateSettings
-                "
-              >
-                <span>{{
-                  t("core.header.updateDialog.advancedSettings")
-                }}</span>
-                <v-icon
-                  :icon="
-                    showAdvancedUpdateSettings
-                      ? 'mdi-chevron-down'
-                      : 'mdi-chevron-right'
-                  "
-                  size="20"
-                ></v-icon>
-              </button>
-
-              <div
-                v-if="showAdvancedUpdateSettings"
-                class="dashboard-update-banner mt-3"
-              >
-                <div>
-                  <div class="font-weight-medium">
-                    {{ t("core.header.updateDialog.dashboardUpdate.title") }}
-                  </div>
-                  <div class="text-caption text-medium-emphasis">
-                    {{
-                      t(
-                        "core.header.updateDialog.dashboardUpdate.currentVersion",
-                      )
-                    }}
-                    {{ dashboardCurrentVersion }}
-                  </div>
-                  <div class="text-caption text-medium-emphasis">
-                    {{
-                      dashboardHasNewVersion
-                        ? t(
-                            "core.header.updateDialog.dashboardUpdate.hasNewVersion",
-                          )
-                        : t("core.header.updateDialog.dashboardUpdate.fallback")
-                    }}
-                  </div>
-                </div>
-                <v-btn
-                  color="primary"
-                  variant="tonal"
-                  @click="updateDashboard()"
-                  :loading="updatingDashboardLoading"
-                >
-                  {{
-                    t(
-                      "core.header.updateDialog.dashboardUpdate.downloadAndUpdate",
-                    )
-                  }}
-                </v-btn>
-              </div>
             </div>
           </v-container>
         </v-card-text>
@@ -1733,6 +1662,40 @@ onMounted(async () => {
             @click="updateStatusDialog = false"
           >
             {{ t("core.common.close") }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- 切换版本前选择是否走代理 -->
+    <v-dialog v-model="switchProxyDialog" max-width="460">
+      <v-card>
+        <v-card-title class="text-h3 pa-4 pb-0 pl-6">
+          {{ t("core.header.updateDialog.switchProxy.title") }}
+          <span class="font-weight-medium">{{ pendingSwitchVersion }}</span>
+        </v-card-title>
+        <v-card-text>
+          <div class="text-body-2 mb-3">
+            {{ t("core.header.updateDialog.switchProxy.hint") }}
+          </div>
+          <ProxySelector></ProxySelector>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer></v-spacer>
+          <v-btn
+            color="medium-emphasis"
+            variant="text"
+            @click="switchProxyDialog = false"
+          >
+            {{ t("core.common.cancel") }}
+          </v-btn>
+          <v-btn
+            color="primary"
+            variant="tonal"
+            :disabled="installLoading"
+            @click="confirmSwitchVersion"
+          >
+            {{ t("core.header.updateDialog.table.switch") }}
           </v-btn>
         </v-card-actions>
       </v-card>

@@ -81,13 +81,3 @@ func (r *Renderer) IsEnabled() bool {
 func (r *Renderer) SetEnabled(enabled bool) {
 	r.enabled = enabled
 }
-
-// RenderToHTML is a convenience function that renders text to HTML.
-func RenderToHTML(text string) string {
-	r := NewRenderer("")
-	html, err := r.Render(text, "default")
-	if err != nil {
-		return text
-	}
-	return html
-}

@@ -48,7 +48,8 @@ type PasswordManager struct {
 	passwordChangeRequired bool
 	jwtSecret              string
 	tokens                 map[string]bool // active session tokens
-	revoked                map[string]bool // JWT jti blacklist (in-memory)
+	revoked                map[string]bool // JWT jti blacklist (in-memory, persisted)
+	revokedPath            string          // 持久化 jti 黑名单的 JSON 文件路径
 	totpSecret             string          // TOTP 密钥（base32）
 	totpEnabled            bool            // 是否启用 TOTP 双重认证
 	totpRecoveryCodes      []string        // 恢复码的 SHA-256 哈希列表（不落明文）
@@ -178,6 +179,11 @@ func NewPasswordManager(configPath string) *PasswordManager {
 
 	// Generate or load JWT secret
 	pm.ensureJWTSecret()
+
+	// 持久化 jti 黑名单路径并加载历史撤销记录，避免进程重启后已撤销的
+	// token 重新有效。
+	pm.revokedPath = filepath.Join(filepath.Dir(configPath), "jwt_revoked.json")
+	pm.loadRevoked()
 
 	// 迁移清理：启动时把磁盘凭据键统一为 password=哈希（删除明文残留与
 	// 旧字段名），避免明文在磁盘上长期存在。
@@ -651,6 +657,61 @@ func (pm *PasswordManager) verifyJWT(token string) (string, string, bool) {
 	return claims.Username, claims.ID, true
 }
 
+// loadRevoked 从 revokedPath 加载持久化的 jti 黑名单。文件缺失或损坏时忽略
+// （损坏文件视为空黑名单），不阻断启动。
+func (pm *PasswordManager) loadRevoked() {
+	if pm.revokedPath == "" {
+		return
+	}
+	data, err := os.ReadFile(pm.revokedPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			authLogger.Warn("loadRevoked: read %s: %v", pm.revokedPath, err)
+		}
+		return
+	}
+	var revoked []string
+	if err := json.Unmarshal(data, &revoked); err != nil {
+		authLogger.Warn("loadRevoked: %s has invalid JSON (%v); ignoring", pm.revokedPath, err)
+		return
+	}
+	if len(revoked) == 0 {
+		return
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if pm.revoked == nil {
+		pm.revoked = make(map[string]bool, len(revoked))
+	}
+	for _, jti := range revoked {
+		if jti != "" {
+			pm.revoked[jti] = true
+		}
+	}
+}
+
+// saveRevoked 把内存中的 jti 黑名单原子写入 revokedPath。失败仅告警，不阻断
+// 撤销流程。
+func (pm *PasswordManager) saveRevoked() {
+	if pm.revokedPath == "" {
+		return
+	}
+	pm.mu.RLock()
+	revoked := make([]string, 0, len(pm.revoked))
+	for jti := range pm.revoked {
+		revoked = append(revoked, jti)
+	}
+	pm.mu.RUnlock()
+	data, err := json.Marshal(revoked)
+	if err != nil {
+		authLogger.Warn("saveRevoked: marshal: %v", err)
+		return
+	}
+	if err := writeConfigFile(pm.revokedPath, data); err != nil {
+		authLogger.Warn("saveRevoked: write %s: %v", pm.revokedPath, err)
+	}
+}
+
 // Login verifies a password and returns a signed session token.
 func (pm *PasswordManager) Login(password string) (string, error) {
 	if !pm.VerifyPassword(password) {
@@ -659,14 +720,13 @@ func (pm *PasswordManager) Login(password string) (string, error) {
 	return pm.IssueToken(pm.Username())
 }
 
-// Logout invalidates a token. Signed JWTs are revoked by jti blacklist (kept
-// in memory, cleared on restart); legacy in-memory tokens are dropped.
+// Logout invalidates a token. Signed JWTs are revoked by jti blacklist
+// (persisted so it survives restarts); legacy in-memory tokens are dropped.
 func (pm *PasswordManager) Logout(token string) {
 	// 解析 jti 需要读 JWTSecret（RLock），不能在持有写锁时调用（同一
 	// goroutine 写锁内再读锁会死锁），故先解析再上锁写黑名单。
 	_, jti, ok := pm.verifyJWT(token)
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	delete(pm.tokens, token)
 	if ok && jti != "" {
 		if pm.revoked == nil {
@@ -674,6 +734,8 @@ func (pm *PasswordManager) Logout(token string) {
 		}
 		pm.revoked[jti] = true
 	}
+	pm.mu.Unlock()
+	pm.saveRevoked()
 }
 
 // IsAuthenticated checks if a token is valid. It accepts both signed JWTs
