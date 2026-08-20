@@ -97,6 +97,10 @@
       "isLatest": "已经是最新版本了。",
       "fallback": "完整更新异常时，可仅重新下载 WebUI 作为兜底。",
       "downloadAndUpdate": "下载并更新"
+    },
+    "switchProxy": {
+      "title": "切换到版本 ",
+      "hint": "选择下载时是否走代理。当 GitHub 下载缓慢时建议使用代理。"
     }
   },
   "accountDialog": {

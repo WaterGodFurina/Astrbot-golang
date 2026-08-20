@@ -27,7 +27,6 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
-	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
 // 上传/解压大小上限：防止认证用户通过超大 multipart 上传或高压缩比 zip
@@ -5574,21 +5573,45 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []st
 	}
 	switch sub {
 	case "check":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"version":        version.Version,
-			"latest_version": version.Version,
-			"has_update":     false,
-		}))
+		proxy := r.URL.Query().Get("proxy")
+		writeJSON(w, http.StatusOK, apiOK(s.handleUpdateCheck(proxy)))
 	case "releases":
-		writeJSON(w, http.StatusOK, apiOK([]interface{}{}))
+		proxy := r.URL.Query().Get("proxy")
+		releases, err := s.handleUpdateReleases(proxy)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiOKMsg("获取发行版失败: "+err.Error(), []interface{}{}))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(releases))
 	case "progress":
+		progressID := r.URL.Query().Get("id")
+		if progressID == "" {
+			progressID = r.URL.Query().Get("progress_id")
+		}
+		st := s.updateProgressGet(progressID)
+		if st == nil {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"progress": 0,
+				"status":   "idle",
+			}))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"progress": 0,
-			"status":   "idle",
+			"progress": st.Percent,
+			"status":   st.Status,
+			"message":  st.Text,
 		}))
-	case "do", "core", "dashboard":
+	case "do", "core":
+		var body struct {
+			Version    string `json:"version"`
+			Proxy      string `json:"proxy"`
+			ProgressID string `json:"progress_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		s.doUpdateCore(w, body.ProgressID, body.Version, body.Proxy)
+	case "dashboard":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "update not supported in Go version",
+			"status": "error", "message": "Dashboard 前端随核心打包，无需单独更新",
 		}))
 	case "pip-install":
 		// Go 版：用 go install 安装 Go 库（原 Python 的 pip install）。
@@ -6209,14 +6232,22 @@ func (s *Server) handlePluginSources(w http.ResponseWriter, r *http.Request, par
 }
 
 // storedPluginSources 读回用户保存的自定义插件源（config plugin_sources）。
+// 兼容两种存储形态：磁盘 JSON 反序列化得到 []interface{}（启动加载），而
+// 运行时 setConfigData 保存的 custom 是 []map[string]interface{}——仅断言
+// []interface{} 会在保存后读取时失败，导致刚添加的插件源"不保存"。
 func (s *Server) storedPluginSources() []map[string]interface{} {
 	all := s.getConfigData("default")
-	raw, _ := all["plugin_sources"].([]interface{})
-	out := make([]map[string]interface{}, 0, len(raw))
-	for _, item := range raw {
-		if m, ok := item.(map[string]interface{}); ok {
-			out = append(out, m)
+	var out []map[string]interface{}
+	switch raw := all["plugin_sources"].(type) {
+	case []interface{}:
+		out = make([]map[string]interface{}, 0, len(raw))
+		for _, item := range raw {
+			if m, ok := item.(map[string]interface{}); ok {
+				out = append(out, m)
+			}
 		}
+	case []map[string]interface{}:
+		out = raw
 	}
 	return out
 }

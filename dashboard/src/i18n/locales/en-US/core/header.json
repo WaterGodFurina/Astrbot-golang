@@ -97,6 +97,10 @@
       "isLatest": "Already the latest version.",
       "fallback": "Use this to re-download the WebUI if the full update path fails.",
       "downloadAndUpdate": "Download and Update"
+    },
+    "switchProxy": {
+      "title": "Switch to version ",
+      "hint": "Choose whether to download through a proxy. This is recommended when the GitHub download is slow."
     }
   },
   "accountDialog": {

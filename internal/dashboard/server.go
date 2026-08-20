@@ -90,6 +90,9 @@ type Server struct {
 	// webhook entry (/api/v1/webhooks/platforms/{uuid}).
 	webhookMu       sync.RWMutex
 	webhookHandlers map[string]func(http.ResponseWriter, *http.Request)
+	// updateProgress 跟踪"切换版本"升级进度（keyed by progress_id），供前端轮询。
+	updateProgressMu sync.Mutex
+	updateProgress   map[string]*installStatus
 }
 
 // RegisterWebhook registers a unified-webhook callback by uuid.
@@ -227,6 +230,7 @@ func NewServer(port int, configPath string) *Server {
 	s.chat = newChatStore(filepath.Dir(configPath))
 	s.chatAdapter = newChatStreamAdapter()
 	s.mcp = newMCPStore(filepath.Dir(configPath))
+	s.updateProgress = make(map[string]*installStatus)
 	s.installProgress = make(map[string]*installStatus)
 	s.marketCache = make(map[string]*marketCacheEntry)
 	s.kbTasks = make(map[string]*kbUploadTask)
