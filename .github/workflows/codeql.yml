@@ -67,6 +67,22 @@ jobs:
     # - name: Setup runtime (example)
     #   uses: actions/setup-example@v1
 
+    # Go 语言：装匹配 go.mod 的 Go 版本，并用 goproxy.cn 预热模块缓存。
+    # go-querystruct v1.0.0 是歧义模块（tag 被重发、多哈希），CodeQL tracer
+    # 若重新下载会与 go.sum 校验和不匹配；预热缓存后 tracer 直接用缓存不下载。
+    - name: 设置 Go 版本
+      if: matrix.language == 'go'
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: go.mod
+    - name: 预热模块缓存（CodeQL 用）
+      if: matrix.language == 'go'
+      env:
+        GOPROXY: https://goproxy.cn,direct
+        GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+        GOFLAGS: -mod=mod
+      run: go mod download all
+
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
       uses: github/codeql-action/init@v4

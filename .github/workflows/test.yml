@@ -307,10 +307,12 @@ jobs:
           GOFLAGS: -mod=mod
         run: go mod tidy
 
-      - name: 固定 Go 环境（CodeQL tracer 的 go 进程不继承 step env，须经 GOENV 文件）
+      - name: 预热模块缓存（tracer 用缓存不再下载，避免 go-querystruct 歧义模块校验和不匹配）
         run: |
           go env -w GOPROXY="https://goproxy.cn,direct"
           go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
+          go env -w GOFLAGS="-mod=mod"
+          go mod download all
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
