@@ -75,9 +75,9 @@ onMounted(() => {
       const response = await statsApi.version();
       if (response.data.status === "ok") {
         commonStore.setAstrBotVersion(
-          response.data.data?.version,
-          response.data.data?.dashboard_version,
-          response.data.data?.python_version,
+          String(response.data.data?.version || ""),
+          String(response.data.data?.dashboard_version || ""),
+          String(response.data.data?.python_version || ""),
         );
       }
     } catch (error) {
