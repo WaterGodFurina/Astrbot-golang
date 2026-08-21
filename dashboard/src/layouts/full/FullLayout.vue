@@ -78,6 +78,7 @@ onMounted(() => {
           String(response.data.data?.version || ""),
           String(response.data.data?.dashboard_version || ""),
           String(response.data.data?.python_version || ""),
+          String(response.data.data?.go_version || ""),
         );
       }
     } catch (error) {

@@ -638,7 +638,14 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		return nil, fmt.Errorf("plugin %s already installed (reload or uninstall first)", id)
 	}
 
-	srcDir, err := m.fetchSource(ctx, id, source)
+	// 优先使用市场提供的 download_url（zip 直链）下载；否则回退 source
+	// （git 仓库 URL 走 git clone）。对齐 Python updater：有 download_url 时
+	// 直接下载安装包，避免在无 git 环境（如 Termux/Android）下克隆失败。
+	fetchSource := source
+	if url := strings.TrimSpace(opts.DownloadURL); url != "" && isArchiveURL(url) {
+		fetchSource = url
+	}
+	srcDir, err := m.fetchSource(ctx, id, fetchSource)
 	if err != nil {
 		return nil, err
 	}

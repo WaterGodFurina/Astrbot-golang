@@ -8,6 +8,6 @@ package version
 var Version = "dev"
 
 // PythonVersion is the AstrBot (Python) version this Go port tracks. It
-// defaults to 4.27.3 and can be customized at build time via -ldflags or
+// defaults to 4.27.4 and can be customized at build time via -ldflags or
 // through the workflow's python_version input.
-var PythonVersion = "4.27.3"
+var PythonVersion = "4.27.4"
