@@ -19,7 +19,7 @@ import (
 // MiMoSTTApiSource transcribes audio into text via the Xiaomi MiMo
 // /chat/completions endpoint with input_audio content.
 type MiMoSTTApiSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiKey  string
 	apiBase string
 	client  *http.Client

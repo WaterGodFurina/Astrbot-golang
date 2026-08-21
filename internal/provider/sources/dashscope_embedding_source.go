@@ -19,7 +19,7 @@ import (
 // (DashScope) native text-embedding endpoint.
 // Ported from astrbot/core/provider/sources/dashscope_embedding_source.py
 type DashScopeEmbeddingSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase string
 	apiKey  string
 	model   string

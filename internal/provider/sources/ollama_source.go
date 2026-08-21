@@ -17,7 +17,7 @@ import (
 
 // OllamaSource is an Ollama local LLM provider.
 type OllamaSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase      string
 	client       *http.Client
 	streamClient *http.Client

@@ -21,7 +21,7 @@ import (
 // VolcengineTTSSource synthesizes speech via the Volcengine (火山引擎)
 // openspeech TTS API and saves the result to a local mp3 file.
 type VolcengineTTSSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiKey     string
 	appid      string
 	cluster    string

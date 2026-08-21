@@ -17,7 +17,7 @@ import (
 // endpoint.
 // Ported from astrbot/core/provider/sources/ollama_embedding_source.py
 type OllamaEmbeddingSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	baseURL string
 	model   string
 	client  *http.Client

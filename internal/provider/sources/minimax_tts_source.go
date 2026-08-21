@@ -20,7 +20,7 @@ import (
 // (streaming SSE response carrying hex-encoded audio).
 // Ported from astrbot/core/provider/sources/minimax_tts_api_source.py
 type MiniMaxTTSSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	client         *http.Client
 	apiKey         string
 	apiBase        string

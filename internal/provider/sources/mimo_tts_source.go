@@ -21,7 +21,7 @@ import (
 // MiMoTTSApiSource synthesizes speech via the Xiaomi MiMo /chat/completions
 // endpoint and saves the returned base64 audio to a local file.
 type MiMoTTSApiSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiKey      string
 	apiBase     string
 	voice       string

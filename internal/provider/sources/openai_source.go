@@ -22,7 +22,7 @@ const maxToolCallIndex = 64
 // OpenAISource is an OpenAI-compatible chat provider.
 // Ported from astrbot/core/provider/sources/openai_source.py
 type OpenAISource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase      string
 	apiKey       string
 	client       *http.Client

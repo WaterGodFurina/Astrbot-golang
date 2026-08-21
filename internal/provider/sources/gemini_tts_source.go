@@ -24,7 +24,7 @@ import (
 // API (response_modalities=["AUDIO"]) and writes the returned PCM bytes into
 // a local wav file.
 type GeminiTTSSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiKey    string
 	apiBase   string
 	model     string
