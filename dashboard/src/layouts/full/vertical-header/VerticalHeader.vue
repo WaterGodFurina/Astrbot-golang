@@ -465,7 +465,7 @@ function getVersion() {
         res.data.data.version || "",
         res.data.data?.dashboard_version || undefined,
         res.data.data?.python_version || undefined,
-        res.data.data?.go_version || undefined,
+        String(res.data.data?.go_version || ""),
       );
       const change_pwd_hint = res.data.data?.change_pwd_hint;
       const md5_pwd_hint = res.data.data?.md5_pwd_hint;
