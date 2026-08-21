@@ -184,7 +184,7 @@ func TestResolveLanguage(t *testing.T) {
 // CCompilerPromptError (either choose_compiler when GCC is present, or
 // download_clang when not) instead of silently succeeding.
 func TestEnsureCCompilerPromptsWithoutChoice(t *testing.T) {
-	_, _, err := ensureCCompiler(context.Background(), InstallOptions{})
+	_, _, err := ensureCCompiler(context.Background(), InstallOptions{GoChoice: "download"})
 	var promptErr *CCompilerPromptError
 	if !errors.As(err, &promptErr) {
 		t.Fatalf("expected *CCompilerPromptError, got %T: %v", err, err)
@@ -303,7 +303,7 @@ func main() { sdk.Serve(&sdk.Plugin{Name: "cgoplugin"}) }
 
 	// #cgo CFLAGS 触发静态扫描风险门（编译期可执行任意命令）：未确认风险时
 	// 返回 *RiskError，即使插件声明了 cgo。
-	_, err := m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{})
+	_, err := m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{GoChoice: "download"})
 	var riskErr *RiskError
 	if !errors.As(err, &riskErr) {
 		t.Fatalf("expected *RiskError for cgo plugin before IgnoreRisk, got %T: %v", err, err)
@@ -313,7 +313,7 @@ func main() { sdk.Serve(&sdk.Plugin{Name: "cgoplugin"}) }
 	}
 
 	// 用户确认风险（IgnoreRisk）后，进入 C 编译器选择流程。
-	_, err = m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{IgnoreRisk: true})
+	_, err = m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{IgnoreRisk: true, GoChoice: "download"})
 	var promptErr *CCompilerPromptError
 	if !errors.As(err, &promptErr) {
 		t.Fatalf("expected *CCompilerPromptError for cgo plugin, got %T: %v", err, err)
@@ -323,7 +323,7 @@ func main() { sdk.Serve(&sdk.Plugin{Name: "cgoplugin"}) }
 	}
 
 	// A cancelled choice terminates install with a clear error.
-	_, err = m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{IgnoreRisk: true, CCChoice: string(CCChoiceCancel)})
+	_, err = m.InstallFromSource(ctx, "cgoplugin", src, InstallOptions{IgnoreRisk: true, CCChoice: string(CCChoiceCancel), GoChoice: "download"})
 	if err == nil || !strings.Contains(err.Error(), "取消") {
 		t.Fatalf("expected cancel error, got %v", err)
 	}
@@ -467,7 +467,7 @@ func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
 
 	// The stale root (with its lock) must be discarded before download starts,
 	// then a fresh zig is downloaded and installed.
-	cc, cxx, err := downloadAndSetupClang(context.Background(), InstallOptions{})
+	cc, cxx, err := downloadAndSetupClang(context.Background(), InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("downloadAndSetupClang: %v", err)
 	}
@@ -504,7 +504,7 @@ func TestClangExtractFailureKeepsLockAndClearsCache(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("ASTRBOT_CLANG_MIRROR", srv.URL)
 
-	_, _, err = downloadAndSetupClang(context.Background(), InstallOptions{})
+	_, _, err = downloadAndSetupClang(context.Background(), InstallOptions{GoChoice: "download"})
 	if err == nil {
 		t.Fatal("expected extract failure for a corrupt archive")
 	}

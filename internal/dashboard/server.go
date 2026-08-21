@@ -687,6 +687,7 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 			"version":           version.Version,
 			"dashboard_version": version.Version,
 			"python_version":    version.PythonVersion,
+			"go_version":        runtime.Version(),
 		}))
 	case "versions":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{

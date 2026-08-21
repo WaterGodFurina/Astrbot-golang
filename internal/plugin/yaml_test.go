@@ -19,7 +19,7 @@ func TestInstallPythonPluginYAMLMetadata(t *testing.T) {
 	m.MaxPort = 50400
 	t.Cleanup(m.Shutdown)
 
-	inst, err := m.InstallFromSource(context.Background(), "yaml_demo", filepath.Join("testdata", "yaml_plugin"), InstallOptions{})
+	inst, err := m.InstallFromSource(context.Background(), "yaml_demo", filepath.Join("testdata", "yaml_plugin"), InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}

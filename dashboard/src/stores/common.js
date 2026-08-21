@@ -14,6 +14,7 @@ export const useCommonStore = defineStore("common", {
     astrbotVersion: "",
     dashboardVersion: "",
     pythonVersion: "",
+    goVersion: "",
 
     pluginMarketData: [],
     pluginMarketDataBySource: {},
@@ -158,10 +159,11 @@ export const useCommonStore = defineStore("common", {
       this.startTime = res.data.data.start_time;
       return this.startTime;
     },
-    setAstrBotVersion(version, dashboardVersion = "", pythonVersion = "") {
+    setAstrBotVersion(version, dashboardVersion = "", pythonVersion = "", goVersion = "") {
       this.astrbotVersion = String(version || "").replace(/^v/i, "");
       this.dashboardVersion = String(dashboardVersion || "");
       this.pythonVersion = String(pythonVersion || "").replace(/^v/i, "");
+      this.goVersion = String(goVersion || "").replace(/^go/i, "");
     },
     async fetchAstrBotVersion(force = false) {
       if (!force && this.astrbotVersion) {
@@ -173,6 +175,7 @@ export const useCommonStore = defineStore("common", {
         data.version,
         data.dashboard_version,
         data.python_version,
+        data.go_version,
       );
       return this.astrbotVersion;
     },

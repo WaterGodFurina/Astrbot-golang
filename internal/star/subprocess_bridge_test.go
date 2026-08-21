@@ -174,7 +174,7 @@ func TestIdleSleepKeepsHandlersAndWakesUp(t *testing.T) {
 	ctx := context.Background()
 	// 用 InstallFromSource（写 manifest）——懒加载 EnsureLoaded 需要从
 	// manifest 读取二进制路径。
-	inst, err := m.InstallFromSource(ctx, "sleepy", filepath.Join("..", "plugin", "testdata", "plugin"), plugin.InstallOptions{})
+	inst, err := m.InstallFromSource(ctx, "sleepy", filepath.Join("..", "plugin", "testdata", "plugin"), plugin.InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}

@@ -1346,6 +1346,16 @@ const updateDialogPluginLogo = computed(() => {
             {{ tm("messages.enterJsonUrl") }}
           </div>
 
+          <v-radio-group
+            v-model="sourceType"
+            class="mt-2"
+            hide-details
+            density="compact"
+          >
+            <v-radio label="Golang" value="golang"></v-radio>
+            <v-radio label="Python" value="python"></v-radio>
+          </v-radio-group>
+
           <v-alert
             v-if="sourceResolveVisible && sourceResolveCurrent"
             type="success"

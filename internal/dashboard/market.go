@@ -41,8 +41,8 @@ const (
 // falls back to defaultPluginMarketURL).
 func defaultPluginSources() []map[string]interface{} {
 	return []map[string]interface{}{
-		{"name": "默认golang插件源", "url": "", "builtin": true},
-		{"name": "默认Python插件源", "url": defaultPythonMarketURL, "builtin": true},
+		{"name": "默认golang插件源", "url": "", "builtin": true, "type": "golang"},
+		{"name": "默认Python插件源", "url": defaultPythonMarketURL, "builtin": true, "type": "python"},
 	}
 }
 

@@ -264,6 +264,7 @@ export const useExtensionPage = (initialTab = "installed") => {
   const showSourceManagerDialog = ref(false);
   const sourceName = ref("");
   const sourceUrl = ref("");
+  const sourceType = ref("golang");
   const sourceResolving = ref(false);
   const sourceResolvedUrl = ref("");
   const sourceResolveVisible = ref(false);
@@ -768,6 +769,18 @@ export const useExtensionPage = (initialTab = "installed") => {
     String(value || "")
       .trim()
       .replace(/\/+$/, "");
+
+  // 根据源 URL 解析市场源类型（"golang"/"python"）。url 为空 = 内置 golang
+  // 默认源；否则匹配自定义源/内置源中的 type 字段。
+  const getSourceTypeForUrl = (sourceUrl) => {
+    const url = normalizeRegistryUrl(sourceUrl || "");
+    if (!url) return "golang";
+    const matched = (customSources.value || []).find(
+      (s) => normalizeRegistryUrl(s.url) === url,
+    );
+    const type = String(matched?.type || "").toLowerCase();
+    return type === "python" ? "python" : "golang";
+  };
 
   const getMarketPluginId = (plugin) => {
     return String(plugin?.market_plugin_id || "").trim();
@@ -1499,6 +1512,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     originalSourceUrl.value = "";
     sourceName.value = "";
     sourceUrl.value = "";
+    sourceType.value = "golang";
     sourceResolvedUrl.value = "";
     sourceResolveVisible.value = false;
     sourceMarketMeta.value = null;
@@ -1773,6 +1787,8 @@ export const useExtensionPage = (initialTab = "installed") => {
     originalSourceUrl.value = source.url;
     sourceName.value = source.name;
     sourceUrl.value = source.url;
+    sourceType.value =
+      String(source.type || "").toLowerCase() === "python" ? "python" : "golang";
     sourceResolvedUrl.value = source.url;
     sourceResolveVisible.value = false;
     sourceMarketMeta.value = null;
@@ -1867,6 +1883,18 @@ export const useExtensionPage = (initialTab = "installed") => {
     }
   };
 
+  // 自定义源名追加源类型后缀（-Golang / -Python）。仅自定义源加；若名称
+  // 已包含对应后缀则不重复追加。
+  const withSourceTypeSuffix = (name, type) => {
+    const trimmed = String(name || "").trim();
+    if (!trimmed) return trimmed;
+    const suffix = type === "python" ? "-Python" : "-Golang";
+    if (new RegExp(`-${type === "python" ? "Python" : "Golang"}$`, "i").test(trimmed)) {
+      return trimmed;
+    }
+    return `${trimmed}${suffix}`;
+  };
+
   const saveCustomSource = () => {
     const normalizedUrl = sourceUrl.value.trim();
 
@@ -1901,8 +1929,9 @@ export const useExtensionPage = (initialTab = "installed") => {
       );
       if (index !== -1) {
         customSources.value[index] = {
-          name: sourceName.value.trim(),
+          name: withSourceTypeSuffix(sourceName.value.trim(), sourceType.value),
           url: normalizedRegistryUrl,
+          type: sourceType.value,
         };
 
         if (
@@ -1925,8 +1954,9 @@ export const useExtensionPage = (initialTab = "installed") => {
       }
 
       customSources.value.push({
-        name: sourceName.value.trim(),
+        name: withSourceTypeSuffix(sourceName.value.trim(), sourceType.value),
         url: normalizedRegistryUrl,
+        type: sourceType.value,
       });
     }
 
@@ -1941,6 +1971,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     // 重置表单
     sourceName.value = "";
     sourceUrl.value = "";
+    sourceType.value = "golang";
     sourceResolvedUrl.value = "";
     sourceResolveVisible.value = false;
     sourceMarketMeta.value = null;
@@ -2169,7 +2200,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     return { checked: true, supported: true, message: "" };
   };
 
-  const annotateMarketEnvSupport = (plugin) => {
+  const annotateMarketEnvSupport = (plugin, sourceType = "") => {
     plugin.env_supported = true;
     plugin.env_support_message = "";
     const runtime = plugin?.runtime;
@@ -2178,7 +2209,33 @@ export const useExtensionPage = (initialTab = "installed") => {
       return;
     }
 
-    // 优先按 Python 插件的 python_version 检查宿主 Python 版本
+    // 按当前市场源类型选择检测字段：golang 源用 go_version/sdk_version，
+    // Python 源用 python_version；源类型未知时按插件 runtime 字段自适应。
+    if (sourceType === "golang") {
+      const goReq = String(
+        runtime.go_version || runtime.sdk_version || "",
+      ).trim();
+      if (!goReq) return;
+      const hostGo = commonStore.goVersion || "";
+      if (!hostGo) return;
+      const result = checkRuntimeVersionSupport(goReq, hostGo);
+      plugin.env_supported = result.supported;
+      plugin.env_support_message = result.message;
+      return;
+    }
+
+    if (sourceType === "python") {
+      const pythonReq = String(runtime.python_version || "").trim();
+      if (!pythonReq) return;
+      const hostPython = commonStore.pythonVersion || "";
+      if (!hostPython) return;
+      const result = checkRuntimeVersionSupport(pythonReq, hostPython);
+      plugin.env_supported = result.supported;
+      plugin.env_support_message = result.message;
+      return;
+    }
+
+    // 源类型未知：优先按 Python 插件的 python_version 检查宿主 Python 版本
     const pythonReq = String(runtime.python_version || "").trim();
     if (pythonReq) {
       const hostPython = commonStore.pythonVersion || "";
@@ -2189,8 +2246,8 @@ export const useExtensionPage = (initialTab = "installed") => {
       return;
     }
 
-    // 回退：Go 插件的 go_version / sdk_version。后端当前未暴露宿主 Go
-    // 版本，无宿主版本可比对时跳过，避免误报不兼容。
+    // 回退：Go 插件的 go_version / sdk_version。后端未暴露宿主 Go 版本时
+    // 无宿主版本可比对则跳过，避免误报不兼容。
     const goReq = String(
       runtime.go_version || runtime.sdk_version || "",
     ).trim();
@@ -2203,9 +2260,13 @@ export const useExtensionPage = (initialTab = "installed") => {
   };
 
   const annotateMarketVersionSupport = async () => {
+    // 市场插件的 astrbot_version 约束是对齐的 Python 版本号（如 >=4.16），
+    // 必须用宿主对齐的 Python 版本（pythonVersion，默认 4.27.4）比对，
+    // 而不是 Go 版发布版本号（astrbotVersion，如 1.1.3）。
     const currentVersion =
-      commonStore.astrbotVersion ||
+      commonStore.pythonVersion ||
       (await commonStore.fetchAstrBotVersion().catch(() => ""));
+    const sourceType = getSourceTypeForUrl(selectedSource.value);
     pluginMarketData.value.forEach((plugin) => {
       const result = checkAstrBotVersionSupport(
         plugin?.astrbot_version,
@@ -2214,7 +2275,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       plugin.astrbot_support_checked = result.checked;
       plugin.astrbot_version_supported = result.supported;
       plugin.astrbot_support_message = result.message;
-      annotateMarketEnvSupport(plugin);
+      annotateMarketEnvSupport(plugin, sourceType);
     });
   };
 
@@ -2880,6 +2941,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     showSourceManagerDialog,
     sourceName,
     sourceUrl,
+    sourceType,
     sourceResolving,
     sourceResolveVisible,
     sourceMarketMeta,

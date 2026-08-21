@@ -247,7 +247,7 @@ func TestLoadInstalledFromManifest(t *testing.T) {
 	ctx := context.Background()
 
 	m1 := NewSubprocessManager(toolchain.New(), dir)
-	inst, err := m1.InstallFromSource(ctx, "persist", filepath.Join("testdata", "plugin"), InstallOptions{})
+	inst, err := m1.InstallFromSource(ctx, "persist", filepath.Join("testdata", "plugin"), InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestInstallFromLocalDir(t *testing.T) {
 	ctx := context.Background()
 
 	src := filepath.Join("testdata", "plugin")
-	inst, err := m.InstallFromSource(ctx, "installed", src, InstallOptions{})
+	inst, err := m.InstallFromSource(ctx, "installed", src, InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
@@ -471,7 +471,7 @@ var _ = syscall.Syscall
 	}
 
 	// Without IgnoreRisk the install is blocked with the offending locations.
-	_, err := m.InstallFromSource(ctx, "evil", src, InstallOptions{})
+	_, err := m.InstallFromSource(ctx, "evil", src, InstallOptions{GoChoice: "download"})
 	if err == nil {
 		t.Fatal("expected install to be blocked by the static scan")
 	}
@@ -498,7 +498,7 @@ var _ = syscall.Syscall
 	}
 
 	// With IgnoreRisk the same plugin installs and loads.
-	inst, err := m.InstallFromSource(ctx, "evil", src, InstallOptions{IgnoreRisk: true})
+	inst, err := m.InstallFromSource(ctx, "evil", src, InstallOptions{IgnoreRisk: true, GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("IgnoreRisk install: %v", err)
 	}
@@ -557,6 +557,7 @@ func TestInstallSourceMetadata(t *testing.T) {
 
 	src := filepath.Join("testdata", "plugin")
 	inst, err := m.InstallFromSource(ctx, "meta", src, InstallOptions{
+		GoChoice:       "download",
 		InstallMethod:  "market",
 		RegistryURL:    "https://astrbotgomarket.350430.xyz/package.json",
 		RegistryName:   "AstrBot-Go 插件市场",
@@ -666,7 +667,7 @@ func main() { sdk.Serve(&sdk.Plugin{Name: "docplugin"}) }
 		t.Fatal(err)
 	}
 
-	inst, err := m.InstallFromSource(ctx, "docplugin", src, InstallOptions{})
+	inst, err := m.InstallFromSource(ctx, "docplugin", src, InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
@@ -745,7 +746,7 @@ func TestUninstallSerializesWithInstallTail(t *testing.T) {
 	ctx := context.Background()
 	src := filepath.Join("testdata", "plugin")
 
-	if _, err := m.InstallFromSource(ctx, "racey", src, InstallOptions{}); err != nil {
+	if _, err := m.InstallFromSource(ctx, "racey", src, InstallOptions{GoChoice: "download"}); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	defer func() { _ = m.Unload("racey") }()
@@ -791,7 +792,7 @@ func TestBindSourceAndReinstall(t *testing.T) {
 	ctx := context.Background()
 
 	src := filepath.Join("testdata", "plugin")
-	inst1, err := m.InstallFromSource(ctx, "reinst", src, InstallOptions{})
+	inst1, err := m.InstallFromSource(ctx, "reinst", src, InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
@@ -813,7 +814,7 @@ func TestBindSourceAndReinstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Reinstall from persisted source (local dir source is carried in manifest).
-	inst2, err := m.ReinstallSource(ctx, inst1.ID, InstallOptions{})
+	inst2, err := m.ReinstallSource(ctx, inst1.ID, InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("ReinstallSource: %v", err)
 	}
@@ -891,7 +892,7 @@ func TestIdleUnloadAndLazyReload(t *testing.T) {
 	requirePlugin(t)
 	m := newTestManager(t)
 
-	inst, err := m.InstallFromSource(context.Background(), "pooled", filepath.Join("testdata", "plugin"), InstallOptions{})
+	inst, err := m.InstallFromSource(context.Background(), "pooled", filepath.Join("testdata", "plugin"), InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
@@ -932,7 +933,7 @@ func TestSweepSkipsActivePlugins(t *testing.T) {
 	m := newTestManager(t)
 	m.SetIdleUnload(10 * time.Millisecond)
 
-	inst, err := m.InstallFromSource(context.Background(), "pooled2", filepath.Join("testdata", "plugin"), InstallOptions{})
+	inst, err := m.InstallFromSource(context.Background(), "pooled2", filepath.Join("testdata", "plugin"), InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
@@ -953,7 +954,7 @@ func TestIdleUnloadBlockedKeepsPluginResident(t *testing.T) {
 	m := newTestManager(t)
 	m.SetIdleUnload(10 * time.Millisecond)
 
-	inst, err := m.InstallFromSource(context.Background(), "resident", filepath.Join("testdata", "plugin"), InstallOptions{})
+	inst, err := m.InstallFromSource(context.Background(), "resident", filepath.Join("testdata", "plugin"), InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}

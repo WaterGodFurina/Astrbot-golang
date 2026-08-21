@@ -115,6 +115,13 @@ func (m *SubprocessManager) ensureGoInstallReady(ctx context.Context, opts Insta
 			toolchainOK = true
 		}
 	}
+	// 无 bundled 工具链时（测试/未配置 bundled 的环境），系统 go 也算可用——
+	// 编译器 Prepare/Build 本就支持系统 go。
+	if !toolchainOK {
+		if _, err := exec.LookPath("go"); err == nil {
+			toolchainOK = true
+		}
+	}
 	sdkOK := m.compiler != nil && m.compiler.sdkDirProbe()
 	if toolchainOK && sdkOK {
 		return nil
@@ -145,15 +152,26 @@ func (m *SubprocessManager) ensureGoInstallReady(ctx context.Context, opts Insta
 // The SDK download targets the default module cache (no GOPATH override), the
 // same location findSDKDirWithGo reads.
 func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptions) error {
-	if m.toolchain == nil || m.compiler == nil {
-		return errors.New("Go 插件安装不可用（工具链未初始化）")
+	if m.compiler == nil {
+		return errors.New("Go 插件安装不可用（编译配置未初始化）")
 	}
-	if opts.Stage != nil {
-		opts.Stage("下载 Go 工具链…")
-	}
-	goBin, err := m.toolchain.EnsureWithProgress(opts.Progress)
-	if err != nil {
-		return err
+	var goBin string
+	if m.toolchain != nil {
+		if opts.Stage != nil {
+			opts.Stage("下载 Go 工具链…")
+		}
+		b, err := m.toolchain.EnsureWithProgress(opts.Progress)
+		if err != nil {
+			return err
+		}
+		goBin = b
+	} else {
+		// 无 bundled 工具链：用系统 go 拉 SDK（测试/无 bundled 环境）。
+		b, err := exec.LookPath("go")
+		if err != nil {
+			return errors.New("Go 插件安装不可用（无 bundled 工具链且 PATH 无 go）")
+		}
+		goBin = b
 	}
 	// SDK 已可 resolve（ASTRBOT_GO_SDK / 本地 replace / 模块缓存）→ 无需下载。
 	if _, err := findSDKDirWithGo(goBin); err == nil {

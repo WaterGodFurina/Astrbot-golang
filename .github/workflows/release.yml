@@ -12,7 +12,7 @@ on:
         required: false
         default: ''
       python_version:
-        description: 'AstrBot（Python）源版本号（跟随的 Python 版本，留空 = 4.27.3）'
+        description: 'AstrBot（Python）源版本号（跟随的 Python 版本，留空 = 4.27.4）'
         required: false
         default: ''
   push:
@@ -98,7 +98,7 @@ jobs:
       - name: 读取 AstrBot（Python）源版本
         id: pymeta
         run: |
-          ver="${PYTHON_VERSION:-4.27.3}"
+          ver="${PYTHON_VERSION:-4.27.4}"
           echo "python_version=${ver}" >> "$GITHUB_OUTPUT"
           echo "AstrBot Python 源版本: ${ver}"
         env:

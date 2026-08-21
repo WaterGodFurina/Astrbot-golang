@@ -20,7 +20,7 @@ func TestPythonPluginPackageRelativeImport(t *testing.T) {
 
 	inst, err := m.InstallFromSource(
 		context.Background(), "pkg_plugin",
-		filepath.Join("testdata", "pkg_plugin"), InstallOptions{},
+		filepath.Join("testdata", "pkg_plugin"), InstallOptions{PythonChoice: "download"},
 	)
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
