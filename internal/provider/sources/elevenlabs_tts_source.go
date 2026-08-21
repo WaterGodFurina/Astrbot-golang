@@ -23,7 +23,7 @@ const (
 // /v1/text-to-speech/{voice_id} endpoint.
 // Ported from astrbot/core/provider/sources/elevenlabs_tts_source.py
 type ElevenLabsTTSSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	client       *http.Client
 	apiKey       string
 	apiBase      string

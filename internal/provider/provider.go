@@ -160,9 +160,9 @@ func (b *BaseProvider) Test(ctx context.Context) error {
 }
 
 // NewBaseProvider creates a base provider.
-func NewBaseProvider(config, settings map[string]interface{}) BaseProvider {
+func NewBaseProvider(config, settings map[string]interface{}) *BaseProvider {
 	model, _ := config["model"].(string)
-	return BaseProvider{
+	return &BaseProvider{
 		modelName:        model,
 		providerConfig:   config,
 		providerSettings: settings,

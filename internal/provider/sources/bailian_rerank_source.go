@@ -31,7 +31,7 @@ var bailianCompatibleAPIPathSuffixes = []string{
 // NOTE: the Python implementation only uses the non-streaming JSON endpoint,
 // so no SSE streaming is needed here.
 type BailianRerankSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	baseURL         string
 	apiKey          string
 	model           string

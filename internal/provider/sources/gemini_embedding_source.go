@@ -17,7 +17,7 @@ import (
 // embedContent / batchEmbedContents REST endpoints.
 // Ported from astrbot/core/provider/sources/gemini_embedding_source.py
 type GeminiEmbeddingSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase string
 	apiKey  string
 	client  *http.Client

@@ -191,6 +191,32 @@ export const useExtensionPage = (initialTab = "installed") => {
   // 用户选择的 C 编译器（gcc / clang / download / cancel）
   const ccChoice = ref("");
 
+  // Go SDK 选择对话框（Go 插件需要 Go 工具链）
+  const goSdkDialog = reactive({
+    show: false,
+    message: "",
+    android: false,
+    mirrors: [],
+    selectedMirror: "",
+  });
+  // 用户选择的 Go SDK 处理（download / cancel）
+  const goChoice = ref("");
+  // 用户选择的 Go 加速镜像
+  const goMirror = ref("");
+
+  // Python 运行时选择对话框（Python 插件需要 Python 运行时）
+  const pythonRuntimeDialog = reactive({
+    show: false,
+    message: "",
+    android: false,
+    mirrors: [],
+    selectedMirror: "",
+  });
+  // 用户选择的 Python 运行时处理（download / cancel）
+  const pythonChoice = ref("");
+  // 用户选择的 Python 加速镜像
+  const pythonMirror = ref("");
+
   // 安装进度轮询状态
   const installProgress = ref({
     show: false,
@@ -2108,6 +2134,74 @@ export const useExtensionPage = (initialTab = "installed") => {
     return { checked: true, supported: true, message: "" };
   };
 
+  const checkRuntimeVersionSupport = (versionSpec, currentVersion) => {
+    const normalizedSpec = normalizeAstrBotVersionSpec(versionSpec);
+    if (!normalizedSpec || !currentVersion) {
+      return { checked: false, supported: true, message: "" };
+    }
+
+    const constraints = normalizedSpec
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!constraints.length) {
+      return { checked: false, supported: true, message: "" };
+    }
+
+    for (const constraint of constraints) {
+      const supported = checkVersionConstraint(currentVersion, constraint);
+      if (supported === null) {
+        return {
+          checked: true,
+          supported: false,
+          message: `Invalid runtime version requirement: ${normalizedSpec}`,
+        };
+      }
+      if (!supported) {
+        return {
+          checked: true,
+          supported: false,
+          message: `Host runtime ${currentVersion} does not satisfy plugin requirement: ${normalizedSpec}`,
+        };
+      }
+    }
+
+    return { checked: true, supported: true, message: "" };
+  };
+
+  const annotateMarketEnvSupport = (plugin) => {
+    plugin.env_supported = true;
+    plugin.env_support_message = "";
+    const runtime = plugin?.runtime;
+    if (!runtime || typeof runtime !== "object") {
+      // 无 runtime 信息（如 Python 市场插件）→ 跳过 env 检查，避免误判不兼容
+      return;
+    }
+
+    // 优先按 Python 插件的 python_version 检查宿主 Python 版本
+    const pythonReq = String(runtime.python_version || "").trim();
+    if (pythonReq) {
+      const hostPython = commonStore.pythonVersion || "";
+      if (!hostPython) return;
+      const result = checkRuntimeVersionSupport(pythonReq, hostPython);
+      plugin.env_supported = result.supported;
+      plugin.env_support_message = result.message;
+      return;
+    }
+
+    // 回退：Go 插件的 go_version / sdk_version。后端当前未暴露宿主 Go
+    // 版本，无宿主版本可比对时跳过，避免误报不兼容。
+    const goReq = String(
+      runtime.go_version || runtime.sdk_version || "",
+    ).trim();
+    if (!goReq) return;
+    const hostGo = commonStore.goVersion || "";
+    if (!hostGo) return;
+    const result = checkRuntimeVersionSupport(goReq, hostGo);
+    plugin.env_supported = result.supported;
+    plugin.env_support_message = result.message;
+  };
+
   const annotateMarketVersionSupport = async () => {
     const currentVersion =
       commonStore.astrbotVersion ||
@@ -2120,6 +2214,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       plugin.astrbot_support_checked = result.checked;
       plugin.astrbot_version_supported = result.supported;
       plugin.astrbot_support_message = result.message;
+      annotateMarketEnvSupport(plugin);
     });
   };
 
@@ -2181,6 +2276,35 @@ export const useExtensionPage = (initialTab = "installed") => {
       return false;
     }
 
+    if (resData.status === "error" && resData.code === "go_sdk_prompt") {
+      const data = resData.data || {};
+      goSdkDialog.message =
+        resData.message || t("dialogs.go_sdk.message");
+      goSdkDialog.android = !!data.android;
+      goSdkDialog.mirrors = Array.isArray(data.mirrors) ? data.mirrors : [];
+      goSdkDialog.selectedMirror = goSdkDialog.mirrors[0] || "";
+      goSdkDialog.show = true;
+      await refreshExtensionsAfterInstallFailure();
+      return false;
+    }
+
+    if (
+      resData.status === "error" &&
+      resData.code === "python_runtime_prompt"
+    ) {
+      const data = resData.data || {};
+      pythonRuntimeDialog.message =
+        resData.message || t("dialogs.python_runtime.message");
+      pythonRuntimeDialog.android = !!data.android;
+      pythonRuntimeDialog.mirrors = Array.isArray(data.mirrors)
+        ? data.mirrors
+        : [];
+      pythonRuntimeDialog.selectedMirror = pythonRuntimeDialog.mirrors[0] || "";
+      pythonRuntimeDialog.show = true;
+      await refreshExtensionsAfterInstallFailure();
+      return false;
+    }
+
     if (resData.status === "error") {
       stopInstallProgressPolling();
       toast(resData.message, "error");
@@ -2227,11 +2351,53 @@ export const useExtensionPage = (initialTab = "installed") => {
     await newExtension();
   };
 
+  const chooseGoDownload = async () => {
+    goSdkDialog.show = false;
+    goChoice.value = "download";
+    goMirror.value = goSdkDialog.selectedMirror || "";
+    await newExtension();
+  };
+
+  const cancelGoDownload = async () => {
+    goSdkDialog.show = false;
+    goChoice.value = "cancel";
+    await newExtension();
+  };
+
+  const choosePythonDownload = async () => {
+    pythonRuntimeDialog.show = false;
+    pythonChoice.value = "download";
+    pythonMirror.value = pythonRuntimeDialog.selectedMirror || "";
+    await newExtension();
+  };
+
+  const cancelPythonDownload = async () => {
+    pythonRuntimeDialog.show = false;
+    pythonChoice.value = "cancel";
+    await newExtension();
+  };
+
+  const copyPkgCommand = async (cmd) => {
+    try {
+      await navigator.clipboard.writeText(cmd);
+      toast(tm("messages.pkgCommandCopied") || "已复制命令，请在终端运行", "success");
+    } catch {
+      toast(
+        tm("messages.pkgCommandCopyFailed") || "复制失败，请手动复制命令",
+        "error",
+      );
+    }
+  };
+
   const performInstallRequest = async ({
     source,
     ignoreVersionCheck,
     ignoreRisk,
     ccChoice,
+    goChoice,
+    goMirror,
+    pythonChoice,
+    pythonMirror,
     installId,
   }) => {
     const shouldIgnoreVersionCheck = ignoreVersionCheck === true;
@@ -2242,6 +2408,10 @@ export const useExtensionPage = (initialTab = "installed") => {
       formData.append("ignore_version_check", String(shouldIgnoreVersionCheck));
       formData.append("ignore_risk", String(shouldIgnoreRisk));
       formData.append("cc_choice", ccChoice || "");
+      formData.append("go_choice", goChoice || "");
+      formData.append("go_mirror", goMirror || "");
+      formData.append("python_choice", pythonChoice || "");
+      formData.append("python_mirror", pythonMirror || "");
       formData.append("install_id", installId || "");
       return pluginApi.installUpload(formData);
     }
@@ -2255,6 +2425,10 @@ export const useExtensionPage = (initialTab = "installed") => {
       ignore_version_check: shouldIgnoreVersionCheck,
       ignore_risk: shouldIgnoreRisk,
       cc_choice: ccChoice || "",
+      go_choice: goChoice || "",
+      go_mirror: goMirror || "",
+      python_choice: pythonChoice || "",
+      python_mirror: pythonMirror || "",
       install_id: installId || "",
       ...getMarketInstallSourcePayload(),
     };
@@ -2295,6 +2469,14 @@ export const useExtensionPage = (initialTab = "installed") => {
     ignoreRiskFlag.value = false;
     const chosenCC = ccChoice.value;
     ccChoice.value = "";
+    const chosenGo = goChoice.value;
+    goChoice.value = "";
+    const chosenGoMirror = goMirror.value;
+    goMirror.value = "";
+    const chosenPython = pythonChoice.value;
+    pythonChoice.value = "";
+    const chosenPythonMirror = pythonMirror.value;
+    pythonMirror.value = "";
     if (extension_url.value === "" && upload_file.value === null) {
       toast(tm("messages.fillUrlOrFile"), "error");
       return;
@@ -2354,6 +2536,10 @@ export const useExtensionPage = (initialTab = "installed") => {
         ignoreVersionCheck: shouldIgnoreVersionCheck,
         ignoreRisk: shouldIgnoreRisk,
         ccChoice: chosenCC,
+        goChoice: chosenGo,
+        goMirror: chosenGoMirror,
+        pythonChoice: chosenPython,
+        pythonMirror: chosenPythonMirror,
         installId,
       });
       loading_.value = false;
@@ -2794,6 +2980,15 @@ export const useExtensionPage = (initialTab = "installed") => {
     chooseCCClang,
     chooseCCDownload,
     cancelCCInstall,
+    goSdkDialog,
+    chooseGoDownload,
+    cancelGoDownload,
+    goMirror,
+    pythonRuntimeDialog,
+    choosePythonDownload,
+    cancelPythonDownload,
+    pythonMirror,
+    copyPkgCommand,
     installProgress,
     newExtension,
     normalizePlatformList,

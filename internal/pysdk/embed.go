@@ -7,6 +7,7 @@ package pysdk
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,6 +28,11 @@ import (
 )
 
 var logger = log.GetDefault().WithComponent("PySDK")
+
+// ErrRuntimeUnavailable is returned by PrepareRuntimeWithStage when no usable
+// Python runtime can be prepared (missing interpreter / host base deps cannot
+// be installed). Installers surface it to the user as a download prompt.
+var ErrRuntimeUnavailable = errors.New("无法准备 Python 运行时（缺少宿主基础依赖且无法自动安装）")
 
 // SDKRootName is the relative directory (under the data dir) that the SDK is
 // downloaded/extracted to.
@@ -75,7 +81,11 @@ const (
 
 	defaultPythonVersion = "20260814"
 	defaultPythonMinor   = "3.12"
-	pyBuildStandaloneURL = "https://github.com/astral-sh/python-build-standalone/releases/download"
+	// minSupportedPythonMinor 是宿主最低支持的 Python 版本（对齐 Python SDK
+	// 的 requires-python >=3.10）。低于此版本的系统解释器会被 DiscoverPythonBin
+	// 拒绝，回退下载 bundled CPython（3.12）——避免 3.8 这类装不了插件的旧版本。
+	minSupportedPythonMinor = "3.10"
+	pyBuildStandaloneURL    = "https://github.com/astral-sh/python-build-standalone/releases/download"
 
 	// defaultPyPIIndex 是国内默认 pip 镜像（阿里云）。用户环境可通过
 	// ASTRBOT_PYPI_INDEX（或 PIP_INDEX_URL）覆盖为其他源。
@@ -196,7 +206,11 @@ func DiscoverPythonBin() string {
 	}
 	for _, name := range []string{"python3", "python"} {
 		if p, err := exec.LookPath(name); err == nil {
-			return p
+			if pythonUsable(p) {
+				return p
+			}
+			// 不可用（Windows 商店别名桩等）→ 继续回退 bundled。
+			logger.Warn("PATH 上的 %s 不可用（%s），跳过回退 bundled Python", name, p)
 		}
 	}
 	// 已下载的 bundled Python（幂等：重启后直接复用）
@@ -207,6 +221,87 @@ func DiscoverPythonBin() string {
 		}
 	}
 	return ""
+}
+
+// pythonUsable 判断解释器是否真实可用：拒绝 Windows 商店的 App Execution Alias
+// 桩（WindowsApps 下的 python3.exe 不是真解释器，创建 venv 必然失败 exit 9009），
+// 并校验版本不低于宿主最低支持（对齐 SDK requires-python），否则视为不可用，
+// 由 DiscoverPythonBin 回退下载 bundled CPython。
+func pythonUsable(p string) bool {
+	if strings.Contains(strings.ToLower(p), `windowsapps`) {
+		return false
+	}
+	ver := probeMinor(p)
+	if ver == "" {
+		return false
+	}
+	if !minorAtLeast(ver, minSupportedPythonMinor) {
+		logger.Warn("Python %s（%s）低于宿主最低支持版本 %s，跳过回退 bundled Python",
+			ver, p, minSupportedPythonMinor)
+		return false
+	}
+	return true
+}
+
+// probeMinor 运行解释器打印 "major.minor"（与 pythonUsable 共用同一探测），
+// 失败（不可执行/超时等）返回 ""。
+func probeMinor(p string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, p, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// DetectTooLowPython 探测 PATH 上是否存在版本过低的系统 Python（低于宿主
+// 最低支持版本 minSupportedPythonMinor）：存在可执行但版本过低的解释器且无
+// 可用解释器时返回其版本号（如 "3.8"），否则返回 ""。仅探测 PATH，不触发
+// 任何下载副作用。供插件安装时提示"系统 Python 版本过低，将自动下载
+// CPython"。
+func DetectTooLowPython() string {
+	tooLow := ""
+	for _, name := range []string{"python3", "python"} {
+		p, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(strings.ToLower(p), `windowsapps`) {
+			continue
+		}
+		ver := probeMinor(p)
+		if ver == "" {
+			continue // 不可执行/探测失败，非"版本过低"情形
+		}
+		if minorAtLeast(ver, minSupportedPythonMinor) {
+			// 存在可用解释器（如 python3 过低但 python 可用）→ 无需提示。
+			return ""
+		}
+		tooLow = ver
+	}
+	return tooLow
+}
+
+// minorAtLeast 比较 "major.minor" 是否 >= 基准（如 "3.10"）。
+func minorAtLeast(v, min string) bool {
+	parse := func(s string) (int, int) {
+		var a, b int
+		if _, err := fmt.Sscanf(s, "%d.%d", &a, &b); err != nil {
+			return -1, -1
+		}
+		return a, b
+	}
+	va, vb := parse(v)
+	ma, mb := parse(min)
+	if va < 0 || ma < 0 {
+		return false
+	}
+	if va != ma {
+		return va > ma
+	}
+	return vb >= mb
 }
 
 // EnsurePythonBin resolves an interpreter, downloading a bundled Python
@@ -273,10 +368,25 @@ func bundledMicroVersion() string {
 	return defaultPythonMinor + ".14"
 }
 
-// pyDownloadURL applies the mirror prefix (ASTRBOT_PYTHON_MIRROR) to the
-// official release URL.
+// pyMirrorOverride 是宿主注入的 CPython 下载镜像前缀（插件安装下载时经
+// SetPythonMirror 设置），非空时优先于 ASTRBOT_PYTHON_MIRROR 环境变量与官方
+// URL。对齐 githubProxyOverride（SetSDKGitHubProxy）的注入模式。
+var pyMirrorOverride string
+
+// SetPythonMirror overrides the mirror prefix used by pyDownloadURL (called by
+// the host with the user's chosen mirror before a plugin-install download;
+// empty restores env/default resolution).
+func SetPythonMirror(prefix string) {
+	pyMirrorOverride = strings.TrimRight(strings.TrimSpace(prefix), "/")
+}
+
+// pyDownloadURL applies the mirror prefix to the official release URL: the
+// SetPythonMirror override wins, then ASTRBOT_PYTHON_MIRROR.
 func pyDownloadURL(archive string) string {
 	u := pyBuildStandaloneURL + "/" + pyVersion() + "/" + archive
+	if pyMirrorOverride != "" {
+		return pyMirrorOverride + "/" + u
+	}
 	if m := strings.TrimSpace(os.Getenv(EnvPythonMirror)); m != "" {
 		return strings.TrimRight(m, "/") + "/" + u
 	}
@@ -867,7 +977,7 @@ func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, e
 		py = EnsureVenv(dataDir)
 	}
 	if py == "" {
-		return nil, fmt.Errorf("无法准备 Python 运行时（缺少宿主基础依赖且无法自动安装）")
+		return nil, ErrRuntimeUnavailable
 	}
 	return &RuntimeEnv{
 		PythonBin: py,

@@ -13,7 +13,7 @@ import (
 
 // DashScopeSource is an Aliyun DashScope (Qwen) chat provider.
 type DashScopeSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase string
 	apiKey  string
 	client  *http.Client

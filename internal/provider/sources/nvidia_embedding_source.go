@@ -17,7 +17,7 @@ import (
 // compatible /embeddings endpoint.
 // Ported from astrbot/core/provider/sources/nvidia_embedding_source.py
 type NvidiaEmbeddingSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase   string
 	apiKey    string
 	model     string

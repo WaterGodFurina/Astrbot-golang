@@ -255,6 +255,28 @@
       "download": "下载并安装 Clang",
       "cancel": "取消安装"
     },
+    "go_sdk": {
+      "title": "需要 Go 工具链/SDK",
+      "message": "该插件需要 Go 工具链（Go SDK）才能编译。",
+      "android_hint": "请在 Termux 中执行以下命令安装 Go SDK：",
+      "download_hint": "是否自动下载 Go 工具链？",
+      "mirrorLabel": "加速下载镜像",
+      "download": "自动下载",
+      "cancel": "取消",
+      "copy": "复制命令",
+      "installed": "我已安装"
+    },
+    "python_runtime": {
+      "title": "需要 Python 运行时",
+      "message": "该插件需要 Python 运行时才能运行。",
+      "android_hint": "请在 Termux 中执行以下命令安装 Python：",
+      "download_hint": "是否自动下载 CPython？",
+      "mirrorLabel": "加速下载镜像",
+      "download": "自动下载",
+      "cancel": "取消",
+      "copy": "复制命令",
+      "installed": "我已安装"
+    },
     "update": {
       "title": "更新插件",
       "sectionTitle": "更新",
@@ -316,6 +338,8 @@
     "fillUrlOrFile": "请填写插件链接或上传插件文件",
     "dontFillBoth": "请不要同时填写插件链接和上传文件",
     "supportedFormats": "支持 .zip 格式的插件文件",
+    "pkgCommandCopied": "已复制命令，请在终端运行",
+    "pkgCommandCopyFailed": "复制失败，请手动复制命令",
     "updateAllSuccess": "所有可更新的插件都已更新！",
     "updateAllFailed": "有 {failed}/{total} 个插件更新失败:",
     "noUpdatesAvailable": "当前没有可更新的插件",

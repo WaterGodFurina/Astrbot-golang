@@ -17,7 +17,7 @@ import (
 // /embeddings endpoint.
 // Ported from astrbot/core/provider/sources/openai_embedding_source.py
 type OpenAIEmbeddingSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase string
 	apiKey  string
 	client  *http.Client

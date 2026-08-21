@@ -45,7 +45,7 @@ type azureOTTSConfig struct {
 //   - OTTS: key is "other[{...}]" JSON pointing at a third-party OTTS service
 //     (signature based auth).
 type AzureTTSProvider struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	client  *http.Client
 	initErr error
 

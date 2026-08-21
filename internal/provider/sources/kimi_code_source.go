@@ -24,7 +24,7 @@ const (
 // KimiCodeSource is a Kimi coding chat provider speaking the Anthropic
 // Messages protocol with a spoofed Claude Code user agent.
 type KimiCodeSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase        string
 	apiKey         string
 	client         *http.Client

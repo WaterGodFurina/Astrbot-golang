@@ -30,8 +30,6 @@ astrbot-go/
 ├── pkg/
 │   ├── message/               # 消息组件
 │   └── sdk/                   # 插件 SDK 文档入口 (SDK 本体在独立 module)
-├── examples/
-│   └── echo_plugin/           # 子进程插件示例 (sdk.Serve)
 └── go.mod
 ```
 
@@ -46,6 +44,14 @@ astrbot-go/
 为了兼容原项目AstrBot的插件，本项目通过gRPC+Python SDK实现了对原项目AstrBot插件的兼容（已知问题：一个插件占用运存80MB，因为gRPC方案是让插件相互独立）
 
 通过zip包内的main.go / main.py进行插件类型识别，利用插件id将Python插件和Go插件进行区分
+
+### 插件闲置休眠
+
+为回收闲置插件进程的内存，可配置 `plugin_idle_unload_minutes`（WebUI 行为页），超过阈值无 RPC 活动的插件进程会被**卸载休眠**（OS 归还内存）：
+
+- **休眠 ≠ 卸载**：休眠时插件进程被终止，但其命令/过滤器 handler 与 LLM 工具仍保留在管线/工具注册表中——下次被命令触发、过滤器命中或 LLM 工具调用时自动**懒加载唤醒**（EnsureLoaded 重启进程），无感恢复
+- 适用所有插件（Go 二进制 / Python 解释器，仅管理进程生命周期）
+- 带 filter/hook 的插件被被动消息排除（不 Touch），避免被无关消息频繁唤醒
 
 ## Go 插件 SDK
 
@@ -102,6 +108,18 @@ cgo 插件的 C 编译器（zig/clang/GCC）也存放在同一私有目录下（
 - 安装 = 下载源码 → 校验 metadata 文件 + main 文件 → 静态扫描 → （如需 cgo 则选择/下载 C 编译器）→ 编译 （Python插件直接安装）→ 启动子进程 → 桥接进管线
 - 安装后把 metadata 内容写入 `data/plugins_config/<name>/config.json` 开头，供 WebUI 展示插件信息
 - 崩溃自动重启（带退避与次数上限）；重载零停机（先起新进程再杀旧进程）
+
+### 自带 Python 解释器（CPython 自动下载）
+
+系统无 `python3`/`python` 时，程序自动下载 **python-build-standalone**（Astral 维护的 CPython 独立发行版，与 uv 同源）到用户私有目录（`~/.local/share/astrbot-go/python/<version>`），跨重启复用，无需用户装 Python：
+
+- `ASTRBOT_PYTHON_BIN`：显式指定已有解释器（最高优先）
+- `ASTRBOT_PYTHON_VERSION`：python-build-standalone 版本 tag（默认 `20260814`，内置 CPython 3.12）
+- `ASTRBOT_PYTHON_MIRROR`：下载镜像前缀（如 `https://ghfast.top/`，会拼在官方 URL 之前）
+- `ASTRBOT_PYTHON_SKIP_VERIFY`：跳过下载后的完整性检查
+- `ASTRBOT_PYTHON_CACHE_DIR`：覆盖缓存目录（venv 与 bundled-Python 共用）
+
+解释器查找优先级：`ASTRBOT_PYTHON_BIN` → PATH `python3`/`python` → 已下载的 bundled Python。插件依赖 pip 默认走阿里云镜像（可用配置 `pypi_index_url` 或 `ASTRBOT_PYPI_INDEX`/`PIP_INDEX_URL` 覆盖）。
 
 ## 平台适配器
 

@@ -393,6 +393,10 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 	carry := InstallOptions{
 		IgnoreRisk:     opts.IgnoreRisk,
 		CCChoice:       opts.CCChoice,
+		GoChoice:       opts.GoChoice,
+		PythonChoice:   opts.PythonChoice,
+		GoMirror:       opts.GoMirror,
+		PythonMirror:   opts.PythonMirror,
 		Progress:       opts.Progress,
 		InstallMethod:  entry.InstallMethod,
 		RegistryURL:    entry.RegistryURL,

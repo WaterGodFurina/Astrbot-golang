@@ -583,6 +583,30 @@ type InstallOptions struct {
 	// plugin declares cgo and the host needs to pick a compiler; empty means no
 	// decision has been made yet (→ a CCompilerPromptError is returned).
 	CCChoice string
+
+	// GoChoice carries the user's answer to a Go toolchain/SDK prompt (one of
+	// "download" / "cancel"). Empty means no decision has been made yet (→ a
+	// RuntimePromptError with Kind RuntimePromptGoSDK is returned when the Go
+	// toolchain or the plugin SDK is not resolvable).
+	GoChoice string
+
+	// GoMirror carries the user's chosen download mirror base URL for the Go
+	// toolchain (one of the mirrors in the prompt response data). Empty means
+	// the default/env resolution is used. Applied via toolchain.SetGoMirror
+	// before the download.
+	GoMirror string
+
+	// PythonChoice carries the user's answer to a Python runtime prompt (one of
+	// "download" / "cancel"). Empty means no decision has been made yet (→ a
+	// RuntimePromptError with Kind RuntimePromptPython is returned when no
+	// usable CPython runtime can be prepared during install).
+	PythonChoice string
+
+	// PythonMirror carries the user's chosen download mirror prefix for CPython
+	// (one of the mirrors in the prompt response data). Empty means the
+	// default/env resolution is used. Applied via pysdk.SetPythonMirror before
+	// the download.
+	PythonMirror string
 }
 
 // RiskError is returned by InstallFromSource when the static scan found risky
@@ -671,6 +695,12 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		}
 	}
 
+	// Go 工具链/SDK 探测：不可用且用户未决定时返回 RuntimePromptError（前端
+	// 弹窗询问是否下载），"download" 自动下载工具链并把 SDK 拉进模块缓存。
+	if err := m.ensureGoInstallReady(ctx, opts); err != nil {
+		return nil, err
+	}
+
 	if opts.Stage != nil {
 		opts.Stage("准备编译插件…")
 	}
@@ -755,6 +785,13 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	if opts.Stage != nil {
 		opts.Stage("准备 Python 插件…")
 	}
+	// 安装路径先解析 Python 运行时（可能触发下载/venv），运行时无法准备且
+	// 用户未决定时返回 RuntimePromptError（前端弹窗询问是否下载 CPython）。
+	// 运行期加载（startInstance）保持 pythonRuntime 原行为，不弹窗。
+	env, err := m.pythonRuntimeForInstall(opts)
+	if err != nil {
+		return nil, err
+	}
 	dest := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
 	if err := os.RemoveAll(dest); err != nil {
 		return nil, err
@@ -769,10 +806,8 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 		if opts.Stage != nil {
 			opts.Stage("安装 Python 依赖 (requirements.txt)…")
 		}
-		if env, err := m.pythonRuntimeWithStage(opts.Stage); err == nil {
-			if err := m.pipInstall(env, dest, req); err != nil {
-				logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
-			}
+		if err := m.pipInstall(env, dest, req); err != nil {
+			logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
 		}
 	}
 

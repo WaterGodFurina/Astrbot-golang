@@ -65,7 +65,7 @@ type responsesResponse struct {
 
 // OpenAIResponsesSource is a stateless Responses API chat provider.
 type OpenAIResponsesSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase       string
 	apiKey        string
 	client        *http.Client

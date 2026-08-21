@@ -255,6 +255,28 @@
       "download": "Download & Install Clang",
       "cancel": "Cancel Installation"
     },
+    "go_sdk": {
+      "title": "Go SDK Required",
+      "message": "This plugin requires the Go toolchain (Go SDK) to build.",
+      "android_hint": "Install the Go SDK in Termux with the following command:",
+      "download_hint": "Automatically download and set up the Go toolchain?",
+      "mirrorLabel": "Download mirror",
+      "download": "Auto Download",
+      "cancel": "Cancel",
+      "copy": "Copy Command",
+      "installed": "I've Installed"
+    },
+    "python_runtime": {
+      "title": "Python Runtime Required",
+      "message": "This plugin requires the Python runtime to run.",
+      "android_hint": "Install Python in Termux with the following command:",
+      "download_hint": "Automatically download CPython?",
+      "mirrorLabel": "Download mirror",
+      "download": "Auto Download",
+      "cancel": "Cancel",
+      "copy": "Copy Command",
+      "installed": "I've Installed"
+    },
     "update": {
       "title": "Update Extension",
       "sectionTitle": "Update",
@@ -316,6 +338,8 @@
     "fillUrlOrFile": "Please fill in extension URL or upload extension file",
     "dontFillBoth": "Please don't fill in both extension URL and upload file",
     "supportedFormats": "Supports .zip extension files",
+    "pkgCommandCopied": "Command copied, please run it in the terminal",
+    "pkgCommandCopyFailed": "Copy failed, please copy the command manually",
     "updateAllSuccess": "All upgradable extensions have been updated!",
     "updateAllFailed": "{failed} of {total} extensions failed to update:",
     "noUpdatesAvailable": "No extensions have updates available",

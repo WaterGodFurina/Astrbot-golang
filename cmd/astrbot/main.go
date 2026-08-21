@@ -67,6 +67,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 清理 Windows 自升级残留：两步改名后留下的 <exe>.old 文件。
+	if runtime.GOOS == "windows" {
+		if exe, err := os.Executable(); err == nil {
+			_ = os.Remove(exe + ".old")
+		}
+	}
+
 	// Create lifecycle
 	lc := lifecycle.New()
 	if *webuiDir != "" {

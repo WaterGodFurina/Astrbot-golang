@@ -27,7 +27,7 @@ const (
 // Note: the Python version converts the resulting mp3 to wav via ffmpeg;
 // this Go port saves the mp3 stream directly.
 type EdgeTTSSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	voice   string
 	rate    string
 	volume  string
