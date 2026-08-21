@@ -6,7 +6,9 @@ package pysdk
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -201,7 +203,11 @@ func DiscoverPythonBin() string {
 	}
 	for _, name := range []string{"python3", "python"} {
 		if p, err := exec.LookPath(name); err == nil {
-			return p
+			if pythonUsable(p) {
+				return p
+			}
+			// 不可用（Windows 商店别名桩等）→ 继续回退 bundled。
+			logger.Warn("PATH 上的 %s 不可用（%s），跳过回退 bundled Python", name, p)
 		}
 	}
 	// 已下载的 bundled Python（幂等：重启后直接复用）
@@ -212,6 +218,23 @@ func DiscoverPythonBin() string {
 		}
 	}
 	return ""
+}
+
+// pythonUsable 判断解释器是否真实可用：拒绝 Windows 商店的 App Execution Alias
+// 桩（WindowsApps 下的 python3.exe 不是真解释器，创建 venv 必然失败 exit 9009），
+// 并用一条快速探测命令验证能真正启动。
+func pythonUsable(p string) bool {
+	if strings.Contains(strings.ToLower(p), `windowsapps`) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, p, "-c", "import sys; print(sys.version.split()[0])")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return len(bytes.TrimSpace(out)) > 0
 }
 
 // EnsurePythonBin resolves an interpreter, downloading a bundled Python
