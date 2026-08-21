@@ -312,7 +312,7 @@ jobs:
           go env -w GOPROXY="https://goproxy.cn,direct"
           go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
           go env -w GOFLAGS="-mod=mod"
-          go mod download all
+          go mod download
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3

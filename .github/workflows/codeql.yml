@@ -81,7 +81,7 @@ jobs:
         GOPROXY: https://goproxy.cn,direct
         GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
         GOFLAGS: -mod=mod
-      run: go mod download all
+      run: go mod download
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
