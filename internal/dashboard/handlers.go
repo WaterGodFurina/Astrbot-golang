@@ -2237,6 +2237,18 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		repo = body.Repo
 		downloadURL = body.DownloadURL
 	case "upload":
+		// 限制请求体大小（对齐 KB/Skill 上传），防止已认证用户上传任意
+		// 大文件耗尽磁盘（DoS）。
+		r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
+		if err := r.ParseMultipartForm(64 << 20); err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeJSON(w, http.StatusRequestEntityTooLarge, apiError("上传文件过大（上限 256MB）"))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiError("解析上传文件失败: "+err.Error()))
+			return
+		}
 		file, fh, err := r.FormFile("file")
 		if err != nil {
 			writeJSON(w, http.StatusOK, apiError("未收到插件文件: "+err.Error()))
@@ -2256,7 +2268,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			writeJSON(w, http.StatusOK, apiError("保存上传文件失败"))
 			return
 		}
-		if _, err := io.Copy(out, file); err != nil {
+		if _, err := io.Copy(out, io.LimitReader(file, maxMultipartBodySize+1)); err != nil {
 			_ = out.Close()
 			writeJSON(w, http.StatusOK, apiError("保存上传文件失败: "+err.Error()))
 			return

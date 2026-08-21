@@ -17,7 +17,7 @@ import (
 
 // AnthropicSource is a Claude/Anthropic chat provider.
 type AnthropicSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase      string
 	apiKey       string
 	client       *http.Client

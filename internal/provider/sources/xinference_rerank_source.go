@@ -23,7 +23,7 @@ import (
 // ported: the configured model (rerank_model) is sent directly as the model
 // UID, so the model must already be running on the server.
 type XinferenceRerankSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	baseURL string
 	apiKey  string
 	model   string

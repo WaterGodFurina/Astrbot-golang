@@ -17,7 +17,7 @@ import (
 // Text Embeddings Inference (TEI) compatible /rerank endpoint.
 // Ported from astrbot/core/provider/sources/tei_rerank_source.py
 type TEIRerankSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	baseURL string
 	apiKey  string
 	client  *http.Client

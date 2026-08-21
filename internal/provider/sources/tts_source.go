@@ -19,7 +19,7 @@ import (
 // /audio/speech endpoint and saves the result to a local wav file.
 // Ported from astrbot/core/provider/sources/openai_tts_api_source.py
 type OpenAITTSSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase string
 	apiKey  string
 	voice   string

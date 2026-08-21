@@ -17,7 +17,7 @@ import (
 // endpoint.
 // Ported from astrbot/core/provider/sources/nvidia_rerank_source.py.
 type NvidiaRerankSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	baseURL       string
 	apiKey        string
 	model         string

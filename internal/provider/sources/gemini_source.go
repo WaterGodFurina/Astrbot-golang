@@ -17,7 +17,7 @@ import (
 
 // GeminiSource is a Google Gemini chat provider.
 type GeminiSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase      string
 	apiKey       string
 	client       *http.Client

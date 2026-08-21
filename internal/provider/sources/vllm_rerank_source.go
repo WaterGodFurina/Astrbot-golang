@@ -17,7 +17,7 @@ import (
 // VLLMRerankSource reranks documents via a vLLM /rerank endpoint.
 // Ported from astrbot/core/provider/sources/vllm_rerank_source.py.
 type VLLMRerankSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	baseURL   string
 	apiSuffix string
 	authKey   string

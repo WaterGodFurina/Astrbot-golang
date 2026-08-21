@@ -21,7 +21,7 @@ var fishReferenceIDPattern = regexp.MustCompile(`^[a-fA-F0-9]{32}$`)
 // The request body is MessagePack encoded (application/msgpack) and the model
 // is passed as an HTTP header instead of a body field.
 type FishAudioTTSSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	client      *http.Client
 	apiKey      string
 	apiBase     string

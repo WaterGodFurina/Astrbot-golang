@@ -20,7 +20,7 @@ import (
 // /audio/transcriptions endpoint.
 // Ported from astrbot/core/provider/sources/whisper_api_source.py
 type OpenAIWhisperSource struct {
-	provider.BaseProvider
+	*provider.BaseProvider
 	apiBase string
 	apiKey  string
 	client  *http.Client
