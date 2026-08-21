@@ -800,6 +800,25 @@ const updateDialogPluginLogo = computed(() => {
         </template>
         <div v-else class="text-medium-emphasis">
           {{ tm("dialogs.go_sdk.download_hint") }}
+          <div
+            v-if="goSdkDialog.mirrors.length"
+            class="mt-2 text-body-2 font-weight-medium"
+          >
+            {{ tm("dialogs.go_sdk.mirrorLabel") }}
+          </div>
+          <v-radio-group
+            v-if="goSdkDialog.mirrors.length"
+            v-model="goSdkDialog.selectedMirror"
+            hide-details
+            class="mt-1"
+          >
+            <v-radio
+              v-for="m in goSdkDialog.mirrors"
+              :key="m"
+              :label="m"
+              :value="m"
+            ></v-radio>
+          </v-radio-group>
         </div>
       </v-card-text>
       <v-card-actions>
@@ -847,6 +866,25 @@ const updateDialogPluginLogo = computed(() => {
         </template>
         <div v-else class="text-medium-emphasis">
           {{ tm("dialogs.python_runtime.download_hint") }}
+          <div
+            v-if="pythonRuntimeDialog.mirrors.length"
+            class="mt-2 text-body-2 font-weight-medium"
+          >
+            {{ tm("dialogs.python_runtime.mirrorLabel") }}
+          </div>
+          <v-radio-group
+            v-if="pythonRuntimeDialog.mirrors.length"
+            v-model="pythonRuntimeDialog.selectedMirror"
+            hide-details
+            class="mt-1"
+          >
+            <v-radio
+              v-for="m in pythonRuntimeDialog.mirrors"
+              :key="m"
+              :label="m"
+              :value="m"
+            ></v-radio>
+          </v-radio-group>
         </div>
       </v-card-text>
       <v-card-actions>

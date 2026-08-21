@@ -294,6 +294,7 @@
       "download_hint": "Автоматически загрузить и настроить Go SDK?",
       "installed": "Уже установлено",
       "message": "Для этого плагина требуется Go SDK для сборки.",
+      "mirrorLabel": "Зеркало загрузки",
       "title": "Требуется Go SDK"
     },
     "python_runtime": {
@@ -304,6 +305,7 @@
       "download_hint": "Автоматически загрузить CPython?",
       "installed": "Уже установлено",
       "message": "Для этого плагина требуется Python runtime.",
+      "mirrorLabel": "Зеркало загрузки",
       "title": "Требуется Python Runtime"
     },
     "risk_warning": {

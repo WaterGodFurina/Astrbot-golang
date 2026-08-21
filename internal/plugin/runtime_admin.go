@@ -395,6 +395,8 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		CCChoice:       opts.CCChoice,
 		GoChoice:       opts.GoChoice,
 		PythonChoice:   opts.PythonChoice,
+		GoMirror:       opts.GoMirror,
+		PythonMirror:   opts.PythonMirror,
 		Progress:       opts.Progress,
 		InstallMethod:  entry.InstallMethod,
 		RegistryURL:    entry.RegistryURL,

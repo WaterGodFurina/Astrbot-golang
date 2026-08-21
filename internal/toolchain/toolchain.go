@@ -278,24 +278,39 @@ func (tc *Toolchain) isExecutable(p string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// goMirrorOverride 是宿主注入的 Go 归档镜像 base URL（插件安装下载时经
+// SetGoMirror 设置）。非空时优先于环境变量与默认源。
+var goMirrorOverride string
+
+// SetGoMirror overrides the mirror base URL used by downloadURL / checksumURL
+// (called by the host with the user's chosen mirror before a plugin-install
+// download; empty restores env/default resolution).
+func SetGoMirror(url string) {
+	goMirrorOverride = strings.TrimSpace(url)
+}
+
+// mirrorBase resolves the Go archive mirror base URL: the SetGoMirror override
+// wins, then ASTRBOT_GO_MIRROR, then the given default.
+func mirrorBase(def string) string {
+	if goMirrorOverride != "" {
+		return goMirrorOverride
+	}
+	if base := os.Getenv(EnvGoMirror); base != "" {
+		return base
+	}
+	return def
+}
+
 // downloadURL builds the mirror-aware URL for an official archive file.
 func downloadURL(archive string) string {
-	base := os.Getenv(EnvGoMirror)
-	if base == "" {
-		base = "https://go.dev/dl"
-	}
-	return strings.TrimRight(base, "/") + "/" + archive
+	return strings.TrimRight(mirrorBase("https://go.dev/dl"), "/") + "/" + archive
 }
 
 // checksumURL builds the URL of the sha256 file. go.dev/dl only serves the
 // archives (redirecting to dl.google.com); the .sha256 files live on
 // dl.google.com directly.
 func checksumURL(archive string) string {
-	base := os.Getenv(EnvGoMirror)
-	if base == "" {
-		base = "https://dl.google.com/go"
-	}
-	return strings.TrimRight(base, "/") + "/" + archive + ".sha256"
+	return strings.TrimRight(mirrorBase("https://dl.google.com/go"), "/") + "/" + archive + ".sha256"
 }
 
 // archiveName returns the official distribution archive file name for the

@@ -590,11 +590,23 @@ type InstallOptions struct {
 	// toolchain or the plugin SDK is not resolvable).
 	GoChoice string
 
+	// GoMirror carries the user's chosen download mirror base URL for the Go
+	// toolchain (one of the mirrors in the prompt response data). Empty means
+	// the default/env resolution is used. Applied via toolchain.SetGoMirror
+	// before the download.
+	GoMirror string
+
 	// PythonChoice carries the user's answer to a Python runtime prompt (one of
 	// "download" / "cancel"). Empty means no decision has been made yet (→ a
 	// RuntimePromptError with Kind RuntimePromptPython is returned when no
 	// usable CPython runtime can be prepared during install).
 	PythonChoice string
+
+	// PythonMirror carries the user's chosen download mirror prefix for CPython
+	// (one of the mirrors in the prompt response data). Empty means the
+	// default/env resolution is used. Applied via pysdk.SetPythonMirror before
+	// the download.
+	PythonMirror string
 }
 
 // RiskError is returned by InstallFromSource when the static scan found risky

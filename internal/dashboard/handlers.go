@@ -2203,7 +2203,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 
 	var source, id, installID string
 	var ignoreRisk bool
-	var ccChoice, goChoice, pythonChoice string
+	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror string
 	var installMethod, registryURL, registryName, marketPluginID, repo, downloadURL string
 
 	method := "url"
@@ -2219,6 +2219,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			CCChoice       string `json:"cc_choice"`
 			GoChoice       string `json:"go_choice"`
 			PythonChoice   string `json:"python_choice"`
+			GoMirror       string `json:"go_mirror"`
+			PythonMirror   string `json:"python_mirror"`
 			InstallID      string `json:"install_id"`
 			InstallMethod  string `json:"install_method"`
 			RegistryURL    string `json:"registry_url"`
@@ -2233,6 +2235,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		ccChoice = strings.TrimSpace(body.CCChoice)
 		goChoice = strings.TrimSpace(body.GoChoice)
 		pythonChoice = strings.TrimSpace(body.PythonChoice)
+		goMirror = strings.TrimSpace(body.GoMirror)
+		pythonMirror = strings.TrimSpace(body.PythonMirror)
 		installID = body.InstallID
 		installMethod = body.InstallMethod
 		registryURL = body.RegistryURL
@@ -2284,6 +2288,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		ccChoice = strings.TrimSpace(r.FormValue("cc_choice"))
 		goChoice = strings.TrimSpace(r.FormValue("go_choice"))
 		pythonChoice = strings.TrimSpace(r.FormValue("python_choice"))
+		goMirror = strings.TrimSpace(r.FormValue("go_mirror"))
+		pythonMirror = strings.TrimSpace(r.FormValue("python_mirror"))
 		installID = r.FormValue("install_id")
 		installMethod = r.FormValue("install_method")
 		registryURL = r.FormValue("registry_url")
@@ -2329,6 +2335,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		CCChoice:       ccChoice,
 		GoChoice:       goChoice,
 		PythonChoice:   pythonChoice,
+		GoMirror:       goMirror,
+		PythonMirror:   pythonMirror,
 		Progress:       s.installProgressCallback(installID),
 		Stage:          s.installStageCallback(installID),
 		InstallMethod:  installMethod,
@@ -2386,6 +2394,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 				"data": map[string]interface{}{
 					"kind":    string(runtimeErr.Kind),
 					"android": runtimeErr.Android,
+					"mirrors": runtimeErr.Mirrors,
 				},
 			})
 			return
@@ -2421,11 +2430,15 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 	ccChoice := ""
 	goChoice := ""
 	pythonChoice := ""
+	goMirror := ""
+	pythonMirror := ""
 	if len(parts) == 1 {
 		ids = append(ids, parts[0])
 		ccChoice = strings.TrimSpace(r.FormValue("cc_choice"))
 		goChoice = strings.TrimSpace(r.FormValue("go_choice"))
 		pythonChoice = strings.TrimSpace(r.FormValue("python_choice"))
+		goMirror = strings.TrimSpace(r.FormValue("go_mirror"))
+		pythonMirror = strings.TrimSpace(r.FormValue("python_mirror"))
 	} else {
 		var body struct {
 			PluginID     string   `json:"plugin_id"`
@@ -2433,6 +2446,8 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			CCChoice     string   `json:"cc_choice"`
 			GoChoice     string   `json:"go_choice"`
 			PythonChoice string   `json:"python_choice"`
+			GoMirror     string   `json:"go_mirror"`
+			PythonMirror string   `json:"python_mirror"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.PluginID != "" {
@@ -2443,6 +2458,8 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 		ccChoice = strings.TrimSpace(body.CCChoice)
 		goChoice = strings.TrimSpace(body.GoChoice)
 		pythonChoice = strings.TrimSpace(body.PythonChoice)
+		goMirror = strings.TrimSpace(body.GoMirror)
+		pythonMirror = strings.TrimSpace(body.PythonMirror)
 	}
 	if len(ids) == 0 {
 		writeJSON(w, http.StatusOK, apiError("缺少要更新的插件"))
@@ -2471,6 +2488,8 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			CCChoice:     ccChoice,
 			GoChoice:     goChoice,
 			PythonChoice: pythonChoice,
+			GoMirror:     goMirror,
+			PythonMirror: pythonMirror,
 		})
 		if err != nil {
 			var riskErr *plugin.RiskError
@@ -2488,7 +2507,7 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 					Name:    name,
 					Status:  "error",
 					Code:    code,
-					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android},
+					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android, "mirrors": runtimeErr.Mirrors},
 					Message: runtimeErr.Error(),
 				})
 				continue

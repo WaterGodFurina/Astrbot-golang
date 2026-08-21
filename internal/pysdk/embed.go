@@ -231,20 +231,57 @@ func pythonUsable(p string) bool {
 	if strings.Contains(strings.ToLower(p), `windowsapps`) {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, p, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
-	out, err := cmd.Output()
-	if err != nil {
+	ver := probeMinor(p)
+	if ver == "" {
 		return false
 	}
-	ver := strings.TrimSpace(string(out))
 	if !minorAtLeast(ver, minSupportedPythonMinor) {
 		logger.Warn("Python %s（%s）低于宿主最低支持版本 %s，跳过回退 bundled Python",
 			ver, p, minSupportedPythonMinor)
 		return false
 	}
 	return true
+}
+
+// probeMinor 运行解释器打印 "major.minor"（与 pythonUsable 共用同一探测），
+// 失败（不可执行/超时等）返回 ""。
+func probeMinor(p string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, p, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// DetectTooLowPython 探测 PATH 上是否存在版本过低的系统 Python（低于宿主
+// 最低支持版本 minSupportedPythonMinor）：存在可执行但版本过低的解释器且无
+// 可用解释器时返回其版本号（如 "3.8"），否则返回 ""。仅探测 PATH，不触发
+// 任何下载副作用。供插件安装时提示"系统 Python 版本过低，将自动下载
+// CPython"。
+func DetectTooLowPython() string {
+	tooLow := ""
+	for _, name := range []string{"python3", "python"} {
+		p, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(strings.ToLower(p), `windowsapps`) {
+			continue
+		}
+		ver := probeMinor(p)
+		if ver == "" {
+			continue // 不可执行/探测失败，非"版本过低"情形
+		}
+		if minorAtLeast(ver, minSupportedPythonMinor) {
+			// 存在可用解释器（如 python3 过低但 python 可用）→ 无需提示。
+			return ""
+		}
+		tooLow = ver
+	}
+	return tooLow
 }
 
 // minorAtLeast 比较 "major.minor" 是否 >= 基准（如 "3.10"）。
@@ -331,10 +368,25 @@ func bundledMicroVersion() string {
 	return defaultPythonMinor + ".14"
 }
 
-// pyDownloadURL applies the mirror prefix (ASTRBOT_PYTHON_MIRROR) to the
-// official release URL.
+// pyMirrorOverride 是宿主注入的 CPython 下载镜像前缀（插件安装下载时经
+// SetPythonMirror 设置），非空时优先于 ASTRBOT_PYTHON_MIRROR 环境变量与官方
+// URL。对齐 githubProxyOverride（SetSDKGitHubProxy）的注入模式。
+var pyMirrorOverride string
+
+// SetPythonMirror overrides the mirror prefix used by pyDownloadURL (called by
+// the host with the user's chosen mirror before a plugin-install download;
+// empty restores env/default resolution).
+func SetPythonMirror(prefix string) {
+	pyMirrorOverride = strings.TrimRight(strings.TrimSpace(prefix), "/")
+}
+
+// pyDownloadURL applies the mirror prefix to the official release URL: the
+// SetPythonMirror override wins, then ASTRBOT_PYTHON_MIRROR.
 func pyDownloadURL(archive string) string {
 	u := pyBuildStandaloneURL + "/" + pyVersion() + "/" + archive
+	if pyMirrorOverride != "" {
+		return pyMirrorOverride + "/" + u
+	}
 	if m := strings.TrimSpace(os.Getenv(EnvPythonMirror)); m != "" {
 		return strings.TrimRight(m, "/") + "/" + u
 	}
