@@ -17,6 +17,8 @@ package knowledgebase
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -65,29 +67,74 @@ type RetrievalResult struct {
 type KBHelper struct {
 	KB        *KnowledgeBase
 	InitError string
+	mgr       *Manager // set by CreateKB; lets UploadFromURL delegate to the Manager's uploadFunc
 }
 
-// UploadFromURL uploads a document from a URL to this KB.
-// Issue #9392: gracefully degrades — returns error but never panics
-// with "SuperKMeans is not defined" like the Python version did.
+// UploadFromURL downloads the URL content and delegates chunk/embed/dual-write
+// to the Manager's injected uploadFunc. When no backend is wired it returns a
+// clear error without panicking or issuing any network request — it never
+// affects other KB operations (Issue #9392: no hard failure on missing deps).
 func (h *KBHelper) UploadFromURL(url string, chunkSize, chunkOverlap, batchSize, tasksLimit, maxRetries int, progressCB func(done, total int)) error {
 	if url == "" {
 		return fmt.Errorf("url is empty")
 	}
-	// In a full implementation, this would download, chunk, embed, and store.
-	// For now we return a descriptive error instead of panicking.
-	return fmt.Errorf("upload not yet implemented (url=%s, kb=%s)", url, h.KB.KBName)
+	// Check the backend before downloading so an unwired manager stays cheap
+	// and never makes network requests.
+	if h.mgr == nil {
+		return fmt.Errorf("upload backend not wired (kb=%s)", h.KB.KBName)
+	}
+	fn := h.mgr.getUploadFunc()
+	if fn == nil {
+		return fmt.Errorf("upload backend not wired (kb=%s)", h.KB.KBName)
+	}
+	// Download with a bounded timeout. Proxy comes from the environment via
+	// http.DefaultTransport (http.ProxyFromEnvironment) — never hardcoded.
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("download %s failed: %w", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("download %s failed: HTTP %d", url, resp.StatusCode)
+	}
+	content, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return fmt.Errorf("read content from %s failed: %w", url, err)
+	}
+	if len(content) == 0 {
+		return fmt.Errorf("downloaded content is empty (url=%s)", url)
+	}
+	return fn(h, url, content, chunkSize, chunkOverlap)
 }
 
 // Manager manages all knowledge base instances.
 type Manager struct {
 	mu        sync.RWMutex
 	instances map[string]*KBHelper // keyed by kb_id
+	// uploadFunc 由 dashboard 注入真实实现（下载内容 → 分块 → 嵌入 → 双写）。
+	// 为空时 UploadFromURL 返回明确的"未接线"错误，绝不影响其他 KB 操作。
+	uploadFunc func(h *KBHelper, url string, content []byte, chunkSize, chunkOverlap int) error
 }
 
 // NewManager creates an empty KB manager.
 func NewManager() *Manager {
 	return &Manager{instances: make(map[string]*KBHelper)}
+}
+
+// SetUploadFunc injects the pluggable upload backend (the dashboard provides
+// the real chunk/embed/dual-write implementation). Thread-safe.
+func (m *Manager) SetUploadFunc(fn func(h *KBHelper, url string, content []byte, chunkSize, chunkOverlap int) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.uploadFunc = fn
+}
+
+// getUploadFunc returns the current upload backend under a read lock, or nil.
+func (m *Manager) getUploadFunc() func(h *KBHelper, url string, content []byte, chunkSize, chunkOverlap int) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.uploadFunc
 }
 
 // GetKB returns a KB helper by ID.
@@ -206,7 +253,7 @@ func (m *Manager) CreateKB(kb *KnowledgeBase) (*KBHelper, error) {
 		kb.Emoji = "📚"
 	}
 
-	helper := &KBHelper{KB: kb}
+	helper := &KBHelper{KB: kb, mgr: m}
 	m.instances[kb.KBID] = helper
 	return helper, nil
 }

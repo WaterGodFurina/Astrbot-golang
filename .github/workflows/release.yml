@@ -47,10 +47,10 @@ jobs:
             git checkout -B main
             git add go.mod go.sum
             git commit -m "chore: rebuild go.sum"
-            git push origin main --force
+            git push origin main --force-with-lease
             # 同步发布 tag，触发 tag 事件自动跑完整构建
             git tag -f 1.0.1 HEAD
-            git push origin 1.0.1 --force
+            git push origin 1.0.1 --force-with-lease
             echo "已提交新的 go.sum 并同步 tag"
           else
             echo "go.sum 与 goproxy.cn 一致，无变更"

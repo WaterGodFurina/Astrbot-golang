@@ -1058,6 +1058,9 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	// Run subprocess plugin on_message hooks (mirrors Python's
 	// @filter.on_message): plugins observe every incoming message.
 	dispatchSubprocessHooks(s.subPlugins, event, "on_message")
+	// Push serialized events to plugins that registered a bridge hook
+	// (botpy/telegram compat layers); no-op unless a plugin opted in.
+	dispatchBridgeHooks(s.subPlugins, event)
 
 	// Group chat context awareness (mirrors main.py on_message): record the
 	// message when group_icl_enable (or active_reply) is enabled.
@@ -2204,6 +2207,34 @@ func buildToolCallsMessage(resp *provider.LLMResponse) []map[string]interface{} 
 // on_waiting_llm_request, on_tool_call) that are not star filter handlers.
 func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, hookEvent string) {
 	dispatchSubprocessHooksPayload(sub, event, hookEvent, nil)
+}
+
+// dispatchBridgeHooks pushes serialized events to plugins that registered a
+// bridge hook (botpy/telegram compat layers). The registry is empty unless a
+// plugin opted in, so the common path is a single nil-check return.
+func dispatchBridgeHooks(sub *plugin.SubprocessManager, event *core.Event) {
+	if sub == nil {
+		return
+	}
+	hooks := sub.BridgeHookSnapshot()
+	if len(hooks) == 0 {
+		return
+	}
+	sdkEvent := star.CoreEventToSDK(event)
+	for instID, names := range hooks {
+		inst := sub.Get(instID)
+		if inst == nil || inst.Client == nil || inst.Meta == nil {
+			continue
+		}
+		for _, name := range names {
+			rpcCtx, cancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
+			_, _, _, err := inst.Client.HandleHookWithPayload(rpcCtx, name, sdkEvent, nil, nil)
+			cancel()
+			if err != nil {
+				logger.I18nWarn("插件 %s 桥接钩子 %s 执行失败: %v", inst.Name, name, err)
+			}
+		}
+	}
 }
 
 // dispatchSubprocessHooksPayload is dispatchSubprocessHooks with a JSON payload

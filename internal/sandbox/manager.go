@@ -58,6 +58,9 @@ type Booter interface {
 // sandbox runtime without Docker: file operations are mapped into the host
 // root so anything written via sandbox file tools can be read back, and vice
 // versa.
+//
+// 注意：本地子进程没有 CPU/内存/磁盘等资源限制，也缺少强隔离，仅用于
+// 开发/测试场景。不可信代码请使用 DockerBooter 或 RemoteBooter。
 type LocalBooter struct {
 	mu      sync.Mutex
 	running bool

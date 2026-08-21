@@ -12,9 +12,11 @@ import (
 // host config (provider_settings.default_provider_id, else first enabled
 // provider) with the given prompt + system prompt, and returns the reply text.
 // Used to back sdk.Host.ChatLLM (plugins that need to call the LLM directly).
-// imageURLs (may be nil) are appended as multimodal content parts.
-func ChatLLMFromConfig(cfg map[string]interface{}, prompt, systemPrompt string, imageURLs []string) (string, error) {
-	providerCfg, providerSettings, err := resolveProviderFromConfig(cfg)
+// imageURLs/audioURLs (may be nil) are appended as multimodal content parts;
+// tools/contexts (may be empty) are forwarded to the provider request;
+// providerID (may be empty) pins a specific provider by id.
+func ChatLLMFromConfig(cfg map[string]interface{}, prompt, systemPrompt string, imageURLs, audioURLs []string, tools, contexts []map[string]interface{}, providerID string) (string, error) {
+	providerCfg, providerSettings, err := resolveProviderFromConfig(cfg, providerID)
 	if err != nil {
 		return "", err
 	}
@@ -38,6 +40,9 @@ func ChatLLMFromConfig(cfg map[string]interface{}, prompt, systemPrompt string, 
 		Prompt:       prompt,
 		SystemPrompt: systemPrompt,
 		ImageURLs:    imageURLs,
+		AudioURLs:    audioURLs,
+		Tools:        tools,
+		Contexts:     contexts,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
@@ -52,13 +57,27 @@ func ChatLLMFromConfig(cfg map[string]interface{}, prompt, systemPrompt string, 
 }
 
 // resolveProviderFromConfig picks the chat provider config from the host config
-// (default provider id first, then the first enabled provider). Extracted from
-// ProcessStage.resolveProvider so plugins' ChatLLM calls share the same logic.
-func resolveProviderFromConfig(config map[string]interface{}) (map[string]interface{}, map[string]interface{}, error) {
+// (explicit provider id first, then default provider id, then the first enabled
+// provider). Extracted from ProcessStage.resolveProvider so plugins' ChatLLM
+// calls share the same logic. explicitID, when non-empty, pins the provider by
+// id and errors if not found.
+func resolveProviderFromConfig(config map[string]interface{}, explicitID string) (map[string]interface{}, map[string]interface{}, error) {
 	providers, _ := config["provider"].([]interface{})
 	providerSettings, _ := config["provider_settings"].(map[string]interface{})
 	if providerSettings == nil {
 		providerSettings = map[string]interface{}{}
+	}
+	if explicitID != "" {
+		for _, p := range providers {
+			pc, ok := p.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if id, _ := pc["id"].(string); id == explicitID {
+				return pc, providerSettings, nil
+			}
+		}
+		return nil, nil, fmt.Errorf("未找到指定的模型提供商 %s，请检查配置", explicitID)
 	}
 	selected, _ := providerSettings["default_provider_id"].(string)
 	if selected != "" {

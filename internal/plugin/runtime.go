@@ -203,6 +203,14 @@ type SubprocessManager struct {
 	// SessionWaitStage 查询消费（见 session_wait.go）。
 	sessionWaitMu  sync.Mutex
 	sessionWaitReg map[string]*sessionWaitEntry
+
+	// bridgeHooksMu 保护 bridgeHooks：实例 ID → 桥接钩子名集合。桥接钩子
+	// 由 Python SDK 的 botpy/telegram 兼容层经 HostService.RegisterBridgeHook
+	// 注册，宿主管线每收到入站消息时向注册过的插件推送序列化事件（见
+	// pipeline.dispatchBridgeHooks）。注册表为空是常见路径，管线快速返回，
+	// 不产生任何额外 RPC 开销。
+	bridgeHooksMu sync.RWMutex
+	bridgeHooks   map[string]map[string]struct{}
 }
 
 // Touch marks the plugin as active (called before/after every RPC into the
@@ -305,6 +313,72 @@ func (m *SubprocessManager) removePluginTools(id string) {
 	}
 }
 
+// RegisterBridgeHook 幂等注册实例 instID 的一个桥接钩子（botpy/telegram
+// 兼容层经 HostService.RegisterBridgeHook 调用）。注册后宿主管线每收到入站
+// 消息即向该钩子推送序列化事件。
+func (m *SubprocessManager) RegisterBridgeHook(instID, hookName string) {
+	if m == nil || instID == "" || hookName == "" {
+		return
+	}
+	m.bridgeHooksMu.Lock()
+	set := m.bridgeHooks[instID]
+	if set == nil {
+		set = make(map[string]struct{})
+		m.bridgeHooks[instID] = set
+	}
+	set[hookName] = struct{}{}
+	m.bridgeHooksMu.Unlock()
+}
+
+// UnregisterBridgeHook 幂等注销实例 instID 的一个桥接钩子；该实例无剩余
+// 钩子时移除其键。
+func (m *SubprocessManager) UnregisterBridgeHook(instID, hookName string) {
+	if m == nil || instID == "" || hookName == "" {
+		return
+	}
+	m.bridgeHooksMu.Lock()
+	if set := m.bridgeHooks[instID]; set != nil {
+		delete(set, hookName)
+		if len(set) == 0 {
+			delete(m.bridgeHooks, instID)
+		}
+	}
+	m.bridgeHooksMu.Unlock()
+}
+
+// BridgeHookSnapshot 返回桥接钩子注册表的快照（实例 ID → hook 名切片）。
+// 注册表为空时返回 nil，调用方可据此快速返回，零额外开销。
+func (m *SubprocessManager) BridgeHookSnapshot() map[string][]string {
+	if m == nil {
+		return nil
+	}
+	m.bridgeHooksMu.RLock()
+	defer m.bridgeHooksMu.RUnlock()
+	if len(m.bridgeHooks) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(m.bridgeHooks))
+	for instID, set := range m.bridgeHooks {
+		names := make([]string, 0, len(set))
+		for name := range set {
+			names = append(names, name)
+		}
+		out[instID] = names
+	}
+	return out
+}
+
+// removePluginBridgeHooks 清除某实例的全部桥接钩子条目（真实卸载/禁用时
+// 调用，防止向已终止进程推送）。
+func (m *SubprocessManager) removePluginBridgeHooks(id string) {
+	if m == nil || id == "" {
+		return
+	}
+	m.bridgeHooksMu.Lock()
+	delete(m.bridgeHooks, id)
+	m.bridgeHooksMu.Unlock()
+}
+
 // setHandlerMeta 记录插件 id → Register 元数据（startInstance 注册成功时
 // 调用；reload/唤醒/崩溃重启的新实例会覆盖旧条目）。meta 为 nil 时删除。
 func (m *SubprocessManager) setHandlerMeta(id string, meta *sdkv1.RegisterResponse) {
@@ -373,6 +447,7 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 		toolRegistry:     make(map[string]toolRegEntry),
 		handlerMeta:      make(map[string]*sdkv1.RegisterResponse),
 		sessionWaitReg:   make(map[string]*sessionWaitEntry),
+		bridgeHooks:      make(map[string]map[string]struct{}),
 		logLevels:        newLogLevels(dataDir),
 		toolchain:        tc,
 		compiler:         NewCompiler(tc),
@@ -1016,6 +1091,7 @@ func (m *SubprocessManager) unloadLocked(id string, notify bool) error {
 		// 保留，前者供按名唤醒、后者供 Rebridge 重建休眠插件 handler）。
 		m.removePluginTools(id)
 		m.removeHandlerMeta(id)
+		m.removePluginBridgeHooks(id)
 		logger.I18nInfo("插件 %s 已卸载", id)
 		m.notifyChanged()
 	} else {
@@ -1275,6 +1351,9 @@ func (m *SubprocessManager) Shutdown() {
 	m.toolRegMu.Lock()
 	m.toolRegistry = make(map[string]toolRegEntry)
 	m.toolRegMu.Unlock()
+	m.bridgeHooksMu.Lock()
+	m.bridgeHooks = make(map[string]map[string]struct{})
+	m.bridgeHooksMu.Unlock()
 
 	for _, inst := range insts {
 		inst.mu.Lock()

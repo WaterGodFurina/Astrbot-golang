@@ -522,13 +522,13 @@ func mustJSON(v interface{}) []byte {
 
 // chatLLMForPlugins backs sdk.Host.ChatLLM: calls the host's default chat LLM
 // provider with the given prompt + system prompt (+ optional image URLs).
-func (l *Lifecycle) chatLLMForPlugins(prompt, systemPrompt string, imageURLs []string) (string, error) {
+func (l *Lifecycle) chatLLMForPlugins(cmd plugin.ChatLLMCmd) (string, error) {
 	cfg := l.configMgr.Get("default")
 	cfgMap := map[string]interface{}{}
 	if cfg != nil {
 		cfgMap = cfg.All()
 	}
-	return pipeline.ChatLLMFromConfig(cfgMap, prompt, systemPrompt, imageURLs)
+	return pipeline.ChatLLMFromConfig(cfgMap, cmd.Prompt, cmd.SystemPrompt, cmd.ImageURLs, cmd.AudioURLs, cmd.Tools, cmd.Contexts, cmd.ProviderID)
 }
 
 // buildPipelineScheduler assembles the full 10-stage pipeline for a config ID

@@ -547,6 +547,7 @@ func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
 		result, err := scheduler.Process(ctx, event)
 		if err != nil {
 			logger.Error("Pipeline task failed: %v", err)
+			break
 		}
 		if result != nil && !result.Continue {
 			break

@@ -29,6 +29,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
@@ -290,6 +291,26 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		}
 		if v, ok := managers["knowledgebase"]; ok {
 			s.kbMgr = v
+			// 接线 URL 上传后端：复用 URL 导入 handler 的分块→嵌入→双写路径。
+			// 类型断言失败时跳过，绝不阻断启动。
+			if km, ok := v.(*knowledgebase.Manager); ok {
+				km.SetUploadFunc(func(h *knowledgebase.KBHelper, url string, content []byte, chunkSize, chunkOverlap int) error {
+					if h == nil || h.KB == nil {
+						return fmt.Errorf("knowledge base helper is nil")
+					}
+					kbID := h.KB.KBID
+					if kbID == "" {
+						return fmt.Errorf("knowledge base id is empty")
+					}
+					name := filepath.Base(strings.TrimRight(url, "/"))
+					if name == "" || name == "." || name == "/" {
+						name = "url_import"
+					}
+					docID := fmt.Sprintf("doc_url_%d_%s", time.Now().UnixNano(), name)
+					_, err := s.indexKBFile(kbID, docID, name, content, chunkSize, chunkOverlap)
+					return err
+				})
+			}
 		}
 		if v, ok := managers["skills"]; ok {
 			s.skillMgr = v

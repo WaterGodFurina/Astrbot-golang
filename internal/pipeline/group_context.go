@@ -451,7 +451,7 @@ func callImageCaptionProvider(cfg map[string]interface{}, providerID, imageURL, 
 		}
 	} else {
 		var err error
-		pc, _, err = resolveProviderFromConfig(cfg)
+		pc, _, err = resolveProviderFromConfig(cfg, "")
 		if err != nil {
 			return "", err
 		}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 )
@@ -150,8 +151,8 @@ func TestHostServiceReverseCalls(t *testing.T) {
 
 	// Install fake host hooks before launching the plugin client.
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
-		ChatLLM: func(prompt, systemPrompt string, imageURLs []string) (string, error) {
-			return "echo:" + prompt, nil
+		ChatLLM: func(req *sdkv1.ChatLLMRequest) (string, error) {
+			return "echo:" + req.Prompt, nil
 		},
 		SetConfig: func(pluginName string, cfg map[string]any) error {
 			saved[pluginName] = cfg

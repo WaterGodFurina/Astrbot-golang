@@ -725,7 +725,7 @@ func ensureVenvReady(dataDir string) (string, error) {
 var hostBaseDeps = []string{
 	"grpcio", "protobuf",
 	"quart", "werkzeug", "jinja2",
-	"aiohttp", "httpx", "requests",
+	"aiohttp", "httpx", "requests", "mcp",
 	"pydantic", "pyyaml", "pillow",
 	"deprecated", "docstring-parser", "markdown", "psutil",
 	"websockets", "apscheduler", "tenacity",
@@ -741,7 +741,7 @@ var hostBaseDeps = []string{
 var hostDepProbes = []string{
 	"grpc", "google.protobuf",
 	"quart", "werkzeug", "jinja2",
-	"aiohttp", "httpx", "requests", "apscheduler", "tenacity",
+	"aiohttp", "httpx", "requests", "mcp", "apscheduler", "tenacity",
 	"openai", "anthropic", "dashscope",
 	"pydantic", "yaml", "PIL", "deprecated", "docstring_parser", "markdown", "psutil",
 	"websockets", "cryptography", "qrcode", "packaging", "jwt",
@@ -753,7 +753,7 @@ var hostDepProbes = []string{
 // baseDepsVersion 是宿主依赖清单（hostBaseDeps/hostDepProbes）的版本号：
 // 修改清单内容时手动 +1，触发既有 venv 的 environment.json 不匹配而重新
 // pip 安装（否则 venv 一旦 READY 就永久复用，清单变化不会生效）。
-const baseDepsVersion = 2
+const baseDepsVersion = 3
 
 const (
 	// envFileName 记录 venv 的供给来源（解释器 / SDK 版本 / 依赖清单版本）。
