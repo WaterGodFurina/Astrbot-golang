@@ -462,9 +462,9 @@ function getVersion() {
       botCurrVersion.value = "v" + (res.data.data.version || "");
       dashboardCurrentVersion.value = res.data.data?.dashboard_version || "";
       commonStore.setAstrBotVersion(
-        res.data.data.version || "",
-        res.data.data?.dashboard_version || undefined,
-        res.data.data?.python_version || undefined,
+        String(res.data.data.version || ""),
+        String(res.data.data?.dashboard_version || ""),
+        String(res.data.data?.python_version || ""),
         String(res.data.data?.go_version || ""),
       );
       const change_pwd_hint = res.data.data?.change_pwd_hint;
