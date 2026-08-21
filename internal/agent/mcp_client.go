@@ -80,22 +80,26 @@ func (c *MCPClient) Connect(ctx context.Context) error {
 		}
 		args := configStringSlice(c.config, "args")
 		cl, err = client.NewStdioMCPClient(command, env, args...)
+	} else if c.isStreamableHTTP() {
+		// Streamable HTTP transport（对齐原版 Python MCP 的
+		// transport: "streamable_http" 语义）。
+		url, _ := c.config["url"].(string)
+		if url == "" {
+			return fmt.Errorf("MCP streamable HTTP client %q is missing the url", c.name)
+		}
+		var opts []transport.StreamableHTTPCOption
+		if hs := configHeaders(c.config); len(hs) > 0 {
+			opts = append(opts, transport.WithHTTPHeaders(hs))
+		}
+		cl, err = client.NewStreamableHttpClient(url, opts...)
 	} else {
 		url, _ := c.config["url"].(string)
 		if url == "" {
 			return fmt.Errorf("MCP client %q has neither a URL nor a stdio command", c.name)
 		}
-		opts := []transport.ClientOption{}
-		if headers, ok := c.config["headers"].(map[string]interface{}); ok {
-			hs := map[string]string{}
-			for k, v := range headers {
-				if vs, ok := v.(string); ok {
-					hs[k] = vs
-				}
-			}
-			if len(hs) > 0 {
-				opts = append(opts, transport.WithHeaders(hs))
-			}
+		var opts []transport.ClientOption
+		if hs := configHeaders(c.config); len(hs) > 0 {
+			opts = append(opts, transport.WithHeaders(hs))
 		}
 		cl, err = client.NewSSEMCPClient(url, opts...)
 	}
@@ -141,6 +145,33 @@ func (c *MCPClient) isStdio() bool {
 		t, _ = c.config["type"].(string)
 	}
 	return t == "stdio"
+}
+
+// isStreamableHTTP reports whether the configured transport is streamable
+// HTTP（对齐原版 Python MCP 的 transport 命名）。
+func (c *MCPClient) isStreamableHTTP() bool {
+	t, _ := c.config["transport"].(string)
+	if t == "" {
+		t, _ = c.config["type"].(string)
+	}
+	switch t {
+	case "streamable_http", "streamable", "http":
+		return true
+	}
+	return false
+}
+
+// configHeaders extracts the configured HTTP headers into a map[string]string.
+func configHeaders(config map[string]interface{}) map[string]string {
+	hs := map[string]string{}
+	if headers, ok := config["headers"].(map[string]interface{}); ok {
+		for k, v := range headers {
+			if vs, ok := v.(string); ok {
+				hs[k] = vs
+			}
+		}
+	}
+	return hs
 }
 
 // listTools issues tools/list and caches the returned tool definitions.
