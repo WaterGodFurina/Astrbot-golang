@@ -283,6 +283,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       security-events: write
+    env:
+      GOPROXY: https://goproxy.cn,direct
+      GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+      GOFLAGS: -mod=mod
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
