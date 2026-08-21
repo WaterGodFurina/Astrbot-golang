@@ -254,10 +254,30 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "设置权限失败: " + err.Error()})
 		return
 	}
-	if err := os.Rename(tmpExe, exe); err != nil {
-		_ = os.Remove(tmpExe)
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败: " + err.Error()})
-		return
+	if runtime.GOOS == "windows" {
+		// Windows 不允许覆盖/删除正在运行的 exe，但允许改名（MoveFileEx 无
+		// REPLACE）。两步改名：先把当前 exe 移成 .old，再把新 exe 移入原位；
+		// 新实例启动时删除 .old（见 main.go 启动清理）。
+		oldExe := exe + ".old"
+		_ = os.Remove(oldExe) // 清理上次升级残留
+		if err := os.Rename(exe, oldExe); err != nil {
+			_ = os.Remove(tmpExe)
+			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败（无法改名运行中的 exe）: " + err.Error()})
+			return
+		}
+		if err := os.Rename(tmpExe, exe); err != nil {
+			// 回滚：把旧 exe 移回原位，避免留下"无主 exe"。
+			_ = os.Rename(oldExe, exe)
+			_ = os.Remove(tmpExe)
+			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败: " + err.Error()})
+			return
+		}
+	} else {
+		if err := os.Rename(tmpExe, exe); err != nil {
+			_ = os.Remove(tmpExe)
+			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败: " + err.Error()})
+			return
+		}
 	}
 
 	s.updateProgressSet(progressID, &installStatus{Status: "done", Percent: 100, Text: "升级完成，正在重启…"})
