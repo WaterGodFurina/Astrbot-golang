@@ -6,7 +6,6 @@ package pysdk
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -82,7 +81,11 @@ const (
 
 	defaultPythonVersion = "20260814"
 	defaultPythonMinor   = "3.12"
-	pyBuildStandaloneURL = "https://github.com/astral-sh/python-build-standalone/releases/download"
+	// minSupportedPythonMinor 是宿主最低支持的 Python 版本（对齐 Python SDK
+	// 的 requires-python >=3.10）。低于此版本的系统解释器会被 DiscoverPythonBin
+	// 拒绝，回退下载 bundled CPython（3.12）——避免 3.8 这类装不了插件的旧版本。
+	minSupportedPythonMinor = "3.10"
+	pyBuildStandaloneURL    = "https://github.com/astral-sh/python-build-standalone/releases/download"
 
 	// defaultPyPIIndex 是国内默认 pip 镜像（阿里云）。用户环境可通过
 	// ASTRBOT_PYPI_INDEX（或 PIP_INDEX_URL）覆盖为其他源。
@@ -222,19 +225,46 @@ func DiscoverPythonBin() string {
 
 // pythonUsable 判断解释器是否真实可用：拒绝 Windows 商店的 App Execution Alias
 // 桩（WindowsApps 下的 python3.exe 不是真解释器，创建 venv 必然失败 exit 9009），
-// 并用一条快速探测命令验证能真正启动。
+// 并校验版本不低于宿主最低支持（对齐 SDK requires-python），否则视为不可用，
+// 由 DiscoverPythonBin 回退下载 bundled CPython。
 func pythonUsable(p string) bool {
 	if strings.Contains(strings.ToLower(p), `windowsapps`) {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, p, "-c", "import sys; print(sys.version.split()[0])")
+	cmd := exec.CommandContext(ctx, p, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
 	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}
-	return len(bytes.TrimSpace(out)) > 0
+	ver := strings.TrimSpace(string(out))
+	if !minorAtLeast(ver, minSupportedPythonMinor) {
+		logger.Warn("Python %s（%s）低于宿主最低支持版本 %s，跳过回退 bundled Python",
+			ver, p, minSupportedPythonMinor)
+		return false
+	}
+	return true
+}
+
+// minorAtLeast 比较 "major.minor" 是否 >= 基准（如 "3.10"）。
+func minorAtLeast(v, min string) bool {
+	parse := func(s string) (int, int) {
+		var a, b int
+		if _, err := fmt.Sscanf(s, "%d.%d", &a, &b); err != nil {
+			return -1, -1
+		}
+		return a, b
+	}
+	va, vb := parse(v)
+	ma, mb := parse(min)
+	if va < 0 || ma < 0 {
+		return false
+	}
+	if va != ma {
+		return va > ma
+	}
+	return vb >= mb
 }
 
 // EnsurePythonBin resolves an interpreter, downloading a bundled Python
