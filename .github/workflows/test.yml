@@ -299,6 +299,7 @@ jobs:
       - name: 重建 go.sum（引用最新 Go SDK，CodeQL autobuild 依赖）
         env:
           GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
         run: go mod tidy
 
