@@ -13,6 +13,7 @@ export const useCommonStore = defineStore("common", {
     startTime: -1,
     astrbotVersion: "",
     dashboardVersion: "",
+    pythonVersion: "",
 
     pluginMarketData: [],
     pluginMarketDataBySource: {},
@@ -157,9 +158,10 @@ export const useCommonStore = defineStore("common", {
       this.startTime = res.data.data.start_time;
       return this.startTime;
     },
-    setAstrBotVersion(version, dashboardVersion = "") {
+    setAstrBotVersion(version, dashboardVersion = "", pythonVersion = "") {
       this.astrbotVersion = String(version || "").replace(/^v/i, "");
       this.dashboardVersion = String(dashboardVersion || "");
+      this.pythonVersion = String(pythonVersion || "").replace(/^v/i, "");
     },
     async fetchAstrBotVersion(force = false) {
       if (!force && this.astrbotVersion) {
@@ -167,7 +169,11 @@ export const useCommonStore = defineStore("common", {
       }
       const res = await statsApi.version();
       const data = res.data?.data || {};
-      this.setAstrBotVersion(data.version, data.dashboard_version);
+      this.setAstrBotVersion(
+        data.version,
+        data.dashboard_version,
+        data.python_version,
+      );
       return this.astrbotVersion;
     },
     getStartTime() {

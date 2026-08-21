@@ -28,6 +28,11 @@ import (
 
 var logger = log.GetDefault().WithComponent("PySDK")
 
+// ErrRuntimeUnavailable is returned by PrepareRuntimeWithStage when no usable
+// Python runtime can be prepared (missing interpreter / host base deps cannot
+// be installed). Installers surface it to the user as a download prompt.
+var ErrRuntimeUnavailable = errors.New("无法准备 Python 运行时（缺少宿主基础依赖且无法自动安装）")
+
 // SDKRootName is the relative directory (under the data dir) that the SDK is
 // downloaded/extracted to.
 const SDKRootName = "python-sdk"
@@ -867,7 +872,7 @@ func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, e
 		py = EnsureVenv(dataDir)
 	}
 	if py == "" {
-		return nil, fmt.Errorf("无法准备 Python 运行时（缺少宿主基础依赖且无法自动安装）")
+		return nil, ErrRuntimeUnavailable
 	}
 	return &RuntimeEnv{
 		PythonBin: py,

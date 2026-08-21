@@ -286,6 +286,26 @@
       "use_clang": "Использовать Clang",
       "use_gcc": "Использовать системный GCC"
     },
+    "go_sdk": {
+      "android_hint": "Установите Go SDK в Termux следующей командой:",
+      "cancel": "Отмена",
+      "copy": "Скопировать команду",
+      "download": "Скачать",
+      "download_hint": "Автоматически загрузить и настроить Go SDK?",
+      "installed": "Уже установлено",
+      "message": "Для этого плагина требуется Go SDK для сборки.",
+      "title": "Требуется Go SDK"
+    },
+    "python_runtime": {
+      "android_hint": "Установите Python в Termux следующей командой:",
+      "cancel": "Отмена",
+      "copy": "Скопировать команду",
+      "download": "Скачать",
+      "download_hint": "Автоматически загрузить CPython?",
+      "installed": "Уже установлено",
+      "message": "Для этого плагина требуется Python runtime.",
+      "title": "Требуется Python Runtime"
+    },
     "risk_warning": {
       "cancel": "Отменить установку",
       "confirm": "Игнорировать риск и продолжить",
@@ -316,6 +336,8 @@
     "fillUrlOrFile": "Укажите ссылку или выберите файл",
     "dontFillBoth": "Пожалуйста, используйте либо ссылку, либо файл, но не оба сразу",
     "supportedFormats": "Поддерживаются файлы плагинов в формате .zip",
+    "pkgCommandCopied": "Команда скопирована, выполните её в терминале",
+    "pkgCommandCopyFailed": "Не удалось скопировать, скопируйте команду вручную",
     "updateAllSuccess": "Все плагины успешно обновлены",
     "updateAllFailed": "Ошибок при обновлении: {failed} из {total}:",
     "noUpdatesAvailable": "Нет плагинов с доступными обновлениями",

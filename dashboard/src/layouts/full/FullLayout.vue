@@ -77,6 +77,7 @@ onMounted(() => {
         commonStore.setAstrBotVersion(
           response.data.data?.version,
           response.data.data?.dashboard_version,
+          response.data.data?.python_version,
         );
       }
     } catch (error) {

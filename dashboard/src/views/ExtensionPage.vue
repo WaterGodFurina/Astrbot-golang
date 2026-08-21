@@ -168,6 +168,13 @@ const {
   chooseCCClang,
   chooseCCDownload,
   cancelCCInstall,
+  goSdkDialog,
+  chooseGoDownload,
+  cancelGoDownload,
+  pythonRuntimeDialog,
+  choosePythonDownload,
+  cancelPythonDownload,
+  copyPkgCommand,
   installProgress,
   newExtension,
   normalizePlatformList,
@@ -763,6 +770,104 @@ const updateDialogPluginLogo = computed(() => {
         >
           {{ tm("dialogs.c_compiler.download") }}
         </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <!-- Go SDK 缺失对话框 -->
+  <v-dialog v-model="goSdkDialog.show" width="560" persistent>
+    <v-card>
+      <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center">
+        <v-icon color="warning" class="mr-2">mdi-language-go</v-icon>
+        {{ tm("dialogs.go_sdk.title") }}
+      </v-card-title>
+      <v-card-text>
+        <div class="mb-2">{{ goSdkDialog.message }}</div>
+        <template v-if="goSdkDialog.android">
+          <div class="mb-2 text-medium-emphasis">
+            {{ tm("dialogs.go_sdk.android_hint") }}
+          </div>
+          <div class="d-flex align-center mb-2">
+            <code class="flex-grow-1">pkg update && pkg install golang</code>
+            <v-btn
+              size="small"
+              variant="tonal"
+              @click="copyPkgCommand('pkg update && pkg install golang')"
+            >
+              {{ tm("dialogs.go_sdk.copy") }}
+            </v-btn>
+          </div>
+        </template>
+        <div v-else class="text-medium-emphasis">
+          {{ tm("dialogs.go_sdk.download_hint") }}
+        </div>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer></v-spacer>
+        <template v-if="goSdkDialog.android">
+          <v-btn color="success" variant="tonal" @click="cancelGoDownload">
+            {{ tm("dialogs.go_sdk.installed") }}
+          </v-btn>
+        </template>
+        <template v-else>
+          <v-btn color="grey" variant="text" @click="cancelGoDownload">
+            {{ tm("dialogs.go_sdk.cancel") }}
+          </v-btn>
+          <v-btn color="primary" variant="tonal" @click="chooseGoDownload">
+            {{ tm("dialogs.go_sdk.download") }}
+          </v-btn>
+        </template>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <!-- Python 运行时缺失对话框 -->
+  <v-dialog v-model="pythonRuntimeDialog.show" width="560" persistent>
+    <v-card>
+      <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center">
+        <v-icon color="warning" class="mr-2">mdi-language-python</v-icon>
+        {{ tm("dialogs.python_runtime.title") }}
+      </v-card-title>
+      <v-card-text>
+        <div class="mb-2">{{ pythonRuntimeDialog.message }}</div>
+        <template v-if="pythonRuntimeDialog.android">
+          <div class="mb-2 text-medium-emphasis">
+            {{ tm("dialogs.python_runtime.android_hint") }}
+          </div>
+          <div class="d-flex align-center mb-2">
+            <code class="flex-grow-1">pkg update && pkg install python</code>
+            <v-btn
+              size="small"
+              variant="tonal"
+              @click="copyPkgCommand('pkg update && pkg install python')"
+            >
+              {{ tm("dialogs.python_runtime.copy") }}
+            </v-btn>
+          </div>
+        </template>
+        <div v-else class="text-medium-emphasis">
+          {{ tm("dialogs.python_runtime.download_hint") }}
+        </div>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer></v-spacer>
+        <template v-if="pythonRuntimeDialog.android">
+          <v-btn color="success" variant="tonal" @click="cancelPythonDownload">
+            {{ tm("dialogs.python_runtime.installed") }}
+          </v-btn>
+        </template>
+        <template v-else>
+          <v-btn color="grey" variant="text" @click="cancelPythonDownload">
+            {{ tm("dialogs.python_runtime.cancel") }}
+          </v-btn>
+          <v-btn
+            color="primary"
+            variant="tonal"
+            @click="choosePythonDownload"
+          >
+            {{ tm("dialogs.python_runtime.download") }}
+          </v-btn>
+        </template>
       </v-card-actions>
     </v-card>
   </v-dialog>

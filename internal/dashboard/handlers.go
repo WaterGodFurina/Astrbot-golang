@@ -2203,7 +2203,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 
 	var source, id, installID string
 	var ignoreRisk bool
-	var ccChoice string
+	var ccChoice, goChoice, pythonChoice string
 	var installMethod, registryURL, registryName, marketPluginID, repo, downloadURL string
 
 	method := "url"
@@ -2217,6 +2217,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			URL            string `json:"url"`
 			IgnoreRisk     bool   `json:"ignore_risk"`
 			CCChoice       string `json:"cc_choice"`
+			GoChoice       string `json:"go_choice"`
+			PythonChoice   string `json:"python_choice"`
 			InstallID      string `json:"install_id"`
 			InstallMethod  string `json:"install_method"`
 			RegistryURL    string `json:"registry_url"`
@@ -2229,6 +2231,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		source = strings.TrimSpace(body.URL)
 		ignoreRisk = body.IgnoreRisk
 		ccChoice = strings.TrimSpace(body.CCChoice)
+		goChoice = strings.TrimSpace(body.GoChoice)
+		pythonChoice = strings.TrimSpace(body.PythonChoice)
 		installID = body.InstallID
 		installMethod = body.InstallMethod
 		registryURL = body.RegistryURL
@@ -2278,6 +2282,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		id = idFromSource(fh.Filename)
 		ignoreRisk = r.FormValue("ignore_risk") == "true"
 		ccChoice = strings.TrimSpace(r.FormValue("cc_choice"))
+		goChoice = strings.TrimSpace(r.FormValue("go_choice"))
+		pythonChoice = strings.TrimSpace(r.FormValue("python_choice"))
 		installID = r.FormValue("install_id")
 		installMethod = r.FormValue("install_method")
 		registryURL = r.FormValue("registry_url")
@@ -2321,6 +2327,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{
 		IgnoreRisk:     ignoreRisk,
 		CCChoice:       ccChoice,
+		GoChoice:       goChoice,
+		PythonChoice:   pythonChoice,
 		Progress:       s.installProgressCallback(installID),
 		Stage:          s.installStageCallback(installID),
 		InstallMethod:  installMethod,
@@ -2363,6 +2371,25 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			})
 			return
 		}
+		var runtimeErr *plugin.RuntimePromptError
+		if errors.As(err, &runtimeErr) {
+			done = false
+			code := "go_sdk_prompt"
+			if runtimeErr.Kind == plugin.RuntimePromptPython {
+				code = "python_runtime_prompt"
+			}
+			s.setInstallProgress(installID, &installStatus{Status: "installing", Text: "需要确认下载运行时…"})
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":  "error",
+				"code":    code,
+				"message": runtimeErr.Error(),
+				"data": map[string]interface{}{
+					"kind":    string(runtimeErr.Kind),
+					"android": runtimeErr.Android,
+				},
+			})
+			return
+		}
 		s.setInstallProgress(installID, &installStatus{Status: "error", Text: err.Error()})
 		done = false
 		writeJSON(w, http.StatusOK, apiError("插件安装失败: "+err.Error()))
@@ -2392,13 +2419,20 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 
 	ids := []string{}
 	ccChoice := ""
+	goChoice := ""
+	pythonChoice := ""
 	if len(parts) == 1 {
 		ids = append(ids, parts[0])
+		ccChoice = strings.TrimSpace(r.FormValue("cc_choice"))
+		goChoice = strings.TrimSpace(r.FormValue("go_choice"))
+		pythonChoice = strings.TrimSpace(r.FormValue("python_choice"))
 	} else {
 		var body struct {
-			PluginID string   `json:"plugin_id"`
-			Names    []string `json:"names"`
-			CCChoice string   `json:"cc_choice"`
+			PluginID     string   `json:"plugin_id"`
+			Names        []string `json:"names"`
+			CCChoice     string   `json:"cc_choice"`
+			GoChoice     string   `json:"go_choice"`
+			PythonChoice string   `json:"python_choice"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if body.PluginID != "" {
@@ -2407,6 +2441,8 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			ids = body.Names
 		}
 		ccChoice = strings.TrimSpace(body.CCChoice)
+		goChoice = strings.TrimSpace(body.GoChoice)
+		pythonChoice = strings.TrimSpace(body.PythonChoice)
 	}
 	if len(ids) == 0 {
 		writeJSON(w, http.StatusOK, apiError("缺少要更新的插件"))
@@ -2417,9 +2453,11 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 	defer cancel()
 
 	type result struct {
-		Name    string `json:"name"`
-		Status  string `json:"status"`
-		Message string `json:"message"`
+		Name    string                 `json:"name"`
+		Status  string                 `json:"status"`
+		Code    string                 `json:"code,omitempty"`
+		Data    map[string]interface{} `json:"data,omitempty"`
+		Message string                 `json:"message"`
 	}
 	results := make([]result, 0, len(ids))
 	for _, id := range ids {
@@ -2429,16 +2467,33 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			continue
 		}
 		inst, err := s.subPluginMgr.ReinstallSource(ctx, pid, plugin.InstallOptions{
-			Progress: s.installProgressCallback(""),
-			CCChoice: ccChoice,
+			Progress:     s.installProgressCallback(""),
+			CCChoice:     ccChoice,
+			GoChoice:     goChoice,
+			PythonChoice: pythonChoice,
 		})
 		if err != nil {
 			var riskErr *plugin.RiskError
 			if errors.As(err, &riskErr) {
 				results = append(results, result{Name: name, Status: "error", Message: "源码包含风险代码"})
-			} else {
-				results = append(results, result{Name: name, Status: "error", Message: err.Error()})
+				continue
 			}
+			var runtimeErr *plugin.RuntimePromptError
+			if errors.As(err, &runtimeErr) {
+				code := "go_sdk_prompt"
+				if runtimeErr.Kind == plugin.RuntimePromptPython {
+					code = "python_runtime_prompt"
+				}
+				results = append(results, result{
+					Name:    name,
+					Status:  "error",
+					Code:    code,
+					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android},
+					Message: runtimeErr.Error(),
+				})
+				continue
+			}
+			results = append(results, result{Name: name, Status: "error", Message: err.Error()})
 			continue
 		}
 		results = append(results, result{Name: inst.Name, Status: "ok", Message: "更新成功"})
@@ -2446,6 +2501,17 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 
 	s.notifyPluginsChanged()
 	if len(ids) == 1 && len(results) == 1 && results[0].Status == "error" {
+		// 单一插件更新失败：保留提示 code（如 go_sdk_prompt/python_runtime_prompt），
+		// 否则前端只 toast 无法弹窗让用户决定是否下载运行时。
+		if results[0].Code != "" {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":  "error",
+				"code":    results[0].Code,
+				"message": results[0].Message,
+				"data":    results[0].Data,
+			})
+			return
+		}
 		writeJSON(w, http.StatusOK, apiError("插件更新失败: "+results[0].Message))
 		return
 	}
