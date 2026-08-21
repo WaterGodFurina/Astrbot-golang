@@ -307,6 +307,11 @@ jobs:
           GOFLAGS: -mod=mod
         run: go mod tidy
 
+      - name: 固定 Go 环境（CodeQL tracer 的 go 进程不继承 step env，须经 GOENV 文件）
+        run: |
+          go env -w GOPROXY="https://goproxy.cn,direct"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
