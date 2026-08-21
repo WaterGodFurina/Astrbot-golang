@@ -22,7 +22,7 @@ func TestPluginToolWakesIdlePlugin(t *testing.T) {
 	}
 	m := plugin.NewSubprocessManager(nil, t.TempDir())
 	ctx := context.Background()
-	inst, err := m.InstallFromSource(ctx, "toolwake", filepath.Join("..", "plugin", "testdata", "plugin"), plugin.InstallOptions{})
+	inst, err := m.InstallFromSource(ctx, "toolwake", filepath.Join("..", "plugin", "testdata", "plugin"), plugin.InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestPluginToolRegistryClearedOnUnload(t *testing.T) {
 	}
 	m := plugin.NewSubprocessManager(nil, t.TempDir())
 	ctx := context.Background()
-	inst, err := m.InstallFromSource(ctx, "toolunload", filepath.Join("..", "plugin", "testdata", "plugin"), plugin.InstallOptions{})
+	inst, err := m.InstallFromSource(ctx, "toolunload", filepath.Join("..", "plugin", "testdata", "plugin"), plugin.InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
