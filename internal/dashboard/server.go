@@ -1439,6 +1439,8 @@ func apiError(message string) map[string]interface{} {
 }
 
 // extractToken gets the Bearer token from the Authorization header.
+// Authorization 以 "ApiKey " 开头时按 API key 处理（对齐 Python
+// _extract_dashboard_jwt 语义），不视为 JWT / legacy token。
 func extractToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
@@ -1446,6 +1448,9 @@ func extractToken(r *http.Request) string {
 	}
 	if strings.HasPrefix(auth, "Bearer ") {
 		return strings.TrimPrefix(auth, "Bearer ")
+	}
+	if strings.HasPrefix(auth, "ApiKey ") {
+		return ""
 	}
 	return auth
 }

@@ -2,6 +2,7 @@
 package dashboard
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -782,6 +783,38 @@ func (ks *apiKeyStore) get(keyID string) *apiKeyRecord {
 		}
 	}
 	return nil
+}
+
+// getByHash 按 PBKDF2 哈希查找 API key（常量时间比较，防时序侧信道），
+// 供请求侧鉴权使用（对齐 Python get_active_api_key_by_hash）。
+func (ks *apiKeyStore) getByHash(hash string) *apiKeyRecord {
+	if hash == "" {
+		return nil
+	}
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	for _, k := range ks.data.Keys {
+		if subtle.ConstantTimeCompare([]byte(k.KeyHash), []byte(hash)) == 1 {
+			cp := *k
+			return &cp
+		}
+	}
+	return nil
+}
+
+// touch 更新 key 的 last_used_at 并落盘（请求侧校验通过后调用，
+// 对齐 Python touch_api_key）。
+func (ks *apiKeyStore) touch(keyID string) {
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	for _, k := range ks.data.Keys {
+		if k.KeyID == keyID {
+			k.LastUsedAt = time.Now().Format(time.RFC3339)
+			k.UpdatedAt = k.LastUsedAt
+			_ = ks.save()
+			return
+		}
+	}
 }
 
 func (ks *apiKeyStore) insert(rec *apiKeyRecord) {

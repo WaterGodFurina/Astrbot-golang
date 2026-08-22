@@ -924,6 +924,81 @@ func clientIP(r *http.Request, trustProxy bool) string {
 	return host
 }
 
+// extractAPIKey 提取请求携带的 API key（对齐 Python _extract_raw_api_key）：
+// Authorization: ApiKey <key>、X-API-Key 头、?api_key= / ?key= query 参数。
+// 以 "Bearer " 开头的 Authorization 属于 JWT，不算 API key。
+func extractAPIKey(r *http.Request) string {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(auth, "Bearer ") {
+		return ""
+	}
+	if strings.HasPrefix(auth, "ApiKey ") {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "ApiKey "))
+	}
+	if key := strings.TrimSpace(r.URL.Query().Get("api_key")); key != "" {
+		return key
+	}
+	if key := strings.TrimSpace(r.URL.Query().Get("key")); key != "" {
+		return key
+	}
+	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
+		return key
+	}
+	return ""
+}
+
+// apiKeyAuthorized 校验 API key 并判定端点放行：key 存在、未吊销、未过期，
+// 且其 scope 满足端点规则（对齐 Python _require_api_key_scope）。systemOnly
+// 端点一律拒绝 API key（Python 语义：system 不在 ALL_OPEN_API_SCOPES）。
+func (s *Server) apiKeyAuthorized(rawKey string, rule endpointScope, method string) bool {
+	if rule.systemOnly || s.apiKeys == nil {
+		return false
+	}
+	rec := s.apiKeys.getByHash(hashAPIKey(rawKey))
+	if rec == nil || rec.RevokedAt != "" {
+		return false
+	}
+	if rec.ExpiresAt != "" {
+		if t, err := time.Parse(time.RFC3339, rec.ExpiresAt); err == nil && t.Before(time.Now()) {
+			return false
+		}
+	}
+	if !apiKeyScopeAllowed(rec.Scopes, rule, method) {
+		return false
+	}
+	// 校验通过后更新 last_used_at（对齐 Python touch_api_key）。
+	s.apiKeys.touch(rec.KeyID)
+	return true
+}
+
+// apiKeyScopeAllowed 判定 key 的 scopes 是否满足端点所需 scope（对齐 Python
+// require_scope 的 scope 判定）：含 "*"、含所需 scope，或 OPEN_API_SCOPE_INCLUDES
+// 隐式包含（config 包含 bot/provider）。required 为空时满足任一默认 OPEN API
+// scope 即可（普通端点默认放行）。
+func apiKeyScopeAllowed(scopes []string, rule endpointScope, method string) bool {
+	required := rule.readScope
+	if rule.writeScope != "" && method != http.MethodGet && method != http.MethodHead {
+		required = rule.writeScope
+	}
+	if required == "" {
+		for _, sc := range scopes {
+			if sc == "*" || containsScope(defaultOpenAPIScopes, sc) {
+				return true
+			}
+		}
+		return false
+	}
+	if containsScope(scopes, "*") || containsScope(scopes, required) {
+		return true
+	}
+	for _, sc := range scopes {
+		if containsScope(openAPIScopeIncludes[sc], required) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // TOTP 双重认证
 // ---------------------------------------------------------------------------

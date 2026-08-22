@@ -8649,6 +8649,12 @@ var defaultOpenAPIScopes = []string{
 	"file", "plugin", "mcp", "skill",
 }
 
+// openAPIScopeIncludes 对齐 Python OPEN_API_SCOPE_INCLUDES：拥有某 scope 的
+// API key 隐式获得其包含的 scope。
+var openAPIScopeIncludes = map[string][]string{
+	"config": {"bot", "provider"},
+}
+
 // normalizeAPIScopes 校验并按 Python OPEN_API_SCOPE_INCLUDES 展开 scope：
 // config 隐式包含 bot/provider；chat:admin 需要 chat、config:edit_admin
 // 需要 config。
@@ -8692,9 +8698,9 @@ func normalizeAPIScopes(raw interface{}) ([]string, string) {
 	if containsScope(normalized, "chat:admin") && !containsScope(normalized, "chat") {
 		return nil, "chat:admin requires the chat scope"
 	}
-	// config 隐式包含 bot/provider（OPEN_API_SCOPE_INCLUDES）。
-	if containsScope(normalized, "config") {
-		normalized = append(normalized, "bot", "provider")
+	// 隐式包含：config 包含 bot/provider（OPEN_API_SCOPE_INCLUDES）。
+	for _, sc := range append([]string{}, normalized...) {
+		normalized = append(normalized, openAPIScopeIncludes[sc]...)
 	}
 	seen := map[string]bool{}
 	var dedup []string
