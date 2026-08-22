@@ -120,9 +120,7 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	case "extensions":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "changelogs":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"versions": []interface{}{},
-		}))
+		s.handleChangelogs(w, r, rest)
 
 	// ── Chat ──────────────────────────────────────────────
 	case "chat":

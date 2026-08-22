@@ -5,6 +5,7 @@ package backup
 import (
 	"archive/zip"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
 var logger = log.GetDefault().WithComponent("Backup")
@@ -38,6 +40,21 @@ func (e *Exporter) Export(destPath string) error {
 	defer zipFile.Close()
 
 	zw := zip.NewWriter(zipFile)
+
+	// manifest.json 记录版本/导出时间/内容摘要（对齐 Python exporter），
+	// dashboard 备份列表（origin/astrbot_version/exported_at）与导入预检查
+	// （pre_check 读 manifest.json）都依赖它。
+	manifestData, err := json.MarshalIndent(e.buildManifest(), "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal manifest: %w", err)
+	}
+	mw, err := zw.Create("manifest.json")
+	if err != nil {
+		return fmt.Errorf("create manifest: %w", err)
+	}
+	if _, err := mw.Write(manifestData); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
 
 	// Snapshot the live SQLite database into a consistent file before walking,
 	// so a WAL-mode database is never copied while being written to. The raw
@@ -122,6 +139,41 @@ func (e *Exporter) Export(destPath string) error {
 		return fmt.Errorf("sync zip: %w", err)
 	}
 	return zipFile.Close()
+}
+
+// buildManifest assembles the backup manifest (mirrors Python exporter's
+// manifest: astrbot_version / exported_at / has_config / has_knowledge_bases /
+// directories). The "tables" key is kept empty: the Go exporter backs up the
+// whole data directory including the SQLite database file itself.
+func (e *Exporter) buildManifest() map[string]interface{} {
+	manifest := map[string]interface{}{
+		"astrbot_version":     version.Version,
+		"exported_at":         time.Now().Format(time.RFC3339),
+		"tables":              []string{},
+		"has_knowledge_bases": false,
+		"has_config":          false,
+		"directories":         []string{},
+	}
+	if _, err := os.Stat(filepath.Join(e.dataDir, "cmd_config.json")); err == nil {
+		manifest["has_config"] = true
+	}
+	if _, err := os.Stat(filepath.Join(e.dataDir, "knowledge_bases")); err == nil {
+		manifest["has_knowledge_bases"] = true
+	}
+	entries, err := os.ReadDir(e.dataDir)
+	if err == nil {
+		var dirs []string
+		for _, entry := range entries {
+			if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
+				dirs = append(dirs, entry.Name())
+			}
+		}
+		if dirs == nil {
+			dirs = []string{}
+		}
+		manifest["directories"] = dirs
+	}
+	return manifest
 }
 
 // snapshotDB produces a consistent copy of dataDir/astrbot.db via
@@ -229,4 +281,130 @@ func (i *Importer) Import(srcPath string) error {
 // DefaultBackupName generates a backup filename.
 func DefaultBackupName() string {
 	return fmt.Sprintf("astrbot_backup_%s.zip", time.Now().Format("20060102_150405"))
+}
+
+// ManifestEntry mirrors the backup manifest written by Export (and the Python
+// exporter): origin/astrbot_version/exported_at plus the content summary keys
+// the dashboard list & pre-check surfaces.
+type ManifestEntry struct {
+	Origin            string   `json:"origin,omitempty"`
+	UploadedAt        string   `json:"uploaded_at,omitempty"`
+	AstrbotVersion    string   `json:"astrbot_version"`
+	ExportedAt        string   `json:"exported_at"`
+	Tables            []string `json:"tables"`
+	HasKnowledgeBases bool     `json:"has_knowledge_bases"`
+	HasConfig         bool     `json:"has_config"`
+	Directories       []string `json:"directories"`
+}
+
+// ReadManifest extracts the manifest.json of a backup archive. Returns a
+// zero-value entry when the archive has no (or an unreadable) manifest.
+func ReadManifest(zipPath string) ManifestEntry {
+	var out ManifestEntry
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return out
+	}
+	defer reader.Close()
+	for _, file := range reader.File {
+		if file.Name != "manifest.json" {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			return out
+		}
+		data, err := io.ReadAll(io.LimitReader(rc, 4<<20))
+		_ = rc.Close()
+		if err != nil {
+			return out
+		}
+		_ = json.Unmarshal(data, &out)
+		return out
+	}
+	return out
+}
+
+// CheckResult is the import pre-check outcome, mirroring Python's
+// ImportPreCheckResult.to_dict() so the WebUI confirm dialog fields match.
+type CheckResult struct {
+	Valid          bool     `json:"valid"`
+	CanImport      bool     `json:"can_import"`
+	VersionStatus  string   `json:"version_status"` // match | minor_diff | major_diff
+	BackupVersion  string   `json:"backup_version"`
+	CurrentVersion string   `json:"current_version"`
+	BackupTime     string   `json:"backup_time"`
+	ConfirmMessage string   `json:"confirm_message"`
+	Warnings       []string `json:"warnings"`
+	Error          string   `json:"error"`
+	BackupSummary  struct {
+		Tables            []string `json:"tables"`
+		HasKnowledgeBases bool     `json:"has_knowledge_bases"`
+		HasConfig         bool     `json:"has_config"`
+		Directories       []string `json:"directories"`
+	} `json:"backup_summary"`
+}
+
+// CheckBackup pre-validates a backup archive (zip integrity + manifest),
+// mirroring Python importer.pre_check: version compatibility decides
+// can_import (major version must match, minor differences are allowed).
+func CheckBackup(zipPath string) *CheckResult {
+	res := &CheckResult{CurrentVersion: version.Version}
+	if _, err := os.Stat(zipPath); err != nil {
+		res.Error = "备份文件不存在: " + zipPath
+		return res
+	}
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		res.Error = "无效的 ZIP 文件"
+		return res
+	}
+	defer reader.Close()
+
+	manifest := ReadManifest(zipPath)
+	if manifest.AstrbotVersion == "" && manifest.ExportedAt == "" {
+		res.Error = "备份文件缺少 manifest.json，不是有效的 AstrBot 备份"
+		return res
+	}
+	res.BackupVersion = manifest.AstrbotVersion
+	if res.BackupVersion == "" {
+		res.BackupVersion = "未知"
+	}
+	res.BackupTime = manifest.ExportedAt
+	if res.BackupTime == "" {
+		res.BackupTime = "未知"
+	}
+	res.Valid = true
+	res.BackupSummary.Tables = manifest.Tables
+	res.BackupSummary.HasKnowledgeBases = manifest.HasKnowledgeBases
+	res.BackupSummary.HasConfig = manifest.HasConfig
+	res.BackupSummary.Directories = manifest.Directories
+
+	// 主版本（前两位）必须一致，小版本差异允许导入（对齐 Python
+	// importer._check_version_compatibility）。
+	backupMajor := majorVersion(res.BackupVersion)
+	currentMajor := majorVersion(version.Version)
+	if backupMajor == "" || currentMajor == "" || backupMajor != currentMajor {
+		res.VersionStatus = "major_diff"
+		res.CanImport = false
+		return res
+	}
+	if res.BackupVersion != version.Version {
+		res.VersionStatus = "minor_diff"
+		res.CanImport = true
+		return res
+	}
+	res.VersionStatus = "match"
+	res.CanImport = true
+	return res
+}
+
+// majorVersion returns the first two dotted components of a version string
+// (e.g. "4.27.4" -> "4.27"); "" when unparsable.
+func majorVersion(v string) string {
+	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(v), "v"), ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0] + "." + parts[1]
 }

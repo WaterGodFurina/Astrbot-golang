@@ -45,33 +45,42 @@ var logger = log.GetDefault().WithComponent("Dashboard")
 
 // Server is the WebUI API server.
 type Server struct {
-	mux                *http.ServeMux
-	srv                *http.Server
-	mu                 sync.RWMutex
+	mux *http.ServeMux
+	srv *http.Server
+	mu  sync.RWMutex
 	// configMu 串行化"快照→修改→整键回写"的配置保存组合（upsertProvider 等），
 	// 防止并发保存请求基于同一旧快照互相覆盖导致配置丢失。
-	configMu           sync.Mutex
-	handlers           map[string]http.HandlerFunc
-	auth               *PasswordManager
-	port               int
-	webuiDir           string
-	dataDir            string
-	configMgr          interface{} // *config.ConfigManager
-	providerMgr        interface{} // *provider.ProviderManager
-	platformMgr        interface{} // *platform.PlatformManager
-	eventBus           interface{} // *core.EventBus
-	chatAdapter        *chatStreamAdapter
-	chatBus            *core.EventBus
-	conversationMgr    interface{} // *conversation.Manager
-	cronMgr            interface{} // *cron.CronJobManager
-	subPluginMgr       *plugin.SubprocessManager
-	kbMgr              interface{}              // *knowledgebase.Manager
-	kbTasks            map[string]*kbUploadTask // knowledge base upload task states
-	skillMgr           interface{}              // *skills.SkillManager
-	personaMgr         interface{}              // *persona.PersonaManager
-	personas           *personaStore
-	chat               *chatStore
-	mcp                *mcpStore
+	configMu        sync.Mutex
+	handlers        map[string]http.HandlerFunc
+	auth            *PasswordManager
+	port            int
+	webuiDir        string
+	dataDir         string
+	configMgr       interface{} // *config.ConfigManager
+	providerMgr     interface{} // *provider.ProviderManager
+	platformMgr     interface{} // *platform.PlatformManager
+	eventBus        interface{} // *core.EventBus
+	chatAdapter     *chatStreamAdapter
+	chatBus         *core.EventBus
+	conversationMgr interface{} // *conversation.Manager
+	cronMgr         interface{} // *cron.CronJobManager
+	subPluginMgr    *plugin.SubprocessManager
+	kbMgr           interface{}              // *knowledgebase.Manager
+	kbTasks         map[string]*kbUploadTask // knowledge base upload task states
+	skillMgr        interface{}              // *skills.SkillManager
+	personaMgr      interface{}              // *persona.PersonaManager
+	personas        *personaStore
+	chat            *chatStore
+	threads         *threadStore
+	projects        *projectStore
+	apiKeys         *apiKeyStore
+	mcp             *mcpStore
+	// backupTaskMu/backupTasks 跟踪后台备份任务（导出/导入）进度。
+	backupTaskMu sync.Mutex
+	backupTasks  map[string]*backupTaskState
+	// uploadMu/uploadSessions 跟踪备份分片上传会话。
+	uploadMu           sync.Mutex
+	uploadSessions     map[string]*uploadSession
 	starMgr            interface{} // *star.Manager
 	database           *db.Database
 	startTime          time.Time
@@ -97,6 +106,11 @@ type Server struct {
 	// updateProgress 跟踪"切换版本"升级进度（keyed by progress_id），供前端轮询。
 	updateProgressMu sync.Mutex
 	updateProgress   map[string]*installStatus
+	// chatRuns 跟踪每个 chat session 正在进行的 run（sessionID -> runID ->
+	// cancel），POST /chat/sessions/{id}/stop 与 WebSocket interrupt 复用，
+	// 对齐 Python active_event_registry.request_agent_stop_all。
+	chatRunMu sync.Mutex
+	chatRuns  map[string]map[string]context.CancelFunc
 }
 
 // RegisterWebhook registers a unified-webhook callback by uuid.
@@ -128,6 +142,43 @@ func (s *Server) UnregisterWebhook(uuid string) {
 	s.webhookMu.Lock()
 	defer s.webhookMu.Unlock()
 	delete(s.webhookHandlers, uuid)
+}
+
+// registerChatRun tracks a run's cancel func for a chat session.
+func (s *Server) registerChatRun(sessionID, runID string, cancel context.CancelFunc) {
+	s.chatRunMu.Lock()
+	defer s.chatRunMu.Unlock()
+	if s.chatRuns[sessionID] == nil {
+		s.chatRuns[sessionID] = make(map[string]context.CancelFunc)
+	}
+	s.chatRuns[sessionID][runID] = cancel
+}
+
+// unregisterChatRun removes a finished run from the registry.
+func (s *Server) unregisterChatRun(sessionID, runID string) {
+	s.chatRunMu.Lock()
+	defer s.chatRunMu.Unlock()
+	if runs, ok := s.chatRuns[sessionID]; ok {
+		delete(runs, runID)
+		if len(runs) == 0 {
+			delete(s.chatRuns, sessionID)
+		}
+	}
+}
+
+// cancelChatRuns cancels every in-flight run of a session (POST stop /
+// session delete) and returns the number of runs stopped. Mirrors Python
+// active_event_registry.request_agent_stop_all.
+func (s *Server) cancelChatRuns(sessionID string) int {
+	s.chatRunMu.Lock()
+	runs := s.chatRuns[sessionID]
+	stopped := len(runs)
+	for _, cancel := range runs {
+		cancel()
+	}
+	delete(s.chatRuns, sessionID)
+	s.chatRunMu.Unlock()
+	return stopped
 }
 
 // handleWebhooks dispatches GET/POST /api/v1/webhooks/platforms/{webhook_uuid}.
@@ -232,12 +283,18 @@ func NewServer(port int, configPath string) *Server {
 	s.auth = NewPasswordManager(configPath)
 	s.personas = newPersonaStore(filepath.Dir(configPath))
 	s.chat = newChatStore(filepath.Dir(configPath))
+	s.threads = newThreadStore(filepath.Dir(configPath))
+	s.projects = newProjectStore(filepath.Dir(configPath))
+	s.apiKeys = newAPIKeyStore(filepath.Dir(configPath))
 	s.chatAdapter = newChatStreamAdapter()
 	s.mcp = newMCPStore(filepath.Dir(configPath))
 	s.updateProgress = make(map[string]*installStatus)
 	s.installProgress = make(map[string]*installStatus)
 	s.marketCache = make(map[string]*marketCacheEntry)
 	s.kbTasks = make(map[string]*kbUploadTask)
+	s.backupTasks = make(map[string]*backupTaskState)
+	s.uploadSessions = make(map[string]*uploadSession)
+	s.chatRuns = make(map[string]map[string]context.CancelFunc)
 	s.loginLimiter = newLoginRateLimiter()
 	s.setupRoutes()
 	s.srv = &http.Server{
@@ -743,13 +800,17 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 		}
 		s.handleGhproxyTest(w, r)
 	case "storage":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"total": 0,
-		}))
+		if len(parts) > 1 && parts[1] == "cleanup" {
+			if r.Method == http.MethodPost {
+				s.cleanupStorage(w, r)
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(s.getStorageStatus()))
 	case "storage-cleanup", "cleanup":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"cleaned": 0,
-		}))
+		s.cleanupStorage(w, r)
 	case "provider-tokens":
 		days := 1
 		if v := r.URL.Query().Get("days"); v != "" {
@@ -763,9 +824,188 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 	}
 }
 
+// storageDirStat 统计一个目录下的文件大小/数量（对齐 Python
+// StorageCleaner._summarize_files）。
+func storageDirStat(dir string) (sizeBytes int64, fileCount int) {
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		fileCount++
+		sizeBytes += info.Size()
+		return nil
+	})
+	return sizeBytes, fileCount
+}
+
+// storageDirEntries 收集目录下全部文件路径（对齐 Python _iter_files）。
+func storageDirEntries(dir string) []string {
+	var out []string
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		out = append(out, path)
+		return nil
+	})
+	return out
+}
+
+// getStorageStatus 返回 logs/temp 两个清理目标的占用统计
+// （对齐 Python StorageCleaner.get_status，frontend StorageCleanupPanel 消费）。
+func (s *Server) getStorageStatus() map[string]interface{} {
+	logsDir := filepath.Join(s.kbDataDir(), "logs")
+	tempDir := filepath.Join(s.kbDataDir(), "temp")
+	logsBytes, logsCount := storageDirStat(logsDir)
+	cacheBytes, cacheCount := storageDirStat(tempDir)
+	_, logsExists := os.Stat(logsDir)
+	_, tempExists := os.Stat(tempDir)
+	return map[string]interface{}{
+		"logs": map[string]interface{}{
+			"size_bytes": logsBytes,
+			"file_count": logsCount,
+			"path":       logsDir,
+			"exists":     logsExists == nil,
+		},
+		"cache": map[string]interface{}{
+			"size_bytes": cacheBytes,
+			"file_count": cacheCount,
+			"path":       tempDir,
+			"exists":     tempExists == nil,
+		},
+		"total_bytes": logsBytes + cacheBytes,
+	}
+}
+
+// cleanupStorage implements POST /stats/storage/cleanup：按 target
+// （logs/cache/all）清理 data/logs 与 data/temp（对齐 Python
+// StorageCleaner.cleanup）。启用的日志文件（log_file_enable/trace_log_enable）
+// 只截断不删除。
+func (s *Server) cleanupStorage(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Target string `json:"target"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	target := strings.ToLower(strings.TrimSpace(body.Target))
+	if target == "" {
+		target = "all"
+	}
+	if target != "logs" && target != "cache" && target != "all" {
+		writeJSON(w, http.StatusBadRequest, apiError("Unsupported cleanup target: "+body.Target))
+		return
+	}
+	cfg := s.getConfigData("default")
+	logFileEnabled, _ := cfg["log_file_enable"].(bool)
+	traceLogEnabled, _ := cfg["trace_log_enable"].(bool)
+	resolveLogPath := func(key, def string) string {
+		if v, ok := cfg[key].(string); ok && v != "" {
+			if filepath.IsAbs(v) {
+				return v
+			}
+			return filepath.Join(s.kbDataDir(), filepath.FromSlash(v))
+		}
+		return filepath.Join(s.kbDataDir(), filepath.FromSlash(def))
+	}
+	activeLogs := map[string]bool{}
+	if logFileEnabled {
+		activeLogs[resolveLogPath("log_file_path", "logs/astrbot.log")] = true
+	}
+	if traceLogEnabled {
+		activeLogs[resolveLogPath("trace_log_path", "logs/astrbot.trace.log")] = true
+	}
+
+	cleanTarget := func(name string) map[string]interface{} {
+		var files []string
+		if name == "logs" {
+			files = storageDirEntries(filepath.Join(s.kbDataDir(), "logs"))
+		} else {
+			files = storageDirEntries(filepath.Join(s.kbDataDir(), "temp"))
+		}
+		removedBytes, deletedFiles, truncatedFiles, failedFiles := int64(0), 0, 0, 0
+		for _, f := range files {
+			info, err := os.Lstat(f)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			size := info.Size()
+			if activeLogs[f] {
+				if err := os.WriteFile(f, nil, 0o644); err == nil {
+					truncatedFiles++
+					removedBytes += size
+				} else {
+					failedFiles++
+				}
+				continue
+			}
+			if err := os.Remove(f); err == nil {
+				deletedFiles++
+				removedBytes += size
+			} else {
+				failedFiles++
+			}
+		}
+		return map[string]interface{}{
+			"removed_bytes":   removedBytes,
+			"processed_files": deletedFiles + truncatedFiles,
+			"deleted_files":   deletedFiles,
+			"truncated_files": truncatedFiles,
+			"failed_files":    failedFiles,
+		}
+	}
+
+	results := map[string]interface{}{}
+	aggregates := map[string]interface{}{
+		"removed_bytes":   int64(0),
+		"processed_files": 0,
+		"deleted_files":   0,
+		"truncated_files": 0,
+		"failed_files":    0,
+	}
+	names := []string{target}
+	if target == "all" {
+		names = []string{"logs", "cache"}
+	}
+	for _, name := range names {
+		res := cleanTarget(name)
+		results[name] = res
+		for _, k := range []string{"removed_bytes", "processed_files", "deleted_files", "truncated_files", "failed_files"} {
+			aggregates[k] = sumCleanupMetrics(aggregates[k], res[k])
+		}
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"target":          target,
+		"results":         results,
+		"status":          s.getStorageStatus(),
+		"removed_bytes":   aggregates["removed_bytes"],
+		"processed_files": aggregates["processed_files"],
+		"deleted_files":   aggregates["deleted_files"],
+		"truncated_files": aggregates["truncated_files"],
+		"failed_files":    aggregates["failed_files"],
+	}))
+}
+
+// sumCleanupMetrics 累加清理结果指标（int64/int 混合）。
+func sumCleanupMetrics(a, b interface{}) interface{} {
+	switch av := a.(type) {
+	case int64:
+		switch bv := b.(type) {
+		case int64:
+			return av + bv
+		case int:
+			return av + int64(bv)
+		}
+	case int:
+		switch bv := b.(type) {
+		case int64:
+			return int64(av) + bv
+		case int:
+			return av + bv
+		}
+	}
+	return a
+}
+
 // handleGhproxyTest 测 GitHub 加速地址连通性（对齐 Python
-// stat_service.test_ghproxy_connection）：GET <proxy>/https://github.com/...
-// 的测试文件测延迟（毫秒）。proxy_url 支持 query 与 POST body 两种传参。
 func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
 	proxyURL := strings.TrimSpace(r.URL.Query().Get("proxy_url"))
 	if proxyURL == "" {

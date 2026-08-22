@@ -324,7 +324,7 @@ func (a *Adapter) pollLoop(ctx context.Context) {
 }
 
 // dispatchUpdate 把 update 交给对应会话的 worker goroutine 串行处理
-//（每 chat_id 一个 channel + worker）：语音下载等慢操作不再阻塞轮询，
+// （每 chat_id 一个 channel + worker）：语音下载等慢操作不再阻塞轮询，
 // 同时保持同一会话内消息的处理顺序。
 func (a *Adapter) dispatchUpdate(ctx context.Context, update map[string]interface{}) {
 	chatID := ""

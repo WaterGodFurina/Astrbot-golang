@@ -674,6 +674,10 @@ func (w *cappedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Bytes returns the buffered output (a byte slice sharing the underlying
+// buffer; callers must not mutate it).
+func (w *cappedWriter) Bytes() []byte { return w.buf.Bytes() }
+
 // maxShellOutput caps how much of a synchronous shell command's output is
 // buffered in memory.
 const maxShellOutput = 1 << 20

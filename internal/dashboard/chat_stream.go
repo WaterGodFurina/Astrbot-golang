@@ -106,6 +106,22 @@ func (a *chatStreamAdapter) unsubscribe(sessionID string, seq uint64, ch chan *m
 	}
 }
 
+// chatStreamRequest describes one SSE chat run (POST /api/v1/chat 与
+// regenerate/thread 消息共用同一管线)。
+type chatStreamRequest struct {
+	SessionID        string
+	Parts            []map[string]interface{}
+	Files            []interface{}
+	SelectedProvider string
+	SelectedModel    string
+	Flags            map[string]interface{}
+	// PersistUser 为 false 时（regenerate）不再落盘 user 消息（历史中已存在）。
+	PersistUser bool
+	// ThreadID 非空时消息写入线程历史而非会话历史（对齐 Python
+	// platform_history_id="webchat_thread"）。
+	ThreadID string
+}
+
 // handleChatSend streams a chat reply over SSE.
 // POST /api/v1/chat  body: {session_id, message:[parts], selected_provider, selected_model, flags}
 func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +133,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		SelectedProvider string                   `json:"selected_provider"`
 		SelectedModel    string                   `json:"selected_model"`
 		Flags            map[string]interface{}   `json:"flags"`
+		SkipUserHistory  bool                     `json:"_skip_user_history"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
@@ -135,33 +152,73 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 0 {
 		parts = filePartsToMessage(body.Files)
 	}
-	text := plainTextFromParts(parts)
 	// 对齐 Python 原版 webchat_message_parts_have_content：纯媒体消息
 	// （仅图片/文件 part，无 plain 文本）也允许发送。
-	if text == "" && !partsHaveMediaContent(parts) {
+	if !partsHaveContent(parts, body.Files) {
 		writeJSON(w, http.StatusBadRequest, apiError("Message content is empty"))
 		return
 	}
+	s.runChatSSEStream(w, r, chatStreamRequest{
+		SessionID:        sessionID,
+		Parts:            parts,
+		Files:            body.Files,
+		SelectedProvider: body.SelectedProvider,
+		SelectedModel:    body.SelectedModel,
+		Flags:            body.Flags,
+		// 编辑后"继续对话"（continueEditedMessage）会带 _skip_user_history：
+		// user 消息已存在于历史中，不再重复落盘（对齐 Python _skip_user_history）。
+		PersistUser: !body.SkipUserHistory,
+	})
+}
 
-	// Persist the user message into the chat session store (WebUI history).
-	savedUserID := fmt.Sprintf("u_%d", time.Now().UnixNano())
-	userRecord := map[string]interface{}{
-		"id":          savedUserID,
-		"session_id":  sessionID,
-		"sender_id":   "dashboard",
-		"sender_name": "dashboard",
-		"role":        "user",
-		"type":        "user",
-		"content":     map[string]interface{}{"type": "user", "message": parts},
-		"created_at":  time.Now().Format(time.RFC3339Nano),
+// partsHaveContent 校验消息有真实内容（plain 文本或媒体 part），对齐
+// webchat_message_parts_have_content；files 兜底用于纯附件消息。
+func partsHaveContent(parts []map[string]interface{}, files []interface{}) bool {
+	if len(parts) == 0 && len(files) > 0 {
+		return true
 	}
-	s.chat.appendMessage(sessionID, userRecord)
+	text := plainTextFromParts(parts)
+	if text == "" && !partsHaveMediaContent(parts) {
+		return false
+	}
+	return true
+}
+
+// runChatSSEStream runs a chat reply through the pipeline and streams it over
+// SSE (events: session_id -> user_message_saved -> run_started -> plain ->
+// complete -> end), mirroring Python build_chat_stream. The run is registered
+// in the session run registry so POST /chat/sessions/{id}/stop can cancel it.
+func (s *Server) runChatSSEStream(w http.ResponseWriter, r *http.Request, req chatStreamRequest) {
+	sessionID := req.SessionID
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, apiError("streaming not supported"))
 		return
 	}
+
+	// Persist the user message (skipped for regenerate: the message already
+	// exists in history).
+	savedUserID := fmt.Sprintf("u_%d", time.Now().UnixNano())
+	llmCheckpointID := fmt.Sprintf("c_%d", time.Now().UnixNano())
+	if req.PersistUser {
+		userRecord := map[string]interface{}{
+			"id":          savedUserID,
+			"session_id":  sessionID,
+			"sender_id":   "dashboard",
+			"sender_name": "dashboard",
+			"role":        "user",
+			"type":        "user",
+			"content":     map[string]interface{}{"type": "user", "message": req.Parts},
+			"created_at":  time.Now().Format(time.RFC3339Nano),
+		}
+		if req.ThreadID != "" {
+			s.threads.appendThreadMessage(req.ThreadID, userRecord)
+		} else {
+			s.chat.appendMessage(sessionID, userRecord)
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -173,19 +230,26 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		"data":       nil,
 		"session_id": sessionID,
 	})
-	sendSSE(w, flusher, map[string]interface{}{
-		"type": "user_message_saved",
-		"data": map[string]interface{}{
-			"id":                savedUserID,
-			"created_at":        time.Now().Format(time.RFC3339Nano),
-			"llm_checkpoint_id": fmt.Sprintf("c_%d", time.Now().UnixNano()),
-		},
-	})
+	if req.PersistUser {
+		sendSSE(w, flusher, map[string]interface{}{
+			"type": "user_message_saved",
+			"data": map[string]interface{}{
+				"id":                savedUserID,
+				"created_at":        time.Now().Format(time.RFC3339Nano),
+				"llm_checkpoint_id": llmCheckpointID,
+			},
+		})
+	}
 	runID := fmt.Sprintf("r_%d", time.Now().UnixNano())
 	sendSSE(w, flusher, map[string]interface{}{
 		"type": "run_started",
 		"data": map[string]interface{}{"run_id": runID},
 	})
+
+	// 注册 run 取消（stop 端点按 session 取消），并绑定到本请求上下文。
+	runCtx, runCancel := context.WithCancel(r.Context())
+	s.registerChatRun(sessionID, runID, runCancel)
+	defer s.unregisterChatRun(sessionID, runID)
 
 	// Subscribe to the pipeline reply for this session. runID 标识本次 run，
 	// 即使同一 session 并发发送也不会把别的请求的回复累积进来。
@@ -194,7 +258,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 
 	// Run the user message through the pipeline; done is closed when the
 	// event finishes processing.
-	done := s.processChatEvent(r.Context(), sessionID, runID, text, body.SelectedProvider, body.SelectedModel, body.Flags, body.Files)
+	done := s.processChatEvent(runCtx, sessionID, runID, plainTextFromParts(req.Parts), req.SelectedProvider, req.SelectedModel, req.Flags, req.Files)
 	if done == nil {
 		sendSSE(w, flusher, map[string]interface{}{"type": "error", "data": "对话管道不可用"})
 		sendSSE(w, flusher, map[string]interface{}{"type": "end", "data": nil})
@@ -225,7 +289,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 			}
 		done:
 			if full.Len() > 0 {
-				// Persist the bot reply into the chat session store.
+				// Persist the bot reply into the chat session/thread store.
 				botID := fmt.Sprintf("b_%d", time.Now().UnixNano())
 				botRecord := map[string]interface{}{
 					"id":          botID,
@@ -240,7 +304,11 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 					},
 					"created_at": time.Now().Format(time.RFC3339Nano),
 				}
-				s.chat.appendMessage(sessionID, botRecord)
+				if req.ThreadID != "" {
+					s.threads.appendThreadMessage(req.ThreadID, botRecord)
+				} else {
+					s.chat.appendMessage(sessionID, botRecord)
+				}
 				sendSSE(w, flusher, map[string]interface{}{
 					"type": "message_saved",
 					"data": map[string]interface{}{"id": botID, "created_at": time.Now().Format(time.RFC3339Nano)},
@@ -756,12 +824,15 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 
 	// Derive a per-run context from the connection so an interrupt can cancel
 	// this specific run (registered by message_id) without tearing down the
-	// whole connection.
+	// whole connection. Also register in the session-level registry so the
+	// HTTP stop endpoint can cancel it.
 	runCtx, runCancel := context.WithCancel(c.ctx)
 	c.runMu.Lock()
 	c.runs[messageID] = runCancel
 	c.runMu.Unlock()
+	s.registerChatRun(sessionID, messageID, runCancel)
 	defer func() {
+		s.unregisterChatRun(sessionID, messageID)
 		c.runMu.Lock()
 		delete(c.runs, messageID)
 		c.runMu.Unlock()

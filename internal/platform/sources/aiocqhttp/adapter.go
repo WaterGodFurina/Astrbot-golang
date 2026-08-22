@@ -1212,14 +1212,12 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 		case *message.File:
 			ref := c.URL
 			switch {
-			case c.Base64 != "":
-				ref = "base64://" + c.Base64
 			case c.URL != "":
 				ref = c.URL
 			case c.Path != "":
 				ref = "file://" + c.Path
-			case c.File != "":
-				ref = c.File
+			case c.FileID != "":
+				ref = c.FileID
 			}
 			segments = append(segments, map[string]interface{}{
 				"type": "file",
@@ -1228,14 +1226,12 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 		case *message.Video:
 			ref := c.URL
 			switch {
-			case c.Base64 != "":
-				ref = "base64://" + c.Base64
 			case c.URL != "":
 				ref = c.URL
 			case c.Path != "":
 				ref = "file://" + c.Path
-			case c.File != "":
-				ref = c.File
+			case c.FileID != "":
+				ref = c.FileID
 			}
 			segments = append(segments, map[string]interface{}{
 				"type": "video",

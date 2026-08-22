@@ -416,3 +416,111 @@ func copyFile(src, dst string) error {
 	}
 	return out.Sync()
 }
+
+// changelogCachePath / changelogBodyPath 是 changelog 的本地缓存位置：
+// releases 列表整体缓存在 data/changelogs.json，单版本 body 缓存为
+// data/changelogs/v<version>.md（对齐 Python stat_service 的 v<version>.md
+// 命名）。
+func (s *Server) changelogCachePath() string {
+	return filepath.Join(s.kbDataDir(), "changelogs.json")
+}
+
+func (s *Server) changelogBodyPath(version string) string {
+	return filepath.Join(s.kbDataDir(), "changelogs", "v"+version+".md")
+}
+
+// changelogCacheTTL 控制 changelog 列表缓存的刷新间隔。
+const changelogCacheTTL = 10 * time.Minute
+
+// changelogVersionRe 白名单校验 changelog 版本号（防路径穿越）。
+var changelogVersionRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// fileExistsLocal reports whether a file exists.
+func fileExistsLocal(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// fetchCachedChangelogReleases 从 GitHub 拉取 releases 并缓存到 data/
+// （TTL 内直接读缓存，离线时回退缓存）。
+func (s *Server) fetchCachedChangelogReleases() []map[string]interface{} {
+	path := s.changelogCachePath()
+	if data, err := os.ReadFile(path); err == nil {
+		var cached struct {
+			FetchedAt time.Time                `json:"fetched_at"`
+			Releases  []map[string]interface{} `json:"releases"`
+		}
+		if json.Unmarshal(data, &cached) == nil && cached.Releases != nil {
+			if time.Since(cached.FetchedAt) < changelogCacheTTL || len(cached.Releases) == 0 {
+				return cached.Releases
+			}
+		}
+	}
+	releases, err := s.fetchGithubReleases("")
+	if err != nil {
+		// 拉取失败时回退到已有缓存（若有）。
+		if data, rerr := os.ReadFile(path); rerr == nil {
+			var cached struct {
+				Releases []map[string]interface{} `json:"releases"`
+			}
+			if json.Unmarshal(data, &cached) == nil && cached.Releases != nil {
+				return cached.Releases
+			}
+		}
+		return nil
+	}
+	if payload, err := json.MarshalIndent(map[string]interface{}{
+		"fetched_at": time.Now(),
+		"releases":   releases,
+	}, "", "  "); err == nil {
+		_ = writeFileAtomic(path, payload, 0o644)
+	}
+	return releases
+}
+
+// handleChangelogs implements GET /changelogs 与 GET /changelogs/{version}：
+// 版本列表来自 GitHub releases（v 前缀剥离），单版本内容为 release body。
+func (s *Server) handleChangelogs(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) > 0 && parts[0] != "" {
+		version := strings.TrimPrefix(parts[0], "v")
+		if !changelogVersionRe.MatchString(version) || strings.Contains(version, "..") {
+			writeJSON(w, http.StatusOK, apiError("Invalid version format"))
+			return
+		}
+		// 优先读本地缓存文件，其次从 releases 缓存取 body 落盘。
+		if bodyPath := s.changelogBodyPath(version); fileExistsLocal(bodyPath) {
+			if content, err := os.ReadFile(bodyPath); err == nil {
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"content": string(content),
+					"version": version,
+				}))
+				return
+			}
+		}
+		releases := s.fetchCachedChangelogReleases()
+		for _, rel := range releases {
+			tag, _ := rel["tag_name"].(string)
+			if strings.TrimPrefix(tag, "v") == version {
+				body, _ := rel["body"].(string)
+				_ = os.MkdirAll(filepath.Dir(s.changelogBodyPath(version)), 0o755)
+				_ = writeFileAtomic(s.changelogBodyPath(version), []byte(body), 0o644)
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"content": body,
+					"version": version,
+				}))
+				return
+			}
+		}
+		writeJSON(w, http.StatusNotFound, apiError("Changelog for version "+version+" not found"))
+		return
+	}
+	releases := s.fetchCachedChangelogReleases()
+	versions := make([]string, 0, len(releases))
+	for _, rel := range releases {
+		tag, _ := rel["tag_name"].(string)
+		if tag != "" {
+			versions = append(versions, strings.TrimPrefix(tag, "v"))
+		}
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"versions": versions}))
+}
