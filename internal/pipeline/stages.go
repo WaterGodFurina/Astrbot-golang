@@ -1465,7 +1465,7 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 	// is not duplicated in req.Contexts.
 	personaID := ""
 	if s.convMgr != nil {
-		conv := s.convMgr.GetOrCreateConversation(event.UnifiedMsgOrigin(), event.Source.Platform)
+		conv := s.convMgr.GetOrCreateConversation(event.UnifiedMsgOrigin(), event.Source.PlatformID)
 		if conv != nil {
 			personaID = conv.Persona
 			providerSettings["persona"] = conv.Persona
@@ -3387,7 +3387,10 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				}
 			}
 		case "future_task":
-			result = executeFutureTask(s.cronMgr, umo, event.GetSenderID(), args)
+			// 存三段式 PythonUMO（platform_id:MessageType:session_id），对齐
+			// Python future_task 与 WebUI 的 umo 解析；两段式 UnifiedMsgOrigin
+			// 会让前端 message_type/session_id 错位。
+			result = executeFutureTask(s.cronMgr, event.PythonUMO(), event.GetSenderID(), args)
 		case "web_search_tavily":
 			result = executeWebSearchTavily(s.config, args)
 		case "web_search_bocha":

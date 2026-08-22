@@ -45,9 +45,10 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 		}
 		// permission
 		desc.Permission = permissionFor(h)
-		// sub_command marker (bridge registers group commands as plain filters)
+		// 组命令 type 统一为 "group"（对齐 Python command_management 的
+		// command_type，WebUI 类型筛选按该值匹配）。
 		if desc.IsGroup {
-			desc.CommandType = "command_group"
+			desc.CommandType = "group"
 		}
 		descriptors = append(descriptors, desc)
 	}

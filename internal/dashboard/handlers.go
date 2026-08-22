@@ -4111,7 +4111,9 @@ func (s *Server) getAvailablePlugins() []interface{} {
 	if spm == nil {
 		return out
 	}
-	for _, inst := range spm.List() {
+	// RegisteredPlugins（含闲置休眠占位，Meta 保留）而非 List()（仅运行中）：
+	// 否则休眠插件从规则编辑器的插件配置选择框里消失（no data available）。
+	for _, inst := range spm.RegisteredPlugins() {
 		if inst.Meta == nil {
 			continue
 		}
@@ -7135,16 +7137,27 @@ func (s *Server) listCommandDescriptors() []map[string]interface{} {
 	cfg := s.getConfigSnapshot()
 	records, _ := cfg["command_configs"].(map[string]interface{})
 
+	type itemState struct {
+		item    map[string]interface{}
+		cmd     string
+		enabled bool
+		handler string
+	}
 	result := make([]map[string]interface{}, 0, len(descriptors))
+	states := make([]itemState, 0, len(descriptors))
 	for _, d := range descriptors {
 		item := descriptorToDict(d)
+		enabled := d.Enabled
+		effective := d.EffectiveCommand
 		if records != nil {
 			if rec, ok := records[d.HandlerFullName].(map[string]interface{}); ok {
-				if enabled, ok := rec["enabled"].(bool); ok {
-					item["enabled"] = enabled
+				if en, ok := rec["enabled"].(bool); ok {
+					item["enabled"] = en
+					enabled = en
 				}
 				if cmd, ok := rec["effective_command"].(string); ok && cmd != "" {
 					item["effective_command"] = cmd
+					effective = cmd
 				}
 				if perm, ok := rec["permission"].(string); ok && perm != "" {
 					item["permission"] = perm
@@ -7152,6 +7165,20 @@ func (s *Server) listCommandDescriptors() []map[string]interface{} {
 			}
 		}
 		result = append(result, item)
+		states = append(states, itemState{item: item, cmd: effective, enabled: enabled, handler: d.HandlerFullName})
+	}
+
+	// 冲突判定基于最终生效名（运行时 filter + 持久化重命名覆盖），且只统计
+	// 启用的指令——对齐 Python _group_conflicts。CollectCommandDescriptors
+	// 的初步判定只看运行时名，插件重载后持久化重命名丢失会导致误报。
+	seen := map[string]int{}
+	for _, st := range states {
+		if st.cmd != "" && st.enabled {
+			seen[st.cmd]++
+		}
+	}
+	for _, st := range states {
+		st.item["has_conflict"] = st.cmd != "" && st.enabled && seen[st.cmd] > 1
 	}
 	return result
 }
@@ -9112,6 +9139,48 @@ func copyDir(src, dst string) error {
 	})
 }
 
+// serializeConversationRow converts a db conversation row into the dict shape
+// the WebUI consumes (mirrors conversation.Manager.serializeConversation).
+// history 为空（include_history=false 的列表查询不拉 content 大字段）。
+func (s *Server) serializeConversationRow(row db.ConversationRow) map[string]interface{} {
+	return map[string]interface{}{
+		"cid":         row.ConversationID,
+		"platform_id": row.PlatformID,
+		"user_id":     row.UserID,
+		"title":       row.Title,
+		"persona_id":  row.PersonaID,
+		"token_usage": 0,
+		"created_at":  row.CreatedAt,
+		"updated_at":  row.UpdatedAt,
+		"umo_info":    parseUMOInfo(row.UserID),
+		"history":     []interface{}{},
+		"is_deleted":  false,
+	}
+}
+
+// parseUMOInfo splits a unified_msg_origin (platform:message_type:session_id)
+// into its segments, mirroring Python _build_umo_info / parse_umo.
+func parseUMOInfo(umo string) map[string]interface{} {
+	parts := strings.SplitN(umo, ":", 3)
+	platform := "unknown"
+	messageType := "unknown"
+	sessionID := umo
+	if len(parts) >= 1 && parts[0] != "" {
+		platform = parts[0]
+	}
+	if len(parts) >= 2 && parts[1] != "" {
+		messageType = parts[1]
+	}
+	if len(parts) >= 3 {
+		sessionID = parts[2]
+	}
+	return map[string]interface{}{
+		"platform":     platform,
+		"message_type": messageType,
+		"session_id":   sessionID,
+	}
+}
+
 func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
 	if len(parts) > 0 {
@@ -9130,25 +9199,39 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 		if pageSize > 100 {
 			pageSize = 100
 		}
-		all := s.getConversationList()
-		total := len(all)
+		q := r.URL.Query()
+		splitCSV := func(key string) []string {
+			var out []string
+			for _, part := range strings.Split(q.Get(key), ",") {
+				if part = strings.TrimSpace(part); part != "" {
+					out = append(out, part)
+				}
+			}
+			return out
+		}
+		// 过滤语义对齐 Python ConversationService.list_conversations /
+		// sqlite.get_filtered_conversations：platforms/message_types/search/
+		// exclude_ids/exclude_platforms。
+		rows, total, err := s.database.GetFilteredConversations(db.ConversationFilter{
+			Platforms:        splitCSV("platforms"),
+			MessageTypes:     splitCSV("message_types"),
+			Search:           q.Get("search"),
+			ExcludeIDs:       splitCSV("exclude_ids"),
+			ExcludePlatforms: splitCSV("exclude_platforms"),
+			Page:             page,
+			PageSize:         pageSize,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("查询对话列表失败: "+err.Error()))
+			return
+		}
+		items := make([]interface{}, 0, len(rows))
+		for _, row := range rows {
+			items = append(items, s.serializeConversationRow(row))
+		}
 		totalPages := (total + pageSize - 1) / pageSize
 		if totalPages < 1 {
 			totalPages = 1
-		}
-		start := (page - 1) * pageSize
-		end := start + pageSize
-		if start > total {
-			start = total
-		}
-		if end > total {
-			end = total
-		}
-		var items []interface{}
-		if start <= total {
-			items = all[start:end]
-		} else {
-			items = []interface{}{}
 		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"conversations": items,

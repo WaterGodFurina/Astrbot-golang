@@ -244,7 +244,14 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		if session == "" {
 			return fmt.Errorf("active_agent job %s has no session", job.ID)
 		}
-		platformID, convID := splitUMO(session)
+		// 三段式 PythonUMO（platform_id:MessageType:session_id）：platformID
+		// 段是适配器实例 ID、中段是消息类型、末段是投递目标会话 ID。
+		parts := strings.SplitN(session, ":", 3)
+		if len(parts) != 3 || parts[0] == "" || parts[2] == "" {
+			return fmt.Errorf("active_agent job %s 的 session 不是三段式 umo: %q", job.ID, session)
+		}
+		platformID := parts[0]
+		convID := parts[2]
 		senderID, _ := job.Payload["sender_id"].(string)
 		if senderID == "" {
 			senderID = convID
@@ -252,7 +259,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: note}}}
 		evt := &core.Event{
 			Type:              core.EventMessage,
-			Source:            core.EventSource{Platform: platformID, ConvID: convID, SenderID: senderID, SenderName: senderID},
+			Source:            core.EventSource{Platform: platformID, PlatformID: platformID, ConvID: convID, SenderID: senderID, SenderName: senderID},
 			Message:           chain,
 			MessageStr:        note,
 			PlainText:         note,
@@ -731,17 +738,6 @@ func cronNextRun(job *cron.Job) (time.Time, error) {
 		return time.Time{}, err
 	}
 	return sched.Next(now), nil
-}
-
-// splitUMO splits a unified_msg_origin ("platform:convID") into platform id and
-// conversation id.
-func splitUMO(umo string) (string, string) {
-	for i := 0; i < len(umo); i++ {
-		if umo[i] == ':' {
-			return umo[:i], umo[i+1:]
-		}
-	}
-	return umo, umo
 }
 
 // personaCache 缓存 data/personas.json 的解析结果，避免每次 LLM 调用都读盘

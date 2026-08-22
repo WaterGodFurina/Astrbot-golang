@@ -580,7 +580,7 @@ export default {
             return {
                 platforms: platforms,
                 messageTypes: this.messageTypeFilter,
-                search: this.search
+                search: String(this.search ?? "")
             };
         },
 
@@ -777,7 +777,7 @@ export default {
                     typeof item === 'object' ? item.value : item
                 ),
                 messageTypes: [...this.messageTypeFilter],
-                search: this.search
+                search: String(this.search ?? "")
             };
             this.listAbortController = markRaw(controller);
             this.listLoading = true;

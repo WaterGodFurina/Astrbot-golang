@@ -7,6 +7,7 @@ package star
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
@@ -58,6 +59,34 @@ func hookEventType(name string) (EventType, bool) {
 		// lifecycle hooks (startup/shutdown) are not pipeline events
 		return 0, false
 	}
+}
+
+// persistentRenames 保存 WebUI 重命名过的指令（handler_full_name → 生效名）。
+// 子进程插件重载后指令按 meta 原始名重新桥接，持久化重命名会丢失——桥接时
+// 从这里恢复（由 dashboard 在保存重命名/启动注入时调用 SetPersistentRenames）。
+var (
+	persistentRenamesMu sync.RWMutex
+	persistentRenames   = map[string]string{}
+)
+
+// SetPersistentRenames 全量替换持久化重命名表（handler_full_name → effective
+// command）。nil/空 map 清空。
+func SetPersistentRenames(renames map[string]string) {
+	persistentRenamesMu.Lock()
+	defer persistentRenamesMu.Unlock()
+	persistentRenames = make(map[string]string, len(renames))
+	for k, v := range renames {
+		if k != "" && v != "" {
+			persistentRenames[k] = v
+		}
+	}
+}
+
+// PersistentRenameFor 返回指定 handler 的持久化生效名（无则空串）。
+func PersistentRenameFor(handlerFullName string) string {
+	persistentRenamesMu.RLock()
+	defer persistentRenamesMu.RUnlock()
+	return persistentRenames[handlerFullName]
 }
 
 // RegisterSubprocessPlugins bridges a batch of running subprocess plugins.
@@ -122,10 +151,9 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 		handler := &StarHandlerMetadata{
 			// 用插件 ID 限定 full name，避免不同插件注册同名指令时互相覆盖
 			// （否则 WebUI 重命名一个指令会连带影响另一个同名指令）。
-			HandlerFullName:   "plugin_" + inst.ID + "_" + cmd.Name,
-			HandlerName:       cmd.Name,
-			HandlerModulePath: "data.plugins",
-			PluginName:        inst.ID,
+			HandlerFullName: "plugin_" + inst.ID + "_" + cmd.Name,
+			HandlerName:     cmd.Name, HandlerModulePath: "data.plugins",
+			PluginName: inst.ID,
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -177,6 +205,16 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 			EventFilters: []HandlerFilter{NewCommandFilter(cmd.Name, cmd.Aliases, nil)},
 			Desc:         cmd.Description,
 			Enabled:      true,
+		}
+		// 应用 WebUI 持久化重命名：插件重载后指令按 meta 原始名桥接，若不
+		// 恢复重命名，运行时匹配仍用旧名（与另一同名指令真冲突、双触发），
+		// 且 WebUI 显示名与实际匹配名不一致。
+		if renamed := PersistentRenameFor(handler.HandlerFullName); renamed != "" {
+			for _, filter := range handler.EventFilters {
+				if cf, ok := filter.(*CommandFilter); ok {
+					cf.SetCommandName(renamed)
+				}
+			}
 		}
 		if cmd.Permission == "admin" {
 			handler.EventFilters = append(handler.EventFilters, NewPermissionFilter(PermissionAdmin))

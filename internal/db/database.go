@@ -555,6 +555,99 @@ func (d *Database) UpdateConversationContent(convID, content string) error {
 	return err
 }
 
+// ConversationFilter mirrors the dashboard conversation list query params
+// (aligned with Python sqlite.get_filtered_conversations).
+type ConversationFilter struct {
+	Platforms        []string // platform_id IN (...)
+	MessageTypes     []string // user_id LIKE '%:<type>:%' (UMO segment match)
+	Search           string   // title/user_id/conversation_id/content LIKE %q%
+	ExcludeIDs       []string // user_id NOT LIKE '<id>%'
+	ExcludePlatforms []string // platform_id NOT IN (...)
+	Page             int
+	PageSize         int
+}
+
+// GetFilteredConversations returns a filtered, paginated conversation list
+// plus the total count matching the filter.
+func (d *Database) GetFilteredConversations(f ConversationFilter) ([]ConversationRow, int, error) {
+	page := f.Page
+	if page < 1 {
+		page = 1
+	}
+	size := f.PageSize
+	if size < 1 {
+		size = 20
+	}
+	if size > 100 {
+		size = 100
+	}
+
+	where := []string{"1=1"}
+	var args []interface{}
+	if len(f.Platforms) > 0 {
+		where = append(where, fmt.Sprintf("platform_id IN (%s)", placeholders(len(f.Platforms), &args, f.Platforms)))
+	}
+	if len(f.MessageTypes) > 0 {
+		conds := make([]string, 0, len(f.MessageTypes))
+		for _, mt := range f.MessageTypes {
+			conds = append(conds, "user_id LIKE ?")
+			args = append(args, "%:"+mt+":%")
+		}
+		where = append(where, "("+strings.Join(conds, " OR ")+")")
+	}
+	if s := strings.TrimSpace(f.Search); s != "" {
+		like := "%" + s + "%"
+		where = append(where, "(title LIKE ? OR user_id LIKE ? OR conversation_id LIKE ? OR content LIKE ?)")
+		for i := 0; i < 4; i++ {
+			args = append(args, like)
+		}
+	}
+	for _, ex := range f.ExcludeIDs {
+		if ex == "" {
+			continue
+		}
+		where = append(where, "user_id NOT LIKE ?")
+		args = append(args, ex+"%")
+	}
+	if len(f.ExcludePlatforms) > 0 {
+		where = append(where, fmt.Sprintf("platform_id NOT IN (%s)", placeholders(len(f.ExcludePlatforms), &args, f.ExcludePlatforms)))
+	}
+	whereSQL := strings.Join(where, " AND ")
+
+	var total int
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM conversations WHERE "+whereSQL, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := `SELECT inner_conversation_id, conversation_id, platform_id, user_id, content, title, persona_id, created_at, updated_at
+		 FROM conversations WHERE ` + whereSQL + ` ORDER BY updated_at DESC, inner_conversation_id DESC LIMIT ? OFFSET ?`
+	args = append(args, size, (page-1)*size)
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var result []ConversationRow
+	for rows.Next() {
+		var row ConversationRow
+		if err := rows.Scan(&row.InnerID, &row.ConversationID, &row.PlatformID, &row.UserID, &row.Content, &row.Title, &row.PersonaID, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		result = append(result, row)
+	}
+	return result, total, rows.Err()
+}
+
+// placeholders expands n bind placeholders and appends values to args.
+func placeholders(n int, args *[]interface{}, vals []string) string {
+	out := make([]string, n)
+	for i, v := range vals {
+		out[i] = "?"
+		*args = append(*args, v)
+	}
+	return strings.Join(out, ",")
+}
+
 // UpdateConversationPersona updates a conversation's persona id.
 func (d *Database) UpdateConversationPersona(convID, personaID string) error {
 	_, err := d.db.Exec(
