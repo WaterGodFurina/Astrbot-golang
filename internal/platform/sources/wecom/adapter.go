@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -251,6 +252,11 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 	msgSignature := query.Get("msg_signature")
 	timestamp := query.Get("timestamp")
 	nonce := query.Get("nonce")
+	// 时间戳新鲜度校验：拒绝与当前时间偏差超过 5 分钟的请求（防重放）。
+	if ts, err := strconv.ParseInt(timestamp, 10, 64); err != nil || math.Abs(float64(time.Now().Unix()-ts)) > 300 {
+		http.Error(w, "timestamp 过期", http.StatusBadRequest)
+		return
+	}
 	if a.crypto == nil {
 		http.Error(w, "verify fail", http.StatusInternalServerError)
 		return
@@ -291,8 +297,11 @@ func (a *Adapter) handleKFMsgOrEvent(msg *WecomMessage) {
 			logger.I18nError("同步微信客服消息失败: %v", err)
 			return
 		}
-		if nc, ok := ret["next_cursor"].(string); ok && nc != "" {
+		if nc, ok := ret["next_cursor"].(string); ok && nc != "" && nc != cursor {
 			cursor = nc
+		} else if hasMore {
+			logger.I18nWarn("kf/sync_msg has_more=1 但游标未推进，终止同步")
+			hasMore = false
 		}
 		if hm, ok := ret["has_more"].(float64); ok {
 			hasMore = int(hm) != 0

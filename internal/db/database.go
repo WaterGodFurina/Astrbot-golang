@@ -650,6 +650,27 @@ func (d *Database) ListPreferencesByScope(scope string) ([]PreferenceRow, error)
 	return out, rows.Err()
 }
 
+// ListPreferencesByScopeID returns every row for a scope + scope_id.
+func (d *Database) ListPreferencesByScopeID(scope, scopeID string) ([]PreferenceRow, error) {
+	rows, err := d.db.Query(
+		`SELECT scope, scope_id, key, value FROM preferences WHERE scope = ? AND scope_id = ? ORDER BY key`,
+		scope, scopeID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PreferenceRow
+	for rows.Next() {
+		var r PreferenceRow
+		if err := rows.Scan(&r.Scope, &r.ScopeID, &r.Key, &r.Value); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // DeletePreferencesByScopeID removes every preference row for a scope + id
 // (e.g. all rules of a session when deleting "all rules").
 func (d *Database) DeletePreferencesByScopeID(scope, scopeID string) error {
@@ -1118,7 +1139,11 @@ func (d *Database) GetKB(kbID string) (*KBRow, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	if !rows.Next() {
+	found := rows.Next()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if !found {
 		return nil, fmt.Errorf("knowledge base %s not found", kbID)
 	}
 	return scanKBRow(rows)

@@ -48,6 +48,9 @@ type Server struct {
 	mux                *http.ServeMux
 	srv                *http.Server
 	mu                 sync.RWMutex
+	// configMu 串行化"快照→修改→整键回写"的配置保存组合（upsertProvider 等），
+	// 防止并发保存请求基于同一旧快照互相覆盖导致配置丢失。
+	configMu           sync.Mutex
 	handlers           map[string]http.HandlerFunc
 	auth               *PasswordManager
 	port               int
@@ -445,6 +448,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if creds.Username == s.auth.Username() && s.auth.VerifyPassword(creds.Password) {
+		// 旧版无盐 MD5 哈希登录成功后立即升级为 PBKDF2 重新落盘（不注销会话）。
+		upgradeRequired := false
+		if isMD5Hash(s.auth.HashedPassword()) {
+			s.auth.SetPasswordKeepUsername(creds.Password)
+			upgradeRequired = true
+		}
 		// TOTP 双因素：启用后登录必须携带验证码（或恢复码）。
 		// 使用恢复码登录会一次性禁用双因素（对齐 Python 语义）。
 		if s.auth.TOTPEnabled() {
@@ -468,7 +477,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"token":                     token,
 			"username":                  s.auth.Username(),
-			"password_upgrade_required": false,
+			"password_upgrade_required": upgradeRequired,
 			"md5_pwd_hint":              false,
 			"change_pwd_hint":           s.auth.PasswordChangeRequired(),
 		}))
@@ -493,7 +502,10 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	username := ""
 	if s.auth != nil {
 		loggedIn = s.auth.IsAuthenticated(token)
-		username = s.auth.Username()
+		if loggedIn {
+			// 未认证请求不返回管理员用户名，避免泄露账户名
+			username = s.auth.Username()
+		}
 	}
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 		"loggedin": loggedIn,
@@ -614,7 +626,14 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	// Outside the first-install onboarding flow (a random password was set and
 	// a change is required), the caller must prove knowledge of the current
 	// password so this endpoint cannot be used to hijack the account.
-	if !s.auth.PasswordChangeRequired() && !s.auth.VerifyPassword(body.OldPassword) {
+	if s.auth.PasswordChangeRequired() {
+		// 首次安装/重置密码窗口内 setup 端点公开，但仍必须提供启动时生成并
+		// 打印在控制台的初始密码，防止窗口期内任何人抢注管理员账户。
+		if !s.auth.VerifyPassword(body.OldPassword) {
+			writeJSON(w, http.StatusUnauthorized, apiError("请提供初始密码（见启动控制台）"))
+			return
+		}
+	} else if !s.auth.VerifyPassword(body.OldPassword) {
 		writeJSON(w, http.StatusUnauthorized, apiError("旧密码错误"))
 		return
 	}
@@ -762,11 +781,17 @@ func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
 	}
 	testURL := strings.TrimRight(proxyURL, "/") +
 		"/https://github.com/AstrBotDevs/AstrBot/raw/refs/heads/master/.python-version"
+	// 校验出站 URL 防 SSRF：仅 http/https，拒绝内网/回环/元数据地址与
+	// localhost 主机名（对齐 market.go validateOutboundURL）。
+	if err := validateOutboundURL(testURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("proxy_url 校验失败: "+err.Error()))
+		return
+	}
 	start := time.Now()
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := newOutboundClient(10 * time.Second)
 	// #nosec tainted-url-host -- 测速端点需 dashboard 登录鉴权（apiAuthAllowed），仅管理员可调用；
 	// 目标路径固定为 GitHub raw 文件（对齐 Python stat_service.test_ghproxy_connection），
-	// 响应体被丢弃（只上报延迟/状态码），非通用 SSRF 探测原语。
+	// 响应体被丢弃（只上报延迟/状态码），且 testURL 已通过 validateOutboundURL（防 SSRF）。
 	resp, err := client.Get(testURL) // nosemgrep: go.lang.security.injection.tainted-url-host.tainted-url-host
 	if err != nil {
 		logger.I18nWarn("ghproxy 测速失败 %s: %v", proxyURL, err)
@@ -1314,6 +1339,12 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	if len(s) > 300 {
 		s = s[:300] + "...(truncated)"
 	}
+	// 敏感响应体（登录/重置返回的 token、TOTP 密钥/otpauth 链接与恢复码）
+	// 不写入访问日志；writeJSON 无请求上下文，按响应中的敏感键名就地脱敏。
+	if strings.Contains(s, `"token":`) || strings.Contains(s, `"secret":`) ||
+		strings.Contains(s, `"recovery_codes":`) || strings.Contains(s, `"otpauth_url":`) {
+		s = `"<redacted>"`
+	}
 	logger.Debug("API response: %s", s)
 }
 
@@ -1507,6 +1538,19 @@ func (s *Server) setConfigDataAll(updates map[string]interface{}) error {
 	}
 	s.notifyConfigChanged()
 	return nil
+}
+
+// mutateConfig 在单一临界区内完成"快照→修改→整键回写"，使读-改-写组合
+// （upsertProvider/setProviderEnabled/upsertBot 等）对并发保存请求串行化，
+// 避免两个请求都基于同一旧快照、后写者覆盖前写者导致配置丢失。
+func (s *Server) mutateConfig(fn func(cfg map[string]interface{}) error) error {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	cfg := s.getConfigSnapshot()
+	if err := fn(cfg); err != nil {
+		return err
+	}
+	return s.setConfigDataAll(cfg)
 }
 
 // injectAuthFields re-asserts the dashboard auth fields from the password

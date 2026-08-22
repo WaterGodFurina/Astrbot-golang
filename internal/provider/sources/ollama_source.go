@@ -47,11 +47,6 @@ func (s *OllamaSource) doRequest(ctx context.Context, body map[string]interface{
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
 	url := fmt.Sprintf("%s/api/chat", s.apiBase)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
 	msgs, _ := body["messages"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	cfg := RetryConfigFromSettings(s.Settings())
@@ -121,6 +116,7 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 		decoder := json.NewDecoder(resp.Body)
 		var usage *provider.TokenUsage
 		var content strings.Builder
+		sawDone := false
 		for decoder.More() {
 			var chunk struct {
 				Message struct {
@@ -154,11 +150,20 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 			}
 			if chunk.Done {
 				// Final chunk: emit consolidated response with usage.
+				sawDone = true
 				ch <- &provider.LLMResponse{
 					Role:           "assistant",
 					CompletionText: content.String(),
 					Usage:          usage,
 				}
+			}
+		}
+		// 流结束但未收到 done 块: 补发最终聚合块, 保证 usage 不丢失。
+		if !sawDone {
+			ch <- &provider.LLMResponse{
+				Role:           "assistant",
+				CompletionText: content.String(),
+				Usage:          usage,
 			}
 		}
 		if usage != nil {

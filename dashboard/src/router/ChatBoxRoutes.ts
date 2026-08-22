@@ -1,5 +1,8 @@
 const ChatBoxRoutes = {
     path: '/chatbox',
+    meta: {
+        requiresAuth: true
+    },
     component: () => import('@/layouts/blank/BlankLayout.vue'),
     children: [
         {

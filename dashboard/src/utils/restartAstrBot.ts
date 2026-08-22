@@ -1,5 +1,6 @@
 import { statsApi } from '@/api/v1'
 import { getDesktopRuntimeInfo } from '@/utils/desktopRuntime'
+import { getToken } from '@/utils/token'
 
 type WaitingForRestartRef = {
   check: (initialStartTime?: number | null) => void | Promise<void>
@@ -32,7 +33,7 @@ export async function restartAstrBot(
     await getDesktopRuntimeInfo()
 
   if (desktopBridge && hasDesktopRestartCapability && isDesktopRuntime) {
-    const authToken = localStorage.getItem('token')
+    const authToken = getToken()
     const initialStartTime = await fetchCurrentStartTime()
     try {
       const restartPromise = desktopBridge.restartBackend(authToken)

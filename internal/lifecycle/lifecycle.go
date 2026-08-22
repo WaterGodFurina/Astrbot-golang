@@ -632,16 +632,21 @@ func (l *Lifecycle) Uptime() time.Duration {
 	return time.Since(l.startedAt)
 }
 
-// Restart 实现 WebUI"重启"：spawn 当前可执行文件的新实例（独立会话、继承
-// stdout/stderr 到原日志文件），随后优雅停机（Stop 会 kill 插件、关闭 DB）
-// 并退出当前进程。新实例启动时 cleanupOrphanPlugins 会清理本进程遗留的
-// 孤儿插件子进程。在 dashboard handler 的 goroutine 中调用（不持有 l.mu）。
+// Restart 实现 WebUI"重启"：先优雅停机（Stop 最先关闭 dashboard 释放监听
+// 端口，随后 kill 插件、关闭 DB），再 spawn 当前可执行文件的新实例（独立
+// 会话、继承 stdout/stderr 到原日志文件），最后退出当前进程。新实例启动时
+// cleanupOrphanPlugins 会清理本进程遗留的孤儿插件子进程。在 dashboard
+// handler 的 goroutine 中调用（不持有 l.mu）。
 func (l *Lifecycle) Restart() {
 	exe, err := os.Executable()
 	if err != nil {
 		logger.Error("Restart: resolve executable: %v", err)
 		return
 	}
+	// 先优雅停机（Stop 最先关闭 dashboard 释放监听端口，随后 kill 插件、
+	// 关闭 DB），再 spawn 新实例——避免新实例绑定仪表盘端口时旧进程仍持有
+	// 端口，只能靠 listenWithRetry 反复等待。
+	l.Stop()
 	// #nosec G204 -- restart spawns this same executable with the original
 	// command-line arguments passed at launch; not user-controlled input.
 	cmd := exec.Command(exe, os.Args[1:]...) // nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
@@ -652,10 +657,11 @@ func (l *Lifecycle) Restart() {
 	utils.DetachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		logger.Error("Restart: spawn new instance failed: %v", err)
-		return
+		// 本进程已停机（dashboard/DB/插件均已关闭），无法继续提供完整服务，
+		// 只能以失败状态退出。
+		os.Exit(1)
 	}
-	logger.I18nInfo("重启：已启动新实例（pid %d），正在关闭当前进程", cmd.Process.Pid)
-	l.Stop()
+	logger.I18nInfo("重启：已启动新实例（pid %d），正在退出当前进程", cmd.Process.Pid)
 	os.Exit(0)
 }
 
@@ -738,18 +744,18 @@ func splitUMO(umo string) (string, string) {
 	return umo, umo
 }
 
-// personaCache 缓存 data/personas.json 的解析结果，避免每次 LLM 调用都读盘。
-// 通过文件 mtime 判断内容是否变化，仅在有变更时重新读取。
+// personaCache 缓存 data/personas.json 的解析结果，避免每次 LLM 调用都读盘
+// 并重复 JSON 解析。通过文件 mtime 判断内容是否变化，仅在有变更时重读。
 type personaCache struct {
 	mu      sync.Mutex
-	content []byte
+	parsed  []map[string]interface{}
 	modTime time.Time
 }
 
 var personaFileCache personaCache
 
 // loadPersonas 返回 data/personas.json 解析后的 persona 列表。
-// mtime 未变化时直接返回缓存内容，变化时才重读文件。
+// mtime 未变化时直接返回缓存的解析结果，变化时才重读文件并重新解析。
 func loadPersonas() []map[string]interface{} {
 	info, err := os.Stat("data/personas.json")
 	if err != nil {
@@ -757,16 +763,16 @@ func loadPersonas() []map[string]interface{} {
 	}
 	personaFileCache.mu.Lock()
 	defer personaFileCache.mu.Unlock()
-	if personaFileCache.content != nil && personaFileCache.modTime.Equal(info.ModTime()) {
-		return parsePersonas(personaFileCache.content)
+	if personaFileCache.parsed != nil && personaFileCache.modTime.Equal(info.ModTime()) {
+		return personaFileCache.parsed
 	}
 	data, err := os.ReadFile("data/personas.json")
 	if err != nil {
 		return nil
 	}
-	personaFileCache.content = data
+	personaFileCache.parsed = parsePersonas(data)
 	personaFileCache.modTime = info.ModTime()
-	return parsePersonas(data)
+	return personaFileCache.parsed
 }
 
 func parsePersonas(data []byte) []map[string]interface{} {

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -135,7 +136,9 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		parts = filePartsToMessage(body.Files)
 	}
 	text := plainTextFromParts(parts)
-	if text == "" {
+	// 对齐 Python 原版 webchat_message_parts_have_content：纯媒体消息
+	// （仅图片/文件 part，无 plain 文本）也允许发送。
+	if text == "" && !partsHaveMediaContent(parts) {
 		writeJSON(w, http.StatusBadRequest, apiError("Message content is empty"))
 		return
 	}
@@ -191,7 +194,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 
 	// Run the user message through the pipeline; done is closed when the
 	// event finishes processing.
-	done := s.processChatEvent(r.Context(), sessionID, runID, text, body.SelectedProvider, body.SelectedModel, body.Flags)
+	done := s.processChatEvent(r.Context(), sessionID, runID, text, body.SelectedProvider, body.SelectedModel, body.Flags, body.Files)
 	if done == nil {
 		sendSSE(w, flusher, map[string]interface{}{"type": "error", "data": "对话管道不可用"})
 		sendSSE(w, flusher, map[string]interface{}{"type": "end", "data": nil})
@@ -274,12 +277,17 @@ func emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full *strings.Bui
 // core.PipelineDone signal that the bus closes once the event is dispatched.
 // Fallback: when the bus is unavailable (queue full / no scheduler), run the
 // event through the scheduler directly in a goroutine.
-func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, providerID, model string, flags map[string]interface{}) <-chan struct{} {
+func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, providerID, model string, flags map[string]interface{}, files []interface{}) <-chan struct{} {
 	bus, ok := s.eventBus.(*core.EventBus)
 	if !ok || bus == nil {
 		return nil
 	}
 	chain := message.NewMessageChain(&message.Plain{Text: text})
+	// 上传的文件转成真实组件追加到链上，让管线能消费本地文件
+	// （LLM 视觉上下文、平台转发等），而不是只留占位文本。
+	if comps := s.filesToChainComponents(files); len(comps) > 0 {
+		chain.Chain = append(chain.Chain, comps...)
+	}
 	event := &core.Event{
 		Type: core.EventMessage,
 		Source: core.EventSource{
@@ -396,19 +404,120 @@ func plainTextFromParts(parts []map[string]interface{}) string {
 	return b.String()
 }
 
-// filePartsToMessage converts a files array (path strings) into plain text
-// placeholders (best effort; attachment parsing is out of scope here).
+// partsHaveMediaContent reports whether parts carry real content (plain text
+// or a media part with attachment_id/filename). 对齐 Python 原版
+// webchat_message_parts_have_content：纯图片/文件消息（无文本）也应放行。
+func partsHaveMediaContent(parts []map[string]interface{}) bool {
+	for _, p := range parts {
+		switch t, _ := p["type"].(string); t {
+		case "plain", "":
+			if text, _ := p["text"].(string); text != "" {
+				return true
+			}
+		case "image", "record", "file", "video":
+			if id, _ := p["attachment_id"].(string); id != "" {
+				return true
+			}
+			if name, _ := p["filename"].(string); name != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// filePartsToMessage converts a files array (uploaded attachments or legacy
+// path strings) into message parts. Each element may be a string (legacy
+// path) or a map carrying attachment_id/filename/type; recognizable types
+// become real parts the WebUI renders via contentUrl/byNameUrl, while
+// unrecognized entries fall back to the "[FILE] path" placeholder.
 func filePartsToMessage(files []interface{}) []map[string]interface{} {
 	if len(files) == 0 {
 		return nil
 	}
 	out := make([]map[string]interface{}, 0, len(files))
 	for _, f := range files {
-		if s, ok := f.(string); ok {
-			out = append(out, map[string]interface{}{"type": "plain", "text": "[FILE] " + s})
+		switch v := f.(type) {
+		case string:
+			out = append(out, map[string]interface{}{"type": "plain", "text": "[FILE] " + v})
+		case map[string]interface{}:
+			typ, _ := v["type"].(string)
+			id, _ := v["attachment_id"].(string)
+			name, _ := v["filename"].(string)
+			if name == "" {
+				if p, ok := v["path"].(string); ok {
+					name = p
+				}
+			}
+			part := map[string]interface{}{
+				"type":          typ,
+				"attachment_id": id,
+				"filename":      name,
+			}
+			if u, ok := v["url"].(string); ok && u != "" {
+				part["embedded_url"] = u
+			}
+			switch typ {
+			case "image", "record", "video", "file":
+				out = append(out, part)
+			default:
+				// 无法识别类型：回退占位文本。
+				out = append(out, map[string]interface{}{"type": "plain", "text": "[FILE] " + name})
+			}
+		default:
+			out = append(out, map[string]interface{}{"type": "plain", "text": "[FILE] " + fmt.Sprint(f)})
 		}
 	}
 	return out
+}
+
+// filesToChainComponents converts a files array (uploaded attachments) into
+// message chain components so the pipeline receives the actual local files
+// (image vision / platform forwarding) instead of dropping them. attachment_id
+// maps to the file under data/webui_files; entries without one fall back to
+// their path/file/url fields. Unresolvable entries are skipped.
+func (s *Server) filesToChainComponents(files []interface{}) []message.Component {
+	var comps []message.Component
+	for _, f := range files {
+		m, ok := f.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		typ, _ := m["type"].(string)
+		id, _ := m["attachment_id"].(string)
+		path := ""
+		if id != "" && safeAttachmentName(id) {
+			path = filepath.Join(s.webuiFilesDir(), id)
+		}
+		if path == "" {
+			for _, k := range []string{"path", "file"} {
+				if p, ok := m[k].(string); ok && p != "" {
+					path = p
+					break
+				}
+			}
+		}
+		if path == "" {
+			if u, ok := m["url"].(string); ok && u != "" {
+				path = u
+			}
+		}
+		if path == "" {
+			continue
+		}
+		switch typ {
+		case "image":
+			comps = append(comps, &message.Image{Path: path, File: path, FileID: id})
+		case "record":
+			comps = append(comps, &message.Record{Path: path, File: path, FileID: id})
+		case "video":
+			comps = append(comps, &message.Video{Path: path, FileID: id})
+		case "file":
+			name, _ := m["filename"].(string)
+			comps = append(comps, &message.File{Path: path, FileID: id, Name: name})
+		}
+	}
+	return comps
 }
 
 // compile-time interface check: chatStreamAdapter must satisfy
@@ -516,6 +625,7 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 			SessionID        string                   `json:"session_id"`
 			MessageID        string                   `json:"message_id"`
 			Message          []map[string]interface{} `json:"message"`
+			Files            []interface{}            `json:"files"`
 			Flags            map[string]interface{}   `json:"flags"`
 			SelectedProvider string                   `json:"selected_provider"`
 			SelectedModel    string                   `json:"selected_model"`
@@ -604,6 +714,7 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 	SessionID        string                   `json:"session_id"`
 	MessageID        string                   `json:"message_id"`
 	Message          []map[string]interface{} `json:"message"`
+	Files            []interface{}            `json:"files"`
 	Flags            map[string]interface{}   `json:"flags"`
 	SelectedProvider string                   `json:"selected_provider"`
 	SelectedModel    string                   `json:"selected_model"`
@@ -657,7 +768,7 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 		runCancel()
 	}()
 
-	done := s.processChatEvent(runCtx, sessionID, messageID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags)
+	done := s.processChatEvent(runCtx, sessionID, messageID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags, msg.Files)
 	if done == nil {
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "error", "data": "对话管道不可用", "message_id": messageID})
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})

@@ -110,11 +110,6 @@ func (s *OpenAITTSSource) SupportStream() bool { return false }
 // Test verifies the provider by listing models.
 func (s *OpenAITTSSource) Test(ctx context.Context) error {
 	url := s.apiBase + "/models"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	cfg := RetryConfigFromSettings(s.Settings())
 	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

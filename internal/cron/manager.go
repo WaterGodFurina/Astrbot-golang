@@ -202,11 +202,27 @@ func (m *CronJobManager) Remove(id string) {
 	}
 }
 
-// Get returns a job by id.
+// clone returns a copy of the job with a copied Payload map, so callers
+// outside the manager lock cannot mutate (or race) the live job state.
+func (j *Job) clone() *Job {
+	c := *j
+	c.Payload = make(map[string]interface{}, len(j.Payload))
+	for k, v := range j.Payload {
+		c.Payload[k] = v
+	}
+	return &c
+}
+
+// Get returns a job by id. The returned job is a copy: callers may read it
+// freely without racing the manager's lock-protected live state.
 func (m *CronJobManager) Get(id string) *Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.jobs[id]
+	job := m.jobs[id]
+	if job == nil {
+		return nil
+	}
+	return job.clone()
 }
 
 // RunNow immediately executes a job's handler in a background goroutine.
@@ -508,13 +524,14 @@ func (m *CronJobManager) persist(job *Job) {
 	}
 }
 
-// List returns all scheduled jobs.
+// List returns all scheduled jobs. Each job is a copy (see clone), so the
+// caller can iterate without racing concurrent UpdateJob mutation.
 func (m *CronJobManager) List() []*Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	result := make([]*Job, 0, len(m.jobs))
 	for _, j := range m.jobs {
-		result = append(result, j)
+		result = append(result, j.clone())
 	}
 	return result
 }

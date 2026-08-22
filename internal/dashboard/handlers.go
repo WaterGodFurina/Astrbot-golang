@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	"github.com/google/uuid"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
@@ -36,6 +38,7 @@ const (
 	maxKBDocFileSize     = 64 << 20  // 64 MiB：单个 KB 文档上限
 	maxSkillFileSize     = 64 << 20  // 64 MiB：skill zip 解压后单个文件上限
 	maxSkillExtractTotal = 256 << 20 // 256 MiB：skill zip 解压总字节上限
+	maxWebUIFileSize     = 64 << 20  // 64 MiB：WebUI 单次上传单文件上限
 )
 
 // ── Auth handlers ────────────────────────────────────────────
@@ -165,7 +168,7 @@ func redactDashboardSecrets(cfg map[string]interface{}) {
 	delete(dash, "totp")
 }
 
-// deepMerge recursively overlays src values onto dst; dst keys win at leaf level.
+// deepMerge recursively overlays src (persisted) values onto dst (defaults); src wins at leaf level.
 func deepMerge(dst, src map[string]interface{}) {
 	for k, v := range src {
 		if sm, ok := v.(map[string]interface{}); ok {
@@ -1505,22 +1508,24 @@ func (s *Server) upsertProvider(config map[string]interface{}) error {
 	if id == "" {
 		return fmt.Errorf("缺少提供商 ID")
 	}
-	cfg := s.getConfigSnapshot()
-	providers, _ := cfg["provider"].([]interface{})
-	replaced := false
-	for i, p := range providers {
-		if m, ok := p.(map[string]interface{}); ok {
-			if pid, _ := m["id"].(string); pid == id {
-				providers[i] = config
-				replaced = true
-				break
+	return s.mutateConfig(func(cfg map[string]interface{}) error {
+		providers, _ := cfg["provider"].([]interface{})
+		replaced := false
+		for i, p := range providers {
+			if m, ok := p.(map[string]interface{}); ok {
+				if pid, _ := m["id"].(string); pid == id {
+					providers[i] = config
+					replaced = true
+					break
+				}
 			}
 		}
-	}
-	if !replaced {
-		providers = append(providers, config)
-	}
-	return s.setConfigData("provider", providers)
+		if !replaced {
+			providers = append(providers, config)
+		}
+		cfg["provider"] = providers
+		return nil
+	})
 }
 
 // getProviderByID returns a provider config by id.
@@ -1539,20 +1544,24 @@ func (s *Server) getProviderByID(id string) map[string]interface{} {
 
 // setProviderEnabled toggles a provider's enable flag.
 func (s *Server) setProviderEnabled(id string, enabled bool) map[string]interface{} {
-	cfg := s.getConfigSnapshot()
-	providers, _ := cfg["provider"].([]interface{})
-	for i, p := range providers {
-		if m, ok := p.(map[string]interface{}); ok {
-			if pid, _ := m["id"].(string); pid == id {
-				providers[i].(map[string]interface{})["enable"] = enabled
-				if err := s.setConfigData("provider", providers); err != nil {
-					return map[string]interface{}{"message": "保存失败: " + err.Error()}
+	result := map[string]interface{}{"message": "未找到对应提供商"}
+	err := s.mutateConfig(func(cfg map[string]interface{}) error {
+		providers, _ := cfg["provider"].([]interface{})
+		for _, p := range providers {
+			if m, ok := p.(map[string]interface{}); ok {
+				if pid, _ := m["id"].(string); pid == id {
+					m["enable"] = enabled
+					result = map[string]interface{}{"message": "更新成功"}
+					return nil
 				}
-				return map[string]interface{}{"message": "更新成功"}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return map[string]interface{}{"message": "保存失败: " + err.Error()}
 	}
-	return map[string]interface{}{"message": "未找到对应提供商"}
+	return result
 }
 
 // deleteProviderByID removes a provider config by id and unregisters its
@@ -1819,21 +1828,24 @@ func (s *Server) upsertBot(config map[string]interface{}) error {
 	if botID == "" {
 		return fmt.Errorf("缺少机器人 ID")
 	}
-	platforms := s.getBotList()
-	replaced := false
-	for i, p := range platforms {
-		if m, ok := p.(map[string]interface{}); ok {
-			if id, _ := m["id"].(string); id == botID {
-				platforms[i] = config
-				replaced = true
-				break
+	return s.mutateConfig(func(cfg map[string]interface{}) error {
+		platforms, _ := cfg["platform"].([]interface{})
+		replaced := false
+		for i, p := range platforms {
+			if m, ok := p.(map[string]interface{}); ok {
+				if id, _ := m["id"].(string); id == botID {
+					platforms[i] = config
+					replaced = true
+					break
+				}
 			}
 		}
-	}
-	if !replaced {
-		platforms = append(platforms, config)
-	}
-	return s.setConfigData("platform", platforms)
+		if !replaced {
+			platforms = append(platforms, config)
+		}
+		cfg["platform"] = platforms
+		return nil
+	})
 }
 
 // setBotEnabled handles PATCH /api/v1/bots/set-enabled.
@@ -1843,24 +1855,33 @@ func (s *Server) setBotEnabled(w http.ResponseWriter, r *http.Request) {
 		Enabled bool   `json:"enabled"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	platforms := s.getBotList()
-	for i, p := range platforms {
-		if m, ok := p.(map[string]interface{}); ok {
-			if id, _ := m["id"].(string); id == body.BotID {
-				platforms[i].(map[string]interface{})["enable"] = body.Enabled
-				if err := s.setConfigData("platform", platforms); err != nil {
-					writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
-					return
+	found := false
+	err := s.mutateConfig(func(cfg map[string]interface{}) error {
+		platforms, _ := cfg["platform"].([]interface{})
+		for i, p := range platforms {
+			if m, ok := p.(map[string]interface{}); ok {
+				if id, _ := m["id"].(string); id == body.BotID {
+					platforms[i].(map[string]interface{})["enable"] = body.Enabled
+					found = true
+					return nil
 				}
-				s.notifyPlatformsChanged()
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "更新成功",
-				}))
-				return
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+		return
 	}
-	writeJSON(w, http.StatusOK, apiError("未找到对应机器人"))
+	if !found {
+		writeJSON(w, http.StatusOK, apiError("未找到对应机器人"))
+		return
+	}
+	s.notifyPlatformsChanged()
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"message": "更新成功",
+	}))
+	return
 }
 
 // deleteBot handles DELETE /api/v1/bots/delete.
@@ -2637,6 +2658,8 @@ func (s *Server) handlePluginLogo(w http.ResponseWriter, r *http.Request) {
 // dynamic <param> segments) — and the response is written back to the client
 // (Go acts as a thin nginx-style gateway).
 func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pluginPath string) {
+	// 限制请求体总量（含 multipart），防止插件代理吞入超大上传。
+	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
 	pluginPath = strings.TrimPrefix(pluginPath, "/")
 	if pluginPath == "" {
 		writeJSON(w, http.StatusOK, apiError("缺少插件路径"))
@@ -2702,10 +2725,14 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 						if err != nil {
 							continue
 						}
-						content, err := io.ReadAll(io.LimitReader(f, 64<<20))
+						content, err := io.ReadAll(io.LimitReader(f, 64<<20+1))
 						_ = f.Close()
 						if err != nil {
 							continue
+						}
+						if len(content) > 64<<20 {
+							writeJSON(w, http.StatusRequestEntityTooLarge, apiError("文件过大（上限 64MB）"))
+							return
 						}
 						req.Files = append(req.Files, &sdkv1.WebUploadFile{
 							Field:       field,
@@ -3440,7 +3467,7 @@ func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID 
 			}
 			status := "completed"
 			if failed > 0 {
-				status = "completed"
+				status = "failed"
 			}
 			s.recordKBTask(&kbUploadTask{
 				TaskID:       taskID,
@@ -3687,6 +3714,9 @@ func (s *Server) deleteKB(kbID string) error {
 	if s.database == nil {
 		return fmt.Errorf("数据库不可用")
 	}
+	if _, err := s.database.GetKB(kbID); err != nil {
+		return fmt.Errorf("知识库不存在")
+	}
 	// 级联清理 1：先删除该 KB 的全部分块行（knowledge_base_chunks），
 	// 避免只删 knowledge_bases 行后留下孤儿分块。
 	if err := s.database.DeleteKBChunks(kbID, ""); err != nil {
@@ -3697,8 +3727,14 @@ func (s *Server) deleteKB(kbID string) error {
 	}
 	// 级联清理 2：删除磁盘数据目录 data/knowledge_bases/<id>/，
 	// 其中 documents/ 与 nanovec 的 .store/.idx（.vec.db）文件一并移除。
-	kbDir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID))
-	if err := os.RemoveAll(kbDir); err != nil {
+	// 删除前双重校验：目录必须落在 knowledge_bases 根目录之内，防止
+	// kbID 形如 "." 或 ".." 时误删整个 data 目录。
+	root, _ := filepath.Abs(filepath.Join(s.kbDataDir(), "knowledge_bases"))
+	abs, _ := filepath.Abs(filepath.Join(root, sanitizePath(kbID)))
+	if abs == root || !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
+		return fmt.Errorf("非法知识库 ID")
+	}
+	if err := os.RemoveAll(abs); err != nil {
 		return fmt.Errorf("删除知识库数据目录失败: %w", err)
 	}
 	// 级联清理 3：释放该 KB 的向量写锁（kbVecMu 中的常驻 Mutex），
@@ -3734,6 +3770,9 @@ func (s *Server) kbDataDir() string {
 // sanitizePath makes a path segment safe for use in file names.
 func sanitizePath(p string) string {
 	p = filepath.Base(strings.ReplaceAll(p, "\\", "/"))
+	if strings.Trim(p, ".") == "" {
+		return "_"
+	}
 	var b strings.Builder
 	for _, r := range p {
 		switch {
@@ -4774,13 +4813,15 @@ func (s *Server) updateTool(w http.ResponseWriter, r *http.Request, toolID, acti
 			writeJSON(w, http.StatusOK, apiError("权限类型必须为 admin 或 member"))
 			return
 		}
-		cfg := s.getConfigSnapshot()
-		permissions, _ := cfg["tool_permissions"].(map[string]interface{})
-		if permissions == nil {
-			permissions = map[string]interface{}{}
-		}
-		permissions[toolID] = map[string]interface{}{"permission": body.Permission}
-		if err := s.setConfigData("tool_permissions", permissions); err != nil {
+		if err := s.mutateConfig(func(cfg map[string]interface{}) error {
+			permissions, _ := cfg["tool_permissions"].(map[string]interface{})
+			if permissions == nil {
+				permissions = map[string]interface{}{}
+			}
+			permissions[toolID] = map[string]interface{}{"permission": body.Permission}
+			cfg["tool_permissions"] = permissions
+			return nil
+		}); err != nil {
 			logger.I18nWarn("保存工具 %s 权限失败: %v", toolID, err)
 			writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
 			return
@@ -5784,42 +5825,302 @@ func (s *Server) handleSubagents(w http.ResponseWriter, r *http.Request, parts [
 
 // ── Files handlers ──────────────────────────────────────────
 
+// webuiFileMeta 是 WebUI 上传文件的元数据（与文件本体同目录存放）。
+type webuiFileMeta struct {
+	AttachmentID string `json:"attachment_id"`
+	Filename     string `json:"filename"`
+	Type         string `json:"type"` // image / record / video / file
+	Size         int64  `json:"size"`
+	CreatedAt    string `json:"created_at"`
+	FileToken    string `json:"file_token"` // 公开 token（平台 logo 预览用）
+}
+
+// webuiFilesDir 返回 WebUI 上传文件目录（data/webui_files）。
+func (s *Server) webuiFilesDir() string {
+	return filepath.Join(s.kbDataDir(), "webui_files")
+}
+
+// safeAttachmentName 校验 attachment_id / filename / file_token：必须是非空
+// 的单个路径段，拒绝 "."、".." 及任何含 "/" 或 "\" 的输入，防止路径穿越。
+func safeAttachmentName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return false
+	}
+	return filepath.Base(name) == name
+}
+
+// webUIFileType 按 Content-Type 前缀归类，对齐 Python 原版 save_uploaded_file
+// 的 attach_type 语义（image→image、audio→record、video→video，其余 file）。
+func webUIFileType(contentType string) string {
+	switch {
+	case strings.HasPrefix(contentType, "image/"):
+		return "image"
+	case strings.HasPrefix(contentType, "audio/"):
+		return "record"
+	case strings.HasPrefix(contentType, "video/"):
+		return "video"
+	default:
+		return "file"
+	}
+}
+
+// uploadWebUIFile 处理 POST /api/v1/files：接收 multipart "file"，落盘到
+// data/webui_files/{attachment_id}，同目录写 {attachment_id}.json 元数据。
+func (s *Server) uploadWebUIFile(w http.ResponseWriter, r *http.Request) {
+	// 限制请求体大小（对齐 KB/Skill 上传入口），防止大文件耗尽磁盘（DoS）。
+	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, apiError("上传文件过大（上限 256MB）"))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiError("解析上传文件失败: "+err.Error()))
+		return
+	}
+	file, fh, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError("未收到文件: "+err.Error()))
+		return
+	}
+	defer file.Close()
+
+	// 文件名只保留安全的单路径段（对齐 Python 原版 sanitize_upload_filename）。
+	filename := sanitizePath(filepath.Base(strings.ReplaceAll(fh.Filename, "\\", "/")))
+	if filename == "_" {
+		filename = "file"
+	}
+
+	attachmentID := uuid.NewString()
+	dir := s.webuiFilesDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		writeJSON(w, http.StatusOK, apiError("创建上传目录失败: "+err.Error()))
+		return
+	}
+	dst := filepath.Join(dir, attachmentID)
+	out, err := os.Create(dst)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError("保存上传文件失败: "+err.Error()))
+		return
+	}
+	n, err := io.Copy(out, io.LimitReader(file, maxWebUIFileSize+1))
+	if err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		writeJSON(w, http.StatusOK, apiError("保存上传文件失败: "+err.Error()))
+		return
+	}
+	_ = out.Close()
+	if n > maxWebUIFileSize {
+		_ = os.Remove(dst)
+		writeJSON(w, http.StatusOK, apiError("上传文件过大（单文件上限 64MB）"))
+		return
+	}
+
+	meta := webuiFileMeta{
+		AttachmentID: attachmentID,
+		Filename:     filename,
+		Type:         webUIFileType(fh.Header.Get("Content-Type")),
+		Size:         n,
+		CreatedAt:    time.Now().Format(time.RFC3339Nano),
+		FileToken:    uuid.NewString(),
+	}
+	data, _ := json.Marshal(meta)
+	if err := writeFileAtomic(filepath.Join(dir, attachmentID+".json"), data, 0o644); err != nil {
+		_ = os.Remove(dst)
+		writeJSON(w, http.StatusOK, apiError("写入元数据失败: "+err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"attachment_id": meta.AttachmentID,
+		"filename":      meta.Filename,
+		"type":          meta.Type,
+	}))
+}
+
+// listWebUIFileMetas 读取 data/webui_files 下全部元数据（按创建时间倒序）。
+func (s *Server) listWebUIFileMetas() []*webuiFileMeta {
+	dir := s.webuiFilesDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var metas []*webuiFileMeta
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var m webuiFileMeta
+		if json.Unmarshal(data, &m) == nil && m.AttachmentID != "" {
+			metas = append(metas, &m)
+		}
+	}
+	sort.Slice(metas, func(i, j int) bool { return metas[i].CreatedAt > metas[j].CreatedAt })
+	return metas
+}
+
+// findWebUIFileMeta 按字段（attachment_id / filename / file_token）查元数据。
+func (s *Server) findWebUIFileMeta(field, value string) *webuiFileMeta {
+	if !safeAttachmentName(value) {
+		return nil
+	}
+	for _, m := range s.listWebUIFileMetas() {
+		switch field {
+		case "attachment_id":
+			if m.AttachmentID == value {
+				return m
+			}
+		case "filename":
+			if m.Filename == value {
+				return m
+			}
+		case "file_token":
+			if m.FileToken == value {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+// serveWebUIFileContent 以正确的 Content-Type 流式返回文件字节。
+func (s *Server) serveWebUIFileContent(w http.ResponseWriter, r *http.Request, meta *webuiFileMeta) {
+	path := filepath.Join(s.webuiFilesDir(), meta.AttachmentID)
+	// 双保险：磁盘路径必须落在 webui_files 目录内。
+	rel, err := filepath.Rel(s.webuiFilesDir(), path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+		return
+	}
+	// Content-Type 按原始文件名扩展名推断，未知类型回退 octet-stream。
+	mimeType := mime.TypeByExtension(filepath.Ext(meta.Filename))
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", mimeType)
+	http.ServeFile(w, r, path)
+}
+
+// handleFiles 分发 /api/v1/files 下的子路径（router.go 只有单一分发点）：
+//   - POST /api/v1/files（无子路径）与 /api/v1/files/upload：上传
+//   - GET /api/v1/files（无子路径）与 /api/v1/files/list：文件列表
+//   - GET /api/v1/files/content?filename=xxx：按文件名返回内容
+//   - GET /api/v1/files/tokens/{file_token}：按公开 token 返回内容
+//   - GET /api/v1/files/{attachment_id}[/content]：按 attachment_id 返回内容
+//   - DELETE /api/v1/files/{attachment_id}：删除附件
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
 	if len(parts) > 0 {
 		sub = parts[0]
 	}
+	// 无子路径的 POST 即上传（对齐 Python 原版 POST /files）。
+	if sub == "" && r.Method == http.MethodPost {
+		s.uploadWebUIFile(w, r)
+		return
+	}
 	switch sub {
 	case "", "list":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"files": []interface{}{},
-		}))
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
+			return
+		}
+		files := make([]map[string]interface{}, 0, 4)
+		for _, m := range s.listWebUIFileMetas() {
+			files = append(files, map[string]interface{}{
+				"attachment_id": m.AttachmentID,
+				"filename":      m.Filename,
+				"type":          m.Type,
+				"size":          m.Size,
+				"created_at":    m.CreatedAt,
+			})
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"files": files}))
 	case "content":
-		if len(parts) > 1 {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"content": "",
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"content": "",
-			}))
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
+			return
 		}
+		name := r.URL.Query().Get("filename")
+		if name == "" {
+			writeJSON(w, http.StatusNotFound, apiError("缺少 filename 参数"))
+			return
+		}
+		meta := s.findWebUIFileMeta("filename", name)
+		if meta == nil {
+			writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+			return
+		}
+		s.serveWebUIFileContent(w, r, meta)
 	case "tokens":
-		if len(parts) > 1 {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"tokens": []interface{}{},
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"tokens": []interface{}{},
-			}))
+		// GET /api/v1/files/tokens/{file_token}：公开 token 文件（平台 logo 预览）。
+		if len(parts) > 1 && r.Method == http.MethodGet {
+			meta := s.findWebUIFileMeta("file_token", parts[1])
+			if meta == nil {
+				writeJSON(w, http.StatusNotFound, apiError("文件令牌无效"))
+				return
+			}
+			s.serveWebUIFileContent(w, r, meta)
+			return
 		}
+		writeJSON(w, http.StatusNotFound, apiError("文件令牌无效"))
 	case "upload":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "file uploaded",
-		}))
+		// 兼容 /api/v1/files/upload 写法。
+		if r.Method == http.MethodPost {
+			s.uploadWebUIFile(w, r)
+			return
+		}
+		writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
 	default:
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		// /api/v1/files/{attachment_id}[/content]：按 attachment_id 读取/删除。
+		if !safeAttachmentName(sub) {
+			writeJSON(w, http.StatusNotFound, apiError("无效的 attachment_id"))
+			return
+		}
+		if len(parts) >= 2 && parts[1] == "content" {
+			if r.Method != http.MethodGet {
+				writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
+				return
+			}
+			meta := s.findWebUIFileMeta("attachment_id", sub)
+			if meta == nil {
+				writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+				return
+			}
+			s.serveWebUIFileContent(w, r, meta)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			// 对齐 Python 原版：GET /files/{attachment_id} 与 /content 同语义。
+			meta := s.findWebUIFileMeta("attachment_id", sub)
+			if meta == nil {
+				writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+				return
+			}
+			s.serveWebUIFileContent(w, r, meta)
+		case http.MethodDelete:
+			meta := s.findWebUIFileMeta("attachment_id", sub)
+			if meta == nil {
+				writeJSON(w, http.StatusOK, apiError("文件不存在"))
+				return
+			}
+			_ = os.Remove(filepath.Join(s.webuiFilesDir(), meta.AttachmentID))
+			_ = os.Remove(filepath.Join(s.webuiFilesDir(), meta.AttachmentID+".json"))
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"attachment_id": meta.AttachmentID}))
+		default:
+			writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
+		}
 	}
 }
 
@@ -5968,41 +6269,55 @@ func (s *Server) updateCommand(w http.ResponseWriter, r *http.Request, handlerFu
 	}
 
 	// Load persisted config
-	cfg := s.getConfigSnapshot()
-	records, _ := cfg["command_configs"].(map[string]interface{})
-	if records == nil {
-		records = map[string]interface{}{}
-	}
-	rec, _ := records[handlerFullName].(map[string]interface{})
-	if rec == nil {
-		rec = map[string]interface{}{}
-	}
+	softErr := error(nil)
+	err := s.mutateConfig(func(cfg map[string]interface{}) error {
+		records, _ := cfg["command_configs"].(map[string]interface{})
+		if records == nil {
+			records = map[string]interface{}{}
+		}
+		rec, _ := records[handlerFullName].(map[string]interface{})
+		if rec == nil {
+			rec = map[string]interface{}{}
+		}
 
-	if body.Enabled != nil {
-		handler.Enabled = *body.Enabled
-		rec["enabled"] = *body.Enabled
-	}
-	if body.Alias != nil && strings.TrimSpace(*body.Alias) != "" {
-		desc, err := star.RenameCommand(sm.Handlers(), handlerFullName, *body.Alias)
-		if err != nil {
-			writeJSON(w, http.StatusOK, apiError(err.Error()))
-			return
+		if body.Enabled != nil {
+			// 经 registry 带锁入口修改，避免与消息管线 GetFilterHandlers 的
+			// 并发读构成 data race。
+			if *body.Enabled {
+				sm.Handlers().Enable(handlerFullName)
+			} else {
+				sm.Handlers().Disable(handlerFullName)
+			}
+			rec["enabled"] = *body.Enabled
 		}
-		rec["effective_command"] = desc.EffectiveCommand
-	}
-	if body.PermissionGroup != nil {
-		perm := strings.TrimSpace(*body.PermissionGroup)
-		if perm != "admin" && perm != "member" {
-			writeJSON(w, http.StatusOK, apiError("权限类型必须为 admin 或 member"))
-			return
+		if body.Alias != nil && strings.TrimSpace(*body.Alias) != "" {
+			desc, err := star.RenameCommand(sm.Handlers(), handlerFullName, *body.Alias)
+			if err != nil {
+				softErr = err
+				return nil
+			}
+			rec["effective_command"] = desc.EffectiveCommand
 		}
-		star.SetHandlerPermission(handler, perm)
-		rec["permission"] = perm
-	}
-	records[handlerFullName] = rec
-	if err := s.setConfigData("command_configs", records); err != nil {
+		if body.PermissionGroup != nil {
+			perm := strings.TrimSpace(*body.PermissionGroup)
+			if perm != "admin" && perm != "member" {
+				softErr = fmt.Errorf("权限类型必须为 admin 或 member")
+				return nil
+			}
+			sm.Handlers().SetHandlerPermission(handlerFullName, perm)
+			rec["permission"] = perm
+		}
+		records[handlerFullName] = rec
+		cfg["command_configs"] = records
+		return nil
+	})
+	if err != nil {
 		logger.I18nWarn("保存指令 %s 配置失败: %v", handlerFullName, err)
 		writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+		return
+	}
+	if softErr != nil {
+		writeJSON(w, http.StatusOK, apiError(softErr.Error()))
 		return
 	}
 
@@ -6411,7 +6726,10 @@ func (s *Server) handleConfigProfiles(w http.ResponseWriter, r *http.Request, pa
 			case http.MethodPut, http.MethodPatch:
 				// Frontend sends the config object directly (DynamicConfig).
 				var raw json.RawMessage
-				_ = json.NewDecoder(r.Body).Decode(&raw)
+				if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				var direct map[string]interface{}
 				if err := json.Unmarshal(raw, &direct); err == nil && direct != nil {
 					if inner, ok := direct["config"].(map[string]interface{}); ok && len(direct) == 1 {
@@ -6703,9 +7021,9 @@ func skillFileEditable(name string) bool {
 	return editableSuffixes[ext]
 }
 
-// skillFilePath resolves a file path inside data/skills/<name>, guarding
+// skillFilePath resolves a file path inside <dataDir>/skills/<name>, guarding
 // against path traversal.
-func skillFilePath(skillName, relPath string) (string, error) {
+func skillFilePath(dataDir, skillName, relPath string) (string, error) {
 	// 校验 skillName：仅允许单段目录名，拒绝空名、"."、含路径分隔符的名字，
 	// 防止 skillName 携带 ../ 使 root 越出 data/skills/ 目录。注意不拒绝
 	// 形如 "a..b" 的名字——".." 仅是合法目录名字符，真正越界由下面的
@@ -6714,7 +7032,7 @@ func skillFilePath(skillName, relPath string) (string, error) {
 		strings.ContainsAny(skillName, `/\\`) {
 		return "", fmt.Errorf("非法技能名")
 	}
-	root, err := filepath.Abs(filepath.Join("data", "skills", skillName))
+	root, err := filepath.Abs(filepath.Join(dataDir, "skills", skillName))
 	if err != nil {
 		return "", err
 	}
@@ -6733,7 +7051,7 @@ func skillFilePath(skillName, relPath string) (string, error) {
 func (s *Server) listSkillFiles(w http.ResponseWriter, r *http.Request) {
 	skillName := r.URL.Query().Get("skill_name")
 	relPath := r.URL.Query().Get("path")
-	target, err := skillFilePath(skillName, relPath)
+	target, err := skillFilePath(s.kbDataDir(), skillName, relPath)
 	if err != nil {
 		writeJSON(w, http.StatusOK, apiError(err.Error()))
 		return
@@ -6792,7 +7110,7 @@ func (s *Server) getSkillFile(w http.ResponseWriter, r *http.Request) {
 	if relPath == "" {
 		relPath = "SKILL.md"
 	}
-	target, err := skillFilePath(skillName, relPath)
+	target, err := skillFilePath(s.kbDataDir(), skillName, relPath)
 	if err != nil {
 		writeJSON(w, http.StatusOK, apiError(err.Error()))
 		return
@@ -6839,7 +7157,7 @@ func (s *Server) updateSkillFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, apiError("File content is too large"))
 		return
 	}
-	target, err := skillFilePath(body.SkillName, body.Path)
+	target, err := skillFilePath(s.kbDataDir(), body.SkillName, body.Path)
 	if err != nil {
 		writeJSON(w, http.StatusOK, apiError(err.Error()))
 		return
@@ -6878,7 +7196,7 @@ func (s *Server) uploadSkillsBatch(w http.ResponseWriter, r *http.Request) {
 	succeeded := []interface{}{}
 	failed := []interface{}{}
 	skipped := []interface{}{}
-	skillsRoot := "data/skills"
+	skillsRoot := filepath.Join(s.kbDataDir(), "skills")
 
 	for _, fh := range files {
 		filename := filepath.Base(fh.Filename)

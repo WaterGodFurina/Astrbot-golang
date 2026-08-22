@@ -117,6 +117,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	a.kookConfig = kc
 	a.client = NewKookClient(kc, a.onReceived)
 	a.rolesCache = NewRolesRecord(a.client.httpClient)
+	a.rolesCache.SetToken(kc.Token)
 	logger.Debug("[KOOK] 配置: id=%s enable=%v", kc.ID, kc.Enable)
 	return a
 }

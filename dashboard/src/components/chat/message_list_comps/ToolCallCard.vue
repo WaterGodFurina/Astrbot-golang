@@ -41,7 +41,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useModuleI18n } from "@/i18n/composables";
 
 const props = defineProps({
@@ -132,6 +132,16 @@ onMounted(() => {
     timer = setInterval(updateTime, 100);
   }
 });
+
+watch(
+  () => props.toolCall.finished_ts,
+  (finished) => {
+    if (finished && timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  },
+);
 
 onUnmounted(() => {
   if (timer) {

@@ -717,6 +717,13 @@ func (pm *PasswordManager) Login(password string) (string, error) {
 	if !pm.VerifyPassword(password) {
 		return "", fmt.Errorf("invalid password")
 	}
+	// 旧版无盐 MD5 哈希登录成功后自动升级为 PBKDF2 落盘（不注销会话）。
+	pm.mu.RLock()
+	md5Stored := isMD5Hash(pm.hashedPassword)
+	pm.mu.RUnlock()
+	if md5Stored {
+		pm.SetPasswordKeepUsername(password)
+	}
 	return pm.IssueToken(pm.Username())
 }
 
@@ -807,6 +814,18 @@ func (pm *PasswordManager) SetPassword(password string) {
 	// Now persist to config file (uses pm.hashedPassword which is already updated).
 	// saveToConfig 的 dashboardAuthFields 会带上 username（默认 admin），
 	// 改密后用户名自动填入配置文件。
+	pm.saveToConfig()
+}
+
+// SetPasswordKeepUsername 仅重新哈希密码并落盘（PBKDF2），不轮换 JWT secret、
+// 不清会话、不改用户名——用于旧版无盐 MD5 哈希登录成功后透明升级。
+func (pm *PasswordManager) SetPasswordKeepUsername(password string) {
+	if password == "" {
+		return
+	}
+	pm.mu.Lock()
+	pm.hashedPassword = hashPBKDF2(password)
+	pm.mu.Unlock()
 	pm.saveToConfig()
 }
 

@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -1114,11 +1115,12 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	activated = s.filterHandlersBySession(event, activated)
 	if permissionDenied {
 		// Ported from waking_check/stage.py: a permission filter failed. When
-		// no_permission_reply is enabled, tell the user; either way the event
-		// is stopped before any handler or the LLM runs.
+		// no_permission_reply is enabled, send the reply directly — Continue=false
+		// short-circuits the pipeline before ResultDecorateStage/RespondStage, so
+		// an event.Result chain would never be delivered; either way the event is
+		// stopped before any handler or the LLM runs.
 		if s.noPermissionReply && !event.IsStopped() {
-			event.Result = &message.MessageEventResult{}
-			event.Result.Chain = []message.Component{&message.Plain{Text: fmt.Sprintf("您(ID: %s)的权限不足以使用此指令。通过 /sid 获取 ID 并请管理员添加。", event.Source.SenderID)}}
+			s.replyText(event, fmt.Sprintf("您(ID: %s)的权限不足以使用此指令。通过 /sid 获取 ID 并请管理员添加。", event.Source.SenderID))
 		}
 		event.Stop()
 		return &StageResult{Continue: false}, nil
@@ -2304,6 +2306,10 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 	return systemPrompt, false, nil
 }
 
+// toolsRefreshTTL 是插件工具列表 ListTools RPC 的缓存时长：TTL 内跳过重复
+// 刷新，避免每次 LLM 调用都对每个插件同步发起一次 RPC。
+const toolsRefreshTTL = 5 * time.Minute
+
 // collectPluginTools returns the OpenAI tool schemas contributed by all loaded
 // subprocess plugins (each plugin's registered LLM function tools).
 func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
@@ -2311,9 +2317,13 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 		return nil
 	}
 	// 先刷新运行中插件的实时工具列表（插件工具在实例化阶段注册，晚于
-	// Register 快照；RefreshTools 成功后回写管理器工具注册表）。
+	// Register 快照；RefreshTools 成功后回写管理器工具注册表）。TTL 内已
+	// 刷新过的插件跳过，避免每次 LLM 调用都同步发起 ListTools RPC。
 	for _, inst := range s.subPlugins.List() {
 		if inst.Meta == nil {
+			continue
+		}
+		if inst.ToolsFreshWithin(toolsRefreshTTL) {
 			continue
 		}
 		inst.RefreshTools(context.Background())
@@ -2632,15 +2642,15 @@ func (s *ProcessStage) mcpSchemasSnapshot() []map[string]interface{} {
 
 // loadMCPTools connects to enabled MCP servers and caches their tools. It runs
 // in a goroutine (see ensureMCPTools) so connecting to slow servers does not
-// stall the pipeline.
+// stall the pipeline. 连接过程在锁外进行（无锁构建局部 clients/schemas），
+// 最后一次性持锁替换，慢服务器不会阻塞 mcpMu 的并发读。
 func (s *ProcessStage) loadMCPTools() {
-	s.mcpMu.Lock()
-	defer s.mcpMu.Unlock()
-
 	data, err := os.ReadFile("data/mcp_server.json")
 	if err != nil {
+		s.mcpMu.Lock()
 		s.mcpClients = nil
 		s.mcpSchemas = nil
+		s.mcpMu.Unlock()
 		return
 	}
 	var mcpCfg struct {
@@ -2648,17 +2658,16 @@ func (s *ProcessStage) loadMCPTools() {
 	}
 	if err := json.Unmarshal(data, &mcpCfg); err != nil {
 		logger.I18nWarn("解析 data/mcp_server.json 失败: %v", err)
+		s.mcpMu.Lock()
 		s.mcpClients = nil
 		s.mcpSchemas = nil
+		s.mcpMu.Unlock()
 		return
 	}
 
-	// Clean up previously connected clients.
-	for _, cl := range s.mcpClients {
-		cl.Cleanup()
-	}
-	s.mcpClients = make(map[string]*agent.MCPClient)
-	s.mcpSchemas = make(map[string]map[string]interface{})
+	// 无锁构建局部 clients/schemas。
+	clients := make(map[string]*agent.MCPClient)
+	schemas := make(map[string]map[string]interface{})
 
 	for name, cfg := range mcpCfg.McpServers {
 		if active, _ := cfg["active"].(bool); !active {
@@ -2675,7 +2684,7 @@ func (s *ProcessStage) loadMCPTools() {
 			logger.I18nWarn("MCP 服务器 %q 连接失败: %v", name, err)
 			continue
 		}
-		s.mcpClients[safeName] = client
+		clients[safeName] = client
 		for _, tool := range client.Tools() {
 			fullName := safeName + "." + sanitizeToolName(tool.Name)
 			schema := map[string]interface{}{
@@ -2686,11 +2695,20 @@ func (s *ProcessStage) loadMCPTools() {
 					"parameters":  tool.InputSchema,
 				},
 			}
-			s.mcpSchemas[fullName] = schema
+			schemas[fullName] = schema
 		}
 		logger.Debug("MCP server %q connected (%d tools)", name, len(client.Tools()))
 	}
+
+	// 持锁清理旧客户端并一次性替换为新状态。
+	s.mcpMu.Lock()
+	for _, cl := range s.mcpClients {
+		cl.Cleanup()
+	}
+	s.mcpClients = clients
+	s.mcpSchemas = schemas
 	s.mcpLoaded = true
+	s.mcpMu.Unlock()
 }
 
 // executeMCPTool dispatches a tool call to the matching MCP server. The tool
@@ -2994,9 +3012,36 @@ func executeWebFetch(rawURL string, maxLength int) string {
 		return "web_fetch 错误: " + err.Error()
 	}
 
+	// Dial 时校验解析后的真实 IP：validateWebFetchHost 的 LookupIP 与真正
+	// 建连之间可能发生 DNS rebinding，连接时刻的校验封死该 TOCTOU 窗口。
+	dialer := &net.Dialer{
+		Timeout: 10 * time.Second,
+		Control: func(network, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			addr, err := netip.ParseAddr(host)
+			if err != nil {
+				return err
+			}
+			addr = addr.Unmap()
+			if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() ||
+				addr.IsMulticast() || addr.IsUnspecified() || addr == cloudMetadataAddr {
+				return fmt.Errorf("拒绝连接到受限地址 %s", addr)
+			}
+			for _, p := range blockedNetPrefixes {
+				if p.Contains(addr) {
+					return fmt.Errorf("拒绝连接到保留地址段 %s 内的地址 %s", p, addr)
+				}
+			}
+			return nil
+		},
+	}
 	client := &http.Client{
 		Timeout:       30 * time.Second,
 		CheckRedirect: webFetchRedirectGuard,
+		Transport:     &http.Transport{DialContext: dialer.DialContext},
 	}
 	resp, err := client.Get(reqURL)
 	if err != nil {
@@ -3021,8 +3066,9 @@ func executeWebFetch(rawURL string, maxLength int) string {
 		text = htmlToText(body)
 	}
 	text = strings.TrimSpace(text)
-	if len(text) > maxLength {
-		text = text[:maxLength]
+	// 按 rune 截断，避免切在多字节 UTF-8 字符中间产生乱码。
+	if r := []rune(text); len(r) > maxLength {
+		text = string(r[:maxLength])
 	}
 	if text == "" {
 		return "web_fetch 结果: 页面无文本内容"
@@ -3105,12 +3151,15 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 			"astrbot_grep_tool":
 			if runtime != "local" {
 				result = fmt.Sprintf("工具 %s 未启用（Computer Use 运行时为 %s，需要 local）", name, runtime)
+			} else if !computerUseAllowed(s.config, event) {
+				// 用户 ACL：本地运行时直接操作宿主机，仅白名单用户可调用。
+				result = fmt.Sprintf("工具 %s 执行失败: computer_use 未授权该用户", name)
 			} else {
 				switch name {
 				case "astrbot_execute_shell":
-					result = executeLocalShell(umo, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
+					result = executeLocalShell(umo, event.GetSenderID(), argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
 				case "astrbot_shell_session":
-					result = executeShellSession(umo, argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
+					result = executeShellSession(umo, event.GetSenderID(), argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
 				case "astrbot_execute_python":
 					result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
 				case "astrbot_file_read_tool":
@@ -3613,6 +3662,7 @@ type ResultDecorateStage struct {
 	segOnlyLLMResult      bool
 	segSplitMode          string
 	segRegex              string
+	segRegexCompiled      *regexp.Regexp
 	segSplitWords         []string
 	segWordsPattern       *regexp.Regexp
 	segContentCleanupRule *regexp.Regexp
@@ -3646,6 +3696,14 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 				s.segSplitMode = "regex"
 			}
 			s.segRegex, _ = cfg["regex"].(string)
+			// 配置正则只编译一次（Initialize），避免每条消息热路径重新编译。
+			if s.segRegex != "" {
+				if re, err := regexp.Compile(s.segRegex); err == nil {
+					s.segRegexCompiled = re
+				} else {
+					logger.Error("Invalid segmented-reply regular expression; using the default segmentation method: %v", err)
+				}
+			}
 			s.segWordsThreshold = 150
 			if v, ok := cfg["words_count_threshold"].(int); ok && v > 0 {
 				s.segWordsThreshold = v

@@ -43,10 +43,11 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		if inst.Meta != nil {
 			desc = inst.Meta.Description
 		}
+		e := entryByID[inst.ID]
 		info := map[string]interface{}{
 			"name":                   inst.Name,
-			"display_name":           m.pluginDisplayName(inst, entryByID[inst.ID]),
-			"short_desc":             m.pluginShortDesc(inst, entryByID[inst.ID]),
+			"display_name":           m.pluginDisplayName(inst, e),
+			"short_desc":             m.pluginShortDesc(inst, e),
 			"marketplace_name":       strings.ReplaceAll(inst.Name, "_", "-"),
 			"version":                inst.Version,
 			"description":            desc,
@@ -60,12 +61,12 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"reserved":               false,
 			"author":                 "",
 			"repo":                   "",
-			"idle_unload_blocked":    m.IdleUnloadBlocked(inst.ID),
+			"idle_unload_blocked":    e != nil && e.IdleUnloadBlocked,
 			"install_source":         nil,
 			"updates_enabled":        true,
 			"update_disabled_reason": "",
 		}
-		if e := entryByID[inst.ID]; e != nil {
+		if e != nil {
 			info["repo"] = e.Repo
 			if info["repo"] == "" {
 				info["repo"] = e.Source
@@ -458,6 +459,10 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 	}
 	m.manifestMu.Unlock()
 
+	if entry == nil && m.Get(id) == nil {
+		return fmt.Errorf("插件 %s 未安装", id)
+	}
+
 	// 二进制目录（始终删除）。
 	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id)))
 	// 插件本体源码目录（Go/Python 统一在 plugins/<id>，始终删除）。
@@ -728,7 +733,7 @@ func (m *SubprocessManager) stripMetadataKeys(id string, cfg map[string]interfac
 	m.mergeMetadataFile(id, removed)
 	// 重写 config.json（不含元数据键）。
 	if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-		_ = os.WriteFile(m.configPath(id), data, 0o644) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
+		_ = os.WriteFile(m.configPath(id), data, 0o600) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
 	}
 	return cfg
 }
@@ -887,7 +892,7 @@ func (m *SubprocessManager) SaveConfig(id string, cfg map[string]interface{}) er
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
+	return os.WriteFile(path, data, 0o600) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
 }
 
 // pluginDataRoot returns the unified per-plugin data root directory
@@ -1003,13 +1008,17 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 	m.docMu.Unlock()
 
 	client := &http.Client{Timeout: 5 * time.Second}
+	const maxDocSize = 2 << 20
 	for _, rawURL := range rawURLs {
 		resp, err := client.Get(rawURL)
 		if err != nil {
 			continue
 		}
-		content, _ := io.ReadAll(resp.Body)
+		content, err := io.ReadAll(io.LimitReader(resp.Body, maxDocSize+1))
 		_ = resp.Body.Close()
+		if err != nil || int64(len(content)) > maxDocSize {
+			continue
+		}
 		if resp.StatusCode == http.StatusOK && len(content) > 0 {
 			m.docMu.Lock()
 			m.docFetchCache[cacheKey] = docCacheEntry{content: string(content), ts: time.Now()}

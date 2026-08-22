@@ -205,8 +205,12 @@ func TestDoWithRetryRetries429(t *testing.T) {
 	if calls != 3 {
 		t.Errorf("calls = %d, want 3", calls)
 	}
-	if elapsed < 900*time.Millisecond {
-		t.Errorf("elapsed = %v, want >= 1.9s (2 x Retry-After 1s)", elapsed)
+	// Retry-After 1s 被 MaxDelay(50ms) 封顶: 每次重试只等待 50ms。
+	if elapsed >= 900*time.Millisecond {
+		t.Errorf("elapsed = %v, want < 900ms (Retry-After capped by MaxDelay 50ms)", elapsed)
+	}
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= 40ms (capped waits still sleep)", elapsed)
 	}
 }
 
@@ -360,8 +364,12 @@ func TestDoWithRetryRetryAfterHeader(t *testing.T) {
 	if calls != 2 {
 		t.Errorf("calls = %d, want 2", calls)
 	}
-	if elapsed < 1900*time.Millisecond {
-		t.Errorf("elapsed = %v, want >= 2s (Retry-After)", elapsed)
+	// Retry-After 2s 被 MaxDelay(50ms) 封顶: 只等待 50ms。
+	if elapsed >= 1900*time.Millisecond {
+		t.Errorf("elapsed = %v, want < 2s (Retry-After 2s capped by MaxDelay 50ms)", elapsed)
+	}
+	if elapsed < 40*time.Millisecond {
+		t.Errorf("elapsed = %v, want >= 40ms (capped Retry-After wait)", elapsed)
 	}
 }
 

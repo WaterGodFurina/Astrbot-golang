@@ -56,6 +56,7 @@
 import { ref, computed, onBeforeUnmount, watch } from 'vue';
 import { useTheme } from 'vuetify';
 import { chatApi } from '@/api/v1';
+import { getToken } from '@/utils/token';
 import { useVADRecording } from '@/composables/useVADRecording';
 import SiriOrb from './LiveOrb.vue';
 
@@ -275,7 +276,7 @@ async function stopLiveMode() {
 function connectWebSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
         // 获取存储的 token
-        const token = localStorage.getItem('token');
+        const token = getToken();
         if (!token) {
             reject(new Error('未登录，请先登录'));
             return;

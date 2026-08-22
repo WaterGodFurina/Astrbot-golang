@@ -44,7 +44,15 @@ const (
 	maxFileDownloadSize = 20 << 20
 	// slackTimestampSkew X-Slack-Request-Timestamp 与当前时间允许的最大偏差（防重放）。
 	slackTimestampSkew = 5 * time.Minute
+	// userNameCacheTTL 用户名缓存过期时间（减少 users.info 的 N+1 查询）。
+	userNameCacheTTL = 10 * time.Minute
 )
+
+// userNameCacheEntry 用户名缓存条目。
+type userNameCacheEntry struct {
+	name string
+	at   time.Time
+}
 
 // limitedWriter 限制写入总量不超过 limit 字节（用于下载大小上限）。
 type limitedWriter struct {
@@ -88,15 +96,19 @@ type Adapter struct {
 
 	stopCh chan struct{}
 	mu     sync.Mutex
+
+	// userNameCache 用户昵称缓存（user_id -> 昵称，带 TTL）。
+	userNameCache map[string]userNameCacheEntry
 }
 
 // New 创建 Slack 适配器。
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		config:   config,
-		settings: settings,
-		EventBus: eventBus,
-		stopCh:   make(chan struct{}),
+		config:        config,
+		settings:      settings,
+		EventBus:      eventBus,
+		stopCh:        make(chan struct{}),
+		userNameCache: make(map[string]userNameCacheEntry),
 	}
 	a.botToken, _ = config["bot_token"].(string)
 	a.appToken, _ = config["app_token"].(string)
@@ -475,7 +487,7 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 // mentionRegex 匹配 <@USER_ID> 提及格式。
 var mentionRegex = regexp.MustCompile(`<@([^>]+)>`)
 
-// fetchUserName 获取用户昵称（users.info），失败时回退为 user_id。
+// fetchUserName 获取用户昵称（users.info，带 10 分钟 TTL 缓存），失败时回退为 user_id。
 // 对应 Python convert_message 中的 users_info 调用。
 func (a *Adapter) fetchUserName(ctx context.Context, userID string) string {
 	if userID == "" {
@@ -484,18 +496,37 @@ func (a *Adapter) fetchUserName(ctx context.Context, userID string) string {
 	if a.client == nil {
 		return userID
 	}
+	a.mu.Lock()
+	if e, ok := a.userNameCache[userID]; ok && time.Since(e.at) < userNameCacheTTL {
+		a.mu.Unlock()
+		return e.name
+	}
+	// 缓存过大时惰性清理过期条目，防止缓存无限增长
+	if len(a.userNameCache) > 1024 {
+		now := time.Now()
+		for id, e := range a.userNameCache {
+			if now.Sub(e.at) > userNameCacheTTL {
+				delete(a.userNameCache, id)
+			}
+		}
+	}
+	a.mu.Unlock()
+
 	users, err := a.client.GetUsersInfoContext(ctx, userID)
 	if err != nil || users == nil || len(*users) == 0 {
 		return userID
 	}
 	user := (*users)[0]
+	name := userID
 	if user.RealName != "" {
-		return user.RealName
+		name = user.RealName
+	} else if user.Name != "" {
+		name = user.Name
 	}
-	if user.Name != "" {
-		return user.Name
-	}
-	return userID
+	a.mu.Lock()
+	a.userNameCache[userID] = userNameCacheEntry{name: name, at: time.Now()}
+	a.mu.Unlock()
+	return name
 }
 
 // isIMChannel 判断频道是否为私聊（conversations.info 的 is_im）。

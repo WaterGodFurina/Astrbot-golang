@@ -1,6 +1,7 @@
 <script setup>
 import { useCommonStore } from '@/stores/common';
 import { logApi } from '@/api/v1';
+import { getToken } from '@/utils/token';
 import { EventSourcePolyfill } from 'event-source-polyfill';
 </script>
 
@@ -119,7 +120,7 @@ export default {
 
       console.log(`正在连接日志流... (尝试次数: ${this.retryAttempts})`);
       
-      const token = localStorage.getItem('token');
+      const token = getToken();
 
       this.eventSource = new EventSourcePolyfill(logApi.liveUrl(), {
         headers: {

@@ -797,6 +797,8 @@ async function downloadPart(part: MessagePart) {
     anchor.download = part.filename || "file";
     anchor.click();
     URL.revokeObjectURL(url);
+  } catch (error) {
+    console.error("Failed to download attachment:", error);
   } finally {
     const next = new Set(downloadingFiles.value);
     next.delete(key);

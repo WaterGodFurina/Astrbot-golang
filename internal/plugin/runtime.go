@@ -76,6 +76,9 @@ type PluginInstance struct {
 	toolsMu     sync.Mutex
 	toolsCache  []*sdkv1.ToolDesc
 	toolsLoaded bool
+	// toolsRefreshedAtNano 是最近一次 RefreshTools 成功的 UnixNano 时间戳，
+	// 供宿主跳过 TTL 内的重复 ListTools RPC（见 ToolsFreshWithin）。
+	toolsRefreshedAtNano atomic.Int64
 
 	mu  sync.Mutex
 	raw *goplugin.Client // go-plugin process client
@@ -85,6 +88,9 @@ type PluginInstance struct {
 	pgid     int
 	stopped  bool // set before intentional kill (suppresses restart)
 	restarts int  // consecutive crash-restart count for this instance
+	// handshakePort 是实例持有的 go-plugin 握手端口（allocPluginPort 分配），
+	// teardown/启动失败时归还，防止插件反复加载/崩溃重启导致端口永久耗尽。
+	handshakePort uint
 	// lastRestartAt 记录上一次崩溃重启的时间，用于 restart 预算的基于时间衰减。
 	lastRestartAt time.Time
 	failed        error // set when the plugin is marked failed
@@ -249,10 +255,18 @@ func (inst *PluginInstance) RefreshTools(ctx context.Context) {
 	inst.toolsMu.Lock()
 	inst.toolsCache = tools
 	inst.toolsLoaded = true
+	inst.toolsRefreshedAtNano.Store(time.Now().UnixNano())
 	inst.toolsMu.Unlock()
 	if m := inst.owner; m != nil {
 		m.setPluginTools(inst.ID, tools)
 	}
+}
+
+// ToolsFreshWithin reports whether the tools list was refreshed by ListTools
+// within dur, so callers can skip redundant refresh RPCs.
+func (inst *PluginInstance) ToolsFreshWithin(dur time.Duration) bool {
+	last := time.Unix(0, inst.toolsRefreshedAtNano.Load())
+	return !last.IsZero() && time.Since(last) < dur
 }
 
 // ToolsSnapshot 返回插件当前的 LLM 工具列表：优先使用 ListTools 缓存
@@ -715,12 +729,20 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	// （本体/文档/logo 统一位置，按 id = name_language 隔离），后续编译与
 	// 文档缓存都从这里取。
 	srcDest := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
-	if err := os.RemoveAll(srcDest); err != nil {
-		return nil, err
-	}
-	if err := copyDir(srcDir, srcDest); err != nil {
+	staged := srcDest + ".staging"
+	old := srcDest + ".old"
+	_ = os.RemoveAll(staged)
+	if err := copyDir(srcDir, staged); err != nil {
+		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("拷贝插件源码: %w", err)
 	}
+	// 后续 Prepare/Vet/Build 全部基于 staged 成功后：
+	_ = os.Rename(srcDest, old)
+	if err := os.Rename(staged, srcDest); err != nil {
+		_ = os.Rename(old, srcDest)
+		return nil, err
+	}
+	defer os.RemoveAll(old)
 	if err := m.compiler.Prepare(srcDest, goModuleNameOf(srcDest, meta)); err != nil {
 		return nil, fmt.Errorf("prepare module: %w", err)
 	}
@@ -800,12 +822,19 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 		return nil, err
 	}
 	dest := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
-	if err := os.RemoveAll(dest); err != nil {
-		return nil, err
-	}
-	if err := copyDir(srcDir, dest); err != nil {
+	staged := dest + ".staging"
+	old := dest + ".old"
+	_ = os.RemoveAll(staged)
+	if err := copyDir(srcDir, staged); err != nil {
+		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("拷贝 Python 插件源码: %w", err)
 	}
+	_ = os.Rename(dest, old)
+	if err := os.Rename(staged, dest); err != nil {
+		_ = os.Rename(old, dest)
+		return nil, err
+	}
+	defer os.RemoveAll(old)
 
 	// requirements.txt → pip install（使用 Python venv；失败仅告警，插件仍可加载）
 	req := filepath.Join(dest, "requirements.txt")
@@ -1258,9 +1287,18 @@ func (m *SubprocessManager) sweepIdlePlugins() {
 	if idle <= 0 {
 		return
 	}
+	// 一次构建常驻插件表（manifest 只读一遍），避免逐插件重读 manifest 磁盘。
+	blocked := map[string]bool{}
+	if man, err := LoadManifest(m.manifestPath()); err == nil {
+		for i := range man.Plugins {
+			if man.Plugins[i].IdleUnloadBlocked {
+				blocked[man.Plugins[i].ID] = true
+			}
+		}
+	}
 	now := time.Now()
 	for _, inst := range insts {
-		if m.IdleUnloadBlocked(inst.ID) {
+		if blocked[inst.ID] {
 			continue // 常驻插件（WebUI 行为页勾选"不允许休眠"）不参与清扫
 		}
 		if inst.IsIdle(now, idle) {
@@ -1434,20 +1472,31 @@ var (
 // 除进程内已分配记录外，还会检测端口当前是否被监听（孤儿插件进程、其他
 // 服务的残留监听），占用则跳过——否则 SO_REUSEPORT 双绑会让宿主连接被
 // 内核路由到错误的进程（Register 元数据串台）。
+// 端口耗尽（>65535）时返回 0,0，调用方应停止启动并上报错误。
 func allocPluginPort(base int) (uint, uint) {
 	globalPortMu.Lock()
 	defer globalPortMu.Unlock()
 	if base <= 0 {
 		base = 10000
 	}
-	p := base
-	for {
+	for p := base; p <= 65535; p++ {
 		if _, used := globalPortUsed[p]; !used && !portInUse(p) {
 			globalPortUsed[p] = struct{}{}
 			return uint(p), uint(p) // #nosec G115 -- 端口从 base(≥1) 起向上扫描，int→uint 不溢出
 		}
-		p++
 	}
+	return 0, 0
+}
+
+// releasePluginPort 归还握手端口（实例 teardown/启动失败时调用；0 = 未分配，
+// 直接忽略）。归还后该端口可被后续插件重新使用。
+func releasePluginPort(p uint) {
+	if p == 0 {
+		return
+	}
+	globalPortMu.Lock()
+	delete(globalPortUsed, int(p))
+	globalPortMu.Unlock()
 }
 
 // portInUse 探测 127.0.0.1:p 是否已被监听（绑定成功=空闲；失败=被占）。
@@ -1607,13 +1656,16 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 	}
 	// 每个插件分配独占握手端口（见 portAllocMu 注释）：避免 SO_REUSEPORT
 	// 同端口双绑导致宿主连接路由到错误的插件进程。
+	var minp, maxp uint
 	if m.MaxPort > 0 && m.MinPort > 0 {
-		minp, maxp := m.allocPortRange()
-		cfg.MinPort, cfg.MaxPort = minp, maxp
+		minp, maxp = m.allocPortRange()
 	} else {
-		minp, maxp := m.allocPortRangeDefault()
-		cfg.MinPort, cfg.MaxPort = minp, maxp
+		minp, maxp = m.allocPortRangeDefault()
 	}
+	if minp == 0 {
+		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: 无可分配握手端口", id))
+	}
+	cfg.MinPort, cfg.MaxPort = minp, maxp
 	raw := goplugin.NewClient(cfg)
 
 	// go-plugin's handshake has no built-in timeout; enforce one.
@@ -1661,6 +1713,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 	case res := <-resCh:
 		if res.err != nil {
 			raw.Kill()
+			releasePluginPort(minp)
 			// 握手失败时直接子进程可能已退出（killProcessGroup 对 ESRCH 视为
 			// 完成），但 Python 桥可能已拉起子进程：按组回收兜底。
 			killProcessGroup(&PluginInstance{pgid: res.pid})
@@ -1673,6 +1726,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		// *pluginsdk.Client（持有 gRPC conn + HostService server）并关闭，
 		// 避免反复 Load 泄漏连接与 goroutine。
 		raw.Kill()
+		releasePluginPort(minp)
 		res := <-resCh
 		killProcessGroup(&PluginInstance{pgid: res.pid})
 		if res.pc != nil {
@@ -1681,6 +1735,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: handshake timed out after %v", id, startTimeout))
 	case <-m.ctx.Done():
 		raw.Kill()
+		releasePluginPort(minp)
 		res := <-resCh
 		killProcessGroup(&PluginInstance{pgid: res.pid})
 		if res.pc != nil {
@@ -1697,6 +1752,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 	if err != nil {
 		_ = pc.Close()
 		raw.Kill()
+		releasePluginPort(minp)
 		killProcessGroup(&PluginInstance{pgid: pid})
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("plugin %s Register: %w", id, err))
 	}
@@ -1708,17 +1764,18 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 	}
 
 	inst := &PluginInstance{
-		ID:        id,
-		Name:      meta.Name,
-		Version:   meta.Version,
-		Binary:    abs,
-		Language:  language,
-		Client:    pc,
-		Meta:      meta,
-		raw:       raw,
-		pgid:      pid, // Setpgid 后进程组 id = 直接子进程 pid
-		StartedAt: time.Now(),
-		owner:     m,
+		ID:            id,
+		Name:          meta.Name,
+		Version:       meta.Version,
+		Binary:        abs,
+		Language:      language,
+		Client:        pc,
+		Meta:          meta,
+		raw:           raw,
+		pgid:          pid, // Setpgid 后进程组 id = 直接子进程 pid
+		handshakePort: minp,
+		StartedAt:     time.Now(),
+		owner:         m,
 	}
 	// 登记 handler 元数据：休眠后实例被移出 instances 表，但元数据保留，
 	// 供 RebridgePlugins 重建休眠插件的 star handler（命令/过滤器/钩子）。
@@ -2288,6 +2345,8 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	if inst.Client != nil {
 		_ = inst.Client.Close()
 	}
+	// 归还握手端口：实例进程已回收，端口不再被占用，可被后续插件复用。
+	releasePluginPort(inst.handshakePort)
 	// 归还 Go 堆给 OS：插件子进程被杀后其内存已由 OS 回收，但宿主 Go 运行时
 	// 默认不会把释放的对象还给系统（RSS 只涨不降）。这里强制 GC + 归还，
 	// 解决"插件禁用/重载后运存不释放"。

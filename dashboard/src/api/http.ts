@@ -3,6 +3,7 @@ import axios, {
   type AxiosInstance,
   type InternalAxiosRequestConfig,
 } from 'axios';
+import { getToken, removeToken } from '@/utils/token';
 
 const AUTH_HEADER = 'Authorization';
 const LOCALE_HEADER = 'Accept-Language';
@@ -12,10 +13,6 @@ let originalFetch: typeof window.fetch | null = null;
 
 export const httpClient = axios;
 export const apiV1Client = axios.create({ baseURL: '/api/v1' });
-
-function getToken(): string | null {
-  return localStorage.getItem('token');
-}
 
 function getLocale(): string | null {
   return localStorage.getItem('astrbot-locale');
@@ -83,13 +80,10 @@ function normalizeAxiosError(error: AxiosError) {
       );
 
     if (requestPath.startsWith('/api/') && !isAuthChallenge) {
-      [
-        'user',
-        'token',
-        'change_pwd_hint',
-        'md5_pwd_hint',
-        'password_upgrade_required',
-      ].forEach((key) => localStorage.removeItem(key));
+      removeToken();
+      ['user', 'change_pwd_hint', 'md5_pwd_hint', 'password_upgrade_required'].forEach(
+        (key) => localStorage.removeItem(key),
+      );
 
       if (!window.location.hash.startsWith('#/auth/login')) {
         window.location.hash = '/auth/login';

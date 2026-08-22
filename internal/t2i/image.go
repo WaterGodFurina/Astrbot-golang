@@ -11,7 +11,9 @@ import (
 	"image/png"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -557,46 +559,57 @@ func wrapSmart(dc *gg.Context, text string, maxWidth float64) []string {
 		}
 		fields := splitKeepSpaces(seg)
 		line := ""
+		// lineW 缓存当前行累计宽度，避免每次候选都重新测量整行（O(n) 增量）。
+		lineW := 0.0
 		for _, field := range fields {
 			if field == " " {
 				if line != "" {
 					line += " "
+					sw, _ := dc.MeasureString(" ")
+					lineW += sw
 				}
 				continue
 			}
 			// candidate = line + (space if needed) + field
+			fw, _ := dc.MeasureString(field)
 			sep := ""
+			sepW := 0.0
 			if line != "" && !strings.HasSuffix(line, " ") {
 				sep = " "
+				sepW, _ = dc.MeasureString(" ")
 			}
-			cand := line + sep + field
-			w, _ := dc.MeasureString(cand)
-			if w <= maxWidth {
-				line = cand
+			if lineW+sepW+fw <= maxWidth {
+				line += sep + field
+				lineW += sepW + fw
 				continue
 			}
 			// field alone fits?
-			fw, _ := dc.MeasureString(field)
 			if line != "" {
 				out = append(out, strings.TrimRight(line, " "))
 				line = ""
+				lineW = 0
 			}
 			if fw <= maxWidth {
 				line = field
+				lineW = fw
 				continue
 			}
 			// field itself exceeds: break by runes
 			cur := ""
+			curW := 0.0
 			for _, ch := range field {
-				cw, _ := dc.MeasureString(cur + string(ch))
-				if cw > maxWidth && cur != "" {
+				cw, _ := dc.MeasureString(string(ch))
+				if curW+cw > maxWidth && cur != "" {
 					out = append(out, strings.TrimRight(cur, " "))
 					cur = ""
+					curW = 0
 				}
 				cur += string(ch)
+				curW += cw
 			}
 			if cur != "" {
 				line = cur
+				lineW = curW
 			}
 		}
 		if strings.TrimSpace(line) != "" {
@@ -982,6 +995,27 @@ func decodeBase64Image(s string) ([]byte, error) {
 }
 
 func fetchRemoteImage(u string) ([]byte, error) {
+	// SSRF 纵深防御：t2i 服务返回的图片 URL 应指向公网对象存储；仅允许
+	// http/https，拒绝 localhost 回环主机与纯 IP 目标（内网探测面）。
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return nil, fmt.Errorf("fetch image: invalid URL: %w", err)
+	}
+	switch parsed.Scheme {
+	case "http", "https":
+	default:
+		return nil, fmt.Errorf("fetch image: unsupported scheme %q", parsed.Scheme)
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if host == "" {
+		return nil, fmt.Errorf("fetch image: missing host")
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return nil, fmt.Errorf("fetch image: loopback host %q rejected", host)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return nil, fmt.Errorf("fetch image: IP target %q rejected", host)
+	}
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Get(u)
 	if err != nil {
@@ -991,5 +1025,12 @@ func fetchRemoteImage(u string) ([]byte, error) {
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("fetch image HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil, err
+	}
+	if !isImageData(body) {
+		return nil, fmt.Errorf("not an image")
+	}
+	return body, nil
 }

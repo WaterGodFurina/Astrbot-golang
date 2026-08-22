@@ -118,29 +118,10 @@ func permissionFor(h *StarHandlerMetadata) string {
 	return "member"
 }
 
-// SetHandlerPermission updates (or inserts) the permission filter of a handler.
-func SetHandlerPermission(h *StarHandlerMetadata, permission string) {
-	if h == nil {
-		return
-	}
-	var target PermissionType
-	switch permission {
-	case "admin":
-		target = PermissionAdmin
-	default:
-		target = PermissionMember
-	}
-	for i, filter := range h.EventFilters {
-		if _, ok := filter.(*PermissionFilter); ok {
-			h.EventFilters[i] = NewPermissionFilter(target)
-			return
-		}
-	}
-	h.EventFilters = append(h.EventFilters, NewPermissionFilter(target))
-}
-
 // ApplyCommandConfigs applies persisted command configs (enabled / renamed /
-// permission) to the runtime handlers at startup.
+// permission) to the runtime handlers at startup. All mutations go through the
+// registry's locked entry points so they cannot race the message pipeline's
+// GetFilterHandlers reads.
 // records: map[handler_full_name] -> {enabled, effective_command, permission}
 func ApplyCommandConfigs(registry *StarHandlerRegistry, records map[string]interface{}) {
 	if registry == nil || records == nil {
@@ -151,18 +132,18 @@ func ApplyCommandConfigs(registry *StarHandlerRegistry, records map[string]inter
 		if !ok {
 			continue
 		}
-		handler := registry.Get(fullName)
-		if handler == nil {
-			continue
-		}
 		if enabled, ok := rec["enabled"].(bool); ok {
-			handler.Enabled = enabled
+			if enabled {
+				registry.Enable(fullName)
+			} else {
+				registry.Disable(fullName)
+			}
 		}
 		if cmd, ok := rec["effective_command"].(string); ok && cmd != "" {
 			_, _ = RenameCommand(registry, fullName, cmd)
 		}
 		if perm, ok := rec["permission"].(string); ok && perm != "" {
-			SetHandlerPermission(handler, perm)
+			registry.SetHandlerPermission(fullName, perm)
 		}
 	}
 }

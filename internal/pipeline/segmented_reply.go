@@ -51,12 +51,8 @@ func (s *ResultDecorateStage) applySegmentedReply(event *core.Event) {
 			segments = s.splitTextByWords(plain.Text)
 		} else {
 			re := defaultSegRegex
-			if s.segRegex != "" {
-				if compiled, err := regexp.Compile(s.segRegex); err == nil {
-					re = compiled
-				} else {
-					logger.Error("Invalid segmented-reply regular expression; using the default segmentation method: %v", err)
-				}
+			if s.segRegexCompiled != nil {
+				re = s.segRegexCompiled
 			}
 			segments = re.FindAllString(plain.Text, -1)
 		}
@@ -88,9 +84,6 @@ func (s *ResultDecorateStage) splitTextByWords(text string) []string {
 		if len(m) > 1 {
 			content = m[1]
 		} else if len(m) > 0 {
-			content = m[0]
-		}
-		if !strings.Contains(content, "") && content == "" && len(m) > 0 {
 			content = m[0]
 		}
 		if content == "" && len(m) > 0 {

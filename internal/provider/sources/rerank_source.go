@@ -110,5 +110,8 @@ func (s *TEIRerankSource) Test(ctx context.Context) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("rerank health check failed: HTTP %d", resp.StatusCode)
+	}
 	return nil
 }

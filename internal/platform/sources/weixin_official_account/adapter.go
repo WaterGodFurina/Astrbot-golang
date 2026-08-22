@@ -55,6 +55,7 @@ type Adapter struct {
 	account *wx.MpAccount
 
 	httpClient *http.Client
+	srv        *http.Server
 	stopCh     chan struct{}
 	once       sync.Once
 	// tokenMu 串行化 access_token 的检查与刷新，避免并发回复多个用户时
@@ -175,11 +176,17 @@ func (a *Adapter) Start(ctx context.Context) error {
 		logger.I18nInfo("微信公众号 webhook 模式已启用, webhook_uuid=%s", a.webhookID)
 		return nil
 	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback/command", a.handleCallback)
+	a.srv = &http.Server{
+		Addr:              fmt.Sprintf("%s:%d", a.host, a.port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/callback/command", a.handleCallback)
-		srv := &http.Server{Addr: fmt.Sprintf("%s:%d", a.host, a.port), Handler: mux}
-		_ = srv.ListenAndServe()
+		if err := a.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.I18nError("微信公众号 webhook 服务器运行异常: %v", err)
+		}
 	}()
 	logger.I18nInfo("微信公众号 webhook 服务器已启动 :%d/callback/command", a.port)
 	return nil
@@ -188,6 +195,11 @@ func (a *Adapter) Start(ctx context.Context) error {
 // Stop stops the adapter.
 func (a *Adapter) Stop() error {
 	a.once.Do(func() { close(a.stopCh) })
+	if a.srv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = a.srv.Shutdown(ctx)
+	}
 	logger.I18nInfo("微信公众号适配器已关闭")
 	return nil
 }

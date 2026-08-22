@@ -162,6 +162,12 @@ func (a *Adapter) SetEventBus(bus platform.EventBus) {
 
 // Start starts the HTTP server for reverse WebSocket connections.
 func (a *Adapter) Start(ctx context.Context) error {
+	// 未配置 ws_reverse_token 时事件入口默认仅监听回环地址（secure-by-default），
+	// 避免无鉴权的事件入口暴露在公网。
+	if a.Token == "" && a.Host == "0.0.0.0" {
+		a.Host = "127.0.0.1"
+		logger.I18nWarn("aiocqhttp: 未配置 ws_reverse_token，事件入口仅监听 127.0.0.1")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleHTTP)
 	mux.HandleFunc("/ws", a.handleWebSocket)
@@ -576,6 +582,9 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 		logger.I18nInfo("反向 WebSocket 客户端已断开")
 	}()
+
+	// 限制单连接消息体大小，防止异常对端放大内存占用。
+	conn.SetReadLimit(1 << 20)
 
 	// Heartbeat: respond to ping, and respect the peer's close/ping timeouts.
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
@@ -1180,9 +1189,20 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 				"data": imgData,
 			})
 		case *message.Record:
+			ref := c.URL
+			switch {
+			case c.Base64 != "":
+				ref = "base64://" + c.Base64
+			case c.URL != "":
+				ref = c.URL
+			case c.Path != "":
+				ref = "file://" + c.Path
+			case c.File != "":
+				ref = c.File
+			}
 			segments = append(segments, map[string]interface{}{
 				"type": "record",
-				"data": map[string]interface{}{"url": c.URL, "file": c.URL},
+				"data": map[string]interface{}{"file": ref},
 			})
 		case *message.Face:
 			segments = append(segments, map[string]interface{}{
@@ -1190,14 +1210,36 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 				"data": map[string]interface{}{"id": c.ID},
 			})
 		case *message.File:
+			ref := c.URL
+			switch {
+			case c.Base64 != "":
+				ref = "base64://" + c.Base64
+			case c.URL != "":
+				ref = c.URL
+			case c.Path != "":
+				ref = "file://" + c.Path
+			case c.File != "":
+				ref = c.File
+			}
 			segments = append(segments, map[string]interface{}{
 				"type": "file",
-				"data": map[string]interface{}{"url": c.URL, "name": c.Name},
+				"data": map[string]interface{}{"file": ref, "name": c.Name},
 			})
 		case *message.Video:
+			ref := c.URL
+			switch {
+			case c.Base64 != "":
+				ref = "base64://" + c.Base64
+			case c.URL != "":
+				ref = c.URL
+			case c.Path != "":
+				ref = "file://" + c.Path
+			case c.File != "":
+				ref = c.File
+			}
 			segments = append(segments, map[string]interface{}{
 				"type": "video",
-				"data": map[string]interface{}{"url": c.URL, "file": c.URL},
+				"data": map[string]interface{}{"file": ref},
 			})
 		case *message.Json:
 			segments = append(segments, map[string]interface{}{

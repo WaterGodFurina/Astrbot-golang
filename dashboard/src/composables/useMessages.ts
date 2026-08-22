@@ -1,6 +1,7 @@
 import { computed, onBeforeUnmount, reactive, ref, type Ref } from "vue";
 import { chatApi, fileApi } from "@/api/v1";
 import { fetchWithAuth } from "@/api/http";
+import { getToken } from "@/utils/token";
 
 export type TransportMode = "sse" | "websocket";
 
@@ -821,7 +822,7 @@ export function useMessages(options: UseMessagesOptions) {
       return existing;
     }
 
-    const token = localStorage.getItem("token") || "";
+    const token = getToken() || "";
     // nosemgrep: websocket
     const ws = new WebSocket(chatApi.unifiedWebSocketUrl(token));
     chatWebSockets[sessionId] = ws;

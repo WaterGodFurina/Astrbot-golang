@@ -135,7 +135,7 @@ func TestShellSessionStatusAndCleanup(t *testing.T) {
 	defer func() { shellSessionTTL = old }()
 
 	umo := "bg:cleanup"
-	out := executeLocalShell(umo, "exit 3", true, 0)
+	out := executeLocalShell(umo, umo, "exit 3", true, 0)
 	id := extractSessionID(t, out)
 
 	// Status eventually reports completed with the exit code.
@@ -379,7 +379,7 @@ func TestCommandTimeoutKillsProcessGroup(t *testing.T) {
 	// Foreground sleep keeps sh alive past the 1s timeout; a background
 	// subshell would write the marker at ~2s if it survived the kill.
 	cmd := fmt.Sprintf("(sleep 2; echo survived > %s) & sleep 8", marker)
-	out := executeLocalShell("t:c", cmd, false, 1)
+	out := executeLocalShell("t:c", "t:c", cmd, false, 1)
 	if !strings.Contains(out, "timed out") {
 		t.Fatalf("expected a timeout, got %q", out)
 	}

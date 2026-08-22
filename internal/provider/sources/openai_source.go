@@ -209,6 +209,7 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 		content := new(strings.Builder)
 		reasoning := new(strings.Builder)
 		var usage *provider.TokenUsage
+		var finishReason string
 
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var chunk struct {
@@ -244,6 +245,9 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 				}
 			}
 			for _, choice := range chunk.Choices {
+				if choice.FinishReason != "" {
+					finishReason = choice.FinishReason
+				}
 				if choice.Delta.Content != "" {
 					content.WriteString(choice.Delta.Content)
 					ch <- &provider.LLMResponse{
@@ -281,6 +285,10 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 		}
 
 		final := &provider.LLMResponse{Role: "assistant", CompletionText: content.String(), ReasoningContent: reasoning.String(), Usage: usage}
+		if finishReason == "length" || finishReason == "content_filter" {
+			logger.Warn("OpenAI stream finished early: %s", finishReason)
+			final.CompletionText += fmt.Sprintf("\n[response truncated: %s]", finishReason)
+		}
 		if len(toolCalls) > 0 {
 			for _, tc := range toolCalls {
 				final.ToolsCallName = append(final.ToolsCallName, tc.name)

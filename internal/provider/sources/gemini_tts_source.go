@@ -124,7 +124,7 @@ func (s *GeminiTTSSource) GetAudio(ctx context.Context, text string) (string, er
 				if err != nil {
 					return "", err
 				}
-				pcmData = decoded
+				pcmData = append(pcmData, decoded...)
 			}
 		}
 	}

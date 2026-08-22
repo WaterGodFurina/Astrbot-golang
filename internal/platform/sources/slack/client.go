@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -24,6 +25,9 @@ import (
 
 // maxWebhookBodySize 限制 Slack 回调请求体大小上限（1MB）。
 const maxWebhookBodySize = 1 << 20
+
+// slackEventDedupTTL 事件去重窗口（Slack 回调超时会重推同一事件）。
+const slackEventDedupTTL = 60 * time.Second
 
 // randRead 读取随机字节（对应 Python 的 uuid4 随机源）。
 func randRead(b []byte) (int, error) { return rand.Read(b) }
@@ -40,6 +44,10 @@ type SlackWebhookServer struct {
 
 	srv    *http.Server
 	stopCh chan struct{}
+
+	// seenEventIDs 事件去重缓存（event_id -> 时间戳，带 TTL 惰性淘汰）。
+	seenMu       sync.Mutex
+	seenEventIDs map[string]time.Time
 }
 
 // NewSlackWebhookServer 创建 Slack Webhook 服务器。
@@ -49,8 +57,27 @@ func NewSlackWebhookServer(signingSecret, path string, eventHandler func(map[str
 		path:          path,
 		eventHandler:  eventHandler,
 		stopCh:        make(chan struct{}),
+		seenEventIDs:  make(map[string]time.Time),
 	}
 	return s
+}
+
+// markSeen 记录并检查事件 id（带 TTL 惰性淘汰，参考 qqofficial_webhook 的实现）。
+// 返回 false 表示该事件在去重窗口内已处理过。
+func (s *SlackWebhookServer) markSeen(eventID string) bool {
+	s.seenMu.Lock()
+	defer s.seenMu.Unlock()
+	now := time.Now()
+	for id, ts := range s.seenEventIDs {
+		if now.Sub(ts) > slackEventDedupTTL {
+			delete(s.seenEventIDs, id)
+		}
+	}
+	if _, seen := s.seenEventIDs[eventID]; seen {
+		return false
+	}
+	s.seenEventIDs[eventID] = now
+	return true
 }
 
 // Start 启动 Webhook HTTP 服务器。
@@ -170,7 +197,13 @@ func (s *SlackWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reque
 	// 处理事件
 	if s.eventHandler != nil {
 		if eventType, _ := eventData["type"].(string); eventType == "event_callback" {
-			s.eventHandler(eventData)
+			if eventID, _ := eventData["event_id"].(string); eventID != "" && !s.markSeen(eventID) {
+				return
+			}
+			// 先返回 200 再异步处理：Slack 要求 3 秒内响应，超时会重推同一事件
+			w.WriteHeader(http.StatusOK)
+			go s.eventHandler(eventData)
+			return
 		}
 	}
 	w.WriteHeader(http.StatusOK)

@@ -38,7 +38,6 @@ func (e *Exporter) Export(destPath string) error {
 	defer zipFile.Close()
 
 	zw := zip.NewWriter(zipFile)
-	defer zw.Close()
 
 	// Snapshot the live SQLite database into a consistent file before walking,
 	// so a WAL-mode database is never copied while being written to. The raw
@@ -114,7 +113,15 @@ func (e *Exporter) Export(destPath string) error {
 	}
 
 	logger.Info("Backup exported to %s", destPath)
-	return nil
+	// 显式收尾 zip：zw.Close 写入中央目录（错误必须上报，否则导出的归档
+	// 缺条目却提示成功），随后 fsync 落盘再关闭文件。
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("finalize zip: %w", err)
+	}
+	if err := zipFile.Sync(); err != nil {
+		return fmt.Errorf("sync zip: %w", err)
+	}
+	return zipFile.Close()
 }
 
 // snapshotDB produces a consistent copy of dataDir/astrbot.db via

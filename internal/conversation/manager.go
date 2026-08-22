@@ -635,14 +635,16 @@ func (m *Manager) persist(conv *Conversation) {
 	}
 	m.mu.RLock()
 	history := copyHistory(conv.History)
+	cid, uid, platformID := conv.CID, conv.UserID, conv.PlatformID
+	title, persona := conv.Title, conv.Persona
 	m.mu.RUnlock()
 	historyJSON, err := json.Marshal(history)
 	if err != nil {
-		logger.Error("persist conversation %s: marshal history: %v", conv.CID, err)
+		logger.Error("persist conversation %s: marshal history: %v", cid, err)
 		return
 	}
-	if err := m.db.UpsertConversation(conv.CID, conv.UserID, conv.PlatformID, string(historyJSON), conv.Title, conv.Persona); err != nil {
-		logger.Error("persist conversation %s: %v", conv.CID, err)
+	if err := m.db.UpsertConversation(cid, uid, platformID, string(historyJSON), title, persona); err != nil {
+		logger.Error("persist conversation %s: %v", cid, err)
 	}
 }
 
@@ -726,14 +728,11 @@ func (m *Manager) GetSessionRules(umo string) map[string]interface{} {
 	if m.db == nil {
 		return out
 	}
-	rows, err := m.db.ListPreferencesByScope("umo")
+	rows, err := m.db.ListPreferencesByScopeID("umo", umo)
 	if err != nil {
 		return out
 	}
 	for _, row := range rows {
-		if row.ScopeID != umo {
-			continue
-		}
 		if !isSessionRuleKey(row.Key) {
 			continue
 		}

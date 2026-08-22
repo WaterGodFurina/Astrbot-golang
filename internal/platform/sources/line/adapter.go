@@ -725,7 +725,9 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		if targetID == "" {
 			return fmt.Errorf("line: 会话 ID 为空，无法发送消息")
 		}
-		a.lineAPI.PushMessage(ctx, targetID, messages)
+		if !a.lineAPI.PushMessage(ctx, targetID, messages) {
+			return fmt.Errorf("line: reply 与 push 均发送失败 (session=%s)", targetID)
+		}
 	}
 	return nil
 }

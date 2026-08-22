@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -24,7 +25,13 @@ const (
 	updateRepoOwner = "WaterGodFurina"
 	updateRepoName  = "Astrbot-golang"
 	updateRepoAPI   = "https://api.github.com/repos/WaterGodFurina/Astrbot-golang/releases"
+	// maxUpdateDownload 升级包下载字节上限（512 MiB），防恶意/损坏内容撑爆磁盘。
+	maxUpdateDownload = 512 << 20
 )
+
+// updateTagRe 白名单校验升级目标版本号：仅允许可选 v 前缀 + 字母数字点横线，
+// 防止恶意 tag 注入下载 URL（路径穿越/协议混淆）。
+var updateTagRe = regexp.MustCompile(`^v?[0-9A-Za-z.\-]+$`)
 
 var updateLogger = log.GetDefault().WithComponent("Updater")
 
@@ -61,6 +68,10 @@ func (s *Server) fetchGithubReleases(proxy string) ([]map[string]interface{}, er
 	url := updateRepoAPI
 	if proxy != "" {
 		url = strings.TrimRight(proxy, "/") + "/" + url
+	}
+	// 出站 URL 校验防 SSRF（代理前缀为管理员输入）。
+	if err := validateOutboundURL(url); err != nil {
+		return nil, err
 	}
 	client := newOutboundClient(30 * time.Second)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -194,6 +205,13 @@ func (s *Server) doUpdateCore(w http.ResponseWriter, progressID, tag, proxy stri
 		}))
 		return
 	}
+	if !updateTagRe.MatchString(tag) {
+		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "非法版本号格式"})
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"status": "error", "message": "非法版本号格式",
+		}))
+		return
+	}
 
 	// 异步执行下载 + 替换 + 重启，先返回让前端开始轮询进度。
 	go s.performUpdate(progressID, tag, resource, proxy)
@@ -219,6 +237,11 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 	downloadURL := buildDownloadURL(tag, resource)
 	if proxy != "" {
 		downloadURL = strings.TrimRight(proxy, "/") + "/" + downloadURL
+	}
+	// 出站 URL 校验防 SSRF（proxy 为管理员输入，tag 已过白名单）。
+	if err := validateOutboundURL(downloadURL); err != nil {
+		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "下载地址校验失败: " + err.Error()})
+		return
 	}
 	setp(5, "下载 "+downloadURL)
 
@@ -290,6 +313,10 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 
 // downloadFile 流式下载 URL 到 dst，并更新进度。
 func (s *Server) downloadFile(url, dst, progressID string) error {
+	// 下载前再次校验出站 URL 防 SSRF。
+	if err := validateOutboundURL(url); err != nil {
+		return err
+	}
 	client := newOutboundClient(2 * time.Minute)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -314,10 +341,13 @@ func (s *Server) downloadFile(url, dst, progressID string) error {
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			written += int64(n)
+			if written > maxUpdateDownload {
+				return fmt.Errorf("下载内容超过 %d MiB 上限", maxUpdateDownload>>20)
+			}
 			if _, werr := out.Write(buf[:n]); werr != nil {
 				return werr
 			}
-			written += int64(n)
 			pct := 5
 			if total > 0 {
 				pct = 5 + int(70*float64(written)/float64(total))

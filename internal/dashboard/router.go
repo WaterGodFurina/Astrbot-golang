@@ -10,6 +10,10 @@ import (
 // apiHandler dispatches API requests.
 // Supports both /api/xxx and /api/v1/xxx prefixes.
 func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
+	// JSON 请求体统一大小上限（16 MiB），防超大请求体耗尽内存。
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
+	}
 	// Global auth gate: every endpoint except the public whitelist below
 	// requires a valid session token (JWT or legacy in-memory token). The
 	// WebUI attaches "Authorization: Bearer <token>" to all requests via its

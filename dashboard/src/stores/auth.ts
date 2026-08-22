@@ -10,6 +10,7 @@ import {
   type VersionData,
 } from '@/api/v1';
 import { httpClient } from '@/api/http';
+import { getToken, removeToken, setToken } from '@/utils/token';
 
 export const useAuthStore = defineStore("auth", {
   state: () => ({
@@ -21,7 +22,7 @@ export const useAuthStore = defineStore("auth", {
     async finishAuthenticatedSession(data: any): Promise<void> {
       this.username = data.username;
       localStorage.setItem('user', this.username);
-      localStorage.setItem('token', data.token);
+      setToken(data.token);
       const passwordUpgradeRequired = !!data?.password_upgrade_required;
       const md5PwdHint = !!data?.md5_pwd_hint;
       const passwordWarning =
@@ -174,7 +175,7 @@ export const useAuthStore = defineStore("auth", {
     logout() {
       this.username = '';
       localStorage.removeItem('user');
-      localStorage.removeItem('token');
+      removeToken();
       localStorage.removeItem('change_pwd_hint');
       localStorage.removeItem('md5_pwd_hint');
       localStorage.removeItem('password_upgrade_required');
@@ -182,7 +183,7 @@ export const useAuthStore = defineStore("auth", {
       router.push('/auth/login');
     },
     has_token(): boolean {
-      return !!localStorage.getItem('token');
+      return !!getToken();
     }
   }
 });

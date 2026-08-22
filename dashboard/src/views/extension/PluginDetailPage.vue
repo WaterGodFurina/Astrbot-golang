@@ -96,6 +96,8 @@ const changelogLoading = ref(false);
 const changelogError = ref("");
 const changelogEmpty = ref(false);
 const renderedChangelog = ref("");
+let readmeRequestId = 0;
+let changelogRequestId = 0;
 const expandedCommandGroups = ref(new Set());
 const logoLoadFailed = ref(false);
 const detailPageRef = ref(null);
@@ -642,6 +644,7 @@ const fetchReadme = async () => {
   const plugin = pluginData.value || {};
   if (!plugin?.name) return;
 
+  const requestId = ++readmeRequestId;
   readmeLoading.value = true;
   readmeError.value = "";
   readmeEmpty.value = false;
@@ -650,6 +653,7 @@ const fetchReadme = async () => {
   if (isMarketDetail.value) {
     const readmeUrl = getDocumentUrl("readme_url");
     if (!readmeUrl) {
+      if (requestId !== readmeRequestId) return;
       readmeEmpty.value = true;
       readmeLoading.value = false;
       return;
@@ -657,15 +661,17 @@ const fetchReadme = async () => {
 
     try {
       const content = await fetchRemoteMarkdown(readmeUrl);
+      if (requestId !== readmeRequestId) return;
       if (!content.trim()) {
         readmeEmpty.value = true;
         return;
       }
       renderedReadme.value = renderMarkdown(content);
     } catch (err) {
-      readmeError.value = err?.message || String(err);
+      if (requestId === readmeRequestId)
+        readmeError.value = err?.message || String(err);
     } finally {
-      readmeLoading.value = false;
+      if (requestId === readmeRequestId) readmeLoading.value = false;
     }
     return;
   }
@@ -702,6 +708,7 @@ const fetchReadme = async () => {
       }),
       new Promise((resolve) => setTimeout(() => resolve(TIMEOUT), 10000)),
     ]);
+    if (requestId !== readmeRequestId) return;
 
     if (content === TIMEOUT) {
       readmeEmpty.value = true;
@@ -716,9 +723,10 @@ const fetchReadme = async () => {
     }
     renderedReadme.value = renderMarkdown(text);
   } catch (err) {
-    readmeError.value = err?.message || String(err);
+    if (requestId === readmeRequestId)
+      readmeError.value = err?.message || String(err);
   } finally {
-    readmeLoading.value = false;
+    if (requestId === readmeRequestId) readmeLoading.value = false;
   }
 };
 
@@ -726,6 +734,7 @@ const fetchChangelog = async () => {
   const plugin = pluginData.value || {};
   if (!plugin?.name) return;
 
+  const requestId = ++changelogRequestId;
   changelogLoading.value = true;
   changelogError.value = "";
   changelogEmpty.value = false;
@@ -734,6 +743,7 @@ const fetchChangelog = async () => {
   if (isMarketDetail.value) {
     const changelogUrl = getDocumentUrl("changelog_url");
     if (!changelogUrl) {
+      if (requestId !== changelogRequestId) return;
       changelogEmpty.value = true;
       changelogLoading.value = false;
       return;
@@ -741,21 +751,24 @@ const fetchChangelog = async () => {
 
     try {
       const content = await fetchRemoteMarkdown(changelogUrl);
+      if (requestId !== changelogRequestId) return;
       if (!content.trim()) {
         changelogEmpty.value = true;
         return;
       }
       renderedChangelog.value = renderMarkdown(content);
     } catch (err) {
-      changelogError.value = err?.message || String(err);
+      if (requestId === changelogRequestId)
+        changelogError.value = err?.message || String(err);
     } finally {
-      changelogLoading.value = false;
+      if (requestId === changelogRequestId) changelogLoading.value = false;
     }
     return;
   }
 
   try {
     const res = await pluginApi.changelog(plugin.name);
+    if (requestId !== changelogRequestId) return;
 
     if (res.data.status !== "ok") {
       changelogError.value = res.data.message || tm("messages.operationFailed");
@@ -770,9 +783,10 @@ const fetchChangelog = async () => {
 
     renderedChangelog.value = renderMarkdown(content);
   } catch (err) {
-    changelogError.value = err?.message || String(err);
+    if (requestId === changelogRequestId)
+      changelogError.value = err?.message || String(err);
   } finally {
-    changelogLoading.value = false;
+    if (requestId === changelogRequestId) changelogLoading.value = false;
   }
 };
 
