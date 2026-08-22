@@ -156,6 +156,7 @@
     "updateFailed": "Ошибка обновления",
     "deleteSuccess": "Удалено",
     "deleteFailed": "Ошибка удаления",
+    "deleteConfirm": "Удалить задачу {name}? Это действие необратимо.",
     "nameRequired": "Укажите имя задачи",
     "sessionRequired": "Укажите цель доставки",
     "noteRequired": "Заполните требования задачи",

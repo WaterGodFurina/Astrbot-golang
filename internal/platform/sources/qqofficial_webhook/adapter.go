@@ -758,8 +758,10 @@ func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType in
 	}
 	if strings.HasPrefix(fileData, "http://") || strings.HasPrefix(fileData, "https://") {
 		payload["url"] = fileData
+	} else if data, err := os.ReadFile(fileData); err == nil {
+		payload["file_data"] = base64.StdEncoding.EncodeToString(data)
 	} else {
-		payload["file_data"] = fileData
+		payload["file_data"] = fileData // 兼容调用方直接传 base64 的旧路径
 	}
 	return a.apiRequest(http.MethodPost, path, payload)
 }

@@ -20,7 +20,7 @@ func testServerWithConfig(t *testing.T, cfgMap map[string]interface{}) *Server {
 		t.Fatal(err)
 	}
 	cm := config.NewConfigManager()
-	acfg := config.NewConfig(cfgPath, config.DefaultConfig())
+	acfg := config.NewConfig(cfgPath)
 	if err := acfg.Load(); err != nil {
 		t.Fatal(err)
 	}

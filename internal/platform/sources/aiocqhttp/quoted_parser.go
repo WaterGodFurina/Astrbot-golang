@@ -282,7 +282,7 @@ func (a *Adapter) resolveNestedForwards(forwardIDs []string) []*message.Node {
 	}
 	fetchCount := 0
 	maxFetch := a.quotedParser.maxForwardFetch
-	for len(pending) > 0 && (maxFetch <= 0 || fetchCount < maxFetch) {
+	for len(pending) > 0 && fetchCount < maxFetch {
 		current := pending[0]
 		pending = pending[1:]
 		if seen[current] {

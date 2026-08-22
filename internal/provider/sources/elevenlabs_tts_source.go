@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -54,6 +55,11 @@ func NewElevenLabsTTSSource(config, settings map[string]interface{}) *ElevenLabs
 		s.initErr = fmt.Errorf("不支持的ElevenLabs输出格式 %q, 应使用 mp3/wav/opus 格式", s.outputFormat)
 		s.outputFormat = elevenLabsDefaultFormat
 	}
+	// voice id 会拼进 URL 路径: 仅允许 URL 安全字符, 否则回退默认值。
+	if !elevenLabsSafeVoiceID(s.voiceID) {
+		s.initErr = fmt.Errorf("无效的ElevenLabs voice id %q", s.voiceID)
+		s.voiceID = elevenLabsDefaultVoiceID
+	}
 	for cfgName, key := range map[string]string{
 		"elevenlabs-tts-stability":        "stability",
 		"elevenlabs-tts-similarity-boost": "similarity_boost",
@@ -77,6 +83,13 @@ func NewElevenLabsTTSSource(config, settings map[string]interface{}) *ElevenLabs
 func elevenLabsValidFormat(fmtStr string) bool {
 	f := strings.ToLower(fmtStr)
 	return strings.HasPrefix(f, "mp3") || strings.HasPrefix(f, "wav") || strings.HasPrefix(f, "opus")
+}
+
+var elevenLabsVoiceIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// elevenLabsSafeVoiceID reports whether the voice id is a plain URL-safe token.
+func elevenLabsSafeVoiceID(id string) bool {
+	return elevenLabsVoiceIDPattern.MatchString(id)
 }
 
 // outputExtension infers the audio file extension from the output format.

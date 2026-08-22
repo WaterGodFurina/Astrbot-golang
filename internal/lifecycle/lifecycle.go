@@ -109,7 +109,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	logger.I18nInfo("数据库已打开（连接池 5，WAL 模式）")
 
 	// 2. Load config
-	cfg := config.NewConfig("data/cmd_config.json", config.DefaultConfig())
+	cfg := config.NewConfig("data/cmd_config.json")
 	if err := cfg.Load(); err != nil {
 		logger.I18nWarn("加载配置失败（文件损坏？），已回退到默认配置继续运行: %v", err)
 		cfg.ResetToDefaults()
@@ -189,6 +189,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		StarMgr:         l.starMgr,
 		ConfigMgr:       l.configMgr,
 		ConversationMgr: l.conversationMgr,
+		Database:        l.database,
 	})
 
 	// 6. Initialize event bus
@@ -244,7 +245,14 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		if session == "" {
 			return fmt.Errorf("active_agent job %s has no session", job.ID)
 		}
-		platformID, convID := splitUMO(session)
+		// 三段式 PythonUMO（platform_id:MessageType:session_id）：platformID
+		// 段是适配器实例 ID、中段是消息类型、末段是投递目标会话 ID。
+		parts := strings.SplitN(session, ":", 3)
+		if len(parts) != 3 || parts[0] == "" || parts[2] == "" {
+			return fmt.Errorf("active_agent job %s 的 session 不是三段式 umo: %q", job.ID, session)
+		}
+		platformID := parts[0]
+		convID := parts[2]
 		senderID, _ := job.Payload["sender_id"].(string)
 		if senderID == "" {
 			senderID = convID
@@ -252,7 +260,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: note}}}
 		evt := &core.Event{
 			Type:              core.EventMessage,
-			Source:            core.EventSource{Platform: platformID, ConvID: convID, SenderID: senderID, SenderName: senderID},
+			Source:            core.EventSource{Platform: platformID, PlatformID: platformID, ConvID: convID, SenderID: senderID, SenderName: senderID},
 			Message:           chain,
 			MessageStr:        note,
 			PlainText:         note,
@@ -299,17 +307,44 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// back into the host. 同时注入会话/人格/Provider/Star 管理器，供插件
 	// 反向调用会话管理、人格解析、Provider 选择与插件安装等管理能力。
 	// starMgr 以闭包（StarManagerLike）传入，规避 star→plugin 的导入环。
-	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins, l.conversationMgr, l.providerMgr, plugin.StarManagerLikeFunc(func() []any {
-		if l.starMgr == nil {
-			return nil
-		}
-		metas := l.starMgr.Registry().All()
-		out := make([]any, 0, len(metas))
-		for _, m := range metas {
-			out = append(out, m)
-		}
-		return out
-	}), l.configMgr)
+	// CommandDescriptors 用 star.CollectCommandDescriptors 聚合全局命令
+	//（内置 + 子进程插件），供插件桥跨进程枚举指令。
+	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins, l.conversationMgr, l.providerMgr, plugin.StarManagerLikeFunc{
+		Fn: func() []any {
+			if l.starMgr == nil {
+				return nil
+			}
+			metas := l.starMgr.Registry().All()
+			out := make([]any, 0, len(metas))
+			for _, m := range metas {
+				out = append(out, m)
+			}
+			return out
+		},
+		CmdFn: func() []map[string]any {
+			if l.starMgr == nil {
+				return nil
+			}
+			descs := star.CollectCommandDescriptors(l.starMgr.Handlers())
+			out := make([]map[string]any, 0, len(descs))
+			for _, d := range descs {
+				out = append(out, map[string]any{
+					"plugin_name":       d.PluginName,
+					"handler_full_name": d.HandlerFullName,
+					"handler_name":      d.HandlerName,
+					"command":           d.EffectiveCommand,
+					"aliases":           d.Aliases,
+					"description":       d.Description,
+					"permission":        d.Permission,
+					"enabled":           d.Enabled,
+					"parent_group":      d.ParentSignature,
+					"is_sub_command":    d.IsSubCommand,
+					"command_type":      d.CommandType,
+				})
+			}
+			return out
+		},
+	}, l.configMgr)
 	// 能力接线：先注入固定能力集（平台尚未加载，All() 为空），插件进程
 	// 启动时即带 ASTRBOT_HOST_CAPABILITIES 环境变量；loadPlatforms 完成后
 	// 再同步一次（含平台 ID），供后续懒加载/重载的插件使用。
@@ -486,13 +521,16 @@ func (l *Lifecycle) setDockerOrLocalBooter(sandboxCfg map[string]interface{}) {
 			image = model
 		}
 	}
-	if dockerAvailable() {
-		l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
-		logger.I18nInfo("沙盒启动器已设置（docker, image=%s）", image)
+	// 对齐 Python computer_client.py：用户显式选择容器沙箱（boxlite）时，
+	// docker 不可用必须让沙箱启动失败并给出明确指引，绝不静默降级到无隔离
+	// 的本地执行（LocalBooter 仅限开发/测试场景）。
+	if !dockerAvailable() {
+		l.sandboxMgr.SetBooter(nil)
+		logger.I18nError("boxlite 沙箱需要 Docker，但当前不可用；请安装 Docker 或改用 shipyard_neo 后端")
 		return
 	}
-	l.sandboxMgr.SetBooter(sandbox.NewLocalBooter())
-	logger.I18nInfo("沙盒启动器已设置（local，docker 不可用）")
+	l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
+	logger.I18nInfo("沙盒启动器已设置（docker, image=%s）", image)
 }
 
 // floatValue converts a JSON numeric (float64/int) to float64, returning 0 on
@@ -632,16 +670,21 @@ func (l *Lifecycle) Uptime() time.Duration {
 	return time.Since(l.startedAt)
 }
 
-// Restart 实现 WebUI"重启"：spawn 当前可执行文件的新实例（独立会话、继承
-// stdout/stderr 到原日志文件），随后优雅停机（Stop 会 kill 插件、关闭 DB）
-// 并退出当前进程。新实例启动时 cleanupOrphanPlugins 会清理本进程遗留的
-// 孤儿插件子进程。在 dashboard handler 的 goroutine 中调用（不持有 l.mu）。
+// Restart 实现 WebUI"重启"：先优雅停机（Stop 最先关闭 dashboard 释放监听
+// 端口，随后 kill 插件、关闭 DB），再 spawn 当前可执行文件的新实例（独立
+// 会话、继承 stdout/stderr 到原日志文件），最后退出当前进程。新实例启动时
+// cleanupOrphanPlugins 会清理本进程遗留的孤儿插件子进程。在 dashboard
+// handler 的 goroutine 中调用（不持有 l.mu）。
 func (l *Lifecycle) Restart() {
 	exe, err := os.Executable()
 	if err != nil {
 		logger.Error("Restart: resolve executable: %v", err)
 		return
 	}
+	// 先优雅停机（Stop 最先关闭 dashboard 释放监听端口，随后 kill 插件、
+	// 关闭 DB），再 spawn 新实例——避免新实例绑定仪表盘端口时旧进程仍持有
+	// 端口，只能靠 listenWithRetry 反复等待。
+	l.Stop()
 	// #nosec G204 -- restart spawns this same executable with the original
 	// command-line arguments passed at launch; not user-controlled input.
 	cmd := exec.Command(exe, os.Args[1:]...) // nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
@@ -652,10 +695,11 @@ func (l *Lifecycle) Restart() {
 	utils.DetachProcess(cmd)
 	if err := cmd.Start(); err != nil {
 		logger.Error("Restart: spawn new instance failed: %v", err)
-		return
+		// 本进程已停机（dashboard/DB/插件均已关闭），无法继续提供完整服务，
+		// 只能以失败状态退出。
+		os.Exit(1)
 	}
-	logger.I18nInfo("重启：已启动新实例（pid %d），正在关闭当前进程", cmd.Process.Pid)
-	l.Stop()
+	logger.I18nInfo("重启：已启动新实例（pid %d），正在退出当前进程", cmd.Process.Pid)
 	os.Exit(0)
 }
 
@@ -692,8 +736,8 @@ func (l *Lifecycle) umoAliasResolver(umo string) string {
 	if cfg == nil {
 		return ""
 	}
-	all := cfg.All()
-	aliases, _ := all["umo_alias"].(map[string]interface{})
+	// 按路径取单个键，避免热路径（每条消息调用）全量深拷贝整个配置树。
+	aliases, _ := cfg.GetNested("umo_alias").(map[string]interface{})
 	if aliases == nil {
 		return ""
 	}
@@ -727,29 +771,18 @@ func cronNextRun(job *cron.Job) (time.Time, error) {
 	return sched.Next(now), nil
 }
 
-// splitUMO splits a unified_msg_origin ("platform:convID") into platform id and
-// conversation id.
-func splitUMO(umo string) (string, string) {
-	for i := 0; i < len(umo); i++ {
-		if umo[i] == ':' {
-			return umo[:i], umo[i+1:]
-		}
-	}
-	return umo, umo
-}
-
-// personaCache 缓存 data/personas.json 的解析结果，避免每次 LLM 调用都读盘。
-// 通过文件 mtime 判断内容是否变化，仅在有变更时重新读取。
+// personaCache 缓存 data/personas.json 的解析结果，避免每次 LLM 调用都读盘
+// 并重复 JSON 解析。通过文件 mtime 判断内容是否变化，仅在有变更时重读。
 type personaCache struct {
 	mu      sync.Mutex
-	content []byte
+	parsed  []map[string]interface{}
 	modTime time.Time
 }
 
 var personaFileCache personaCache
 
 // loadPersonas 返回 data/personas.json 解析后的 persona 列表。
-// mtime 未变化时直接返回缓存内容，变化时才重读文件。
+// mtime 未变化时直接返回缓存的解析结果，变化时才重读文件并重新解析。
 func loadPersonas() []map[string]interface{} {
 	info, err := os.Stat("data/personas.json")
 	if err != nil {
@@ -757,16 +790,16 @@ func loadPersonas() []map[string]interface{} {
 	}
 	personaFileCache.mu.Lock()
 	defer personaFileCache.mu.Unlock()
-	if personaFileCache.content != nil && personaFileCache.modTime.Equal(info.ModTime()) {
-		return parsePersonas(personaFileCache.content)
+	if personaFileCache.parsed != nil && personaFileCache.modTime.Equal(info.ModTime()) {
+		return personaFileCache.parsed
 	}
 	data, err := os.ReadFile("data/personas.json")
 	if err != nil {
 		return nil
 	}
-	personaFileCache.content = data
+	personaFileCache.parsed = parsePersonas(data)
 	personaFileCache.modTime = info.ModTime()
-	return parsePersonas(data)
+	return personaFileCache.parsed
 }
 
 func parsePersonas(data []byte) []map[string]interface{} {
@@ -811,7 +844,10 @@ func personaSkillsResolver(personaID string) []string {
 		}
 		list, ok := skillsRaw.([]interface{})
 		if !ok {
-			return nil
+			// 类型错误时按最严格语义处理：技能白名单失效等价于禁止全部技能，
+			// 而不是 fail-open 变成全量放行。
+			logger.I18nWarn("persona %s 的 skills 字段类型错误（应为数组），已按禁止全部技能处理", personaID)
+			return []string{}
 		}
 		result := make([]string, 0, len(list))
 		for _, v := range list {

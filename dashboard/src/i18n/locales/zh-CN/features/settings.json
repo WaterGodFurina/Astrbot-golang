@@ -293,6 +293,7 @@
     },
     "messages": {
       "loadFailed": "加载 API Key 失败",
+      "nameRequired": "请输入 Key 名称",
       "scopeRequired": "请至少选择一个权限",
       "createSuccess": "API Key 创建成功",
       "createFailed": "创建 API Key 失败",

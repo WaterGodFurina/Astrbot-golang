@@ -1,6 +1,7 @@
 package knowledgebase
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,10 +32,16 @@ type VecDB struct {
 
 // OpenVecDB opens (or creates) the vector index for a knowledge base.
 func OpenVecDB(dir, kbID string, dimension int) (*VecDB, error) {
+	// 拍平成单段文件名，防止 kbID 含分隔符/.. 时逃出 dir（目录级净化与
+	// 文件级拼接脱节时构成纵深防御缺口）。
+	safe := filepath.Base(filepath.Clean(kbID))
+	if safe == "." || safe == ".." || safe == string(filepath.Separator) {
+		return nil, fmt.Errorf("invalid kb id %q", kbID)
+	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, kbID+".vec.db")
+	path := filepath.Join(dir, safe+".vec.db")
 	cfg := &nanovec.Config{
 		Dimension: dimension,
 		IndexType: nanovec.IndexTypeFlat, // exact search, matches FAISS IndexFlatL2
@@ -171,15 +178,18 @@ func ChunkText(text string, chunkSize, chunkOverlap int) []string {
 		}
 		content := string(runes[start:end])
 		consumed := end
-		if nl := strings.LastIndex(content, "\n"); nl > chunkSize/2 {
-			content = content[:nl]
-			consumed = start + nl
+		if nl := strings.LastIndex(content, "\n"); nl >= 0 {
+			prefix := []rune(content[:nl])
+			if len(prefix) > chunkSize/2 {
+				content = string(prefix)
+				consumed = start + len(prefix)
+			}
 		}
 		content = strings.TrimSpace(content)
 		if content != "" {
 			chunks = append(chunks, content)
 		}
-		if end == len(runes) {
+		if consumed >= len(runes) {
 			break
 		}
 		// 下一 chunk 起点为 max(start+step, 实际消费位置) 中的较小者：若换行

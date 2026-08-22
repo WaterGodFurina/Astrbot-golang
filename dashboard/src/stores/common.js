@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
-import { logApi, pluginApi, statsApi } from "@/api/v1";
+import { logApi, pluginApi, statsApi, systemConfigApi } from "@/api/v1";
 import { fetchWithAuth } from "@/api/http";
+import { getToken } from "@/utils/token";
 
 export const useCommonStore = defineStore("common", {
   state: () => ({
@@ -8,6 +9,7 @@ export const useCommonStore = defineStore("common", {
     eventSource: null,
     log_cache: [],
     sse_connected: false,
+    sseRetryCount: 0,
 
     log_cache_max_len: 1000,
     startTime: -1,
@@ -15,6 +17,9 @@ export const useCommonStore = defineStore("common", {
     dashboardVersion: "",
     pythonVersion: "",
     goVersion: "",
+    // 设置里的 github_proxy（system-config 持久化值）：安装插件/切换版本的
+    // GitHub 加速弹窗默认选中项，用户在弹窗里的单次选择可临时覆盖。
+    githubProxyConfig: "",
 
     pluginMarketData: [],
     pluginMarketDataBySource: {},
@@ -31,7 +36,7 @@ export const useCommonStore = defineStore("common", {
       // 如果是用 fetch 的话，这里是支持 Authorization Header 的
       const headers = {
         "Content-Type": "multipart/form-data",
-        Authorization: "Bearer " + localStorage.getItem("token"),
+        Authorization: "Bearer " + getToken(),
       };
 
       fetchWithAuth(logApi.liveUrl(), {
@@ -46,6 +51,7 @@ export const useCommonStore = defineStore("common", {
           }
           console.log("SSE stream opened");
           this.sse_connected = true;
+          this.sseRetryCount = 0;
 
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
@@ -53,11 +59,13 @@ export const useCommonStore = defineStore("common", {
 
           const processStream = ({ done, value }) => {
             if (done) {
-              console.log("SSE stream closed");
+              this.sse_connected = false;
+              // 服务端主动关闭也走指数退避，避免固定 2s 打雷式重连
+              const delay = Math.min(30000, 1000 * 2 ** this.sseRetryCount++);
               setTimeout(() => {
                 this.eventSource = null;
                 this.createEventSource();
-              }, 2000);
+              }, delay);
               return;
             }
 
@@ -128,28 +136,30 @@ export const useCommonStore = defineStore("common", {
         })
         .catch((error) => {
           console.error("SSE error:", error);
-          // Attempt to reconnect after a delay
+          // Attempt to reconnect with exponential backoff
+          const delay = Math.min(30000, 1000 * 2 ** this.sseRetryCount++);
           this.log_cache.push({
             type: "log",
             level: "ERROR",
             time: Date.now() / 1000,
-            data: "SSE Connection failed, retrying in 5 seconds...",
+            data: `SSE Connection failed, retrying in ${Math.round(delay / 1000)} seconds...`,
             uuid: "error-" + Date.now(),
           });
           setTimeout(() => {
             this.eventSource = null;
             this.createEventSource();
-          }, 1000);
+          }, delay);
         });
 
       // Store controller to allow closing the connection
       this.eventSource = controller;
     },
-    closeEventSourcet() {
+    closeEventSource() {
       if (this.eventSource) {
         this.eventSource.abort();
         this.eventSource = null;
       }
+      this.sse_connected = false;
     },
     getLogCache() {
       return this.log_cache;
@@ -164,6 +174,21 @@ export const useCommonStore = defineStore("common", {
       this.dashboardVersion = String(dashboardVersion || "");
       this.pythonVersion = String(pythonVersion || "").replace(/^v/i, "");
       this.goVersion = String(goVersion || "").replace(/^go/i, "");
+    },
+    // 拉取设置里的 github_proxy（缓存到 githubProxyConfig），供代理选择
+    // 弹窗作为默认选中项。失败静默（弹窗回退 localStorage/空）。
+    async fetchGithubProxyConfig(force = false) {
+      if (!force && this.githubProxyConfig) {
+        return this.githubProxyConfig;
+      }
+      try {
+        const res = await systemConfigApi.get();
+        const cfg = res.data?.data?.config || {};
+        this.githubProxyConfig = String(cfg.github_proxy || "").trim();
+      } catch {
+        // keep current value
+      }
+      return this.githubProxyConfig;
     },
     async fetchAstrBotVersion(force = false) {
       if (!force && this.astrbotVersion) {

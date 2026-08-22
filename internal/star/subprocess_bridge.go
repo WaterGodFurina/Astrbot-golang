@@ -7,6 +7,7 @@ package star
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
@@ -58,6 +59,34 @@ func hookEventType(name string) (EventType, bool) {
 		// lifecycle hooks (startup/shutdown) are not pipeline events
 		return 0, false
 	}
+}
+
+// persistentRenames 保存 WebUI 重命名过的指令（handler_full_name → 生效名）。
+// 子进程插件重载后指令按 meta 原始名重新桥接，持久化重命名会丢失——桥接时
+// 从这里恢复（由 dashboard 在保存重命名/启动注入时调用 SetPersistentRenames）。
+var (
+	persistentRenamesMu sync.RWMutex
+	persistentRenames   = map[string]string{}
+)
+
+// SetPersistentRenames 全量替换持久化重命名表（handler_full_name → effective
+// command）。nil/空 map 清空。
+func SetPersistentRenames(renames map[string]string) {
+	persistentRenamesMu.Lock()
+	defer persistentRenamesMu.Unlock()
+	persistentRenames = make(map[string]string, len(renames))
+	for k, v := range renames {
+		if k != "" && v != "" {
+			persistentRenames[k] = v
+		}
+	}
+}
+
+// PersistentRenameFor 返回指定 handler 的持久化生效名（无则空串）。
+func PersistentRenameFor(handlerFullName string) string {
+	persistentRenamesMu.RLock()
+	defer persistentRenamesMu.RUnlock()
+	return persistentRenames[handlerFullName]
 }
 
 // RegisterSubprocessPlugins bridges a batch of running subprocess plugins.
@@ -117,15 +146,31 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 	meta := inst.Meta
 	pluginID := inst.ID
 
+	// 组命令映射：meta.Commands 中带 parent_group 的子命令挂到对应
+	// CommandGroupFilter 上——GetCompleteCommandNames 据此计算
+	// "<group> <cmd>" 完整名，消息匹配与 WebUI 分组展示都依赖它。
+	groupFilters := map[string]*CommandGroupFilter{}
+	groupOrder := []string{}
+	for _, cmd := range meta.Commands {
+		pg := strings.TrimSpace(cmd.ParentGroup)
+		if pg == "" {
+			continue
+		}
+		if _, ok := groupFilters[pg]; !ok {
+			groupFilters[pg] = NewCommandGroupFilter(pg, nil, nil)
+			groupOrder = append(groupOrder, pg)
+		}
+	}
+
 	for _, cmd := range meta.Commands {
 		cmd := cmd
 		handler := &StarHandlerMetadata{
 			// 用插件 ID 限定 full name，避免不同插件注册同名指令时互相覆盖
 			// （否则 WebUI 重命名一个指令会连带影响另一个同名指令）。
-			HandlerFullName:   "plugin_" + inst.ID + "_" + cmd.Name,
-			HandlerName:       cmd.Name,
-			HandlerModulePath: "data.plugins",
-			PluginName:        inst.ID,
+			HandlerFullName: "plugin_" + inst.ID + "_" + cmd.Name,
+			HandlerName:     cmd.Name, HandlerModulePath: "data.plugins",
+			PluginName: inst.ID,
+			Source:     "subprocess_cmd",
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -173,10 +218,23 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				e.Result.Chain = []message.Component{&message.Plain{Text: text}}
 				return nil
 			},
-			EventType:    EventTypeFilter,
-			EventFilters: []HandlerFilter{NewCommandFilter(cmd.Name, cmd.Aliases, nil)},
-			Desc:         cmd.Description,
-			Enabled:      true,
+			EventType: EventTypeFilter,
+			EventFilters: func() []HandlerFilter {
+				cf := NewCommandFilter(cmd.Name, cmd.Aliases, groupFilters[strings.TrimSpace(cmd.ParentGroup)])
+				return []HandlerFilter{cf}
+			}(),
+			Desc:    cmd.Description,
+			Enabled: true,
+		}
+		// 应用 WebUI 持久化重命名：插件重载后指令按 meta 原始名桥接，若不
+		// 恢复重命名，运行时匹配仍用旧名（与另一同名指令真冲突、双触发），
+		// 且 WebUI 显示名与实际匹配名不一致。
+		if renamed := PersistentRenameFor(handler.HandlerFullName); renamed != "" {
+			for _, filter := range handler.EventFilters {
+				if cf, ok := filter.(*CommandFilter); ok {
+					cf.SetCommandName(renamed)
+				}
+			}
 		}
 		if cmd.Permission == "admin" {
 			handler.EventFilters = append(handler.EventFilters, NewPermissionFilter(PermissionAdmin))
@@ -191,6 +249,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 			HandlerName:       f.Name,
 			HandlerModulePath: "data.plugins",
 			PluginName:        inst.ID,
+			Source:            "subprocess_filter",
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -245,6 +304,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 			HandlerName:       h.Name,
 			HandlerModulePath: "data.plugins",
 			PluginName:        inst.ID,
+			Source:            "subprocess_hook",
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -277,7 +337,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 	}
 
 	// 把插件元数据注册进 star 注册表，使其能被宿主插件管理 RPC（如
-	// HostService.ListStars / Context.get_all_stars）枚举到——否则
+	// HostService.GetPluginRegistry / Context.get_all_stars）枚举到——否则
 	// update_manager 等依赖 get_all_stars 的管理类插件拿到空列表。
 	// 幂等：reload 时按 module path 查找，已存在则跳过（避免重复条目）。
 	modulePath := "data.plugins." + inst.ID
@@ -319,7 +379,7 @@ func CoreEventToSDK(e *core.Event) *pluginsdk.Event {
 		PlainText:   e.PlainText,
 		RawMessage:  e.RawMessage,
 		Timestamp:   e.Timestamp.Unix(),
-		Metadata:    e.Metadata,
+		Metadata:    sdkMetadata(e),
 	}
 	if e.MessageObj != nil {
 		out.MessageID = e.MessageObj.MessageID
@@ -337,6 +397,28 @@ var coreEventTypeNames = map[core.EventType]string{
 	core.EventNotice:  "notice",
 	core.EventRequest: "request",
 	core.EventMeta:    "meta",
+}
+
+// sdkMetadata 返回注入角色后的插件事件元数据。Python SDK 优先读
+// metadata.role（admin/owner/member，见 astr_message_event.from_event_json），
+// 缺失时二值化为 admin/member——宿主事件只有 admin/member 维度
+// （event.Role，WakingCheck 阶段设置），注入 role 使权限过滤器的
+// OWNER/GROUP_ADMIN 权限位有对齐的取值基础。为避免共享底层 map 被后续
+// 修改，存在注入需求时拷贝一份。
+func sdkMetadata(e *core.Event) map[string]interface{} {
+	md := e.Metadata
+	if e.Role == "" {
+		return md
+	}
+	if _, exists := md["role"]; exists {
+		return md
+	}
+	copied := make(map[string]interface{}, len(md)+1)
+	for k, v := range md {
+		copied[k] = v
+	}
+	copied["role"] = e.Role
+	return copied
 }
 
 func coreEventTypeName(t core.EventType) string {
@@ -437,14 +519,16 @@ func componentToSDK(c message.Component) pluginsdk.Component {
 }
 
 // RemovePluginCommands removes all subprocess-plugin command handlers from the
-// star registry (prefix "plugin_"). Used when re-bridging after install,
-// unload, reload or crash-restart.
+// star registry (Source "subprocess_cmd"; legacy .so 插件命令 Source
+// "so_plugin"). Used when re-bridging after install, unload, reload or
+// crash-restart. 按显式来源标记匹配，避免宽前缀 "plugin_" 误删
+// plugin_filter_*/plugin_hook_* 类 handler。
 func RemovePluginCommands(starMgr *Manager) {
 	if starMgr == nil || starMgr.Handlers() == nil {
 		return
 	}
 	for _, h := range starMgr.Handlers().All() {
-		if strings.HasPrefix(h.HandlerFullName, "plugin_") {
+		if h.Source == "subprocess_cmd" || h.Source == "so_plugin" {
 			starMgr.Handlers().Remove(h.HandlerFullName)
 		}
 	}
@@ -461,26 +545,26 @@ func RemovePluginMetadata(starMgr *Manager) {
 }
 
 // RemovePluginFilters removes all subprocess-plugin filter handlers from the
-// star registry (prefix "plugin_filter_").
+// star registry (Source "subprocess_filter").
 func RemovePluginFilters(starMgr *Manager) {
 	if starMgr == nil || starMgr.Handlers() == nil {
 		return
 	}
 	for _, h := range starMgr.Handlers().All() {
-		if strings.HasPrefix(h.HandlerFullName, "plugin_filter_") {
+		if h.Source == "subprocess_filter" {
 			starMgr.Handlers().Remove(h.HandlerFullName)
 		}
 	}
 }
 
 // RemovePluginHooks removes all subprocess-plugin hook handlers from the star
-// registry (prefix "plugin_hook_").
+// registry (Source "subprocess_hook").
 func RemovePluginHooks(starMgr *Manager) {
 	if starMgr == nil || starMgr.Handlers() == nil {
 		return
 	}
 	for _, h := range starMgr.Handlers().All() {
-		if strings.HasPrefix(h.HandlerFullName, "plugin_hook_") {
+		if h.Source == "subprocess_hook" {
 			starMgr.Handlers().Remove(h.HandlerFullName)
 		}
 	}

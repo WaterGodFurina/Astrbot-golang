@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"crypto/rand"
 	"fmt"
 	"sort"
 	"sync/atomic"
@@ -23,7 +24,7 @@ import (
 type sessionWaitEntry struct {
 	// pluginName 是等待所属插件的注册名（SDK 侧从连接身份注入）。
 	pluginName string
-	// umo 是等待监听的会话标识（platform:conversation_id）。
+	// umo 是等待监听的三段式会话标识（platform_id:MessageType:session_id）。
 	umo string
 }
 
@@ -35,6 +36,10 @@ type SessionWaitTarget struct {
 	PluginName string
 }
 
+// maxSessionWaits 是会话等待注册表的上限：插件异常反复注册时防止注册表
+// 无限增长（超时/卸载兜底清理只覆盖正常路径）。
+const maxSessionWaits = 10000
+
 // RegisterSessionWait 注册插件对 umo 的会话等待并返回 wait_id（subMgr 为
 // nil 时返回空串 = 宿主不支持）。timeoutSeconds > 0 时超时自动注销，
 // 插件结束等待后应主动 UnregisterSessionWait。
@@ -42,11 +47,20 @@ func (m *SubprocessManager) RegisterSessionWait(pluginName, umo string, timeoutS
 	if m == nil {
 		return ""
 	}
-	// waitID 格式 <插件名>-<序号>：日志/仪表盘可直读归属，序号保证唯一。
+	// waitID 格式 <插件名>-<序号>-<8 字节随机熵>：纯序号可枚举，恶意插件可
+	// 批量注销其他插件的等待（注册表无归属校验）；随机后缀使其不可枚举。
+	var entropy [8]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		entropy = [8]byte{} // crypto/rand 异常（极罕见）：退化为无熵格式
+	}
 	n := sessionWaitSeq.Add(1)
-	waitID := fmt.Sprintf("%s-%d", sanitizeID(pluginName), n)
+	waitID := fmt.Sprintf("%s-%d-%x", sanitizeID(pluginName), n, entropy)
 
 	m.sessionWaitMu.Lock()
+	if len(m.sessionWaitReg) >= maxSessionWaits {
+		m.sessionWaitMu.Unlock()
+		return ""
+	}
 	m.sessionWaitReg[waitID] = &sessionWaitEntry{pluginName: pluginName, umo: umo}
 	m.sessionWaitMu.Unlock()
 

@@ -653,6 +653,11 @@ export const authApi = {
       httpClient.post<ApiEnvelope<any>>('/api/auth/totp/setup', payload),
     );
   },
+  disableTotp() {
+    // spec 未收录 totp/disable 端点，直接走 httpClient（后端 handleTOTP
+    // 的 "disable" 分支已存在）。
+    return httpClient.post<ApiEnvelope<any>>('/api/auth/totp/disable');
+  },
   recoverTotp() {
     return withLegacyFallback<any>(openApiV1.recoverTotp(), () =>
       httpClient.post<ApiEnvelope<any>>('/api/auth/totp/recovery'),
@@ -795,8 +800,15 @@ export const backupApi = {
       openApiV1.renameBackup({ path: { filename }, body: payload }),
     );
   },
-  downloadUrl(filename: string, token: string) {
-    return `/api/v1/backups/${encodeURIComponent(filename)}?token=${encodeURIComponent(token)}`;
+  // 备份下载：一次性 ws-ticket 走 URL（30s、单次使用），长效 token 不进 URL。
+  downloadUrl(filename: string, ticket: string) {
+    return `/api/v1/backups/${encodeURIComponent(filename)}?ticket=${encodeURIComponent(ticket)}`;
+  },
+  // 备份下载（blob 方式）：经 Authorization 头鉴权，票据不可用时的兜底路径。
+  download(filename: string) {
+    return apiV1Client.get(`/backups/${encodeURIComponent(filename)}`, {
+      responseType: 'blob',
+    });
   },
 };
 
@@ -810,13 +822,15 @@ export const chatApi = {
   resumeRunStreamUrl(runId: string) {
     return `/api/v1/chat/runs/${encodeURIComponent(runId)}/stream`;
   },
-  liveWebSocketUrl(token: string, host = window.location.host) {
+  // 一次性 ws-ticket 置于后端约定的 ?token= 参数（兼容旧 ?token= 协议），
+  // 长效 JWT 不再进入 URL；调用方必须在拿到票据后才建立连接。
+  liveWebSocketUrl(ticket: string, host = window.location.host) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${protocol}//${host}/api/v1/live-chat/ws?token=${encodeURIComponent(token)}`;
+    return `${protocol}//${host}/api/v1/live-chat/ws?token=${encodeURIComponent(ticket)}`;
   },
-  unifiedWebSocketUrl(token: string, host = window.location.host) {
+  unifiedWebSocketUrl(ticket: string, host = window.location.host) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${protocol}//${host}/api/v1/unified-chat/ws?token=${encodeURIComponent(token)}`;
+    return `${protocol}//${host}/api/v1/unified-chat/ws?token=${encodeURIComponent(ticket)}`;
   },
   listSessions(params?: ChatSessionListParams) {
     return typed<any>(

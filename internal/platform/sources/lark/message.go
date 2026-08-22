@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -315,27 +317,32 @@ func sendMessageChain(ctx context.Context, client *lark.Client, chain *message.M
 		}
 	}
 
+	var errs []error
 	if len(otherComps) > 0 {
 		if err := sendRichText(ctx, client, otherComps, replyMessageID, receiveID, receiveIDType); err != nil {
 			logger.I18nWarn("发送飞书富文本消息失败: %v", err)
+			errs = append(errs, err)
 		}
 	}
 	for _, f := range fileComps {
 		if err := sendFileMessage(ctx, client, f, replyMessageID, receiveID, receiveIDType); err != nil {
 			logger.I18nWarn("发送飞书文件失败: %v", err)
+			errs = append(errs, err)
 		}
 	}
 	for _, rec := range audioComps {
 		if err := sendAudioMessage(ctx, client, rec, replyMessageID, receiveID, receiveIDType); err != nil {
 			logger.I18nWarn("发送飞书音频失败: %v", err)
+			errs = append(errs, err)
 		}
 	}
 	for _, v := range videoComps {
 		if err := sendMediaMessage(ctx, client, v, replyMessageID, receiveID, receiveIDType); err != nil {
 			logger.I18nWarn("发送飞书视频失败: %v", err)
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // sendRichText converts non-file components into a Lark post message
@@ -381,6 +388,14 @@ func convertToLark(ctx context.Context, client *lark.Client, comps []message.Com
 			if path == "" && c.Base64 != "" {
 				tempPath = writeTempBase64(c.Base64, "lark_img")
 				path = tempPath
+			}
+			if path == "" {
+				var err error
+				path, tempPath, err = resolveMediaPath(ctx, "", c.URL)
+				if err != nil {
+					logger.Error("无法下载飞书图片: %v", err)
+					continue
+				}
 			}
 			if path == "" {
 				logger.Error("飞书图片路径为空，无法上传")
@@ -497,9 +512,12 @@ func uploadImage(ctx context.Context, client *lark.Client, path string) (string,
 
 // sendFileMessage sends a File component (mirrors _send_file_message).
 func sendFileMessage(ctx context.Context, client *lark.Client, comp *message.File, replyMessageID, receiveID, receiveIDType string) error {
-	path := comp.Path
-	if path == "" {
-		path = comp.URL
+	path, tempPath, err := resolveMediaPath(ctx, comp.Path, comp.URL)
+	if err != nil {
+		return err
+	}
+	if tempPath != "" {
+		defer os.Remove(tempPath)
 	}
 	if path == "" {
 		return fmt.Errorf("lark: 文件路径为空")
@@ -517,7 +535,18 @@ func sendFileMessage(ctx context.Context, client *lark.Client, comp *message.Fil
 func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Record, replyMessageID, receiveID, receiveIDType string) error {
 	path := comp.Path
 	if path == "" {
-		path = comp.URL
+		path = comp.File
+	}
+	tempPath := ""
+	if path == "" {
+		var err error
+		path, tempPath, err = resolveMediaPath(ctx, "", comp.URL)
+		if err != nil {
+			return err
+		}
+	}
+	if tempPath != "" {
+		defer os.Remove(tempPath)
 	}
 	if path == "" {
 		return fmt.Errorf("lark: 音频路径为空")
@@ -532,7 +561,13 @@ func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Re
 
 // sendMediaMessage sends a Video component (mirrors _send_media_message).
 func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Video, replyMessageID, receiveID, receiveIDType string) error {
-	path := comp.Path
+	path, tempPath, err := resolveMediaPath(ctx, comp.Path, comp.URL)
+	if err != nil {
+		return err
+	}
+	if tempPath != "" {
+		defer os.Remove(tempPath)
+	}
 	if path == "" {
 		return fmt.Errorf("lark: 视频路径为空")
 	}
@@ -542,6 +577,34 @@ func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Vi
 	}
 	content, _ := json.Marshal(map[string]string{"file_key": key})
 	return sendImMessage(ctx, client, string(content), "media", replyMessageID, receiveID, receiveIDType)
+}
+
+// resolveMediaPath 将组件的本地路径/URL 解析为可上传路径：
+// 路径为空且 URL 为 http(s) 时先下载到临时文件（经 SSRF 校验与大小上限），
+// 返回的 tempPath 非空时调用方应在发送后 os.Remove。
+func resolveMediaPath(ctx context.Context, path, rawURL string) (string, string, error) {
+	if path != "" {
+		return path, "", nil
+	}
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		return "", "", nil
+	}
+	data, err := platform.SafeDownloadBytes(ctx, rawURL, 50<<20)
+	if err != nil {
+		return "", "", err
+	}
+	tmp, err := os.CreateTemp("", "lark_dl_*")
+	if err != nil {
+		return "", "", err
+	}
+	name := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return "", "", err
+	}
+	_ = tmp.Close()
+	return name, name, nil
 }
 
 // writeTempBase64 decodes a base64 payload to a temp file.

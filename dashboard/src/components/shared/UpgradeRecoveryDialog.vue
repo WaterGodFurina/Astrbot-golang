@@ -59,6 +59,7 @@ import {
   type VersionData,
 } from '@/api/v1';
 import { useI18n } from '@/i18n/composables';
+import { getToken } from '@/utils/token';
 
 type StartTimeData = {
   start_time?: number | string | null;
@@ -119,7 +120,7 @@ function getDismissKey() {
 function recoveryRequestConfig(validateStatus = false): AxiosRequestConfig {
   const headers: Record<string, string> = {};
   const token =
-    localStorage.getItem('token') ||
+    getToken() ||
     sessionStorage.getItem(UPGRADE_RECOVERY_TOKEN_KEY);
   const locale = localStorage.getItem('astrbot-locale');
   if (token) {

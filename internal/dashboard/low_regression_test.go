@@ -344,7 +344,7 @@ func TestChatSessionsMessagesReturnsHistory(t *testing.T) {
 
 func TestSkillFilePathAllowsDotsInsideName(t *testing.T) {
 	// "a..b" is a legitimate single-segment directory name, not traversal.
-	p, err := skillFilePath("a..b", "file.txt")
+	p, err := skillFilePath("data", "a..b", "file.txt")
 	if err != nil {
 		t.Fatalf("skillFilePath(a..b) should be allowed: %v", err)
 	}
@@ -355,14 +355,14 @@ func TestSkillFilePathAllowsDotsInsideName(t *testing.T) {
 	// Actual traversal vectors remain blocked: skillName separators / exact
 	// ".." are rejected, and relPath ".." is neutralized by Clean + the
 	// containment check so the result never escapes the skill root.
-	if _, err := skillFilePath("..", "x"); err == nil {
+	if _, err := skillFilePath("data", "..", "x"); err == nil {
 		t.Error("exact '..' must be rejected")
 	}
-	if _, err := skillFilePath("../evil", "x"); err == nil {
+	if _, err := skillFilePath("data", "../evil", "x"); err == nil {
 		t.Error("separator traversal name must be rejected")
 	}
 	root, _ := filepath.Abs(filepath.Join("data", "skills", "ok"))
-	p2, err := skillFilePath("ok", "../../etc/passwd")
+	p2, err := skillFilePath("data", "ok", "../../etc/passwd")
 	if err != nil {
 		t.Fatalf("relPath '..' should be neutralized, not error: %v", err)
 	}

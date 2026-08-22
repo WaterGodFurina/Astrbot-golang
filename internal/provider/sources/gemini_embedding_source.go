@@ -39,13 +39,31 @@ func NewGeminiEmbeddingSource(config, settings map[string]interface{}) *GeminiEm
 	s.apiKey = configString(config, "embedding_api_key", configString(config, "key", ""))
 	s.dim = configInt(config, "embedding_dimensions", 768)
 	if m := configString(config, "embedding_model", configString(config, "model", "")); m != "" {
-		s.SetModel(m)
+		if geminiModelPathSafe(m) {
+			s.SetModel(m)
+		} else {
+			logger.Warn("Gemini embedding: 模型名 %q 含 URL 非法字符, 使用默认模型", m)
+		}
 	}
 	if s.GetModel() == "" {
 		s.SetModel("gemini-embedding-exp-03-07")
 	}
 	s.SetCapability(provider.CapEmbedding)
 	return s
+}
+
+// geminiModelPathSafe reports whether the model name only contains characters
+// safe for the /v1beta/models/<model> URL path segment.
+func geminiModelPathSafe(m string) bool {
+	for _, c := range m {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-', c == '_', c == '.', c == ':', c == '/':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // GetEmbedding returns the embedding vector for a single text.
@@ -87,6 +105,9 @@ func (s *GeminiEmbeddingSource) GetEmbedding(ctx context.Context, text string) (
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
+	}
+	if len(result.Embedding.Values) == 0 {
+		return nil, fmt.Errorf("gemini embedding API returned empty vector")
 	}
 	vec := make([]float32, len(result.Embedding.Values))
 	for i, v := range result.Embedding.Values {

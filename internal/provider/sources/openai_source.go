@@ -96,8 +96,8 @@ func (s *OpenAISource) GetModels(ctx context.Context) ([]string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(body), 1024))
 	}
 	var result struct {
 		Data []struct {
@@ -123,18 +123,19 @@ func (s *OpenAISource) TextChat(ctx context.Context, req *provider.ProviderReque
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return &provider.LLMResponse{
 			Role:           "err",
-			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, string(respBody)),
+			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024)),
 		}, nil
 	}
 	var result struct {
 		Choices []struct {
 			Message struct {
-				Role      string `json:"role"`
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Role             string `json:"role"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function struct {
@@ -154,12 +155,13 @@ func (s *OpenAISource) TextChat(ctx context.Context, req *provider.ProviderReque
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	if len(result.Choices) == 0 {
-		return &provider.LLMResponse{Role: "assistant", CompletionText: ""}, nil
+		return nil, fmt.Errorf("openai completion has no usable output")
 	}
 	choice := result.Choices[0]
 	llmResp := &provider.LLMResponse{
-		Role:           choice.Message.Role,
-		CompletionText: choice.Message.Content,
+		Role:             choice.Message.Role,
+		CompletionText:   choice.Message.Content,
+		ReasoningContent: choice.Message.ReasoningContent,
 		Usage: &provider.TokenUsage{
 			InputOther: result.Usage.PromptTokens,
 			Output:     result.Usage.CompletionTokens,
@@ -189,9 +191,9 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024))
 	}
 
 	ch := make(chan *provider.LLMResponse, 100)
@@ -209,6 +211,7 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 		content := new(strings.Builder)
 		reasoning := new(strings.Builder)
 		var usage *provider.TokenUsage
+		var finishReason string
 
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var chunk struct {
@@ -233,9 +236,21 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 					CompletionTokens int `json:"completion_tokens"`
 					TotalTokens      int `json:"total_tokens"`
 				} `json:"usage"`
+				Error *struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+				} `json:"error"`
 			}
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				return false
+			}
+			if chunk.Error != nil {
+				msg := chunk.Error.Message
+				if msg == "" {
+					msg = chunk.Error.Type
+				}
+				ch <- &provider.LLMResponse{Role: "err", CompletionText: "API stream error: " + msg}
+				return true
 			}
 			if chunk.Usage != nil {
 				usage = &provider.TokenUsage{
@@ -244,6 +259,9 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 				}
 			}
 			for _, choice := range chunk.Choices {
+				if choice.FinishReason != "" {
+					finishReason = choice.FinishReason
+				}
 				if choice.Delta.Content != "" {
 					content.WriteString(choice.Delta.Content)
 					ch <- &provider.LLMResponse{
@@ -281,6 +299,10 @@ func (s *OpenAISource) TextChatStream(ctx context.Context, req *provider.Provide
 		}
 
 		final := &provider.LLMResponse{Role: "assistant", CompletionText: content.String(), ReasoningContent: reasoning.String(), Usage: usage}
+		if finishReason == "length" || finishReason == "content_filter" {
+			logger.Warn("OpenAI stream finished early: %s", finishReason)
+			final.CompletionText += fmt.Sprintf("\n[response truncated: %s]", finishReason)
+		}
 		if len(toolCalls) > 0 {
 			for _, tc := range toolCalls {
 				final.ToolsCallName = append(final.ToolsCallName, tc.name)
@@ -317,6 +339,49 @@ func (s *OpenAISource) Test(ctx context.Context) error {
 	return nil
 }
 
+// sanitizeContexts filters and normalizes assistant messages before send.
+// Strict APIs (Moonshot, DeepSeek Reasoner) reject assistant messages lacking
+// both content and tool_calls; context truncation/compression also leaves
+// orphaned tool messages behind. Ported from _sanitize_assistant_messages in
+// openai_source.py.
+func sanitizeContexts(msgs []map[string]interface{}) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(msgs))
+	pendingToolIDs := map[string]bool{}
+	for _, msg := range msgs {
+		role, _ := msg["role"].(string)
+		if role == "assistant" {
+			content, _ := msg["content"].(string)
+			hasToolCalls := len(toolCallsSlice(msg["tool_calls"])) > 0
+			if content == "" && !hasToolCalls {
+				continue // 空 assistant 垃圾消息，丢弃
+			}
+			copied := cloneMap(msg)
+			if content == "" && hasToolCalls {
+				copied["content"] = nil
+			}
+			pendingToolIDs = map[string]bool{}
+			for _, tc := range toolCallsSlice(copied["tool_calls"]) {
+				if id, ok := tc["id"].(string); ok {
+					pendingToolIDs[id] = true
+				}
+			}
+			out = append(out, copied)
+			continue
+		}
+		if role == "tool" {
+			id, _ := msg["tool_call_id"].(string)
+			if pendingToolIDs[id] {
+				delete(pendingToolIDs, id)
+				out = append(out, msg)
+			}
+			continue // 孤儿 tool 消息，丢弃
+		}
+		pendingToolIDs = map[string]bool{}
+		out = append(out, msg)
+	}
+	return out
+}
+
 func (s *OpenAISource) buildRequestBody(req *provider.ProviderRequest, stream bool) map[string]interface{} {
 	body := map[string]interface{}{
 		"model":  s.GetModel(),
@@ -337,7 +402,7 @@ func (s *OpenAISource) buildRequestBody(req *provider.ProviderRequest, stream bo
 		})
 	}
 	// Add context messages
-	messages = append(messages, req.Contexts...)
+	messages = append(messages, sanitizeContexts(req.Contexts)...)
 	// Add current user message
 	messages = append(messages, req.ToUserMessage())
 	body["messages"] = messages

@@ -43,29 +43,37 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		if inst.Meta != nil {
 			desc = inst.Meta.Description
 		}
+		e := entryByID[inst.ID]
 		info := map[string]interface{}{
-			"name":                   inst.Name,
-			"display_name":           m.pluginDisplayName(inst, entryByID[inst.ID]),
-			"short_desc":             m.pluginShortDesc(inst, entryByID[inst.ID]),
-			"marketplace_name":       strings.ReplaceAll(inst.Name, "_", "-"),
-			"version":                inst.Version,
-			"description":            desc,
-			"path":                   inst.Binary,
-			"id":                     inst.ID,
-			"language":               inst.Language,
-			"logo":                   m.pluginLogoURL(inst.ID),
-			"loaded":                 true,
-			"enabled":                true,
-			"activated":              true,
-			"reserved":               false,
-			"author":                 "",
-			"repo":                   "",
-			"idle_unload_blocked":    m.IdleUnloadBlocked(inst.ID),
-			"install_source":         nil,
-			"updates_enabled":        true,
-			"update_disabled_reason": "",
+			"name":                    inst.Name,
+			"display_name":            m.pluginDisplayName(inst, e),
+			"short_desc":              m.pluginShortDesc(inst, e),
+			"marketplace_name":        strings.ReplaceAll(inst.Name, "_", "-"),
+			"version":                 inst.Version,
+			"description":             desc,
+			"path":                    inst.Binary,
+			"id":                      inst.ID,
+			"language":                inst.Language,
+			"logo":                    m.pluginLogoURL(inst.ID),
+			"loaded":                  true,
+			"enabled":                 true,
+			"activated":               true,
+			"reserved":                false,
+			"author":                  "",
+			"repo":                    "",
+			"idle_unload_blocked":     e != nil && e.IdleUnloadBlocked,
+			"install_source":          nil,
+			"updates_enabled":         true,
+			"update_disabled_reason":  "",
+			"logo_path":               "",
+			"support_platforms":       []string{},
+			"astrbot_version":         "",
+			"i18n":                    nil,
+			"pages":                   []interface{}{},
+			"root_dir_name":           "",
+			"star_handler_full_names": []string{},
 		}
-		if e := entryByID[inst.ID]; e != nil {
+		if e != nil {
 			info["repo"] = e.Repo
 			if info["repo"] == "" {
 				info["repo"] = e.Source
@@ -75,6 +83,15 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			if !updatesEnabled(e.InstallMethod) {
 				info["update_disabled_reason"] = "该插件缺少可用的安装源或仓库地址，无法更新或重新安装"
 			}
+			// 以下字段从持久化 manifest 条目读取（对齐 Python StarMetadata），
+			// entry 为 nil 时保持上方的空值。
+			info["author"] = e.Author
+			info["logo_path"] = e.LogoPath
+			info["support_platforms"] = e.SupportPlatforms
+			info["astrbot_version"] = e.AstrbotVersion
+			info["i18n"] = e.I18n
+			info["pages"] = e.Pages
+			info["root_dir_name"] = e.ID
 		}
 		result = append(result, info)
 	}
@@ -96,26 +113,33 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			enabled = true
 		}
 		result = append(result, map[string]interface{}{
-			"name":                   e.Name,
-			"display_name":           m.pluginDisplayName(nil, &e),
-			"short_desc":             m.pluginShortDesc(nil, &e),
-			"marketplace_name":       strings.ReplaceAll(e.Name, "_", "-"),
-			"version":                e.Version,
-			"description":            desc,
-			"path":                   e.Binary,
-			"id":                     e.ID,
-			"language":               e.Language,
-			"logo":                   m.pluginLogoURL(e.ID),
-			"loaded":                 false,
-			"enabled":                enabled,
-			"activated":              false,
-			"reserved":               false,
-			"author":                 "",
-			"repo":                   repo,
-			"idle_unload_blocked":    e.IdleUnloadBlocked,
-			"install_source":         e.installSourceMap(),
-			"updates_enabled":        updatesEnabled(e.InstallMethod),
-			"update_disabled_reason": "",
+			"name":                    e.Name,
+			"display_name":            m.pluginDisplayName(nil, &e),
+			"short_desc":              m.pluginShortDesc(nil, &e),
+			"marketplace_name":        strings.ReplaceAll(e.Name, "_", "-"),
+			"version":                 e.Version,
+			"description":             desc,
+			"path":                    e.Binary,
+			"id":                      e.ID,
+			"language":                e.Language,
+			"logo":                    m.pluginLogoURL(e.ID),
+			"loaded":                  false,
+			"enabled":                 enabled,
+			"activated":               false,
+			"reserved":                false,
+			"author":                  e.Author,
+			"repo":                    repo,
+			"idle_unload_blocked":     e.IdleUnloadBlocked,
+			"install_source":          e.installSourceMap(),
+			"updates_enabled":         updatesEnabled(e.InstallMethod),
+			"update_disabled_reason":  "",
+			"logo_path":               e.LogoPath,
+			"support_platforms":       e.SupportPlatforms,
+			"astrbot_version":         e.AstrbotVersion,
+			"i18n":                    e.I18n,
+			"pages":                   e.Pages,
+			"root_dir_name":           e.ID,
+			"star_handler_full_names": []string{},
 		})
 	}
 	return result
@@ -379,12 +403,25 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		m.manifestMu.Unlock()
 		return nil, fmt.Errorf("plugin %s not in install manifest", id)
 	}
-	source := entry.DownloadURL
+	// 更新时外部（dashboard，对齐 Python resolve_market_update_info）可能已从
+	// 插件原 registry 重新解析出该插件的最新下载源：显式传入的
+	// download_url/repo 优先于 manifest 快照，避免更新拉取固定旧版本 zip
+	//（manifest 的 download_url 指向具体版本，如 …/2.6.0/xxx-2.6.0-<sha>.zip，
+	// 直接用会永远装回旧版本）。
+	dlURL := entry.DownloadURL
+	if v := strings.TrimSpace(opts.DownloadURL); v != "" {
+		dlURL = v
+	}
+	repo := entry.Repo
+	if v := strings.TrimSpace(opts.Repo); v != "" {
+		repo = v
+	}
+	source := dlURL
 	if source == "" {
 		source = entry.Source
 	}
 	if source == "" {
-		source = entry.Repo
+		source = repo
 	}
 	if source == "" {
 		m.manifestMu.Unlock()
@@ -402,8 +439,8 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		RegistryURL:    entry.RegistryURL,
 		RegistryName:   entry.RegistryName,
 		MarketPluginID: entry.MarketPluginID,
-		Repo:           entry.Repo,
-		DownloadURL:    entry.DownloadURL,
+		Repo:           repo,
+		DownloadURL:    dlURL,
 	}
 	m.manifestMu.Unlock()
 
@@ -414,6 +451,17 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 	}
 
 	return m.InstallFromSource(ctx, id, source, carry)
+}
+
+// ManifestEntry returns the persisted install-manifest entry for id (nil when
+// absent), consumed by the dashboard to re-resolve the plugin's original
+// registry when refreshing update sources (对齐 Python resolve_market_update_info).
+func (m *SubprocessManager) ManifestEntry(id string) *ManifestEntry {
+	man := m.cachedManifest()
+	if man == nil {
+		return nil
+	}
+	return man.Get(id)
 }
 
 // Uninstall removes an installed plugin: unloads it, drops the manifest entry,
@@ -520,17 +568,20 @@ func (m *SubprocessManager) safeDataDirPath(sub string) (string, error) {
 }
 
 // instanceByName returns the running instance for a plugin identifier (id or
-// name), or nil.
+// name), or nil. 同名 Go/Python 多变体并存时（实例按 id = name_language 分键）
+// 取 id 字典序最小者，保证解析确定性（map 遍历顺序随机会导致 GetConfig/
+// SetConfig/会话等待喂入漂移到任意一个变体）。
 func (m *SubprocessManager) instanceByName(name string) *PluginInstance {
 	if inst := m.Get(name); inst != nil {
 		return inst
 	}
+	var hit *PluginInstance
 	for _, inst := range m.List() {
-		if inst.Name == name {
-			return inst
+		if inst.Name == name && (hit == nil || inst.ID < hit.ID) {
+			hit = inst
 		}
 	}
-	return nil
+	return hit
 }
 
 // ConfigSchema returns the plugin's config schema exported via Register().
@@ -728,7 +779,7 @@ func (m *SubprocessManager) stripMetadataKeys(id string, cfg map[string]interfac
 	m.mergeMetadataFile(id, removed)
 	// 重写 config.json（不含元数据键）。
 	if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
-		_ = os.WriteFile(m.configPath(id), data, 0o644) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
+		_ = os.WriteFile(m.configPath(id), data, 0o600) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
 	}
 	return cfg
 }
@@ -887,7 +938,7 @@ func (m *SubprocessManager) SaveConfig(id string, cfg map[string]interface{}) er
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0644) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
+	return os.WriteFile(path, data, 0o600) // #nosec G306 -- 插件配置（用户态）非常规敏感信息
 }
 
 // pluginDataRoot returns the unified per-plugin data root directory
@@ -1002,20 +1053,26 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 	}
 	m.docMu.Unlock()
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: safeRedirect}
+	const maxDocSize = 2 << 20
 	for _, rawURL := range rawURLs {
 		resp, err := client.Get(rawURL)
 		if err != nil {
 			continue
 		}
-		content, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusOK && len(content) > 0 {
-			m.docMu.Lock()
-			m.docFetchCache[cacheKey] = docCacheEntry{content: string(content), ts: time.Now()}
-			m.docMu.Unlock()
-			return string(content)
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			continue
 		}
+		content, err := io.ReadAll(io.LimitReader(resp.Body, maxDocSize+1))
+		_ = resp.Body.Close()
+		if err != nil || int64(len(content)) > maxDocSize || len(content) == 0 {
+			continue
+		}
+		m.docMu.Lock()
+		m.docFetchCache[cacheKey] = docCacheEntry{content: string(content), ts: time.Now()}
+		m.docMu.Unlock()
+		return string(content)
 	}
 	// 负面缓存：本次未取到（网络不通/无 README）也记录（TTL 内不再重试），
 	// 前端立即得到"没有 README"而非长时间转圈。
@@ -1027,15 +1084,14 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 
 // repoURLFor returns the plugin's repository URL (manifest Repo, else Source).
 func (m *SubprocessManager) repoURLFor(name string) string {
-	if man, err := LoadManifest(m.manifestPath()); err == nil {
-		for i := range man.Plugins {
-			e := &man.Plugins[i]
-			if e.Name == name || e.ID == name {
-				if e.Repo != "" {
-					return e.Repo
-				}
-				return e.Source
+	man := m.cachedManifest()
+	for i := range man.Plugins {
+		e := &man.Plugins[i]
+		if e.Name == name || e.ID == name {
+			if e.Repo != "" {
+				return e.Repo
 			}
+			return e.Source
 		}
 	}
 	return ""

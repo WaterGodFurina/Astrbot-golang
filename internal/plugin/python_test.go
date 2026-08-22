@@ -190,7 +190,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	}
 
 	// HandleLLMRequest（on_llm_request 注入 system prompt）
-	sp, stop, _, err := inst.Client.HandleLLMRequest(cmdCtx, "python_plugin.main_llm_req", sdkEvent(t, ev), "SP", "hi")
+	sp, _, stop, _, err := inst.Client.HandleLLMRequest(cmdCtx, "python_plugin.main_llm_req", sdkEvent(t, ev), "SP", "hi")
 	if err != nil {
 		t.Fatalf("HandleLLMRequest: %v", err)
 	}

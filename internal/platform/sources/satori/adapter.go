@@ -296,8 +296,11 @@ func (a *Adapter) sendIdentify(ws *websocket.Conn) error {
 		"token": a.token, // 字符串
 	}
 	// 只有在有序列号时才添加 sn 字段
-	if a.sequence > 0 {
-		body["sn"] = a.sequence
+	a.mu.Lock()
+	sn := a.sequence
+	a.mu.Unlock()
+	if sn > 0 {
+		body["sn"] = sn
 	}
 	payload := map[string]interface{}{
 		"op":   opIdentify,
@@ -503,15 +506,12 @@ func (a *Adapter) sendHTTPRequest(method, path string, data map[string]interface
 	if a.token != "" {
 		headers["Authorization"] = "Bearer " + a.token
 	}
+	if platformName == "" || userID == "" {
+		platformName, userID = a.currentLogin()
+	}
 	if platformName != "" && userID != "" {
 		headers["satori-platform"] = platformName
 		headers["satori-user-id"] = userID
-	} else if len(a.logins) > 0 {
-		login := a.logins[0]
-		headers["satori-platform"] = login.Platform
-		if login.User != nil {
-			headers["satori-user-id"] = login.User.ID
-		}
 	}
 
 	if !strings.HasPrefix(path, "/") {

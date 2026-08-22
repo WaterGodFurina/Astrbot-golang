@@ -74,7 +74,7 @@ type KBHelper struct {
 // to the Manager's injected uploadFunc. When no backend is wired it returns a
 // clear error without panicking or issuing any network request — it never
 // affects other KB operations (Issue #9392: no hard failure on missing deps).
-func (h *KBHelper) UploadFromURL(url string, chunkSize, chunkOverlap, batchSize, tasksLimit, maxRetries int, progressCB func(done, total int)) error {
+func (h *KBHelper) UploadFromURL(url string, chunkSize, chunkOverlap int) error {
 	if url == "" {
 		return fmt.Errorf("url is empty")
 	}
@@ -198,9 +198,9 @@ func (m *Manager) Retrieve(ctx context.Context, query string, kbNames []string, 
 		return nil, nil
 	}
 
-	// In a full implementation, this would delegate to the retrieval manager.
-	// For now, return nil (no results) which the caller handles gracefully.
-	return nil, nil
+	// 真实检索在 dashboard/kb_vec.go 的 kbRetrieve 中实现；此处未接线，
+	// 显式报错而不是"成功返回空"，避免调用方误判。
+	return nil, fmt.Errorf("retrieval not wired in this manager; use the dashboard KB backend")
 }
 
 // ListKBs returns all knowledge bases.
@@ -272,7 +272,7 @@ func (m *Manager) DeleteKB(kbID string) bool {
 // UploadFromURL uploads a document from a URL to the specified KB.
 // This is a wrapper that finds the KB by name or ID and delegates.
 // Issue #9392: gracefully degrades if optional vector deps are unavailable.
-func (m *Manager) UploadFromURL(kbNameOrID, url string, chunkSize, chunkOverlap, batchSize, tasksLimit, maxRetries int, progressCB func(done, total int)) error {
+func (m *Manager) UploadFromURL(kbNameOrID, url string, chunkSize, chunkOverlap int) error {
 	m.mu.RLock()
 	helper, ok := m.instances[kbNameOrID]
 	if !ok {
@@ -288,7 +288,7 @@ func (m *Manager) UploadFromURL(kbNameOrID, url string, chunkSize, chunkOverlap,
 	if helper == nil {
 		return fmt.Errorf("knowledge base '%s' not found", kbNameOrID)
 	}
-	return helper.UploadFromURL(url, chunkSize, chunkOverlap, batchSize, tasksLimit, maxRetries, progressCB)
+	return helper.UploadFromURL(url, chunkSize, chunkOverlap)
 }
 
 // generateID creates a simple unique ID.

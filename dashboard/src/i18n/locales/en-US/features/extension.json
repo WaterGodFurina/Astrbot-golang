@@ -138,7 +138,8 @@
       "astrbotVersion": "AstrBot Version Requirement",
       "supportPlatforms": "Supported Platforms",
       "authorWebsite": "Author Website",
-      "repository": "Repository"
+      "repository": "Repository",
+      "pluginLanguage": "Plugin Language"
     },
     "sleep": {
       "globalLabel": "Global idle auto-sleep",
@@ -184,7 +185,8 @@
     "sourceResolved": "Source resolved successfully",
     "installPlugin": "Install Plugin",
     "randomPlugins": "🎲 Random Plugins",
-    "sourceSafetyWarning": "Even with the default source, plugin stability and security cannot be fully guaranteed. Please verify carefully before use."
+    "sourceSafetyWarning": "Even with the default source, plugin stability and security cannot be fully guaranteed. Please verify carefully before use.",
+    "sourceTypeHint": "Choose the plugin type of this source: Golang sources list Go plugins (compatibility checked against the Go version); Python sources list Python plugins (checked against the tracked Python version). This affects the install method (direct zip download vs git clone) and version compatibility checks."
   },
   "sort": {
     "by": "Sort by",
@@ -269,13 +271,14 @@
     "python_runtime": {
       "title": "Python Runtime Required",
       "message": "This plugin requires the Python runtime to run.",
-      "android_hint": "Install Python in Termux with the following command:",
+      "android_hint": "Run the following command in Termux to install the missing prebuilt dependencies:",
       "download_hint": "Automatically download CPython?",
       "mirrorLabel": "Download mirror",
       "download": "Auto Download",
       "cancel": "Cancel",
       "copy": "Copy Command",
-      "installed": "I've Installed"
+      "installed": "I've Installed",
+      "primaryLabel": "Source address (official CDN)"
     },
     "update": {
       "title": "Update Extension",
@@ -516,5 +519,15 @@
   },
   "pluginChangelog": {
     "menuTitle": "View Changelog"
+  },
+  "adminList": {
+    "manage": "Manage Plugin Admins",
+    "hint": "Authorize specific plugins to manage other plugins (install/uninstall/enable/disable). Unauthorized plugins can only manage themselves. Leave empty for no admin plugins.",
+    "label": "Plugin names (comma-separated)",
+    "placeholder": "astrbot_plugin_xxx_python, astrbot_plugin_yyy_go",
+    "example": "Plugin name format: name_language (e.g. astrbot_plugin_box_python). Takes effect after plugin restart.",
+    "save": "Save",
+    "cancel": "Cancel",
+    "saved": "Plugin admin list saved"
   }
 }

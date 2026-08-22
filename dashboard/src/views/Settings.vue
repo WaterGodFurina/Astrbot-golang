@@ -515,6 +515,7 @@ import DashboardTwoFactorDialog from '@/components/shared/DashboardTwoFactorDial
 import ChangelogDialog from '@/components/shared/ChangelogDialog.vue';
 import { restartAstrBot as restartAstrBotRuntime } from '@/utils/restartAstrBot';
 import { copyToClipboard } from '@/utils/clipboard';
+import { removeToken } from '@/utils/token';
 import { useI18n, useModuleI18n } from '@/i18n/composables';
 import { useTheme } from 'vuetify';
 import { PurpleTheme } from '@/theme/LightTheme';
@@ -909,6 +910,14 @@ const saveSystemConfig = async (configOverride = null, headers = {}, allow2faPro
             return { success: false, requires2fa: true };
         }
 
+        if (res.status === 401) {
+            // 普通鉴权失败（非 TOTP 流程）：清除本地凭证并引导重新登录
+            removeToken();
+            localStorage.removeItem('user');
+            window.location.hash = '/auth/login';
+            return { success: false };
+        }
+
         if (res.data.status !== 'ok') {
             showToast(res.data.message || tm('systemConfig.messages.saveFailed'), 'error');
             return { success: false };
@@ -1035,6 +1044,11 @@ const copyCreatedApiKey = async () => {
 };
 
 const createApiKey = async () => {
+    const name = newApiKeyName.value.trim();
+    if (!name) {
+        showToast(tm('apiKey.messages.nameRequired'), 'warning');
+        return;
+    }
     const selectedScopeSet = new Set(newApiKeyScopes.value);
     if (selectedScopeSet.has('config')) {
         for (const scope of configIncludedScopes) {
@@ -1063,7 +1077,7 @@ const createApiKey = async () => {
     apiKeyCreating.value = true;
     try {
         const payload = {
-            name: newApiKeyName.value,
+            name,
             scopes: selectedScopes
         };
         if (newApiKeyExpiresInDays.value !== 'permanent') {
@@ -1075,6 +1089,10 @@ const createApiKey = async () => {
             return;
         }
         createdApiKeyPlaintext.value = res.data.data?.api_key || '';
+        // 明文 Key 长时间驻留界面有泄露风险，5 分钟后自动清除
+        setTimeout(() => {
+            createdApiKeyPlaintext.value = '';
+        }, 5 * 60 * 1000);
         newApiKeyName.value = '';
         newApiKeyExpiresInDays.value = 30;
         showToast(tm('apiKey.messages.createSuccess'), 'success');
@@ -1141,9 +1159,7 @@ const resetThemeColors = () => {
 
 onMounted(async () => {
     await Promise.all([loadApiKeys(), loadSystemConfig()]);
-    serverClockTimer.value = window.setInterval(() => {
-        serverClockTickMs.value = performance.now();
-    }, 1000);
+    startServerClockTicker();
     const hash = window.location.hash;
     if (hash.includes('settings-appearance')) {
         activeSettingsSection.value = 'appearance';
@@ -1158,13 +1174,39 @@ onMounted(async () => {
     } else if (hash.includes('settings-resources')) {
         activeSettingsSection.value = 'resources';
     }
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 });
 
-onUnmounted(() => {
+const startServerClockTicker = () => {
+    if (serverClockTimer.value) return;
+    serverClockTimer.value = window.setInterval(() => {
+        serverClockTickMs.value = performance.now();
+    }, 1000);
+};
+
+const stopServerClockTicker = () => {
     if (serverClockTimer.value) {
         clearInterval(serverClockTimer.value);
         serverClockTimer.value = null;
     }
+};
+
+// 页面不可见时暂停每秒 tick，避免无谓的响应式更新
+const handleVisibilityChange = () => {
+    if (document.hidden) {
+        stopServerClockTicker();
+        return;
+    }
+    if (serverClockAnchorMs.value !== null) {
+        serverClockAnchorMs.value = performance.now();
+        serverClockTickMs.value = serverClockAnchorMs.value;
+    }
+    startServerClockTicker();
+};
+
+onUnmounted(() => {
+    stopServerClockTicker();
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
     if (systemConfigAutoSaveTimer.value) {
         clearTimeout(systemConfigAutoSaveTimer.value);
         systemConfigAutoSaveTimer.value = null;

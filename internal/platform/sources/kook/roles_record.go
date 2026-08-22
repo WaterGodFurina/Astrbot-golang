@@ -11,10 +11,10 @@ import (
 
 // 角色缓存相关常量 (对应 Python kook_roles_record.py)。
 const (
-	userViewRequestTimeout = 3 * time.Second // 请求超时, 避免阻塞消息接收太久
-	rolesCacheMaxSize      = 2000            // 缓存最大条目数 (LRU)
-	maxRetryTimes          = 3               // 最大失败重试次数
-	retryIntervalSecond    = 60              // 失败后的重试间隔(秒)
+	userViewRequestTimeout = 3 * time.Second  // 请求超时, 避免阻塞消息接收太久
+	rolesCacheMaxSize      = 2000             // 缓存最大条目数 (LRU)
+	maxRetryTimes          = 3                // 最大失败重试次数
+	retryInterval          = 60 * time.Second // 失败后的重试间隔
 )
 
 // rolesCacheEntry 对应 Python 的 RolesCache 数据类。
@@ -49,7 +49,9 @@ type pendingFetch struct {
 type RolesRecord struct {
 	mu sync.Mutex
 
-	botID      string
+	botID string
+	token string
+
 	httpClient *http.Client
 
 	cache   map[int64]*rolesCacheEntry // 频道 id -> 缓存 (LRU)
@@ -71,6 +73,13 @@ func (r *RolesRecord) SetBotID(botID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.botID = botID
+}
+
+// SetToken 设置机器人 token (请求 /user/view 时携带 Authorization: Bot <token>)。
+func (r *RolesRecord) SetToken(token string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.token = token
 }
 
 // ClearGuildRolesCache 清除指定频道的角色缓存 (对应 Python clear_guild_roles_cache)。
@@ -112,6 +121,7 @@ func (r *RolesRecord) fetchRolesByGuildID(ctx context.Context, guildID int64) ma
 		logger.I18nError("[KOOK] 获取机器人在频道 %q 的角色id信息时请求异常: %v", fmt.Sprintf("%d", guildID), err)
 		return nil
 	}
+	req.Header.Set("Authorization", "Bot "+r.token)
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		logger.I18nError("[KOOK] 获取机器人在频道 %q 的角色id信息时请求异常: %v", fmt.Sprintf("%d", guildID), err)
@@ -189,7 +199,7 @@ func (r *RolesRecord) doFetch(ctx context.Context, guildID, roleID int64) map[in
 	r.mu.Lock()
 	if cache, ok := r.cache[guildID]; ok {
 		// 失败次数过多且在重试间隔内, 直接放弃本次查询
-		if cache.FailedCount > maxRetryTimes && time.Since(cache.LatestUpdateTime) < retryIntervalSecond {
+		if cache.FailedCount > maxRetryTimes && time.Since(cache.LatestUpdateTime) < retryInterval {
 			r.mu.Unlock()
 			return nil
 		}

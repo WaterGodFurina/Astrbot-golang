@@ -45,6 +45,7 @@ type PasswordManager struct {
 	configMgr              *config.ConfigManager // 注入后 auth 持久化统一走 ConfigManager（M-08）
 	username               string
 	hashedPassword         string // PBKDF2 hash（dashboard.password 字段）
+	initialPassword        string // 启动生成/重置的初始密码明文（仅内存，供 setup 校验与测试）
 	passwordChangeRequired bool
 	jwtSecret              string
 	tokens                 map[string]bool // active session tokens
@@ -153,11 +154,15 @@ func NewPasswordManager(configPath string) *PasswordManager {
 					if enable, ok := totpCfg["enable"].(bool); ok {
 						pm.totpEnabled = enable
 					}
-					if secret, ok := totpCfg["secret"].(string); ok && secret != "" {
-						pm.totpSecret = secret
-						// 存在 secret 但未显式开启时按已启用处理，保证两者一致。
-						if !pm.totpEnabled {
-							pm.totpEnabled = true
+					// ⚠️ 严格按 enable 字段决定启用状态。不要"存在 secret 就
+					// 视为已启用"——setup 两步流程（生成密钥→验证码确认）中，
+					// 用户生成密钥后未完成验证即关闭弹窗会留下
+					// {enable:false, secret:...} 的半启用状态；此时若自动置
+					// true，重启后登录要求 TOTP 但验证器从未绑定，直接死锁。
+					pm.totpSecret = ""
+					if pm.totpEnabled {
+						if secret, ok := totpCfg["secret"].(string); ok && secret != "" {
+							pm.totpSecret = secret
 						}
 					}
 					if rh, ok := totpCfg["recovery_code_hash"].(string); ok && rh != "" {
@@ -206,6 +211,7 @@ func (pm *PasswordManager) generateAndStorePassword() {
 		pm.username = Username
 	}
 	pm.hashedPassword = hashed
+	pm.initialPassword = password
 	pm.passwordChangeRequired = true
 	pm.mu.Unlock()
 
@@ -479,6 +485,14 @@ func (pm *PasswordManager) PasswordChangeRequired() bool {
 	return pm.passwordChangeRequired
 }
 
+// InitialPassword 返回启动生成/重置的初始密码明文（仅内存）。供 setup 端点
+// 校验初始密码与测试使用；从未生成过时返回空串。
+func (pm *PasswordManager) InitialPassword() string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.initialPassword
+}
+
 // generateRandomPassword creates a strong random password.
 // Ported from astrbot/core/utils/auth_password.py generate_dashboard_password()
 func generateRandomPassword() string {
@@ -657,6 +671,61 @@ func (pm *PasswordManager) verifyJWT(token string) (string, string, bool) {
 	return claims.Username, claims.ID, true
 }
 
+// ───────────────────────────────────────────────────────────────
+// ws-ticket 一次性票据（复核开放项 10-2）
+// ───────────────────────────────────────────────────────────────
+
+// wsTicket 是一次性短期票据：已认证用户经 POST /api/v1/auth/ws-ticket 换取，
+// 用于 WebSocket 连接 / 下载 URL 的 ?token= 鉴权，避免长效 JWT 出现在 URL
+// （会进代理/服务端日志）。命中即消耗，单次使用。
+type wsTicket struct {
+	expiresAt time.Time
+	used      bool
+}
+
+// wsTicketTTL 票据有效期：足够完成连接建立/下载发起，短到泄露后危害可控。
+const wsTicketTTL = 30 * time.Second
+
+// issueWSTicket 为已认证用户签发一次性短期票据，返回随机 32 字节 hex 值。
+func (s *Server) issueWSTicket() string {
+	t := generateRandomToken(32)
+	s.ticketMu.Lock()
+	defer s.ticketMu.Unlock()
+	s.gcWSTicketsLocked()
+	s.wsTickets[t] = &wsTicket{expiresAt: time.Now().Add(wsTicketTTL)}
+	return t
+}
+
+// consumeWSTicket 校验并消耗一次性票据：命中、未过期且未用 → 标记 used 并
+// 返回 true；重复使用或过期一律拒绝（返回 false 由调用方回退 JWT 校验）。
+func (s *Server) consumeWSTicket(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	s.ticketMu.Lock()
+	defer s.ticketMu.Unlock()
+	s.gcWSTicketsLocked()
+	tk, ok := s.wsTickets[raw]
+	if !ok {
+		return false
+	}
+	if tk.used || time.Now().After(tk.expiresAt) {
+		return false
+	}
+	tk.used = true
+	return true
+}
+
+// gcWSTicketsLocked 惰性清理已用/过期票据，防止 map 只增不删（调用方持锁）。
+func (s *Server) gcWSTicketsLocked() {
+	now := time.Now()
+	for k, tk := range s.wsTickets {
+		if tk.used || now.After(tk.expiresAt) {
+			delete(s.wsTickets, k)
+		}
+	}
+}
+
 // loadRevoked 从 revokedPath 加载持久化的 jti 黑名单。文件缺失或损坏时忽略
 // （损坏文件视为空黑名单），不阻断启动。
 func (pm *PasswordManager) loadRevoked() {
@@ -716,6 +785,13 @@ func (pm *PasswordManager) saveRevoked() {
 func (pm *PasswordManager) Login(password string) (string, error) {
 	if !pm.VerifyPassword(password) {
 		return "", fmt.Errorf("invalid password")
+	}
+	// 旧版无盐 MD5 哈希登录成功后自动升级为 PBKDF2 落盘（不注销会话）。
+	pm.mu.RLock()
+	md5Stored := isMD5Hash(pm.hashedPassword)
+	pm.mu.RUnlock()
+	if md5Stored {
+		pm.SetPasswordKeepUsername(password)
 	}
 	return pm.IssueToken(pm.Username())
 }
@@ -810,6 +886,18 @@ func (pm *PasswordManager) SetPassword(password string) {
 	pm.saveToConfig()
 }
 
+// SetPasswordKeepUsername 仅重新哈希密码并落盘（PBKDF2），不轮换 JWT secret、
+// 不清会话、不改用户名——用于旧版无盐 MD5 哈希登录成功后透明升级。
+func (pm *PasswordManager) SetPasswordKeepUsername(password string) {
+	if password == "" {
+		return
+	}
+	pm.mu.Lock()
+	pm.hashedPassword = hashPBKDF2(password)
+	pm.mu.Unlock()
+	pm.saveToConfig()
+}
+
 // loginRateLimiter is a per-IP token bucket used to slow down dashboard login
 // brute force. Config comes from dashboard.auth_rate_limit (enable /
 // average_interval / max_burst). Buckets idle longer than loginBucketIdleTTL
@@ -893,6 +981,81 @@ func clientIP(r *http.Request, trustProxy bool) string {
 		host = r.RemoteAddr
 	}
 	return host
+}
+
+// extractAPIKey 提取请求携带的 API key（对齐 Python _extract_raw_api_key）：
+// Authorization: ApiKey <key>、X-API-Key 头、?api_key= / ?key= query 参数。
+// 以 "Bearer " 开头的 Authorization 属于 JWT，不算 API key。
+func extractAPIKey(r *http.Request) string {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(auth, "Bearer ") {
+		return ""
+	}
+	if strings.HasPrefix(auth, "ApiKey ") {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "ApiKey "))
+	}
+	if key := strings.TrimSpace(r.URL.Query().Get("api_key")); key != "" {
+		return key
+	}
+	if key := strings.TrimSpace(r.URL.Query().Get("key")); key != "" {
+		return key
+	}
+	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
+		return key
+	}
+	return ""
+}
+
+// apiKeyAuthorized 校验 API key 并判定端点放行：key 存在、未吊销、未过期，
+// 且其 scope 满足端点规则（对齐 Python _require_api_key_scope）。systemOnly
+// 端点一律拒绝 API key（Python 语义：system 不在 ALL_OPEN_API_SCOPES）。
+func (s *Server) apiKeyAuthorized(rawKey string, rule endpointScope, method string) bool {
+	if rule.systemOnly || s.apiKeys == nil {
+		return false
+	}
+	rec := s.apiKeys.getByHash(hashAPIKey(rawKey))
+	if rec == nil || rec.RevokedAt != "" {
+		return false
+	}
+	if rec.ExpiresAt != "" {
+		if t, err := time.Parse(time.RFC3339, rec.ExpiresAt); err == nil && t.Before(time.Now()) {
+			return false
+		}
+	}
+	if !apiKeyScopeAllowed(rec.Scopes, rule, method) {
+		return false
+	}
+	// 校验通过后更新 last_used_at（对齐 Python touch_api_key）。
+	s.apiKeys.touch(rec.KeyID)
+	return true
+}
+
+// apiKeyScopeAllowed 判定 key 的 scopes 是否满足端点所需 scope（对齐 Python
+// require_scope 的 scope 判定）：含 "*"、含所需 scope，或 OPEN_API_SCOPE_INCLUDES
+// 隐式包含（config 包含 bot/provider）。required 为空时满足任一默认 OPEN API
+// scope 即可（普通端点默认放行）。
+func apiKeyScopeAllowed(scopes []string, rule endpointScope, method string) bool {
+	required := rule.readScope
+	if rule.writeScope != "" && method != http.MethodGet && method != http.MethodHead {
+		required = rule.writeScope
+	}
+	if required == "" {
+		for _, sc := range scopes {
+			if sc == "*" || containsScope(defaultOpenAPIScopes, sc) {
+				return true
+			}
+		}
+		return false
+	}
+	if containsScope(scopes, "*") || containsScope(scopes, required) {
+		return true
+	}
+	for _, sc := range scopes {
+		if containsScope(openAPIScopeIncludes[sc], required) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------

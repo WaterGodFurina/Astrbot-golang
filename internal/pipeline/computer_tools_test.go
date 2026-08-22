@@ -186,7 +186,7 @@ func registerTestShellSession(t *testing.T, id, owner string, stdin io.WriteClos
 	shellSessionsMu.Lock()
 	shellSessions[id] = &shellSession{
 		ID:    id,
-		Owner: owner,
+		Owner: owner + "\x00" + owner,
 		Stdin: stdin,
 	}
 	shellSessionsMu.Unlock()
@@ -204,7 +204,7 @@ func TestShellSessionWriteOwnershipAndData(t *testing.T) {
 	pr, pw := io.Pipe()
 	registerTestShellSession(t, "write1", "alice", pw)
 
-	if out := shellSessionWrite("write1", "hello", "bob"); !strings.Contains(out, "does not belong") {
+	if out := shellSessionWrite("write1", "hello", "bob", "bob", false); !strings.Contains(out, "does not belong") {
 		t.Errorf("write from wrong owner not blocked: %q", out)
 	}
 	got := make(chan string, 1)
@@ -217,13 +217,13 @@ func TestShellSessionWriteOwnershipAndData(t *testing.T) {
 		}
 		got <- string(buf[:n])
 	}()
-	if out := shellSessionWrite("write1", "hello", "alice"); !strings.Contains(out, "Written to session") {
+	if out := shellSessionWrite("write1", "hello", "alice", "alice", false); !strings.Contains(out, "Written to session") {
 		t.Errorf("write from owner failed: %q", out)
 	}
 	select {
 	case data := <-got:
-		if data != "hello\n" {
-			t.Errorf("session received %q, want %q", data, "hello\n")
+		if data != "hello" {
+			t.Errorf("session received %q, want %q", data, "hello")
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out reading from stdin pipe")
@@ -233,20 +233,20 @@ func TestShellSessionWriteOwnershipAndData(t *testing.T) {
 
 func TestShellSessionPollOwnership(t *testing.T) {
 	registerTestShellSession(t, "poll1", "alice", nil)
-	if out := shellSessionPoll("poll1", "bob"); !strings.Contains(out, "does not belong") {
+	if out := shellSessionPoll("poll1", "bob", "bob"); !strings.Contains(out, "does not belong") {
 		t.Errorf("poll from wrong owner not blocked: %q", out)
 	}
-	if out := shellSessionPoll("poll1", "alice"); strings.Contains(out, "does not belong") {
+	if out := shellSessionPoll("poll1", "alice", "alice"); strings.Contains(out, "does not belong") {
 		t.Errorf("poll from owner incorrectly blocked: %q", out)
 	}
 }
 
 func TestShellSessionSignalOwnership(t *testing.T) {
 	registerTestShellSession(t, "sig1", "alice", nil)
-	if out := shellSessionSignal("sig1", true, "bob"); !strings.Contains(out, "does not belong") {
+	if out := shellSessionSignal("sig1", true, "bob", "bob"); !strings.Contains(out, "does not belong") {
 		t.Errorf("signal from wrong owner not blocked: %q", out)
 	}
-	if out := shellSessionSignal("sig1", true, "alice"); !strings.Contains(out, "not running") {
+	if out := shellSessionSignal("sig1", true, "alice", "alice"); !strings.Contains(out, "not running") {
 		t.Errorf("signal from owner failed: %q", out)
 	}
 }
@@ -254,7 +254,7 @@ func TestShellSessionSignalOwnership(t *testing.T) {
 func TestBackgroundShellSessionStdinWrite(t *testing.T) {
 	inTempDir(t)
 	umo := "bg:test"
-	out := executeLocalShell(umo, "cat", true, 0)
+	out := executeLocalShell(umo, umo, "cat", true, 0)
 	prefix := "session id: "
 	idx := strings.Index(out, prefix)
 	if idx < 0 {
@@ -271,10 +271,10 @@ func TestBackgroundShellSessionStdinWrite(t *testing.T) {
 	if s == nil || s.Stdin == nil {
 		t.Fatalf("session %s not registered with a stdin pipe", id)
 	}
-	if r := shellSessionWrite(id, "x", "other:user"); !strings.Contains(r, "does not belong") {
+	if r := shellSessionWrite(id, "x", "other:user", "other:user", false); !strings.Contains(r, "does not belong") {
 		t.Fatalf("write from wrong owner not blocked: %q", r)
 	}
-	if r := shellSessionWrite(id, "hello world", umo); !strings.Contains(r, "Written to session") {
+	if r := shellSessionWrite(id, "hello world", umo, umo, false); !strings.Contains(r, "Written to session") {
 		t.Fatalf("write to background session failed: %q", r)
 	}
 
@@ -282,12 +282,12 @@ func TestBackgroundShellSessionStdinWrite(t *testing.T) {
 	ok := false
 	for time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
-		if strings.Contains(shellSessionPoll(id, umo), "hello world") {
+		if strings.Contains(shellSessionPoll(id, umo, umo), "hello world") {
 			ok = true
 			break
 		}
 	}
-	shellSessionSignal(id, true, umo)
+	shellSessionSignal(id, true, umo, umo)
 	if !ok {
 		t.Fatal("background session output did not contain written data")
 	}

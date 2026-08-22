@@ -162,6 +162,12 @@ func (a *Adapter) SetEventBus(bus platform.EventBus) {
 
 // Start starts the HTTP server for reverse WebSocket connections.
 func (a *Adapter) Start(ctx context.Context) error {
+	// ⚠️ 不要把 Host 强制改成 127.0.0.1（曾作为"secure-by-default"引入后
+	// 已撤销）：0.0.0.0 监听是 Docker 桥接与跨服务器 OneBot 客户端（反向
+	// WS）的硬需求，缺 token 只告警——对齐 Python 原版 run() 的行为。
+	if a.Token == "" {
+		logger.I18nWarn("aiocqhttp: 未配置 ws_reverse_token，事件入口（GET /ws）未做访问鉴权。若本端口可被公网访问，请配置访问令牌")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleHTTP)
 	mux.HandleFunc("/ws", a.handleWebSocket)
@@ -577,6 +583,9 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		logger.I18nInfo("反向 WebSocket 客户端已断开")
 	}()
 
+	// 限制单连接消息体大小，防止异常对端放大内存占用。
+	conn.SetReadLimit(1 << 20)
+
 	// Heartbeat: respond to ping, and respect the peer's close/ping timeouts.
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	conn.SetPongHandler(func(string) error {
@@ -613,7 +622,11 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if _, hasPost := msg["post_type"]; hasPost {
-			events <- msg
+			select {
+			case events <- msg:
+			default:
+				logger.I18nWarn("aiocqhttp: 事件处理队列已满，丢弃一条事件（echo 通道不受影响）")
+			}
 			continue
 		}
 		if echo, hasEcho := msg["echo"].(string); hasEcho {
@@ -1180,9 +1193,20 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 				"data": imgData,
 			})
 		case *message.Record:
+			ref := c.URL
+			switch {
+			case c.Base64 != "":
+				ref = "base64://" + c.Base64
+			case c.URL != "":
+				ref = c.URL
+			case c.Path != "":
+				ref = "file://" + c.Path
+			case c.File != "":
+				ref = c.File
+			}
 			segments = append(segments, map[string]interface{}{
 				"type": "record",
-				"data": map[string]interface{}{"url": c.URL, "file": c.URL},
+				"data": map[string]interface{}{"file": ref},
 			})
 		case *message.Face:
 			segments = append(segments, map[string]interface{}{
@@ -1190,14 +1214,32 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 				"data": map[string]interface{}{"id": c.ID},
 			})
 		case *message.File:
+			ref := c.URL
+			switch {
+			case c.URL != "":
+				ref = c.URL
+			case c.Path != "":
+				ref = "file://" + c.Path
+			case c.FileID != "":
+				ref = c.FileID
+			}
 			segments = append(segments, map[string]interface{}{
 				"type": "file",
-				"data": map[string]interface{}{"url": c.URL, "name": c.Name},
+				"data": map[string]interface{}{"file": ref, "name": c.Name},
 			})
 		case *message.Video:
+			ref := c.URL
+			switch {
+			case c.URL != "":
+				ref = c.URL
+			case c.Path != "":
+				ref = "file://" + c.Path
+			case c.FileID != "":
+				ref = c.FileID
+			}
 			segments = append(segments, map[string]interface{}{
 				"type": "video",
-				"data": map[string]interface{}{"url": c.URL, "file": c.URL},
+				"data": map[string]interface{}{"file": ref},
 			})
 		case *message.Json:
 			segments = append(segments, map[string]interface{}{

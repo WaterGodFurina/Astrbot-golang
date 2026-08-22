@@ -12,6 +12,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha1" // #nosec G505 -- sha1 为企业微信智能机器人签名（协议要求），非密码学哈希用途
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -198,7 +199,7 @@ func (c *WXBizJsonMsgCrypt) VerifyURL(msgSignature, timestamp, nonce, echostr st
 	if ret != MsgCryptOK {
 		return ret, ""
 	}
-	if signature != msgSignature {
+	if subtle.ConstantTimeCompare([]byte(signature), []byte(msgSignature)) != 1 {
 		return MsgCryptValidateSignatureError, ""
 	}
 	return c.decrypt(echostr)
@@ -232,7 +233,7 @@ func (c *WXBizJsonMsgCrypt) DecryptMsg(postData []byte, msgSignature, timestamp,
 	if ret != MsgCryptOK {
 		return ret, ""
 	}
-	if signature != msgSignature {
+	if subtle.ConstantTimeCompare([]byte(signature), []byte(msgSignature)) != 1 {
 		return MsgCryptValidateSignatureError, ""
 	}
 	return c.decrypt(encrypt)

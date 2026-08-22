@@ -49,6 +49,16 @@ type Adapter struct {
 	seenPostIDs   map[string]float64
 	seenPostQueue [][2]interface{} // [post_id, seen_at]
 	dedupTTL      float64
+
+	// msgCh 待处理的消息队列（WS 读循环仅入队，由 msgLoop 串行处理，
+	// 避免附件下载等耗时操作阻塞读循环导致连接超时）。
+	msgCh chan *pendingWsMessage
+}
+
+// pendingWsMessage 待处理的消息载荷（post 数据 + 原始 data）。
+type pendingWsMessage struct {
+	post map[string]interface{}
+	data map[string]interface{}
 }
 
 // New 创建 Mattermost 适配器。
@@ -83,6 +93,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		stopCh:         make(chan struct{}),
 		seenPostIDs:    make(map[string]float64),
 		dedupTTL:       300.0,
+		msgCh:          make(chan *pendingWsMessage, 64),
 	}
 }
 
@@ -125,6 +136,7 @@ func (a *Adapter) Start(ctx context.Context) error {
 	a.mu.Unlock()
 
 	go a.wsLoop(ctx)
+	go a.msgLoop(ctx)
 	return nil
 }
 
@@ -302,11 +314,32 @@ func (a *Adapter) handleWsEvent(payload map[string]interface{}) {
 		return
 	}
 
-	abm := a.convertMessage(post, data)
-	if abm == nil {
-		return
+	// 事件仅入队，由 msgLoop 串行处理（附件下载在独立 goroutine 中完成）
+	select {
+	case a.msgCh <- &pendingWsMessage{post: post, data: data}:
+	default:
+		logger.I18nWarn("Mattermost 消息处理队列已满, 丢弃一条消息")
 	}
-	a.publishMessage(abm)
+}
+
+// msgLoop 串行处理入队的消息事件（对齐 dingtalk 的 msgCh 模式）：
+// 附件下载等耗时操作不阻塞 WS 读循环，单条处理带 60s 超时。
+func (a *Adapter) msgLoop(ctx context.Context) {
+	for {
+		select {
+		case <-a.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		case pending := <-a.msgCh:
+			procCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			abm := a.convertMessage(procCtx, pending.post, pending.data)
+			cancel()
+			if abm != nil {
+				a.publishMessage(abm)
+			}
+		}
+	}
 }
 
 // isDuplicatePost 检查帖子 ID 是否重复（对应 _is_duplicate_post）。
@@ -338,7 +371,8 @@ func (a *Adapter) pruneSeenPosts(now float64) {
 }
 
 // convertMessage 将 Mattermost post 数据转换为 AstrBotMessage（对应 convert_message）。
-func (a *Adapter) convertMessage(post, data map[string]interface{}) *platform.AstrBotMessage {
+// ctx 用于限制附件下载等耗时操作的总时长。
+func (a *Adapter) convertMessage(ctx context.Context, post, data map[string]interface{}) *platform.AstrBotMessage {
 	channelID := stringVal(post["channel_id"])
 	if channelID == "" {
 		return nil
@@ -383,7 +417,7 @@ func (a *Adapter) convertMessage(post, data map[string]interface{}) *platform.As
 
 	var tempPaths []string
 	if len(fileIDs) > 0 {
-		attachmentComponents, paths := a.client.ParsePostAttachments(context.Background(), fileIDs)
+		attachmentComponents, paths := a.client.ParsePostAttachments(ctx, fileIDs)
 		abm.Message = append(abm.Message, attachmentComponents...)
 		tempPaths = paths
 	}

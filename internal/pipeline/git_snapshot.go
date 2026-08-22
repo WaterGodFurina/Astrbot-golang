@@ -5,7 +5,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
+
+// wsGitMu 按工作区串行化 git 操作：并发 git add 会争抢 index.lock 互相
+// 阻塞或失败。条目（dir → *sync.Mutex）常驻，数量 = 使用过快照的工作区数。
+var wsGitMu sync.Map
+
+// wsGitLock returns the per-workspace mutex for dir.
+func wsGitLock(dir string) *sync.Mutex {
+	mu, _ := wsGitMu.LoadOrStore(dir, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
 
 // gitTreeHash snapshots the directory's tracked content and returns a git tree
 // hash. The repo is initialized on first use. Returns "" on any failure.
@@ -13,8 +24,13 @@ func gitTreeHash(dir string) string {
 	if dir == "" {
 		return ""
 	}
+	mu := wsGitLock(dir)
+	mu.Lock()
+	defer mu.Unlock()
 	gitInitIfNeeded(dir)
-	_ = gitRun(dir, "add", "-A")
+	if err := gitRun(dir, "add", "-A"); err != nil {
+		logger.I18nWarn("工作区 %s 快照 git add 失败: %v", dir, err)
+	}
 	out, err := gitRunOut(dir, "write-tree")
 	if err != nil || strings.TrimSpace(out) == "" {
 		return ""
@@ -30,7 +46,12 @@ func gitDiffTree(dir, oldHash string) string {
 	if dir == "" || oldHash == "" {
 		return ""
 	}
-	_ = gitRun(dir, "add", "-A")
+	mu := wsGitLock(dir)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := gitRun(dir, "add", "-A"); err != nil {
+		logger.I18nWarn("工作区 %s 快照 git add 失败: %v", dir, err)
+	}
 	out, err := gitRunOut(dir, "diff", oldHash)
 	if err != nil {
 		return ""
@@ -82,10 +103,12 @@ func snapshotFileMutation(ws, before, toolName, result string) string {
 	if patch == "" {
 		return result
 	}
-	truncated := patch
 	const maxPatch = 800
-	if len(truncated) > maxPatch {
-		truncated = truncated[:maxPatch] + "\n...(截断)"
+	// 按 rune 截断（truncateRunes），避免字节切分切断 UTF-8 多字节字符
+	// 产生非法 UTF-8（中文 diff 超长时必然触发）。
+	truncated := truncateRunes(patch, maxPatch)
+	if len(patch) > len(truncated) {
+		truncated += "\n...(截断)"
 	}
 	logger.I18nInfo("工具 %s 修改了工作区文件（快照变更）:\n%s", toolName, truncated)
 	return result + "\n\n[工作区快照] 工具 " + toolName + " 修改了文件:\n" + truncated

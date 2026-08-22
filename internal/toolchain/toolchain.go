@@ -16,6 +16,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -26,12 +27,20 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
 var logger = log.GetDefault().WithComponent("Toolchain")
+
+// provisionMu serializes concurrent provisioning: two goroutines calling
+// Ensure at the same time (e.g. dashboard plugin install + startup auto
+// compile) must not download/extract the same archive concurrently — that
+// truncates and interleaves files, and a half-extracted bundle would then be
+// mistaken for a complete toolchain by the GoBin fast path.
+var provisionMu sync.Mutex
 
 // DefaultGoVersion is the Go release bundled when none is pinned via
 // ASTRBOT_GO_VERSION.
@@ -77,7 +86,10 @@ func (tc *Toolchain) GoBin() (string, error) {
 	}
 
 	if tc.BundledRoot() != "" {
-		if bin := filepath.Join(tc.BundledRoot(), "bin", exe("go")); tc.isExecutable(bin) {
+		// 归档解压产物保留顶层 go/ 目录（GOROOT = root/go），go 二进制在
+		// root/go/bin/go(.exe)——之前漏拼 go/ 子目录导致永远找不到已下载
+		// 的 bundled 工具链（每次重启报 no toolchain、每次插件安装重下）。
+		if bin := filepath.Join(tc.BundledRoot(), "go", "bin", exe("go")); tc.isExecutable(bin) {
 			logger.Info("Using bundled Go toolchain: %s", bin)
 			return bin, nil
 		}
@@ -102,6 +114,26 @@ func (tc *Toolchain) Ensure() (string, error) {
 func (tc *Toolchain) EnsureWithProgress(progress ProgressFunc) (string, error) {
 	if bin, err := tc.GoBin(); err == nil {
 		return bin, nil
+	}
+	provisionMu.Lock()
+	defer provisionMu.Unlock()
+	// Double check: while waiting for the lock another goroutine may have
+	// completed provisioning.
+	if bin, err := tc.GoBin(); err == nil {
+		return bin, nil
+	}
+	// 残缺工具链自愈：fast path 只 stat 文件存在，解压被中断/被杀软破坏的
+	// go 二进制仍会命中。这里对 bundled go 做一次 `go version` 快速探测
+	//（~100ms），跑不动则删除重装，避免后续 go mod download / go list 以
+	// 残缺工具链失败、报"SDK 无法解析"。
+	if root := tc.BundledRoot(); root != "" {
+		bin := filepath.Join(root, "bin", exe("go"))
+		if tc.isExecutable(bin) && !goBinaryUsable(bin) {
+			logger.I18nWarn("检测到 bundled Go 工具链不可用（go version 失败），自动重新下载…")
+			if err := os.RemoveAll(root); err != nil {
+				logger.I18nWarn("清理损坏的 Go 工具链失败: %v", err)
+			}
+		}
 	}
 	return tc.downloadAndExtract(progress)
 }
@@ -172,6 +204,16 @@ func CGOEnabled() bool {
 	return false
 }
 
+// goBinaryUsable 快速探测 go 二进制能否正常运行（`go version`，10s 超时）。
+// 残缺/被破坏的工具链会在此失败，供 EnsureWithProgress 触发自动重装。
+func goBinaryUsable(bin string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "version") // #nosec G204 -- 固定参数，无注入面
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
 // downloadAndExtract provisions the official Go distribution under BaseDir.
 func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	if !supportsBundledGo() {
@@ -187,6 +229,9 @@ func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	dest := filepath.Join(base, archive)
 	url := downloadURL(archive)
 
+	// 上次解压中断留下的 staging 先清理，避免半成品目录残留。
+	_ = os.RemoveAll(base + ".staging")
+
 	logger.Info("Downloading Go toolchain %s from %s", archive, url)
 	if err := downloadFile(url, dest, progress); err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
@@ -200,15 +245,32 @@ func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	}
 
 	logger.Info("Extracting Go toolchain %s", archive)
-	if err := extractArchive(dest, base); err != nil {
+	// 先解压到 staging 目录并校验 go 可执行，再原子替换正式目录：中途失败
+	// 不会留下残缺 bundle（残缺的 <base>/go/bin/go 会让后续所有 Ensure 在
+	// GoBin 处直接命中并返回，插件编译持续失败）。
+	staging := base + ".staging"
+	if err := extractArchive(dest, staging, progress); err != nil {
+		_ = os.RemoveAll(staging)
+		_ = os.Remove(dest)
 		return "", fmt.Errorf("extract %s: %w", archive, err)
 	}
 	_ = os.Remove(dest)
 
-	bin := filepath.Join(base, "go", "bin", exe("go"))
-	if !tc.isExecutable(bin) {
-		return "", fmt.Errorf("extracted toolchain missing go binary: %s", bin)
+	if !tc.isExecutable(filepath.Join(staging, "go", "bin", exe("go"))) {
+		_ = os.RemoveAll(staging)
+		return "", fmt.Errorf("extracted toolchain missing go binary: %s", filepath.Join(staging, "go", "bin", exe("go")))
 	}
+	if err := os.RemoveAll(filepath.Join(base, "go")); err != nil {
+		_ = os.RemoveAll(staging)
+		return "", fmt.Errorf("remove old toolchain: %w", err)
+	}
+	if err := os.Rename(filepath.Join(staging, "go"), filepath.Join(base, "go")); err != nil {
+		_ = os.RemoveAll(staging)
+		return "", fmt.Errorf("install toolchain: %w", err)
+	}
+	_ = os.RemoveAll(staging)
+
+	bin := filepath.Join(base, "go", "bin", exe("go"))
 	return bin, nil
 }
 
@@ -238,7 +300,7 @@ func (tc *Toolchain) verifyChecksum(dest, archive string) error {
 		return nil
 	}
 	sumURL := checksumURL(archive)
-	resp, err := http.Get(sumURL)
+	resp, err := dlClient.Get(sumURL)
 	if err != nil {
 		return fmt.Errorf("fetch checksum: %w", err)
 	}
@@ -282,9 +344,10 @@ func (tc *Toolchain) isExecutable(p string) bool {
 // SetGoMirror 设置）。非空时优先于环境变量与默认源。
 var goMirrorOverride string
 
-// SetGoMirror overrides the mirror base URL used by downloadURL / checksumURL
-// (called by the host with the user's chosen mirror before a plugin-install
-// download; empty restores env/default resolution).
+// SetGoMirror overrides the mirror base URL used by downloadURL (checksum
+// verification is always anchored to the official source, see checksumURL).
+// Called by the host with the user's chosen mirror before a plugin-install
+// download; empty restores env/default resolution.
 func SetGoMirror(url string) {
 	goMirrorOverride = strings.TrimSpace(url)
 }
@@ -306,11 +369,13 @@ func downloadURL(archive string) string {
 	return strings.TrimRight(mirrorBase("https://go.dev/dl"), "/") + "/" + archive
 }
 
-// checksumURL builds the URL of the sha256 file. go.dev/dl only serves the
-// archives (redirecting to dl.google.com); the .sha256 files live on
-// dl.google.com directly.
+// checksumURL builds the URL of the sha256 file. The checksum anchor is pinned
+// to the official dl.google.com source even when a mirror is configured:
+// otherwise the mirror could serve both the archive and a matching .sha256,
+// bypassing the supply-chain gate entirely. Downloads stay mirrorable; the
+// verification anchor never moves.
 func checksumURL(archive string) string {
-	return strings.TrimRight(mirrorBase("https://dl.google.com/go"), "/") + "/" + archive + ".sha256"
+	return "https://dl.google.com/go/" + archive + ".sha256"
 }
 
 // archiveName returns the official distribution archive file name for the
@@ -368,17 +433,25 @@ func UserStateDir() string {
 	return "."
 }
 
+// dlClient 是工具链下载/校验专用的 HTTP 客户端（30 分钟超时），防止镜像
+// 源挂起时下载与 checksum 请求无限期阻塞。
+var dlClient = &http.Client{Timeout: 30 * time.Minute}
+
 // downloadFile streams a URL to dest with a progress timeout, logging and
 // reporting download progress every ~10%.
 func downloadFile(url, dest string, progress ProgressFunc) error {
-	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Get(url)
+	resp, err := dlClient.Get(url)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	// 幂等：已下载且大小与远端一致时跳过（避免解压期间重复触发下载 83MB）。
+	if info, err := os.Stat(dest); err == nil && !info.IsDir() && resp.ContentLength > 0 && info.Size() == resp.ContentLength {
+		logger.Info("Go toolchain archive already downloaded: %s", dest)
+		return nil
 	}
 	f, err := os.Create(dest) // #nosec G304 -- dest is the private BaseDir archive path constructed from tc.Version
 	if err != nil {
@@ -437,15 +510,30 @@ func humanSize(n int64) string {
 }
 
 // extractArchive unpacks a Go official archive (tar.gz or zip) into dir,
-// preserving the leading "go/" component so GOROOT becomes dir/go.
-func extractArchive(src, dir string) error {
+// preserving the leading "go/" component so GOROOT becomes dir/go. progress
+// reports extracted-file count / total count (percentages match download).
+func extractArchive(src, dir string, progress ProgressFunc) error {
 	if strings.HasSuffix(src, ".zip") {
-		return extractZip(src, dir)
+		return extractZip(src, dir, progress)
 	}
-	return extractTarGz(src, dir)
+	return extractTarGz(src, dir, progress)
 }
 
-func extractTarGz(src, dir string) error {
+// extractProgress 按已解压文件数推进进度回调并每 10% 打日志，让解压阶段
+// （Windows 杀软实时扫描下可能较慢）有可见反馈，避免误判卡死。
+func extractProgress(done, total int64, progress ProgressFunc) {
+	if progress != nil {
+		progress(done, total)
+	}
+	if total > 0 {
+		pct := int(done * 100 / total)
+		if pct%10 == 0 && pct >= 0 && pct <= 100 {
+			logger.Debug("Extracting Go toolchain: %d%% (%d / %d files)", pct, done, total)
+		}
+	}
+}
+
+func extractTarGz(src, dir string, progress ProgressFunc) error {
 	f, err := os.Open(src) // #nosec G304 -- src is the verified archive under the private BaseDir
 	if err != nil {
 		return err
@@ -458,6 +546,17 @@ func extractTarGz(src, dir string) error {
 	defer gz.Close()
 
 	tr := tar.NewReader(gz)
+	total, done := int64(0), int64(0)
+	for {
+		if _, err := tr.Next(); err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+		total++
+	}
+	gz.Reset(f)
+	tr = tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -466,6 +565,8 @@ func extractTarGz(src, dir string) error {
 		if err != nil {
 			return err
 		}
+		done++
+		extractProgress(done, total, progress)
 		target, err := safeJoin(dir, hdr.Name)
 		if err != nil {
 			return err
@@ -494,13 +595,17 @@ func extractTarGz(src, dir string) error {
 	}
 }
 
-func extractZip(src, dir string) error {
+func extractZip(src, dir string, progress ProgressFunc) error {
 	zr, err := zip.OpenReader(src)
 	if err != nil {
 		return err
 	}
 	defer zr.Close()
+	total := int64(len(zr.File))
+	var done int64
 	for _, zf := range zr.File {
+		done++
+		extractProgress(done, total, progress)
 		target, err := safeJoin(dir, zf.Name)
 		if err != nil {
 			return err

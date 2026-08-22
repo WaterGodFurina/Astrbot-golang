@@ -91,9 +91,17 @@ func fetchMediaData(raw string) ([]byte, string, error) {
 	}
 	path := strings.TrimPrefix(trimmed, "file://")
 	if info, err := os.Stat(path); err == nil && !info.IsDir() {
-		data, err := os.ReadFile(path)
+		f, err := os.Open(path)
 		if err != nil {
 			return nil, "", err
+		}
+		defer f.Close()
+		data, err := io.ReadAll(io.LimitReader(f, maxImageBytes+1))
+		if err != nil {
+			return nil, "", err
+		}
+		if len(data) > maxImageBytes {
+			return nil, "", fmt.Errorf("media exceeds %d bytes", maxImageBytes)
 		}
 		return data, mediaTypeForExt(path), nil
 	}
@@ -143,6 +151,9 @@ func decodeDataURL(raw string) ([]byte, string, error) {
 		if strings.Contains(part, "/") {
 			mediaType = part
 		}
+	}
+	if len(payload) > base64.StdEncoding.EncodedLen(maxImageBytes) {
+		return nil, "", fmt.Errorf("media exceeds %d bytes", maxImageBytes)
 	}
 	data, err := base64.StdEncoding.DecodeString(payload)
 	if err != nil {

@@ -1,5 +1,6 @@
 <script setup>
 import { logApi } from '@/api/v1';
+import { getToken } from '@/utils/token';
 import { EventSourcePolyfill } from 'event-source-polyfill';
 </script>
 
@@ -137,7 +138,7 @@ export default {
         this.eventSource = null;
       }
 
-      const token = localStorage.getItem('token');
+      const token = getToken();
 
       this.eventSource = new EventSourcePolyfill(logApi.liveUrl(), {
         headers: {

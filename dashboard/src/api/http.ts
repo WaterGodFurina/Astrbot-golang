@@ -3,6 +3,7 @@ import axios, {
   type AxiosInstance,
   type InternalAxiosRequestConfig,
 } from 'axios';
+import { getToken, removeToken } from '@/utils/token';
 
 const AUTH_HEADER = 'Authorization';
 const LOCALE_HEADER = 'Accept-Language';
@@ -12,10 +13,6 @@ let originalFetch: typeof window.fetch | null = null;
 
 export const httpClient = axios;
 export const apiV1Client = axios.create({ baseURL: '/api/v1' });
-
-function getToken(): string | null {
-  return localStorage.getItem('token');
-}
 
 function getLocale(): string | null {
   return localStorage.getItem('astrbot-locale');
@@ -33,13 +30,24 @@ function setAxiosHeader(
   headers[key] = value;
 }
 
+// 仅对同源（或相对路径）请求附加 Authorization，避免把 Bearer Token
+// 泄露给第三方域名（如插件市场可控的 readme_url）。
+function isSameOriginUrl(url: string): boolean {
+  return (
+    !/^([a-z][a-z\d+\-.]*:)?\/\//i.test(url) ||
+    new URL(url, window.location.origin).origin === window.location.origin
+  );
+}
+
 function attachAxiosHeaders(config: InternalAxiosRequestConfig) {
-  const token = getToken();
+  const sameOrigin = isSameOriginUrl(config.url || '');
+
+  const token = sameOrigin ? getToken() : null;
   if (token) {
     setAxiosHeader(config.headers, AUTH_HEADER, `Bearer ${token}`);
   }
 
-  const locale = getLocale();
+  const locale = sameOrigin ? getLocale() : null;
   if (locale) {
     setAxiosHeader(config.headers, LOCALE_HEADER, locale);
   }
@@ -83,13 +91,10 @@ function normalizeAxiosError(error: AxiosError) {
       );
 
     if (requestPath.startsWith('/api/') && !isAuthChallenge) {
-      [
-        'user',
-        'token',
-        'change_pwd_hint',
-        'md5_pwd_hint',
-        'password_upgrade_required',
-      ].forEach((key) => localStorage.removeItem(key));
+      removeToken();
+      ['user', 'change_pwd_hint', 'md5_pwd_hint', 'password_upgrade_required'].forEach(
+        (key) => localStorage.removeItem(key),
+      );
 
       if (!window.location.hash.startsWith('#/auth/login')) {
         window.location.hash = '/auth/login';
@@ -111,12 +116,27 @@ function installAxiosInterceptors(instance: AxiosInstance) {
   instance.interceptors.response.use((response) => response, normalizeAxiosError);
 }
 
+function isSameOriginRequest(input: RequestInfo | URL): boolean {
+  try {
+    const url =
+      typeof input === 'string'
+        ? new URL(input, window.location.origin)
+        : input instanceof URL
+          ? input
+          : new URL(input.url, window.location.origin);
+    return url.origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
 export function fetchWithAuth(input: RequestInfo | URL, init?: RequestInit) {
   const fetchImpl = originalFetch ?? window.fetch.bind(window);
   const token = getToken();
   const locale = getLocale();
 
-  if (!token && !locale) {
+  // 只对同源请求附加凭证，第三方域名/非 HTTP 目标一律原样转发。
+  if ((!token && !locale) || !isSameOriginRequest(input)) {
     return fetchImpl(input, init);
   }
 

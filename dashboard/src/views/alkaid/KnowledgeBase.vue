@@ -435,6 +435,7 @@
 import { pluginApi, pluginExtensionApi, providerApi } from '@/api/v1';
 import ConsoleDisplayer from '@/components/shared/ConsoleDisplayer.vue';
 import { useModuleI18n } from '@/i18n/composables';
+import { useCommonStore } from '@/stores/common';
 import { normalizeTextInput } from '@/utils/inputValue';
 
 export default {
@@ -444,7 +445,8 @@ export default {
     },
     setup() {
         const { tm } = useModuleI18n('features/alkaid/knowledge-base');
-        return { tm };
+        const commonStore = useCommonStore();
+        return { tm, commonStore };
     },
     data() {
         return {
@@ -587,9 +589,14 @@ export default {
         },
         getSelectedGitHubProxy() {
             if (typeof window === "undefined" || !window.localStorage) return "";
-            return localStorage.getItem("githubProxyRadioValue") === "1"
-                ? localStorage.getItem("selectedGitHubProxy") || ""
-                : "";
+            // 弹窗显式选择优先；从未碰过弹窗 → 回退设置里的 github_proxy。
+            if (localStorage.getItem("githubProxyRadioValue") === "1") {
+                return localStorage.getItem("selectedGitHubProxy") || "";
+            }
+            if (localStorage.getItem("githubProxyRadioValue") === "0") {
+                return "";
+            }
+            return this.commonStore?.githubProxyConfig || "";
         },
         llmModelProps(providerConfig) {
             return {
@@ -1014,7 +1021,7 @@ export default {
         },
 
         openUrl(url) {
-            window.open(url, '_blank');
+            window.open(url, '_blank', 'noopener,noreferrer');
         },
 
         // URL导入相关方法

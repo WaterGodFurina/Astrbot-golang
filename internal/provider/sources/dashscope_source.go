@@ -14,9 +14,10 @@ import (
 // DashScopeSource is an Aliyun DashScope (Qwen) chat provider.
 type DashScopeSource struct {
 	*provider.BaseProvider
-	apiBase string
-	apiKey  string
-	client  *http.Client
+	apiBase      string
+	apiKey       string
+	client       *http.Client
+	streamClient *http.Client
 }
 
 // NewDashScopeSource creates a DashScope provider.
@@ -27,6 +28,7 @@ func NewDashScopeSource(config, settings map[string]interface{}) *DashScopeSourc
 		client: &http.Client{
 			Timeout: 120 * time.Second,
 		},
+		streamClient: newStreamClient(),
 	}
 	s.apiBase, _ = config["api_base"].(string)
 	if s.apiBase == "" {
@@ -62,9 +64,9 @@ func (s *DashScopeSource) TextChatStream(ctx context.Context, req *provider.Prov
 		apiBase:      s.apiBase,
 		apiKey:       s.apiKey,
 		client:       s.client,
-		// DashScope does not create a dedicated stream client; reuse the
-		// (timeout-bounded) request client so streaming cannot hang forever.
-		streamClient: s.client,
+		// DashScope 使用独立的流式客户端(10 分钟整体超时), 避免长流式
+		// 回复被普通请求的 120s 超时掐断。
+		streamClient: s.streamClient,
 	}
 	return openai.TextChatStream(ctx, req)
 }

@@ -208,6 +208,9 @@ func buildSendComponent(m map[string]interface{}, umo string) (message.Component
 		if p == "" {
 			p = path
 		}
+		if p == "" && url == "" {
+			return nil, fmt.Errorf("record 组件需要 path 或 url 之一")
+		}
 		return &message.Record{Path: p, File: p, URL: url, Text: text}, nil
 	case "video":
 		if err := checkURL(); err != nil {
@@ -220,6 +223,9 @@ func buildSendComponent(m map[string]interface{}, umo string) (message.Component
 		if p == "" {
 			p = path
 		}
+		if p == "" && url == "" {
+			return nil, fmt.Errorf("video 组件需要 path 或 url 之一")
+		}
 		return &message.Video{Path: p, URL: url}, nil
 	case "file":
 		if err := checkURL(); err != nil {
@@ -231,6 +237,9 @@ func buildSendComponent(m map[string]interface{}, umo string) (message.Component
 		}
 		if p == "" {
 			p = path
+		}
+		if p == "" && url == "" {
+			return nil, fmt.Errorf("file 组件需要 path 或 url 之一")
 		}
 		name, _ := m["name"].(string)
 		if name == "" {

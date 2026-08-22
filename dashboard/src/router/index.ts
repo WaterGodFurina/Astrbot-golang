@@ -33,8 +33,6 @@ router.beforeEach(async (to, from, next) => {
     loadingStore.start();
   }
 
-  const publicPages = ['/auth/login', '/auth/setup'];
-  const authRequired = !publicPages.includes(to.path);
   const auth: AuthStore = useAuthStore();
 
   // 如果用户已登录且试图访问登录页面，则重定向到首页
@@ -42,15 +40,17 @@ router.beforeEach(async (to, from, next) => {
     return next('/welcome');
   }
 
-  if (to.matched.some((record) => record.meta.requiresAuth)) {
-    if (authRequired && !auth.has_token()) {
-      auth.returnUrl = to.fullPath;
-      return next('/auth/login');
-    }
-    return next();
-  } else {
-    next();
+  // 统一以 meta.requiresAuth 为唯一判断来源（未显式关闭鉴权的路由默认
+  // 要求登录），避免漏配 requiresAuth 的路由被放行。前端守卫只是 UX 层，
+  // token 有效性由后端 401 拦截兜底。
+  const requiresAuth = to.matched.every(
+    (record) => record.meta.requiresAuth !== false,
+  );
+  if (requiresAuth && !auth.has_token()) {
+    auth.returnUrl = to.fullPath;
+    return next('/auth/login');
   }
+  return next();
 });
 
 router.afterEach(() => {

@@ -97,6 +97,7 @@
     "globalLabel": "Global idle auto-sleep",
     "globalDesc": "When enabled, plugin processes idle for over 10 minutes are unloaded (memory reclaimed) and lazily reloaded on next use",
     "columnPlugin": "Plugin",
+    "columnLanguage": "Plugin Language",
     "columnAllow": "Allow sleep",
     "noPlugins": "No enabled plugins",
     "globalSaved": "Global sleep policy updated",

@@ -21,6 +21,11 @@ import (
 // plugin links against. Builds `replace` it to the local copy.
 const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 
+// sdkModuleVersion 是宿主内置的插件 SDK 版本（与宿主 go.mod 的 require 一致，
+// 发版时同步 bump）。发布版宿主进程的 CWD 下没有 go.mod，SDK 解析与下载在
+// 找不到 go.mod 时以该常量兜底定位模块缓存，不再依赖进程工作目录。
+const sdkModuleVersion = "v1.4.0"
+
 // Compiler builds plugin source into a platform-native executable using the
 // bundled Go toolchain. It also performs static safety checks (import
 // blacklist) and `go vet` before compiling.
@@ -303,6 +308,10 @@ func findSDKDirWithGo(goBin string) (string, error) {
 		}
 		dir = parent
 	}
+	// 兜底：发布版宿主无 go.mod（CWD 任意），用内置 SDK 版本直接查模块缓存。
+	if p, err := sdkInModCache(goBin, "", sdkModuleVersion); err == nil {
+		return p, nil
+	}
 	return "", fmt.Errorf("no go.mod with the AstrBot SDK replace found (set %s)", "ASTRBOT_GO_SDK")
 }
 
@@ -341,6 +350,16 @@ func sdkRequireFromGoMod(data []byte) string {
 // only used by toolchain-less test helpers); workDir pins the command's working
 // directory to the go.mod location instead of the process CWD.
 func sdkInModCache(goBin, workDir, version string) (string, error) {
+	// 主路径：按 GOMODCACHE 布局直接文件系统定位（不加载宿主依赖图、
+	// 不依赖网络，Windows 网络差时 go list -m 加载完整模块图会失败）。
+	if version != "" {
+		if dir := sdkInModuleCacheDir(goBin, version); dir != "" {
+			logger.Debug("SDK 解析：命中模块缓存目录 %s", dir)
+			return dir, nil
+		}
+		logger.Debug("SDK 解析：模块缓存未命中（version=%s），回退 go list -m", version)
+	}
+	// 回退：go list -m 解析（完整依赖图，网络好时也能命中本地 replace 场景）。
 	if goBin == "" {
 		goBin = "go"
 	}
@@ -349,6 +368,12 @@ func sdkInModCache(goBin, workDir, version string) (string, error) {
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	out, err := cmd.Output()
 	if err != nil {
+		// stderr 里通常是依赖图加载失败的根因（缺失模块 go.mod / 网络错误）。
+		var stderr []byte
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = ee.Stderr
+		}
+		logger.Debug("SDK 解析：go list -m 失败（go=%s dir=%s）: %v %s", goBin, workDir, err, strings.TrimSpace(string(stderr)))
 		return "", fmt.Errorf("locate SDK %s@%s in module cache: %w", sdkModulePath, version, err)
 	}
 	dir := strings.TrimSpace(string(out))
@@ -359,6 +384,48 @@ func sdkInModCache(goBin, workDir, version string) (string, error) {
 		return "", fmt.Errorf("SDK source %q missing go.mod: %w", dir, err)
 	}
 	return dir, nil
+}
+
+// sdkInModuleCacheDir 直接按 GOMODCACHE 目录布局定位 SDK 源码目录
+// （$GOMODCACHE/<module-path>@<version>，大写字母按 Go 规范转 !x! 编码）。
+// go env GOMODCACHE 只读本地配置，不加载模块图、不联网。
+func sdkInModuleCacheDir(goBin, version string) string {
+	if goBin == "" {
+		goBin = "go"
+	}
+	out, err := exec.Command(goBin, "env", "GOMODCACHE").Output() // #nosec G204 -- 固定参数，无注入面
+	if err != nil {
+		logger.Debug("SDK 解析：go env GOMODCACHE 失败（go=%s）: %v", goBin, err)
+		return ""
+	}
+	modcache := strings.TrimSpace(string(out))
+	if modcache == "" {
+		logger.Debug("SDK 解析：go env GOMODCACHE 返回空（go=%s）", goBin)
+		return ""
+	}
+	dir := filepath.Join(modcache, moduleCachePath(sdkModulePath, version))
+	logger.Debug("SDK 解析：检查模块缓存 %s", dir)
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+		return dir
+	} else {
+		logger.Debug("SDK 解析：%s 不存在（%v）", dir, err)
+	}
+	return ""
+}
+
+// moduleCachePath 把模块路径+版本转为 GOMODCACHE 目录名：大写字母前缀
+// "!" 并转小写（如 WaterGodFurina → !water!god!furina）。
+func moduleCachePath(modPath, version string) string {
+	var sb strings.Builder
+	for _, r := range modPath {
+		if r >= 'A' && r <= 'Z' {
+			sb.WriteByte('!')
+			sb.WriteRune(r - 'A' + 'a')
+		} else {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String() + "@" + version
 }
 
 // sdkReplaceFromGoMod extracts the SDK replace target from go.mod contents
@@ -390,7 +457,11 @@ func sanitizeID(id string) string {
 			b.WriteByte('_')
 		}
 	}
-	return b.String()
+	s := b.String()
+	if s == "." || s == ".." {
+		return "plugin"
+	}
+	return s
 }
 
 // artifactName returns the compiled binary file name for the current platform.

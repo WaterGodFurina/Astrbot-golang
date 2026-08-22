@@ -192,6 +192,9 @@ func applyFieldPart(spec *fieldSpec, part string, min, max int, names map[string
 			return err
 		}
 		if from > to {
+			// croniter 对 from>to 的区间做环绕匹配（如 dow 的 fri-mon）；本实现
+			// 不支持环绕，静默交换会静默改变触发语义，告警提示用户。
+			logger.I18nWarn("cron 字段 %q 的区间 %s-%s 起点大于终点，已交换处理（不支持环绕匹配）", part, fromStr, toStr)
 			from, to = to, from
 		}
 		spec.rangeAny = true
@@ -206,6 +209,15 @@ func applyFieldPart(spec *fieldSpec, part string, min, max int, names map[string
 	v, err := parseFieldValue(part, min, max, names)
 	if err != nil {
 		return err
+	}
+	if step > 1 {
+		// croniter 语义：单值带步长等价于 v..max/step（如 `5/15` → 5,20,35,50）。
+		spec.rangeAny = true
+		spec.from, spec.to = v, max
+		for x := v; x <= max; x += step {
+			spec.values[x] = true
+		}
+		return nil
 	}
 	spec.values[v] = true
 	return nil
@@ -232,10 +244,7 @@ func parseFieldValue(s string, min, max int, names map[string]int) (int, error) 
 }
 
 func (f *fieldSpec) matches(v int) bool {
-	if f.rangeAny && !f.any {
-		// Range already expanded into values during parse.
-		return f.values[v]
-	}
+	// Range values are expanded into f.values during parse, so lookup only.
 	return f.values[v]
 }
 

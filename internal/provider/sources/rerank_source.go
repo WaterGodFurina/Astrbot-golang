@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -95,6 +96,10 @@ func (s *TEIRerankSource) Rerank(ctx context.Context, query string, documents []
 			RelevanceScore: r.Score,
 		})
 	}
+	sort.Slice(results, func(i, j int) bool { return results[i].RelevanceScore > results[j].RelevanceScore })
+	if topN > 0 && len(results) > topN {
+		results = results[:topN]
+	}
 	return results, nil
 }
 
@@ -110,5 +115,8 @@ func (s *TEIRerankSource) Test(ctx context.Context) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("rerank health check failed: HTTP %d", resp.StatusCode)
+	}
 	return nil
 }

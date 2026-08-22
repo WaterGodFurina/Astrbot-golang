@@ -24,7 +24,7 @@ jobs:
   update-go-sum:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -36,13 +36,15 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: 用 goproxy.cn 重建 go.sum（含 params 的正确内容）
+      - name: 用 goproxy.cn 校验 go.sum 可重建（只读验证，不写回仓库）
         env:
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
         run: |
           # goproxy.cn 与 GitHub runner 偶发 HTTP/2 抖动（DATA after END_STREAM），
           # 重试 5 次避免一次网络抖动废掉整个发布。
+          # 仅做本地重建校验（go mod tidy 会更新本地 go.sum，但不提交回仓库——
+          # workflow 禁止向 main 写入文件）。
           for i in 1 2 3 4 5; do
             if go mod tidy; then
               echo "go.sum 重建成功"
@@ -53,24 +55,6 @@ jobs:
           done
           echo "go mod tidy 重试 5 次仍失败" >&2
           exit 1
-
-      - name: 有变更则提交回仓库并同步 tag
-        run: |
-          if ! git diff --quiet go.mod go.sum; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            # checkout 处于 detached HEAD，先切回 main 分支再提交推送
-            git checkout -B main
-            git add go.mod go.sum
-            git commit -m "chore: rebuild go.sum"
-            git push origin main --force-with-lease
-            # 同步发布 tag，触发 tag 事件自动跑完整构建
-            git tag -f 1.0.1 HEAD
-            git push origin 1.0.1 --force-with-lease
-            echo "已提交新的 go.sum 并同步 tag"
-          else
-            echo "go.sum 与 goproxy.cn 一致，无变更"
-          fi
 
   # ── 版本/元信息：自动探测最新 release 版本 + 读取 go.mod 的 Go 版本 ──
   release-meta:
@@ -157,7 +141,7 @@ jobs:
           - { runner: ubuntu-latest,  target: loongarch64-unknown-linux-musl, resource: linux-loongarch64-musl, goos: linux, goarch: loong64, ext: '', libc: musl }
           - { runner: macos-15-intel, target: x86_64-apple-darwin,   resource: macos-x86_64,   goos: darwin, goarch: amd64,  ext: '', libc: '' }
           - { runner: macos-14,       target: aarch64-apple-darwin,  resource: macos-aarch64,  goos: darwin, goarch: arm64,  ext: '', libc: '' }
-          - { runner: ubuntu-latest,  target: aarch64-linux-android, resource: android-aarch64, goos: android, goarch: arm64, ext: '', libc: '' }
+          - { runner: ubuntu-24.04-arm, target: aarch64-linux-android, resource: android-aarch64, goos: android, goarch: arm64, ext: '',   libc: bionic }
 
     steps:
       - name: Checkout repository
@@ -171,15 +155,38 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: 安装 Android NDK（Lzhiyong/termux-ndk r29）
+        if: matrix.goos == 'android'
+        run: |
+          mkdir -p $HOME/ndk
+          curl -sL "https://github.com/Lzhiyong/termux-ndk/releases/download/android-ndk/android-ndk-r29-aarch64.tar.xz" -o $HOME/ndk/ndk.tar.xz
+          tar -xJf $HOME/ndk/ndk.tar.xz -C $HOME/ndk
+          echo "NDK_PATH=$HOME/ndk" >> "$GITHUB_ENV"
+
       - name: 交叉编译 AstrBot（CGO_ENABLED=0，纯 Go，modernc.org/sqlite）
+        shell: bash
         env:
-          CGO_ENABLED: '0'
+          CGO_ENABLED: ${{ matrix.libc == 'bionic' && '1' || '0' }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM64: v8.0
+          CC: ${{ matrix.libc == 'bionic' && format('{0}/android-ndk-r29/toolchains/llvm/prebuilt/linux-aarch64/bin/aarch64-linux-android30-clang', env.NDK_PATH) || '' }}
+          CXX: ${{ matrix.libc == 'bionic' && format('{0}/android-ndk-r29/toolchains/llvm/prebuilt/linux-aarch64/bin/aarch64-linux-android30-clang++', env.NDK_PATH) || '' }}
+          CGO_CFLAGS: ''
+          CGO_CPPFLAGS: ''
+          CGO_CXXFLAGS: ''
+          CGO_LDFLAGS: ''
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
-        run: go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ needs.release-meta.outputs.version }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ needs.release-meta.outputs.python_version }}" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
+        run: |
+          BUILDARGS="-trimpath"
+          if [ "${{ matrix.libc }}" = "bionic" ]; then
+            # android + CGO_ENABLED=1：默认产出 PIE 动态链接（对齐 Termux go build）
+            go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ needs.release-meta.outputs.version }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ needs.release-meta.outputs.python_version }}" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
+          else
+            go build -buildmode=exe -compiler=gc -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ needs.release-meta.outputs.version }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ needs.release-meta.outputs.python_version }}" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
+          fi
 
       - name: 打包 zip（Windows）
         if: runner.os == 'Windows'
@@ -211,5 +218,6 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}
-          path: astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip
+          path: |
+            astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip
           if-no-files-found: error

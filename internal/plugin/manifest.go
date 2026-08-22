@@ -42,6 +42,15 @@ type ManifestEntry struct {
 	DisplayName string `json:"display_name,omitempty"`
 	ShortDesc   string `json:"short_desc,omitempty"`
 
+	// 以下字段安装时从打包元数据（metadata.json/yaml）持久化，供 ListInfo
+	// 直接读取而无需每次重新读盘解析（对齐 Python StarMetadata 对应字段）。
+	Author           string                       `json:"author,omitempty"`
+	SupportPlatforms []string                     `json:"support_platforms,omitempty"`
+	AstrbotVersion   string                       `json:"astrbot_version,omitempty"`
+	I18n             map[string]map[string]string `json:"i18n,omitempty"`
+	Pages            []interface{}                `json:"pages,omitempty"`
+	LogoPath         string                       `json:"logo_path,omitempty"`
+
 	// 插件在 dataDir 下创建的目录足迹（相对 dataDir），供卸载时按
 	// "删除配置文件 / 删除插件数据" 选项精确清理。
 	ConfigDir string `json:"config_dir,omitempty"` // plugins_config/<name>  (config.json + config_schema.json)

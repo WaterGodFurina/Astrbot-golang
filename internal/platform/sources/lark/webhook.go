@@ -4,12 +4,15 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
-	"sync"
+	"strconv"
+	"time"
 )
 
 // LarkWebhookServer implements the Lark webhook event subscription:
@@ -22,7 +25,6 @@ type LarkWebhookServer struct {
 	verifyToken string
 	cipher      cipher.Block
 	callback    func(map[string]interface{})
-	warnOnce    sync.Once
 }
 
 // NewLarkWebhookServer creates a webhook server.
@@ -49,7 +51,7 @@ func (s *LarkWebhookServer) SetCallback(cb func(map[string]interface{})) {
 func (s *LarkWebhookServer) verifySignature(timestamp, nonce, signature string, body []byte) bool {
 	bytesB1 := append([]byte(timestamp+nonce+s.encryptKey), body...)
 	sum := sha256.Sum256(bytesB1)
-	return hex.EncodeToString(sum[:]) == signature
+	return subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(signature)) == 1
 }
 
 // decryptEvent AES-256-CBC decrypts an encrypted event payload.
@@ -113,6 +115,11 @@ func (s *LarkWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reques
 			writeWebhookError(w, http.StatusUnauthorized, "Missing signature headers")
 			return
 		}
+		// 时间戳新鲜度校验：拒绝与当前时间偏差超过 5 分钟的请求（防重放）。
+		if ts, err := strconv.ParseInt(timestamp, 10, 64); err != nil || math.Abs(float64(time.Now().Unix()-ts)) > 300 {
+			writeWebhookError(w, http.StatusBadRequest, "timestamp expired")
+			return
+		}
 		if !s.verifySignature(timestamp, nonce, signature, body) {
 			writeWebhookError(w, http.StatusUnauthorized, "Invalid signature")
 			return
@@ -145,11 +152,11 @@ func (s *LarkWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 未配置 encrypt_key 与 verification_token 时, 事件无法通过任何签名/令牌校验,
-	// 仅提示配置风险, 不阻断流程。
+	// 直接拒绝处理, 避免被伪造的事件进入消息管线。
 	if s.encryptKey == "" && s.verifyToken == "" {
-		s.warnOnce.Do(func() {
-			logger.Warn("飞书 Webhook 未配置 encrypt_key 与 verification_token, 事件无法被签名/令牌校验, 存在被伪造的风险")
-		})
+		logger.Error("飞书 Webhook 未配置 encrypt_key 与 verification_token, 拒绝处理事件")
+		writeWebhookError(w, http.StatusServiceUnavailable, "encrypt_key or verification_token required")
+		return
 	}
 
 	// URL verification (challenge).

@@ -168,11 +168,14 @@ func sanitizeContextByModalities(messages []map[string]interface{}, modalities [
 					filtered = append(filtered, part)
 				}
 				if removed {
-					m = make(map[string]interface{}, len(msg))
-					for k, v := range msg {
-						m[k] = v
+					// 基于已加工的 m 拷贝（而非原始 msg），避免把上一分支刚
+					// 删除的 tool_calls 恢复回来。
+					nm := make(map[string]interface{}, len(m))
+					for k, v := range m {
+						nm[k] = v
 					}
-					m["content"] = filtered
+					nm["content"] = filtered
+					m = nm
 				}
 			}
 		}

@@ -170,11 +170,6 @@ func (s *OpenAIWhisperSource) fetchAudio(ctx context.Context, audioURL string) (
 // Test verifies the provider by listing models.
 func (s *OpenAIWhisperSource) Test(ctx context.Context) error {
 	url := s.apiBase + "/models"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	cfg := RetryConfigFromSettings(s.Settings())
 	resp, err := DoWithRetry(ctx, s.client, func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

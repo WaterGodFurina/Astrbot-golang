@@ -1035,7 +1035,16 @@ watch(
     if (routeSessionId && routeSessionId !== currSessionId.value) {
       showChatWorkspace();
       selectedProjectId.value = null;
-      await selectSession(routeSessionId, false);
+      try {
+        await selectSession(routeSessionId, false);
+      } catch (error) {
+        toast.error(
+          isAxiosError(error)
+            ? error.response?.data?.message || error.message
+            : tm("errors.createSessionFailed"),
+        );
+        console.error("Failed to select session:", error);
+      }
     } else if (!routeSessionId && currSessionId.value) {
       showChatWorkspace();
       currSessionId.value = "";
@@ -1188,7 +1197,16 @@ async function handleProjectToggle(projectId: string, expanded: boolean) {
 }
 
 async function handleDeleteProject(projectId: string) {
-  await deleteProjectById(projectId);
+  try {
+    await deleteProjectById(projectId);
+  } catch (error) {
+    toast.error(
+      isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : tm("batch.requestFailed"),
+    );
+    console.error("Failed to delete project:", error);
+  }
   const nextSessionsById = { ...projectSessionsById.value };
   delete nextSessionsById[projectId];
   projectSessionsById.value = nextSessionsById;
@@ -1241,6 +1259,13 @@ async function saveSessionTitleDialog() {
       await loadProjectSessions();
     }
     sessionTitleDialogOpen.value = false;
+  } catch (error) {
+    toast.error(
+      isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : tm("conversation.displayNameUpdateFailed"),
+    );
+    console.error("Failed to save session title:", error);
   } finally {
     savingSessionTitle.value = false;
   }
@@ -1256,7 +1281,16 @@ async function deleteSidebarSession(session: Session) {
   if (!(await askForConfirmation(message, confirmDialog))) return;
 
   const wasCurrent = currSessionId.value === session.session_id;
-  await deleteSession(session.session_id);
+  try {
+    await deleteSession(session.session_id);
+  } catch (error) {
+    toast.error(
+      isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : tm("batch.requestFailed"),
+    );
+    console.error("Failed to delete session:", error);
+  }
   if (wasCurrent) {
     selectedProjectId.value = null;
     await router.push(basePath());
@@ -1276,11 +1310,20 @@ async function deleteProjectSession(
   sessionId: string,
   projectId = selectedProjectId.value,
 ) {
-  await deleteSession(sessionId);
-  if (projectId) {
-    await loadProjectSessions(projectId);
-  } else {
-    await loadProjectSessions();
+  try {
+    await deleteSession(sessionId);
+    if (projectId) {
+      await loadProjectSessions(projectId);
+    } else {
+      await loadProjectSessions();
+    }
+  } catch (error) {
+    toast.error(
+      isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : tm("batch.requestFailed"),
+    );
+    console.error("Failed to delete project session:", error);
   }
 }
 
@@ -1394,6 +1437,11 @@ async function sendCurrentMessage() {
     });
   } catch (error) {
     console.error("Failed to send message:", error);
+    toast.error(
+      isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : tm("errors.createSessionFailed"),
+    );
   } finally {
     sending.value = false;
     await focusChatInput();
@@ -1673,15 +1721,22 @@ function removeThreadFromMessages(threadId: string) {
   }
 }
 
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4GB，与后端上传限制保持一致
+
 async function handleFilesSelected(files: FileList | File[]) {
   const selectedFiles = Array.from(files || []);
-  for (const file of selectedFiles) {
-    if (file.type.startsWith("image/")) {
-      await processAndUploadImage(file);
-    } else {
-      await processAndUploadFile(file);
-    }
+  const oversized = selectedFiles.filter((f) => f.size > MAX_UPLOAD_BYTES);
+  for (const file of oversized) {
+    toast.error(tm("input.fileTooLarge", { name: file.name }));
   }
+  const okFiles = selectedFiles.filter((f) => f.size <= MAX_UPLOAD_BYTES);
+  await Promise.all(
+    okFiles.map((file) =>
+      file.type.startsWith("image/")
+        ? processAndUploadImage(file)
+        : processAndUploadFile(file),
+    ),
+  );
 }
 
 function toggleStreaming() {

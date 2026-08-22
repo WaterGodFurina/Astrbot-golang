@@ -156,6 +156,7 @@
     "updateFailed": "更新失败",
     "deleteSuccess": "已删除",
     "deleteFailed": "删除失败",
+    "deleteConfirm": "确定要删除任务 {name} 吗？此操作无法撤销。",
     "nameRequired": "请填写任务名称",
     "sessionRequired": "请选择投递目标",
     "noteRequired": "请填写任务需求",

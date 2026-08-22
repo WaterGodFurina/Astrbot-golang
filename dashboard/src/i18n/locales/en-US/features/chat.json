@@ -11,7 +11,8 @@
     "recordingPrompt": "Recording, please speak...",
     "chatPrompt": "Let's chat!",
     "dropToUpload": "Drop files to upload",
-    "stopGenerating": "Stop generating"
+    "stopGenerating": "Stop generating",
+    "fileTooLarge": "File {name} exceeds the 4GB limit and was skipped"
   },
   "message": {
     "user": "User",

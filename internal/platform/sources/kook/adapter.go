@@ -117,6 +117,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	a.kookConfig = kc
 	a.client = NewKookClient(kc, a.onReceived)
 	a.rolesCache = NewRolesRecord(a.client.httpClient)
+	a.rolesCache.SetToken(kc.Token)
 	logger.Debug("[KOOK] 配置: id=%s enable=%v", kc.ID, kc.Enable)
 	return a
 }
@@ -669,6 +670,27 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.I18nError("[KOOK] 发布消息事件失败: %v", err)
 	}
+	a.removeMsgTempFiles(abm)
+}
+
+// removeMsgTempFiles 清理本条消息转换时下载到临时目录的媒体文件
+// (卡片音频经 utils.TempFilePath 落盘, 发布后无其他消费方)。
+func (a *Adapter) removeMsgTempFiles(abm *platform.AstrBotMessage) {
+	for _, comp := range abm.Message {
+		var p string
+		switch c := comp.(type) {
+		case *message.Image:
+			p = c.Path
+		case *message.Record:
+			p = c.File
+		case *message.File:
+			p = c.Path
+		}
+		if p != "" && strings.HasPrefix(p, os.TempDir()+string(os.PathSeparator)) &&
+			strings.HasPrefix(filepath.Base(p), "astrbot_") {
+			_ = os.Remove(p)
+		}
+	}
 }
 
 // orderMessage 对应 Python kook_event.py 的 OrderMessage。
@@ -726,19 +748,11 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 			continue
 		}
 		if err := a.client.SendText(ctx, sessionID, item.text, msgType, item.msgType, replyID); err != nil {
-			// 发送失败时尝试把错误信息当普通文本发送 (对应 Python)
-			if err2 := a.client.SendText(ctx, sessionID, err.Error(), msgType, KookMsgText, replyID); err2 != nil {
-				logger.I18nError("[KOOK] 发送错误信息失败: %v", err2)
-			}
 			errors = append(errors, err)
 		}
 	}
 	if len(errors) > 0 {
-		msgs := make([]string, 0, len(errors))
-		for _, e := range errors {
-			msgs = append(msgs, e.Error())
-		}
-		logger.I18nError("[KOOK] 发送消息时出现 %d 个错误: %s", len(errors), strings.Join(msgs, "\n"))
+		return fmt.Errorf("kook: %d/%d 条消息发送失败: %w", len(errors), len(orders), errors[0])
 	}
 	return nil
 }

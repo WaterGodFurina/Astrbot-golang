@@ -79,6 +79,9 @@ func (c *WecomAIBotLongConnectionClient) Start(ctx context.Context) {
 		err := c.runOnce(ctx)
 		if err != nil {
 			logger.I18nError("[WecomAI][LongConn] 长连接异常: %v", err)
+		} else {
+			// 正常退出（曾成功建立连接）后复位退避，对齐 Python
+			reconnectDelay = time.Second
 		}
 		if c.isShutdown() {
 			return

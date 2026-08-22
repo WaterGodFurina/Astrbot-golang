@@ -97,8 +97,8 @@ func (s *KimiCodeSource) GetModels(ctx context.Context) ([]string, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(body), 1024))
 	}
 	var result struct {
 		Data []struct {
@@ -124,10 +124,10 @@ func (s *KimiCodeSource) TextChat(ctx context.Context, req *provider.ProviderReq
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return &provider.LLMResponse{
 			Role:           "err",
-			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, string(respBody)),
+			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024)),
 		}, nil
 	}
 	var result struct {
@@ -195,9 +195,9 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024))
 	}
 
 	ch := make(chan *provider.LLMResponse, 100)
@@ -245,6 +245,10 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 					OutputTokens         int `json:"output_tokens"`
 					CacheReadInputTokens int `json:"cache_read_input_tokens"`
 				} `json:"usage"`
+				Error *struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
 			}
 			if err := json.Unmarshal([]byte(data), &event); err != nil {
 				return false
@@ -306,6 +310,13 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 					usage.Output = event.Usage.OutputTokens
 				}
 			case "message_stop":
+				return true
+			case "error":
+				msg := "Kimi Code stream error"
+				if event.Error != nil && event.Error.Message != "" {
+					msg = event.Error.Message
+				}
+				ch <- &provider.LLMResponse{Role: "err", CompletionText: msg}
 				return true
 			}
 			return false
@@ -451,17 +462,20 @@ func (s *KimiCodeSource) doRequest(ctx context.Context, body map[string]interfac
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
 	url := fmt.Sprintf("%s/v1/messages", s.apiBase)
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", s.apiKey)
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	for k, v := range s.customHeaders {
-		httpReq.Header.Set(k, v)
-	}
 	msgs, _ := body["messages"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
-	return client.Do(httpReq)
+	cfg := RetryConfigFromSettings(s.Settings())
+	return DoWithRetry(ctx, client, func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-api-key", s.apiKey)
+		httpReq.Header.Set("anthropic-version", "2023-06-01")
+		for k, v := range s.customHeaders {
+			httpReq.Header.Set(k, v)
+		}
+		return httpReq, nil
+	}, cfg, "KimiCode")
 }

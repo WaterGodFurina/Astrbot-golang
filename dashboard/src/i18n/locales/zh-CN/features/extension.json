@@ -138,7 +138,8 @@
       "astrbotVersion": "AstrBot 版本要求",
       "supportPlatforms": "支持平台",
       "authorWebsite": "作者网站",
-      "repository": "仓库"
+      "repository": "仓库",
+      "pluginLanguage": "插件语言"
     },
     "sleep": {
       "globalLabel": "全局闲置自动休眠",
@@ -184,7 +185,8 @@
     "sourceResolved": "插件源可用",
     "installPlugin": "安装插件",
     "randomPlugins": "🎲 随机插件",
-    "sourceSafetyWarning": "即使是默认插件源，我们也不能完全保证插件的稳定性和安全性，使用前请谨慎核查。"
+    "sourceSafetyWarning": "即使是默认插件源，我们也不能完全保证插件的稳定性和安全性，使用前请谨慎核查。",
+    "sourceTypeHint": "选择源的插件类型：Golang 源收录 Go 插件（按 Go 版本检测兼容性）；Python 源收录 Python 插件（按对齐的 Python 版本检测）。类型影响安装方式（zip 直链 / git clone）与版本兼容性判断。"
   },
   "sort": {
     "by": "排序方式",
@@ -269,13 +271,14 @@
     "python_runtime": {
       "title": "需要 Python 运行时",
       "message": "该插件需要 Python 运行时才能运行。",
-      "android_hint": "请在 Termux 中执行以下命令安装 Python：",
+      "android_hint": "请在 Termux 中执行以下命令安装缺失的预编译依赖：",
       "download_hint": "是否自动下载 CPython？",
       "mirrorLabel": "加速下载镜像",
       "download": "自动下载",
       "cancel": "取消",
       "copy": "复制命令",
-      "installed": "我已安装"
+      "installed": "我已安装",
+      "primaryLabel": "加速地址（官方 CDN）"
     },
     "update": {
       "title": "更新插件",
@@ -516,5 +519,15 @@
   },
   "pluginChangelog": {
     "menuTitle": "查看更新日志"
+  },
+  "adminList": {
+    "manage": "管理插件授权",
+    "hint": "授权指定插件管理其他插件（安装/卸载/启停）。未授权的插件只能操作自身。留空表示无管理插件。",
+    "label": "插件注册名（逗号分隔）",
+    "placeholder": "astrbot_plugin_xxx_python, astrbot_plugin_yyy_go",
+    "example": "插件注册名格式：插件名_语言（如 astrbot_plugin_box_python）。需重启插件后生效。",
+    "save": "保存",
+    "cancel": "取消",
+    "saved": "已保存插件授权名单"
   }
 }

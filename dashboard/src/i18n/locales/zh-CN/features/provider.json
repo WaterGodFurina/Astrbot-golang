@@ -91,6 +91,16 @@
   "providerTypes": {
     "title": "提供商类型"
   },
+  "agentRunnerDialog": {
+    "title": "请前往「配置文件」页测试 Agent 执行器",
+    "description": "Agent 执行器的测试请在「配置文件」页进行。",
+    "step1": "找到对应的配置文件并打开。",
+    "step2": "找到 Agent 执行方式部分，修改执行器后点击保存。",
+    "step3": "点击右下角的 💬 聊天按钮进行测试。",
+    "applyHint": "要让机器人应用这个 Agent 执行器，你也需要前往修改 Agent 执行器。",
+    "ok": "好的",
+    "go": "点击前往"
+  },
   "providerSources": {
     "title": "提供商源",
     "add": "新增",
@@ -140,6 +150,7 @@
     "testError": "模型测试失败",
     "searchPlaceholder": "搜索模型或 ID",
     "manualAddButton": "自定义模型",
+    "manualDialogAddButton": "添加",
     "manualDialogTitle": "添加自定义模型",
     "manualDialogModelLabel": "模型 ID（如 gpt-4.1-mini）",
     "manualDialogPreviewLabel": "显示 ID（自动生成）",

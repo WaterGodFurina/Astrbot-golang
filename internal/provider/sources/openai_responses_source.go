@@ -136,8 +136,8 @@ func (s *OpenAIResponsesSource) GetModels(ctx context.Context) ([]string, error)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(body), 1024))
 	}
 	var result struct {
 		Data []struct {
@@ -163,10 +163,10 @@ func (s *OpenAIResponsesSource) TextChat(ctx context.Context, req *provider.Prov
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return &provider.LLMResponse{
 			Role:           "err",
-			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, string(respBody)),
+			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024)),
 		}, nil
 	}
 	var result responsesResponse
@@ -188,9 +188,9 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024))
 	}
 
 	ch := make(chan *provider.LLMResponse, 100)
@@ -208,6 +208,7 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 		reasoning := new(strings.Builder)
 		var responseID string
 		var final *provider.LLMResponse
+		var termErr error
 
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var event struct {
@@ -277,8 +278,11 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 				}
 			case "response.completed", "response.incomplete", "response.failed":
 				if event.Response != nil {
-					if parsed, err := s.parseResponse(event.Response, len(req.Tools) > 0); err == nil {
+					parsed, err := s.parseResponse(event.Response, len(req.Tools) > 0)
+					if err == nil {
 						final = parsed
+					} else {
+						termErr = err
 					}
 				}
 				return true
@@ -288,6 +292,11 @@ func (s *OpenAIResponsesSource) TextChatStream(ctx context.Context, req *provide
 		if err := reader.scan(); err != nil {
 			logger.Warn("Responses API stream read error: %v", err)
 			ch <- &provider.LLMResponse{Role: "err", CompletionText: fmt.Sprintf("Responses API stream read error: %v", err)}
+			return
+		}
+
+		if termErr != nil {
+			ch <- &provider.LLMResponse{Role: "err", CompletionText: termErr.Error()}
 			return
 		}
 
@@ -748,14 +757,17 @@ func (s *OpenAIResponsesSource) doRequest(ctx context.Context, body map[string]i
 	url := fmt.Sprintf("%s/responses", s.apiBase)
 	input, _ := body["input"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(input))
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
-	for k, v := range s.customHeaders {
-		httpReq.Header.Set(k, v)
-	}
-	return client.Do(httpReq)
+	cfg := RetryConfigFromSettings(s.Settings())
+	return DoWithRetry(ctx, client, func() (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+		for k, v := range s.customHeaders {
+			httpReq.Header.Set(k, v)
+		}
+		return httpReq, nil
+	}, cfg, "OpenAIResponses")
 }

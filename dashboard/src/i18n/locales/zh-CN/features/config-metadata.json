@@ -796,6 +796,14 @@
       "disable_builtin_commands": {
         "description": "禁用自带指令",
         "hint": "禁用所有 AstrBot 自带指令,如 help, sid, new 等"
+      },
+      "t2i": {
+        "description": "文本转图像输出",
+        "hint": "开启后，回复文本超过字数阈值时将以图片形式发送"
+      },
+      "t2i_word_threshold": {
+        "description": "文本转图像字数阈值",
+        "hint": "回复文本达到该字数时转为图片发送（默认 150）"
       }
     },
     "whitelist": {
@@ -867,15 +875,6 @@
             "hint": "额外的屏蔽关键词列表,支持正则表达式。"
           }
         }
-      }
-    },
-    "t2i": {
-      "description": "文本转图像",
-      "t2i": {
-        "description": "文本转图像输出"
-      },
-      "t2i_word_threshold": {
-        "description": "文本转图像字数阈值"
       }
     },
     "others": {

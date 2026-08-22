@@ -60,21 +60,15 @@ import { chatApi } from "@/api/v1";
 import { fetchWithAuth } from "@/api/http";
 import {
   appendPlain,
-  appendReasoningPart,
+  applyStreamPayloadToRecord,
   buildChatRequestFlags,
   extractReasoningText,
-  finishToolCall,
-  hasPlainText,
-  markMessageStarted,
   normalizeMessageParts,
-  parseJsonSafe,
-  payloadText,
-  upsertToolCall,
   type ChatRecord,
-  type MessagePart,
   type ChatThread,
 } from "@/composables/useMessages";
 import { useModuleI18n } from "@/i18n/composables";
+import { readSseStream } from "@/utils/sse";
 import ChatMessageList from "@/components/chat/ChatMessageList.vue";
 
 const props = defineProps<{
@@ -201,140 +195,8 @@ function normalizeRecord(record: any): ChatRecord {
   };
 }
 
-async function readSseStream(
-  stream: ReadableStream<Uint8Array>,
-  onPayload: (payload: any) => void,
-) {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop() || "";
-    for (const chunk of chunks) {
-      const data = chunk
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n");
-      if (!data) continue;
-      try {
-        onPayload(JSON.parse(data));
-      } catch (error) {
-        console.error("Failed to parse thread SSE payload:", error, data);
-      }
-    }
-  }
-}
-
 function processPayload(botRecord: ChatRecord, userRecord: ChatRecord, payload: any) {
-  const normalized =
-    payload?.ct === "chat"
-      ? { ...payload, type: payload.type || payload.t }
-      : payload;
-  const type = normalized?.type || normalized?.t;
-  const chainType = normalized?.chain_type;
-  const data = normalized?.data ?? "";
-
-  if (type === "session_id" || type === "session_bound") return;
-
-  if (type === "user_message_saved") {
-    userRecord.id = data?.id || userRecord.id;
-    userRecord.created_at = data?.created_at || userRecord.created_at;
-    userRecord.llm_checkpoint_id =
-      data?.llm_checkpoint_id || userRecord.llm_checkpoint_id;
-    return;
-  }
-
-  if (type === "message_saved") {
-    markMessageStarted(botRecord);
-    botRecord.id = data?.id || botRecord.id;
-    botRecord.created_at = data?.created_at || botRecord.created_at;
-    botRecord.llm_checkpoint_id =
-      data?.llm_checkpoint_id || botRecord.llm_checkpoint_id;
-    if (data?.refs) {
-      botRecord.content.refs = data.refs;
-    }
-    return;
-  }
-
-  if (type === "agent_stats" || chainType === "agent_stats") {
-    markMessageStarted(botRecord);
-    botRecord.content.agentStats = data;
-    return;
-  }
-
-  if (type === "error") {
-    markMessageStarted(botRecord);
-    appendPlain(botRecord, `\n\n${String(data)}`);
-    return;
-  }
-
-  if (type === "complete" || type === "break") {
-    markMessageStarted(botRecord);
-    const finalText = payloadText(data);
-    const existingText = botRecord.content.message
-      .filter((part) => part.type === "plain")
-      .map((part) => part.text || "")
-      .join("");
-    const missingText = finalText.slice(existingText.length);
-    if (
-      type === "complete" &&
-      missingText &&
-      finalText.startsWith(existingText)
-    ) {
-      appendPlain(botRecord, missingText);
-    } else if (finalText && !hasPlainText(botRecord)) {
-      appendPlain(botRecord, finalText, false);
-    }
-    return;
-  }
-
-  if (type === "end") {
-    markMessageStarted(botRecord);
-    return;
-  }
-
-  if (type === "plain") {
-    markMessageStarted(botRecord);
-    if (chainType === "reasoning") {
-      appendReasoningPart(botRecord, payloadText(data));
-      return;
-    }
-    if (chainType === "tool_call") {
-      upsertToolCall(botRecord, parseJsonSafe(data));
-      return;
-    }
-    if (chainType === "tool_call_result") {
-      finishToolCall(botRecord, parseJsonSafe(data));
-      return;
-    }
-    appendPlain(botRecord, payloadText(data), normalized.streaming !== false);
-    return;
-  }
-
-  if (["image", "record", "file", "video"].includes(type)) {
-    markMessageStarted(botRecord);
-    const rawFilename = String(data)
-      .replace("[IMAGE]", "")
-      .replace("[RECORD]", "")
-      .replace("[FILE]", "")
-      .replace("[VIDEO]", "");
-    const separatorIndex = rawFilename.indexOf("|");
-    const storedFilename =
-      separatorIndex >= 0 ? rawFilename.slice(0, separatorIndex) : rawFilename;
-    const displayFilename =
-      separatorIndex >= 0 ? rawFilename.slice(separatorIndex + 1) : storedFilename;
-    const filename = displayFilename || storedFilename;
-    const mediaPart: MessagePart = { type, filename };
-    if (storedFilename && storedFilename !== filename) {
-      mediaPart.stored_filename = storedFilename;
-    }
-    botRecord.content.message.push(mediaPart);
-  }
+  applyStreamPayloadToRecord(botRecord, payload, { userRecord });
 }
 
 function scrollToBottom() {

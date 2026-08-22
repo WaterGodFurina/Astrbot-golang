@@ -66,9 +66,11 @@ func DownloadFile(ctx context.Context, urlStr, destPath string) error {
 	defer f.Close()
 	written, err := io.Copy(f, io.LimitReader(resp.Body, maxDownloadBytes+1))
 	if err != nil {
+		_ = os.Remove(destPath)
 		return err
 	}
 	if written > maxDownloadBytes {
+		_ = os.Remove(destPath)
 		return fmt.Errorf("download exceeds size limit of %d bytes", maxDownloadBytes)
 	}
 	return nil
@@ -108,7 +110,8 @@ func ReadFileToBase64(path string) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// EnsureJPEG converts an image to JPEG format (placeholder — returns original path).
+// EnsureJPEG 返回原始路径，不做实际 JPEG 转码：本实现未引入图像处理依赖
+// （Python 原版使用 PIL 转码），调用方不应依赖格式转换结果；只校验文件存在。
 func EnsureJPEG(path string) (string, error) {
 	// In Go, we would use imaging library to convert.
 	// For now, just verify the file exists.
@@ -152,7 +155,7 @@ func DetectAudioFormat(path string) string {
 	if bytes.Equal(header[:3], []byte("ID3")) || (header[0] == 0xff && header[1] == 0xfb) {
 		return "mp3"
 	}
-	if bytes.Equal(header[:4], []byte("ftyp")) {
+	if len(header) >= 8 && bytes.Equal(header[4:8], []byte("ftyp")) {
 		return "m4a"
 	}
 	if bytes.HasPrefix(header, []byte("#!SILK_V3")) || bytes.HasPrefix(header, []byte{0x02, '#', '!', 'S', 'I', 'L', 'K', '_', 'V', '3'}) {
@@ -161,7 +164,9 @@ func DetectAudioFormat(path string) string {
 	return ""
 }
 
-// EnsureWAV converts audio to WAV format (placeholder — returns original path).
+// EnsureWAV 返回原始路径，不做实际 WAV 转码：本实现未引入 ffmpeg 等依赖
+// （Python 原版调用 ffmpeg/tencent_silk_to_wav 转码），调用方不应依赖格式
+// 转换结果；只校验文件存在。
 func EnsureWAV(path string) (string, error) {
 	if _, err := os.Stat(path); err != nil {
 		return "", err

@@ -5,8 +5,9 @@
     size="x-small"
     variant="flat"
     :style="chipStyle"
-    :href="url"
+    :href="safeUrl"
     target="_blank"
+    rel="noopener noreferrer"
     clickable
   >
     <v-icon start size="x-small" color>mdi-link-variant</v-icon>
@@ -42,6 +43,18 @@ const resultData = computed(() => {
       ? webSearchResults()
       : webSearchResults;
   return results?.[refIndex.value] || null;
+});
+
+const safeUrl = computed(() => {
+  const raw = String(resultData.value?.url || "").trim();
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? parsed.href
+      : "";
+  } catch {
+    return "";
+  }
 });
 
 const url = computed(() => resultData.value?.url || "");

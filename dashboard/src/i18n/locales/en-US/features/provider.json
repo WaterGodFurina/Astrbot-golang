@@ -91,6 +91,16 @@
   "providerTypes": {
     "title": "Provider Types"
   },
+  "agentRunnerDialog": {
+    "title": "Test the Agent Runner on the \"Config File\" page",
+    "description": "Agent Runner tests are done on the \"Config File\" page.",
+    "step1": "Open the corresponding config file.",
+    "step2": "Find the Agent Runner section, change the runner and click Save.",
+    "step3": "Click the 💬 chat button in the bottom-right corner to test.",
+    "applyHint": "For the bot to use this Agent Runner, you also need to change it in the config.",
+    "ok": "OK",
+    "go": "Go there"
+  },
   "providerSources": {
     "title": "Provider Sources",
     "add": "Add",
@@ -140,6 +150,7 @@
     "testError": "Model test failed",
     "searchPlaceholder": "Search models or ID",
     "manualAddButton": "Custom Model",
+    "manualDialogAddButton": "Add",
     "manualDialogTitle": "Add Custom Model",
     "manualDialogModelLabel": "Model ID (e.g. gpt-4.1-mini)",
     "manualDialogPreviewLabel": "Display ID (auto generated)",

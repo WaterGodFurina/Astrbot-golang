@@ -957,6 +957,30 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.I18nError("发布钉钉消息事件失败: %v", err)
 	}
+	a.removeMsgTempFiles(abm)
+}
+
+// removeMsgTempFiles 清理本条消息下载到临时目录的媒体文件
+// (downloadDingFile 落盘为 dingtalk_* 文件, 发布后无其他消费方)。
+func (a *Adapter) removeMsgTempFiles(abm *platform.AstrBotMessage) {
+	for _, comp := range abm.Message {
+		var p string
+		switch c := comp.(type) {
+		case *message.Image:
+			p = c.Path
+		case *message.Record:
+			p = c.File
+		case *message.File:
+			p = c.Path
+		}
+		removeDingtalkTemp(p)
+	}
+}
+
+func removeDingtalkTemp(p string) {
+	if p != "" && strings.HasPrefix(filepath.Base(p), "dingtalk_") {
+		_ = os.Remove(p)
+	}
 }
 
 // msgStaffID 从原始消息中提取 senderStaffId (用于会话映射保留)。

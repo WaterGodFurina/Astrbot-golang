@@ -133,6 +133,8 @@ func (a *Adapter) startStream(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("连接钉钉长连接失败: %v", err)
 	}
+	// 与 aiocqhttp/qqofficial/satori 对齐: 限制单帧大小, 防止异常大帧放大内存占用
+	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 	a.wsMu.Lock()
 	a.wsConn = conn

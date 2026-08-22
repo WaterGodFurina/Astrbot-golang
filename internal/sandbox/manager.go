@@ -53,6 +53,75 @@ type Booter interface {
 	WriteFile(ctx context.Context, path, content string) error
 }
 
+// blockedCmdPatterns 对齐 Python booters/local.py 的 _BLOCKED_COMMAND_PATTERNS：
+// 本地沙箱（无隔离）下的破坏性 shell 命令黑名单。命中即拒绝执行。
+var blockedCmdPatterns = []string{
+	" rm -rf ", " rm -fr ", " rm -r ", " mkfs", " dd if=",
+	" shutdown", " reboot", " poweroff", " halt", " sudo ",
+	":(){:|:&};:", " kill -9 ", " killall ",
+}
+
+// isSafeLocalCommand 检查 sh -c 形式的命令串是否命中破坏性命令黑名单
+// （对齐 Python _is_safe_command 的包裹空格匹配）。
+func isSafeLocalCommand(args []string) bool {
+	if len(args) >= 2 && args[0] == "-c" {
+		cmd := " " + strings.ToLower(strings.TrimSpace(args[1])) + " "
+		for _, pat := range blockedCmdPatterns {
+			if strings.Contains(cmd, pat) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// maxSandboxOutput 限制单条沙箱命令捕获的 stdout/stderr 总量（1MB，对齐
+// pipeline 宿主 shell 工具 maxShellOutput），超限部分丢弃并附加截断标记，
+// 防止 `yes` 一类高输出命令在超时窗口内把宿主内存灌满。
+const maxSandboxOutput = 1 << 20
+
+// cappedBuffer 是上限缓冲 Writer：达到 max 后丢弃后续写入（不报错，避免
+// SIGPIPE 噪音）并标记截断，String() 在截断时附加提示。
+type cappedBuffer struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	max  int
+	trun bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.buf.Len() >= b.max {
+		b.trun = true
+		return len(p), nil
+	}
+	if b.buf.Len()+len(p) > b.max {
+		_, _ = b.buf.Write(p[:b.max-b.buf.Len()])
+		b.trun = true
+		return len(p), nil
+	}
+	return b.buf.Write(p)
+}
+
+func (b *cappedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.buf.String()
+	if b.trun {
+		s += "\n[输出超过 1MB 已截断]"
+	}
+	return s
+}
+
+// stringBuffer 是 dockerRun 输出参数的抽象：strings.Builder 与 cappedBuffer
+// 都满足（dockerOutput 等工具调用保持 strings.Builder，沙箱 Exec 用
+// cappedBuffer 限流）。
+type stringBuffer interface {
+	Write(p []byte) (int, error)
+	String() string
+}
+
 // LocalBooter executes commands as local subprocesses with restricted env,
 // backing the sandbox's /workspace onto a host directory. This gives a working
 // sandbox runtime without Docker: file operations are mapped into the host
@@ -200,6 +269,11 @@ func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workd
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", "", -1, err
 	}
+	// 本地沙箱无隔离：先做破坏性命令黑名单拦截（对齐 Python local.py 的
+	// _is_safe_command），命中即拒绝，避免 LLM 工具调用 rm -rf/mkfs 等。
+	if !isSafeLocalCommand(args) {
+		return "", "", -1, fmt.Errorf("blocked unsafe shell command")
+	}
 	// #nosec G204 -- 本地沙箱执行核心：cmd/args 由 Booter 从沙箱操作（LLM 给定的工具调用）构造，
 	// 环境变量已最小化（localBooterEnv 剔除敏感变量），工作目录限定在沙箱映射路径内。
 	c := exec.CommandContext(ctx, cmd, args...) // nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
@@ -208,7 +282,9 @@ func (b *LocalBooter) Exec(ctx context.Context, cmd string, args []string, workd
 	// 默认 exec 会继承宿主全部环境变量，沙箱内 `env` 可读到 ASTRBOT_*/API key
 	// 等敏感变量，这里全部剔除。
 	c.Env = localBooterEnv()
-	var stdout, stderr bytes.Buffer
+	// 输出有上限缓冲（maxSandboxOutput）：高输出命令只保留前 1MB。
+	var stdout, stderr cappedBuffer
+	stdout.max, stderr.max = maxSandboxOutput, maxSandboxOutput
 	c.Stdout = &stdout
 	c.Stderr = &stderr
 	err = c.Run()
@@ -486,7 +562,8 @@ func (b *DockerBooter) Exec(ctx context.Context, cmd string, args []string, work
 		dockerArgs = append(dockerArgs, cmd)
 		dockerArgs = append(dockerArgs, args...)
 	}
-	var stdout, stderr strings.Builder
+	var stdout, stderr cappedBuffer
+	stdout.max, stderr.max = maxSandboxOutput, maxSandboxOutput
 	code, err := dockerRun(ctx, dockerArgs, nil, &stdout, &stderr)
 	return stdout.String(), stderr.String(), code, err
 }
@@ -584,7 +661,7 @@ func dockerOutput(ctx context.Context, args ...string) (string, error) {
 
 // dockerRun executes the `docker` CLI, optionally feeding stdin, and captures
 // stdout/stderr. Returns the process exit code.
-func dockerRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr *strings.Builder) (int, error) {
+func dockerRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr stringBuffer) (int, error) {
 	bin := os.Getenv("ASTRBOT_DOCKER_BIN")
 	if bin == "" {
 		bin = "docker"

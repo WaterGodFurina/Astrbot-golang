@@ -26,6 +26,7 @@ type GroupChatContext struct {
 	locks      map[string]*sync.Mutex
 	rawRecords map[string]*list.List // umo -> records (front = oldest)
 	recordIDs  map[string]*list.List // umo -> record ids
+	lastSeen   map[string]time.Time  // umo -> last activity (idle eviction)
 }
 
 // NewGroupChatContext creates a group chat context tracker.
@@ -35,6 +36,7 @@ func NewGroupChatContext(config map[string]interface{}) *GroupChatContext {
 		locks:      make(map[string]*sync.Mutex),
 		rawRecords: make(map[string]*list.List),
 		recordIDs:  make(map[string]*list.List),
+		lastSeen:   make(map[string]time.Time),
 	}
 }
 
@@ -51,9 +53,30 @@ type groupContextCfg struct {
 	arWhitelist            []string
 }
 
+// groupContextIdleTTL 是群上下文记录的闲置淘汰时长：超过该时长没有新消息
+// 也没有 LLM 请求的 umo，其记录与锁表条目被清除（locks/rawRecords/
+// recordIDs 只增不删，长期运行内存缓慢增长；RemoveSession 目前无调用方）。
+const groupContextIdleTTL = 24 * time.Hour
+
+// pruneIdle removes records of sessions idle beyond groupContextIdleTTL.
+// Caller must hold g.mu.
+func (g *GroupChatContext) pruneIdle() {
+	cutoff := time.Now().Add(-groupContextIdleTTL)
+	for umo, last := range g.lastSeen {
+		if last.Before(cutoff) {
+			delete(g.locks, umo)
+			delete(g.rawRecords, umo)
+			delete(g.recordIDs, umo)
+			delete(g.lastSeen, umo)
+		}
+	}
+}
+
 func (g *GroupChatContext) getLock(umo string) *sync.Mutex {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.pruneIdle()
+	g.lastSeen[umo] = time.Now()
 	l := g.locks[umo]
 	if l == nil {
 		l = &sync.Mutex{}
@@ -341,8 +364,9 @@ func (g *GroupChatContext) formatMessage(event *core.Event, c groupContextCfg) s
 				b.WriteString(" [Image]")
 			}
 		case *message.At:
-			fmt.Fprintf(&b, " @%s", v.Name)
-			if v.Name == "" {
+			if v.Name != "" {
+				fmt.Fprintf(&b, " @%s", v.Name)
+			} else {
 				fmt.Fprintf(&b, " @%s", v.TargetID)
 			}
 		case *message.Record:

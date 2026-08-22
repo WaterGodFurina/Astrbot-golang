@@ -2,6 +2,8 @@ package plugin
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -392,6 +394,19 @@ func zigUnsupportedHint() error {
 		runtime.GOOS, runtime.GOARCH)
 }
 
+// zigArchiveSHA256 是默认 zig 版本（0.16.0）各平台归档的 sha256 校验值
+// （来源 https://ziglang.org/download/index.json），下载后校验再解压，防镜像
+// 被劫持时执行被篡改的编译器。自定义版本/镜像（ASTRBOT_CLANG_VERSION /
+// ASTRBOT_CLANG_MIRROR）的归档不在表内时跳过校验（best effort）。
+var zigArchiveSHA256 = map[string]string{
+	"zig-x86_64-linux-0.16.0.tar.xz":  "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+	"zig-aarch64-linux-0.16.0.tar.xz": "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
+	"zig-x86_64-macos-0.16.0.tar.xz":  "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7",
+	"zig-aarch64-macos-0.16.0.tar.xz": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+	"zig-x86_64-windows-0.16.0.zip":   "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e",
+	"zig-aarch64-windows-0.16.0.zip":  "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef",
+}
+
 // downloadClangArchive downloads the Clang archive to dest, trying each mirror
 // base in order and resuming an existing partial file via HTTP Range requests.
 // A 10-minute per-request timeout keeps a stalled mirror from hanging forever.
@@ -401,7 +416,13 @@ func downloadClangArchive(ctx context.Context, archive, dest string, progress fu
 		logger.I18nInfo("Clang 压缩包已缓存: %s", dest)
 		return nil
 	}
-	client := &http.Client{Timeout: 30 * time.Minute, CheckRedirect: safeRedirect}
+	client := &http.Client{
+		Timeout:       30 * time.Minute,
+		CheckRedirect: safeRedirect,
+		// 与 source.go 下载路径一致：pin 单次 DNS 解析结果，封死
+		// DNS-rebinding TOCTOU（safeRedirect 只复检主机名）。
+		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: pinnedDialContext()},
+	}
 	var lastErr error
 	for _, base := range zigMirrorBases() {
 		url := base + "/" + archive
@@ -410,6 +431,15 @@ func downloadClangArchive(ctx context.Context, archive, dest string, progress fu
 			logger.I18nWarn("从 %s 下载 Clang 失败: %v", url, err)
 			continue
 		}
+		// 完整性校验：默认版本归档在表内，校验失败即删除并换下一个镜像。
+		if sum, ok := zigArchiveSHA256[archive]; ok {
+			if err := verifySHA256(dest, sum); err != nil {
+				lastErr = fmt.Errorf("Clang 归档 sha256 校验失败: %w", err)
+				_ = os.Remove(dest)
+				logger.I18nWarn("从 %s 下载的 Clang 归档校验失败，已删除: %v", url, err)
+				continue
+			}
+		}
 		logger.I18nInfo("Clang 压缩包已从 %s 下载", url)
 		return nil
 	}
@@ -417,6 +447,24 @@ func downloadClangArchive(ctx context.Context, archive, dest string, progress fu
 		lastErr = fmt.Errorf("no mirror base configured")
 	}
 	return fmt.Errorf("下载 Clang 失败：%w。可手动安装 Clang/GCC 或设置 ASTRBOT_CLANG_BIN", lastErr)
+}
+
+// verifySHA256 校验文件的 sha256 与期望值一致（十六进制，大小写不敏感）。
+func verifySHA256(path, want string) error {
+	f, err := os.Open(path) // #nosec G304 -- 已下载的工具链归档路径
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("sha256 不匹配: 期望 %s 实际 %s", want, got)
+	}
+	return nil
 }
 
 // resumeDownload streams url into dest, resuming from the current file size via
@@ -462,6 +510,12 @@ func resumeDownload(ctx context.Context, client *http.Client, url, dest string, 
 	if total <= 0 {
 		total = 0
 	}
+	// 大小上限：zig 压缩包实际 ~60MB，300MB 上限仅防恶意镜像无限流量
+	//（与 source.go 下载路径的 maxDownloadSize 对应）。
+	const maxZigDownload int64 = 300 << 20
+	if offset+total > maxZigDownload {
+		return fmt.Errorf("download %s exceeds size limit (%d bytes)", url, maxZigDownload)
+	}
 	// Open append-only so a resumed range extends the partial file.
 	flag := os.O_CREATE | os.O_WRONLY
 	if offset > 0 {
@@ -477,18 +531,22 @@ func resumeDownload(ctx context.Context, client *http.Client, url, dest string, 
 
 	buf := make([]byte, 256*1024)
 	written := offset
+	limited := io.LimitReader(resp.Body, maxZigDownload-offset+1)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		n, rerr := resp.Body.Read(buf)
+		n, rerr := limited.Read(buf)
 		if n > 0 {
+			written += int64(n)
+			if written > maxZigDownload {
+				return fmt.Errorf("download %s exceeds size limit (%d bytes)", url, maxZigDownload)
+			}
 			if _, werr := f.Write(buf[:n]); werr != nil {
 				return werr
 			}
-			written += int64(n)
 			if progress != nil {
 				progress(written, offset+total)
 			}

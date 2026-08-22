@@ -420,7 +420,7 @@ export default {
   },
   methods: {
     openurl(url) {
-      window.open(url, '_blank');
+      window.open(url, '_blank', 'noopener,noreferrer');
     },
     getServers() {
       this.loadingGettingServers = true;

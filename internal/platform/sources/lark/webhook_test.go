@@ -2,10 +2,12 @@ package lark
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestWebhookChallenge: url_verification returns the challenge echo.
@@ -50,9 +52,9 @@ func TestWebhookEncryptedEvent(t *testing.T) {
 	body := `{"encrypt":"` + enc + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
 	// encrypt_key 配置后签名头缺失必须被拒绝 (M-27)。
-	req.Header.Set("X-Lark-Request-Timestamp", "1700000000")
+	req.Header.Set("X-Lark-Request-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
 	req.Header.Set("X-Lark-Request-Nonce", "nonce_1")
-	req.Header.Set("X-Lark-Signature", signatureForTest(t, encryptKey, "1700000000", "nonce_1", body))
+	req.Header.Set("X-Lark-Signature", signatureForTest(t, encryptKey, fmt.Sprintf("%d", time.Now().Unix()), "nonce_1", body))
 	w := httptest.NewRecorder()
 
 	got := ""
@@ -91,9 +93,9 @@ func TestWebhookEncryptedEventWrongSignature(t *testing.T) {
 	enc := encryptForTest(t, encryptKey, `{"header":{"event_type":"im.message.receive_v1"},"event":{}}`)
 	body := `{"encrypt":"` + enc + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
-	req.Header.Set("X-Lark-Request-Timestamp", "1700000000")
+	req.Header.Set("X-Lark-Request-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
 	req.Header.Set("X-Lark-Request-Nonce", "nonce_1")
-	req.Header.Set("X-Lark-Signature", "00"+signatureForTest(t, encryptKey, "1700000000", "nonce_1", body)[2:])
+	req.Header.Set("X-Lark-Signature", "00"+signatureForTest(t, encryptKey, fmt.Sprintf("%d", time.Now().Unix()), "nonce_1", body)[2:])
 	w := httptest.NewRecorder()
 	srv.HandleCallback(w, req)
 	if w.Code != http.StatusUnauthorized {
@@ -115,9 +117,9 @@ func TestWebhookDecryptInvalidLength(t *testing.T) {
 	for _, enc := range cases {
 		body := `{"encrypt":"` + enc + `"}`
 		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
-		req.Header.Set("X-Lark-Request-Timestamp", "1700000000")
+		req.Header.Set("X-Lark-Request-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
 		req.Header.Set("X-Lark-Request-Nonce", "nonce_1")
-		req.Header.Set("X-Lark-Signature", signatureForTest(t, encryptKey, "1700000000", "nonce_1", body))
+		req.Header.Set("X-Lark-Signature", signatureForTest(t, encryptKey, fmt.Sprintf("%d", time.Now().Unix()), "nonce_1", body))
 		w := httptest.NewRecorder()
 		srv.HandleCallback(w, req)
 		if w.Code != http.StatusBadRequest {

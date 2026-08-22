@@ -107,15 +107,17 @@ func (m *CronJobManager) SetNextRunFn(fn func(j *Job) (time.Time, error)) {
 	}
 }
 
-// Add schedules a job (persisted).
+// Add schedules a job (persisted). The job is snapshotted under the lock so
+// persist (and any later caller) never reads fields being written by tick.
 func (m *CronJobManager) Add(job *Job) {
 	m.mu.Lock()
 	job.Enabled = true
 	m.jobs[job.ID] = job
 	m.armJobLocked(job)
 	m.computeNextRunLocked(job, time.Now())
+	snapshot := job.clone()
 	m.mu.Unlock()
-	m.persist(job)
+	m.persist(snapshot)
 	logger.Debug("Scheduled job %s (%s) type=%s next=%v", job.ID, job.Name, job.JobType, job.NextRun)
 }
 
@@ -157,8 +159,9 @@ func (m *CronJobManager) UpdateJob(id string, mutate func(*Job)) bool {
 	mutate(job)
 	m.armJobLocked(job)
 	m.computeNextRunLocked(job, time.Now())
+	snapshot := job.clone()
 	m.mu.Unlock()
-	m.persist(job)
+	m.persist(snapshot)
 	return true
 }
 
@@ -187,7 +190,9 @@ func (m *CronJobManager) AddActiveJob(name, cronExpr string, payload map[string]
 		Payload:        payload,
 	}
 	m.Add(job)
-	return job, nil
+	// 返回副本（Get 在锁内 clone），调用方读 NextRun 等字段不会与 tick 的
+	// 持锁写竞争。
+	return m.Get(job.ID), nil
 }
 
 // Remove cancels a job (persisted).
@@ -202,35 +207,102 @@ func (m *CronJobManager) Remove(id string) {
 	}
 }
 
-// Get returns a job by id.
+// clone returns a copy of the job with a deep-copied Payload (nested maps and
+// slices included), so callers outside the manager lock cannot mutate (or race)
+// the live job state.
+func (j *Job) clone() *Job {
+	c := *j
+	c.Payload = deepCopyPayload(j.Payload)
+	return &c
+}
+
+func deepCopyPayload(m map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(m))
+	for k, v := range m {
+		out[k] = deepCopyPayloadValue(v)
+	}
+	return out
+}
+
+func deepCopyPayloadValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		return deepCopyPayload(val)
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i, e := range val {
+			out[i] = deepCopyPayloadValue(e)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// snapshotForFireLocked clones a job for fire-and-forget execution and rebinds
+// its handler to the snapshot, so the handler only reads the deep-copied
+// payload and never races UpdateJob's lock-protected writes (the original
+// Handler closure captures the live job pointer). Caller must hold m.mu.
+func (m *CronJobManager) snapshotForFireLocked(job *Job) *Job {
+	snap := job.clone()
+	if h, ok := m.handlers[job.JobType]; ok {
+		snap.Handler = func(ctx context.Context) error { return h(ctx, snap) }
+	} else {
+		snap.Handler = nil
+	}
+	return snap
+}
+
+// Get returns a job by id. The returned job is a copy: callers may read it
+// freely without racing the manager's lock-protected live state.
 func (m *CronJobManager) Get(id string) *Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.jobs[id]
+	job := m.jobs[id]
+	if job == nil {
+		return nil
+	}
+	return job.clone()
 }
 
 // RunNow immediately executes a job's handler in a background goroutine.
+// It shares the tick's anti-overlap semantics: a job that is already running
+// is rejected, and the handler runs against a locked-in snapshot so it never
+// races UpdateJob's writes.
 func (m *CronJobManager) RunNow(id string) error {
 	m.mu.Lock()
 	job := m.jobs[id]
-	runCtx := m.ctx
-	m.mu.Unlock()
 	if job == nil {
+		m.mu.Unlock()
 		return fmt.Errorf("job not found: %s", id)
 	}
 	if job.Handler == nil {
+		m.mu.Unlock()
 		return fmt.Errorf("job %s has no handler", id)
 	}
+	if job.running {
+		m.mu.Unlock()
+		return fmt.Errorf("job %s is already running", id)
+	}
+	job.running = true
+	snap := m.snapshotForFireLocked(job)
+	runCtx := m.ctx
+	m.mu.Unlock()
 	// 任务挂到 manager 的运行上下文：Start 传入的 ctx 被取消（或 Stop）时，
 	// 在途的 run-now 任务也能随之停止，而不是用无法取消的 Background。
 	if runCtx == nil {
 		runCtx = context.Background()
 	}
-	go func(j *Job) {
+	go func(live, j *Job) {
+		defer func() {
+			m.mu.Lock()
+			live.running = false
+			m.mu.Unlock()
+		}()
 		if err := j.Handler(runCtx); err != nil {
 			logger.Error("Cron job %s run-now failed: %v", j.ID, err)
 		}
-	}(job)
+	}(job, snap)
 	return nil
 }
 
@@ -279,9 +351,20 @@ func (m *CronJobManager) Stop() {
 // cronStopTimeout bounds how long Stop waits for in-flight cron jobs.
 const cronStopTimeout = 10 * time.Second
 
+// dueJob pairs the live job (for clearing the running flag) with the locked-in
+// snapshot the handler executes against.
+type dueJob struct {
+	live *Job
+	snap *Job
+}
+
 func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
+	// tick 自身计入 WaitGroup，使内部 per-job 的 wg.Add 全部发生在 Stop 的
+	// wg.Wait 观察到零计数之前（WaitGroup 约定），避免 Add 与 Wait 竞争。
+	m.wg.Add(1)
+	defer m.wg.Done()
 	m.mu.Lock()
-	due := []*Job{}
+	due := []dueJob{}
 	for _, job := range m.jobs {
 		if job.Handler == nil || !job.Enabled {
 			continue
@@ -294,7 +377,9 @@ func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 			logger.Debug("Cron job %s still running, skipping this tick", job.ID)
 			continue
 		}
-		due = append(due, job)
+		// 持锁阶段克隆快照：handler 只读触发时刻的任务快照（深拷贝 Payload），
+		// 不与 UpdateJob 的持锁写并发。
+		due = append(due, dueJob{live: job, snap: m.snapshotForFireLocked(job)})
 		job.running = true
 		// Advance next run.
 		if job.RunOnce {
@@ -310,20 +395,20 @@ func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 	}
 	m.mu.Unlock()
 
-	for _, job := range due {
+	for _, dj := range due {
 		m.wg.Add(1)
-		go func(j *Job) {
+		go func(live, j *Job) {
 			defer m.wg.Done()
 			// 无论成败都清掉 running 标志，让下一次到点能再次触发。
 			defer func() {
 				m.mu.Lock()
-				j.running = false
+				live.running = false
 				m.mu.Unlock()
 			}()
 			if err := j.Handler(ctx); err != nil {
 				logger.Error("Cron job %s failed: %v", j.ID, err)
 			}
-		}(job)
+		}(dj.live, dj.snap)
 	}
 }
 
@@ -508,13 +593,14 @@ func (m *CronJobManager) persist(job *Job) {
 	}
 }
 
-// List returns all scheduled jobs.
+// List returns all scheduled jobs. Each job is a copy (see clone), so the
+// caller can iterate without racing concurrent UpdateJob mutation.
 func (m *CronJobManager) List() []*Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	result := make([]*Job, 0, len(m.jobs))
 	for _, j := range m.jobs {
-		result = append(result, j)
+		result = append(result, j.clone())
 	}
 	return result
 }

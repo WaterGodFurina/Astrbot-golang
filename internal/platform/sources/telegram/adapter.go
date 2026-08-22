@@ -3,14 +3,15 @@
 package telegram
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,11 @@ type Adapter struct {
 	SelfID   string
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// workerMu 保护 workers；workers 按 chat_id 串行处理 update 的队列
+	//（见 dispatchUpdate）。
+	workerMu sync.Mutex
+	workers  map[string]chan map[string]interface{}
 }
 
 // New creates a Telegram adapter.
@@ -225,33 +231,37 @@ func (a *Adapter) sendMediaUpload(ctx context.Context, sessionID, method, field,
 	if err != nil {
 		return fmt.Errorf("open media %s: %w", filePath, err)
 	}
-	defer f.Close()
 
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile(field, filepath.Base(filePath))
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(part, f); err != nil {
-		return err
-	}
-	if err := writer.WriteField("chat_id", sessionID); err != nil {
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
+	// io.Pipe 流式构造 multipart 请求体，避免整个文件读入内存。
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	go func() {
+		defer f.Close()
+		defer pw.Close()
+		part, werr := writer.CreateFormFile(field, filepath.Base(filePath))
+		if werr != nil {
+			return
+		}
+		if _, werr = io.Copy(part, f); werr != nil {
+			return
+		}
+		if werr = writer.WriteField("chat_id", sessionID); werr != nil {
+			return
+		}
+		_ = writer.Close()
+	}()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", a.apiBase+"/"+method, body)
+	req, err := http.NewRequestWithContext(ctx, "POST", a.apiBase+"/"+method, pr)
 	if err != nil {
+		_ = pr.Close()
 		return err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := a.client.Do(req)
+	_ = pr.Close()
 	if err != nil {
-		return err
+		return fmt.Errorf("telegram %s upload request failed: %s", method, sanitizeURLErr(err))
 	}
 	defer resp.Body.Close()
 	var result map[string]interface{}
@@ -295,6 +305,8 @@ func (a *Adapter) pollLoop(ctx context.Context) {
 
 		updates, ok := resp["result"].([]interface{})
 		if !ok {
+			// 响应异常/空 result：短暂退避再轮询，避免空转轰炸。
+			time.Sleep(5 * time.Second)
 			continue
 		}
 
@@ -306,8 +318,65 @@ func (a *Adapter) pollLoop(ctx context.Context) {
 			if updateID, ok := updateMap["update_id"].(float64); ok {
 				offset = int(updateID) + 1
 			}
-			a.handleUpdate(ctx, updateMap)
+			a.dispatchUpdate(ctx, updateMap)
 		}
+	}
+}
+
+// dispatchUpdate 把 update 交给对应会话的 worker goroutine 串行处理
+// （每 chat_id 一个 channel + worker）：语音下载等慢操作不再阻塞轮询，
+// 同时保持同一会话内消息的处理顺序。
+func (a *Adapter) dispatchUpdate(ctx context.Context, update map[string]interface{}) {
+	chatID := ""
+	if msg, ok := update["message"].(map[string]interface{}); ok {
+		if chat, ok := msg["chat"].(map[string]interface{}); ok {
+			if id, ok := chat["id"].(float64); ok {
+				chatID = fmt.Sprintf("%d", int64(id))
+			}
+		}
+	}
+	if chatID == "" {
+		chatID = "unknown"
+	}
+	a.workerMu.Lock()
+	if a.workers == nil {
+		a.workers = make(map[string]chan map[string]interface{})
+	}
+	ch, ok := a.workers[chatID]
+	if !ok {
+		ch = make(chan map[string]interface{}, 64)
+		a.workers[chatID] = ch
+		go func(c chan map[string]interface{}) {
+			// 空闲超时自动退出并从 map 删除，避免常驻 goroutine 只增不减。
+			idle := time.NewTicker(workerIdleTimeout)
+			defer idle.Stop()
+			for {
+				select {
+				case <-idle.C:
+					a.workerMu.Lock()
+					if len(c) == 0 {
+						delete(a.workers, chatID)
+						a.workerMu.Unlock()
+						return
+					}
+					a.workerMu.Unlock()
+				case u, ok := <-c:
+					if !ok {
+						return
+					}
+					idle.Reset(workerIdleTimeout)
+					a.handleUpdate(ctx, u)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(ch)
+	}
+	a.workerMu.Unlock()
+	select {
+	case ch <- update:
+	default:
+		logger.Warn("Telegram chat %s 的 update 队列已满，丢弃 update_id=%v", chatID, update["update_id"])
 	}
 }
 
@@ -374,6 +443,44 @@ func (a *Adapter) handleUpdate(ctx context.Context, update map[string]interface{
 		}
 	}
 
+	// 图片/贴纸/文件/视频/视频笔记消息：经 getFile 下载到本地临时文件并构造组件，
+	// caption 作为 Plain 追加（对齐 Python 的 _apply_caption）。
+	if _, ok := msg["photo"]; ok {
+		if img := a.handlePhotoMessage(ctx, msg); img != nil {
+			chain.Chain = append(chain.Chain, img)
+		}
+		if caption, ok := msg["caption"].(string); ok && caption != "" {
+			chain.Chain = append(chain.Chain, &message.Plain{Text: caption})
+		}
+	} else if _, ok := msg["sticker"]; ok {
+		if img := a.handleStickerMessage(ctx, msg); img != nil {
+			chain.Chain = append(chain.Chain, img)
+		}
+		if st, ok := msg["sticker"].(map[string]interface{}); ok {
+			if emoji, _ := st["emoji"].(string); emoji != "" {
+				chain.Chain = append(chain.Chain, &message.Plain{Text: "Sticker: " + emoji})
+			}
+		}
+	} else if _, ok := msg["document"]; ok {
+		if f := a.handleDocumentMessage(ctx, msg); f != nil {
+			chain.Chain = append(chain.Chain, f)
+		}
+		if caption, ok := msg["caption"].(string); ok && caption != "" {
+			chain.Chain = append(chain.Chain, &message.Plain{Text: caption})
+		}
+	} else if _, ok := msg["video"]; ok {
+		if v := a.handleVideoMessage(ctx, msg); v != nil {
+			chain.Chain = append(chain.Chain, v)
+		}
+		if caption, ok := msg["caption"].(string); ok && caption != "" {
+			chain.Chain = append(chain.Chain, &message.Plain{Text: caption})
+		}
+	} else if _, ok := msg["video_note"]; ok {
+		if v := a.handleVideoNoteMessage(ctx, msg); v != nil {
+			chain.Chain = append(chain.Chain, v)
+		}
+	}
+
 	event := &core.Event{
 		Type: core.EventMessage,
 		Source: core.EventSource{
@@ -413,33 +520,8 @@ func (a *Adapter) handleAudioMessage(ctx context.Context, msg map[string]interfa
 	}
 	mimeType, _ := info["mime_type"].(string)
 
-	resp, err := a.apiCall(ctx, "getFile", map[string]interface{}{"file_id": fileID})
-	if err != nil {
-		logger.Warn("Telegram getFile 失败 (%s): %v", field, err)
-		return nil
-	}
-	result, ok := resp["result"].(map[string]interface{})
-	if !ok {
-		logger.Warn("Telegram getFile 返回异常 (%s)", field)
-		return nil
-	}
-	filePath, _ := result["file_path"].(string)
-	if filePath == "" {
-		logger.Warn("Telegram getFile 缺少 file_path (%s)", field)
-		return nil
-	}
-
-	tmp, err := os.CreateTemp("", "astrbot-tg-"+field+"-*")
-	if err != nil {
-		logger.Warn("创建 Telegram 音频临时文件失败 (%s): %v", field, err)
-		return nil
-	}
-	tmpName := tmp.Name()
-	_ = tmp.Close()
-
-	if err := utils.DownloadFile(ctx, a.fileBase+"/"+filePath, tmpName); err != nil {
-		logger.Warn("Telegram 音频文件下载失败 (%s): %v", field, err)
-		_ = os.Remove(tmpName)
+	tmpName := a.handleMediaDownload(ctx, fileID, field)
+	if tmpName == "" {
 		return nil
 	}
 
@@ -473,9 +555,142 @@ func (a *Adapter) handleAudioMessage(ctx context.Context, msg map[string]interfa
 	}
 }
 
+// handleMediaDownload 经 getFile 获取 Telegram 文件信息并下载到本地临时文件，
+// 返回临时文件路径；失败时返回空字符串。临时文件由 scheduleAudioCleanup 延迟清理。
+func (a *Adapter) handleMediaDownload(ctx context.Context, fileID, field string) string {
+	if fileID == "" {
+		logger.Warn("Telegram %s 消息缺少 file_id", field)
+		return ""
+	}
+	resp, err := a.apiCall(ctx, "getFile", map[string]interface{}{"file_id": fileID})
+	if err != nil {
+		logger.Warn("Telegram getFile 失败 (%s): %v", field, err)
+		return ""
+	}
+	result, ok := resp["result"].(map[string]interface{})
+	if !ok {
+		logger.Warn("Telegram getFile 返回异常 (%s)", field)
+		return ""
+	}
+	filePath, _ := result["file_path"].(string)
+	if filePath == "" {
+		logger.Warn("Telegram getFile 缺少 file_path (%s)", field)
+		return ""
+	}
+
+	tmp, err := os.CreateTemp("", "astrbot-tg-"+field+"-*")
+	if err != nil {
+		logger.Warn("创建 Telegram %s 临时文件失败: %v", field, err)
+		return ""
+	}
+	tmpName := tmp.Name()
+	_ = tmp.Close()
+
+	if err := utils.DownloadFile(ctx, a.fileBase+"/"+filePath, tmpName); err != nil {
+		logger.Warn("Telegram %s 文件下载失败: %v", field, err)
+		_ = os.Remove(tmpName)
+		return ""
+	}
+	scheduleAudioCleanup(tmpName)
+	return tmpName
+}
+
+// handlePhotoMessage 处理 Telegram 图片消息：取数组最后一个（最大尺寸）下载为 Image。
+func (a *Adapter) handlePhotoMessage(ctx context.Context, msg map[string]interface{}) *message.Image {
+	sizes, ok := msg["photo"].([]interface{})
+	if !ok || len(sizes) == 0 {
+		return nil
+	}
+	s, ok := sizes[len(sizes)-1].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	fileID, _ := s["file_id"].(string)
+	path := a.handleMediaDownload(ctx, fileID, "photo")
+	if path == "" {
+		return nil
+	}
+	return &message.Image{File: path, Path: path}
+}
+
+// handleStickerMessage 处理 Telegram 贴纸消息：动图/视频贴纸回退缩略图，附 emoji 文本。
+func (a *Adapter) handleStickerMessage(ctx context.Context, msg map[string]interface{}) *message.Image {
+	st, ok := msg["sticker"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	fileID := ""
+	if animated, _ := st["is_animated"].(bool); animated {
+		if thumb, ok := st["thumbnail"].(map[string]interface{}); ok {
+			fileID, _ = thumb["file_id"].(string)
+		}
+	} else if video, _ := st["is_video"].(bool); video {
+		if thumb, ok := st["thumbnail"].(map[string]interface{}); ok {
+			fileID, _ = thumb["file_id"].(string)
+		}
+	} else {
+		fileID, _ = st["file_id"].(string)
+	}
+	path := a.handleMediaDownload(ctx, fileID, "sticker")
+	if path == "" {
+		return nil
+	}
+	return &message.Image{File: path, Path: path}
+}
+
+// handleDocumentMessage 处理 Telegram 文件消息，构造 File 组件。
+func (a *Adapter) handleDocumentMessage(ctx context.Context, msg map[string]interface{}) *message.File {
+	doc, ok := msg["document"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	fileID, _ := doc["file_id"].(string)
+	name, _ := doc["file_name"].(string)
+	if name == "" {
+		name = fileID
+	}
+	path := a.handleMediaDownload(ctx, fileID, "document")
+	if path == "" {
+		return nil
+	}
+	return &message.File{Path: path, Name: name}
+}
+
+// handleVideoMessage 处理 Telegram 视频消息，构造 Video 组件。
+func (a *Adapter) handleVideoMessage(ctx context.Context, msg map[string]interface{}) *message.Video {
+	vid, ok := msg["video"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	fileID, _ := vid["file_id"].(string)
+	path := a.handleMediaDownload(ctx, fileID, "video")
+	if path == "" {
+		return nil
+	}
+	return &message.Video{Path: path}
+}
+
+// handleVideoNoteMessage 处理 Telegram 视频笔记消息，构造 Video 组件。
+func (a *Adapter) handleVideoNoteMessage(ctx context.Context, msg map[string]interface{}) *message.Video {
+	note, ok := msg["video_note"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	fileID, _ := note["file_id"].(string)
+	path := a.handleMediaDownload(ctx, fileID, "video_note")
+	if path == "" {
+		return nil
+	}
+	return &message.Video{Path: path}
+}
+
 // tempAudioCleanupDelay 是临时音频文件的清理延迟：消息在事件总线中异步处理，
 // 延迟清理保证文件在消费/转发期间可用。
 const tempAudioCleanupDelay = 30 * time.Minute
+
+// workerIdleTimeout 是每 chat worker 的空闲回收超时：超过该时间没有新 update
+// 且队列为空时，worker 自动退出并从 map 中删除，避免常驻 goroutine 累积。
+const workerIdleTimeout = 30 * time.Minute
 
 // scheduleAudioCleanup 在延迟后删除临时音频文件。
 func scheduleAudioCleanup(path string) {
@@ -550,7 +765,7 @@ func (a *Adapter) apiCall(ctx context.Context, method string, params map[string]
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("telegram %s request failed: %s", method, sanitizeURLErr(err))
 	}
 	defer resp.Body.Close()
 
@@ -564,5 +779,22 @@ func (a *Adapter) apiCall(ctx context.Context, method string, params map[string]
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
+	// HTTP 401/409/429 等错误也可能带 200 状态码：ok=false 时按失败处理，
+	// 否则 Send 会把失败响应当成功，pollLoop 也会对空 result 立即重发轰炸。
+	if ok, _ := result["ok"].(bool); !ok {
+		desc, _ := result["description"].(string)
+		return nil, fmt.Errorf("telegram %s failed: %s", method, desc)
+	}
+
 	return result, nil
+}
+
+// sanitizeURLErr 去除 *url.Error 中的完整 URL（bot token 内嵌于 URL），
+// 仅保留底层错误与操作名，避免 token 泄漏进日志。
+func sanitizeURLErr(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Sprintf("%s: %v", ue.Err, ue.Op)
+	}
+	return err.Error()
 }

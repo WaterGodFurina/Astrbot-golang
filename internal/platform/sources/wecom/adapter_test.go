@@ -86,7 +86,7 @@ func TestAdapterURLVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	timestamp := "1700000000"
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 	nonce := "noncexyz"
 	sig := a.crypto.GetSignature(timestamp, nonce, echostr)
 
@@ -123,7 +123,7 @@ func TestAdapterCallbackTextMessage(t *testing.T) {
 	plain := `<xml><ToUserName><![CDATA[corpid]]></ToUserName><FromUserName><![CDATA[zhangsan]]></FromUserName><CreateTime>1348831860</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[你好AstrBot]]></Content><MsgId>111222333</MsgId><AgentID>1000002</AgentID></xml>`
 	enc, _ := a.crypto.Encrypt(plain)
 	xmlBody := `<xml><Encrypt><![CDATA[` + enc + `]]></Encrypt></xml>`
-	timestamp := "1700000001"
+	timestamp := fmt.Sprintf("%d", time.Now().Unix())
 	nonce := "nonce1"
 	sig := a.crypto.GetSignature(timestamp, nonce, enc)
 
@@ -187,7 +187,7 @@ func TestWebhookPlatformInterface(t *testing.T) {
 
 	// GET 验证
 	echostr, _ := a.crypto.Encrypt("unified_echo")
-	ts := "1700000002"
+	ts := fmt.Sprintf("%d", time.Now().Unix())
 	nonce := "nn1"
 	sig := a.crypto.GetSignature(ts, nonce, echostr)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/webhooks/platforms/abc-123?msg_signature="+sig+"&timestamp="+ts+"&nonce="+nonce+"&echostr="+url.QueryEscape(echostr), nil)
@@ -201,7 +201,7 @@ func TestWebhookPlatformInterface(t *testing.T) {
 	plain := `<xml><ToUserName><![CDATA[corpid]]></ToUserName><FromUserName><![CDATA[lisi]]></FromUserName><CreateTime>1348831860</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[统一Webhook测试]]></Content><MsgId>999888777</MsgId><AgentID>1000002</AgentID></xml>`
 	enc, _ := a.crypto.Encrypt(plain)
 	xmlBody := `<xml><Encrypt><![CDATA[` + enc + `]]></Encrypt></xml>`
-	ts2 := "1700000003"
+	ts2 := fmt.Sprintf("%d", time.Now().Unix())
 	sig2 := a.crypto.GetSignature(ts2, nonce, enc)
 	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/platforms/abc-123?msg_signature="+sig2+"&timestamp="+ts2+"&nonce="+nonce, strings.NewReader(xmlBody))
 	w2 := httptest.NewRecorder()
@@ -369,6 +369,9 @@ func TestSendChainAppMode(t *testing.T) {
 
 // TestSendChainURLOnlyFileVideo URL-only 文件/视频组件应能解析下载并发送（回归 M-45）。
 func TestSendChainURLOnlyFileVideo(t *testing.T) {
+	// 发送链路 SSRF 防护默认拒绝回环地址：本地 httptest 服务需测试豁免。
+	platform.SafeDownloadAllowLoopback = true
+	t.Cleanup(func() { platform.SafeDownloadAllowLoopback = false })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/file.bin":

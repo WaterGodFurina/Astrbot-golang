@@ -84,9 +84,22 @@ type Event struct {
 	Trace *log.TraceSpan
 }
 
-// UnifiedMsgOrigin returns platform:conversation_id.
+// UnifiedMsgOrigin returns the three-part unified_msg_origin
+// "platform_id:MessageType:session_id" (mirrors MessageSession.__str__ in the
+// original AstrBot). The host uses this form everywhere as the session key —
+// conversations, session rules, cron targets, session waiter and plugin SDK
+// all share the same format, so no conversion is needed at any boundary.
 func (e *Event) UnifiedMsgOrigin() string {
-	return fmt.Sprintf("%s:%s", e.Source.Platform, e.Source.ConvID)
+	platformID := e.Source.PlatformID
+	if platformID == "" {
+		platformID = e.Source.Platform
+	}
+	mt := ""
+	if e.MessageObj != nil {
+		mt = e.MessageObj.MessageType
+	}
+	msgType := pythonMessageType(mt, e.Source.IsGroup)
+	return fmt.Sprintf("%s:%s:%s", platformID, msgType, e.Source.ConvID)
 }
 
 // pythonMessageType maps the host message-type value to the Python
@@ -112,24 +125,12 @@ func pythonMessageType(messageType string, isGroup bool) string {
 }
 
 // PythonUMO returns the Python-sdk style three-part unified_msg_origin
-// "platform_id:MessageType:session_id" (mirrors MessageSession.__str__ in the
-// original AstrBot). It is used wherever an event must align with the
-// Python plugin's unified_msg_origin key (SessionWaitStage, CoreEventToSDK).
-// The two-part UnifiedMsgOrigin() is kept for host-internal session keys.
+// (alias of UnifiedMsgOrigin — the host session key IS the three-part form).
 func (e *Event) PythonUMO() string {
-	platformID := e.Source.PlatformID
-	if platformID == "" {
-		platformID = e.Source.Platform
-	}
-	mt := ""
-	if e.MessageObj != nil {
-		mt = e.MessageObj.MessageType
-	}
-	msgType := pythonMessageType(mt, e.Source.IsGroup)
-	return fmt.Sprintf("%s:%s:%s", platformID, msgType, e.Source.ConvID)
+	return e.UnifiedMsgOrigin()
 }
 
-// GetUnifiedMsgOrigin returns platform:conversation_id (alias).
+// GetUnifiedMsgOrigin returns the three-part unified_msg_origin (alias).
 func (e *Event) GetUnifiedMsgOrigin() string {
 	return e.UnifiedMsgOrigin()
 }
@@ -338,6 +339,7 @@ func (bus *EventBus) Start(ctx context.Context) error {
 			return nil
 		}
 		event := bus.queue[0]
+		bus.queue[0] = nil // release the head reference so the backing array can be GC'd
 		bus.queue = bus.queue[1:]
 		bus.cond.Broadcast() // wake blocked publishers
 		bus.queueMu.Unlock()

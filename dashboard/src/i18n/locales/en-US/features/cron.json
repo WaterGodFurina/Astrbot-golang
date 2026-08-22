@@ -156,6 +156,7 @@
     "updateFailed": "Failed to update",
     "deleteSuccess": "Deleted",
     "deleteFailed": "Failed to delete",
+    "deleteConfirm": "Delete task {name}? This cannot be undone.",
     "nameRequired": "Task name is required",
     "sessionRequired": "Delivery target is required",
     "noteRequired": "Task requirements are required",

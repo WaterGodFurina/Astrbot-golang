@@ -73,6 +73,9 @@ func (c *KeywordChecker) SetKeywords(kws []string) {
 type StrategySelector struct {
 	checkers []Checker
 	enabled  bool
+	// degraded reports that a configured strategy is present but not actually
+	// enforced (e.g. baidu_aip enabled in a build without the SDK tag).
+	degraded bool
 }
 
 // NewStrategySelector creates a selector from the content_safety config map.
@@ -106,6 +109,7 @@ func NewStrategySelector(config map[string]interface{}) *StrategySelector {
 				// baidu-aip 依赖，也不报错）。
 				if !baiduAipSDKEnabled {
 					logger.Error("baidu_aip 已开启，但未编译官方 golang-sdk。请执行 `go get github.com/Baidu-AIP/golang-sdk` 后以 `-tags baidu_aip` 重新编译。当前将 fail-open 不拦截消息。")
+					s.degraded = true
 				}
 				s.checkers = append(s.checkers, NewBaiduAipChecker(appID, apiKey, secretKey))
 				s.enabled = true
@@ -130,4 +134,11 @@ func (s *StrategySelector) Check(text string) (bool, string) {
 // IsEnabled returns true if any content safety strategy is active.
 func (s *StrategySelector) IsEnabled() bool {
 	return s.enabled
+}
+
+// HasDegradedStrategy reports whether a configured strategy is present but not
+// actually enforced (e.g. baidu_aip enabled in a build without the SDK tag, so
+// Check fails open). Lets the WebUI surface "configured but not effective".
+func (s *StrategySelector) HasDegradedStrategy() bool {
+	return s.degraded
 }

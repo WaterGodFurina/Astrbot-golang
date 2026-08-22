@@ -486,13 +486,20 @@ func handleSatoriElement(d *xml.Decoder, start xml.StartElement, elements *[]mes
 
 // skipElement 跳过当前元素的完整子树（包括其 EndElement）。
 func skipElement(d *xml.Decoder) error {
+	depth := 0
 	for {
 		tok, err := d.Token()
 		if err != nil {
 			return err
 		}
-		if _, ok := tok.(xml.EndElement); ok {
-			return nil
+		switch tok.(type) {
+		case xml.StartElement:
+			depth++
+		case xml.EndElement:
+			if depth == 0 {
+				return nil
+			}
+			depth--
 		}
 	}
 }
@@ -684,15 +691,15 @@ func convertComponentToSatori(comp message.Component) string {
 		return text
 	case *message.At:
 		if c.TargetID != "" {
-			return fmt.Sprintf(`<at id="%s"/>`, c.TargetID)
+			return fmt.Sprintf(`<at id="%s"/>`, escapeAttrValue(c.TargetID))
 		}
 		if c.Name != "" {
-			return fmt.Sprintf(`<at name="%s"/>`, c.Name)
+			return fmt.Sprintf(`<at name="%s"/>`, escapeAttrValue(c.Name))
 		}
 	case *message.Image:
 		dataURL, err := imageToDataURL(c)
 		if err == nil && dataURL != "" {
-			return fmt.Sprintf(`<img src="%s"/>`, dataURL)
+			return fmt.Sprintf(`<img src="%s"/>`, escapeAttrValue(dataURL))
 		}
 		logger.Error("图片转换为base64失败: %v", err)
 	case *message.File:
@@ -704,15 +711,15 @@ func convertComponentToSatori(comp message.Component) string {
 		if ref == "" {
 			ref = c.Path
 		}
-		return fmt.Sprintf(`<file src="%s" name="%s"/>`, ref, name)
+		return fmt.Sprintf(`<file src="%s" name="%s"/>`, escapeAttrValue(ref), escapeAttrValue(name))
 	case *message.Record:
 		b64, err := recordToBase64(c)
 		if err == nil && b64 != "" {
-			return fmt.Sprintf(`<audio src="data:audio/wav;base64,%s"/>`, b64)
+			return fmt.Sprintf(`<audio src="data:audio/wav;base64,%s"/>`, escapeAttrValue(b64))
 		}
 		logger.Error("语音转换为base64失败: %v", err)
 	case *message.Reply:
-		return fmt.Sprintf(`<reply id="%s"/>`, c.MessageID)
+		return fmt.Sprintf(`<reply id="%s"/>`, escapeAttrValue(c.MessageID))
 	case *message.Video:
 		// 优先 URL：<video src> 是交给 Satori 网关解析的资源引用，materialize
 		// 会把同一 URL 同时填充为本地临时 Path，而该临时文件在 Send 返回后即被
@@ -724,9 +731,9 @@ func convertComponentToSatori(comp message.Component) string {
 		if ref == "" {
 			ref = c.FileID
 		}
-		return fmt.Sprintf(`<video src="%s"/>`, ref)
+		return fmt.Sprintf(`<video src="%s"/>`, escapeAttrValue(ref))
 	case *message.Forward:
-		return fmt.Sprintf(`<message id="%s" forward/>`, c.ID)
+		return fmt.Sprintf(`<message id="%s" forward/>`, escapeAttrValue(c.ID))
 	}
 	// 对于其他未处理的组件类型，返回空字符串
 	return ""
@@ -747,10 +754,10 @@ func convertNodeToSatori(node *message.Node) string {
 	// 构建 Satori 格式的转发节点
 	authorAttrs := []string{}
 	if node.UIN != "" {
-		authorAttrs = append(authorAttrs, fmt.Sprintf(`id="%s"`, node.UIN))
+		authorAttrs = append(authorAttrs, fmt.Sprintf(`id="%s"`, escapeAttrValue(node.UIN)))
 	}
 	if node.Name != "" {
-		authorAttrs = append(authorAttrs, fmt.Sprintf(`name="%s"`, node.Name))
+		authorAttrs = append(authorAttrs, fmt.Sprintf(`name="%s"`, escapeAttrValue(node.Name)))
 	}
 	return fmt.Sprintf(`<message><author %s/>%s</message>`, strings.Join(authorAttrs, " "), s)
 }
@@ -776,11 +783,26 @@ func convertNodesToSatori(nodes *message.Nodes) string {
 // maxMediaDownloadSize 限制发送时下载外部媒体的大小上限。
 const maxMediaDownloadSize = 20 << 20
 
-// mediaHTTPClient 用于发送时下载外部媒体（带超时，避免 DefaultClient 永久挂起）。
-var mediaHTTPClient = &http.Client{Timeout: 30 * time.Second}
+// mediaHTTPClient 用于发送时下载外部媒体（带超时，避免 DefaultClient 永久挂起；
+// 重定向的每一跳重新做主机校验，防跨主机跳转绕过 SSRF 防线）。
+var mediaHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("too many redirects")
+		}
+		if !platform.MediaHostAllowed(req.URL.String()) {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	},
+}
 
 // fetchMedia 下载媒体 URL 并返回内容与最终 URL 路径（供 MIME 推断）。
 func fetchMedia(rawURL string) ([]byte, string, error) {
+	if !platform.MediaHostAllowed(rawURL) {
+		return nil, "", fmt.Errorf("媒体地址被拒绝: %s", rawURL)
+	}
 	resp, err := mediaHTTPClient.Get(rawURL)
 	if err != nil {
 		return nil, "", err

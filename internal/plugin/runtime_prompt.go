@@ -31,11 +31,13 @@ var goSDKMirrors = []string{
 	"https://mirrors.aliyun.com/golang",
 }
 
-// pythonMirrors 是 CPython（python-build-standalone）的下载镜像列表（前缀
-// 风格：镜像前缀直接拼在官方 URL 之前）。构造 Python 下载确认弹窗时随 prompt
-// 返回。
-var pythonMirrors = []string{
-	"https://github.com/astral-sh/python-build-standalone/releases/download",
+// pythonPrimaryURL 是 CPython（python-build-standalone）的官方/主下载地址
+// （base 风格：直接拼版本与归档名）。作为"加速地址"单独列出，可编辑替换。
+const pythonPrimaryURL = "https://github.com/astral-sh/python-build-standalone/releases/download"
+
+// pythonMirrorPrefixes 是 CPython 下载的加速镜像列表（前缀风格：镜像前缀
+// 直接拼在官方完整 URL 之前，如 https://gh-proxy.com/<官方完整 URL>）。
+var pythonMirrorPrefixes = []string{
 	"https://gh-proxy.com/",
 	"https://ghfast.top/",
 	"https://ghproxy.net/",
@@ -46,12 +48,18 @@ var pythonMirrors = []string{
 type RuntimePromptError struct {
 	Kind    RuntimePromptKind `json:"kind"`
 	Android bool              `json:"android"` // runtime.GOOS == "android"
-	// Mirrors 是可供用户选择的下载镜像列表（Go 为 base URL 风格，CPython 为
-	// 前缀风格）。用户选中后随 GoChoice/PythonChoice 一起回传。
+	// Primary 是主下载地址（"加速地址"）：Go 为官方 dl 镜像，CPython 为
+	// python-build-standalone 官方 URL。前端单独列出，可编辑替换。
+	Primary string `json:"primary,omitempty"`
+	// Mirrors 是可供用户选择的加速下载镜像列表（前缀风格）。用户选中后随
+	// GoChoice/PythonChoice 一起回传。
 	Mirrors []string `json:"mirrors"`
 	// Message 是可选的定制提示文案（如"系统 Python 版本过低"场景）；空时用
 	// Error() 的默认文案。
 	Message string `json:"message,omitempty"`
+	// Command 是 Android/Termux 下建议用户执行的补救命令（前端 code 块展示
+	// 并提供复制按钮）。
+	Command string `json:"command,omitempty"`
 }
 
 func (e *RuntimePromptError) Error() string {
@@ -61,7 +69,13 @@ func (e *RuntimePromptError) Error() string {
 	if e.Android {
 		switch e.Kind {
 		case RuntimePromptPython:
-			return "无法准备 Python 运行时。请在 Termux 中执行 pkg install python 后重试，或选择自动下载 CPython"
+			// Android/Termux 上 Python 运行时准备失败的常见根因：宿主基础
+			// 依赖里的 C 扩展包（grpcio/cryptography/pillow/psutil）在
+			// Termux 无预编译 wheel、pip 本地编译失败——而非缺解释器本身。
+			// 这 4 个包 Termux 官方仓库有预编译包；其余依赖均为纯 Python/
+			// 有 wheel，pip 直接装无需 clang。
+			e.Command = "pkg install python python-grpcio python-cryptography python-pillow python-psutil"
+			return "无法准备 Python 插件运行环境：缺少 C 扩展依赖的预编译包"
 		default:
 			return "未检测到可用的 Go 工具链/SDK。请在 Termux 中执行 pkg install golang 后重试，或选择自动下载 Go 工具链"
 		}
@@ -80,7 +94,8 @@ func newRuntimePromptError(kind RuntimePromptKind, android bool) *RuntimePromptE
 	e := &RuntimePromptError{Kind: kind, Android: android}
 	switch kind {
 	case RuntimePromptPython:
-		e.Mirrors = pythonMirrors
+		e.Primary = pythonPrimaryURL
+		e.Mirrors = pythonMirrorPrefixes
 	default:
 		e.Mirrors = goSDKMirrors
 	}
@@ -174,8 +189,12 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 		goBin = b
 	}
 	// SDK 已可 resolve（ASTRBOT_GO_SDK / 本地 replace / 模块缓存）→ 无需下载。
+	logger.Debug("SDK 解析：使用 go=%s 探测 SDK（版本来自宿主 go.mod）", goBin)
 	if _, err := findSDKDirWithGo(goBin); err == nil {
+		logger.Debug("SDK 解析：SDK 已可 resolve，跳过下载")
 		return nil
+	} else {
+		logger.Debug("SDK 解析：SDK 未 resolve: %v，准备下载", err)
 	}
 	if opts.Stage != nil {
 		opts.Stage("下载插件 SDK…")
@@ -188,12 +207,13 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 			version = sdkRequireFromGoMod(data)
 		}
 	}
-	target := sdkModulePath
-	if version != "" {
-		target += "@" + version
-	} else {
-		target += "@latest"
+	// 发布版宿主 CWD 下没有 go.mod：回退内置 SDK 版本常量（与 go.mod require
+	// 同步），保证 go mod download 与后续模块缓存定位使用同一版本。
+	if version == "" {
+		version = sdkModuleVersion
+		logger.Debug("SDK 解析：未找到宿主 go.mod，使用内置 SDK 版本 %s", version)
 	}
+	target := sdkModulePath + "@" + version
 	tmp, err := os.MkdirTemp("", "astrbot-go-sdk-*")
 	if err != nil {
 		return err
@@ -203,6 +223,7 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module astrbot-sdk-download\n\ngo 1.23\n"), 0o644); err != nil { // #nosec G306 -- 临时模块文件，常规权限即可
 		return err
 	}
+	logger.Debug("SDK 解析：执行 go mod download %s（GOPROXY=%s）", target, m.compiler.goproxyEnv())
 	cmd := exec.CommandContext(ctx, goBin, "mod", "download", target) // #nosec G204 -- 下载固定的插件 SDK 模块（target 由固定 module path + 宿主 go.mod 版本拼装）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = tmp
 	cmd.Env = append(os.Environ(),
@@ -211,13 +232,17 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		logger.Debug("SDK 解析：go mod download 失败: %v\n%s", err, strings.TrimSpace(string(out)))
 		return fmt.Errorf("下载插件 SDK 失败: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
+	logger.Debug("SDK 解析：go mod download 成功（%s）", target)
 	// 校验下载后 SDK 确实可 resolve，否则后续 Prepare 仍会失败（给出明确错误
 	// 而非笼统的 "no go.mod with the AstrBot SDK replace found"）。
 	if _, err := findSDKDirWithGo(goBin); err != nil {
+		logger.Debug("SDK 解析：下载后仍无法 resolve: %v", err)
 		return fmt.Errorf("插件 SDK 下载后仍无法解析: %w", err)
 	}
+	logger.Debug("SDK 解析：SDK 下载后可 resolve")
 	return nil
 }
 
@@ -232,7 +257,7 @@ func (m *SubprocessManager) pythonRuntimeForInstall(opts InstallOptions) (*pysdk
 	switch choice {
 	case "cancel":
 		if runtime.GOOS == "android" {
-			return nil, errors.New("已取消安装：请先在 Termux 中执行 pkg install python 安装 Python，然后重新安装该插件")
+			return nil, errors.New("已取消安装：请先在 Termux 中执行 pkg install python python-grpcio python-cryptography python-pillow python-psutil 后重试")
 		}
 		return nil, errors.New("已取消安装：请先手动安装 Python（或允许自动下载 CPython）后再安装该插件")
 	case "":
@@ -242,7 +267,8 @@ func (m *SubprocessManager) pythonRuntimeForInstall(opts InstallOptions) (*pysdk
 			return nil, &RuntimePromptError{
 				Kind:    RuntimePromptPython,
 				Android: runtime.GOOS == "android",
-				Mirrors: pythonMirrors,
+				Primary: pythonPrimaryURL,
+				Mirrors: pythonMirrorPrefixes,
 				Message: fmt.Sprintf("检测到系统 Python %s 版本过低，将自动下载 CPython 3.12", tooLow),
 			}
 		}

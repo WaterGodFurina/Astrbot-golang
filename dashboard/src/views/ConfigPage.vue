@@ -226,6 +226,7 @@ import {
 import UnsavedChangesConfirmDialog from '@/components/config/UnsavedChangesConfirmDialog.vue';
 import DashboardTwoFactorDialog from '@/components/shared/DashboardTwoFactorDialog.vue';
 import { normalizeTextInput } from '@/utils/inputValue';
+import { removeToken } from '@/utils/token';
 
 export default {
   name: 'ConfigPage',
@@ -301,10 +302,6 @@ export default {
       };
     },
     // 检查配置是否变化
-    configHasChanges() {
-      if (!this.originalConfigData || !this.config_data) return false;
-      return JSON.stringify(this.originalConfigData) !== JSON.stringify(this.config_data);
-    },
     configInfoNameList() {
       return this.configInfoList.map(info => info.name);
     },
@@ -343,14 +340,6 @@ export default {
   watch: {
     config_data_str(val) {
       this.config_data_has_changed = true;
-    },
-    config_data: {
-      deep: true,
-      handler() {
-        if (this.fetched) {
-          this.hasUnsavedChanges = this.configHasChanges;
-        }
-      }
     },
     async '$route.fullPath'(newVal) {
       if (this.extractConfigTypeFromHash(newVal) === 'system') {
@@ -416,8 +405,8 @@ export default {
 
       // 未保存的更改状态
       hasUnsavedChanges: false,
-      // 存储原始配置
-      originalConfigData: null,
+      // getConfig 请求序号，用于丢弃过期响应（防竞态）
+      configRequestId: 0,
     }
   },
   mounted() {
@@ -438,13 +427,6 @@ export default {
     
     // 监听语言切换事件，重新加载配置以获取插件的 i18n 数据
     window.addEventListener('astrbot-locale-changed', this.handleLocaleChange);
-
-    // 保存初始配置
-    this.$watch('config_data', (newVal) => {
-      if (!this.originalConfigData && newVal) {
-        this.originalConfigData = JSON.parse(JSON.stringify(newVal));
-      }
-    }, { immediate: false, deep: true });
   },
 
   beforeUnmount() {
@@ -514,12 +496,14 @@ export default {
       });
     },
     getConfig(abconf_id) {
+      const requestId = ++this.configRequestId;
       this.fetched = false
       const request = this.isSystemConfig
         ? systemConfigApi.get()
         : configProfileApi.get(abconf_id || this.selectedConfigID);
 
       request.then((res) => {
+        if (requestId !== this.configRequestId) return; // 过期响应直接丢弃
         this.config_data = res.data.data.config;
         this.lastSavedConfigSnapshot = this.getConfigSnapshot(this.config_data);
         this.fetched = true
@@ -527,13 +511,13 @@ export default {
         this.configContentKey += 1;
         // 获取配置后更新
           this.$nextTick(() => {
-            this.originalConfigData = JSON.parse(JSON.stringify(this.config_data));
             this.hasUnsavedChanges = false;
             if (!this.isSystemConfig) {
               this.currentConfigId = abconf_id || this.selectedConfigID;
             }
           });
       }).catch((err) => {
+        if (requestId !== this.configRequestId) return;
         this.save_message = this.messages.loadError;
         this.save_message_snack = true;
         this.save_message_success = "error";
@@ -576,6 +560,14 @@ export default {
           this.configSave2faError = this.tmMeta('system_group.system.dashboard.totp.configSaveError');
           this.configSave2faDialogVisible = true;
           return { success: false, requires2fa: true };
+        }
+
+        if (res.status === 401) {
+          // 普通鉴权失败（非 TOTP 流程）：清除本地凭证并引导重新登录
+          removeToken();
+          localStorage.removeItem('user');
+          window.location.hash = '/auth/login';
+          return { success: false };
         }
 
         if (res.data.status === "ok") {
@@ -649,7 +641,6 @@ export default {
     // 重置未保存状态
     onConfigSaved() {
       this.hasUnsavedChanges = false;
-      this.originalConfigData = JSON.parse(JSON.stringify(this.config_data));
     },
 
     configToString() {

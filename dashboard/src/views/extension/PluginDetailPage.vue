@@ -7,7 +7,6 @@ import {
   ref,
   watch,
 } from "vue";
-import axios from "axios";
 import DOMPurify from "dompurify";
 import MarkdownIt from "markdown-it";
 import defaultPluginIcon from "/favicon.svg";
@@ -96,6 +95,8 @@ const changelogLoading = ref(false);
 const changelogError = ref("");
 const changelogEmpty = ref(false);
 const renderedChangelog = ref("");
+let readmeRequestId = 0;
+let changelogRequestId = 0;
 const expandedCommandGroups = ref(new Set());
 const logoLoadFailed = ref(false);
 const detailPageRef = ref(null);
@@ -185,6 +186,17 @@ const authorWebsite = computed(() => {
 const repoUrl = computed(
   () => pluginData.value?.repo || props.marketPlugin?.repo || "",
 );
+
+// 插件语言：优先用后端 language 字段，否则从插件 id 后缀（_go/_python）推断。
+const languageDisplay = computed(() => {
+  const lang = String(pluginData.value?.language || "").toLowerCase();
+  if (lang === "python") return "python";
+  if (lang === "go" || lang === "golang") return "golang";
+  const id = String(pluginData.value?.id || "");
+  if (/_python$/i.test(id)) return "python";
+  if (/_go$/i.test(id)) return "golang";
+  return "";
+});
 
 const firstPresentValue = (...values) =>
   values.find(
@@ -310,6 +322,11 @@ const infoRows = computed(() => {
       label: tm("detail.info.repository"),
       value: repoUrl.value,
       href: repoUrl.value,
+      optional: true,
+    },
+    {
+      label: tm("detail.info.pluginLanguage"),
+      value: languageDisplay.value,
       optional: true,
     },
   ];
@@ -631,17 +648,32 @@ const getDocumentUrl = (fieldName) => {
 };
 
 const fetchRemoteMarkdown = async (url) => {
-  const res = await axios.get(url, {
-    responseType: "text",
-    transformResponse: [(data) => data],
+  // 第三方可控 URL：使用不带鉴权拦截器的裸 fetch（并仅放行 http/https），
+  // 杜绝 dashboard 凭证随 readme_url 外泄。
+  let parsed;
+  try {
+    parsed = new URL(url, window.location.origin);
+  } catch {
+    throw new Error("Invalid readme URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Invalid readme URL protocol");
+  }
+  const res = await window.fetch(parsed.toString(), {
+    method: "GET",
+    headers: { Accept: "text/plain,text/markdown,*/*" },
   });
-  return typeof res.data === "string" ? res.data : String(res.data || "");
+  if (!res.ok) {
+    throw new Error(`Failed to fetch readme: ${res.status}`);
+  }
+  return await res.text();
 };
 
 const fetchReadme = async () => {
   const plugin = pluginData.value || {};
   if (!plugin?.name) return;
 
+  const requestId = ++readmeRequestId;
   readmeLoading.value = true;
   readmeError.value = "";
   readmeEmpty.value = false;
@@ -650,6 +682,7 @@ const fetchReadme = async () => {
   if (isMarketDetail.value) {
     const readmeUrl = getDocumentUrl("readme_url");
     if (!readmeUrl) {
+      if (requestId !== readmeRequestId) return;
       readmeEmpty.value = true;
       readmeLoading.value = false;
       return;
@@ -657,15 +690,17 @@ const fetchReadme = async () => {
 
     try {
       const content = await fetchRemoteMarkdown(readmeUrl);
+      if (requestId !== readmeRequestId) return;
       if (!content.trim()) {
         readmeEmpty.value = true;
         return;
       }
       renderedReadme.value = renderMarkdown(content);
     } catch (err) {
-      readmeError.value = err?.message || String(err);
+      if (requestId === readmeRequestId)
+        readmeError.value = err?.message || String(err);
     } finally {
-      readmeLoading.value = false;
+      if (requestId === readmeRequestId) readmeLoading.value = false;
     }
     return;
   }
@@ -702,6 +737,7 @@ const fetchReadme = async () => {
       }),
       new Promise((resolve) => setTimeout(() => resolve(TIMEOUT), 10000)),
     ]);
+    if (requestId !== readmeRequestId) return;
 
     if (content === TIMEOUT) {
       readmeEmpty.value = true;
@@ -716,9 +752,10 @@ const fetchReadme = async () => {
     }
     renderedReadme.value = renderMarkdown(text);
   } catch (err) {
-    readmeError.value = err?.message || String(err);
+    if (requestId === readmeRequestId)
+      readmeError.value = err?.message || String(err);
   } finally {
-    readmeLoading.value = false;
+    if (requestId === readmeRequestId) readmeLoading.value = false;
   }
 };
 
@@ -726,6 +763,7 @@ const fetchChangelog = async () => {
   const plugin = pluginData.value || {};
   if (!plugin?.name) return;
 
+  const requestId = ++changelogRequestId;
   changelogLoading.value = true;
   changelogError.value = "";
   changelogEmpty.value = false;
@@ -734,6 +772,7 @@ const fetchChangelog = async () => {
   if (isMarketDetail.value) {
     const changelogUrl = getDocumentUrl("changelog_url");
     if (!changelogUrl) {
+      if (requestId !== changelogRequestId) return;
       changelogEmpty.value = true;
       changelogLoading.value = false;
       return;
@@ -741,21 +780,24 @@ const fetchChangelog = async () => {
 
     try {
       const content = await fetchRemoteMarkdown(changelogUrl);
+      if (requestId !== changelogRequestId) return;
       if (!content.trim()) {
         changelogEmpty.value = true;
         return;
       }
       renderedChangelog.value = renderMarkdown(content);
     } catch (err) {
-      changelogError.value = err?.message || String(err);
+      if (requestId === changelogRequestId)
+        changelogError.value = err?.message || String(err);
     } finally {
-      changelogLoading.value = false;
+      if (requestId === changelogRequestId) changelogLoading.value = false;
     }
     return;
   }
 
   try {
     const res = await pluginApi.changelog(plugin.name);
+    if (requestId !== changelogRequestId) return;
 
     if (res.data.status !== "ok") {
       changelogError.value = res.data.message || tm("messages.operationFailed");
@@ -770,9 +812,10 @@ const fetchChangelog = async () => {
 
     renderedChangelog.value = renderMarkdown(content);
   } catch (err) {
-    changelogError.value = err?.message || String(err);
+    if (requestId === changelogRequestId)
+      changelogError.value = err?.message || String(err);
   } finally {
-    changelogLoading.value = false;
+    if (requestId === changelogRequestId) changelogLoading.value = false;
   }
 };
 

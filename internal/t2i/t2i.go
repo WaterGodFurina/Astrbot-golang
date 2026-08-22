@@ -31,7 +31,9 @@ func NewRenderer(tmplDir string) *Renderer {
 		enabled:   true,
 	}
 	// Try to load default template
-	r.LoadTemplate("default", "default.html")
+	if err := r.LoadTemplate("default", "default.html"); err != nil {
+		logger.Debug("t2i default template not loaded: %v", err)
+	}
 	return r
 }
 
@@ -74,10 +76,14 @@ func (r *Renderer) Render(text, templateName string) (string, error) {
 
 // IsEnabled returns true if T2I is enabled.
 func (r *Renderer) IsEnabled() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.enabled
 }
 
 // SetEnabled enables/disables T2I.
 func (r *Renderer) SetEnabled(enabled bool) {
+	r.mu.Lock()
 	r.enabled = enabled
+	r.mu.Unlock()
 }

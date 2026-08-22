@@ -141,13 +141,35 @@ export default {
         this.initializing = true;
 
         const savedProxy = this.modelValue || localStorage.getItem('selectedGitHubProxy') || "";
-        const savedRadio = localStorage.getItem('githubProxyRadioValue') || "0";
+        const savedRadio = localStorage.getItem('githubProxyRadioValue');
         const savedControl = String(localStorage.getItem('githubProxyRadioControl') || "0");
 
-        this.radioValue = savedRadio;
+        // 默认选中项来自设置里的 github_proxy（commonStore.githubProxyConfig，
+        // 由打开弹窗的调用方预先拉取传入 modelValue）；用户在弹窗里做过选择
+        // （localStorage 有记录）则以用户选择为准。
+        if (savedRadio === null && !savedProxy) {
+            const configured = this.modelValue || "";
+            if (configured) {
+                // 设置值匹配预设列表 → 选中对应 radio；否则选中自定义并填入。
+                const idx = this.githubProxies.indexOf(configured);
+                this.radioValue = "1";
+                if (idx >= 0) {
+                    this.githubProxyRadioControl = String(idx);
+                    this.selectedGitHubProxy = configured;
+                } else {
+                    this.githubProxyRadioControl = "-1";
+                    this.selectedGitHubProxy = configured;
+                }
+                this.initializing = false;
+                this.$emit("update:modelValue", configured);
+                return;
+            }
+        }
+
+        this.radioValue = savedRadio || "0";
         this.githubProxyRadioControl = savedControl;
 
-        if (savedRadio === "1") {
+        if (this.radioValue === "1") {
             if (savedControl !== "-1") {
                 this.selectedGitHubProxy = this.getProxyByControl(savedControl);
             } else {

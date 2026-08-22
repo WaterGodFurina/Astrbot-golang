@@ -1,4 +1,4 @@
-import { ref, computed, onMounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { providerApi } from '@/api/v1'
 import { getProviderIcon } from '@/utils/providerUtils'
 import { askForConfirmation as askForConfirmationDialog, useConfirmDialog } from '@/utils/confirmDialog'
@@ -68,6 +68,17 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
 
   let suppressSourceWatch = false
   const unsavedProviderSourceMarker = Symbol('unsavedProviderSource')
+
+  // 写操作后的全量 schema 刷新做防抖合并，避免一次保存/切换触发多次
+  // providerApi.schema() 全量拉取。
+  let loadConfigTimer: number | null = null
+  function scheduleLoadConfig() {
+    if (loadConfigTimer !== null) return
+    loadConfigTimer = window.setTimeout(() => {
+      loadConfigTimer = null
+      void loadConfig()
+    }, 300)
+  }
 
   const providerTypes = computed(() => [
     { value: 'chat_completion', label: tm('providers.tabs.chatCompletion'), icon: 'mdi-message-text' },
@@ -491,7 +502,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
     } catch (error: any) {
       showMessage(error.message || tm('providerSources.deleteError'), 'error')
     } finally {
-      await loadConfig()
+      scheduleLoadConfig()
     }
   }
 
@@ -538,7 +549,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       return false
     } finally {
       savingSource.value = false
-      loadConfig()
+      scheduleLoadConfig()
     }
   }
 
@@ -635,7 +646,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
     } catch (error: any) {
       showMessage(error.response?.data?.message || error.message || tm('providerSources.saveError'), 'error')
     } finally {
-      await loadConfig()
+      scheduleLoadConfig()
     }
   }
 
@@ -654,7 +665,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
     } catch (error: any) {
       showMessage(error.message || tm('models.deleteError'), 'error')
     } finally {
-      await loadConfig()
+      scheduleLoadConfig()
     }
   }
 
@@ -678,7 +689,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       showMessage(error.response?.data?.message || error.message || tm('providerSources.saveError'), 'error')
       return false
     } finally {
-      await loadConfig()
+      scheduleLoadConfig()
       savingProviderToggles.value = savingProviderToggles.value.filter((id) => id !== provider.id)
     }
   }
@@ -728,6 +739,13 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
 
   onMounted(async () => {
     await loadProviderTemplate()
+  })
+
+  onUnmounted(() => {
+    if (loadConfigTimer !== null) {
+      clearTimeout(loadConfigTimer)
+      loadConfigTimer = null
+    }
   })
 
   return {

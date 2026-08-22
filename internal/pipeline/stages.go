@@ -33,6 +33,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -684,7 +685,8 @@ const rateLimitMaxDelays = 5
 // ContentSafetyCheckStage checks message content against safety rules.
 // Ported from astrbot/core/pipeline/content_safety_check/stage.py
 type ContentSafetyCheckStage struct {
-	selector *contentsafety.StrategySelector
+	selector    *contentsafety.StrategySelector
+	platformMgr *platform.PlatformManager
 }
 
 func NewContentSafetyCheckStage() *ContentSafetyCheckStage {
@@ -699,6 +701,7 @@ func (s *ContentSafetyCheckStage) Initialize(ctx *PipelineContext) error {
 		config = cs
 	}
 	s.selector = contentsafety.NewStrategySelector(config)
+	s.platformMgr = ctx.PlatformMgr
 	logger.Debug("ContentSafetyCheck initialized: enabled=%v", s.selector.IsEnabled())
 	return nil
 }
@@ -729,10 +732,12 @@ func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event
 
 	ok, info := s.selector.Check(strings.Join(texts, "\n"))
 	if !ok {
-		if event.IsAtOrWakeCommand {
-			// Set a block result
-			event.Result = &message.MessageEventResult{}
-			event.Result.Chain = []message.Component{&message.Plain{Text: "Your message or the model response contains inappropriate content and has been blocked."}}
+		// 与 ProcessStage 的 no_permission_reply 相同：调度器对
+		// Continue:false 直接短路，写 event.Result 的提示不会被
+		// RespondStage 送达，必须直接经平台发送。
+		if event.IsAtOrWakeCommand && s.platformMgr != nil {
+			chain := message.NewMessageChain(&message.Plain{Text: "Your message or the model response contains inappropriate content and has been blocked."})
+			_ = s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
 		}
 		event.Stop()
 		logger.Debug("Content safety check failed: %s", info)
@@ -843,7 +848,7 @@ func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*Stag
 			if !ok {
 				continue
 			}
-			text, err := s.sttRecord(rec, event.UnifiedMsgOrigin())
+			text, err := s.sttRecord(event, rec)
 			if err != nil {
 				logger.I18nWarn("STT 转写失败: %v", err)
 				continue
@@ -876,13 +881,11 @@ func (s *PreProcessStage) sttEnabled(umo string) bool {
 
 // sttRecord transcribes a voice component using the session/global STT provider
 // (provider_perf_speech_to_text rule wins).
-func (s *PreProcessStage) sttRecord(rec *message.Record, umo string) (string, error) {
+func (s *PreProcessStage) sttRecord(event *core.Event, rec *message.Record) (string, error) {
 	var stt provider.STTProvider
 	providerID := ""
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
-			providerID, _ = rules[conversation.RuleProviderSpeechToText].(string)
-		}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		providerID, _ = rules[conversation.RuleProviderSpeechToText].(string)
 	}
 	if providerID != "" {
 		if p := s.providerMgr.Get(providerID); p != nil {
@@ -941,6 +944,11 @@ type ProcessStage struct {
 	mcpLoaded  bool
 	mcpClients map[string]*agent.MCPClient       // sanitized server name -> client
 	mcpSchemas map[string]map[string]interface{} // full tool name -> OpenAI tool schema
+
+	// toolPermsMu guards toolPerms (tool name -> configured permission level),
+	// parsed lazily once from the stage's immutable config snapshot.
+	toolPermsMu sync.Mutex
+	toolPerms   map[string]string
 
 	// Subagents (subagent_orchestrator): handoff tools injected into the main
 	// LLM and executed as a fresh persona round.
@@ -1112,13 +1120,17 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	// Session custom rules (session_plugin_config) can disable/enable plugins
 	// for this session.
 	activated = s.filterHandlersBySession(event, activated)
-	if permissionDenied {
-		// Ported from waking_check/stage.py: a permission filter failed. When
-		// no_permission_reply is enabled, tell the user; either way the event
-		// is stopped before any handler or the LLM runs.
+	// Ported from waking_check/stage.py: a permission filter failure only skips
+	// that handler (raise_error=False path); the other matched handlers still
+	// run. Only when NO handler is left does the event stop before the LLM.
+	if permissionDenied && len(activated) == 0 {
+		// When no_permission_reply is enabled, send the reply directly —
+		// Continue=false short-circuits the pipeline before
+		// ResultDecorateStage/RespondStage, so an event.Result chain would
+		// never be delivered; either way the event is stopped before any
+		// handler or the LLM runs.
 		if s.noPermissionReply && !event.IsStopped() {
-			event.Result = &message.MessageEventResult{}
-			event.Result.Chain = []message.Component{&message.Plain{Text: fmt.Sprintf("您(ID: %s)的权限不足以使用此指令。通过 /sid 获取 ID 并请管理员添加。", event.Source.SenderID)}}
+			s.replyText(event, fmt.Sprintf("您(ID: %s)的权限不足以使用此指令。通过 /sid 获取 ID 并请管理员添加。", event.Source.SenderID))
 		}
 		event.Stop()
 		return &StageResult{Continue: false}, nil
@@ -1208,7 +1220,11 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 
 	logger.Debug("[dbg] findMatchingHandlers: %d 个 filter handler, msg=%q wake=%v", len(all), event.MessageStr, event.IsAtOrWakeCommand)
 	for _, handler := range all {
-		if !handler.Enabled {
+		// 经快照读取 filters/Enabled：dashboard 可能在运行期经写锁修改
+		// EventFilters/Enabled（SetHandlerPermission/Enable/Disable），
+		// 直接遍历共享切片会与写者并发构成数据竞争。
+		filters, enabled, ok := registry.SnapshotFilters(handler.HandlerFullName)
+		if !ok || !enabled {
 			continue
 		}
 		if s.disableBuiltinCommands && handler.HandlerModulePath == "astrbot.builtin_stars.builtin_commands.main" {
@@ -1226,7 +1242,7 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 		// filter marks the event as permission-denied.
 		passed := true
 		filterDenied := false
-		for _, filter := range handler.EventFilters {
+		for _, filter := range filters {
 			if _, isPerm := filter.(*star.PermissionFilter); isPerm {
 				if !filter.Match(fctx) {
 					filterDenied = true
@@ -1260,6 +1276,23 @@ func (s *ProcessStage) executeHandler(ctx context.Context, event *core.Event, ha
 	return handler.Handler(event)
 }
 
+// sessionRulesMemo returns the event-level memoized session rules.
+// GetSessionRules runs 2 SQL queries + JSON decode per call; the pipeline
+// queries it up to 6 times per event (plugin filter, provider override,
+// persona override, TTS ×2, STT). Rules cannot change mid-event, so caching
+// on the event is safe. Returns nil when the conversation manager is absent.
+func sessionRulesMemo(event *core.Event, convMgr *conversation.Manager) map[string]interface{} {
+	if convMgr == nil {
+		return nil
+	}
+	if r, ok := event.GetExtra("_session_rules").(map[string]interface{}); ok {
+		return r
+	}
+	r := convMgr.GetSessionRules(event.UnifiedMsgOrigin())
+	event.SetExtra("_session_rules", r)
+	return r
+}
+
 // filterHandlersBySession applies the session_plugin_config rule
 // (disabled_plugins / enabled_plugins) to the matched plugin handlers,
 // mirroring Python SessionPluginManager.filter_handlers_by_session.
@@ -1267,7 +1300,7 @@ func (s *ProcessStage) filterHandlersBySession(event *core.Event, handlers []*st
 	if s.convMgr == nil || len(handlers) == 0 {
 		return handlers
 	}
-	rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin())
+	rules := sessionRulesMemo(event, s.convMgr)
 	pc, ok := rules[conversation.RulePluginConfig].(map[string]interface{})
 	if !ok {
 		return handlers
@@ -1338,8 +1371,55 @@ func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
 	return false
 }
 
-// callLLMAgent invokes the LLM provider and sets the result.
+// agentRequest carries the state prepared for one LLM agent invocation
+// through the tool loop and the reply finalization (the callLLMAgent split).
+type agentRequest struct {
+	event              *core.Event
+	prompt             string // final user prompt (after knowledge-base injection)
+	systemPrompt       string // persona prompt after skills / safety / hooks
+	providerCfg        map[string]interface{}
+	providerSettings   map[string]interface{}
+	chatInst           provider.ChatProvider
+	req                *provider.ProviderRequest
+	computerUseRuntime string
+	streaming          bool
+	// cleanup removes image-compress temp files once the whole request
+	// completes; nil when there is nothing to clean up.
+	cleanup func()
+}
+
+// callLLMAgent invokes the LLM provider and sets the result. It is a thin
+// orchestrator: prepareAgentRequest resolves the persona/provider and
+// assembles the request, runAgentToolLoop drives the chat + tool-call rounds,
+// and finalizeAgentReply persists the reply and flushes the stream.
 func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) error {
+	ar, err := s.prepareAgentRequest(event)
+	if err != nil || ar == nil {
+		// A failure reply was already written to event.Result, a plugin hook
+		// stopped the call, or the prompt was empty.
+		return nil
+	}
+	if ar.cleanup != nil {
+		defer ar.cleanup()
+	}
+
+	streamer := newStreamSender(s, event)
+	defer streamer.flush()
+
+	resp, ok := s.runAgentToolLoop(ctx, ar, streamer)
+	if !ok {
+		return nil
+	}
+	s.finalizeAgentReply(ar, resp, streamer)
+	return nil
+}
+
+// resolveAgentContext extracts the prompt, resolves the effective provider
+// config and the persona system prompt, and applies the prompt-shaping steps
+// (skills, safety mode, on_llm_request hooks, knowledge base). It returns
+// (nil, nil) when the call is already finished (empty prompt or a plugin hook
+// stopped it) and (nil, err) when a failure reply was written to event.Result.
+func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, error) {
 	// Prefer the adapter's clean message_str (mirrors Python's use of
 	// event.message_str). PlainText is the chain-rendered text and may carry a
 	// self-mention (e.g. the qq_official adapter prepends At{qq_official} to
@@ -1352,8 +1432,13 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		prompt = extractPlainText(event.Message)
 	}
 	logger.Debug("callLLMAgent: prompt=%q plaintext=%q messagestr=%q", prompt, event.PlainText, event.MessageStr)
+	// 纯媒体消息（图片/语音）没有可提取的文本，但同样需要调用 LLM（对齐
+	// Python：req.prompt 为空但 image_urls/audio_urls 非空时继续）。
 	if prompt == "" {
-		return nil
+		imgs, auds := collectMediaURLs(event)
+		if len(imgs) == 0 && len(auds) == 0 {
+			return nil, nil
+		}
 	}
 
 	// Reset the doom-loop counters for this session at each request entry so
@@ -1379,18 +1464,16 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	if err != nil {
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 " + err.Error()}}
-		return nil
+		return nil, err
 	}
 
 	// Session-level provider override (custom rules / /provider command):
 	// when the session has a provider_perf_chat_completion rule, use that
 	// provider instead of the global default.
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin()); rules != nil {
-			if pid, _ := rules[conversation.RuleProviderChatCompletion].(string); pid != "" {
-				if pc := findProviderByID(s.config, pid); pc != nil {
-					providerCfg = pc
-				}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		if pid, _ := rules[conversation.RuleProviderChatCompletion].(string); pid != "" {
+			if pc := findProviderByID(s.config, pid); pc != nil {
+				providerCfg = pc
 			}
 		}
 	}
@@ -1407,7 +1490,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	// is not duplicated in req.Contexts.
 	personaID := ""
 	if s.convMgr != nil {
-		conv := s.convMgr.GetOrCreateConversation(event.UnifiedMsgOrigin(), event.Source.Platform)
+		conv := s.convMgr.GetOrCreateConversation(event.UnifiedMsgOrigin(), event.Source.PlatformID)
 		if conv != nil {
 			personaID = conv.Persona
 			providerSettings["persona"] = conv.Persona
@@ -1423,13 +1506,11 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 
 	// Session custom-rule persona overrides everything (highest priority):
 	// session_service_config.persona_id from the WebUI rules editor.
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin()); rules != nil {
-			if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
-				if pid, ok := sc["persona_id"].(string); ok && pid != "" {
-					personaID = pid
-					providerSettings["persona"] = pid
-				}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
+			if pid, ok := sc["persona_id"].(string); ok && pid != "" {
+				personaID = pid
+				providerSettings["persona"] = pid
 			}
 		}
 	}
@@ -1447,7 +1528,12 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		systemPrompt = s.personaPrompt(event.UnifiedMsgOrigin(), personaID)
 	}
 	if systemPrompt == "" {
-		systemPrompt = personaPrompt(providerSettings)
+		// providerSettings["persona"] 在上方被写成 persona ID（非提示词文本），
+		// 不能再把它当系统提示词回退（persona 被删除/改名时会把 ID 直接发给
+		// 模型）。仅兼容历史遗留的"纯文本 persona"形态配置。
+		if p, ok := providerSettings["persona_prompt_text"].(string); ok && p != "" {
+			systemPrompt = p
+		}
 	}
 
 	// Inject active skills into the system prompt (mirrors Python's
@@ -1459,17 +1545,18 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	systemPrompt = s.applyLLMSafetyMode(systemPrompt)
 
 	// Apply on_llm_request hooks from subprocess plugins: they may modify the
-	// system prompt (e.g. identity injection) or stop the LLM call entirely.
+	// system prompt and/or user prompt, or stop the LLM call entirely.
 	if s.subPlugins != nil {
-		sp, stop, err := s.applyLLMRequestHooks(event, systemPrompt, prompt)
+		sp, up, stop, err := s.applyLLMRequestHooks(event, systemPrompt, prompt)
 		if err != nil {
 			logger.I18nWarn("插件 on_llm_request 钩子执行失败: %v", err)
 		} else {
 			systemPrompt = sp
+			prompt = up
 			if stop {
 				logger.Debug("plugin on_llm_request hook stopped the LLM call")
 				event.Stop()
-				return nil
+				return nil, nil
 			}
 		}
 	}
@@ -1489,12 +1576,36 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		computerUseRuntime = s.providerConf.ComputerUseRuntime
 	}
 
+	return &agentRequest{
+		event:              event,
+		prompt:             prompt,
+		systemPrompt:       systemPrompt,
+		providerCfg:        providerCfg,
+		providerSettings:   providerSettings,
+		computerUseRuntime: computerUseRuntime,
+	}, nil
+}
+
+// prepareAgentRequest resolves the persona/provider for the event (via
+// resolveAgentContext), assembles the ProviderRequest, creates the chat
+// provider instance, and injects the tool schemas / streaming flags.
+// Return conventions match resolveAgentContext: (nil, nil) = already
+// finished, (nil, err) = failure reply written to event.Result.
+func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, error) {
+	ar, err := s.resolveAgentContext(event)
+	if err != nil || ar == nil {
+		return nil, err
+	}
+	providerCfg, providerSettings := ar.providerCfg, ar.providerSettings
+	prompt, systemPrompt := ar.prompt, ar.systemPrompt
+
+	imageURLs, audioURLs := collectMediaURLs(event)
 	req := &provider.ProviderRequest{
 		Prompt:       prompt,
 		SessionID:    event.UnifiedMsgOrigin(),
 		SystemPrompt: systemPrompt,
-		ImageURLs:    []string{},
-		AudioURLs:    []string{},
+		ImageURLs:    imageURLs,
+		AudioURLs:    audioURLs,
 		Conversation: s.convMgr,
 		Contexts:     s.conversationHistory(event.UnifiedMsgOrigin()),
 	}
@@ -1515,10 +1626,19 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		}
 		req.ImageURLs = compressed
 		// Temp files created by compressImageForProvider are consumed by the
-		// provider during chatRound; remove them once the request completes.
+		// provider during chatRound; the orchestrator removes them once the
+		// whole request completes.
+		tempFiles := []string{}
 		for _, p := range compressed {
 			if isCompressTempFile(p) {
-				defer os.Remove(p)
+				tempFiles = append(tempFiles, p)
+			}
+		}
+		if len(tempFiles) > 0 {
+			ar.cleanup = func() {
+				for _, p := range tempFiles {
+					os.Remove(p)
+				}
 			}
 		}
 	}
@@ -1536,7 +1656,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	if providerType == "" {
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 模型提供商配置缺少 type 字段，请重新配置提供商"}}
-		return nil
+		return nil, fmt.Errorf("provider config missing type field")
 	}
 
 	// Merge the provider source config (api_base/key live on the source,
@@ -1547,30 +1667,24 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	if err != nil {
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 初始化模型提供商失败: " + err.Error()}}
-		return nil
+		return nil, err
 	}
 
 	chatInst, ok := inst.(provider.ChatProvider)
 	if !ok {
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 提供商 " + providerType + " 不支持聊天能力"}}
-		return nil
+		return nil, fmt.Errorf("provider %s has no chat capability", providerType)
 	}
-
-	llmCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
-	defer cancel()
-
-	// Context-limit handling: llm_compress / truncate_by_turns based on
-	// provider_settings.max_context_length (token estimate).
-	req.Contexts = s.maybeCompressContext(llmCtx, chatInst, systemPrompt, req.Contexts)
+	ar.chatInst = chatInst
 
 	// Inject active tools (built-in + MCP servers) so the model can call them.
 	// skills_like mode sends light schemas (name/description only) to save
 	// tokens; arguments are re-queried once a tool is selected.
 	if s.toolSchemaMode == "skills_like" {
-		req.Tools = s.collectLightTools(computerUseRuntime)
+		req.Tools = s.collectLightTools(ar.computerUseRuntime)
 	} else {
-		req.Tools = s.collectTools(computerUseRuntime)
+		req.Tools = s.collectTools(ar.computerUseRuntime)
 	}
 	toolNames := make([]string, 0, len(req.Tools))
 	for _, t := range req.Tools {
@@ -1583,7 +1697,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	logger.Debug("callLLMAgent: injecting %d tool(s): %v", len(toolNames), toolNames)
 
 	// Computer Use "local" runtime: announce host access in the system prompt.
-	switch computerUseRuntime {
+	switch ar.computerUseRuntime {
 	case "local":
 		req.SystemPrompt += "\n" + localModePrompt(workspaceRoot(event.UnifiedMsgOrigin())) + "\n"
 	case "sandbox":
@@ -1600,6 +1714,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	if streamingEnabled && s.unsupportedStreamingStrategyIsTurnOff() {
 		streamingEnabled = false
 	}
+	ar.streaming = streamingEnabled
 
 	// System context reminder (identifier / group name / datetime), appended as
 	// an extra user-content part like Python's astr_main_agent.
@@ -1611,26 +1726,74 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		})
 	}
 
+	ar.req = req
+	return ar, nil
+}
+
+// collectMediaURLs gathers image/audio URLs from the event message chain for
+// the multimodal provider request (mirrors Python's astr_main_agent media
+// attachment collection). Image components prefer URL, then local path
+// (file://), then base64 data; Record components prefer URL, then path.
+func collectMediaURLs(event *core.Event) (imageURLs, audioURLs []string) {
+	if event.Message == nil {
+		return nil, nil
+	}
+	for _, comp := range event.Message.Chain {
+		switch c := comp.(type) {
+		case *message.Image:
+			switch {
+			case c.URL != "":
+				imageURLs = append(imageURLs, c.URL)
+			case c.Path != "":
+				imageURLs = append(imageURLs, "file://"+c.Path)
+			case c.Base64 != "":
+				imageURLs = append(imageURLs, "data:image/png;base64,"+c.Base64)
+			}
+		case *message.Record:
+			switch {
+			case c.URL != "":
+				audioURLs = append(audioURLs, c.URL)
+			case c.Path != "":
+				audioURLs = append(audioURLs, "file://"+c.Path)
+			}
+		}
+	}
+	return imageURLs, audioURLs
+}
+
+// runAgentToolLoop issues the initial chat round, executes the requested
+// tools (up to provider_settings.max_agent_step rounds) and runs the
+// follow-up rounds with the tool results. It returns ok=false when a failure
+// reply was already written to event.Result (or the provider reported an
+// error role), in which case the caller must not finalize the reply.
+func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, streamer *streamSender) (*provider.LLMResponse, bool) {
+	event := ar.event
+	req := ar.req
+
+	llmCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
+	defer cancel()
+
+	// Context-limit handling: llm_compress / truncate_by_turns based on
+	// provider_settings.max_context_length (token estimate).
+	req.Contexts = s.maybeCompressContext(llmCtx, ar.chatInst, ar.systemPrompt, req.Contexts)
+
 	// Tool-call loop: up to 5 rounds of tool execution + follow-up.
 	messages := append([]map[string]interface{}{}, req.Contexts...)
 	messages = append(messages, req.ToUserMessage())
 
-	streamer := newStreamSender(s, event)
-	defer streamer.flush()
-
-	resp, err := s.chatRound(llmCtx, chatInst, req, streamingEnabled, streamer)
+	resp, err := s.chatRound(llmCtx, ar.chatInst, req, ar.streaming, streamer)
 	if err != nil {
 		logger.Error("LLM call failed: %v", err)
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
-		return nil
+		return nil, false
 	}
-	s.recordProviderCall(providerCfg, event.UnifiedMsgOrigin(), resp)
+	s.recordProviderCall(ar.providerCfg, event.UnifiedMsgOrigin(), resp)
 	// skills_like: the main request carried no tool parameters. When the model
 	// chose tools, re-query once with the chosen tools' full parameter schemas
 	// (minimal context) so the LLM produces proper arguments.
 	if s.toolSchemaMode == "skills_like" && len(resp.ToolsCallName) > 0 {
-		if requery, ok := s.requeryToolArgs(llmCtx, chatInst, req, resp, computerUseRuntime); ok {
+		if requery, ok := s.requeryToolArgs(llmCtx, ar.chatInst, req, resp, ar.computerUseRuntime); ok {
 			resp = requery
 		}
 	}
@@ -1678,7 +1841,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 					"tool_args": truncateRunes(fmt.Sprintf("%v", args), 200),
 				})
 			}
-			result := s.executeToolWithTimeout(event, computerUseRuntime, name, args)
+			result := s.executeToolWithTimeout(event, ar.computerUseRuntime, name, args)
 			// on_llm_tool_respond fires after the tool executed, carrying the
 			// tool name/args plus its result.
 			dispatchSubprocessHooksPayload(s.subPlugins, event, "on_llm_tool_respond", &pluginsdk.ToolCall{
@@ -1714,28 +1877,44 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		// so one slow round does not exhaust the whole tool-loop budget.
 		req.Contexts = messages
 		roundCtx, roundCancel := context.WithTimeout(llmCtx, 120*time.Second)
-		resp, err = s.chatRound(roundCtx, chatInst, req, streamingEnabled, streamer)
+		resp, err = s.chatRound(roundCtx, ar.chatInst, req, ar.streaming, streamer)
 		roundCancel()
 		if err != nil {
 			logger.Error("LLM tool-loop call failed: %v", err)
 			event.Result = &message.MessageEventResult{}
 			event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
-			return nil
+			return nil, false
 		}
-		s.recordProviderCall(providerCfg, event.UnifiedMsgOrigin(), resp)
+		s.recordProviderCall(ar.providerCfg, event.UnifiedMsgOrigin(), resp)
 	}
 
 	if resp.Role == "err" {
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 " + resp.CompletionText}}
-		return nil
+		return nil, false
+	}
+	return resp, true
+}
+
+// finalizeAgentReply appends the user/assistant pair to the conversation
+// history, fires the on_llm_response hooks, persists the reply for enabled
+// group sessions (group LTM), flushes the stream and sets event.Result.
+func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMResponse, streamer *streamSender) {
+	event := ar.event
+
+	// The tool loop ends early when the model hit maxSteps or a tool was paused
+	// by doom-loop detection: the last response carries tool calls and usually
+	// no text. Record a visible notice instead of polluting history with an
+	// empty assistant turn (L-24).
+	if strings.TrimSpace(resp.CompletionText) == "" && len(resp.ToolsCallName) > 0 {
+		resp.CompletionText = "（已达最大工具调用步数/工具被暂停，未能生成最终回复。）"
 	}
 
 	// Append user + assistant reply to history (Python appends the pair
 	// post-completion; the user message is intentionally not in req.Contexts
 	// since it is sent as the current prompt).
 	if s.convMgr != nil {
-		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "user", prompt)
+		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "user", ar.prompt)
 		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "assistant", resp.CompletionText)
 	}
 
@@ -1763,7 +1942,6 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 
 	event.Result = &message.MessageEventResult{}
 	event.Result.Chain = []message.Component{&message.Plain{Text: resp.CompletionText}}
-	return nil
 }
 
 // chatRound issues a single LLM request. When streaming is enabled it consumes
@@ -2270,10 +2448,11 @@ func dispatchSubprocessHooksPayload(sub *plugin.SubprocessManager, event *core.E
 }
 
 // applyLLMRequestHooks runs every loaded subprocess plugin's on_llm_request
-// hooks, letting them modify the system prompt or stop the LLM call.
-func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, userPrompt string) (string, bool, error) {
+// hooks, letting them modify the system prompt, the user prompt, or stop the
+// LLM call.
+func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, userPrompt string) (string, string, bool, error) {
 	if s.subPlugins == nil {
-		return systemPrompt, false, nil
+		return systemPrompt, userPrompt, false, nil
 	}
 	sdkEvent := star.CoreEventToSDK(event)
 	for _, inst := range s.subPlugins.List() {
@@ -2286,7 +2465,7 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 			}
 			// on_llm_request 是被动广播，不计入活动时间。
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-			sp, stop, res, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
+			sp, up, stop, res, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
 			rpcCancel()
 			if err != nil {
 				logger.I18nWarn("插件 %s 的 on_llm_request 钩子 %s 执行失败: %v", inst.Name, h.Name, err)
@@ -2296,13 +2475,18 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 				event.HasSendOper = true
 			}
 			systemPrompt = sp
+			userPrompt = up
 			if stop {
-				return systemPrompt, true, nil
+				return systemPrompt, userPrompt, true, nil
 			}
 		}
 	}
-	return systemPrompt, false, nil
+	return systemPrompt, userPrompt, false, nil
 }
+
+// toolsRefreshTTL 是插件工具列表 ListTools RPC 的缓存时长：TTL 内跳过重复
+// 刷新，避免每次 LLM 调用都对每个插件同步发起一次 RPC。
+const toolsRefreshTTL = 5 * time.Minute
 
 // collectPluginTools returns the OpenAI tool schemas contributed by all loaded
 // subprocess plugins (each plugin's registered LLM function tools).
@@ -2311,12 +2495,19 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 		return nil
 	}
 	// 先刷新运行中插件的实时工具列表（插件工具在实例化阶段注册，晚于
-	// Register 快照；RefreshTools 成功后回写管理器工具注册表）。
+	// Register 快照；RefreshTools 成功后回写管理器工具注册表）。TTL 内已
+	// 刷新过的插件跳过，避免每次 LLM 调用都同步发起 ListTools RPC。TTL
+	// 过期时先用旧快照（AllPluginTools 兜底），后台异步刷新，下次请求生效
+	// ——同步刷新会阻塞 LLM 热路径最长 30s/插件（插件假死/被调试器暂停时
+	// 用户消息长时间无响应）。
 	for _, inst := range s.subPlugins.List() {
 		if inst.Meta == nil {
 			continue
 		}
-		inst.RefreshTools(context.Background())
+		if inst.ToolsFreshWithin(toolsRefreshTTL) {
+			continue
+		}
+		go inst.RefreshTools(context.Background())
 	}
 	// 注入全部已注册工具（含闲置休眠插件：其工具保留在注册表中，LLM 调用
 	// 时按名唤醒——避免休眠导致 LLM 工具集收缩）。
@@ -2632,15 +2823,15 @@ func (s *ProcessStage) mcpSchemasSnapshot() []map[string]interface{} {
 
 // loadMCPTools connects to enabled MCP servers and caches their tools. It runs
 // in a goroutine (see ensureMCPTools) so connecting to slow servers does not
-// stall the pipeline.
+// stall the pipeline. 连接过程在锁外进行（无锁构建局部 clients/schemas），
+// 最后一次性持锁替换，慢服务器不会阻塞 mcpMu 的并发读。
 func (s *ProcessStage) loadMCPTools() {
-	s.mcpMu.Lock()
-	defer s.mcpMu.Unlock()
-
 	data, err := os.ReadFile("data/mcp_server.json")
 	if err != nil {
+		s.mcpMu.Lock()
 		s.mcpClients = nil
 		s.mcpSchemas = nil
+		s.mcpMu.Unlock()
 		return
 	}
 	var mcpCfg struct {
@@ -2648,17 +2839,16 @@ func (s *ProcessStage) loadMCPTools() {
 	}
 	if err := json.Unmarshal(data, &mcpCfg); err != nil {
 		logger.I18nWarn("解析 data/mcp_server.json 失败: %v", err)
+		s.mcpMu.Lock()
 		s.mcpClients = nil
 		s.mcpSchemas = nil
+		s.mcpMu.Unlock()
 		return
 	}
 
-	// Clean up previously connected clients.
-	for _, cl := range s.mcpClients {
-		cl.Cleanup()
-	}
-	s.mcpClients = make(map[string]*agent.MCPClient)
-	s.mcpSchemas = make(map[string]map[string]interface{})
+	// 无锁构建局部 clients/schemas。
+	clients := make(map[string]*agent.MCPClient)
+	schemas := make(map[string]map[string]interface{})
 
 	for name, cfg := range mcpCfg.McpServers {
 		if active, _ := cfg["active"].(bool); !active {
@@ -2675,7 +2865,7 @@ func (s *ProcessStage) loadMCPTools() {
 			logger.I18nWarn("MCP 服务器 %q 连接失败: %v", name, err)
 			continue
 		}
-		s.mcpClients[safeName] = client
+		clients[safeName] = client
 		for _, tool := range client.Tools() {
 			fullName := safeName + "." + sanitizeToolName(tool.Name)
 			schema := map[string]interface{}{
@@ -2686,11 +2876,20 @@ func (s *ProcessStage) loadMCPTools() {
 					"parameters":  tool.InputSchema,
 				},
 			}
-			s.mcpSchemas[fullName] = schema
+			schemas[fullName] = schema
 		}
 		logger.Debug("MCP server %q connected (%d tools)", name, len(client.Tools()))
 	}
+
+	// 持锁清理旧客户端并一次性替换为新状态。
+	s.mcpMu.Lock()
+	for _, cl := range s.mcpClients {
+		cl.Cleanup()
+	}
+	s.mcpClients = clients
+	s.mcpSchemas = schemas
 	s.mcpLoaded = true
+	s.mcpMu.Unlock()
 }
 
 // executeMCPTool dispatches a tool call to the matching MCP server. The tool
@@ -2994,9 +3193,36 @@ func executeWebFetch(rawURL string, maxLength int) string {
 		return "web_fetch 错误: " + err.Error()
 	}
 
+	// Dial 时校验解析后的真实 IP：validateWebFetchHost 的 LookupIP 与真正
+	// 建连之间可能发生 DNS rebinding，连接时刻的校验封死该 TOCTOU 窗口。
+	dialer := &net.Dialer{
+		Timeout: 10 * time.Second,
+		Control: func(network, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			addr, err := netip.ParseAddr(host)
+			if err != nil {
+				return err
+			}
+			addr = addr.Unmap()
+			if addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() ||
+				addr.IsMulticast() || addr.IsUnspecified() || addr == cloudMetadataAddr {
+				return fmt.Errorf("拒绝连接到受限地址 %s", addr)
+			}
+			for _, p := range blockedNetPrefixes {
+				if p.Contains(addr) {
+					return fmt.Errorf("拒绝连接到保留地址段 %s 内的地址 %s", p, addr)
+				}
+			}
+			return nil
+		},
+	}
 	client := &http.Client{
 		Timeout:       30 * time.Second,
 		CheckRedirect: webFetchRedirectGuard,
+		Transport:     &http.Transport{DialContext: dialer.DialContext},
 	}
 	resp, err := client.Get(reqURL)
 	if err != nil {
@@ -3021,8 +3247,9 @@ func executeWebFetch(rawURL string, maxLength int) string {
 		text = htmlToText(body)
 	}
 	text = strings.TrimSpace(text)
-	if len(text) > maxLength {
-		text = text[:maxLength]
+	// 按 rune 截断，避免切在多字节 UTF-8 字符中间产生乱码。
+	if r := []rune(text); len(r) > maxLength {
+		text = string(r[:maxLength])
 	}
 	if text == "" {
 		return "web_fetch 结果: 页面无文本内容"
@@ -3045,9 +3272,110 @@ func htmlToText(body []byte) string {
 // executeTool runs a tool call and returns the result text.
 // Dispatches to built-in tools, MCP servers, and the Computer Use local or
 // sandbox executors.
+// coreBuiltinToolSet lists the LLM tools implemented by the host itself
+// (built-ins, Computer Use host tools, web-search/KB/message tools and the
+// proactive future_task). tool_permissions only governs non-builtin tools —
+// the dashboard exposes built-ins as readonly — mirroring Python, where the
+// permission guard is applied to function tools registered by MCP servers and
+// plugins, never to the core's own executors.
+var coreBuiltinToolSet = map[string]bool{
+	"get_current_time":           true,
+	"web_fetch":                  true,
+	"astrbot_execute_shell":      true,
+	"astrbot_shell_session":      true,
+	"astrbot_execute_python":     true,
+	"astrbot_file_read_tool":     true,
+	"astrbot_file_write_tool":    true,
+	"astrbot_file_edit_tool":     true,
+	"astrbot_grep_tool":          true,
+	"web_search_tavily":          true,
+	"web_search_bocha":           true,
+	"web_search_brave":           true,
+	"web_search_firecrawl":       true,
+	"web_search_baidu":           true,
+	"web_search_exa":             true,
+	"tavily_extract_web_page":    true,
+	"firecrawl_extract_web_page": true,
+	"exa_get_contents":           true,
+	"send_message_to_user":       true,
+	"get_group_message_history":  true,
+	"astr_kb_search":             true,
+	"future_task":                true,
+}
+
+// parseToolPermissions reads config["tool_permissions"] into a tool name ->
+// permission level map. Both the dashboard shape
+// {"<tool>": {"permission": "admin"|"member"}} and a bare "<tool>": "admin"
+// value are accepted (the python-sdk guard parses both shapes too); unknown
+// levels are ignored so a malformed entry never locks a tool out.
+func parseToolPermissions(config map[string]interface{}) map[string]string {
+	raw, _ := config["tool_permissions"].(map[string]interface{})
+	if len(raw) == 0 {
+		return nil
+	}
+	perms := make(map[string]string, len(raw))
+	for name, v := range raw {
+		level := ""
+		switch lv := v.(type) {
+		case string:
+			level = lv
+		case map[string]interface{}:
+			level, _ = lv["permission"].(string)
+		}
+		if level == "admin" || level == "member" {
+			perms[name] = level
+		}
+	}
+	if len(perms) == 0 {
+		return nil
+	}
+	return perms
+}
+
+// adminOnlyTools returns the admin-only tool names configured in
+// tool_permissions. The map is parsed once from the stage's config snapshot
+// and cached: s.config is the deep copy taken at Initialize (config.Get/All
+// already return copies, so the read is race-free) and the whole pipeline is
+// rebuilt whenever the dashboard saves the config, so the cache never goes
+// stale within a stage lifetime — repeated tool calls in one request (or
+// across requests served by this stage) do not re-parse the config.
+func (s *ProcessStage) adminOnlyTools() map[string]string {
+	s.toolPermsMu.Lock()
+	defer s.toolPermsMu.Unlock()
+	if s.toolPerms == nil {
+		s.toolPerms = parseToolPermissions(s.config)
+	}
+	return s.toolPerms
+}
+
+// toolPermissionDenied reports whether the event's role is not allowed to run
+// the named tool under config tool_permissions (the dashboard tools panel). A
+// tool configured as "admin" is refused for member events; builtin tools and
+// the host-generated transfer_to_* subagent handoffs always pass. This is the
+// host-side closure of the python-sdk permission guard, which has no host RPC
+// to consult (review 1.2-6): MCP and plugin tools are both governed here.
+func (s *ProcessStage) toolPermissionDenied(name string, event *core.Event) bool {
+	if event.Role == "admin" {
+		return false
+	}
+	if coreBuiltinToolSet[name] || strings.HasPrefix(name, "transfer_to_") {
+		return false
+	}
+	return s.adminOnlyTools()[name] == "admin"
+}
+
 func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runtime, name string, args map[string]interface{}) string {
 	umo := event.UnifiedMsgOrigin()
 	logger.Debug("executeTool: name=%s args=%v", name, args)
+
+	// Host-side tool permission guard: a tool marked admin-only in
+	// tool_permissions refuses to run for member events. Checked before any
+	// dispatch so neither the executors nor the on_tool_call hooks observe a
+	// denied invocation.
+	if s.toolPermissionDenied(name, event) {
+		logger.I18nWarn("工具 %s 需要管理员权限，用户 %s 无权调用", name, event.GetSenderID())
+		return fmt.Sprintf("工具 %s 需要管理员权限，当前用户无权调用", name)
+	}
 
 	// Dispatch registered plugins' on_tool_call / on_using_llm_tool hooks before
 	// executing the tool, stashing the tool name/args on the event metadata for
@@ -3105,12 +3433,15 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 			"astrbot_grep_tool":
 			if runtime != "local" {
 				result = fmt.Sprintf("工具 %s 未启用（Computer Use 运行时为 %s，需要 local）", name, runtime)
+			} else if !computerUseAllowed(s.config, event) {
+				// 用户 ACL：本地运行时直接操作宿主机，仅白名单用户可调用。
+				result = fmt.Sprintf("工具 %s 执行失败: computer_use 未授权该用户", name)
 			} else {
 				switch name {
 				case "astrbot_execute_shell":
-					result = executeLocalShell(umo, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
+					result = executeLocalShell(umo, event.GetSenderID(), argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
 				case "astrbot_shell_session":
-					result = executeShellSession(umo, argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
+					result = executeShellSession(umo, event.GetSenderID(), argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
 				case "astrbot_execute_python":
 					result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
 				case "astrbot_file_read_tool":
@@ -3130,7 +3461,9 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				}
 			}
 		case "future_task":
-			result = executeFutureTask(s.cronMgr, umo, event.GetSenderID(), args)
+			// 存三段式 unified_msg_origin（platform_id:MessageType:session_id），
+			// 保证 WebUI/Python future_task 解析时 message_type 与 session_id 对位。
+			result = executeFutureTask(s.cronMgr, event.PythonUMO(), event.GetSenderID(), args)
 		case "web_search_tavily":
 			result = executeWebSearchTavily(s.config, args)
 		case "web_search_bocha":
@@ -3321,14 +3654,6 @@ func (s *ProcessStage) applySelectedProviderModel(event *core.Event, providerCfg
 		pc["model"] = selModel
 	}
 	return pc
-}
-
-// personaPrompt extracts the persona system prompt from settings.
-func personaPrompt(settings map[string]interface{}) string {
-	if p, ok := settings["persona"].(string); ok {
-		return p
-	}
-	return ""
 }
 
 // conversationHistory converts conversation history to LLM context messages.
@@ -3613,6 +3938,7 @@ type ResultDecorateStage struct {
 	segOnlyLLMResult      bool
 	segSplitMode          string
 	segRegex              string
+	segRegexCompiled      *regexp.Regexp
 	segSplitWords         []string
 	segWordsPattern       *regexp.Regexp
 	segContentCleanupRule *regexp.Regexp
@@ -3646,6 +3972,14 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 				s.segSplitMode = "regex"
 			}
 			s.segRegex, _ = cfg["regex"].(string)
+			// 配置正则只编译一次（Initialize），避免每条消息热路径重新编译。
+			if s.segRegex != "" {
+				if re, err := regexp.Compile(s.segRegex); err == nil {
+					s.segRegexCompiled = re
+				} else {
+					logger.Error("Invalid segmented-reply regular expression; using the default segmentation method: %v", err)
+				}
+			}
 			s.segWordsThreshold = 150
 			if v, ok := cfg["words_count_threshold"].(int); ok && v > 0 {
 				s.segWordsThreshold = v
@@ -3905,15 +4239,12 @@ func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
 	if event.Result == nil || len(event.Result.Chain) == 0 {
 		return nil
 	}
-	umo := event.UnifiedMsgOrigin()
 
 	// Session tts_enabled rule (session_service_config), default true.
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
-			if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
-				if enabled, ok := sc["tts_enabled"].(bool); ok && !enabled {
-					return nil
-				}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
+			if enabled, ok := sc["tts_enabled"].(bool); ok && !enabled {
+				return nil
 			}
 		}
 	}
@@ -3926,10 +4257,8 @@ func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
 	// Resolve TTS provider: session rule provider_perf_text_to_speech wins.
 	var tts provider.TTSProvider
 	providerID := ""
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
-			providerID, _ = rules[conversation.RuleProviderTextToSpeech].(string)
-		}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		providerID, _ = rules[conversation.RuleProviderTextToSpeech].(string)
 	}
 	if providerID != "" {
 		if p := s.providerMgr.Get(providerID); p != nil {

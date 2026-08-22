@@ -9,12 +9,12 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -54,6 +54,7 @@ func (a *Adapter) sendChain(chain *message.MessageChain, selfID, touser string) 
 				logger.I18nError("准备图片失败: %v", err)
 				return err
 			}
+			defer removeWecomTemp(path)
 			mediaID, err := a.client.UploadMedia(ctx, "image", path)
 			if err != nil {
 				logger.I18nError("上传图片失败: %v", err)
@@ -73,6 +74,7 @@ func (a *Adapter) sendChain(chain *message.MessageChain, selfID, touser string) 
 				logger.I18nError("准备语音失败: %v", err)
 				return err
 			}
+			defer removeWecomTemp(path)
 			// Python 此处会将音频转码为 amr；Go 端直接上传原文件
 			mediaID, err := a.client.UploadMedia(ctx, "voice", path)
 			if err != nil {
@@ -93,6 +95,7 @@ func (a *Adapter) sendChain(chain *message.MessageChain, selfID, touser string) 
 				logger.I18nError("准备文件失败: %v", err)
 				return err
 			}
+			defer removeWecomTemp(path)
 			mediaID, err := a.client.UploadMedia(ctx, "file", path)
 			if err != nil {
 				logger.I18nError("上传文件失败: %v", err)
@@ -112,6 +115,7 @@ func (a *Adapter) sendChain(chain *message.MessageChain, selfID, touser string) 
 				logger.I18nError("准备视频失败: %v", err)
 				return err
 			}
+			defer removeWecomTemp(path)
 			mediaID, err := a.client.UploadMedia(ctx, "video", path)
 			if err != nil {
 				logger.I18nError("上传视频失败: %v", err)
@@ -184,23 +188,20 @@ func resolveComponentFile(path, file, url, b64, suffix string) (string, error) {
 	return "", fmt.Errorf("媒体组件没有可用的 path/url/base64")
 }
 
-// downloadToFile 下载 URL 内容到本地文件。
+// downloadToFile 下载 URL 内容到本地文件（经 SSRF 校验与大小上限约束）。
 func downloadToFile(ctx context.Context, url, dest string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	data, err := platform.SafeDownloadBytes(ctx, url, 64<<20)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(dest, data, 0600)
+}
+
+// removeWecomTemp 删除发送链路经 resolveComponentFile 创建在临时目录的媒体文件
+// （仅限本模块创建的 astrbot_wecom_* 文件，避免误删调用方自备文件）。
+func removeWecomTemp(p string) {
+	if p != "" && strings.HasPrefix(p, os.TempDir()+string(os.PathSeparator)) &&
+		strings.Contains(filepath.Base(p), "astrbot_wecom_") {
+		_ = os.Remove(p)
+	}
 }

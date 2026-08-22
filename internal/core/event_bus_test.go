@@ -211,7 +211,7 @@ func TestDispatchWorkerSurvivesPanic(t *testing.T) {
 func TestDispatchWorkerConcurrentAcrossSessions(t *testing.T) {
 	bus := NewEventBus(10)
 	block := make(chan struct{})
-	stage := newBlockingStage("plat:slow", block)
+	stage := newBlockingStage("plat:FriendMessage:slow", block)
 	bus.RegisterScheduler("test", func() *PipelineScheduler {
 		s := NewPipelineScheduler("test")
 		s.AddStage(stage)

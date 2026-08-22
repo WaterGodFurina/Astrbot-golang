@@ -753,6 +753,8 @@ export default {
       itemsPerPage: 10,
       totalItems: 0,
       searchTimeout: null,
+      // loadData 请求序号，丢弃过期响应（防竞态）
+      listRequestId: 0,
 
       // 可用选项
       availablePersonas: [],
@@ -1062,6 +1064,7 @@ export default {
 
   methods: {
     async loadData() {
+      const requestId = ++this.listRequestId
       this.loading = true
       try {
         const response = await sessionApi.listRules({
@@ -1069,6 +1072,7 @@ export default {
           page_size: this.itemsPerPage,
           search: this.searchQuery || '',
         })
+        if (requestId !== this.listRequestId) return // 过期响应直接丢弃
         if (response.data.status === 'ok') {
           const data = response.data.data
           this.rulesList = data.rules
@@ -1081,12 +1085,16 @@ export default {
           this.availablePlugins = data.available_plugins || []
           this.availableKbs = data.available_kbs || []
         } else {
+          if (requestId !== this.listRequestId) return
           this.showError(response.data.message || this.tm('messages.loadError'))
         }
       } catch (error) {
+        if (requestId !== this.listRequestId) return
         this.showError(error.response?.data?.message || this.tm('messages.loadError'))
       }
-      this.loading = false
+      if (requestId === this.listRequestId) {
+        this.loading = false
+      }
     },
 
     onTableOptionsUpdate(options) {
@@ -1278,6 +1286,7 @@ export default {
 
     async saveServiceConfig() {
       if (!this.selectedUmo) return
+      const targetUmo = this.selectedUmo.umo // 提前缓存
 
       this.saving = true
       try {
@@ -1287,27 +1296,28 @@ export default {
         if (config.persona_id === null) delete config.persona_id
 
         const response = await sessionApi.upsertRule({
-          umo: this.selectedUmo.umo,
+          umo: targetUmo,
           rule_key: 'session_service_config',
           rule_value: config,
         })
 
         if (response.data.status === 'ok') {
-          this.showSuccess(this.tm('messages.saveSuccess'))
           this.editingRules.session_service_config = config
 
           // 更新或添加到列表
-          let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
+          const item = this.rulesList.find((u) => u.umo === targetUmo)
           if (item) {
             item.rules = { ...item.rules, session_service_config: config }
           } else {
             // 新规则，添加到列表
             this.rulesList.push(
-              this.buildUmoItem(this.selectedUmo.umo, {
+              this.buildUmoItem(targetUmo, {
                 session_service_config: config,
               }),
             )
           }
+          this.showSuccess(this.tm('messages.saveSuccess'))
+          this.closeRuleEditor() // 最后再关闭
         } else {
           this.showError(response.data.message || this.tm('messages.saveError'))
         }
@@ -1319,6 +1329,7 @@ export default {
 
     async saveProviderConfig() {
       if (!this.selectedUmo) return
+      const targetUmo = this.selectedUmo.umo // 提前缓存
 
       this.saving = true
       try {
@@ -1332,7 +1343,7 @@ export default {
             // 有值时更新
             updateTasks.push(
               sessionApi.upsertRule({
-                umo: this.selectedUmo.umo,
+                umo: targetUmo,
                 rule_key: `provider_perf_${type}`,
                 rule_value: value,
               }),
@@ -1341,7 +1352,7 @@ export default {
             // 选择了"跟随配置文件" (__astrbot_follow_config__) 且之前有配置，则删除
             deleteTasks.push(
               sessionApi.deleteRules({
-                umo: this.selectedUmo.umo,
+                umo: targetUmo,
                 rule_key: `provider_perf_${type}`,
               }),
             )
@@ -1354,9 +1365,9 @@ export default {
           this.showSuccess(this.tm('messages.saveSuccess'))
 
           // 更新或添加到列表
-          let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
+          let item = this.rulesList.find((u) => u.umo === targetUmo)
           if (!item) {
-            item = this.buildUmoItem(this.selectedUmo.umo)
+            item = this.buildUmoItem(targetUmo)
             this.rulesList.push(item)
           }
           for (const type of providerTypes) {
@@ -1370,6 +1381,7 @@ export default {
               delete this.editingRules[`provider_perf_${type}`]
             }
           }
+          this.closeRuleEditor() // 最后再关闭
         } else {
           this.showSuccess(this.tm('messages.noChanges'))
         }
@@ -1381,6 +1393,7 @@ export default {
 
     async savePluginConfig() {
       if (!this.selectedUmo) return
+      const targetUmo = this.selectedUmo.umo // 提前缓存
 
       this.saving = true
       try {
@@ -1393,35 +1406,37 @@ export default {
         if (config.enabled_plugins.length === 0 && config.disabled_plugins.length === 0) {
           if (this.editingRules.session_plugin_config) {
             await sessionApi.deleteRules({
-              umo: this.selectedUmo.umo,
+              umo: targetUmo,
               rule_key: 'session_plugin_config',
             })
             delete this.editingRules.session_plugin_config
-            let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
+            let item = this.rulesList.find((u) => u.umo === targetUmo)
             if (item) delete item.rules.session_plugin_config
           }
           this.showSuccess(this.tm('messages.saveSuccess'))
+          this.closeRuleEditor()
         } else {
           const response = await sessionApi.upsertRule({
-            umo: this.selectedUmo.umo,
+            umo: targetUmo,
             rule_key: 'session_plugin_config',
             rule_value: config,
           })
 
           if (response.data.status === 'ok') {
-            this.showSuccess(this.tm('messages.saveSuccess'))
             this.editingRules.session_plugin_config = config
 
-            let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
+            let item = this.rulesList.find((u) => u.umo === targetUmo)
             if (item) {
               item.rules.session_plugin_config = config
             } else {
               this.rulesList.push(
-                this.buildUmoItem(this.selectedUmo.umo, {
+                this.buildUmoItem(targetUmo, {
                   session_plugin_config: config,
                 }),
               )
             }
+            this.showSuccess(this.tm('messages.saveSuccess'))
+            this.closeRuleEditor() // 最后再关闭
           } else {
             this.showError(response.data.message || this.tm('messages.saveError'))
           }
@@ -1434,6 +1449,7 @@ export default {
 
     async saveKbConfig() {
       if (!this.selectedUmo) return
+      const targetUmo = this.selectedUmo.umo // 提前缓存
 
       this.saving = true
       try {
@@ -1447,35 +1463,37 @@ export default {
         if (config.kb_ids.length === 0) {
           if (this.editingRules.kb_config) {
             await sessionApi.deleteRules({
-              umo: this.selectedUmo.umo,
+              umo: targetUmo,
               rule_key: 'kb_config',
             })
             delete this.editingRules.kb_config
-            let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
+            let item = this.rulesList.find((u) => u.umo === targetUmo)
             if (item) delete item.rules.kb_config
           }
           this.showSuccess(this.tm('messages.saveSuccess'))
+          this.closeRuleEditor()
         } else {
           const response = await sessionApi.upsertRule({
-            umo: this.selectedUmo.umo,
+            umo: targetUmo,
             rule_key: 'kb_config',
             rule_value: config,
           })
 
           if (response.data.status === 'ok') {
-            this.showSuccess(this.tm('messages.saveSuccess'))
             this.editingRules.kb_config = config
 
-            let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
+            let item = this.rulesList.find((u) => u.umo === targetUmo)
             if (item) {
               item.rules.kb_config = config
             } else {
               this.rulesList.push(
-                this.buildUmoItem(this.selectedUmo.umo, {
+                this.buildUmoItem(targetUmo, {
                   kb_config: config,
                 }),
               )
             }
+            this.showSuccess(this.tm('messages.saveSuccess'))
+            this.closeRuleEditor() // 最后再关闭
           } else {
             this.showError(response.data.message || this.tm('messages.saveError'))
           }
@@ -1742,6 +1760,7 @@ export default {
         }
       } catch (error) {
         console.error('加载分组失败:', error)
+        this.showError(error.response?.data?.message || this.tm('messages.loadError'))
       }
       this.groupsLoading = false
     },
@@ -1757,6 +1776,7 @@ export default {
         }
       } catch (error) {
         console.error('加载会话列表失败:', error)
+        this.showError(error.response?.data?.message || this.tm('messages.loadError'))
       }
       this.loadingUmos = false
     },
@@ -1767,9 +1787,14 @@ export default {
         if (response.data.status === 'ok') {
           this.mergeUmoInfos(response.data.data.umo_infos || [])
           this.allSessions = response.data.data.umos || []
+          // 首屏共享同一次 activeUmos() 结果，避免重复请求
+          if (this.availableUmos.length === 0) {
+            this.availableUmos = response.data.data.umos || []
+          }
         }
       } catch (error) {
         console.error('加载全部会话失败:', error)
+        this.showError(error.response?.data?.message || this.tm('messages.loadError'))
       }
     },
 

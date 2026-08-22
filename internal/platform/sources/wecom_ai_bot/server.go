@@ -8,8 +8,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -83,6 +85,11 @@ func (s *WecomAIBotServer) handleCallback(w http.ResponseWriter, r *http.Request
 		http.Error(w, "缺少必要参数", http.StatusBadRequest)
 		return
 	}
+	// 时间戳新鲜度校验：拒绝与当前时间偏差超过 5 分钟的请求（防重放）。
+	if ts, err := strconv.ParseInt(timestamp, 10, 64); err != nil || math.Abs(float64(time.Now().Unix()-ts)) > 300 {
+		http.Error(w, "timestamp 过期", http.StatusBadRequest)
+		return
+	}
 	logger.Debug("收到消息回调，msg_signature=%s, timestamp=%s, nonce=%s", msgSignature, timestamp, nonce)
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
@@ -139,6 +146,8 @@ func (s *WecomAIBotServer) Start() error {
 		Addr:              fmt.Sprintf("%s:%d", s.host, s.port),
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	logger.I18nInfo("启动企业微信智能机器人服务器，监听 %s:%d", s.host, s.port)
 	go func() {

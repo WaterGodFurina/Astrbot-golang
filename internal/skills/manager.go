@@ -519,18 +519,14 @@ func (sm *SkillManager) loadConfig() skillsConfig {
 	return cfg
 }
 
-// saveConfig writes skills.json atomically: 先写临时文件并 fsync，再 os.Rename
-// 替换，避免并发写/崩溃截断导致配置丢失（与 plugin manifest 的 Save 一致）。
-func (sm *SkillManager) saveConfig(cfg skillsConfig) error {
-	data, err := json.MarshalIndent(cfg, "", "    ")
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(sm.configPath)
+// atomicWriteFile writes data to path atomically: temp file + fsync + rename,
+// so a crash mid-write can never leave a truncated file at path.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
 	if dir == "" {
 		dir = "."
 	}
-	tmp, err := os.CreateTemp(dir, filepath.Base(sm.configPath)+".*.tmp")
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
@@ -538,9 +534,7 @@ func (sm *SkillManager) saveConfig(cfg skillsConfig) error {
 	committed := false
 	defer func() {
 		if !committed {
-			if err := os.Remove(tmpName); err != nil {
-				logger.Debug("cleanup temp config %s failed: %v", tmpName, err)
-			}
+			_ = os.Remove(tmpName)
 		}
 	}()
 	if _, err := tmp.Write(data); err != nil {
@@ -554,11 +548,21 @@ func (sm *SkillManager) saveConfig(cfg skillsConfig) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, sm.configPath); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
 	committed = true
 	return nil
+}
+
+// saveConfig writes skills.json atomically: 先写临时文件并 fsync，再 os.Rename
+// 替换，避免并发写/崩溃截断导致配置丢失（与 plugin manifest 的 Save 一致）。
+func (sm *SkillManager) saveConfig(cfg skillsConfig) error {
+	data, err := json.MarshalIndent(cfg, "", "    ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(sm.configPath, data, 0o600)
 }
 
 func (sm *SkillManager) loadSandboxCache() SandboxCache {
@@ -568,6 +572,7 @@ func (sm *SkillManager) loadSandboxCache() SandboxCache {
 	}
 	var cache SandboxCache
 	if err := json.Unmarshal(data, &cache); err != nil {
+		logger.Warn("sandbox skills cache %s is corrupted, falling back to empty: %v", sm.sandboxSkillsCachePath, err)
 		return SandboxCache{Version: SandboxCacheVersion, Skills: []SandboxCacheEntry{}}
 	}
 	if cache.Skills == nil {
@@ -580,9 +585,9 @@ func (sm *SkillManager) saveSandboxCache(cache SandboxCache) {
 	cache.Version = SandboxCacheVersion
 	cache.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	data, _ := json.MarshalIndent(cache, "", "  ")
-	// #nosec G306 -- cache file stores non-sensitive skill metadata; 0600 keeps
-	// other local users from reading it.
-	if err := os.WriteFile(sm.sandboxSkillsCachePath, data, 0600); err != nil {
+	// 原子写（temp+fsync+rename），与 saveConfig 同策略，避免崩溃截断后
+	// loadSandboxCache 静默回退空缓存。
+	if err := atomicWriteFile(sm.sandboxSkillsCachePath, data, 0600); err != nil {
 		logger.Debug("write sandbox skills cache failed: %v", err)
 	}
 }

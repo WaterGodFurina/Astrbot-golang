@@ -80,10 +80,10 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return &provider.LLMResponse{
 			Role:           "err",
-			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, string(respBody)),
+			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024)),
 		}, nil
 	}
 	var result struct {
@@ -96,8 +96,10 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 		} `json:"content"`
 		Role  string `json:"role"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -109,8 +111,9 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 		ToolsCallName: []string{},
 		ToolsCallIDs:  []string{},
 		Usage: &provider.TokenUsage{
-			InputOther: result.Usage.InputTokens,
-			Output:     result.Usage.OutputTokens,
+			InputOther:  result.Usage.InputTokens,
+			InputCached: result.Usage.CacheReadInputTokens,
+			Output:      result.Usage.OutputTokens,
 		},
 	}
 	var text strings.Builder
@@ -143,9 +146,9 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024))
 	}
 
 	ch := make(chan *provider.LLMResponse, 100)
@@ -161,6 +164,34 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 		content := new(strings.Builder)
 		usage := &provider.TokenUsage{}
 		var responseID string
+		sentFinal := false
+
+		// buildFinal 聚合文本/工具调用/用量为最终响应, 在 message_stop
+		// 分支或流干净结束时发送。
+		buildFinal := func() *provider.LLMResponse {
+			final := &provider.LLMResponse{
+				Role:           "assistant",
+				ID:             responseID,
+				CompletionText: content.String(),
+				Usage:          usage,
+				ToolsCallArgs:  []map[string]interface{}{},
+				ToolsCallName:  []string{},
+				ToolsCallIDs:   []string{},
+			}
+			for _, tc := range finalToolCalls {
+				argsMap := map[string]interface{}{}
+				if tc.inputJSON != "" {
+					_ = json.Unmarshal([]byte(tc.inputJSON), &argsMap)
+				}
+				final.ToolsCallName = append(final.ToolsCallName, tc.name)
+				final.ToolsCallIDs = append(final.ToolsCallIDs, tc.id)
+				final.ToolsCallArgs = append(final.ToolsCallArgs, argsMap)
+			}
+			if len(final.ToolsCallArgs) > 0 {
+				final.Role = "tool"
+			}
+			return final
+		}
 
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var event struct {
@@ -169,8 +200,10 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 				Message *struct {
 					ID    string `json:"id"`
 					Usage struct {
-						InputTokens  int `json:"input_tokens"`
-						OutputTokens int `json:"output_tokens"`
+						InputTokens              int `json:"input_tokens"`
+						OutputTokens             int `json:"output_tokens"`
+						CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+						CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
 				ContentBlock *struct {
@@ -184,8 +217,10 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 					PartialJSON string `json:"partial_json"`
 				} `json:"delta"`
 				Usage *struct {
-					InputTokens  int `json:"input_tokens"`
-					OutputTokens int `json:"output_tokens"`
+					InputTokens              int `json:"input_tokens"`
+					OutputTokens             int `json:"output_tokens"`
+					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 				} `json:"usage"`
 				Error *struct {
 					Type    string `json:"type"`
@@ -200,6 +235,7 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 				if event.Message != nil {
 					responseID = event.Message.ID
 					usage.InputOther = event.Message.Usage.InputTokens
+					usage.InputCached = event.Message.Usage.CacheReadInputTokens
 					usage.Output = event.Message.Usage.OutputTokens
 				}
 			case "content_block_start":
@@ -235,32 +271,14 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 					delete(toolBuf, event.Index)
 				}
 			case "message_delta":
+				// message_delta 的 usage 只携带 output_tokens（对齐 Python
+				// _update_usage：input 字段缺失时保留 message_start 的值）。
 				if event.Usage != nil {
 					usage.Output = event.Usage.OutputTokens
 				}
 			case "message_stop":
-				final := &provider.LLMResponse{
-					Role:           "assistant",
-					ID:             responseID,
-					CompletionText: content.String(),
-					Usage:          usage,
-					ToolsCallArgs:  []map[string]interface{}{},
-					ToolsCallName:  []string{},
-					ToolsCallIDs:   []string{},
-				}
-				for _, tc := range finalToolCalls {
-					argsMap := map[string]interface{}{}
-					if tc.inputJSON != "" {
-						_ = json.Unmarshal([]byte(tc.inputJSON), &argsMap)
-					}
-					final.ToolsCallName = append(final.ToolsCallName, tc.name)
-					final.ToolsCallIDs = append(final.ToolsCallIDs, tc.id)
-					final.ToolsCallArgs = append(final.ToolsCallArgs, argsMap)
-				}
-				if len(final.ToolsCallArgs) > 0 {
-					final.Role = "tool"
-				}
-				ch <- final
+				ch <- buildFinal()
+				sentFinal = true
 				return true
 			case "error":
 				msg := "Anthropic stream error"
@@ -268,6 +286,7 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 					msg = event.Error.Message
 				}
 				ch <- &provider.LLMResponse{Role: "err", CompletionText: msg}
+				sentFinal = true
 				return true
 			}
 			return false
@@ -276,6 +295,11 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 			logger.Warn("Anthropic stream read error: %v", err)
 			ch <- &provider.LLMResponse{Role: "err", CompletionText: fmt.Sprintf("Anthropic stream read error: %v", err)}
 			return
+		}
+		// 对端干净 FIN 但未收到 message_stop: 补发最终聚合响应,
+		// 保证工具调用与 token 统计不会丢失。
+		if !sentFinal {
+			ch <- buildFinal()
 		}
 		if usage != nil {
 			logger.Debug("LLM stream done, usage=%v", usage)

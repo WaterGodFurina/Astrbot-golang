@@ -5,10 +5,12 @@ package dashboard
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/backup"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
@@ -27,6 +30,8 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/google/uuid"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 // 上传/解压大小上限：防止认证用户通过超大 multipart 上传或高压缩比 zip
@@ -36,6 +41,7 @@ const (
 	maxKBDocFileSize     = 64 << 20  // 64 MiB：单个 KB 文档上限
 	maxSkillFileSize     = 64 << 20  // 64 MiB：skill zip 解压后单个文件上限
 	maxSkillExtractTotal = 256 << 20 // 256 MiB：skill zip 解压总字节上限
+	maxWebUIFileSize     = 64 << 20  // 64 MiB：WebUI 单次上传单文件上限
 )
 
 // ── Auth handlers ────────────────────────────────────────────
@@ -165,7 +171,7 @@ func redactDashboardSecrets(cfg map[string]interface{}) {
 	delete(dash, "totp")
 }
 
-// deepMerge recursively overlays src values onto dst; dst keys win at leaf level.
+// deepMerge recursively overlays src (persisted) values onto dst (defaults); src wins at leaf level.
 func deepMerge(dst, src map[string]interface{}) {
 	for k, v := range src {
 		if sm, ok := v.(map[string]interface{}); ok {
@@ -1231,7 +1237,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 	case "", "list":
 		if r.Method == http.MethodPost {
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body == nil {
 				body = map[string]interface{}{}
 			}
@@ -1332,7 +1341,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 			var body struct {
 				ProviderID string `json:"provider_id"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			writeJSON(w, http.StatusOK, apiOK(s.testProvider(body.ProviderID)))
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -1355,7 +1367,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 				ProviderID string                 `json:"provider_id"`
 				Config     map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.ProviderID != "" {
 				providerID = body.ProviderID
 			}
@@ -1386,19 +1401,80 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 			ProviderID string `json:"provider_id"`
 			Enabled    bool   `json:"enabled"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(s.setProviderEnabled(body.ProviderID, body.Enabled)))
 	case "models":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"models": []interface{}{},
 		}))
 	case "embedding-dimension":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"dimension": 0,
-		}))
+		s.handleEmbeddingDimension(w, r, "")
 	default:
+		// /providers/{provider_id}/embedding-dimension
+		if len(parts) > 1 && parts[1] == "embedding-dimension" {
+			s.handleEmbeddingDimension(w, r, parts[0])
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// handleEmbeddingDimension implements POST /providers[/{id}]/embedding-dimension：
+// 实例化 embedding provider 并请求一次嵌入探测向量维度（对齐 Python
+// config_service.get_embedding_dimension）。
+func (s *Server) handleEmbeddingDimension(w http.ResponseWriter, r *http.Request, providerID string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		return
+	}
+	var body struct {
+		ProviderID     string                 `json:"provider_id"`
+		ProviderConfig map[string]interface{} `json:"provider_config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	if providerID == "" {
+		providerID = body.ProviderID
+	}
+	config := body.ProviderConfig
+	if config == nil && providerID != "" {
+		config = s.getProviderByID(providerID)
+	}
+	if config == nil || len(config) == 0 {
+		writeJSON(w, http.StatusBadRequest, apiError("缺少参数 provider_config"))
+		return
+	}
+	merged := s.mergeProviderSource(config)
+	providerType, _ := merged["type"].(string)
+	if providerType == "" {
+		writeJSON(w, http.StatusBadRequest, apiError("provider_config 缺少 type 字段"))
+		return
+	}
+	inst, err := provider.CreateProvider(providerType, merged, map[string]interface{}{})
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("提供商适配器加载失败，请检查提供商类型配置或查看服务端日志"))
+		return
+	}
+	ep, ok := inst.(provider.EmbeddingProvider)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, apiError("提供商不是 EmbeddingProvider 类型"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	vec, err := ep.GetEmbedding(ctx, "echo")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("嵌入探测失败: "+err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"embedding_dimensions": len(vec),
+	}))
 }
 
 // mergeProviderSource merges the provider source config into a provider config.
@@ -1505,22 +1581,24 @@ func (s *Server) upsertProvider(config map[string]interface{}) error {
 	if id == "" {
 		return fmt.Errorf("缺少提供商 ID")
 	}
-	cfg := s.getConfigSnapshot()
-	providers, _ := cfg["provider"].([]interface{})
-	replaced := false
-	for i, p := range providers {
-		if m, ok := p.(map[string]interface{}); ok {
-			if pid, _ := m["id"].(string); pid == id {
-				providers[i] = config
-				replaced = true
-				break
+	return s.mutateConfig(func(cfg map[string]interface{}) error {
+		providers, _ := cfg["provider"].([]interface{})
+		replaced := false
+		for i, p := range providers {
+			if m, ok := p.(map[string]interface{}); ok {
+				if pid, _ := m["id"].(string); pid == id {
+					providers[i] = config
+					replaced = true
+					break
+				}
 			}
 		}
-	}
-	if !replaced {
-		providers = append(providers, config)
-	}
-	return s.setConfigData("provider", providers)
+		if !replaced {
+			providers = append(providers, config)
+		}
+		cfg["provider"] = providers
+		return nil
+	})
 }
 
 // getProviderByID returns a provider config by id.
@@ -1539,20 +1617,24 @@ func (s *Server) getProviderByID(id string) map[string]interface{} {
 
 // setProviderEnabled toggles a provider's enable flag.
 func (s *Server) setProviderEnabled(id string, enabled bool) map[string]interface{} {
-	cfg := s.getConfigSnapshot()
-	providers, _ := cfg["provider"].([]interface{})
-	for i, p := range providers {
-		if m, ok := p.(map[string]interface{}); ok {
-			if pid, _ := m["id"].(string); pid == id {
-				providers[i].(map[string]interface{})["enable"] = enabled
-				if err := s.setConfigData("provider", providers); err != nil {
-					return map[string]interface{}{"message": "保存失败: " + err.Error()}
+	result := map[string]interface{}{"message": "未找到对应提供商"}
+	err := s.mutateConfig(func(cfg map[string]interface{}) error {
+		providers, _ := cfg["provider"].([]interface{})
+		for _, p := range providers {
+			if m, ok := p.(map[string]interface{}); ok {
+				if pid, _ := m["id"].(string); pid == id {
+					m["enable"] = enabled
+					result = map[string]interface{}{"message": "更新成功"}
+					return nil
 				}
-				return map[string]interface{}{"message": "更新成功"}
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		return map[string]interface{}{"message": "保存失败: " + err.Error()}
 	}
-	return map[string]interface{}{"message": "未找到对应提供商"}
+	return result
 }
 
 // deleteProviderByID removes a provider config by id and unregisters its
@@ -1654,7 +1736,10 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 				BotID  string                 `json:"bot_id"`
 				Config map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.Config == nil {
 				body.Config = map[string]interface{}{}
 			}
@@ -1819,21 +1904,24 @@ func (s *Server) upsertBot(config map[string]interface{}) error {
 	if botID == "" {
 		return fmt.Errorf("缺少机器人 ID")
 	}
-	platforms := s.getBotList()
-	replaced := false
-	for i, p := range platforms {
-		if m, ok := p.(map[string]interface{}); ok {
-			if id, _ := m["id"].(string); id == botID {
-				platforms[i] = config
-				replaced = true
-				break
+	return s.mutateConfig(func(cfg map[string]interface{}) error {
+		platforms, _ := cfg["platform"].([]interface{})
+		replaced := false
+		for i, p := range platforms {
+			if m, ok := p.(map[string]interface{}); ok {
+				if id, _ := m["id"].(string); id == botID {
+					platforms[i] = config
+					replaced = true
+					break
+				}
 			}
 		}
-	}
-	if !replaced {
-		platforms = append(platforms, config)
-	}
-	return s.setConfigData("platform", platforms)
+		if !replaced {
+			platforms = append(platforms, config)
+		}
+		cfg["platform"] = platforms
+		return nil
+	})
 }
 
 // setBotEnabled handles PATCH /api/v1/bots/set-enabled.
@@ -1842,25 +1930,37 @@ func (s *Server) setBotEnabled(w http.ResponseWriter, r *http.Request) {
 		BotID   string `json:"bot_id"`
 		Enabled bool   `json:"enabled"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	platforms := s.getBotList()
-	for i, p := range platforms {
-		if m, ok := p.(map[string]interface{}); ok {
-			if id, _ := m["id"].(string); id == body.BotID {
-				platforms[i].(map[string]interface{})["enable"] = body.Enabled
-				if err := s.setConfigData("platform", platforms); err != nil {
-					writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
-					return
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	found := false
+	err := s.mutateConfig(func(cfg map[string]interface{}) error {
+		platforms, _ := cfg["platform"].([]interface{})
+		for i, p := range platforms {
+			if m, ok := p.(map[string]interface{}); ok {
+				if id, _ := m["id"].(string); id == body.BotID {
+					platforms[i].(map[string]interface{})["enable"] = body.Enabled
+					found = true
+					return nil
 				}
-				s.notifyPlatformsChanged()
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "更新成功",
-				}))
-				return
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+		return
 	}
-	writeJSON(w, http.StatusOK, apiError("未找到对应机器人"))
+	if !found {
+		writeJSON(w, http.StatusOK, apiError("未找到对应机器人"))
+		return
+	}
+	s.notifyPlatformsChanged()
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"message": "更新成功",
+	}))
+	return
 }
 
 // deleteBot handles DELETE /api/v1/bots/delete.
@@ -1923,7 +2023,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 				DeleteConfig bool `json:"delete_config"`
 				DeleteData   bool `json:"delete_data"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			s.pluginUninstall(pluginID, body.DeleteConfig, body.DeleteData)
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
 		case http.MethodPost:
@@ -1937,7 +2040,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			PluginID string `json:"plugin_id"`
 			Enabled  bool   `json:"enabled"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		s.pluginSetEnabled(body.PluginID, body.Enabled)
 		writeJSON(w, http.StatusOK, apiOKMsg("插件状态已更新", map[string]interface{}{}))
 	case "idle-unload":
@@ -1947,10 +2053,13 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			PluginID   string `json:"plugin_id"`
 			AllowSleep bool   `json:"allow_sleep"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if s.subPluginMgr != nil {
-			if _, _, ok := s.resolveSubprocessPlugin(body.PluginID); ok {
-				if err := s.subPluginMgr.SetIdleUnloadBlocked(body.PluginID, !body.AllowSleep); err != nil {
+			if pid, _, ok := s.resolveSubprocessPlugin(body.PluginID); ok {
+				if err := s.subPluginMgr.SetIdleUnloadBlocked(pid, !body.AllowSleep); err != nil {
 					writeJSON(w, http.StatusOK, apiError(err.Error()))
 					return
 				}
@@ -1973,7 +2082,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		var body struct {
 			Minutes int `json:"minutes"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body.Minutes < 0 {
 			body.Minutes = 0
 		}
@@ -1991,7 +2103,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		var body struct {
 			PluginID string `json:"plugin_id"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		s.pluginReload(body.PluginID)
 		writeJSON(w, http.StatusOK, apiOKMsg("插件已重载", map[string]interface{}{}))
 	case "config":
@@ -2007,7 +2122,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 					PluginID string                 `json:"plugin_id"`
 					Config   map[string]interface{} `json:"config"`
 				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				if pluginID == "" {
 					pluginID = body.PluginID
 				}
@@ -2028,7 +2146,12 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		}
 		writeJSON(w, http.StatusOK, apiOK(market))
 	case "page":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		// 插件自带页面入口（对齐 Python get_plugin_page_entry_config）。
+		s.handlePluginPage(w, r)
+	case "page-content":
+		// 插件页面资产。请求已由 apiAuthAllowed 用 asset_token / 专用
+		// Cookie 放行（iframe 子资源无法携带 Authorization 头）。
+		s.servePluginPageContent(w, r, parts[1:])
 	case "readme":
 		s.handlePluginDocs(w, r, s.subPluginMgr.Readme)
 	case "extensions":
@@ -2064,7 +2187,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		var body struct {
 			Level string `json:"level"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		level := strings.ToUpper(strings.TrimSpace(body.Level))
 		switch level {
 		case "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL":
@@ -2096,7 +2222,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 				var body struct {
 					Level *string `json:"level"`
 				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				var level string
 				if body.Level != nil {
 					level = strings.ToUpper(strings.TrimSpace(*body.Level))
@@ -2142,7 +2271,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 					var body struct {
 						Config map[string]interface{} `json:"config"`
 					}
-					_ = json.NewDecoder(r.Body).Decode(&body)
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+						return
+					}
 					s.pluginSaveConfig(pluginID, body.Config)
 					writeJSON(w, http.StatusOK, apiOKMsg("插件配置已保存", map[string]interface{}{}))
 				} else {
@@ -2229,7 +2361,10 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			Repo           string `json:"repo"`
 			DownloadURL    string `json:"download_url"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		source = strings.TrimSpace(body.URL)
 		ignoreRisk = body.IgnoreRisk
 		ccChoice = strings.TrimSpace(body.CCChoice)
@@ -2394,7 +2529,9 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 				"data": map[string]interface{}{
 					"kind":    string(runtimeErr.Kind),
 					"android": runtimeErr.Android,
+					"primary": runtimeErr.Primary,
 					"mirrors": runtimeErr.Mirrors,
+					"command": runtimeErr.Command,
 				},
 			})
 			return
@@ -2449,7 +2586,10 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			GoMirror     string   `json:"go_mirror"`
 			PythonMirror string   `json:"python_mirror"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body.PluginID != "" {
 			ids = append(ids, body.PluginID)
 		} else {
@@ -2483,6 +2623,10 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			results = append(results, result{Name: id, Status: "error", Message: "插件不存在或非子进程插件"})
 			continue
 		}
+		// 更新前从插件原 registry 重新解析最新下载源（对齐 Python
+		// resolve_market_update_info）：market 类型插件拉取最新
+		// download_url/repo，避免更新拉取 manifest 记录的固定旧版本 zip。
+		latestDL, latestRepo := s.resolveLatestPluginSource(pid)
 		inst, err := s.subPluginMgr.ReinstallSource(ctx, pid, plugin.InstallOptions{
 			Progress:     s.installProgressCallback(""),
 			CCChoice:     ccChoice,
@@ -2490,6 +2634,8 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			PythonChoice: pythonChoice,
 			GoMirror:     goMirror,
 			PythonMirror: pythonMirror,
+			DownloadURL:  latestDL,
+			Repo:         latestRepo,
 		})
 		if err != nil {
 			var riskErr *plugin.RiskError
@@ -2507,7 +2653,7 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 					Name:    name,
 					Status:  "error",
 					Code:    code,
-					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android, "mirrors": runtimeErr.Mirrors},
+					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android, "primary": runtimeErr.Primary, "mirrors": runtimeErr.Mirrors, "command": runtimeErr.Command},
 					Message: runtimeErr.Error(),
 				})
 				continue
@@ -2570,7 +2716,10 @@ func (s *Server) handlePluginBindSource(w http.ResponseWriter, r *http.Request, 
 		Repo           string `json:"repo"`
 		DownloadURL    string `json:"download_url"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 
 	pid, _, ok := s.resolveSubprocessPlugin(pluginID)
 	if !ok {
@@ -2637,6 +2786,8 @@ func (s *Server) handlePluginLogo(w http.ResponseWriter, r *http.Request) {
 // dynamic <param> segments) — and the response is written back to the client
 // (Go acts as a thin nginx-style gateway).
 func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pluginPath string) {
+	// 限制请求体总量（含 multipart），防止插件代理吞入超大上传。
+	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
 	pluginPath = strings.TrimPrefix(pluginPath, "/")
 	if pluginPath == "" {
 		writeJSON(w, http.StatusOK, apiError("缺少插件路径"))
@@ -2663,10 +2814,20 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 		http.NotFound(w, r)
 		return
 	}
-	// 有没有注册 Web API？没有则 404（避免无谓 RPC）。
+	// 有没有注册 Web API？实时拉取（运行期 register_web_api 也能被网关
+	// 识别）；旧插件二进制无 ListWebApis RPC 时返回 UNIMPLEMENTED，回退
+	// Register 快照（对齐 ListTools 模式）。
 	hasWebAPI := false
 	if inst.Meta != nil {
 		hasWebAPI = len(inst.Meta.WebApis) > 0
+	}
+	webAPICtx, webAPICancel := context.WithTimeout(r.Context(), 30*time.Second)
+	descs, listErr := inst.Client.ListWebApis(webAPICtx)
+	webAPICancel()
+	if listErr != nil {
+		logger.I18nWarn("plug proxy: 插件 %q ListWebApis 失败: %v", pid, listErr)
+	} else {
+		hasWebAPI = len(descs) > 0
 	}
 	if !hasWebAPI {
 		logger.I18nWarn("plug proxy: 插件 %q 未注册 Web API (path=%s)", pid, pluginPath)
@@ -2702,10 +2863,14 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 						if err != nil {
 							continue
 						}
-						content, err := io.ReadAll(io.LimitReader(f, 64<<20))
+						content, err := io.ReadAll(io.LimitReader(f, 64<<20+1))
 						_ = f.Close()
 						if err != nil {
 							continue
+						}
+						if len(content) > 64<<20 {
+							writeJSON(w, http.StatusRequestEntityTooLarge, apiError("文件过大（上限 64MB）"))
+							return
 						}
 						req.Files = append(req.Files, &sdkv1.WebUploadFile{
 							Field:       field,
@@ -2847,7 +3012,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 		case "create":
 			if method == http.MethodPost {
 				var body map[string]interface{}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				kb, err := s.createKB(body)
 				if err != nil {
 					writeJSON(w, http.StatusOK, apiError("创建知识库失败: "+err.Error()))
@@ -2859,7 +3027,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 		case "update":
 			kbID := r.URL.Query().Get("kb_id")
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if kbID == "" {
 				if v, _ := body["kb_id"].(string); v != "" {
 					kbID = v
@@ -2879,7 +3050,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 		case "delete":
 			kbID := r.URL.Query().Get("kb_id")
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if kbID == "" {
 				if v, _ := body["kb_id"].(string); v != "" {
 					kbID = v
@@ -2934,9 +3108,23 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 				s.handleKBDocuments(w, r, kbID, parts[2:])
 				return
 			case "chunks":
-				// List chunks from the SQLite index (list source of truth).
+				// List chunks from the SQLite index (list source of truth),
+				// with real pagination（对齐前端 page/page_size 参数，避免大 KB
+				// 全量返回）。
 				docID := r.URL.Query().Get("doc_id")
-				chunks, err := s.database.ListKBChunks(kbID, docID)
+				page := parseIntDefault(r.URL.Query().Get("page"), 1)
+				pageSize := parseIntDefault(r.URL.Query().Get("page_size"), 50)
+				if page < 1 {
+					page = 1
+				}
+				if pageSize < 1 || pageSize > 200 {
+					pageSize = 50
+				}
+				total := 0
+				if n, err := s.database.CountKBChunks(kbID, docID); err == nil {
+					total = n
+				}
+				chunks, err := s.database.ListKBChunksPage(kbID, docID, pageSize, (page-1)*pageSize)
 				items := []interface{}{}
 				if err == nil {
 					for _, c := range chunks {
@@ -2949,11 +3137,16 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 						})
 					}
 				}
+				totalPages := 0
+				if total > 0 {
+					totalPages = (total + pageSize - 1) / pageSize
+				}
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"items":     items,
-					"page":      1,
-					"page_size": len(items),
-					"total":     len(items),
+					"items":       items,
+					"page":        page,
+					"page_size":   pageSize,
+					"total":       total,
+					"total_pages": totalPages,
 				}))
 				return
 			case "stats":
@@ -2966,7 +3159,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 				return
 			case "retrieve":
 				var body map[string]interface{}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				query, _ := body["query"].(string)
 				if strings.TrimSpace(query) == "" {
 					query = r.URL.Query().Get("query")
@@ -3014,7 +3210,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 		}
 		if method == http.MethodPut {
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			kb, err := s.updateKB(kbID, body)
 			if err != nil {
 				writeJSON(w, http.StatusOK, apiError("更新知识库失败: "+err.Error()))
@@ -3038,7 +3237,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 	// No sub-path: GET → list, POST → create.
 	if method == http.MethodPost {
 		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		kb, err := s.createKB(body)
 		if err != nil {
 			writeJSON(w, http.StatusOK, apiError("创建知识库失败: "+err.Error()))
@@ -3121,444 +3323,27 @@ func (s *Server) getKBTask(taskID string) *kbUploadTask {
 	return s.kbTasks[taskID]
 }
 
-// recordKBTask stores a knowledge-base upload task state.
-func (s *Server) recordKBTask(t *kbUploadTask) {
-	if t == nil || t.TaskID == "" {
-		return
-	}
-	s.mu.Lock()
-	s.kbTasks[t.TaskID] = t
-	s.mu.Unlock()
-	if t.Status == "completed" || t.Status == "failed" {
-		// 终态在 TTL 后自动清除（仅当仍是本条记录时），避免 map 只增不删。
-		time.AfterFunc(kbTaskCleanupTTL, func() {
-			s.mu.Lock()
-			if s.kbTasks[t.TaskID] == t {
-				delete(s.kbTasks, t.TaskID)
-			}
-			s.mu.Unlock()
-		})
-	}
-}
-
 // handleKBDocuments handles document endpoints: list (GET), upload (POST
 // multipart), and URL import. kbID comes from the RESTful path
 // /knowledge-bases/{kb_id}/documents; for the legacy sub-path form the caller
-// passes it via parts[0].
+// passes it via parts[0]. 本函数只做子资源分发，各分支实现拆分在
+// kb_documents.go：import-url 导入、单文档详情/删除、multipart 上传、目录列表。
 func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID string, parts []string) {
 	if len(parts) > 0 && parts[0] == "import-url" {
-		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		url, _ := body["url"].(string)
-		if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
-			writeJSON(w, http.StatusOK, apiError("缺少或无效的参数 url"))
-			return
-		}
-		if err := validateOutboundURL(url); err != nil {
-			writeJSON(w, http.StatusOK, apiError("下载文档失败: "+err.Error()))
-			return
-		}
-		chunkSize := 512
-		chunkOverlap := 50
-		if v, ok := body["chunk_size"].(float64); ok && v > 0 {
-			chunkSize = int(v)
-		}
-		if v, ok := body["chunk_overlap"].(float64); ok && v >= 0 {
-			chunkOverlap = int(v)
-		}
-
-		// Download the remote content with a bounded timeout and size limit.
-		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			writeJSON(w, http.StatusOK, apiError("创建下载请求失败: "+err.Error()))
-			return
-		}
-		client := newOutboundClient(60 * time.Second)
-		resp, err := client.Do(req)
-		if err != nil {
-			writeJSON(w, http.StatusOK, apiError("下载文档失败: "+err.Error()))
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			writeJSON(w, http.StatusOK, apiError(fmt.Sprintf("下载文档失败: HTTP %d", resp.StatusCode)))
-			return
-		}
-		content, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-		if err != nil {
-			writeJSON(w, http.StatusOK, apiError("读取文档内容失败: "+err.Error()))
-			return
-		}
-		if len(content) == 0 {
-			writeJSON(w, http.StatusOK, apiError("下载的文档内容为空"))
-			return
-		}
-
-		// Save under the KB documents directory like the multipart upload path.
-		dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			writeJSON(w, http.StatusOK, apiError("创建知识库数据目录失败: "+err.Error()))
-			return
-		}
-		name := filepath.Base(strings.TrimRight(url, "/"))
-		if name == "" || name == "." || name == "/" {
-			name = "imported"
-		}
-		dst := filepath.Join(dir, sanitizePath(name))
-		if err := os.WriteFile(dst, content, 0o644); err != nil {
-			writeJSON(w, http.StatusOK, apiError("保存文档失败: "+err.Error()))
-			return
-		}
-		mod := time.Now().UnixNano()
-		docID := fmt.Sprintf("doc_%d_%s", mod, name)
-		taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
-		s.recordKBTask(&kbUploadTask{
-			TaskID: taskID,
-			KBID:   kbID,
-			Status: "processing",
-			Stage:  "chunking",
-			Total:  100,
-		})
-
-		// Index asynchronously (chunk → embed → dual write), same as uploads.
-		go func() {
-			if _, err := s.indexKBFile(kbID, docID, name, content, chunkSize, chunkOverlap); err != nil {
-				s.recordKBTask(&kbUploadTask{
-					TaskID:       taskID,
-					KBID:         kbID,
-					Status:       "completed",
-					Stage:        "embedding_failed",
-					Current:      100,
-					Total:        100,
-					SuccessCount: 0,
-					FailedCount:  1,
-					Error:        err.Error(),
-				})
-				return
-			}
-			s.recordKBTask(&kbUploadTask{
-				TaskID:       taskID,
-				KBID:         kbID,
-				Status:       "completed",
-				Stage:        "completed",
-				Current:      100,
-				Total:        100,
-				SuccessCount: 1,
-				FailedCount:  0,
-			})
-		}()
-
-		writeJSON(w, http.StatusOK, apiOKMsg("文档导入任务已创建", map[string]interface{}{
-			"task_id":    taskID,
-			"file_count": 1,
-			"documents": []map[string]interface{}{{
-				"doc_id":    docID,
-				"doc_name":  name,
-				"file_size": len(content),
-			}},
-		}))
+		s.kbDocImportURL(w, r, kbID)
 		return
 	}
 	// GET /knowledge-bases/{kb_id}/documents/{document_id} — single doc detail.
 	if len(parts) > 0 && (r.Method == http.MethodGet || r.Method == http.MethodDelete) {
-		docID := parts[0]
-		if r.Method == http.MethodDelete {
-			// Delete nanovec vectors first, then SQLite chunk rows, then the
-			// on-disk file.
-			if err := s.kbDeleteDoc(kbID, docID); err != nil {
-				logger.I18nWarn("删除文档 %s 失败: %v", docID, err)
-				writeJSON(w, http.StatusInternalServerError, apiError("删除文档失败: "+err.Error()))
-				return
-			}
-			dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-			if doc := s.kbDocumentByID(kbID, docID); doc != nil {
-				if err := os.Remove(filepath.Join(dir, sanitizePath(anyStr(doc["doc_name"])))); err != nil {
-					logger.I18nWarn("删除文档文件 %s 失败: %v", docID, err)
-				}
-			}
-			writeJSON(w, http.StatusOK, apiOKMsg("文档已删除", map[string]interface{}{}))
-			return
-		}
-		if doc := s.kbDocumentByID(kbID, docID); doc != nil {
-			writeJSON(w, http.StatusOK, apiOK(doc))
-			return
-		}
-		writeJSON(w, http.StatusOK, apiError("文档不存在"))
+		s.kbDocDetail(w, r, kbID, parts[0])
 		return
 	}
 	if r.Method == http.MethodPost {
-		// Multipart upload: save the files under the KB's data directory, then
-		// index them asynchronously (chunk → embed → SQLite + nanovec dual
-		// write). The WebUI polls the returned task for progress.
-		r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
-		if err := r.ParseMultipartForm(64 << 20); err != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
-				writeJSON(w, http.StatusRequestEntityTooLarge, apiError("上传文件过大（上限 256MB）"))
-				return
-			}
-			writeJSON(w, http.StatusOK, apiError("解析上传文件失败: "+err.Error()))
-			return
-		}
-		chunkSize := 512
-		chunkOverlap := 50
-		if v := r.FormValue("chunk_size"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				chunkSize = n
-			}
-		}
-		if v := r.FormValue("chunk_overlap"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-				chunkOverlap = n
-			}
-		}
-
-		dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			writeJSON(w, http.StatusOK, apiError("创建知识库数据目录失败: "+err.Error()))
-			return
-		}
-		var docs []struct {
-			DocID string
-			Name  string
-			Path  string
-		}
-		for key, files := range r.MultipartForm.File {
-			if key != "file" && !strings.HasPrefix(key, "file") && key != "files[]" {
-				continue
-			}
-			for _, fh := range files {
-				src, err := fh.Open()
-				if err != nil {
-					continue
-				}
-				name := filepath.Base(fh.Filename)
-				if name == "" || name == "." {
-					name = "document"
-				}
-				dst := filepath.Join(dir, sanitizePath(name))
-				out, err := os.Create(dst)
-				if err != nil {
-					_ = src.Close()
-					continue
-				}
-				n, err := io.Copy(out, io.LimitReader(src, maxKBDocFileSize+1))
-				if err != nil {
-					_ = out.Close()
-					_ = src.Close()
-					_ = os.Remove(dst)
-					continue
-				}
-				_ = out.Close()
-				_ = src.Close()
-				if n > maxKBDocFileSize {
-					_ = os.Remove(dst)
-					continue
-				}
-				info, _ := os.Stat(dst)
-				mod := int64(0)
-				if info != nil {
-					mod = info.ModTime().UnixNano()
-				}
-				docID := fmt.Sprintf("doc_%d_%s", mod, name)
-				docs = append(docs, struct {
-					DocID string
-					Name  string
-					Path  string
-				}{DocID: docID, Name: name, Path: dst})
-			}
-		}
-		if len(docs) == 0 {
-			writeJSON(w, http.StatusOK, apiError("缺少文件"))
-			return
-		}
-		taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
-		s.recordKBTask(&kbUploadTask{
-			TaskID: taskID,
-			KBID:   kbID,
-			Status: "processing",
-			Stage:  "chunking",
-			Total:  len(docs) * 100,
-		})
-
-		saved := make([]map[string]interface{}, 0, len(docs))
-		for _, d := range docs {
-			saved = append(saved, map[string]interface{}{
-				"doc_id":   d.DocID,
-				"doc_name": d.Name,
-				"file_size": func() int64 {
-					if fi, err := os.Stat(d.Path); err == nil {
-						return fi.Size()
-					}
-					return 0
-				}(),
-			})
-		}
-
-		// Index asynchronously: chunk each file, embed, dual-write.
-		go func() {
-			success, failed := 0, 0
-			total := len(docs)
-			for i, d := range docs {
-				s.recordKBTask(&kbUploadTask{
-					TaskID:       taskID,
-					KBID:         kbID,
-					Status:       "processing",
-					Stage:        "chunking",
-					FileIndex:    i,
-					Current:      i * 100,
-					Total:        total * 100,
-					SuccessCount: success,
-					FailedCount:  failed,
-				})
-				content, err := os.ReadFile(d.Path)
-				if err != nil {
-					failed++
-					continue
-				}
-				if _, err := s.indexKBFile(kbID, d.DocID, d.Name, content, chunkSize, chunkOverlap); err != nil {
-					// The file is saved; SQLite records may exist. Report failure
-					// for the vector index but keep the doc listed.
-					failed++
-					s.recordKBTask(&kbUploadTask{
-						TaskID:       taskID,
-						KBID:         kbID,
-						Status:       "processing",
-						Stage:        "embedding_failed",
-						FileIndex:    i,
-						Current:      (i + 1) * 100,
-						Total:        total * 100,
-						SuccessCount: success,
-						FailedCount:  failed,
-						Error:        err.Error(),
-					})
-					continue
-				}
-				success++
-			}
-			status := "completed"
-			if failed > 0 {
-				status = "completed"
-			}
-			s.recordKBTask(&kbUploadTask{
-				TaskID:       taskID,
-				KBID:         kbID,
-				Status:       status,
-				Stage:        "completed",
-				Current:      total * 100,
-				Total:        total * 100,
-				SuccessCount: success,
-				FailedCount:  failed,
-			})
-		}()
-
-		writeJSON(w, http.StatusOK, apiOKMsg("文档上传成功，正在后台分块", map[string]interface{}{
-			"task_id":    taskID,
-			"file_count": len(docs),
-			"documents":  saved,
-		}))
+		s.kbDocUpload(w, r, kbID)
 		return
 	}
 	// GET: list documents stored under the KB data directory.
-	dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-	items := []interface{}{}
-	if entries, err := os.ReadDir(dir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			info, _ := e.Info()
-			size := int64(0)
-			mod := int64(0)
-			modTime := time.Time{}
-			if info != nil {
-				size = info.Size()
-				mod = info.ModTime().UnixNano()
-				modTime = info.ModTime()
-			}
-			docID := fmt.Sprintf("doc_%d_%s", mod, e.Name())
-			chunkCount := 0
-			if s.database != nil {
-				if n, err := s.database.CountKBChunks(kbID, docID); err == nil {
-					chunkCount = n
-				}
-			}
-			items = append(items, map[string]interface{}{
-				"doc_id":      docID,
-				"doc_name":    e.Name(),
-				"file_type":   strings.TrimPrefix(filepath.Ext(e.Name()), "."),
-				"file_size":   size,
-				"created_at":  modTime.Format(time.RFC3339),
-				"chunk_count": chunkCount,
-			})
-		}
-	}
-	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-		"items":     items,
-		"page":      1,
-		"page_size": len(items),
-		"total":     len(items),
-	}))
-}
-
-// kbDocumentByID finds a document file in a KB's data directory by its doc_id.
-// The doc_id encodes "<modtime>_<filename>"; the file name is the part after
-// the first underscore so re-listing and detail both resolve to the same doc.
-func (s *Server) kbDocumentByID(kbID, docID string) map[string]interface{} {
-	dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, _ := e.Info()
-		mod := int64(0)
-		if info != nil {
-			mod = info.ModTime().UnixNano()
-		}
-		candidate := fmt.Sprintf("doc_%d_%s", mod, e.Name())
-		if candidate != docID {
-			continue
-		}
-		size := int64(0)
-		if info != nil {
-			size = info.Size()
-		}
-		content, _ := os.ReadFile(filepath.Join(dir, e.Name()))
-		chunkCount := 0
-		if s.database != nil {
-			if n, err := s.database.CountKBChunks(kbID, candidate); err == nil {
-				chunkCount = n
-			}
-		}
-		created := ""
-		if info != nil {
-			created = info.ModTime().Format(time.RFC3339)
-		}
-		return map[string]interface{}{
-			"doc_id":      candidate,
-			"doc_name":    e.Name(),
-			"file_type":   strings.TrimPrefix(filepath.Ext(e.Name()), "."),
-			"file_size":   size,
-			"content":     string(content),
-			"chunk_count": chunkCount,
-			"created_at":  created,
-		}
-	}
-	return nil
-}
-
-// anyStr extracts a string from an interface value.
-func anyStr(v interface{}) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
+	s.kbDocList(w, r, kbID)
 }
 
 // getKBByID returns a single knowledge base as a serializable map.
@@ -3687,6 +3472,9 @@ func (s *Server) deleteKB(kbID string) error {
 	if s.database == nil {
 		return fmt.Errorf("数据库不可用")
 	}
+	if _, err := s.database.GetKB(kbID); err != nil {
+		return fmt.Errorf("知识库不存在")
+	}
 	// 级联清理 1：先删除该 KB 的全部分块行（knowledge_base_chunks），
 	// 避免只删 knowledge_bases 行后留下孤儿分块。
 	if err := s.database.DeleteKBChunks(kbID, ""); err != nil {
@@ -3697,8 +3485,14 @@ func (s *Server) deleteKB(kbID string) error {
 	}
 	// 级联清理 2：删除磁盘数据目录 data/knowledge_bases/<id>/，
 	// 其中 documents/ 与 nanovec 的 .store/.idx（.vec.db）文件一并移除。
-	kbDir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID))
-	if err := os.RemoveAll(kbDir); err != nil {
+	// 删除前双重校验：目录必须落在 knowledge_bases 根目录之内，防止
+	// kbID 形如 "." 或 ".." 时误删整个 data 目录。
+	root, _ := filepath.Abs(filepath.Join(s.kbDataDir(), "knowledge_bases"))
+	abs, _ := filepath.Abs(filepath.Join(root, sanitizePath(kbID)))
+	if abs == root || !strings.HasPrefix(abs, root+string(os.PathSeparator)) {
+		return fmt.Errorf("非法知识库 ID")
+	}
+	if err := os.RemoveAll(abs); err != nil {
 		return fmt.Errorf("删除知识库数据目录失败: %w", err)
 	}
 	// 级联清理 3：释放该 KB 的向量写锁（kbVecMu 中的常驻 Mutex），
@@ -3734,6 +3528,9 @@ func (s *Server) kbDataDir() string {
 // sanitizePath makes a path segment safe for use in file names.
 func sanitizePath(p string) string {
 	p = filepath.Base(strings.ReplaceAll(p, "\\", "/"))
+	if strings.Trim(p, ".") == "" {
+		return "_"
+	}
 	var b strings.Builder
 	for _, r := range p {
 		switch {
@@ -3931,7 +3728,10 @@ func (s *Server) handleSessionGroups(w http.ResponseWriter, r *http.Request, par
 			Name string   `json:"name"`
 			Umos []string `json:"umos"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if strings.TrimSpace(body.Name) == "" {
 			writeJSON(w, http.StatusOK, apiError("分组名称不能为空"))
 			return
@@ -3960,7 +3760,10 @@ func (s *Server) handleSessionGroups(w http.ResponseWriter, r *http.Request, par
 			Name string   `json:"name"`
 			Umos []string `json:"umos"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		groups := s.getSessionGroups()
 		g, ok := groups[groupID]
 		if !ok {
@@ -4020,7 +3823,10 @@ func (s *Server) handleSessionRules(w http.ResponseWriter, r *http.Request, part
 			UMOs    []string `json:"umos"`
 			RuleKey string   `json:"rule_key"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		umos := body.UMOs
 		if body.UMO != "" {
 			umos = append(umos, body.UMO)
@@ -4142,8 +3948,8 @@ func (s *Server) handleSessionRules(w http.ResponseWriter, r *http.Request, part
 		"page_size":                pageSize,
 		"available_personas":       s.getAvailablePersonas(),
 		"available_chat_providers": s.getAvailableChatProviders(),
-		"available_stt_providers":  []interface{}{},
-		"available_tts_providers":  []interface{}{},
+		"available_stt_providers":  s.getAvailableSTTProviders(),
+		"available_tts_providers":  s.getAvailableTTSProviders(),
 		"available_plugins":        s.getAvailablePlugins(),
 		"available_kbs":            s.getAvailableKBs(),
 		"available_rule_keys":      conversation.AvailableSessionRuleKeys,
@@ -4333,6 +4139,51 @@ func (s *Server) getAvailableChatProviders() []interface{} {
 	return out
 }
 
+// getAvailableSTTProviders returns the enabled speech-to-text providers for
+// the rules editor (provider_type=stt 条目)。
+func (s *Server) getAvailableSTTProviders() []interface{} {
+	return s.getAvailableProvidersByKind("stt")
+}
+
+// getAvailableTTSProviders returns the enabled text-to-speech providers for
+// the rules editor (provider_type=tts 条目)。
+func (s *Server) getAvailableTTSProviders() []interface{} {
+	return s.getAvailableProvidersByKind("tts")
+}
+
+// getAvailableProvidersByKind 按 provider_type 过滤启用中的 provider。
+func (s *Server) getAvailableProvidersByKind(kind string) []interface{} {
+	cfg := s.getConfigData("default")
+	providers, ok := cfg["provider"].([]interface{})
+	if !ok {
+		return []interface{}{}
+	}
+	out := make([]interface{}, 0, len(providers))
+	for _, p := range providers {
+		pm, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		id, _ := pm["id"].(string)
+		model, _ := pm["model"].(string)
+		enabled, _ := pm["enable"].(bool)
+		if id == "" || !enabled {
+			continue
+		}
+		providerType, _ := pm["provider_type"].(string)
+		ptype, _ := pm["type"].(string)
+		if !strings.Contains(strings.ToLower(providerType+" "+ptype), kind) {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"id":    id,
+			"name":  id,
+			"model": model,
+		})
+	}
+	return out
+}
+
 // getAvailablePersonas returns the persona list for the rules editor.
 func (s *Server) getAvailablePersonas() []interface{} {
 	out := []interface{}{}
@@ -4362,7 +4213,9 @@ func (s *Server) getAvailablePlugins() []interface{} {
 	if spm == nil {
 		return out
 	}
-	for _, inst := range spm.List() {
+	// RegisteredPlugins（含闲置休眠占位，Meta 保留）而非 List()（仅运行中）：
+	// 否则休眠插件从规则编辑器的插件配置选择框里消失（no data available）。
+	for _, inst := range spm.RegisteredPlugins() {
 		if inst.Meta == nil {
 			continue
 		}
@@ -4424,7 +4277,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		switch r.Method {
 		case http.MethodPost:
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body == nil {
 				body = map[string]interface{}{}
 			}
@@ -4453,7 +4309,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 			}))
 		case http.MethodPut:
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body == nil {
 				body = map[string]interface{}{}
 			}
@@ -4484,7 +4343,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 			PersonaID string `json:"persona_id"`
 			FolderID  string `json:"folder_id"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if err := s.personas.movePersona(body.PersonaID, body.FolderID); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("移动失败: "+err.Error()))
 			return
@@ -4496,7 +4358,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		var body struct {
 			Items []map[string]interface{} `json:"items"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if err := s.personas.reorder(body.Items); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
 			return
@@ -4508,7 +4373,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		writeJSON(w, http.StatusOK, apiOK(s.personas.tree()))
 	case "create":
 		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if err := s.personas.upsertPersona(body); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
 			return
@@ -4551,7 +4419,10 @@ func (s *Server) handlePersonaFolders(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body == nil {
 				body = map[string]interface{}{}
 			}
@@ -4580,7 +4451,10 @@ func (s *Server) handlePersonaFolders(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body == nil {
 			body = map[string]interface{}{}
 		}
@@ -4750,7 +4624,10 @@ func (s *Server) updateTool(w http.ResponseWriter, r *http.Request, toolID, acti
 		var body struct {
 			Enabled bool `json:"enabled"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		// Built-in tools are readonly; MCP tools map to their server active flag.
 		for _, name := range builtinToolNames() {
 			if name == toolID {
@@ -4769,18 +4646,23 @@ func (s *Server) updateTool(w http.ResponseWriter, r *http.Request, toolID, acti
 		var body struct {
 			Permission string `json:"permission"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body.Permission != "admin" && body.Permission != "member" {
 			writeJSON(w, http.StatusOK, apiError("权限类型必须为 admin 或 member"))
 			return
 		}
-		cfg := s.getConfigSnapshot()
-		permissions, _ := cfg["tool_permissions"].(map[string]interface{})
-		if permissions == nil {
-			permissions = map[string]interface{}{}
-		}
-		permissions[toolID] = map[string]interface{}{"permission": body.Permission}
-		if err := s.setConfigData("tool_permissions", permissions); err != nil {
+		if err := s.mutateConfig(func(cfg map[string]interface{}) error {
+			permissions, _ := cfg["tool_permissions"].(map[string]interface{})
+			if permissions == nil {
+				permissions = map[string]interface{}{}
+			}
+			permissions[toolID] = map[string]interface{}{"permission": body.Permission}
+			cfg["tool_permissions"] = permissions
+			return nil
+		}); err != nil {
 			logger.I18nWarn("保存工具 %s 权限失败: %v", toolID, err)
 			writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
 			return
@@ -4814,7 +4696,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 				ServerName string `json:"server_name"`
 				Enabled    bool   `json:"enabled"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if err := s.mcp.setEnabled(body.ServerName, body.Enabled); err != nil {
 				writeJSON(w, http.StatusOK, apiError(err.Error()))
 				return
@@ -4825,7 +4710,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 			var body struct {
 				ServerName string `json:"server_name"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			s.testMCPServer(w, r, body.ServerName)
 			return
 		}
@@ -4837,7 +4725,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 					ServerName string `json:"server_name"`
 					Enabled    bool   `json:"enabled"`
 				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				if body.ServerName != "" {
 					serverName = body.ServerName
 				}
@@ -4859,7 +4750,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 				ServerName string                 `json:"server_name"`
 				Config     map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.ServerName != "" {
 				serverName = body.ServerName
 			}
@@ -4891,7 +4785,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		} else if r.Method == http.MethodPost {
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			name, _ := body["name"].(string)
 			if name == "" {
 				writeJSON(w, http.StatusOK, apiError("Server name cannot be empty"))
@@ -4910,7 +4807,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 			var body struct {
 				AccessToken string `json:"access_token"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			count, err := s.syncModelScopeMCPServers(body.AccessToken)
 			if err != nil {
 				writeJSON(w, http.StatusOK, apiError(err.Error()))
@@ -4935,7 +4835,10 @@ func (s *Server) mcpByID(w http.ResponseWriter, r *http.Request) {
 		ServerName string                 `json:"server_name"`
 		Config     map[string]interface{} `json:"config"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if body.ServerName != "" {
 		serverName = body.ServerName
 	}
@@ -5206,6 +5109,93 @@ func sseLogLine(entry log.LogEntry) string {
 
 // ── Backups handlers ─────────────────────────────────────────
 
+// backupDir 返回备份目录（data/backups），对齐 Python get_astrbot_backups_path。
+func (s *Server) backupDir() string {
+	return filepath.Join(s.kbDataDir(), "backups")
+}
+
+// backupChunksDir 返回分片上传临时目录（data/backups/.chunks）。
+func (s *Server) backupChunksDir() string {
+	return filepath.Join(s.backupDir(), ".chunks")
+}
+
+// uploadSession 是一次分片上传的进行中状态（对齐 Python BackupService
+// upload_sessions）。分片落盘到 .chunks/<upload_id>/<index>.part。
+type uploadSession struct {
+	Filename         string
+	OriginalFilename string
+	TotalSize        int64
+	TotalChunks      int
+	ReceivedChunks   map[int]bool
+	ChunkDir         string
+	CreatedAt        time.Time
+	LastActivity     time.Time
+}
+
+// backupTaskState 是一次后台备份任务（导出/导入）的进度状态（对齐 Python
+// BackupService backup_tasks + backup_progress）。
+type backupTaskState struct {
+	TaskID  string
+	Type    string // "export" | "import"
+	Status  string // pending | processing | completed | failed
+	Result  map[string]interface{}
+	Error   string
+	Stage   string
+	Current int
+	Total   int
+	Message string
+}
+
+// validateBackupFilename 校验备份文件名不含路径穿越字符（对齐 Python
+// _safe_backup_filename）。
+func validateBackupFilename(filename string) (string, error) {
+	if filename == "" {
+		return "", fmt.Errorf("缺少参数 filename")
+	}
+	if strings.Contains(filename, "..") || strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+		return "", fmt.Errorf("文件名包含非法路径字符")
+	}
+	return filename, nil
+}
+
+// secureBackupFilename 净化上传文件名（对齐 Python secure_filename）：
+// 仅保留文件名部分并把非法字符替换为下划线。
+func secureBackupFilename(filename string) string {
+	filename = strings.ReplaceAll(filename, "\\", "/")
+	filename = filepath.Base(filename)
+	filename = strings.ReplaceAll(filename, "..", "_")
+	var b strings.Builder
+	for _, r := range filename {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	name := strings.Trim(b.String(), ".")
+	if name == "" || strings.ReplaceAll(name, "_", "") == "" {
+		name = "backup"
+	}
+	return name
+}
+
+// uniqueBackupFilename 在净化文件名中追加时间戳（对齐 Python
+// generate_unique_filename）。
+func uniqueBackupFilename(filename string) string {
+	ext := filepath.Ext(filename)
+	name := strings.TrimSuffix(filename, ext)
+	return fmt.Sprintf("%s_%s%s", name, time.Now().Format("20060102_150405"), ext)
+}
+
+// readBackupManifest 读取备份 zip 的 manifest.json（缺失时返回零值）。
+func (s *Server) readBackupManifest(zipPath string) backup.ManifestEntry {
+	return backup.ReadManifest(zipPath)
+}
+
+// handleBackups implements /api/v1/backups[...] (list/create/upload/chunked
+// upload/download/check/import/rename/delete), mirroring Python backups.py.
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
 	if len(parts) > 0 {
@@ -5213,84 +5203,658 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, parts []s
 	}
 	switch sub {
 	case "", "list":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"items":     []interface{}{},
-			"total":     0,
-			"page":      1,
-			"page_size": 20,
-		}))
+		s.handleBackupsList(w, r)
 	case "tasks":
-		if len(parts) > 1 {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"status":   "pending",
-				"progress": 0,
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK([]interface{}{}))
-		}
+		s.handleBackupsTask(w, r, parts)
 	case "upload":
+		s.handleBackupsUpload(w, r, parts)
+	default:
+		// GET /backups/{filename}（下载）、PATCH/DELETE /backups/{filename}、
+		// POST /backups/{filename}/check、POST /backups/{filename}/import。
+		filename, err := validateBackupFilename(sub)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
+			return
+		}
 		if len(parts) > 1 {
 			switch parts[1] {
-			case "init":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"task_id": "",
-				}))
-			case "chunk":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "chunk uploaded",
-				}))
-			case "complete":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "upload complete",
-				}))
-			case "abort":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "upload aborted",
-				}))
+			case "check":
+				if r.Method != http.MethodPost {
+					writeJSON(w, http.StatusMethodNotAllowed, apiError("POST required"))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOK(s.checkBackupFile(filename)))
+			case "import":
+				if r.Method != http.MethodPost {
+					writeJSON(w, http.StatusMethodNotAllowed, apiError("POST required"))
+					return
+				}
+				s.handleBackupsImport(w, r, filename)
 			default:
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "upload endpoint",
-				}))
+				writeJSON(w, http.StatusNotFound, apiError("unknown backup endpoint"))
 			}
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"message": "upload endpoint",
-			}))
+			return
 		}
-	default:
-		if len(parts) > 0 {
-			if len(parts) > 1 {
-				switch parts[1] {
-				case "check":
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"valid": true,
-					}))
-				case "import":
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "import started",
-					}))
-				default:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		switch r.Method {
+		case http.MethodGet:
+			s.handleBackupsDownload(w, r, filename)
+		case http.MethodPatch:
+			s.handleBackupsRename(w, r, filename)
+		case http.MethodDelete:
+			s.handleBackupsDelete(w, r, filename)
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, apiError("method not allowed"))
+		}
+	}
+}
+
+// handleBackupsList returns GET /backups: paginated zip list with manifest
+// metadata (filename/size/created_at/type/astrbot_version/exported_at).
+func (s *Server) handleBackupsList(w http.ResponseWriter, r *http.Request) {
+	page := 1
+	pageSize := 20
+	if v := r.URL.Query().Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	if v := r.URL.Query().Get("page_size"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			pageSize = n
+		}
+	}
+	dir := s.backupDir()
+	_ = os.MkdirAll(dir, 0o755)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"items": []interface{}{}, "total": 0, "page": page, "page_size": pageSize,
+		}))
+		return
+	}
+	type backupItem struct {
+		filename  string
+		size      int64
+		createdAt int64
+		item      map[string]interface{}
+	}
+	var items []backupItem
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".zip") || strings.HasPrefix(name, ".") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		zipPath := filepath.Join(dir, name)
+		manifest := s.readBackupManifest(zipPath)
+		typ := manifest.Origin
+		if typ == "" {
+			typ = "exported"
+		}
+		astrbotVersion := manifest.AstrbotVersion
+		if astrbotVersion == "" {
+			astrbotVersion = "未知"
+		}
+		exportedAt := manifest.ExportedAt
+		items = append(items, backupItem{
+			filename:  name,
+			size:      info.Size(),
+			createdAt: info.ModTime().Unix(),
+			item: map[string]interface{}{
+				"filename":        name,
+				"size":            info.Size(),
+				"created_at":      info.ModTime().Unix(),
+				"type":            typ,
+				"astrbot_version": astrbotVersion,
+				"exported_at":     exportedAt,
+			},
+		})
+	}
+	// 按创建时间倒序（对齐 Python sort by created_at desc）。
+	sort.Slice(items, func(i, j int) bool { return items[i].createdAt > items[j].createdAt })
+	total := len(items)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	out := make([]interface{}, 0, end-start)
+	for _, it := range items[start:end] {
+		out = append(out, it.item)
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"items": out, "total": total, "page": page, "page_size": pageSize,
+	}))
+}
+
+// handleBackupsTask returns GET /backups/tasks/{task_id} progress (and the
+// task list when no id is given), mirroring Python get_progress.
+func (s *Server) handleBackupsTask(w http.ResponseWriter, r *http.Request, parts []string) {
+	s.backupTaskMu.Lock()
+	defer s.backupTaskMu.Unlock()
+	if len(parts) < 2 {
+		tasks := make([]interface{}, 0, len(s.backupTasks))
+		for _, t := range s.backupTasks {
+			tasks = append(tasks, map[string]interface{}{
+				"task_id": t.TaskID, "type": t.Type, "status": t.Status,
+			})
+		}
+		writeJSON(w, http.StatusOK, apiOK(tasks))
+		return
+	}
+	task := s.backupTasks[parts[1]]
+	if task == nil {
+		writeJSON(w, http.StatusOK, apiError("找不到该任务"))
+		return
+	}
+	resp := map[string]interface{}{
+		"task_id": task.TaskID,
+		"type":    task.Type,
+		"status":  task.Status,
+	}
+	switch task.Status {
+	case "processing":
+		resp["progress"] = map[string]interface{}{
+			"status": "processing", "stage": task.Stage,
+			"current": task.Current, "total": task.Total, "message": task.Message,
+		}
+	case "completed":
+		resp["result"] = task.Result
+	case "failed":
+		resp["error"] = task.Error
+	}
+	writeJSON(w, http.StatusOK, apiOK(resp))
+}
+
+// handleBackupsUpload implements POST /backups/upload (whole-file multipart)
+// and the chunked upload lifecycle (init/chunk/complete/abort), mirroring
+// Python BackupService.upload_backup / upload_init / upload_chunk /
+// upload_complete / upload_abort.
+func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) > 1 {
+		switch parts[1] {
+		case "init":
+			var body struct {
+				Filename  string `json:"filename"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
+			if !strings.HasSuffix(strings.ToLower(body.Filename), ".zip") {
+				writeJSON(w, http.StatusBadRequest, apiError("请上传 ZIP 格式的备份文件"))
+				return
+			}
+			if body.TotalSize <= 0 {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的文件大小"))
+				return
+			}
+			totalChunks := int((body.TotalSize + chunkSizeBytes - 1) / chunkSizeBytes)
+			uploadID := uuid.NewString()
+			safe := secureBackupFilename(body.Filename)
+			unique := uniqueBackupFilename(safe)
+			chunkDir := filepath.Join(s.backupChunksDir(), uploadID)
+			if err := os.MkdirAll(chunkDir, 0o755); err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiError("初始化分片上传失败: "+err.Error()))
+				return
+			}
+			s.uploadMu.Lock()
+			s.uploadSessions[uploadID] = &uploadSession{
+				Filename: unique, OriginalFilename: body.Filename,
+				TotalSize: body.TotalSize, TotalChunks: totalChunks,
+				ReceivedChunks: map[int]bool{}, ChunkDir: chunkDir,
+				CreatedAt: time.Now(), LastActivity: time.Now(),
+			}
+			s.uploadMu.Unlock()
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"upload_id": uploadID, "chunk_size": chunkSizeBytes,
+				"total_chunks": totalChunks, "filename": unique,
+			}))
+		case "chunk":
+			uploadID := r.FormValue("upload_id")
+			chunkIndexStr := r.FormValue("chunk_index")
+			chunk, _, err := r.FormFile("chunk")
+			if uploadID == "" || chunkIndexStr == "" || err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("缺少必要参数"))
+				return
+			}
+			defer chunk.Close()
+			chunkIndex, err := strconv.Atoi(chunkIndexStr)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的分片索引"))
+				return
+			}
+			s.uploadMu.Lock()
+			session := s.uploadSessions[uploadID]
+			s.uploadMu.Unlock()
+			if session == nil {
+				writeJSON(w, http.StatusBadRequest, apiError("上传会话不存在或已过期"))
+				return
+			}
+			if chunkIndex < 0 || chunkIndex >= session.TotalChunks {
+				writeJSON(w, http.StatusBadRequest, apiError("分片索引超出范围"))
+				return
+			}
+			chunkPath := filepath.Join(session.ChunkDir, fmt.Sprintf("%d.part", chunkIndex))
+			if err := writeChunkFile(chunkPath, chunk); err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiError("保存分片失败: "+err.Error()))
+				return
+			}
+			s.uploadMu.Lock()
+			session.ReceivedChunks[chunkIndex] = true
+			session.LastActivity = time.Now()
+			received := len(session.ReceivedChunks)
+			s.uploadMu.Unlock()
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"received": received, "total": session.TotalChunks, "chunk_index": chunkIndex,
+			}))
+		case "complete":
+			var body struct {
+				UploadID string `json:"upload_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
+			if body.UploadID == "" {
+				writeJSON(w, http.StatusBadRequest, apiError("缺少 upload_id 参数"))
+				return
+			}
+			s.uploadMu.Lock()
+			session := s.uploadSessions[body.UploadID]
+			s.uploadMu.Unlock()
+			if session == nil {
+				writeJSON(w, http.StatusBadRequest, apiError("上传会话不存在或已过期"))
+				return
+			}
+			if len(session.ReceivedChunks) != session.TotalChunks {
+				writeJSON(w, http.StatusBadRequest, apiError(fmt.Sprintf("分片不完整，缺少: %d 个分片", session.TotalChunks-len(session.ReceivedChunks))))
+				return
+			}
+			dir := s.backupDir()
+			_ = os.MkdirAll(dir, 0o755)
+			outputPath := filepath.Join(dir, session.Filename)
+			file, err := os.Create(outputPath) // #nosec G304 -- filename 已经 secureBackupFilename 净化，会话为服务端生成
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiError("合并分片失败: "+err.Error()))
+				return
+			}
+			var mergeErr error
+			for i := 0; i < session.TotalChunks; i++ {
+				chunkPath := filepath.Join(session.ChunkDir, fmt.Sprintf("%d.part", i))
+				cf, err := os.Open(chunkPath) // #nosec G304 -- chunkPath 由服务端 upload_id/索引拼接
+				if err != nil {
+					mergeErr = err
+					break
 				}
-			} else {
-				switch r.Method {
-				case http.MethodPatch:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "renamed",
-					}))
-				case http.MethodDelete:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "deleted",
-					}))
-				default:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+				_, err = io.Copy(file, cf)
+				_ = cf.Close()
+				if err != nil {
+					mergeErr = err
+					break
 				}
 			}
-		} else {
+			_ = file.Close()
+			if mergeErr != nil {
+				_ = os.Remove(outputPath)
+				writeJSON(w, http.StatusInternalServerError, apiError("合并分片失败: "+mergeErr.Error()))
+				return
+			}
+			size, _ := os.Stat(outputPath)
+			fileSize := int64(0)
+			if size != nil {
+				fileSize = size.Size()
+			}
+			// 合并完成后立即校验 ZIP 有效性：损坏的备份不应进入备份列表。
+			// 校验失败删除已保存文件、清理分片会话并返回错误。
+			if res := backup.CheckBackup(outputPath); res == nil || !res.Valid || res.Error != "" {
+				_ = os.Remove(outputPath)
+				s.cleanupUploadSession(body.UploadID)
+				msg := "上传的备份文件无效"
+				if res != nil && res.Error != "" {
+					msg += ": " + res.Error
+				}
+				writeJSON(w, http.StatusBadRequest, apiError(msg))
+				return
+			}
+			// 标记上传来源（对齐 mark_backup_as_uploaded：写入 manifest.json）。
+			s.markBackupAsUploaded(outputPath)
+			s.cleanupUploadSession(body.UploadID)
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"backups": []interface{}{},
+				"filename": session.Filename, "original_filename": session.OriginalFilename, "size": fileSize,
 			}))
+		case "abort":
+			var body struct {
+				UploadID string `json:"upload_id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
+			if body.UploadID != "" {
+				s.cleanupUploadSession(body.UploadID)
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("上传已取消", nil))
+		default:
+			writeJSON(w, http.StatusNotFound, apiError("unknown upload endpoint"))
 		}
+		return
+	}
+	// 整体上传：multipart 单文件。
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("缺少备份文件"))
+		return
+	}
+	defer file.Close()
+	if header == nil || !strings.HasSuffix(strings.ToLower(header.Filename), ".zip") {
+		writeJSON(w, http.StatusBadRequest, apiError("请上传 ZIP 格式的备份文件"))
+		return
+	}
+	safe := secureBackupFilename(header.Filename)
+	unique := uniqueBackupFilename(safe)
+	dir := s.backupDir()
+	_ = os.MkdirAll(dir, 0o755)
+	zipPath := filepath.Join(dir, unique)
+	dst, err := os.Create(zipPath) // #nosec G304 -- unique 经 secureBackupFilename 净化
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("保存备份文件失败: "+err.Error()))
+		return
+	}
+	// 限制上传体积（256 MiB），防磁盘耗尽。
+	n, copyErr := io.Copy(dst, io.LimitReader(file, maxMultipartBodySize))
+	_ = dst.Close()
+	if copyErr != nil {
+		_ = os.Remove(zipPath)
+		writeJSON(w, http.StatusInternalServerError, apiError("保存备份文件失败: "+copyErr.Error()))
+		return
+	}
+	if n >= maxMultipartBodySize {
+		_ = os.Remove(zipPath)
+		writeJSON(w, http.StatusBadRequest, apiError("备份文件过大"))
+		return
+	}
+	// 保存后立即校验 ZIP 有效性：损坏的备份不应进入备份列表（对齐
+	// Python 上传后 pre_check）。校验失败删除已保存文件并返回错误。
+	if res := backup.CheckBackup(zipPath); res == nil || !res.Valid || res.Error != "" {
+		_ = os.Remove(zipPath)
+		msg := "上传的备份文件无效"
+		if res != nil && res.Error != "" {
+			msg += ": " + res.Error
+		}
+		writeJSON(w, http.StatusBadRequest, apiError(msg))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"filename": unique, "original_filename": header.Filename, "size": n,
+	}))
+}
+
+// chunkSizeBytes 对齐 Python CHUNK_SIZE（1 MiB）。
+const chunkSizeBytes = 1024 * 1024
+
+// writeChunkFile 把分片流落盘到 chunkPath。
+func writeChunkFile(chunkPath string, src io.Reader) error {
+	dst, err := os.Create(chunkPath) // #nosec G304 -- chunkPath 由服务端 upload_id/索引拼接
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(dst, io.LimitReader(src, maxMultipartBodySize))
+	_ = dst.Close()
+	return err
+}
+
+// cleanupUploadSession 删除分片会话及其临时目录。
+func (s *Server) cleanupUploadSession(uploadID string) {
+	s.uploadMu.Lock()
+	session := s.uploadSessions[uploadID]
+	delete(s.uploadSessions, uploadID)
+	s.uploadMu.Unlock()
+	if session != nil && session.ChunkDir != "" {
+		_ = os.RemoveAll(session.ChunkDir)
+	}
+}
+
+// markBackupAsUploaded 向已上传的备份写入 manifest.json（origin=uploaded），
+// 对齐 Python mark_backup_as_uploaded。
+func (s *Server) markBackupAsUploaded(zipPath string) {
+	entry := s.readBackupManifest(zipPath)
+	entry.Origin = "uploaded"
+	entry.UploadedAt = time.Now().Format(time.RFC3339)
+	data, err := json.MarshalIndent(entry, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(s.backupDir(), "backup-*.zip.tmp")
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmp.Name())
+	zw := zip.NewWriter(tmp)
+	if err != nil {
+		return
+	}
+	// 从原 zip 复制全部条目，替换/新增 manifest.json（zip 不支持原地更新）。
+	src, err := zip.OpenReader(zipPath)
+	if err != nil {
+		_ = zw.Close()
+		return
+	}
+	defer src.Close()
+	for _, f := range src.File {
+		if f.Name == "manifest.json" {
+			continue
+		}
+		w, err := zw.Create(f.Name)
+		if err != nil {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		_, _ = io.Copy(w, rc)
+		_ = rc.Close()
+	}
+	mw, err := zw.Create("manifest.json")
+	if err == nil {
+		_, _ = mw.Write(data)
+	}
+	_ = zw.Close()
+	_ = tmp.Close()
+	_ = os.Rename(tmp.Name(), zipPath)
+}
+
+// handleBackupsDownload streams the backup file with Content-Disposition.
+// Auth via Authorization header or ?token= (browsers cannot set headers for
+// <a download>), mirroring Python download_backup.
+func (s *Server) handleBackupsDownload(w http.ResponseWriter, r *http.Request, filename string) {
+	// 复核开放项 10-2：浏览器原生下载无法携带 Authorization 头，URL 凭据
+	// 优先用一次性 ws-ticket（30s、单次使用），长效 JWT 仅作旧前端回退，
+	// 避免其进入代理/服务端访问日志。
+	if ticket := r.URL.Query().Get("ticket"); ticket != "" {
+		if s.auth == nil || !s.consumeWSTicket(ticket) {
+			writeJSON(w, http.StatusUnauthorized, apiError("票据无效或已使用"))
+			return
+		}
+	} else {
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			token = extractToken(r)
+		}
+		if token == "" || s.auth == nil || !s.auth.IsAuthenticated(token) {
+			writeJSON(w, http.StatusUnauthorized, apiError("未认证"))
+			return
+		}
+	}
+	zipPath := filepath.Join(s.backupDir(), filename)
+	if _, err := os.Stat(zipPath); err != nil {
+		writeJSON(w, http.StatusNotFound, apiError("备份文件不存在"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	http.ServeFile(w, r, zipPath) // #nosec G304 -- filename 已过 validateBackupFilename 校验
+}
+
+// handleBackupsRename implements PATCH /backups/{filename}（重命名）。
+func (s *Server) handleBackupsRename(w http.ResponseWriter, r *http.Request, filename string) {
+	var body struct {
+		NewName string `json:"new_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	if body.NewName == "" {
+		writeJSON(w, http.StatusBadRequest, apiError("缺少参数 new_name"))
+		return
+	}
+	newName := secureBackupFilename(body.NewName)
+	if strings.HasSuffix(newName, ".zip") {
+		newName = strings.TrimSuffix(newName, ".zip")
+	}
+	if newName == "" || strings.ReplaceAll(newName, "_", "") == "" {
+		writeJSON(w, http.StatusBadRequest, apiError("新文件名无效"))
+		return
+	}
+	newFilename := newName + ".zip"
+	oldPath := filepath.Join(s.backupDir(), filename)
+	if _, err := os.Stat(oldPath); err != nil {
+		writeJSON(w, http.StatusNotFound, apiError("备份文件不存在"))
+		return
+	}
+	newPath := filepath.Join(s.backupDir(), newFilename)
+	if _, err := os.Stat(newPath); err == nil {
+		writeJSON(w, http.StatusConflict, apiError("文件名 '"+newFilename+"' 已存在"))
+		return
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("重命名失败: "+err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"old_filename": filename, "new_filename": newFilename,
+	}))
+}
+
+// handleBackupsDelete implements DELETE /backups/{filename}.
+func (s *Server) handleBackupsDelete(w http.ResponseWriter, r *http.Request, filename string) {
+	zipPath := filepath.Join(s.backupDir(), filename)
+	if _, err := os.Stat(zipPath); err != nil {
+		writeJSON(w, http.StatusNotFound, apiError("备份文件不存在"))
+		return
+	}
+	if err := os.Remove(zipPath); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("删除备份失败: "+err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOKMsg("删除备份成功", nil))
+}
+
+// checkBackupFile pre-validates a backup archive (zip integrity + manifest +
+// version compatibility), mirroring Python importer.pre_check.
+func (s *Server) checkBackupFile(filename string) *backup.CheckResult {
+	return backup.CheckBackup(filepath.Join(s.backupDir(), filename))
+}
+
+// handleBackupsImport starts a background restore task (POST
+// /backups/{filename}/import). Restore requires an explicit confirmed flag and
+// extracts the archive into the data dir (zip-slip guarded inside the backup
+// package), mirroring Python import_backup.
+func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request, filename string) {
+	var body struct {
+		Confirmed bool `json:"confirmed"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	if !body.Confirmed {
+		writeJSON(w, http.StatusBadRequest, apiError("请先确认导入。导入将会清空并覆盖现有数据，此操作不可撤销。"))
+		return
+	}
+	zipPath := filepath.Join(s.backupDir(), filename)
+	if _, err := os.Stat(zipPath); err != nil {
+		writeJSON(w, http.StatusNotFound, apiError("备份文件不存在"))
+		return
+	}
+	taskID := uuid.NewString()
+	s.backupTaskMu.Lock()
+	s.backupTasks[taskID] = &backupTaskState{TaskID: taskID, Type: "import", Status: "processing", Stage: "waiting", Total: 100}
+	s.backupTaskMu.Unlock()
+	go func() {
+		importer := backup.NewImporter(s.kbDataDir())
+		err := importer.Import(zipPath)
+		s.backupTaskMu.Lock()
+		defer s.backupTaskMu.Unlock()
+		task := s.backupTasks[taskID]
+		if err != nil {
+			task.Status = "failed"
+			task.Error = err.Error()
+			return
+		}
+		task.Status = "completed"
+		task.Result = map[string]interface{}{"success": true, "warnings": []interface{}{}, "errors": []interface{}{}}
+	}()
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"task_id": taskID, "message": "import task created, processing in background",
+	}))
+}
+
+// handleBackupsCreate starts a background export (POST /backups), mirroring
+// Python export_backup（返回 task_id，前端轮询进度）。
+func (s *Server) handleBackupsCreate(w http.ResponseWriter, r *http.Request) {
+	taskID := uuid.NewString()
+	s.backupTaskMu.Lock()
+	s.backupTasks[taskID] = &backupTaskState{TaskID: taskID, Type: "export", Status: "processing", Stage: "waiting", Total: 100}
+	s.backupTaskMu.Unlock()
+	go func() {
+		dir := s.backupDir()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			s.setBackupTaskError(taskID, err.Error())
+			return
+		}
+		zipPath := filepath.Join(dir, backup.DefaultBackupName())
+		exporter := backup.NewExporter(s.kbDataDir())
+		if err := exporter.Export(zipPath); err != nil {
+			_ = os.Remove(zipPath)
+			s.setBackupTaskError(taskID, err.Error())
+			return
+		}
+		info, err := os.Stat(zipPath)
+		size := int64(0)
+		if err == nil {
+			size = info.Size()
+		}
+		s.backupTaskMu.Lock()
+		task := s.backupTasks[taskID]
+		if task != nil {
+			task.Status = "completed"
+			task.Result = map[string]interface{}{
+				"filename": filepath.Base(zipPath), "path": zipPath, "size": size,
+			}
+		}
+		s.backupTaskMu.Unlock()
+	}()
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"task_id": taskID, "message": "export task created, processing in background",
+	}))
+}
+
+func (s *Server) setBackupTaskError(taskID, msg string) {
+	s.backupTaskMu.Lock()
+	defer s.backupTaskMu.Unlock()
+	if task := s.backupTasks[taskID]; task != nil {
+		task.Status = "failed"
+		task.Error = msg
 	}
 }
 
@@ -5322,7 +5886,10 @@ func (s *Server) handleCron(w http.ResponseWriter, r *http.Request, parts []stri
 				switch r.Method {
 				case http.MethodPatch:
 					var body map[string]interface{}
-					_ = json.NewDecoder(r.Body).Decode(&body)
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+						return
+					}
 					updated, errMsg := s.cronUpdateJob(jobID, body)
 					if errMsg != "" {
 						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
@@ -5349,7 +5916,10 @@ func (s *Server) handleCron(w http.ResponseWriter, r *http.Request, parts []stri
 		} else {
 			if r.Method == http.MethodPost {
 				var body map[string]interface{}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				created, errMsg := s.cronCreateJob(body)
 				if errMsg != "" {
 					writeJSON(w, http.StatusBadRequest, apiOK(map[string]interface{}{
@@ -5391,121 +5961,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, parts []stri
 	case "sessions":
 		s.handleChatSessions(w, r, parts[1:])
 	case "threads":
-		if len(parts) > 1 {
-			threadID := parts[1]
-			if len(parts) > 2 && parts[2] == "messages" {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "message sent to thread " + threadID,
-				}))
-			} else {
-				switch r.Method {
-				case http.MethodGet:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"id": threadID,
-					}))
-				case http.MethodDelete:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "thread " + threadID + " deleted",
-					}))
-				default:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-				}
-			}
-		} else {
-			if r.Method == http.MethodPost {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"id": "",
-				}))
-			} else {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"threads": []interface{}{},
-				}))
-			}
-		}
+		s.handleChatThreads(w, r, parts[1:])
 	case "runs":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"runs": []interface{}{},
 		}))
 	case "projects":
-		if len(parts) > 1 {
-			projectID := parts[1]
-			if len(parts) > 2 {
-				switch parts[2] {
-				case "sessions":
-					if len(parts) > 3 {
-						sessionID := parts[3]
-						if r.Method == http.MethodPost {
-							writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-								"message": "session " + sessionID + " added to project " + projectID,
-							}))
-						} else if r.Method == http.MethodDelete {
-							writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-								"message": "session " + sessionID + " removed from project " + projectID,
-							}))
-						} else {
-							writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-						}
-					} else {
-						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-							"sessions": []interface{}{},
-						}))
-					}
-				case "workspace":
-					if len(parts) > 3 {
-						switch parts[3] {
-						case "files":
-							writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-								"path":    "",
-								"entries": []interface{}{},
-							}))
-						case "file":
-							if len(parts) > 4 && parts[4] == "download" {
-								writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-									"content": "",
-								}))
-							} else {
-								writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-									"content": "",
-								}))
-							}
-						default:
-							writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-						}
-					} else {
-						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-					}
-				default:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-				}
-			} else {
-				switch r.Method {
-				case http.MethodGet:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"id": projectID,
-					}))
-				case http.MethodPatch:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "project " + projectID + " updated",
-					}))
-				case http.MethodDelete:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "project " + projectID + " deleted",
-					}))
-				default:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-				}
-			}
-		} else {
-			if r.Method == http.MethodPost {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"id": "",
-				}))
-			} else {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"projects": []interface{}{},
-				}))
-			}
-		}
+		s.handleChatProjects(w, r, parts[1:])
 	case "send":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"message": "message sent",
@@ -5513,6 +5975,663 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request, parts []stri
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// handleChatThreads handles /api/v1/chat/threads[...] endpoints.
+// 对齐 Python chat.py 的 create/get/delete thread + send thread message（SSE）。
+func (s *Server) handleChatThreads(w http.ResponseWriter, r *http.Request, rest []string) {
+	if len(rest) > 0 {
+		threadID := rest[0]
+		if len(rest) > 1 && rest[1] == "messages" {
+			if r.Method == http.MethodPost {
+				s.handleChatThreadSend(w, r, threadID)
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			detail := s.threads.threadDetail(threadID)
+			if detail == nil {
+				writeJSON(w, http.StatusNotFound, apiError("Thread "+threadID+" not found"))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(detail))
+		case http.MethodDelete:
+			if !s.threads.deleteThread(threadID) {
+				writeJSON(w, http.StatusNotFound, apiError("Thread "+threadID+" not found"))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"thread_id": threadID}))
+		default:
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		}
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		s.handleChatThreadCreate(w, r)
+	default:
+		// 无按全部线程的列表端点（Python 无），支持按 session_id 过滤查询。
+		threads := []map[string]interface{}{}
+		if sessionID := r.URL.Query().Get("session_id"); sessionID != "" {
+			threads = s.threads.listThreadsBySession(sessionID)
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"threads": threads}))
+	}
+}
+
+// handleChatThreadCreate implements POST /chat/threads: 校验父消息为 bot 消息
+// 且 selected_text 非空后落库（对齐 Python chat_service.create_thread）。
+func (s *Server) handleChatThreadCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID       string `json:"session_id"`
+		ParentMessageID string `json:"parent_message_id"`
+		SelectedText    string `json:"selected_text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+		return
+	}
+	if body.SessionID == "" {
+		writeJSON(w, http.StatusBadRequest, apiError("Missing key: session_id"))
+		return
+	}
+	if body.ParentMessageID == "" {
+		writeJSON(w, http.StatusBadRequest, apiError("Missing key: parent_message_id"))
+		return
+	}
+	if strings.TrimSpace(body.SelectedText) == "" {
+		writeJSON(w, http.StatusBadRequest, apiError("Missing key: selected_text"))
+		return
+	}
+	detail := s.chat.sessionDetail(body.SessionID)
+	if detail == nil {
+		writeJSON(w, http.StatusNotFound, apiError("Session "+body.SessionID+" not found"))
+		return
+	}
+	history, _ := detail["history"].([]map[string]interface{})
+	var parent map[string]interface{}
+	for _, m := range history {
+		if mid, _ := m["id"].(string); mid == body.ParentMessageID {
+			parent = m
+		}
+	}
+	if parent == nil {
+		writeJSON(w, http.StatusBadRequest, apiError("Parent message not found"))
+		return
+	}
+	if t, _ := parent["type"].(string); t != "bot" {
+		writeJSON(w, http.StatusBadRequest, apiError("Only bot messages can create threads"))
+		return
+	}
+	checkpointID, _ := parent["llm_checkpoint_id"].(string)
+	thread := s.threads.createThread("dashboard", body.SessionID, body.ParentMessageID, checkpointID, body.SelectedText)
+	writeJSON(w, http.StatusOK, apiOK(serializeThread(thread)))
+}
+
+// handleChatThreadSend streams a thread chat reply over SSE
+// (POST /chat/threads/{thread_id}/messages)，消息写入线程历史。
+func (s *Server) handleChatThreadSend(w http.ResponseWriter, r *http.Request, threadID string) {
+	if s.threads.getThread(threadID) == nil {
+		writeJSON(w, http.StatusNotFound, apiError("Thread "+threadID+" not found"))
+		return
+	}
+	var body struct {
+		Message          []map[string]interface{} `json:"message"`
+		Files            []interface{}            `json:"files"`
+		SelectedProvider string                   `json:"selected_provider"`
+		SelectedModel    string                   `json:"selected_model"`
+		Flags            map[string]interface{}   `json:"flags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+		return
+	}
+	parts := body.Message
+	if len(parts) == 0 {
+		parts = filePartsToMessage(body.Files)
+	}
+	if !partsHaveContent(parts, body.Files) {
+		writeJSON(w, http.StatusBadRequest, apiError("Message content is empty"))
+		return
+	}
+	s.runChatSSEStream(w, r, chatStreamRequest{
+		SessionID:        threadID,
+		Parts:            parts,
+		Files:            body.Files,
+		SelectedProvider: body.SelectedProvider,
+		SelectedModel:    body.SelectedModel,
+		Flags:            body.Flags,
+		PersistUser:      true,
+		ThreadID:         threadID,
+	})
+}
+
+// handleChatRegenerate implements POST /chat/sessions/{id}/messages/{mid}/regenerate:
+// 用目标 bot 消息对应的上一条 user 消息重新跑一遍管线（SSE，不重复落盘 user 消息），
+// 对齐 Python prepare_regenerate_message_payload + build_chat_stream。
+func (s *Server) handleChatRegenerate(w http.ResponseWriter, r *http.Request, sessionID, messageID string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiError("POST required"))
+		return
+	}
+	detail := s.chat.sessionDetail(sessionID)
+	if detail == nil {
+		writeJSON(w, http.StatusNotFound, apiError("Session "+sessionID+" not found"))
+		return
+	}
+	history, _ := detail["history"].([]map[string]interface{})
+	targetIdx := -1
+	for i, m := range history {
+		if mid, _ := m["id"].(string); mid == messageID {
+			targetIdx = i
+		}
+	}
+	if targetIdx < 0 {
+		writeJSON(w, http.StatusNotFound, apiError("Message "+messageID+" not found"))
+		return
+	}
+	if t, _ := history[targetIdx]["type"].(string); t != "bot" {
+		writeJSON(w, http.StatusBadRequest, apiError("Only bot messages can be regenerated"))
+		return
+	}
+	var parts []map[string]interface{}
+	for i := targetIdx - 1; i >= 0; i-- {
+		if t, _ := history[i]["type"].(string); t == "user" {
+			if content, ok := history[i]["content"].(map[string]interface{}); ok {
+				parts = messagePartsFromValue(content["message"])
+			}
+			break
+		}
+	}
+	if len(parts) == 0 {
+		writeJSON(w, http.StatusBadRequest, apiError("Linked user message not found"))
+		return
+	}
+	var body struct {
+		SelectedProvider string                 `json:"selected_provider"`
+		SelectedModel    string                 `json:"selected_model"`
+		Flags            map[string]interface{} `json:"flags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	s.runChatSSEStream(w, r, chatStreamRequest{
+		SessionID:        sessionID,
+		Parts:            parts,
+		SelectedProvider: body.SelectedProvider,
+		SelectedModel:    body.SelectedModel,
+		Flags:            body.Flags,
+		PersistUser:      false,
+	})
+}
+
+// messagePartsFromValue 把存储的 message parts（JSON 反序列化后为
+// []interface{}，也可能是 []map[string]interface{}）转成 map 切片。
+func messagePartsFromValue(v interface{}) []map[string]interface{} {
+	switch t := v.(type) {
+	case []map[string]interface{}:
+		return t
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(t))
+		for _, item := range t {
+			if m, ok := item.(map[string]interface{}); ok {
+				out = append(out, m)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// handleChatProjects handles /api/v1/chat/projects[...] endpoints.
+// 对齐 Python chat_projects.py + chatui_project_service.py。
+func (s *Server) handleChatProjects(w http.ResponseWriter, r *http.Request, rest []string) {
+	// DELETE /chat/projects/sessions/{session_id}：把会话从其所属项目移除。
+	if len(rest) > 1 && rest[0] == "sessions" {
+		if r.Method == http.MethodDelete {
+			sessionID := rest[1]
+			if sessionID != "" {
+				s.projects.removeSessionFromProject(sessionID)
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		return
+	}
+	if len(rest) == 0 {
+		switch r.Method {
+		case http.MethodGet:
+			projects := s.serializeProjectsWithWorkspaces(s.projects.listProjectsByCreator(""))
+			writeJSON(w, http.StatusOK, apiOK(projects))
+		case http.MethodPost:
+			var body map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body == nil {
+				writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+				return
+			}
+			title, _ := body["title"].(string)
+			if strings.TrimSpace(title) == "" {
+				writeJSON(w, http.StatusBadRequest, apiError("Missing key: title"))
+				return
+			}
+			emoji, _ := body["emoji"].(string)
+			if emoji == "" {
+				emoji = "📁"
+			}
+			description, _ := body["description"].(string)
+			workspaceType, _ := body["workspace_type"].(string)
+			workspacePath, _ := body["workspace_path"].(string)
+			if workspaceType != "custom" {
+				workspacePath = ""
+			} else if _, errMsg := s.validateCustomWorkspacePath(workspacePath); errMsg != "" {
+				writeJSON(w, http.StatusBadRequest, apiError(errMsg))
+				return
+			}
+			project := s.projects.createProject("dashboard", title, emoji, description, workspaceType, workspacePath)
+			writeJSON(w, http.StatusOK, apiOK(s.serializeProjectWithWorkspace(project)))
+		default:
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		}
+		return
+	}
+
+	projectID := rest[0]
+	if len(rest) > 1 {
+		switch rest[1] {
+		case "sessions":
+			if len(rest) > 2 {
+				sessionID := rest[2]
+				if r.Method == http.MethodPost {
+					if s.projects.getProject(projectID) == nil {
+						writeJSON(w, http.StatusNotFound, apiError("Project "+projectID+" not found"))
+						return
+					}
+					if s.chat.getSession(sessionID) == nil {
+						writeJSON(w, http.StatusNotFound, apiError("Session "+sessionID+" not found"))
+						return
+					}
+					s.projects.addSessionToProject(projectID, sessionID)
+					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+					return
+				}
+			} else if r.Method == http.MethodGet {
+				project := s.projects.getProject(projectID)
+				if project == nil {
+					writeJSON(w, http.StatusNotFound, apiError("Project "+projectID+" not found"))
+					return
+				}
+				sessions := []interface{}{}
+				for _, sid := range s.projects.projectSessionIDs(projectID) {
+					if sess := s.chat.getSession(sid); sess != nil {
+						sessions = append(sessions, sessionView(sess))
+					}
+				}
+				writeJSON(w, http.StatusOK, apiOK(sessions))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		case "workspace":
+			s.handleChatProjectWorkspace(w, r, projectID, rest[2:])
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		project := s.projects.getProject(projectID)
+		if project == nil {
+			writeJSON(w, http.StatusNotFound, apiError("Project "+projectID+" not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(s.serializeProjectWithWorkspace(project)))
+	case http.MethodPatch:
+		project := s.projects.getProject(projectID)
+		if project == nil {
+			writeJSON(w, http.StatusNotFound, apiError("Project "+projectID+" not found"))
+			return
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body == nil {
+			writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+			return
+		}
+		if wt, ok := body["workspace_type"].(string); ok {
+			if wt != "session" && wt != "project" && wt != "custom" {
+				writeJSON(w, http.StatusBadRequest, apiError("Invalid workspace_type"))
+				return
+			}
+			if wt != "custom" {
+				body["workspace_path"] = ""
+			}
+		}
+		if wp, _ := body["workspace_path"].(string); wp != "" {
+			if _, errMsg := s.validateCustomWorkspacePath(wp); errMsg != "" {
+				writeJSON(w, http.StatusBadRequest, apiError(errMsg))
+				return
+			}
+		}
+		if !s.projects.updateProject(projectID, body) {
+			writeJSON(w, http.StatusNotFound, apiError("Project "+projectID+" not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "Project " + projectID + " updated"}))
+	case http.MethodDelete:
+		if !s.projects.deleteProject(projectID) {
+			writeJSON(w, http.StatusNotFound, apiError("Project "+projectID+" not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "Project " + projectID + " deleted"}))
+	default:
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	}
+}
+
+// workspaceFileMaxBytes 对齐 Python _WORKSPACE_FILE_MAX_BYTES。
+const workspaceFileMaxBytes = 512 * 1024
+
+// handleChatProjectWorkspace implements /chat/projects/{id}/workspace[...]。
+func (s *Server) handleChatProjectWorkspace(w http.ResponseWriter, r *http.Request, projectID string, rest []string) {
+	if len(rest) == 0 {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		return
+	}
+	project := s.projects.getProject(projectID)
+	if project == nil {
+		writeJSON(w, http.StatusNotFound, apiError("Project "+projectID+" not found"))
+		return
+	}
+	root, errMsg := s.resolveProjectWorkspaceRoot(project)
+	if errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, apiError(errMsg))
+		return
+	}
+	rel := strings.TrimSpace(r.URL.Query().Get("path"))
+	if !safeWorkspaceRelPath(rel) {
+		writeJSON(w, http.StatusBadRequest, apiError("Invalid workspace path"))
+		return
+	}
+	switch rest[0] {
+	case "files":
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		target := root
+		if rel != "" {
+			target = filepath.Join(root, filepath.FromSlash(rel))
+		}
+		if !workspacePathWithin(target, root) {
+			writeJSON(w, http.StatusBadRequest, apiError("Workspace path escapes project directory"))
+			return
+		}
+		if _, err := os.Stat(root); err != nil && rel == "" {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"path": "", "entries": []interface{}{}}))
+			return
+		}
+		entries, err := os.ReadDir(target)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("Workspace directory not found"))
+			return
+		}
+		type wsEntry struct {
+			Name     string `json:"name"`
+			Path     string `json:"path"`
+			Type     string `json:"type"`
+			Size     int64  `json:"size"`
+			Readable bool   `json:"readable"`
+		}
+		list := make([]wsEntry, 0, len(entries))
+		for _, e := range entries {
+			if e.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			entryPath := filepath.Join(rel, e.Name())
+			isDir := e.IsDir()
+			size := int64(0)
+			if !isDir {
+				size = info.Size()
+			}
+			list = append(list, wsEntry{
+				Name:     e.Name(),
+				Path:     filepath.ToSlash(entryPath),
+				Type:     map[bool]string{true: "directory", false: "file"}[isDir],
+				Size:     size,
+				Readable: !isDir && size <= workspaceFileMaxBytes,
+			})
+		}
+		sort.Slice(list, func(i, j int) bool {
+			if (list[i].Type == "directory") != (list[j].Type == "directory") {
+				return list[i].Type == "directory"
+			}
+			return strings.ToLower(list[i].Name) < strings.ToLower(list[j].Name)
+		})
+		cur := ""
+		if rel != "" {
+			cur = filepath.ToSlash(rel)
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"path": cur, "entries": list}))
+	case "file":
+		if len(rest) > 1 && rest[1] == "download" {
+			if r.Method != http.MethodGet {
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+				return
+			}
+			target := filepath.Join(root, filepath.FromSlash(rel))
+			if !workspacePathWithin(target, root) {
+				writeJSON(w, http.StatusBadRequest, apiError("Workspace path escapes project directory"))
+				return
+			}
+			if !workspaceFileExists(root, target) {
+				writeJSON(w, http.StatusBadRequest, apiError("Workspace file not found"))
+				return
+			}
+			w.Header().Set("Content-Disposition", "attachment; filename=\""+filepath.Base(target)+"\"")
+			http.ServeFile(w, r, target)
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		target := filepath.Join(root, filepath.FromSlash(rel))
+		if !workspacePathWithin(target, root) {
+			writeJSON(w, http.StatusBadRequest, apiError("Workspace path escapes project directory"))
+			return
+		}
+		if !workspaceFileExists(root, target) {
+			writeJSON(w, http.StatusBadRequest, apiError("Workspace file not found"))
+			return
+		}
+		data, err := os.ReadFile(target)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("Workspace file cannot be read"))
+			return
+		}
+		if len(data) > workspaceFileMaxBytes {
+			writeJSON(w, http.StatusBadRequest, apiError("Workspace file is too large to preview"))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"path":    rel,
+			"content": string(data),
+			"size":    len(data),
+		}))
+	default:
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	}
+}
+
+// safeWorkspaceRelPath 校验工作区相对路径：允许空串（根目录），拒绝绝对路径
+// 与 .. 段（对齐 Python list_workspace_files / get_workspace_file_location）。
+func safeWorkspaceRelPath(rel string) bool {
+	if rel == "" {
+		return true
+	}
+	cleaned := filepath.Clean(filepath.FromSlash(rel))
+	if filepath.IsAbs(cleaned) {
+		return false
+	}
+	for _, part := range strings.Split(cleaned, string(os.PathSeparator)) {
+		if part == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// workspacePathWithin 校验 target 位于 root 内（对齐 Python 的 normcase +
+// prefix 校验）。
+func workspacePathWithin(target, root string) bool {
+	t, err := filepath.Abs(target)
+	if err != nil {
+		return false
+	}
+	r, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	return t == r || strings.HasPrefix(t, r+string(os.PathSeparator))
+}
+
+// workspaceFileExists 校验目标是一个真实文件（且不是符号链接），
+// 防止符号链接逃逸工作区。
+func workspaceFileExists(root, target string) bool {
+	if !workspacePathWithin(target, root) {
+		return false
+	}
+	info, err := os.Lstat(target)
+	if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	return true
+}
+
+// workspaceRootDir returns <dataDir>/workspaces.
+func (s *Server) workspaceRootDir() string {
+	dir := filepath.Join(s.kbDataDir(), "workspaces")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+// normalizeWorkspaceName 把 umo/project id 转成文件系统安全目录名
+// （对齐 Python normalize_umo_for_workspace）。
+func normalizeWorkspaceName(v string) string {
+	var b strings.Builder
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
+}
+
+// resolveProjectWorkspaceRoot 解析项目工作区根目录（对齐 Python
+// resolve_project_workspace_root）：session→按 umo 的旧目录，project→
+// project_<id> 共享目录，custom→用户指定路径。
+func (s *Server) resolveProjectWorkspaceRoot(p *chatProject) (string, string) {
+	switch p.WorkspaceType {
+	case "project":
+		root := filepath.Join(s.workspaceRootDir(), "project_"+normalizeWorkspaceName(p.ProjectID))
+		_ = os.MkdirAll(root, 0o755)
+		return root, ""
+	case "custom":
+		path := strings.TrimSpace(p.WorkspacePath)
+		if path == "" {
+			return "", "Custom workspace requires a path"
+		}
+		root, errMsg := s.validateCustomWorkspacePath(path)
+		if errMsg != "" {
+			return "", errMsg
+		}
+		return root, ""
+	default:
+		fallback := "webchat:FriendMessage:webchat!dashboard!default"
+		return filepath.Join(s.workspaceRootDir(), normalizeWorkspaceName(fallback)), ""
+	}
+}
+
+// validateCustomWorkspacePath 解析并校验自定义工作区路径：相对路径必须位于
+// <data>/workspaces 之下（对齐 Python workspace_path_to_root）。
+func (s *Server) validateCustomWorkspacePath(path string) (string, string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", "Custom workspace requires a path"
+	}
+	expanded := path
+	if strings.HasPrefix(expanded, "~/") || expanded == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			expanded = filepath.Join(home, strings.TrimPrefix(expanded, "~"))
+		}
+	}
+	workspacesRoot, err := filepath.Abs(s.workspaceRootDir())
+	if err != nil {
+		return "", "Invalid workspace path"
+	}
+	var root string
+	if filepath.IsAbs(expanded) {
+		root = expanded
+	} else {
+		root = filepath.Join(workspacesRoot, filepath.FromSlash(expanded))
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", "Invalid workspace path"
+	}
+	if !filepath.IsAbs(expanded) && !workspacePathWithin(abs, workspacesRoot) {
+		return "", "Relative workspace path must stay within a subdirectory of AstrBot workspaces"
+	}
+	if !filepath.IsAbs(expanded) && abs == workspacesRoot {
+		return "", "Relative workspace path must stay within a subdirectory of AstrBot workspaces"
+	}
+	info, err := os.Stat(abs)
+	if err != nil || !info.IsDir() {
+		return "", "Custom workspace path does not exist"
+	}
+	return abs, ""
+}
+
+// serializeProjectWithWorkspace 填充 resolved_workspace_path
+// （非 session 类型时返回真实工作区目录）。
+func (s *Server) serializeProjectWithWorkspace(p *chatProject) map[string]interface{} {
+	out := serializeProject(p)
+	if p.WorkspaceType != "session" {
+		if root, errMsg := s.resolveProjectWorkspaceRoot(p); errMsg == "" {
+			out["resolved_workspace_path"] = root
+		}
+	}
+	return out
+}
+
+func (s *Server) serializeProjectsWithWorkspaces(projects []map[string]interface{}) []interface{} {
+	out := make([]interface{}, 0, len(projects))
+	for _, p := range projects {
+		pid, _ := p["project_id"].(string)
+		if proj := s.projects.getProject(pid); proj != nil {
+			out = append(out, s.serializeProjectWithWorkspace(proj))
+		} else {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // handleChatSessions handles /api/v1/chat/sessions[...] endpoints.
@@ -5558,7 +6677,10 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 		var body struct {
 			SessionIDs []string `json:"session_ids"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		deleted := s.chat.deleteSessions(body.SessionIDs)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"deleted_count": deleted,
@@ -5570,10 +6692,33 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 		if len(rest) > 1 {
 			switch rest[1] {
 			case "messages":
-				if len(rest) > 2 {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "message updated",
-					}))
+				if len(rest) > 2 && rest[2] != "" {
+					messageID := rest[2]
+					if len(rest) > 3 && rest[3] == "regenerate" {
+						s.handleChatRegenerate(w, r, sessionID, messageID)
+						return
+					}
+					if r.Method == http.MethodPatch {
+						var body struct {
+							Content map[string]interface{} `json:"content"`
+						}
+						if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+							writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+							return
+						}
+						updated, truncated, ok := s.chat.updateMessageContent(sessionID, messageID, body.Content)
+						if !ok {
+							writeJSON(w, http.StatusBadRequest, apiError("Only the latest user message can be edited"))
+							return
+						}
+						writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+							"message":                 updated,
+							"needs_regenerate":        true,
+							"truncated_after_message": truncated != nil,
+						}))
+						return
+					}
+					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 				} else {
 					// 返回该会话的真实历史消息（此前为恒空 stub）。
 					detail := s.chat.sessionDetail(sessionID)
@@ -5592,8 +6737,9 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 				}
 				return
 			case "stop":
+				stopped := s.cancelChatRuns(sessionID)
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "session stopped",
+					"stopped_count": stopped,
 				}))
 				return
 			default:
@@ -5608,15 +6754,32 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 				writeJSON(w, http.StatusNotFound, apiError("会话不存在"))
 				return
 			}
+			// 接线线程列表与所属项目（对齐 Python get_session 的 threads/project）。
+			detail["threads"] = s.threads.listThreadsBySession(sessionID)
+			if proj := s.projects.projectBySession(sessionID); proj != nil {
+				detail["project"] = map[string]interface{}{
+					"project_id": proj.ProjectID,
+					"title":      proj.Title,
+					"emoji":      proj.Emoji,
+				}
+			} else {
+				detail["project"] = nil
+			}
 			writeJSON(w, http.StatusOK, apiOK(detail))
 		case http.MethodPatch:
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			_ = s.chat.updateSession(sessionID, body)
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"message": "session updated",
 			}))
 		case http.MethodDelete:
+			// 删除会话时同时取消进行中的 run（对齐 Python delete_session_internal
+			// 的 request_agent_stop_all）。
+			s.cancelChatRuns(sessionID)
 			s.chat.deleteSessions([]string{sessionID})
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"message": "session deleted",
@@ -5637,7 +6800,10 @@ func (s *Server) installGoPackage(w http.ResponseWriter, r *http.Request) {
 		Package string `json:"package"`
 		Mirror  string `json:"mirror"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if s.subPluginMgr == nil {
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"status":  "error",
@@ -5685,6 +6851,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []st
 		if progressID == "" {
 			progressID = r.URL.Query().Get("progress_id")
 		}
+		if progressID == "" && len(parts) > 1 {
+			// OpenAPI 客户端（openApiV1.getUpdateProgress）用路径参数调用
+			// /api/v1/updates/progress/{task_id}。
+			progressID = parts[1]
+		}
 		st := s.updateProgressGet(progressID)
 		if st == nil {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -5693,18 +6864,20 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []st
 			}))
 			return
 		}
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"progress": st.Percent,
-			"status":   st.Status,
-			"message":  st.Text,
-		}))
+		// 富结构对齐 Python UpdateService.get_update_progress：WebUI 更新
+		// 对话框按 stages.dashboard / stages.core 渲染逐阶段下载进度条，
+		// overall_percent 为总进度。
+		writeJSON(w, http.StatusOK, apiOK(st))
 	case "do", "core":
 		var body struct {
 			Version    string `json:"version"`
 			Proxy      string `json:"proxy"`
 			ProgressID string `json:"progress_id"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		s.doUpdateCore(w, body.ProgressID, body.Version, body.Proxy)
 	case "dashboard":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -5776,7 +6949,27 @@ func (s *Server) handleSubagents(w http.ResponseWriter, r *http.Request, parts [
 		}
 		writeJSON(w, http.StatusOK, apiOK(subCfg))
 	case "available-tools":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"tools": []interface{}{}}))
+		// 对齐 Python SubAgentService.get_available_tools：列出全部 LLM 工具，
+		// 剔除 subagent 内部注入的 handoff 工具（transfer_to_*）。
+		tools := []interface{}{}
+		for _, row := range s.listTools() {
+			m, ok := row.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["name"].(string)
+			if strings.HasPrefix(name, "transfer_to_") {
+				continue
+			}
+			tools = append(tools, map[string]interface{}{
+				"name":                name,
+				"description":         m["description"],
+				"parameters":          m["parameters"],
+				"active":              m["active"],
+				"handler_module_path": m["origin_name"],
+			})
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"tools": tools}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
@@ -5784,42 +6977,302 @@ func (s *Server) handleSubagents(w http.ResponseWriter, r *http.Request, parts [
 
 // ── Files handlers ──────────────────────────────────────────
 
+// webuiFileMeta 是 WebUI 上传文件的元数据（与文件本体同目录存放）。
+type webuiFileMeta struct {
+	AttachmentID string `json:"attachment_id"`
+	Filename     string `json:"filename"`
+	Type         string `json:"type"` // image / record / video / file
+	Size         int64  `json:"size"`
+	CreatedAt    string `json:"created_at"`
+	FileToken    string `json:"file_token"` // 公开 token（平台 logo 预览用）
+}
+
+// webuiFilesDir 返回 WebUI 上传文件目录（data/webui_files）。
+func (s *Server) webuiFilesDir() string {
+	return filepath.Join(s.kbDataDir(), "webui_files")
+}
+
+// safeAttachmentName 校验 attachment_id / filename / file_token：必须是非空
+// 的单个路径段，拒绝 "."、".." 及任何含 "/" 或 "\" 的输入，防止路径穿越。
+func safeAttachmentName(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return false
+	}
+	return filepath.Base(name) == name
+}
+
+// webUIFileType 按 Content-Type 前缀归类，对齐 Python 原版 save_uploaded_file
+// 的 attach_type 语义（image→image、audio→record、video→video，其余 file）。
+func webUIFileType(contentType string) string {
+	switch {
+	case strings.HasPrefix(contentType, "image/"):
+		return "image"
+	case strings.HasPrefix(contentType, "audio/"):
+		return "record"
+	case strings.HasPrefix(contentType, "video/"):
+		return "video"
+	default:
+		return "file"
+	}
+}
+
+// uploadWebUIFile 处理 POST /api/v1/files：接收 multipart "file"，落盘到
+// data/webui_files/{attachment_id}，同目录写 {attachment_id}.json 元数据。
+func (s *Server) uploadWebUIFile(w http.ResponseWriter, r *http.Request) {
+	// 限制请求体大小（对齐 KB/Skill 上传入口），防止大文件耗尽磁盘（DoS）。
+	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, apiError("上传文件过大（上限 256MB）"))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiError("解析上传文件失败: "+err.Error()))
+		return
+	}
+	file, fh, err := r.FormFile("file")
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError("未收到文件: "+err.Error()))
+		return
+	}
+	defer file.Close()
+
+	// 文件名只保留安全的单路径段（对齐 Python 原版 sanitize_upload_filename）。
+	filename := sanitizePath(filepath.Base(strings.ReplaceAll(fh.Filename, "\\", "/")))
+	if filename == "_" {
+		filename = "file"
+	}
+
+	attachmentID := uuid.NewString()
+	dir := s.webuiFilesDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		writeJSON(w, http.StatusOK, apiError("创建上传目录失败: "+err.Error()))
+		return
+	}
+	dst := filepath.Join(dir, attachmentID)
+	out, err := os.Create(dst)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError("保存上传文件失败: "+err.Error()))
+		return
+	}
+	n, err := io.Copy(out, io.LimitReader(file, maxWebUIFileSize+1))
+	if err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		writeJSON(w, http.StatusOK, apiError("保存上传文件失败: "+err.Error()))
+		return
+	}
+	_ = out.Close()
+	if n > maxWebUIFileSize {
+		_ = os.Remove(dst)
+		writeJSON(w, http.StatusOK, apiError("上传文件过大（单文件上限 64MB）"))
+		return
+	}
+
+	meta := webuiFileMeta{
+		AttachmentID: attachmentID,
+		Filename:     filename,
+		Type:         webUIFileType(fh.Header.Get("Content-Type")),
+		Size:         n,
+		CreatedAt:    time.Now().Format(time.RFC3339Nano),
+		FileToken:    uuid.NewString(),
+	}
+	data, _ := json.Marshal(meta)
+	if err := writeFileAtomic(filepath.Join(dir, attachmentID+".json"), data, 0o644); err != nil {
+		_ = os.Remove(dst)
+		writeJSON(w, http.StatusOK, apiError("写入元数据失败: "+err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"attachment_id": meta.AttachmentID,
+		"filename":      meta.Filename,
+		"type":          meta.Type,
+	}))
+}
+
+// listWebUIFileMetas 读取 data/webui_files 下全部元数据（按创建时间倒序）。
+func (s *Server) listWebUIFileMetas() []*webuiFileMeta {
+	dir := s.webuiFilesDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var metas []*webuiFileMeta
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var m webuiFileMeta
+		if json.Unmarshal(data, &m) == nil && m.AttachmentID != "" {
+			metas = append(metas, &m)
+		}
+	}
+	sort.Slice(metas, func(i, j int) bool { return metas[i].CreatedAt > metas[j].CreatedAt })
+	return metas
+}
+
+// findWebUIFileMeta 按字段（attachment_id / filename / file_token）查元数据。
+func (s *Server) findWebUIFileMeta(field, value string) *webuiFileMeta {
+	if !safeAttachmentName(value) {
+		return nil
+	}
+	for _, m := range s.listWebUIFileMetas() {
+		switch field {
+		case "attachment_id":
+			if m.AttachmentID == value {
+				return m
+			}
+		case "filename":
+			if m.Filename == value {
+				return m
+			}
+		case "file_token":
+			if m.FileToken == value {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+// serveWebUIFileContent 以正确的 Content-Type 流式返回文件字节。
+func (s *Server) serveWebUIFileContent(w http.ResponseWriter, r *http.Request, meta *webuiFileMeta) {
+	path := filepath.Join(s.webuiFilesDir(), meta.AttachmentID)
+	// 双保险：磁盘路径必须落在 webui_files 目录内。
+	rel, err := filepath.Rel(s.webuiFilesDir(), path)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+		return
+	}
+	// Content-Type 按原始文件名扩展名推断，未知类型回退 octet-stream。
+	mimeType := mime.TypeByExtension(filepath.Ext(meta.Filename))
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", mimeType)
+	http.ServeFile(w, r, path)
+}
+
+// handleFiles 分发 /api/v1/files 下的子路径（router.go 只有单一分发点）：
+//   - POST /api/v1/files（无子路径）与 /api/v1/files/upload：上传
+//   - GET /api/v1/files（无子路径）与 /api/v1/files/list：文件列表
+//   - GET /api/v1/files/content?filename=xxx：按文件名返回内容
+//   - GET /api/v1/files/tokens/{file_token}：按公开 token 返回内容
+//   - GET /api/v1/files/{attachment_id}[/content]：按 attachment_id 返回内容
+//   - DELETE /api/v1/files/{attachment_id}：删除附件
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
 	if len(parts) > 0 {
 		sub = parts[0]
 	}
+	// 无子路径的 POST 即上传（对齐 Python 原版 POST /files）。
+	if sub == "" && r.Method == http.MethodPost {
+		s.uploadWebUIFile(w, r)
+		return
+	}
 	switch sub {
 	case "", "list":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"files": []interface{}{},
-		}))
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
+			return
+		}
+		files := make([]map[string]interface{}, 0, 4)
+		for _, m := range s.listWebUIFileMetas() {
+			files = append(files, map[string]interface{}{
+				"attachment_id": m.AttachmentID,
+				"filename":      m.Filename,
+				"type":          m.Type,
+				"size":          m.Size,
+				"created_at":    m.CreatedAt,
+			})
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"files": files}))
 	case "content":
-		if len(parts) > 1 {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"content": "",
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"content": "",
-			}))
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
+			return
 		}
+		name := r.URL.Query().Get("filename")
+		if name == "" {
+			writeJSON(w, http.StatusNotFound, apiError("缺少 filename 参数"))
+			return
+		}
+		meta := s.findWebUIFileMeta("filename", name)
+		if meta == nil {
+			writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+			return
+		}
+		s.serveWebUIFileContent(w, r, meta)
 	case "tokens":
-		if len(parts) > 1 {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"tokens": []interface{}{},
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"tokens": []interface{}{},
-			}))
+		// GET /api/v1/files/tokens/{file_token}：公开 token 文件（平台 logo 预览）。
+		if len(parts) > 1 && r.Method == http.MethodGet {
+			meta := s.findWebUIFileMeta("file_token", parts[1])
+			if meta == nil {
+				writeJSON(w, http.StatusNotFound, apiError("文件令牌无效"))
+				return
+			}
+			s.serveWebUIFileContent(w, r, meta)
+			return
 		}
+		writeJSON(w, http.StatusNotFound, apiError("文件令牌无效"))
 	case "upload":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "file uploaded",
-		}))
+		// 兼容 /api/v1/files/upload 写法。
+		if r.Method == http.MethodPost {
+			s.uploadWebUIFile(w, r)
+			return
+		}
+		writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
 	default:
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		// /api/v1/files/{attachment_id}[/content]：按 attachment_id 读取/删除。
+		if !safeAttachmentName(sub) {
+			writeJSON(w, http.StatusNotFound, apiError("无效的 attachment_id"))
+			return
+		}
+		if len(parts) >= 2 && parts[1] == "content" {
+			if r.Method != http.MethodGet {
+				writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
+				return
+			}
+			meta := s.findWebUIFileMeta("attachment_id", sub)
+			if meta == nil {
+				writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+				return
+			}
+			s.serveWebUIFileContent(w, r, meta)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			// 对齐 Python 原版：GET /files/{attachment_id} 与 /content 同语义。
+			meta := s.findWebUIFileMeta("attachment_id", sub)
+			if meta == nil {
+				writeJSON(w, http.StatusNotFound, apiError("文件不存在"))
+				return
+			}
+			s.serveWebUIFileContent(w, r, meta)
+		case http.MethodDelete:
+			meta := s.findWebUIFileMeta("attachment_id", sub)
+			if meta == nil {
+				writeJSON(w, http.StatusOK, apiError("文件不存在"))
+				return
+			}
+			_ = os.Remove(filepath.Join(s.webuiFilesDir(), meta.AttachmentID))
+			_ = os.Remove(filepath.Join(s.webuiFilesDir(), meta.AttachmentID+".json"))
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"attachment_id": meta.AttachmentID}))
+		default:
+			writeJSON(w, http.StatusNotFound, apiError("不支持的请求方式"))
+		}
 	}
 }
 
@@ -5897,16 +7350,27 @@ func (s *Server) listCommandDescriptors() []map[string]interface{} {
 	cfg := s.getConfigSnapshot()
 	records, _ := cfg["command_configs"].(map[string]interface{})
 
+	type itemState struct {
+		item    map[string]interface{}
+		cmd     string
+		enabled bool
+		handler string
+	}
 	result := make([]map[string]interface{}, 0, len(descriptors))
+	states := make([]itemState, 0, len(descriptors))
 	for _, d := range descriptors {
 		item := descriptorToDict(d)
+		enabled := d.Enabled
+		effective := d.EffectiveCommand
 		if records != nil {
 			if rec, ok := records[d.HandlerFullName].(map[string]interface{}); ok {
-				if enabled, ok := rec["enabled"].(bool); ok {
-					item["enabled"] = enabled
+				if en, ok := rec["enabled"].(bool); ok {
+					item["enabled"] = en
+					enabled = en
 				}
 				if cmd, ok := rec["effective_command"].(string); ok && cmd != "" {
 					item["effective_command"] = cmd
+					effective = cmd
 				}
 				if perm, ok := rec["permission"].(string); ok && perm != "" {
 					item["permission"] = perm
@@ -5914,6 +7378,20 @@ func (s *Server) listCommandDescriptors() []map[string]interface{} {
 			}
 		}
 		result = append(result, item)
+		states = append(states, itemState{item: item, cmd: effective, enabled: enabled, handler: d.HandlerFullName})
+	}
+
+	// 冲突判定基于最终生效名（运行时 filter + 持久化重命名覆盖），且只统计
+	// 启用的指令——对齐 Python _group_conflicts。CollectCommandDescriptors
+	// 的初步判定只看运行时名，插件重载后持久化重命名丢失会导致误报。
+	seen := map[string]int{}
+	for _, st := range states {
+		if st.cmd != "" && st.enabled {
+			seen[st.cmd]++
+		}
+	}
+	for _, st := range states {
+		st.item["has_conflict"] = st.cmd != "" && st.enabled && seen[st.cmd] > 1
 	}
 	return result
 }
@@ -5923,6 +7401,13 @@ func descriptorToDict(d *star.CommandDescriptor) map[string]interface{} {
 	aliases := d.Aliases
 	if aliases == nil {
 		aliases = []string{}
+	}
+	subs := make([]interface{}, 0, len(d.SubCommands))
+	for _, sub := range d.SubCommands {
+		subItem := descriptorToDict(sub)
+		// 子命令不再嵌套自己的 sub_commands（组层级由顶层条目承载）。
+		subItem["sub_commands"] = []interface{}{}
+		subs = append(subs, subItem)
 	}
 	return map[string]interface{}{
 		"handler_full_name":   d.HandlerFullName,
@@ -5942,7 +7427,7 @@ func descriptorToDict(d *star.CommandDescriptor) map[string]interface{} {
 		"is_group":            d.IsGroup,
 		"has_conflict":        d.HasConflict,
 		"reserved":            d.Reserved,
-		"sub_commands":        []interface{}{},
+		"sub_commands":        subs,
 	}
 }
 
@@ -5954,7 +7439,10 @@ func (s *Server) updateCommand(w http.ResponseWriter, r *http.Request, handlerFu
 		Aliases         []string `json:"aliases"`
 		PermissionGroup *string  `json:"permission_group"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 
 	sm, ok := s.starMgr.(*star.Manager)
 	if !ok || sm == nil {
@@ -5968,41 +7456,55 @@ func (s *Server) updateCommand(w http.ResponseWriter, r *http.Request, handlerFu
 	}
 
 	// Load persisted config
-	cfg := s.getConfigSnapshot()
-	records, _ := cfg["command_configs"].(map[string]interface{})
-	if records == nil {
-		records = map[string]interface{}{}
-	}
-	rec, _ := records[handlerFullName].(map[string]interface{})
-	if rec == nil {
-		rec = map[string]interface{}{}
-	}
+	softErr := error(nil)
+	err := s.mutateConfig(func(cfg map[string]interface{}) error {
+		records, _ := cfg["command_configs"].(map[string]interface{})
+		if records == nil {
+			records = map[string]interface{}{}
+		}
+		rec, _ := records[handlerFullName].(map[string]interface{})
+		if rec == nil {
+			rec = map[string]interface{}{}
+		}
 
-	if body.Enabled != nil {
-		handler.Enabled = *body.Enabled
-		rec["enabled"] = *body.Enabled
-	}
-	if body.Alias != nil && strings.TrimSpace(*body.Alias) != "" {
-		desc, err := star.RenameCommand(sm.Handlers(), handlerFullName, *body.Alias)
-		if err != nil {
-			writeJSON(w, http.StatusOK, apiError(err.Error()))
-			return
+		if body.Enabled != nil {
+			// 经 registry 带锁入口修改，避免与消息管线 GetFilterHandlers 的
+			// 并发读构成 data race。
+			if *body.Enabled {
+				sm.Handlers().Enable(handlerFullName)
+			} else {
+				sm.Handlers().Disable(handlerFullName)
+			}
+			rec["enabled"] = *body.Enabled
 		}
-		rec["effective_command"] = desc.EffectiveCommand
-	}
-	if body.PermissionGroup != nil {
-		perm := strings.TrimSpace(*body.PermissionGroup)
-		if perm != "admin" && perm != "member" {
-			writeJSON(w, http.StatusOK, apiError("权限类型必须为 admin 或 member"))
-			return
+		if body.Alias != nil && strings.TrimSpace(*body.Alias) != "" {
+			desc, err := star.RenameCommand(sm.Handlers(), handlerFullName, *body.Alias)
+			if err != nil {
+				softErr = err
+				return nil
+			}
+			rec["effective_command"] = desc.EffectiveCommand
 		}
-		star.SetHandlerPermission(handler, perm)
-		rec["permission"] = perm
-	}
-	records[handlerFullName] = rec
-	if err := s.setConfigData("command_configs", records); err != nil {
+		if body.PermissionGroup != nil {
+			perm := strings.TrimSpace(*body.PermissionGroup)
+			if perm != "admin" && perm != "member" {
+				softErr = fmt.Errorf("权限类型必须为 admin 或 member")
+				return nil
+			}
+			sm.Handlers().SetHandlerPermission(handlerFullName, perm)
+			rec["permission"] = perm
+		}
+		records[handlerFullName] = rec
+		cfg["command_configs"] = records
+		return nil
+	})
+	if err != nil {
 		logger.I18nWarn("保存指令 %s 配置失败: %v", handlerFullName, err)
 		writeJSON(w, http.StatusInternalServerError, apiError("保存失败"))
+		return
+	}
+	if softErr != nil {
+		writeJSON(w, http.StatusOK, apiError(softErr.Error()))
 		return
 	}
 
@@ -6032,7 +7534,10 @@ func (s *Server) handleProviderSources(w http.ResponseWriter, r *http.Request, p
 			var body struct {
 				Config map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if err := s.upsertProviderSource(body.Config); err != nil {
 				writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
 				return
@@ -6057,7 +7562,10 @@ func (s *Server) handleProviderSources(w http.ResponseWriter, r *http.Request, p
 				SourceID string                 `json:"source_id"`
 				Config   map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.SourceID != "" {
 				sourceID = body.SourceID
 			}
@@ -6103,7 +7611,10 @@ func (s *Server) handleProviderSources(w http.ResponseWriter, r *http.Request, p
 				SourceID string                 `json:"source_id"`
 				Config   map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.Config == nil {
 				body.Config = map[string]interface{}{}
 			}
@@ -6206,6 +7717,20 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
+			"type":                      "qq_official_webhook",
+			"id":                        "qq_official_webhook",
+			"description":               "QQ 官方机器人（Webhook）适配器",
+			"display_name":              "QQ 官方机器人(Webhook)",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "qq_official_webhook", "enable": true,
+				"appid": "", "secret": "",
+				"is_sandbox": false, "unified_webhook_mode": true,
+				"webhook_uuid": "", "callback_server_host": "0.0.0.0", "port": 6196,
+			},
+		},
+		map[string]interface{}{
 			"type":                      "aiocqhttp",
 			"id":                        "aiocqhttp",
 			"description":               "OneBot v11 适配器（反向 WebSocket）",
@@ -6229,6 +7754,175 @@ func (s *Server) listBotTypes() []interface{} {
 				"telegram_token": "your_bot_token",
 			},
 		},
+		map[string]interface{}{
+			"type":                      "lark",
+			"id":                        "lark",
+			"description":               "飞书（Lark）适配器",
+			"display_name":              "飞书(Lark)",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "lark", "enable": true,
+				"app_id": "", "app_secret": "",
+				"domain": "https://open.feishu.cn", "lark_connection_mode": "socket",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "dingtalk",
+			"id":                        "dingtalk",
+			"description":               "钉钉（DingTalk）适配器",
+			"display_name":              "钉钉(DingTalk)",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "dingtalk", "enable": true,
+				"client_id": "", "client_secret": "",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "weixin_oc",
+			"id":                        "weixin_oc",
+			"description":               "微信开放平台（智能对话机器人）适配器",
+			"display_name":              "微信开放平台",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "weixin_oc", "enable": true,
+				"weixin_oc_base_url": "https://ilinkai.weixin.qq.com",
+				"weixin_oc_bot_type": "3",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "weixin_official_account",
+			"id":                        "weixin_official_account",
+			"description":               "微信公众号适配器",
+			"display_name":              "微信公众号",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "weixin_official_account", "enable": true,
+				"appid": "", "secret": "", "token": "",
+				"unified_webhook_mode": true, "webhook_uuid": "",
+				"callback_server_host": "0.0.0.0", "port": 6194,
+			},
+		},
+		map[string]interface{}{
+			"type":                      "discord",
+			"id":                        "discord",
+			"description":               "Discord 适配器",
+			"display_name":              "Discord",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "discord", "type": "discord", "enable": true,
+				"discord_token": "",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "kook",
+			"id":                        "kook",
+			"description":               "KOOK 适配器",
+			"display_name":              "KOOK",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "kook", "enable": true,
+				"kook_bot_token": "",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "satori",
+			"id":                        "satori",
+			"description":               "Satori 协议适配器",
+			"display_name":              "Satori",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "satori", "enable": true,
+				"satori_api_base_url": "http://localhost:5140/satori/v1",
+				"satori_endpoint":     "ws://localhost:5140/satori/v1/events",
+				"satori_token":        "",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "line",
+			"id":                        "line",
+			"description":               "LINE 适配器",
+			"display_name":              "Line",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "line", "enable": true,
+				"channel_access_token": "", "channel_secret": "",
+				"unified_webhook_mode": true, "webhook_uuid": "",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "slack",
+			"id":                        "slack",
+			"description":               "Slack 适配器",
+			"display_name":              "Slack",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "slack", "enable": true,
+				"bot_token": "", "app_token": "", "signing_secret": "",
+				"slack_connection_mode": "socket",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "misskey",
+			"id":                        "misskey",
+			"description":               "Misskey 适配器",
+			"display_name":              "Misskey",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "misskey", "enable": true,
+				"misskey_instance_url": "https://misskey.example", "misskey_token": "",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "mattermost",
+			"id":                        "mattermost",
+			"description":               "Mattermost 适配器",
+			"display_name":              "Mattermost",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "mattermost", "enable": true,
+				"mattermost_url": "", "mattermost_bot_token": "",
+			},
+		},
+		map[string]interface{}{
+			"type":                      "wecom",
+			"id":                        "wecom",
+			"description":               "企业微信应用 & 微信客服适配器",
+			"display_name":              "企业微信",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "wecom", "enable": true,
+				"corpid": "", "secret": "", "token": "", "encoding_aes_key": "",
+				"unified_webhook_mode": true, "webhook_uuid": "",
+				"callback_server_host": "0.0.0.0", "port": 6195,
+			},
+		},
+		map[string]interface{}{
+			"type":                      "wecom_ai_bot",
+			"id":                        "wecom_ai_bot",
+			"description":               "企业微信（智能机器人）适配器",
+			"display_name":              "企业微信 (智能机器人)",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config": map[string]interface{}{
+				"id": "default", "type": "wecom_ai_bot", "enable": true,
+				"wecom_ai_bot_connection_mode": "long_connection",
+				"wecom_ai_bot_name":            "",
+				"wecomaibot_ws_bot_id":         "",
+				"wecomaibot_ws_secret":         "",
+			},
+		},
 	}
 }
 
@@ -6242,7 +7936,10 @@ func (s *Server) handleBotRegistration(w http.ResponseWriter, r *http.Request, b
 		TaskID           string                 `json:"task_id"`
 		BindKey          string                 `json:"bind_key"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if body.PlatformConfig == nil {
 		body.PlatformConfig = map[string]interface{}{}
 	}
@@ -6357,77 +8054,44 @@ func (s *Server) handleConfigProfiles(w http.ResponseWriter, r *http.Request, pa
 	switch sub {
 	case "", "list":
 		if r.Method == http.MethodPost {
-			var body struct {
-				Name   string                 `json:"name"`
-				Config map[string]interface{} `json:"config"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
-				return
-			}
-			confID := "default"
-			if body.Config != nil {
-				if err := s.setConfigDataAll(body.Config); err != nil {
-					writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
-					return
-				}
-			}
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"conf_id": confID,
-			}))
-		} else {
-			now := time.Now().Format("2006-01-02T15:04:05.000Z")
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"info_list": []map[string]interface{}{
-					{
-						"id":         "default",
-						"name":       "default",
-						"updated_at": now,
-					},
-				},
-			}))
+			s.createConfigProfile(w, r)
+			return
 		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"info_list": s.listConfigProfileInfos(),
+		}))
 	case "schema":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"config_schema": map[string]interface{}{
-				"platform": map[string]interface{}{
-					"description":     "消息平台适配器",
-					"type":            "list",
-					"config_template": map[string]interface{}{},
-				},
-			},
+			"config":   s.getConfigSnapshot(),
+			"metadata": s.getProfileMetadata(),
 		}))
 	default:
 		if len(parts) > 0 {
 			profileID := parts[0]
 			switch r.Method {
 			case http.MethodGet:
+				cfg, ok := s.getConfigProfile(profileID)
+				if !ok {
+					writeJSON(w, http.StatusOK, apiError("Config file "+profileID+" does not exist"))
+					return
+				}
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"id":       profileID,
-					"name":     profileID,
-					"config":   s.getConfigSnapshot(),
+					"config":   cfg,
 					"metadata": s.getProfileMetadata(),
 				}))
 			case http.MethodPut, http.MethodPatch:
-				// Frontend sends the config object directly (DynamicConfig).
-				var raw json.RawMessage
-				_ = json.NewDecoder(r.Body).Decode(&raw)
-				var direct map[string]interface{}
-				if err := json.Unmarshal(raw, &direct); err == nil && direct != nil {
-					if inner, ok := direct["config"].(map[string]interface{}); ok && len(direct) == 1 {
-						direct = inner
-					}
-					if err := s.setConfigDataAll(direct); err != nil {
-						writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
-						return
-					}
+				s.updateConfigProfile(w, r, profileID, r.Method == http.MethodPatch)
+			case http.MethodDelete:
+				if profileID == "default" {
+					writeJSON(w, http.StatusBadRequest, apiError("不能删除默认配置文件"))
+					return
+				}
+				if err := s.deleteConfigProfile(profileID); err != nil {
+					writeJSON(w, http.StatusOK, apiError(err.Error()))
+					return
 				}
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "profile " + profileID + " updated",
-				}))
-			case http.MethodDelete:
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "profile " + profileID + " deleted",
+					"message": "删除成功",
 				}))
 			default:
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -6438,6 +8102,242 @@ func (s *Server) handleConfigProfiles(w http.ResponseWriter, r *http.Request, pa
 	}
 }
 
+// configProfilesDir returns <dataDir>/config_profiles（对齐 Python
+// AstrBotConfigManager 的 abconf 存储）。
+func (s *Server) configProfilesDir() string {
+	dir := filepath.Join(s.kbDataDir(), "config_profiles")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+type configProfileIndex struct {
+	Profiles []configProfileInfo `json:"profiles"`
+}
+
+type configProfileInfo struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+func (s *Server) configProfileIndexPath() string {
+	return filepath.Join(s.configProfilesDir(), "index.json")
+}
+
+func (s *Server) loadConfigProfileIndex() *configProfileIndex {
+	idx := &configProfileIndex{Profiles: []configProfileInfo{}}
+	data, err := os.ReadFile(s.configProfileIndexPath())
+	if err == nil {
+		_ = json.Unmarshal(data, idx)
+	}
+	if idx.Profiles == nil {
+		idx.Profiles = []configProfileInfo{}
+	}
+	return idx
+}
+
+func (s *Server) saveConfigProfileIndex(idx *configProfileIndex) error {
+	data, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(s.configProfileIndexPath(), data, 0o644)
+}
+
+// configProfileFilePath 校验 profile id 并返回其配置文件路径（防穿越）。
+func (s *Server) configProfileFilePath(id string) (string, error) {
+	if id == "" || id == "." || id == ".." || strings.ContainsAny(id, `/\\`) {
+		return "", fmt.Errorf("非法配置文件 ID")
+	}
+	return filepath.Join(s.configProfilesDir(), id+".json"), nil
+}
+
+// listConfigProfileInfos 返回全部配置文件元数据（default 恒在列表内，
+// 对齐 Python get_conf_list）。
+func (s *Server) listConfigProfileInfos() []map[string]interface{} {
+	idx := s.loadConfigProfileIndex()
+	infos := []map[string]interface{}{
+		{"id": "default", "name": "default", "updated_at": time.Now().Format("2006-01-02T15:04:05.000Z")},
+	}
+	for _, p := range idx.Profiles {
+		infos = append(infos, map[string]interface{}{
+			"id":         p.ID,
+			"name":       p.Name,
+			"updated_at": p.UpdatedAt,
+		})
+	}
+	return infos
+}
+
+// createConfigProfile implements POST /config-profiles：创建独立配置文件
+// （初始内容默认复制当前配置快照），返回 conf_id。
+func (s *Server) createConfigProfile(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name   string                 `json:"name"`
+		Config map[string]interface{} `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	id := "conf_" + generateRandomToken(8)
+	cfg := body.Config
+	if cfg == nil {
+		cfg = s.getConfigSnapshot()
+	}
+	path, err := s.configProfileFilePath(id)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
+		return
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("创建失败: "+err.Error()))
+		return
+	}
+	if err := writeFileAtomic(path, data, 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("创建失败: "+err.Error()))
+		return
+	}
+	idx := s.loadConfigProfileIndex()
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		name = id
+	}
+	idx.Profiles = append(idx.Profiles, configProfileInfo{
+		ID:        id,
+		Name:      name,
+		UpdatedAt: time.Now().Format("2006-01-02T15:04:05.000Z"),
+	})
+	_ = s.saveConfigProfileIndex(idx)
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"conf_id": id,
+		"message": "创建成功",
+	}))
+}
+
+// getConfigProfile 读取配置文件内容；default 返回当前运行配置。
+func (s *Server) getConfigProfile(id string) (map[string]interface{}, bool) {
+	if id == "default" {
+		return s.getConfigSnapshot(), true
+	}
+	path, err := s.configProfileFilePath(id)
+	if err != nil {
+		return nil, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil || cfg == nil {
+		return nil, false
+	}
+	return cfg, true
+}
+
+// updateConfigProfile implements PUT/PATCH /config-profiles/{id}：
+// PUT 保存配置内容（default 即应用为当前运行配置）；PATCH 重命名。
+func (s *Server) updateConfigProfile(w http.ResponseWriter, r *http.Request, profileID string, rename bool) {
+	if rename {
+		var body struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
+		if profileID == "default" {
+			writeJSON(w, http.StatusBadRequest, apiError("默认配置不可重命名"))
+			return
+		}
+		idx := s.loadConfigProfileIndex()
+		for i := range idx.Profiles {
+			if idx.Profiles[i].ID == profileID {
+				idx.Profiles[i].Name = strings.TrimSpace(body.Name)
+				if idx.Profiles[i].Name == "" {
+					idx.Profiles[i].Name = profileID
+				}
+				_ = s.saveConfigProfileIndex(idx)
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "更新成功"}))
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, apiError("Config file "+profileID+" does not exist"))
+		return
+	}
+	// PUT：前端直接发送 config 对象（也可能包一层 {"config": ...}）。
+	var raw json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	var direct map[string]interface{}
+	if err := json.Unmarshal(raw, &direct); err != nil || direct == nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON"))
+		return
+	}
+	if inner, ok := direct["config"].(map[string]interface{}); ok && len(direct) == 1 {
+		direct = inner
+	}
+	if profileID == "default" {
+		if err := s.setConfigDataAll(direct); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "保存成功"}))
+		return
+	}
+	path, err := s.configProfileFilePath(profileID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
+		return
+	}
+	if _, err := os.Stat(path); err != nil {
+		writeJSON(w, http.StatusOK, apiError("Config file "+profileID+" does not exist"))
+		return
+	}
+	data, err := json.MarshalIndent(direct, "", "  ")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+		return
+	}
+	if err := writeFileAtomic(path, data, 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+		return
+	}
+	idx := s.loadConfigProfileIndex()
+	for i := range idx.Profiles {
+		if idx.Profiles[i].ID == profileID {
+			idx.Profiles[i].UpdatedAt = time.Now().Format("2006-01-02T15:04:05.000Z")
+			break
+		}
+	}
+	_ = s.saveConfigProfileIndex(idx)
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "保存成功"}))
+}
+
+// deleteConfigProfile 删除配置文件与索引条目。
+func (s *Server) deleteConfigProfile(id string) error {
+	path, err := s.configProfileFilePath(id)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("Config file %s does not exist", id)
+	}
+	idx := s.loadConfigProfileIndex()
+	next := idx.Profiles[:0]
+	for _, p := range idx.Profiles {
+		if p.ID != id {
+			next = append(next, p)
+		}
+	}
+	idx.Profiles = next
+	_ = s.saveConfigProfileIndex(idx)
+	return nil
+}
+
 func (s *Server) handleConfigRoutes(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
 	if len(parts) > 0 {
@@ -6446,81 +8346,355 @@ func (s *Server) handleConfigRoutes(w http.ResponseWriter, r *http.Request, part
 	switch sub {
 	case "", "list":
 		if r.Method == http.MethodPut {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"message": "config routes updated",
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"routing": map[string]interface{}{},
-			}))
+			s.replaceConfigRoutes(w, r)
+			return
 		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"routing": s.listConfigRouteMapping(),
+		}))
 	case "by-umo":
 		if len(parts) > 1 {
 			umo := parts[1]
-			if r.Method == http.MethodPut {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"umo":     umo,
-					"message": "route updated",
-				}))
-			} else if r.Method == http.MethodDelete {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "route deleted",
-				}))
-			} else {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-			}
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			s.handleConfigRouteByUMO(w, r, umo)
+			return
 		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	default:
+		// 前端 openapi 直接使用 /config-routes/{umo}。
+		s.handleConfigRouteByUMO(w, r, sub)
+	}
+}
+
+// listConfigRouteMapping 返回 umo -> conf_id 路由表（preferences 表
+// scope="config_route"，对齐 Python umop_config_router.umop_to_conf_id）。
+func (s *Server) listConfigRouteMapping() map[string]string {
+	out := map[string]string{}
+	if s.database == nil {
+		return out
+	}
+	rows, err := s.database.ListPreferencesByScope("config_route")
+	if err != nil {
+		return out
+	}
+	for _, row := range rows {
+		if row.Key == "conf_id" && row.Value != "" {
+			out[row.ScopeID] = row.Value
+		}
+	}
+	return out
+}
+
+// handleConfigRouteByUMO implements PUT/DELETE /config-routes/{umo}。
+func (s *Server) handleConfigRouteByUMO(w http.ResponseWriter, r *http.Request, umo string) {
+	if umo == "" {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		var body struct {
+			ConfigID string `json:"config_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+			return
+		}
+		if strings.TrimSpace(body.ConfigID) == "" {
+			writeJSON(w, http.StatusBadRequest, apiError("Missing key: config_id"))
+			return
+		}
+		if s.database == nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("数据库不可用"))
+			return
+		}
+		if err := s.database.SetPreference("config_route", umo, "conf_id", body.ConfigID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "更新成功"}))
+	case http.MethodDelete:
+		if s.database != nil {
+			if err := s.database.DeletePreferencesByScopeID("config_route", umo); err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiError("删除失败: "+err.Error()))
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "删除成功"}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
 }
 
-func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request, parts []string) {
-	sub := ""
-	if len(parts) > 0 {
-		sub = parts[0]
+// replaceConfigRoutes implements PUT /config-routes（整表替换，
+// 对齐 Python replace_route_mapping）。
+func (s *Server) replaceConfigRoutes(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Routing map[string]string `json:"routing"`
 	}
-	switch sub {
-	case "", "list":
-		if r.Method == http.MethodPost {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"key": map[string]interface{}{
-					"id":         "",
-					"name":       "",
-					"key":        "",
-					"created_at": "",
-				},
-			}))
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"keys": []interface{}{},
-			}))
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Routing == nil {
+		writeJSON(w, http.StatusBadRequest, apiError("缺少或错误的路由表数据"))
+		return
+	}
+	if s.database == nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("数据库不可用"))
+		return
+	}
+	existing, err := s.database.ListPreferencesByScope("config_route")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("替换失败: "+err.Error()))
+		return
+	}
+	for _, row := range existing {
+		if err := s.database.DeletePreferencesByScopeID("config_route", row.ScopeID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("替换失败: "+err.Error()))
+			return
 		}
-	case "by-id":
+	}
+	for umo, confID := range body.Routing {
+		if umo == "" || confID == "" {
+			continue
+		}
+		if err := s.database.SetPreference("config_route", umo, "conf_id", confID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"message": "更新成功"}))
+}
+
+func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) == 0 || parts[0] == "" || parts[0] == "list" {
+		if r.Method == http.MethodPost {
+			s.createAPIKey(w, r)
+			return
+		}
+		// data 直接是数组（对齐 Python list_api_keys：ok(await
+		// service.list_api_keys())），WebUI Settings 页把 res.data.data 当
+		// 数组遍历渲染表格。
+		writeJSON(w, http.StatusOK, apiOK(s.serializeAPIKeys()))
+		return
+	}
+	if parts[0] == "by-id" {
+		// 兼容旧路径 /api/v1/api-keys/by-id/{key_id}[/revoke]。
 		if len(parts) > 1 {
-			keyID := parts[1]
-			if len(parts) > 2 && parts[2] == "revoke" {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "API key " + keyID + " revoked",
-				}))
-			} else {
-				switch r.Method {
-				case http.MethodDelete:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "API key " + keyID + " deleted",
-					}))
-				default:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-				}
-			}
+			parts = parts[1:]
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
 		}
+	}
+	keyID := parts[0]
+	if len(parts) > 1 && parts[1] == "revoke" {
+		if r.Method == http.MethodPost {
+			if !s.apiKeys.revoke(keyID) {
+				writeJSON(w, http.StatusNotFound, apiError("API key not found"))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"message": "API key " + keyID + " revoked",
+			}))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		if !s.apiKeys.delete(keyID) {
+			writeJSON(w, http.StatusNotFound, apiError("API key not found"))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"message": "API key " + keyID + " deleted",
+		}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// allOpenAPIScopes 对齐 Python ALL_OPEN_API_SCOPES。
+var allOpenAPIScopes = []string{
+	"bot", "provider", "persona", "im", "config", "chat", "data",
+	"file", "plugin", "mcp", "skill", "chat:admin", "config:edit_admin",
+}
+
+// defaultOpenAPIScopes 对齐 Python DEFAULT_OPEN_API_SCOPES。
+var defaultOpenAPIScopes = []string{
+	"bot", "provider", "persona", "im", "config", "chat", "data",
+	"file", "plugin", "mcp", "skill",
+}
+
+// openAPIScopeIncludes 对齐 Python OPEN_API_SCOPE_INCLUDES：拥有某 scope 的
+// API key 隐式获得其包含的 scope。
+var openAPIScopeIncludes = map[string][]string{
+	"config": {"bot", "provider"},
+}
+
+// normalizeAPIScopes 校验并按 Python OPEN_API_SCOPE_INCLUDES 展开 scope：
+// config 隐式包含 bot/provider；chat:admin 需要 chat、config:edit_admin
+// 需要 config。
+func normalizeAPIScopes(raw interface{}) ([]string, string) {
+	var scopes []string
+	switch t := raw.(type) {
+	case nil:
+		scopes = append([]string{}, defaultOpenAPIScopes...)
+	case []interface{}:
+		for _, item := range t {
+			if sv, ok := item.(string); ok {
+				scopes = append(scopes, sv)
+			} else {
+				return nil, "Invalid scopes"
+			}
+		}
+	case []string:
+		scopes = append([]string{}, t...)
+	default:
+		return nil, "Invalid scopes"
+	}
+	valid := map[string]bool{}
+	for _, sc := range allOpenAPIScopes {
+		valid[sc] = true
+	}
+	var invalid []string
+	var normalized []string
+	for _, sc := range scopes {
+		if !valid[sc] {
+			invalid = append(invalid, sc)
+			continue
+		}
+		normalized = append(normalized, sc)
+	}
+	if len(invalid) > 0 {
+		return nil, "Invalid scopes: " + strings.Join(invalid, ", ")
+	}
+	if containsScope(normalized, "config:edit_admin") && !containsScope(normalized, "config") {
+		return nil, "config:edit_admin requires the config scope"
+	}
+	if containsScope(normalized, "chat:admin") && !containsScope(normalized, "chat") {
+		return nil, "chat:admin requires the chat scope"
+	}
+	// 隐式包含：config 包含 bot/provider（OPEN_API_SCOPE_INCLUDES）。
+	for _, sc := range append([]string{}, normalized...) {
+		normalized = append(normalized, openAPIScopeIncludes[sc]...)
+	}
+	seen := map[string]bool{}
+	var dedup []string
+	for _, sc := range normalized {
+		if seen[sc] {
+			continue
+		}
+		seen[sc] = true
+		dedup = append(dedup, sc)
+	}
+	if len(dedup) == 0 {
+		return nil, "At least one valid scope is required"
+	}
+	return dedup, ""
+}
+
+func containsScope(scopes []string, target string) bool {
+	for _, sc := range scopes {
+		if sc == target {
+			return true
+		}
+	}
+	return false
+}
+
+// hashAPIKey PBKDF2-SHA256 哈希（salt 固定为 "astrbot_api_key"，100000 轮，
+// 对齐 Python api_key_service.hash_key）。
+func hashAPIKey(rawKey string) string {
+	return fmt.Sprintf("%x", pbkdf2SHA256([]byte(rawKey), []byte("astrbot_api_key"), 100000))
+}
+
+// pbkdf2SHA256 derives a PBKDF2-HMAC-SHA256 digest.
+func pbkdf2SHA256(password, salt []byte, iterations int) []byte {
+	return pbkdf2.Key(password, salt, iterations, 32, sha256.New)
+}
+
+// createAPIKey implements POST /api/v1/api-keys：生成 abk_ 前缀随机 key，
+// 落盘仅存哈希，响应返回一次完整 key（对齐 Python create_api_key）。
+func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name          string      `json:"name"`
+		Scopes        interface{} `json:"scopes"`
+		ExpiresInDays interface{} `json:"expires_in_days"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+		return
+	}
+	scopes, errMsg := normalizeAPIScopes(body.Scopes)
+	if errMsg != "" {
+		writeJSON(w, http.StatusBadRequest, apiError(errMsg))
+		return
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		name = "Untitled API Key"
+	}
+	var expiresAt string
+	if body.ExpiresInDays != nil {
+		days, ok := body.ExpiresInDays.(float64)
+		if !ok {
+			days = 0
+		}
+		if int(days) <= 0 {
+			writeJSON(w, http.StatusBadRequest, apiError("expires_in_days must be greater than 0"))
+			return
+		}
+		expiresAt = time.Now().Add(time.Duration(int(days)) * 24 * time.Hour).Format(time.RFC3339)
+	}
+	rawKey := "abk_" + generateRandomToken(43)
+	now := time.Now()
+	rec := &apiKeyRecord{
+		KeyID:     "k_" + fmt.Sprintf("%d", now.UnixNano()),
+		Name:      name,
+		KeyHash:   hashAPIKey(rawKey),
+		KeyPrefix: rawKey[:12],
+		Scopes:    scopes,
+		CreatedBy: "dashboard",
+		CreatedAt: now.Format(time.RFC3339),
+		UpdatedAt: now.Format(time.RFC3339),
+		ExpiresAt: expiresAt,
+	}
+	s.apiKeys.insert(rec)
+	out := s.serializeAPIKey(rec)
+	out["api_key"] = rawKey
+	writeJSON(w, http.StatusOK, apiOK(out))
+}
+
+// serializeAPIKey 对齐 Python serialize_api_key：不暴露哈希。
+func (s *Server) serializeAPIKey(k *apiKeyRecord) map[string]interface{} {
+	expired := false
+	if k.ExpiresAt != "" {
+		if t, err := time.Parse(time.RFC3339, k.ExpiresAt); err == nil {
+			expired = t.Before(time.Now())
+		}
+	}
+	return map[string]interface{}{
+		"key_id":       k.KeyID,
+		"name":         k.Name,
+		"key_prefix":   k.KeyPrefix,
+		"scopes":       k.Scopes,
+		"created_by":   k.CreatedBy,
+		"created_at":   k.CreatedAt,
+		"updated_at":   k.UpdatedAt,
+		"last_used_at": k.LastUsedAt,
+		"expires_at":   k.ExpiresAt,
+		"revoked_at":   k.RevokedAt,
+		"is_revoked":   k.RevokedAt != "",
+		"is_expired":   expired,
+	}
+}
+
+func (s *Server) serializeAPIKeys() []interface{} {
+	keys := s.apiKeys.list()
+	out := make([]interface{}, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, s.serializeAPIKey(k))
+	}
+	return out
 }
 
 func (s *Server) handleT2I(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -6530,53 +8704,222 @@ func (s *Server) handleT2I(w http.ResponseWriter, r *http.Request, parts []strin
 	}
 	switch sub {
 	case "", "templates":
-		if len(parts) > 1 {
-			templateName := parts[1]
-			if templateName == "active" {
-				if r.Method == http.MethodPut {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "active template updated",
-					}))
-				} else {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"name": "",
-					}))
-				}
-			} else if templateName == "default" && len(parts) > 2 && parts[2] == "reset" {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "default template reset",
-				}))
-			} else {
-				switch r.Method {
-				case http.MethodGet:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"name": templateName,
-					}))
-				case http.MethodPut:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "template " + templateName + " updated",
-					}))
-				case http.MethodDelete:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "template " + templateName + " deleted",
-					}))
-				default:
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-				}
-			}
-		} else {
-			if r.Method == http.MethodPost {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"name": "",
-				}))
-			} else {
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"templates": []interface{}{},
-				}))
-			}
-		}
+		s.handleT2ITemplates(w, r, parts[1:])
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	}
+}
+
+// t2iTemplatesDir returns <dataDir>/t2i_templates (对齐 Python
+// get_astrbot_t2i_template_path 的 user_template_dir）。
+func (s *Server) t2iTemplatesDir() string {
+	dir := filepath.Join(s.kbDataDir(), "t2i_templates")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
+// t2iDefaultTemplate is the built-in "base" template, seeded into the user
+// template dir when missing（对齐 Python reset_default_template）。
+const t2iDefaultTemplate = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ text }}</title>
+  <style>
+    body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; padding: 48px; }
+    article { font-size: 24px; line-height: 1.8; word-break: break-word; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <article>{{ text | safe }}</article>
+</body>
+</html>
+`
+
+// t2iTemplatePath 校验模板名并返回用户模板文件路径（防路径穿越，
+// 对齐 Python _get_user_template_path）。
+func (s *Server) t2iTemplatePath(name string) (string, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\\`) {
+		return "", fmt.Errorf("模板名称包含非法字符")
+	}
+	return filepath.Join(s.t2iTemplatesDir(), name+".html"), nil
+}
+
+// t2iEnsureBaseTemplate 在用户模板目录缺失时写入内置 base 模板。
+func (s *Server) t2iEnsureBaseTemplate() {
+	path, err := s.t2iTemplatePath("base")
+	if err != nil {
+		return
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		_ = writeFileAtomic(path, []byte(t2iDefaultTemplate), 0o644)
+	}
+}
+
+// t2iListTemplates 列出全部模板（用户目录；is_default=base 对齐 Python
+// list_templates）。
+func (s *Server) t2iListTemplates() []interface{} {
+	s.t2iEnsureBaseTemplate()
+	entries, err := os.ReadDir(s.t2iTemplatesDir())
+	if err != nil {
+		return []interface{}{}
+	}
+	out := make([]interface{}, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".html") {
+			continue
+		}
+		name := strings.TrimSuffix(e.Name(), ".html")
+		out = append(out, map[string]interface{}{
+			"name":       name,
+			"is_default": name == "base",
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		ni := out[i].(map[string]interface{})["name"].(string)
+		nj := out[j].(map[string]interface{})["name"].(string)
+		return ni < nj
+	})
+	return out
+}
+
+// handleT2ITemplates implements /t2i/templates[...]。
+func (s *Server) handleT2ITemplates(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) > 0 {
+		name := parts[0]
+		switch {
+		case name == "active":
+			if r.Method == http.MethodPut {
+				var body struct {
+					Name string `json:"name"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
+				if strings.TrimSpace(body.Name) == "" {
+					writeJSON(w, http.StatusBadRequest, apiError("模板名称(name)不能为空"))
+					return
+				}
+				path, err := s.t2iTemplatePath(body.Name)
+				if err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
+					return
+				}
+				if _, err := os.Stat(path); err != nil {
+					writeJSON(w, http.StatusNotFound, apiError("模板 '"+body.Name+"' 不存在，无法应用"))
+					return
+				}
+				if err := s.setConfigData("t2i_active_template", body.Name); err != nil {
+					writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"message": "模板 '" + body.Name + "' 已成功应用",
+				}))
+				return
+			}
+			active, _ := s.getConfigData("default")["t2i_active_template"].(string)
+			if active == "" {
+				active = "base"
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"active_template": active}))
+			return
+		case name == "default" && len(parts) > 1 && parts[1] == "reset":
+			if r.Method == http.MethodPost {
+				path, err := s.t2iTemplatePath("base")
+				if err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
+					return
+				}
+				if err := writeFileAtomic(path, []byte(t2iDefaultTemplate), 0o644); err != nil {
+					writeJSON(w, http.StatusInternalServerError, apiError("重置失败: "+err.Error()))
+					return
+				}
+				if err := s.setConfigData("t2i_active_template", "base"); err != nil {
+					writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"message": "Default template has been reset and activated.",
+				}))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		path, err := s.t2iTemplatePath(name)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			data, err := os.ReadFile(path)
+			if err != nil {
+				writeJSON(w, http.StatusNotFound, apiError("Template not found"))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"name": name, "content": string(data)}))
+		case http.MethodPut:
+			var body struct {
+				Content string `json:"content"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+				return
+			}
+			if err := writeFileAtomic(path, []byte(body.Content), 0o644); err != nil {
+				writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"name": name}))
+		case http.MethodDelete:
+			if err := os.Remove(path); err != nil {
+				writeJSON(w, http.StatusNotFound, apiError("Template not found"))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"message": "Template deleted successfully.",
+			}))
+		default:
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		}
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var body struct {
+			Name    string `json:"name"`
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
+			return
+		}
+		body.Name = strings.TrimSpace(body.Name)
+		if body.Name == "" || body.Content == "" {
+			writeJSON(w, http.StatusBadRequest, apiError("Name and content are required."))
+			return
+		}
+		path, err := s.t2iTemplatePath(body.Name)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
+			return
+		}
+		if _, err := os.Stat(path); err == nil {
+			writeJSON(w, http.StatusConflict, apiError("Template with this name already exists."))
+			return
+		}
+		if err := writeFileAtomic(path, []byte(body.Content), 0o644); err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("创建失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"name": body.Name}))
+	default:
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"templates": s.t2iListTemplates(),
+		}))
 	}
 }
 
@@ -6600,7 +8943,10 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 				SkillName string `json:"skill_name"`
 				Enabled   *bool  `json:"enabled"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.SkillName != "" {
 				skillName = body.SkillName
 			}
@@ -6703,9 +9049,9 @@ func skillFileEditable(name string) bool {
 	return editableSuffixes[ext]
 }
 
-// skillFilePath resolves a file path inside data/skills/<name>, guarding
+// skillFilePath resolves a file path inside <dataDir>/skills/<name>, guarding
 // against path traversal.
-func skillFilePath(skillName, relPath string) (string, error) {
+func skillFilePath(dataDir, skillName, relPath string) (string, error) {
 	// 校验 skillName：仅允许单段目录名，拒绝空名、"."、含路径分隔符的名字，
 	// 防止 skillName 携带 ../ 使 root 越出 data/skills/ 目录。注意不拒绝
 	// 形如 "a..b" 的名字——".." 仅是合法目录名字符，真正越界由下面的
@@ -6714,7 +9060,7 @@ func skillFilePath(skillName, relPath string) (string, error) {
 		strings.ContainsAny(skillName, `/\\`) {
 		return "", fmt.Errorf("非法技能名")
 	}
-	root, err := filepath.Abs(filepath.Join("data", "skills", skillName))
+	root, err := filepath.Abs(filepath.Join(dataDir, "skills", skillName))
 	if err != nil {
 		return "", err
 	}
@@ -6733,7 +9079,7 @@ func skillFilePath(skillName, relPath string) (string, error) {
 func (s *Server) listSkillFiles(w http.ResponseWriter, r *http.Request) {
 	skillName := r.URL.Query().Get("skill_name")
 	relPath := r.URL.Query().Get("path")
-	target, err := skillFilePath(skillName, relPath)
+	target, err := skillFilePath(s.kbDataDir(), skillName, relPath)
 	if err != nil {
 		writeJSON(w, http.StatusOK, apiError(err.Error()))
 		return
@@ -6792,7 +9138,7 @@ func (s *Server) getSkillFile(w http.ResponseWriter, r *http.Request) {
 	if relPath == "" {
 		relPath = "SKILL.md"
 	}
-	target, err := skillFilePath(skillName, relPath)
+	target, err := skillFilePath(s.kbDataDir(), skillName, relPath)
 	if err != nil {
 		writeJSON(w, http.StatusOK, apiError(err.Error()))
 		return
@@ -6831,7 +9177,10 @@ func (s *Server) updateSkillFile(w http.ResponseWriter, r *http.Request) {
 		Path      string `json:"path"`
 		Content   string `json:"content"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if body.Path == "" {
 		body.Path = "SKILL.md"
 	}
@@ -6839,7 +9188,7 @@ func (s *Server) updateSkillFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, apiError("File content is too large"))
 		return
 	}
-	target, err := skillFilePath(body.SkillName, body.Path)
+	target, err := skillFilePath(s.kbDataDir(), body.SkillName, body.Path)
 	if err != nil {
 		writeJSON(w, http.StatusOK, apiError(err.Error()))
 		return
@@ -6878,7 +9227,7 @@ func (s *Server) uploadSkillsBatch(w http.ResponseWriter, r *http.Request) {
 	succeeded := []interface{}{}
 	failed := []interface{}{}
 	skipped := []interface{}{}
-	skillsRoot := "data/skills"
+	skillsRoot := filepath.Join(s.kbDataDir(), "skills")
 
 	for _, fh := range files {
 		filename := filepath.Base(fh.Filename)
@@ -7035,6 +9384,48 @@ func copyDir(src, dst string) error {
 	})
 }
 
+// serializeConversationRow converts a db conversation row into the dict shape
+// the WebUI consumes (mirrors conversation.Manager.serializeConversation).
+// history 为空（include_history=false 的列表查询不拉 content 大字段）。
+func (s *Server) serializeConversationRow(row db.ConversationRow) map[string]interface{} {
+	return map[string]interface{}{
+		"cid":         row.ConversationID,
+		"platform_id": row.PlatformID,
+		"user_id":     row.UserID,
+		"title":       row.Title,
+		"persona_id":  row.PersonaID,
+		"token_usage": 0,
+		"created_at":  row.CreatedAt,
+		"updated_at":  row.UpdatedAt,
+		"umo_info":    parseUMOInfo(row.UserID),
+		"history":     []interface{}{},
+		"is_deleted":  false,
+	}
+}
+
+// parseUMOInfo splits a unified_msg_origin (platform:message_type:session_id)
+// into its segments, mirroring Python _build_umo_info / parse_umo.
+func parseUMOInfo(umo string) map[string]interface{} {
+	parts := strings.SplitN(umo, ":", 3)
+	platform := "unknown"
+	messageType := "unknown"
+	sessionID := umo
+	if len(parts) >= 1 && parts[0] != "" {
+		platform = parts[0]
+	}
+	if len(parts) >= 2 && parts[1] != "" {
+		messageType = parts[1]
+	}
+	if len(parts) >= 3 {
+		sessionID = parts[2]
+	}
+	return map[string]interface{}{
+		"platform":     platform,
+		"message_type": messageType,
+		"session_id":   sessionID,
+	}
+}
+
 func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
 	if len(parts) > 0 {
@@ -7053,25 +9444,48 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 		if pageSize > 100 {
 			pageSize = 100
 		}
-		all := s.getConversationList()
-		total := len(all)
+		q := r.URL.Query()
+		splitCSV := func(key string) []string {
+			var out []string
+			for _, part := range strings.Split(q.Get(key), ",") {
+				if part = strings.TrimSpace(part); part != "" {
+					out = append(out, part)
+				}
+			}
+			return out
+		}
+		// 过滤语义对齐 Python ConversationService.list_conversations /
+		// sqlite.get_filtered_conversations：platforms/message_types/search/
+		// exclude_ids/exclude_platforms。
+		if s.database == nil {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"conversations": []interface{}{},
+				"pagination": map[string]interface{}{
+					"page": page, "page_size": pageSize, "total": 0, "total_pages": 1,
+				},
+			}))
+			return
+		}
+		rows, total, err := s.database.GetFilteredConversations(db.ConversationFilter{
+			Platforms:        splitCSV("platforms"),
+			MessageTypes:     splitCSV("message_types"),
+			Search:           q.Get("search"),
+			ExcludeIDs:       splitCSV("exclude_ids"),
+			ExcludePlatforms: splitCSV("exclude_platforms"),
+			Page:             page,
+			PageSize:         pageSize,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("查询对话列表失败: "+err.Error()))
+			return
+		}
+		items := make([]interface{}, 0, len(rows))
+		for _, row := range rows {
+			items = append(items, s.serializeConversationRow(row))
+		}
 		totalPages := (total + pageSize - 1) / pageSize
 		if totalPages < 1 {
 			totalPages = 1
-		}
-		start := (page - 1) * pageSize
-		end := start + pageSize
-		if start > total {
-			start = total
-		}
-		if end > total {
-			end = total
-		}
-		var items []interface{}
-		if start <= total {
-			items = all[start:end]
-		} else {
-			items = []interface{}{}
 		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"conversations": items,
@@ -7093,7 +9507,10 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 			ConversationIDs []string `json:"conversation_ids"`
 			UserID          string   `json:"user_id"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		deleted := 0
 		for _, id := range body.ConversationIDs {
 			if s.conversationDeleteByCID(id) {
@@ -7104,9 +9521,8 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 			"deleted": deleted,
 		}))
 	case "export":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"data": []interface{}{},
-		}))
+		// 对齐 Python ConversationService.export_conversations：导出 JSONL。
+		s.handleConversationsExport(w, r)
 	default:
 		// Direct conversation-id form (matches the OpenAPI generated client):
 		// /conversations/{conversation_id} and
@@ -7128,7 +9544,10 @@ func (s *Server) handleConversationByID(w http.ResponseWriter, r *http.Request, 
 			var body struct {
 				History []map[string]interface{} `json:"history"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			history := make([]interface{}, 0, len(body.History))
 			for _, h := range body.History {
 				history = append(history, h)
@@ -7159,7 +9578,10 @@ func (s *Server) handleConversationByID(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusOK, apiOK(detail))
 	case http.MethodPatch:
 		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if s.conversationUpdateByCID(convID, body) {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"message": "conversation " + convID + " updated",
@@ -7204,7 +9626,10 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request, parts []str
 			var body struct {
 				TraceEnable *bool `json:"trace_enable"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.TraceEnable != nil {
 				if err := s.setConfigData("trace_enable", *body.TraceEnable); err != nil {
 					writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
@@ -7328,4 +9753,84 @@ func countEnabledBots(platforms []interface{}) int {
 		}
 	}
 	return n
+}
+
+// parseIntDefault parses an int query parameter, falling back to def when
+// empty or invalid.
+func parseIntDefault(v string, def int) int {
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	return def
+}
+
+// handleConversationsExport implements POST /conversations/export（对齐 Python
+// ConversationService.export_conversations）：按 {user_id(=unified_msg_origin),
+// cid} 列表把会话连同历史导出为 JSONL 附件下载。
+func (s *Server) handleConversationsExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiError("仅支持 POST"))
+		return
+	}
+	var body struct {
+		Conversations []struct {
+			UserID string `json:"user_id"`
+			CID    string `json:"cid"`
+		} `json:"conversations"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	if len(body.Conversations) == 0 {
+		writeJSON(w, http.StatusBadRequest, apiError("导出列表不能为空"))
+		return
+	}
+	m := s.conversationManager()
+	if m == nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("会话管理器不可用"))
+		return
+	}
+	var b strings.Builder
+	exported := 0
+	for _, item := range body.Conversations {
+		if item.UserID == "" || item.CID == "" {
+			continue
+		}
+		conv := m.FindByCID(item.CID)
+		// 与 Python 一致：按 user_id(=unified_msg_origin) 校验会话归属，
+		// 不能导出他人的会话。
+		if conv == nil || (conv.UserID != item.UserID && conv.UnifiedMsgOrigin != item.UserID) {
+			continue
+		}
+		history := conv.History
+		if history == nil {
+			history = []map[string]interface{}{}
+		}
+		line, err := json.Marshal(map[string]interface{}{
+			"cid":         conv.CID,
+			"user_id":     conv.UserID,
+			"platform_id": conv.PlatformID,
+			"title":       conv.Title,
+			"persona_id":  conv.Persona,
+			"created_at":  conv.CreatedAt,
+			"updated_at":  conv.UpdatedAt,
+			"content":     history,
+		})
+		if err != nil {
+			continue
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+		exported++
+	}
+	if exported == 0 {
+		writeJSON(w, http.StatusInternalServerError, apiError("没有成功导出任何对话"))
+		return
+	}
+	filename := "astrbot_conversations_export_" + time.Now().Format("20060102_150405") + ".jsonl"
+	w.Header().Set("Content-Type", "application/jsonl")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(b.String()))
 }

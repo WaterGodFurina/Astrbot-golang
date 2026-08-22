@@ -75,6 +75,7 @@ const {
   showSourceManagerDialog,
   sourceName,
   sourceUrl,
+  sourceType,
   sourceResolving,
   sourceResolveVisible,
   sourceMarketMeta,
@@ -854,11 +855,11 @@ const updateDialogPluginLogo = computed(() => {
             {{ tm("dialogs.python_runtime.android_hint") }}
           </div>
           <div class="d-flex align-center mb-2">
-            <code class="flex-grow-1">pkg update && pkg install python</code>
+            <code class="flex-grow-1">{{ pythonRuntimeDialog.command || "pkg update && pkg install python" }}</code>
             <v-btn
               size="small"
               variant="tonal"
-              @click="copyPkgCommand('pkg update && pkg install python')"
+              @click="copyPkgCommand(pythonRuntimeDialog.command || 'pkg update && pkg install python')"
             >
               {{ tm("dialogs.python_runtime.copy") }}
             </v-btn>
@@ -866,6 +867,23 @@ const updateDialogPluginLogo = computed(() => {
         </template>
         <div v-else class="text-medium-emphasis">
           {{ tm("dialogs.python_runtime.download_hint") }}
+          <div
+            v-if="pythonRuntimeDialog.primary"
+            class="mt-2 text-body-2 font-weight-medium"
+          >
+            {{ tm("dialogs.python_runtime.primaryLabel") }}
+          </div>
+          <v-radio-group
+            v-if="pythonRuntimeDialog.primary"
+            v-model="pythonRuntimeDialog.selectedMirror"
+            hide-details
+            class="mt-1"
+          >
+            <v-radio
+              :label="pythonRuntimeDialog.primary"
+              :value="pythonRuntimeDialog.primary"
+            ></v-radio>
+          </v-radio-group>
           <div
             v-if="pythonRuntimeDialog.mirrors.length"
             class="mt-2 text-body-2 font-weight-medium"
@@ -1025,6 +1043,7 @@ const updateDialogPluginLogo = computed(() => {
 
           <ProxySelector
             v-if="installUsesGithubArchiveSource"
+            :model-value="commonStore.githubProxyConfig"
             class="mt-4"
           />
         </div>
@@ -1203,6 +1222,7 @@ const updateDialogPluginLogo = computed(() => {
 
                 <ProxySelector
                   v-if="installUsesGithubArchiveSource"
+                  :model-value="commonStore.githubProxyConfig"
                 ></ProxySelector>
               </div>
             </v-window-item>
@@ -1355,6 +1375,9 @@ const updateDialogPluginLogo = computed(() => {
             <v-radio label="Golang" value="golang"></v-radio>
             <v-radio label="Python" value="python"></v-radio>
           </v-radio-group>
+          <div class="text-caption text-medium-emphasis mt-1">
+            {{ tm("market.sourceTypeHint") }}
+          </div>
 
           <v-alert
             v-if="sourceResolveVisible && sourceResolveCurrent"
@@ -1506,6 +1529,7 @@ const updateDialogPluginLogo = computed(() => {
 
           <ProxySelector
             v-if="updateUsesGithubArchiveSource"
+            :model-value="commonStore.githubProxyConfig"
             class="mt-4"
           />
         </div>

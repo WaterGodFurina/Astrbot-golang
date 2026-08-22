@@ -47,6 +47,41 @@ func TestFiveFieldStillMinuteGranularity(t *testing.T) {
 	}
 }
 
+func TestSingleValueWithStepExpandsToMax(t *testing.T) {
+	// croniter 语义：`5/15` 等价于 5-59/15 → 5,20,35,50。
+	sched, err := ParseCron("5/15 * * * *")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	base := time.Date(2026, 1, 1, 0, 4, 0, 0, time.UTC)
+	next := sched.Next(base)
+	want := time.Date(2026, 1, 1, 0, 5, 0, 0, time.UTC)
+	if !next.Equal(want) {
+		t.Fatalf("expected %v, got %v", want, next)
+	}
+	next = sched.Next(want)
+	want = time.Date(2026, 1, 1, 0, 20, 0, 0, time.UTC)
+	if !next.Equal(want) {
+		t.Fatalf("expected %v, got %v", want, next)
+	}
+	next = sched.Next(want)
+	want = time.Date(2026, 1, 1, 0, 35, 0, 0, time.UTC)
+	if !next.Equal(want) {
+		t.Fatalf("expected %v, got %v", want, next)
+	}
+	next = sched.Next(want)
+	want = time.Date(2026, 1, 1, 0, 50, 0, 0, time.UTC)
+	if !next.Equal(want) {
+		t.Fatalf("expected %v, got %v", want, next)
+	}
+	// 50 之后的下一跳回到下一小时的 5 分。
+	next = sched.Next(want)
+	want = time.Date(2026, 1, 1, 1, 5, 0, 0, time.UTC)
+	if !next.Equal(want) {
+		t.Fatalf("expected %v, got %v", want, next)
+	}
+}
+
 func TestParseCronNeverMatches(t *testing.T) {
 	// Feb 30 never occurs: Next must return zero, not loop forever.
 	sched, err := ParseCron("0 0 30 2 *")

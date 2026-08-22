@@ -158,6 +158,28 @@ func pyTarget() (string, error) {
 	return pyTargetFor(runtime.GOOS, runtime.GOARCH)
 }
 
+// termuxPrebuiltPkgs 是 Android/Termux 上宿主基础依赖中含 C 扩展、pip 无
+// 预编译 wheel 的包对应的 Termux 预编译软件包（pkg install 即装好，免去
+// 本地编译对 clang 的要求）。
+var termuxPrebuiltPkgs = []string{
+	"python-grpcio", "python-cryptography", "python-pillow", "python-psutil",
+	"resolv-conf",
+}
+
+// pkgInstallTermuxPrebuilt 在 Termux 上预装 C 扩展依赖的预编译包。任一失败
+// 仅告警（后续 pip 安装仍会尝试，失败时由上层转为运行时下载提示）。
+func pkgInstallTermuxPrebuilt() {
+	for _, pkg := range termuxPrebuiltPkgs {
+		cmd := exec.Command("/data/data/com.termux/files/usr/bin/pkg", "install", "-y", pkg)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			logger.Warn("pkg install %s 失败: %v\n%s", pkg, err, strings.TrimSpace(string(out)))
+			continue
+		}
+		logger.Info("已安装 Termux 预编译包: %s", pkg)
+	}
+}
+
 // pyTargetFor is pyTarget's pure logic (testable across platforms).
 func pyTargetFor(goos, goarch string) (string, error) {
 	archMap := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}
@@ -176,6 +198,21 @@ func pyTargetFor(goos, goarch string) (string, error) {
 	}
 	return "", fmt.Errorf("bundled Python is not supported on %s/%s (install python3 or set %s)",
 		goos, goarch, EnvPythonBin)
+}
+
+// bundledPythonBin 探测已下载的 bundled CPython 解释器路径
+// （python-build-standalone 布局：Unix python/bin/python3，Windows 顶层
+// python/python.exe）。系统解释器缺失但 bundled 已下载时供 venv 准备使用。
+func bundledPythonBin() string {
+	rel := filepath.Join("python", "bin", "python3")
+	if runtime.GOOS == "windows" {
+		rel = filepath.Join("python", "python.exe")
+	}
+	bin := filepath.Join(pythonBaseDir(), pyVersion(), rel)
+	if info, err := os.Stat(bin); err == nil && !info.IsDir() {
+		return bin
+	}
+	return ""
 }
 
 // pyVersion returns the python-build-standalone tag (ASTRBOT_PYTHON_VERSION or
@@ -304,12 +341,54 @@ func minorAtLeast(v, min string) bool {
 	return vb >= mb
 }
 
+// pythonArchiveSHA256 固定 pin 每个 python-build-standalone 版本各平台归档的
+// sha256（键为 "version/target"），下载后校验，防止镜像/代理替换 tarball 获得
+// 宿主上的任意代码执行。未 pin 的版本（如自定义 ASTRBOT_PYTHON_VERSION）拒绝
+// 使用，除非显式设置 ASTRBOT_PYTHON_SKIP_VERIFY。
+var pythonArchiveSHA256 = map[string]string{
+	"20260814/x86_64-unknown-linux-gnu":  "3297691ae34f75fed81ac424e040145fccb0bafe8e581cd5cadbddfa1c0766c0",
+	"20260814/aarch64-unknown-linux-gnu": "4952b18bafda1880d4ab1f86e1c348dbdb31f0e6d049e76dc5f052f2f796f1c5",
+	"20260814/x86_64-apple-darwin":       "1a94c83264731e9603fbea78e57e7ca8f20e7d91eb866627ac2304621b0f6f1f",
+	"20260814/aarch64-apple-darwin":      "4572133a5542f306b9bdb155da5800f9e38950cd0a98d469b832ce256fe299ea",
+	"20260814/x86_64-pc-windows-msvc":    "7330282b47cd43a66b702d39078d2e5a88e580cee351d82f95045f21f5ee042a",
+}
+
+// verifyArchive 校验下载归档的 sha256 与固定 pin 一致；
+// ASTRBOT_PYTHON_SKIP_VERIFY 显式设置后跳过（默认校验，镜像路径不可信）。
+func verifyArchive(dest, version, target string) error {
+	if os.Getenv(EnvPythonSkipVerify) != "" {
+		return nil
+	}
+	want, ok := pythonArchiveSHA256[version+"/"+target]
+	if !ok {
+		return fmt.Errorf("no pinned sha256 for python %s (%s); set %s to skip verification", version, target, EnvPythonSkipVerify)
+	}
+	f, err := os.Open(dest) // #nosec G304 -- dest is the just-downloaded archive under the cache dir
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		return fmt.Errorf("python archive checksum mismatch: got %s want %s", got, want)
+	}
+	return nil
+}
+
 // EnsurePythonBin resolves an interpreter, downloading a bundled Python
 // (python-build-standalone) when the system has none. stage receives
 // human-readable phase text (may be nil). The downloaded tree is cached under
 // ~/.local/share/astrbot-go/python/<version> and reused across restarts.
 func EnsurePythonBin(stage func(string)) (string, error) {
 	if py := DiscoverPythonBin(); py != "" {
+		return py, nil
+	}
+	// 系统解释器缺失：先复用已下载的 bundled CPython（重启后避免重复下载）。
+	if py := bundledPythonBin(); py != "" {
+		logger.Info("Using downloaded bundled Python: %s", py)
 		return py, nil
 	}
 	return downloadPython(stage)
@@ -340,6 +419,10 @@ func downloadPython(stage func(string)) (string, error) {
 	if err := downloadFile(url, dest, stage); err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
 	}
+	if err := verifyArchive(dest, version, target); err != nil {
+		_ = os.Remove(dest)
+		return "", fmt.Errorf("verify %s: %w", archive, err)
+	}
 
 	if stage != nil {
 		stage("解压 Python 解释器…")
@@ -350,7 +433,13 @@ func downloadPython(stage func(string)) (string, error) {
 	}
 	_ = os.Remove(dest)
 
-	bin := filepath.Join(base, "python", "bin", exe("python3"))
+	// python-build-standalone 布局：Unix 为 python/bin/python3(.x)，Windows
+	// 无 bin 目录、解释器在顶层 python/python.exe（3.12 起也提供 python3.exe）。
+	rel := filepath.Join("python", "bin", "python3")
+	if runtime.GOOS == "windows" {
+		rel = filepath.Join("python", "python.exe")
+	}
+	bin := filepath.Join(base, rel)
 	if info, err := os.Stat(bin); err != nil || info.IsDir() {
 		return "", fmt.Errorf("extracted Python missing interpreter: %s", bin)
 	}
@@ -382,22 +471,45 @@ func SetPythonMirror(prefix string) {
 
 // pyDownloadURL applies the mirror prefix to the official release URL: the
 // SetPythonMirror override wins, then ASTRBOT_PYTHON_MIRROR.
+//
+// 镜像分两种风格（对齐 zig/Go 的 SetGoMirror 处理）：
+//   - 前缀风格（gh-proxy.com / ghfast.top / ghproxy.net）：官方完整 URL 跟在
+//     代理前缀后，即 <mirror>/<官方完整 URL>；
+//   - base 风格（官方完整 URL 本身）：直接作为下载 base，不再重复拼接官方
+//     前缀，否则会出现 URL 双段重复（404）。
 func pyDownloadURL(archive string) string {
-	u := pyBuildStandaloneURL + "/" + pyVersion() + "/" + archive
+	prefix := ""
 	if pyMirrorOverride != "" {
-		return pyMirrorOverride + "/" + u
+		prefix = pyMirrorOverride
+	} else if m := strings.TrimSpace(os.Getenv(EnvPythonMirror)); m != "" {
+		prefix = strings.TrimRight(m, "/")
 	}
-	if m := strings.TrimSpace(os.Getenv(EnvPythonMirror)); m != "" {
-		return strings.TrimRight(m, "/") + "/" + u
+	suffix := pyVersion() + "/" + archive
+	if prefix == "" {
+		return pyBuildStandaloneURL + "/" + suffix
 	}
-	return u
+	// 镜像已含官方发布路径（官方完整 URL 或其子集）→ 直接作 base。
+	if strings.Contains(prefix, "python-build-standalone/releases/download") {
+		return prefix + "/" + suffix
+	}
+	// 前缀风格：代理前缀 + 官方完整 URL。
+	return prefix + "/" + pyBuildStandaloneURL + "/" + suffix
 }
+
+// dlClient 是 Python 解释器下载专用 HTTP 客户端：30 分钟超时防止镜像源
+// 挂起时下载永远阻塞（与 Go 工具链下载对齐）。Transport 沿用默认配置，
+// 仍会走宿主的全局代理。
+var dlClient = &http.Client{Timeout: 30 * time.Minute}
+
+// maxArchiveBytes 限制解释器/SDK 归档下载总量（1GB），防止镜像返回无限流
+// 灌满磁盘。
+const maxArchiveBytes = 1 << 30
 
 // downloadFile streams url to dest with 10%-step progress logs and the stage
 // callback (download phase text). The default http.Client transport honors
 // the host's global proxy configuration.
 func downloadFile(url, dest string, stage func(string)) error {
-	resp, err := http.Get(url)
+	resp, err := dlClient.Get(url)
 	if err != nil {
 		return err
 	}
@@ -419,6 +531,9 @@ func downloadFile(url, dest string, stage func(string)) error {
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			if written+int64(n) > maxArchiveBytes {
+				return fmt.Errorf("archive exceeds size limit %d bytes", maxArchiveBytes)
+			}
 			if _, werr := out.Write(buf[:n]); werr != nil {
 				return werr
 			}
@@ -516,8 +631,37 @@ func extractTarGzKeepTop(src, dir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
+			link := hdr.Linkname
+			// 拒绝绝对路径目标与逃逸根目录的相对目标，防止恶意归档利用
+			// symlink 把后续条目写到根目录之外。
+			if filepath.IsAbs(link) {
+				return fmt.Errorf("symlink %q -> absolute target %q rejected", name, link)
+			}
+			if _, err := safeJoin(filepath.Dir(target), link); err != nil {
+				return fmt.Errorf("symlink %q -> %q escapes root: %w", name, link, err)
+			}
+			if err := os.Symlink(link, target); err != nil {
 				return err
+			}
+		case tar.TypeLink:
+			// GNU tar 硬链接条目的 Linkname 指向归档内的首个实体（内容为空），
+			// 跳过即丢失该路径；先尝试 os.Link，跨设备/不支持时退化为复制。
+			_ = os.Remove(target)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			src, err := safeJoin(dir, filepath.FromSlash(hdr.Linkname))
+			if err != nil {
+				return fmt.Errorf("hardlink %q -> %q escapes root: %w", name, hdr.Linkname, err)
+			}
+			if err := os.Link(src, target); err != nil {
+				data, rerr := os.ReadFile(src)
+				if rerr != nil {
+					return err
+				}
+				if werr := os.WriteFile(target, data, os.FileMode(uint32(hdr.Mode&0o777))); werr != nil {
+					return werr
+				}
 			}
 		}
 	}
@@ -586,15 +730,37 @@ func Ensure(dataDir string) (string, error) {
 		return dir, nil
 	}
 
+	// 下载/解包段落包进与 venv 相同的跨进程锁：双实例共享同一 dataDir 时，
+	// RemoveAll + 解包与另一实例的解包/读取交错会产出损坏的 SDK 目录。
+	lockPath := filepath.Join(absData, ".python-sdk.lock")
+	release, err := acquireVenvLock(lockPath, venvLockTimeout)
+	if err != nil {
+		return "", fmt.Errorf("获取 Python SDK 锁失败: %w", err)
+	}
+	defer release()
+
 	marker := filepath.Join(root, "astrbot", "__init__.py")
 	versionFile := filepath.Join(root, "VERSION")
+	// 锁内重新检查 marker/versionFile（双重检查：等锁期间他人可能已装好），
+	// 再决定 needFetch 与 RemoveAll。versionFile 读取错误区分 not-exist 与
+	// 其他 IO 错误，后者直接报错而非误判版本不匹配触发全量重下。
 	needFetch := false
 	if _, err := os.Stat(marker); err != nil {
 		needFetch = true
-	} else if data, err := os.ReadFile(versionFile); err != nil || strings.TrimSpace(string(data)) != SDKVersion { // #nosec G304 -- versionFile is a host-controlled marker under root
-		logger.Info("Python SDK 版本变化（磁盘 %q vs 期望 %q），重新下载…",
-			strings.TrimSpace(string(data)), SDKVersion)
-		needFetch = true
+	} else {
+		data, rerr := os.ReadFile(versionFile)
+		switch {
+		case os.IsNotExist(rerr):
+			needFetch = true
+		case rerr == nil && strings.TrimSpace(string(data)) != SDKVersion:
+			logger.Info("Python SDK 版本变化（磁盘 %q vs 期望 %q），重新下载…",
+				strings.TrimSpace(string(data)), SDKVersion)
+			needFetch = true
+		case rerr != nil:
+			return "", fmt.Errorf("read VERSION: %w", rerr)
+		}
+	}
+	if needFetch {
 		_ = os.RemoveAll(root)
 	}
 	if !needFetch {
@@ -705,6 +871,28 @@ func extractTarGzStripTop(src, dir string) error {
 			if err := w.Close(); err != nil {
 				return err
 			}
+		case tar.TypeLink:
+			_ = os.Remove(target)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			link := hdr.Linkname
+			if top != "" && (link == top || strings.HasPrefix(link, top+"/")) {
+				link = strings.TrimPrefix(strings.TrimPrefix(link, top), "/")
+			}
+			src, err := safeJoin(dir, filepath.FromSlash(link))
+			if err != nil {
+				return fmt.Errorf("hardlink %q -> %q escapes root: %w", name, hdr.Linkname, err)
+			}
+			if err := os.Link(src, target); err != nil {
+				data, rerr := os.ReadFile(src)
+				if rerr != nil {
+					return err
+				}
+				if werr := os.WriteFile(target, data, os.FileMode(uint32(hdr.Mode&0o777))); werr != nil {
+					return werr
+				}
+			}
 		}
 	}
 }
@@ -723,7 +911,13 @@ func extractTarGzStripTop(src, dir string) error {
 // mismatched markers trigger a host-deps reinstall under a cross-process lock
 // (pip 并发安全；见 venv_lock_*.go)。
 func EnsureVenv(dataDir string) string {
-	venvPython, err := ensureVenvReady(dataDir)
+	return EnsureVenvWithStage(dataDir, nil)
+}
+
+// EnsureVenvWithStage is EnsureVenv with a stage callback for install-dialog
+// progress ("创建 venv 并安装宿主 Python 依赖…").
+func EnsureVenvWithStage(dataDir string, stage func(string)) string {
+	venvPython, err := ensureVenvReady(dataDir, stage)
 	if err != nil {
 		logger.Warn("Python venv 准备失败: %v（插件将无法启动）", err)
 		return ""
@@ -741,12 +935,17 @@ var venvLockTimeout = 10 * time.Minute
 // incomplete venvs (marker missing/mismatched, or a legacy venv without
 // environment.json whose deps probe fails) are re-provisioned under the venv
 // lock. 返回 "" 语义由调用方（EnsureVenv）处理。
-func ensureVenvReady(dataDir string) (string, error) {
+func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 	cacheDir := userCacheDir()
 	if cacheDir == "" {
 		cacheDir = filepath.Join(dataDir, SDKRootName)
 	}
 	base := DiscoverPythonBin()
+	if base == "" {
+		// 系统解释器缺失时，回退到已下载的 bundled CPython（EnsurePythonBin
+		// 下载成功但未缓存到系统探测路径的场景，如 Windows 商店桩被拒绝）。
+		base = bundledPythonBin()
+	}
 	if base == "" {
 		return "", errors.New("未找到 Python 解释器（请安装 python3 或设置 " + EnvPythonBin + "）")
 	}
@@ -808,12 +1007,25 @@ func ensureVenvReady(dataDir string) (string, error) {
 		logger.Warn("venv 宿主依赖不完整（标记缺失/不匹配），锁内重新安装…")
 	} else {
 		logger.Info("Python %s 缺少宿主基础依赖，创建独立 venv 安装…", base)
-		if err := exec.Command(base, "-m", "venv", root).Run(); err != nil { // #nosec G204 -- Python SDK venv 初始化核心：base 为宿主探测到的解释器，root 为宿主生成的目录路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+		if stage != nil {
+			stage("创建 venv 并安装宿主 Python 依赖…")
+		}
+		// Android/Termux：grpcio/cryptography/pillow/psutil 等 C 扩展包无
+		// 预编译 wheel，pip 本地编译几乎必失败；Termux 官方仓库有预编译包，
+		// 先 pkg install 它们，并让 venv 以 --system-site-packages 创建以
+		// 继承这些系统级包（其余纯 Python 依赖仍由 pip 装进 venv）。
+		venvArgs := []string{"-m", "venv"}
+		if runtime.GOOS == "android" {
+			pkgInstallTermuxPrebuilt()
+			venvArgs = append(venvArgs, "--system-site-packages")
+		}
+		venvArgs = append(venvArgs, root)
+		if err := exec.Command(base, venvArgs...).Run(); err != nil { // #nosec G204 -- Python SDK venv 初始化核心：base 为宿主探测到的解释器，root/venvArgs 由宿主生成; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 			logger.Warn("创建 venv 失败: %v（插件将无法启动）", err)
 			return "", fmt.Errorf("创建 venv 失败: %w", err)
 		}
 	}
-	if err := installHostDeps(venvPython); err != nil {
+	if err := installHostDeps(venvPython, stage); err != nil {
 		// 安装失败：移除 READY，下次启动重试。
 		_ = os.Remove(readyPath(root))
 		return "", fmt.Errorf("venv 安装宿主依赖失败: %w", err)
@@ -942,12 +1154,35 @@ func hasHostDeps(pythonBin string) bool {
 	return cmd.Run() == nil
 }
 
-func installHostDeps(pythonBin string) error {
-	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, hostBaseDeps...)
+func installHostDeps(pythonBin string, stage func(string)) error {
+	deps := hostBaseDeps
+	if runtime.GOOS == "android" {
+		// Termux：跳过已有预编译系统包的 C 扩展（pkg install 装的
+		// grpcio/cryptography/pillow/psutil 经 --system-site-packages 可见），
+		// 避免 pip 重复安装触发本地编译失败。
+		skip := map[string]bool{}
+		for _, p := range termuxPrebuiltPkgs {
+			skip[strings.TrimPrefix(p, "python-")] = true
+		}
+		filtered := make([]string, 0, len(deps))
+		for _, d := range deps {
+			if !skip[d] {
+				filtered = append(filtered, d)
+			}
+		}
+		deps = filtered
+	}
+	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, deps...)
 	args = append(args, "-i", PyPIIndex())
+	logger.Debug("pip install: %s %s", pythonBin, strings.Join(args, " "))
 	out, err := exec.Command(pythonBin, args...).CombinedOutput() // #nosec G204 -- pip 安装插件宿主基础依赖：args 由固定常量 hostBaseDeps + 固定 pip 参数组成，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	// pip 过程输出统一走 DEBUG（正常安装时的下载/构建细节；失败时下面再报
+	// 错误信息）。
+	if len(strings.TrimSpace(string(out))) > 0 {
+		logger.Debug("pip install 输出: %s", strings.TrimSpace(string(out)))
+	}
 	if err != nil {
-		logger.Warn("pip install 输出: %s", strings.TrimSpace(string(out)))
+		logger.Warn("pip install 失败: %v", err)
 		return err
 	}
 	logger.Info("venv 宿主基础依赖安装完成（grpcio/protobuf + 本体常驻依赖）")
@@ -974,7 +1209,7 @@ func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, e
 		return nil, err
 	}
 	if !hasHostDeps(py) {
-		py = EnsureVenv(dataDir)
+		py = EnsureVenvWithStage(dataDir, stage)
 	}
 	if py == "" {
 		return nil, ErrRuntimeUnavailable
@@ -1012,5 +1247,25 @@ func (r *RuntimeEnv) Env(pluginDir, dataDir string) []string {
 		"ASTRBOT_DATA_PATH="+dataDir,
 		"ASTRBOT_PLUGIN_DATA_DIR="+filepath.Join(dataDir, "plugins_data"),
 	)
+	if runtime.GOOS == "windows" {
+		// Windows 子进程管道输出默认走 ANSI 代码页（GBK/cp936），Go 侧按
+		// UTF-8 读取 stderr 日志会乱码。强制 Python UTF-8 模式（Python
+		// 3.7+）使插件日志/异常文本统一 UTF-8。
+		env = setEnvKey(env, "PYTHONUTF8", "1")
+		env = setEnvKey(env, "PYTHONIOENCODING", "utf-8")
+	}
 	return env
+}
+
+// setEnvKey 覆盖或追加环境变量键值（os.Environ 可能已含同名键，重复键在
+// 子进程环境块中行为未定义，必须显式覆盖）。
+func setEnvKey(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }

@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,9 +33,42 @@ func ComponentsFromSDK(chain []pluginsdk.Component) []message.Component {
 		case pluginsdk.CompAt:
 			out = append(out, &message.At{TargetID: c.TargetID, Name: c.Name})
 		case pluginsdk.CompImage:
-			out = append(out, &message.Image{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID})
+			img := &message.Image{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID}
+			// data:image/...;base64,xxx / base64://xxx 形式的图片内容归一化到
+			// Base64 字段（Python 插件 text_to_image/html_render 返回 data URI，
+			// 若不归一化会被当作本地文件路径发送 → OneBot stat ENAMETOOLONG）。
+			if img.Base64 == "" {
+				if b64, ok := mediaDataURIToBase64(c.File); ok {
+					img.Base64 = b64
+					img.File = ""
+				}
+			}
+			// SDK Image.fromFileSystem 对 data URI 误做 Path.resolve 时，伪装
+			// 成绝对路径的 data URI 会同时出现在 path 字段（file 为 file://
+			// URI）：path 一律清除（含 base64 已提取的场景），防止其他适配器
+			// 按路径读取失败。
+			if b64, ok := mediaDataURIToBase64(c.Path); ok {
+				if img.Base64 == "" {
+					img.Base64 = b64
+				}
+				img.Path = ""
+			}
+			out = append(out, img)
 		case pluginsdk.CompRecord:
-			out = append(out, &message.Record{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID})
+			rec := &message.Record{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID}
+			if rec.Base64 == "" {
+				if b64, ok := mediaDataURIToBase64(c.File); ok {
+					rec.Base64 = b64
+					rec.File = ""
+				}
+			}
+			if b64, ok := mediaDataURIToBase64(c.Path); ok {
+				if rec.Base64 == "" {
+					rec.Base64 = b64
+				}
+				rec.Path = ""
+			}
+			out = append(out, rec)
 		case pluginsdk.CompFile:
 			out = append(out, &message.File{URL: c.URL, Path: c.Path, FileID: c.FileID, Name: c.Name})
 		case pluginsdk.CompVideo:
@@ -51,6 +86,37 @@ func ComponentsFromSDK(chain []pluginsdk.Component) []message.Component {
 	return out
 }
 
+// mediaDataURIToBase64 提取 media 内容为裸 base64：
+//   - base64://xxx
+//   - data:image/png;base64,xxx（裸 data URI）
+//   - file://<插件CWD>/data:image/png;base64,xxx 或 <绝对路径>/data:image/...
+//     （Python SDK Image.fromFileSystem 对 data URI 误做 Path.resolve+as_uri
+//     后的形态——data URI 被当作相对路径拼到插件工作目录，宿主必须识别并
+//     归一化，否则会被当本地文件路径发送 → OneBot stat ENAMETOOLONG）
+//
+// 非此类字符串返回 ok=false。
+func mediaDataURIToBase64(v string) (string, bool) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return "", false
+	}
+	if rest, found := strings.CutPrefix(s, "base64://"); found {
+		return rest, true
+	}
+	lower := strings.ToLower(s)
+	idx := strings.Index(lower, ";base64,")
+	if idx < 0 {
+		return "", false
+	}
+	// 要求 ";base64," 之前是 data:media 形态（允许 file:// 或绝对路径前缀）。
+	if dataIdx := strings.LastIndex(lower[:idx], "data:"); dataIdx >= 0 {
+		if strings.HasPrefix(lower[dataIdx:], "data:") {
+			return s[idx+len(";base64,"):], true
+		}
+	}
+	return "", false
+}
+
 // CallActionAdapter is implemented by platform adapters that can serve generic
 // API calls (e.g. the aiocqhttp OneBot adapter).
 type CallActionAdapter interface {
@@ -60,6 +126,33 @@ type CallActionAdapter interface {
 // RecallAdapter is implemented by platform adapters that can recall messages.
 type RecallAdapter interface {
 	RecallMessage(messageID string) error
+}
+
+// pluginAdminListFromConfig 从主配置读取插件管理管理员名单（config 键
+// plugin_admin_list，字符串数组）。缺省返回 nil（无管理插件）。
+func pluginAdminListFromConfig(cfgMgr *config.ConfigManager) []string {
+	if cfgMgr == nil {
+		return nil
+	}
+	cfg := cfgMgr.Get("default")
+	if cfg == nil {
+		return nil
+	}
+	v := cfg.GetNested("plugin_admin_list")
+	if v == nil {
+		return nil
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, e := range arr {
+		if s, ok := e.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // pluginConfigID 把 HostService 反调用携带的插件注册名解析为实例 id
@@ -134,10 +227,15 @@ type personaFileCache struct {
 
 var personaCache personaFileCache
 
+// personaDataPath 是人格数据文件路径。SetHostService 时按 subMgr.dataDir
+// 对齐 dashboard 的写入路径（filepath.Join(dataDir, "personas.json")），
+// 避免宿主 CWD 非项目根/配置 dataDir 非 "data" 时插件人格 RPC 静默读空。
+var personaDataPath = "data/personas.json"
+
 // loadPersonas 返回 data/personas.json 解析后的 persona 列表。
 // mtime 未变化时直接返回缓存内容，变化时才重读文件。
 func loadPersonas() []map[string]any {
-	info, err := os.Stat("data/personas.json")
+	info, err := os.Stat(personaDataPath)
 	if err != nil {
 		return nil
 	}
@@ -146,7 +244,7 @@ func loadPersonas() []map[string]any {
 	if personaCache.content != nil && personaCache.modTime.Equal(info.ModTime()) {
 		return parsePersonas(personaCache.content)
 	}
-	data, err := os.ReadFile("data/personas.json")
+	data, err := os.ReadFile(personaDataPath)
 	if err != nil {
 		return nil
 	}
@@ -200,18 +298,34 @@ func defaultPersona() map[string]any {
 type StarManagerLike interface {
 	// StarMetadataList 返回全部插件元数据（*star.StarMetadata 的 any 包装）。
 	StarMetadataList() []any
+	// CommandDescriptors 返回全部插件的命令描述符（含子命令/组/别名/权限/
+	// 描述，map 序列化）。供插件桥查询全局指令列表（子进程架构下 helps 类
+	// 插件无法从自身进程的注册表枚举其他插件指令）。
+	CommandDescriptors() []map[string]any
 }
 
 // StarManagerLikeFunc 是 StarManagerLike 的函数式适配器，供调用方用闭包
-// 便捷构造（避免在 plugin 包内匿名 struct 样板）。
-type StarManagerLikeFunc func() []any
+// 便捷构造（避免在 plugin 包内匿名 struct 样板）。CmdFn 为 nil 时
+// CommandDescriptors 返回 nil。
+type StarManagerLikeFunc struct {
+	Fn    func() []any
+	CmdFn func() []map[string]any
+}
 
 // StarMetadataList implements StarManagerLike.
 func (f StarManagerLikeFunc) StarMetadataList() []any {
-	if f == nil {
+	if f.Fn == nil {
 		return nil
 	}
-	return f()
+	return f.Fn()
+}
+
+// CommandDescriptors implements StarManagerLike.
+func (f StarManagerLikeFunc) CommandDescriptors() []map[string]any {
+	if f.CmdFn == nil {
+		return nil
+	}
+	return f.CmdFn()
 }
 
 // StarMetadata 是插件元数据的只读视图（镜像 internal/star.StarMetadata 字段，
@@ -309,6 +423,13 @@ type ChatLLMCmd struct {
 // Call once at startup, after all managers exist and before plugins begin
 // handling messages.
 func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(cmd ChatLLMCmd) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager) {
+	if subMgr != nil && subMgr.dataDir != "" {
+		personaDataPath = filepath.Join(subMgr.dataDir, "personas.json")
+	}
+	// 插件管理管理员名单：默认无管理插件（插件仅能启停自身）。
+	// config 的 plugin_admin_list 数组可授权指定插件（注册名，如
+	// astrbot_plugin_xxx_python）执行安装/卸载/操作其他插件。
+	pluginsdk.SetPluginAdminList(pluginAdminListFromConfig(cfgMgr))
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
 		CallAction: func(platformID, api string, params map[string]any) (map[string]any, error) {
 			adapter := pm.Get(platformID)
@@ -447,33 +568,20 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			return base64.StdEncoding.EncodeToString(data), nil
 		},
 		HtmlRender: func(template, data, options string) (string, error) {
-			// 优先远程 t2i：配置了 t2i_endpoint 时调用 RenderCustomTemplate
-			// （HTML 模板 + 数据 → 图片），失败回退本地 gg 渲染。
+			// 远程 t2i（HTML 模板 → 图片）：优先用户配置的 t2i_endpoint，
+			// 未配置时用官方默认端点（RenderCustomTemplate 内部解析，对齐
+			// 原版 ASTRBOT_T2I_DEFAULT_ENDPOINT + 官方端点列表容灾）。
+			// 远程失败直接返回错误，让插件降级到纯文本渲染（text_to_image）
+			// ——绝不能把 HTML 模板当纯文本渲染，否则帮助图显示 HTML 源码。
 			endpoint := ""
 			if cfgMgr != nil {
 				if cfg := cfgMgr.Get("default"); cfg != nil {
 					endpoint = cfg.GetString("t2i_endpoint")
 				}
 			}
-			if endpoint != "" {
-				img, err := t2i.RenderCustomTemplate(endpoint, template, data, options)
-				if err == nil {
-					return base64.StdEncoding.EncodeToString(img), nil
-				}
-				// 远程失败 → 回退本地渲染。
-				logger.Warn("html_render 远程 t2i 渲染失败（%v），回退本地渲染", err)
-			}
-			// 本地 gg 兜底：模板为空时用 data 作为渲染文本。
-			text := template
-			if text == "" {
-				text = data
-			}
-			if text == "" {
-				return "", fmt.Errorf("html_render: 模板与数据均为空，无法渲染")
-			}
-			img, err := t2i.RenderTextToPNG(text, t2i.ImageOptions{})
+			img, err := t2i.RenderCustomTemplate(endpoint, template, data, options)
 			if err != nil {
-				return "", fmt.Errorf("html_render 本地渲染失败: %w", err)
+				return "", fmt.Errorf("html_render 远程渲染失败: %w", err)
 			}
 			return base64.StdEncoding.EncodeToString(img), nil
 		},
@@ -706,39 +814,38 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		},
 
 		// ── 插件/Star 管理（对齐 Python star_manager）──
-		ListStars: func() []map[string]any {
+		GetPluginRegistry: func() []map[string]any {
 			// 用子进程插件的静态清单（含已安装但休眠/禁用的插件），对齐
 			// Python 原版 star_registry 语义（原版插件全常驻、注册表含全部
 			// 插件）：update_manager 等依赖 get_all_stars 枚举全部插件以
 			// 填充黑/白名单选项的管理类插件，不能只看到运行中插件。
+			// 每插件附带 commands（宿主聚合的指令描述符）：helps 类插件经
+			// 现有 GetPluginRegistry 通道跨进程枚举全部插件指令（SDK 注册
+			// 完成后一次性注入本进程注册表，0 运行期开销）。
+			commandsByPlugin := map[string][]map[string]any{}
+			if starMgr != nil {
+				for _, d := range starMgr.CommandDescriptors() {
+					pid, _ := d["plugin_name"].(string)
+					if pid == "" {
+						continue
+					}
+					commandsByPlugin[pid] = append(commandsByPlugin[pid], d)
+				}
+			}
+			withCommands := func(id string, base map[string]any) map[string]any {
+				if cmds := commandsByPlugin[id]; len(cmds) > 0 {
+					base["commands"] = cmds
+				}
+				return base
+			}
 			if subMgr != nil {
+				// 直接透传 ListInfo 返回的整条 info map（含 author/
+				// support_platforms/astrbot_version/i18n/pages/logo_path 等
+				// 对齐字段），再附加 commands，避免手挑字段遗漏新增元数据。
 				var out []map[string]any
 				for _, info := range subMgr.ListInfo() {
-					name, _ := info["name"].(string)
-					displayName, _ := info["display_name"].(string)
-					if displayName == "" {
-						displayName = name
-					}
-					desc, _ := info["description"].(string)
-					if desc == "" {
-						desc, _ = info["short_desc"].(string)
-					}
-					author, _ := info["author"].(string)
-					version, _ := info["version"].(string)
-					repo, _ := info["repo"].(string)
-					activated, _ := info["activated"].(bool)
-					reserved, _ := info["reserved"].(bool)
-					out = append(out, map[string]any{
-						"name":         name,
-						"display_name": displayName,
-						"author":       author,
-						"desc":         desc,
-						"version":      version,
-						"module_path":  "data.plugins." + name,
-						"activated":    activated,
-						"repo":         repo,
-						"reserved":     reserved,
-					})
+					instID, _ := info["id"].(string)
+					out = append(out, withCommands(instID, info))
 				}
 				return out
 			}
@@ -751,7 +858,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				if m == nil {
 					continue
 				}
-				out = append(out, map[string]any{
+				out = append(out, withCommands(m.PluginID, map[string]any{
 					"name":        m.Name,
 					"author":      m.Author,
 					"desc":        m.Desc,
@@ -759,12 +866,12 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 					"module_path": m.StarModulePath,
 					"activated":   m.Activated,
 					"repo":        m.Repo,
-				})
+				}))
 			}
 			return out
 		},
 		GetStar: func(name string) map[string]any {
-			// 与 ListStars 一致：从静态插件清单查找（含休眠/禁用插件）。
+			// 与 GetPluginRegistry 一致：从静态插件清单查找（含休眠/禁用插件）。
 			if subMgr != nil {
 				for _, info := range subMgr.ListInfo() {
 					instName, _ := info["name"].(string)
@@ -830,7 +937,10 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			if subMgr == nil {
 				return fmt.Errorf("plugin manager not available")
 			}
-			_, err := subMgr.InstallFromSource(context.Background(), "", repo, InstallOptions{})
+			// 安装可能下载/编译数分钟：带超时 context，避免无界后台拉取。
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			_, err := subMgr.InstallFromSource(ctx, "", repo, InstallOptions{})
 			return err
 		},
 		UninstallPlugin: func(pluginName string) error {
@@ -839,6 +949,29 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			id := subMgr.pluginConfigID(pluginName)
 			return subMgr.Uninstall(id, false, false)
+		},
+		ListPlatforms: func() []map[string]any {
+			// 全部已加载平台实例元数据（id/type/name/display_name）：
+			// 子进程架构下插件无法访问宿主 Go 平台对象，经此发现平台并
+			// 构造跨进程 bot 代理（call_action 转发宿主），群分析类插件
+			// 初始化时调用（非消息路径，无运行期开销）。
+			if pm == nil {
+				return nil
+			}
+			var out []map[string]any
+			for _, a := range pm.All() {
+				if a == nil {
+					continue
+				}
+				t := a.Type()
+				out = append(out, map[string]any{
+					"id":           a.ID(),
+					"type":         t,
+					"name":         t,
+					"display_name": a.ID(),
+				})
+			}
+			return out
 		},
 
 		// ── 会话等待（SessionWaiter 跨进程喂入）──

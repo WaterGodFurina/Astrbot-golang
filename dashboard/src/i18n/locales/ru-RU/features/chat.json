@@ -11,7 +11,8 @@
     "recordingPrompt": "Запись... говорите",
     "chatPrompt": "Давай пообщаемся!",
     "dropToUpload": "Отпустите, чтобы загрузить файл",
-    "stopGenerating": "Остановить генерацию"
+    "stopGenerating": "Остановить генерацию",
+    "fileTooLarge": "Файл {name} превышает лимит 4 ГБ и был пропущен"
   },
   "message": {
     "user": "Вы",

@@ -1,17 +1,33 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { Form } from 'vee-validate';
 import { useModuleI18n } from '@/i18n/composables';
 import { useAuthStore } from '@/stores/auth';
+import { authApi } from '@/api/v1';
 
 const { tm: t } = useModuleI18n('features/auth');
 
 const username = ref('astrbot');
 const password = ref('');
 const confirmPassword = ref('');
+// 首次安装/重置窗口内必须提供启动时打印在控制台的初始密码（防抢注）。
+// requireInitialPassword 由 setup-status 接口下发。
+const initialPassword = ref('');
+const requireInitialPassword = ref(false);
 const showPassword = ref(false);
 const showConfirmPassword = ref(false);
+const showInitialPassword = ref(false);
 const loading = ref(false);
+
+onMounted(async () => {
+  try {
+    const res = await authApi.setupStatus();
+    requireInitialPassword.value = !!res.data?.data?.require_initial_password;
+  } catch {
+    // 查询失败按不需要处理（后端会再校验，缺失时返回明确错误）
+    requireInitialPassword.value = false;
+  }
+});
 
 const usernameRules = [
   (value: string) => !!value || t('setup.validation.usernameRequired'),
@@ -28,16 +44,23 @@ const confirmPasswordRules = [
   (value: string) => !!value || t('setup.validation.confirmPasswordRequired'),
   (value: string) => value === password.value || t('setup.validation.passwordMatch'),
 ];
+const initialPasswordRules = [
+  (value: string) =>
+    !requireInitialPassword.value || !!value || t('setup.validation.initialPasswordRequired'),
+];
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 async function validate(values: any, { setErrors }: any) {
   loading.value = true;
   const authStore = useAuthStore();
-  return authStore.setup(username.value, password.value, confirmPassword.value).catch((err) => {
-    setErrors({ apiError: err });
-  }).finally(() => {
-    loading.value = false;
-  });
+  return authStore
+    .setup(username.value, password.value, confirmPassword.value, initialPassword.value)
+    .catch((err) => {
+      setErrors({ apiError: err });
+    })
+    .finally(() => {
+      loading.value = false;
+    });
 }
 </script>
 
@@ -45,6 +68,14 @@ async function validate(values: any, { setErrors }: any) {
   <Form @submit="validate" class="mt-4 setup-form" v-slot="{ errors, isSubmitting }">
     <v-text-field v-model="username" :label="t('setup.username')" class="mb-5 input-field" required hide-details="auto"
       variant="outlined" prepend-inner-icon="mdi-account-edit" :disabled="loading" :rules="usernameRules"></v-text-field>
+
+    <v-text-field v-if="requireInitialPassword" v-model="initialPassword"
+      :label="t('setup.initialPassword')" required variant="outlined" hide-details="auto"
+      :append-inner-icon="showInitialPassword ? 'mdi-eye' : 'mdi-eye-off'"
+      :type="showInitialPassword ? 'text' : 'password'"
+      @click:append-inner="showInitialPassword = !showInitialPassword" class="pwd-input mb-5"
+      prepend-inner-icon="mdi-key-variant" :disabled="loading"
+      :rules="initialPasswordRules"></v-text-field>
 
     <v-text-field v-model="password" :label="t('setup.password')" required variant="outlined" hide-details="auto"
       :append-inner-icon="showPassword ? 'mdi-eye' : 'mdi-eye-off'" :type="showPassword ? 'text' : 'password'"

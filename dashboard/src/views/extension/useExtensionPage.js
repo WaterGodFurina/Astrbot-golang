@@ -39,9 +39,15 @@ export const useExtensionPage = (initialTab = "installed") => {
 
   const getSelectedGitHubProxy = () => {
     if (typeof window === "undefined" || !window.localStorage) return "";
-    return localStorage.getItem("githubProxyRadioValue") === "1"
-      ? localStorage.getItem("selectedGitHubProxy") || ""
-      : "";
+    // 用户在弹窗里显式选择"使用代理"→ 用弹窗选择；
+    // 显式选"不使用"→ 空串；从未碰过弹窗 → 回退设置里的 github_proxy。
+    if (localStorage.getItem("githubProxyRadioValue") === "1") {
+      return localStorage.getItem("selectedGitHubProxy") || "";
+    }
+    if (localStorage.getItem("githubProxyRadioValue") === "0") {
+      return "";
+    }
+    return commonStore.githubProxyConfig || "";
   };
 
   // 检查指令冲突并提示
@@ -209,8 +215,12 @@ export const useExtensionPage = (initialTab = "installed") => {
     show: false,
     message: "",
     android: false,
+    // primary 是主下载地址（"加速地址"，官方 CDN，可编辑替换）
+    primary: "",
+    // mirrors 是加速下载镜像（前缀风格，radio 选择）
     mirrors: [],
     selectedMirror: "",
+    command: "",
   });
   // 用户选择的 Python 运行时处理（download / cancel）
   const pythonChoice = ref("");
@@ -614,7 +624,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         await checkUpdate();
       }
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     } finally {
       if (withLoading) {
         loading_.value = false;
@@ -974,6 +984,8 @@ export const useExtensionPage = (initialTab = "installed") => {
   };
 
   const openUpdateConfirmDialog = (extensionName, forceUpdate = false) => {
+    // 预取设置里的 github_proxy，代理选择弹窗默认选中它。
+    commonStore.fetchGithubProxyConfig().catch(() => {});
     updateConfirmDialog.extensionName = extensionName;
     updateConfirmDialog.forceUpdate = forceUpdate;
     updateConfirmDialog.show = true;
@@ -1102,7 +1114,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         }
       }, 1000);
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     }
   };
 
@@ -1212,7 +1224,7 @@ export const useExtensionPage = (initialTab = "installed") => {
 
       await checkAndPromptConflicts();
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     } finally {
       extension.__toggle_pending = false;
     }
@@ -1231,7 +1243,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       toast(res.data.message, "success");
       await getExtensions();
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     } finally {
       extension.__toggle_pending = false;
     }
@@ -1252,7 +1264,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       extension_config.i18n = res.data.data.i18n || {};
       extension_config.log_level = res.data.data.log_level ?? null;
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     }
   };
 
@@ -1287,7 +1299,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       if (curr_namespace.value === pluginName) {
         extension_config.log_level = previous;
       }
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     } finally {
       pluginLogLevelSaving.value = false;
     }
@@ -1443,6 +1455,8 @@ export const useExtensionPage = (initialTab = "installed") => {
 
   // 为表格视图创建一个处理安装插件的函数
   const handleInstallPlugin = async (plugin) => {
+    // 预取设置里的 github_proxy，代理选择弹窗默认选中它。
+    commonStore.fetchGithubProxyConfig().catch(() => {});
     if (plugin.tags && plugin.tags.includes("danger")) {
       selectedDangerPlugin.value = plugin;
       dangerConfirmDialog.value = true;
@@ -2360,7 +2374,11 @@ export const useExtensionPage = (initialTab = "installed") => {
       pythonRuntimeDialog.mirrors = Array.isArray(data.mirrors)
         ? data.mirrors
         : [];
-      pythonRuntimeDialog.selectedMirror = pythonRuntimeDialog.mirrors[0] || "";
+      pythonRuntimeDialog.primary = String(data.primary || "");
+      pythonRuntimeDialog.command = String(data.command || "");
+      // 默认选中主地址（官方 CDN），镜像需用户显式选择
+      pythonRuntimeDialog.selectedMirror =
+        pythonRuntimeDialog.primary || pythonRuntimeDialog.mirrors[0] || "";
       pythonRuntimeDialog.show = true;
       await refreshExtensionsAfterInstallFailure();
       return false;
@@ -2802,9 +2820,14 @@ export const useExtensionPage = (initialTab = "installed") => {
   // 监听语言切换事件
   window.addEventListener("astrbot-locale-changed", handleLocaleChange);
 
-  // 清理事件监听器
+  // 清理事件监听器与定时器
   onUnmounted(() => {
     window.removeEventListener("astrbot-locale-changed", handleLocaleChange);
+    stopInstallProgressPolling();
+    if (searchDebounceTimer) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = null;
+    }
   });
 
   // 搜索防抖处理

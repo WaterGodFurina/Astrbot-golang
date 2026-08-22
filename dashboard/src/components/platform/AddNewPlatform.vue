@@ -1309,7 +1309,7 @@ export default {
     },
     openTutorial() {
       const tutorialUrl = getTutorialLink(this.selectedPlatformConfig.type);
-      window.open(tutorialUrl, "_blank");
+      window.open(tutorialUrl, "_blank", "noopener,noreferrer");
     },
     openConfigDrawer(configId) {
       const targetId = configId || "default";

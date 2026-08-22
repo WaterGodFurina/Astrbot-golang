@@ -103,15 +103,16 @@ func fromSegmentToSlackBlock(ctx context.Context, comp message.Component, client
 			AltText: "图片",
 		}
 	case *message.File:
-		url := c.URL
-		if url == "" {
-			url = c.Path
+		// 本地路径优先（materialize 已把远程 URL 下载到 Path），
+		// 避免把 URL 字符串直接喂给 os.Stat。
+		if c.Path == "" || !fileExists(c.Path) {
+			return blockSection("文件上传失败（无本地文件）")
 		}
 		name := c.Name
 		if name == "" {
 			name = "file"
 		}
-		permalink, ok := uploadAndGetPermalink(ctx, client, url, name)
+		permalink, ok := uploadAndGetPermalink(ctx, client, c.Path, name)
 		if !ok {
 			return blockSection("文件上传失败")
 		}
@@ -119,6 +120,12 @@ func fromSegmentToSlackBlock(ctx context.Context, comp message.Component, client
 		return blockSection(fmt.Sprintf("文件: <%s|%s>", permalink, name))
 	}
 	return nil
+}
+
+// fileExists 判断路径是否为本地存在的常规文件。
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // uploadAndGetURL 上传本地文件并返回 url_private。

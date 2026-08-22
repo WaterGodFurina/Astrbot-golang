@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
@@ -41,25 +42,38 @@ func materializeRemoteMedia(chain *message.MessageChain) (cleanup func()) {
 		return func() {}
 	}
 	var temps []string
+	// mediaUndo 记录被物化的组件原值，cleanup 时还原，避免二次发送命中已删除的临时路径。
+	type mediaUndo struct {
+		restore func()
+	}
+	var undos []mediaUndo
 	var walk func(comps []message.Component)
 	walk = func(comps []message.Component) {
 		for _, comp := range comps {
 			switch c := comp.(type) {
 			case *message.Image:
 				if p := materializeMediaURL(c.URL, c.Path, c.File, &temps); p != "" {
+					oldPath, oldFile := c.Path, c.File
 					c.Path, c.File = p, p
+					undos = append(undos, mediaUndo{restore: func() { c.Path, c.File = oldPath, oldFile }})
 				}
 			case *message.Record:
 				if p := materializeMediaURL(c.URL, c.Path, c.File, &temps); p != "" {
+					oldPath, oldFile := c.Path, c.File
 					c.Path, c.File = p, p
+					undos = append(undos, mediaUndo{restore: func() { c.Path, c.File = oldPath, oldFile }})
 				}
 			case *message.Video:
 				if p := materializeMediaURL(c.URL, c.Path, "", &temps); p != "" {
+					oldPath := c.Path
 					c.Path = p
+					undos = append(undos, mediaUndo{restore: func() { c.Path = oldPath }})
 				}
 			case *message.File:
 				if p := materializeMediaURL(c.URL, c.Path, "", &temps); p != "" {
+					oldPath := c.Path
 					c.Path = p
+					undos = append(undos, mediaUndo{restore: func() { c.Path = oldPath }})
 				}
 			case *message.Reply:
 				walk(c.Chain)
@@ -77,6 +91,9 @@ func materializeRemoteMedia(chain *message.MessageChain) (cleanup func()) {
 		for _, p := range temps {
 			_ = os.Remove(p)
 		}
+		for _, u := range undos {
+			u.restore()
+		}
 	}
 }
 
@@ -90,7 +107,7 @@ func materializeMediaURL(remoteURL, path, file string, temps *[]string) string {
 	if !isHTTPURL(remoteURL) {
 		return ""
 	}
-	if !mediaHostAllowed(remoteURL) {
+	if !MediaHostAllowed(remoteURL) {
 		logger.Warn("媒体 URL 因地址受限被拒绝（拒绝链路本地/组播/未指定地址）: %s", remoteURL)
 		return ""
 	}
@@ -113,13 +130,13 @@ func isHTTPURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
-// mediaHostAllowed rejects hosts whose IP is link-local (covers the cloud
+// MediaHostAllowed rejects hosts whose IP is link-local (covers the cloud
 // metadata endpoints 169.254.169.254), multicast or unspecified. Loopback and
 // RFC1918 private ranges are allowed on purpose: media URLs routinely point to
 // the bot's own loopback services (aiocqhttp / line media servers) or LAN
 // storage, and unlike web_fetch the fetched bytes are only forwarded to a chat
 // platform. DNS failure fails closed (reject).
-func mediaHostAllowed(rawURL string) bool {
+func MediaHostAllowed(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Hostname() == "" {
 		return false
@@ -148,11 +165,41 @@ func ipAllowed(ip net.IP) bool {
 	return true
 }
 
+// mediaDownloadClient 构建下载用 HTTP 客户端：在拨号时刻（Control 回调拿到的是
+// 实际即将连接的 IP）拒绝受限地址，重定向的每一跳也重新过主机校验，避免
+// DNS 重绑定与跨主机跳转绕过 MediaHostAllowed。
+func mediaDownloadClient() *http.Client {
+	dialer := &net.Dialer{
+		Control: func(network, address string, _ syscall.RawConn) error {
+			host, _, _ := net.SplitHostPort(address)
+			if ip := net.ParseIP(host); ip != nil && !ipAllowed(ip) {
+				return fmt.Errorf("blocked address: %s", host)
+			}
+			return nil
+		},
+	}
+	return &http.Client{
+		Timeout: mediaDownloadTimeout,
+		Transport: &http.Transport{
+			DialContext: dialer.DialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if !MediaHostAllowed(req.URL.String()) {
+				return http.ErrUseLastResponse
+			}
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			return nil
+		},
+	}
+}
+
 // downloadMediaToTemp downloads rawURL (2xx only) to a temp file with a size
 // cap and preserves a sanitized file extension so MIME-sniffing adapters keep
 // working. Returns the temp path.
 func downloadMediaToTemp(rawURL string) (string, error) {
-	client := &http.Client{Timeout: mediaDownloadTimeout}
+	client := mediaDownloadClient()
 	resp, err := client.Get(rawURL)
 	if err != nil {
 		return "", err

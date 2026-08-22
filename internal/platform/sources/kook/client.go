@@ -60,6 +60,7 @@ type KookClient struct {
 	stopEvent chan struct{}
 	stopOnce  sync.Once
 
+	heartbeatMu     sync.Mutex
 	heartbeatCancel context.CancelFunc
 }
 
@@ -269,15 +270,23 @@ func (c *KookClient) Connect(ctx context.Context) bool {
 		c.closeWS()
 		return false
 	}
+	// 与 aiocqhttp/qqofficial/satori 对齐: 限制单帧大小, 防止异常大帧放大内存占用
+	conn.SetReadLimit(1 << 20)
 	c.wsMu.Lock()
 	c.ws = conn
 	c.wsMu.Unlock()
 	c.setRunning(true)
 	logger.I18nInfo("[KOOK] WebSocket 连接成功")
 
-	// 启动心跳任务
+	// 启动心跳任务。先取消上一个心跳, 避免重连后新旧两个心跳循环
+	// 并发向同一连接 WriteMessage (gorilla/websocket 要求单写者)。
+	c.heartbeatMu.Lock()
+	if c.heartbeatCancel != nil {
+		c.heartbeatCancel()
+	}
 	hbCtx, cancel := context.WithCancel(context.Background())
 	c.heartbeatCancel = cancel
+	c.heartbeatMu.Unlock()
 	go c.heartbeatLoop(hbCtx)
 
 	// 开始监听消息 (阻塞)
@@ -289,6 +298,12 @@ func (c *KookClient) Connect(ctx context.Context) bool {
 func (c *KookClient) listen(ctx context.Context) {
 	defer func() {
 		c.setRunning(false)
+		// 心跳与单次连接同生共死: 连接结束时取消心跳, 防止旧心跳在新连接上复活
+		c.heartbeatMu.Lock()
+		if c.heartbeatCancel != nil {
+			c.heartbeatCancel()
+		}
+		c.heartbeatMu.Unlock()
 		c.stopOnce.Do(func() { close(c.stopEvent) })
 	}()
 	for c.IsRunning() {
@@ -337,14 +352,14 @@ func (c *KookClient) currentWS() *websocket.Conn {
 	return c.ws
 }
 
-// zlibUncompress 解压 zlib 数据。
+// zlibUncompress 解压 zlib 数据 (解压结果上限 10MiB, 防止解压炸弹放大内存占用)。
 func zlibUncompress(data []byte) ([]byte, error) {
 	r, err := zlib.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	return io.ReadAll(io.LimitReader(r, 10<<20))
 }
 
 // handleSignal 处理不同类型的信令 (对应 Python _handle_signal)。
@@ -650,9 +665,11 @@ func (c *KookClient) React(ctx context.Context, msgID, emoji string) error {
 func (c *KookClient) Close() {
 	c.setRunning(false)
 	c.stopOnce.Do(func() { close(c.stopEvent) })
+	c.heartbeatMu.Lock()
 	if c.heartbeatCancel != nil {
 		c.heartbeatCancel()
 	}
+	c.heartbeatMu.Unlock()
 	c.closeWS()
 	logger.I18nInfo("[KOOK] 连接已关闭")
 }

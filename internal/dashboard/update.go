@@ -6,12 +6,16 @@ package dashboard
 
 import (
 	"archive/zip"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -24,7 +28,13 @@ const (
 	updateRepoOwner = "WaterGodFurina"
 	updateRepoName  = "Astrbot-golang"
 	updateRepoAPI   = "https://api.github.com/repos/WaterGodFurina/Astrbot-golang/releases"
+	// maxUpdateDownload 升级包下载字节上限（512 MiB），防恶意/损坏内容撑爆磁盘。
+	maxUpdateDownload = 512 << 20
 )
+
+// updateTagRe 白名单校验升级目标版本号：仅允许可选 v 前缀 + 字母数字点横线，
+// 防止恶意 tag 注入下载 URL（路径穿越/协议混淆）。
+var updateTagRe = regexp.MustCompile(`^v?[0-9A-Za-z.\-]+$`)
 
 var updateLogger = log.GetDefault().WithComponent("Updater")
 
@@ -38,7 +48,7 @@ func (s *Server) githubUpdateProxy(reqProxy string) string {
 }
 
 // updateProgressSet 记录切换版本进度（供前端轮询）。
-func (s *Server) updateProgressSet(id string, st *installStatus) {
+func (s *Server) updateProgressSet(id string, st *updateProgress) {
 	if id == "" {
 		return
 	}
@@ -48,7 +58,7 @@ func (s *Server) updateProgressSet(id string, st *installStatus) {
 }
 
 // updateProgressGet 读取切换版本进度。
-func (s *Server) updateProgressGet(id string) *installStatus {
+func (s *Server) updateProgressGet(id string) *updateProgress {
 	s.updateProgressMu.Lock()
 	defer s.updateProgressMu.Unlock()
 	st := s.updateProgress[id]
@@ -62,12 +72,18 @@ func (s *Server) fetchGithubReleases(proxy string) ([]map[string]interface{}, er
 	if proxy != "" {
 		url = strings.TrimRight(proxy, "/") + "/" + url
 	}
+	// 出站 URL 校验防 SSRF（代理前缀为管理员输入）。
+	if err := validateOutboundURL(url); err != nil {
+		return nil, err
+	}
 	client := newOutboundClient(30 * time.Second)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	// GitHub API 强制要求 User-Agent，缺失会直接 403（未认证 rate limit 也更易触发）。
+	req.Header.Set("User-Agent", "AstrBot-Go")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -177,9 +193,14 @@ func (s *Server) handleUpdateCheck(proxy string) map[string]interface{} {
 // doUpdateCore 执行"切换版本"：根据 version + 当前平台选择 zip 下载，
 // 解压替换本进程二进制并触发重启。
 func (s *Server) doUpdateCore(w http.ResponseWriter, progressID, tag, proxy string) {
+	setErr := func(msg string) {
+		p := newUpdateProgress(progressID, tag)
+		p.Status, p.Message = "error", msg
+		s.updateProgressSet(progressID, p)
+	}
 	resource := resourceForPlatform(runtime.GOOS, runtime.GOARCH)
 	if resource == "" {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "当前平台暂不支持自动升级"})
+		setErr("当前平台暂不支持自动升级")
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"status": "error", "message": "当前平台暂不支持自动升级",
 		}))
@@ -188,14 +209,23 @@ func (s *Server) doUpdateCore(w http.ResponseWriter, progressID, tag, proxy stri
 
 	tag = strings.TrimSpace(tag)
 	if tag == "" {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "缺少目标版本号"})
+		setErr("缺少目标版本号")
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"status": "error", "message": "缺少目标版本号",
 		}))
 		return
 	}
+	if !updateTagRe.MatchString(tag) {
+		setErr("非法版本号格式")
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"status": "error", "message": "非法版本号格式",
+		}))
+		return
+	}
 
-	// 异步执行下载 + 替换 + 重启，先返回让前端开始轮询进度。
+	// 初始化富结构进度（对齐 Python _init_update_progress），异步执行下载 +
+	// 替换 + 重启，先返回让前端开始轮询进度。
+	s.updateProgressSet(progressID, newUpdateProgress(progressID, tag))
 	go s.performUpdate(progressID, tag, resource, proxy)
 
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -203,16 +233,64 @@ func (s *Server) doUpdateCore(w http.ResponseWriter, progressID, tag, proxy stri
 	}))
 }
 
-// performUpdate 在后台执行下载→解压→替换→重启。
+// performUpdate 在后台执行下载→解压→替换→重启。进度以富结构写入（对齐
+// Python UpdateService：stage=core 的下载阶段带字节/速度/百分比）。
 func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
-	setp := func(pct int, text string) {
-		s.updateProgressSet(progressID, &installStatus{Status: "downloading", Percent: pct, Text: text})
+	// setStage 更新当前阶段状态/消息/总进度。
+	setStage := func(stage, status, message string, overall int) {
+		p := s.updateProgressGet(progressID)
+		if p == nil {
+			p = newUpdateProgress(progressID, tag)
+		}
+		p.Stage = stage
+		p.Status = status
+		p.Message = message
+		if overall > 0 {
+			p.OverallPercent = overall
+		}
+		if _, ok := p.Stages[stage]; !ok {
+			p.Stages[stage] = &downloadStageInfo{Status: "pending"}
+		}
+		s.updateProgressSet(progressID, p)
 	}
-	setp(2, "准备下载 "+tag)
+	// setErr 写入错误终态。
+	setErr := func(msg string) {
+		p := s.updateProgressGet(progressID)
+		if p == nil {
+			p = newUpdateProgress(progressID, tag)
+		}
+		p.Status, p.Message = "error", msg
+		s.updateProgressSet(progressID, p)
+	}
+	// 下载进度回调：更新 core 阶段的字节/速度/百分比。
+	dlProgress := func(downloaded, total int64, speedKiBs int64) {
+		p := s.updateProgressGet(progressID)
+		if p == nil {
+			return
+		}
+		st := p.Stages["core"]
+		if st == nil {
+			st = &downloadStageInfo{}
+			p.Stages["core"] = st
+		}
+		st.Status = "downloading"
+		st.Downloaded = downloaded
+		st.Total = total
+		if total > 0 {
+			st.Percent = int(100 * downloaded / total)
+		}
+		st.Speed = speedKiBs
+		p.Stage = "core"
+		p.OverallPercent = 5 + int(70*float64(downloaded)/float64(total+1))
+		p.Message = fmt.Sprintf("下载中 %d%%", st.Percent)
+		s.updateProgressSet(progressID, p)
+	}
+
+	setStage("preparing", "running", "准备下载 "+tag, 2)
 
 	exe, err := os.Executable()
 	if err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "定位可执行文件失败: " + err.Error()})
+		setErr("定位可执行文件失败: " + err.Error())
 		return
 	}
 
@@ -220,25 +298,41 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 	if proxy != "" {
 		downloadURL = strings.TrimRight(proxy, "/") + "/" + downloadURL
 	}
-	setp(5, "下载 "+downloadURL)
+	// 出站 URL 校验防 SSRF（proxy 为管理员输入，tag 已过白名单）。
+	if err := validateOutboundURL(downloadURL); err != nil {
+		setErr("下载地址校验失败: " + err.Error())
+		return
+	}
+	setStage("core", "downloading", "下载 "+downloadURL, 5)
 
 	tmpDir, err := os.MkdirTemp("", "astrbot-update-*")
 	if err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "创建临时目录失败: " + err.Error()})
+		setErr("创建临时目录失败: " + err.Error())
 		return
 	}
 	defer os.RemoveAll(tmpDir)
 
 	zipPath := filepath.Join(tmpDir, "release.zip")
-	if err := s.downloadFile(downloadURL, zipPath, progressID); err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "下载失败: " + err.Error()})
+	if err := s.downloadFile(downloadURL, zipPath, dlProgress); err != nil {
+		setErr("下载失败: " + err.Error())
 		return
 	}
-	setp(75, "解压并替换")
+
+	// 审查项 3.2-3：解压替换前校验升级包完整性（GitHub 官方 assets digest，
+	// 见 verifyUpdateChecksum），不匹配则硬失败中止，绝不替换运行中的二进制
+	// ——防止被劫持的代理会话完成持久化替换。
+	setStage("core", "done", "校验升级包完整性", 72)
+	if err := s.verifyUpdateChecksum(downloadURL, zipPath, tag, proxy); err != nil {
+		updateLogger.Error("升级包完整性校验失败: %v", err)
+		setErr("完整性校验失败: " + err.Error())
+		return
+	}
+
+	setStage("dependencies", "running", "解压并替换", 75)
 
 	newBin, err := extractSingleBinary(zipPath, tmpDir)
 	if err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "解压失败: " + err.Error()})
+		setErr("解压失败: " + err.Error())
 		return
 	}
 
@@ -246,12 +340,12 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 	exeDir := filepath.Dir(exe)
 	tmpExe := filepath.Join(exeDir, ".astrbot-update-bin"+filepath.Ext(exe))
 	if err := copyFile(newBin, tmpExe); err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "写入新二进制失败: " + err.Error()})
+		setErr("写入新二进制失败: " + err.Error())
 		return
 	}
 	if err := os.Chmod(tmpExe, 0o755); err != nil {
 		_ = os.Remove(tmpExe)
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "设置权限失败: " + err.Error()})
+		setErr("设置权限失败: " + err.Error())
 		return
 	}
 	if runtime.GOOS == "windows" {
@@ -262,25 +356,25 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 		_ = os.Remove(oldExe) // 清理上次升级残留
 		if err := os.Rename(exe, oldExe); err != nil {
 			_ = os.Remove(tmpExe)
-			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败（无法改名运行中的 exe）: " + err.Error()})
+			setErr("替换二进制失败（无法改名运行中的 exe）: " + err.Error())
 			return
 		}
 		if err := os.Rename(tmpExe, exe); err != nil {
 			// 回滚：把旧 exe 移回原位，避免留下"无主 exe"。
 			_ = os.Rename(oldExe, exe)
 			_ = os.Remove(tmpExe)
-			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败: " + err.Error()})
+			setErr("替换二进制失败: " + err.Error())
 			return
 		}
 	} else {
 		if err := os.Rename(tmpExe, exe); err != nil {
 			_ = os.Remove(tmpExe)
-			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败: " + err.Error()})
+			setErr("替换二进制失败: " + err.Error())
 			return
 		}
 	}
 
-	s.updateProgressSet(progressID, &installStatus{Status: "done", Percent: 100, Text: "升级完成，正在重启…"})
+	setStage("restart", "running", "升级完成，正在重启…", 98)
 
 	// 触发核心自重启（spawn 新实例 → 优雅停机 → 退出）。
 	if s.restartFunc != nil {
@@ -289,7 +383,11 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 }
 
 // downloadFile 流式下载 URL 到 dst，并更新进度。
-func (s *Server) downloadFile(url, dst, progressID string) error {
+func (s *Server) downloadFile(url, dst string, onProgress func(downloaded, total int64, speedKiBs int64)) error {
+	// 下载前再次校验出站 URL 防 SSRF。
+	if err := validateOutboundURL(url); err != nil {
+		return err
+	}
 	client := newOutboundClient(2 * time.Minute)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -311,18 +409,28 @@ func (s *Server) downloadFile(url, dst, progressID string) error {
 	defer out.Close()
 	buf := make([]byte, 64*1024)
 	var written int64
+	start := time.Now()
+	lastReport := time.Now()
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			written += int64(n)
+			if written > maxUpdateDownload {
+				return fmt.Errorf("下载内容超过 %d MiB 上限", maxUpdateDownload>>20)
+			}
 			if _, werr := out.Write(buf[:n]); werr != nil {
 				return werr
 			}
-			written += int64(n)
-			pct := 5
-			if total > 0 {
-				pct = 5 + int(70*float64(written)/float64(total))
+			// 每 300ms 上报一次下载进度（字节/速度），避免高频锁竞争。
+			if onProgress != nil && time.Since(lastReport) >= 300*time.Millisecond {
+				elapsed := time.Since(start).Seconds()
+				speedKiBs := int64(0)
+				if elapsed > 0 {
+					speedKiBs = int64(float64(written)/elapsed) / 1024
+				}
+				onProgress(written, total, speedKiBs)
+				lastReport = time.Now()
 			}
-			s.updateProgressSet(progressID, &installStatus{Status: "downloading", Percent: pct, Text: fmt.Sprintf("下载中 %d%%", pct)})
 		}
 		if rerr == io.EOF {
 			break
@@ -331,7 +439,138 @@ func (s *Server) downloadFile(url, dst, progressID string) error {
 			return rerr
 		}
 	}
+	// 完成时上报最终状态（100%）。
+	if onProgress != nil && total > 0 {
+		onProgress(total, total, 0)
+	}
 	return nil
+}
+
+// checksumHexRe 匹配合法的 sha256 十六进制摘要（64 位），用于解析校验文件。
+var checksumHexRe = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+// verifyUpdateChecksum 校验下载的升级包完整性（审查项 3.2-3）。校验源是
+// GitHub 官方数据：GET /repos/{owner}/{repo}/releases/tags/{tag} 响应里的
+// assets[].digest（"sha256:<hex>"，GitHub 在资产上传时自动计算），按文件名
+// 匹配目标 zip 后做常量时间比对。API 拉取失败或历史版本无 digest 时告警
+// 放行（不能砍死更新功能）；digest 存在但不匹配则硬失败中止。
+func (s *Server) verifyUpdateChecksum(downloadURL, zipPath, tag, proxy string) error {
+	zipName := filepath.Base(downloadURL)
+	assets, err := s.fetchGithubReleaseAssets(tag, proxy)
+	if err != nil {
+		updateLogger.Warn("获取 release %s 资产失败，跳过完整性校验: %v", tag, err)
+		return nil
+	}
+	want := releaseAssetDigest(assets, zipName)
+	if want == "" {
+		updateLogger.I18nWarn("版本 %s 的 %s 无官方 digest，跳过完整性校验", tag, zipName)
+		return nil
+	}
+	if err := compareUpdateChecksum(zipPath, want); err != nil {
+		return fmt.Errorf("升级包与 GitHub 官方摘要不一致: %w", err)
+	}
+	return nil
+}
+
+// compareUpdateChecksum 计算本地 zip 文件的 sha256 并与期望摘要做常量时间
+// 比对；不匹配返回错误，绝不放行（防止时序侧信道逐字节猜测摘要）。
+func compareUpdateChecksum(zipPath, wantHex string) error {
+	f, err := os.Open(zipPath) // #nosec G304 -- zipPath 是 performUpdate 刚下载到私有临时目录的文件
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	want, err := hex.DecodeString(wantHex)
+	if err != nil {
+		return fmt.Errorf("校验值格式非法: %w", err)
+	}
+	actual := h.Sum(nil)
+	if subtle.ConstantTimeCompare(actual, want) != 1 {
+		return fmt.Errorf("SHA-256 校验不匹配（期望 %s，实际 %s）", wantHex, hex.EncodeToString(actual))
+	}
+	return nil
+}
+
+// fetchGithubReleaseAssets 拉取指定 tag 的 release 资产列表（name、
+// browser_download_url 与 GitHub 官方摘要 digest）。fetchGithubReleases 的
+// 返回直接面向前端列表接口且不含 assets，故此处单独请求单版本详情
+// （GET /repos/{owner}/{repo}/releases/tags/{tag}），供完整性校验取
+// assets[].digest（形如 "sha256:<64位hex>"，GitHub 上传资产时自动计算）。
+func (s *Server) fetchGithubReleaseAssets(tag, proxy string) ([]map[string]interface{}, error) {
+	url := updateRepoAPI + "/tags/" + tag // tag 已过 updateTagRe 白名单，无注入风险
+	if proxy != "" {
+		url = strings.TrimRight(proxy, "/") + "/" + url
+	}
+	// 出站 URL 校验防 SSRF（代理前缀为管理员输入）。
+	if err := validateOutboundURL(url); err != nil {
+		return nil, err
+	}
+	client := newOutboundClient(30 * time.Second)
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	// GitHub API 强制要求 User-Agent，缺失会直接 403（未认证 rate limit 也更易触发）。
+	req.Header.Set("User-Agent", "AstrBot-Go")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("GitHub release API 返回 HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		Assets []struct {
+			Name               string `json:"name"`
+			BrowserDownloadURL string `json:"browser_download_url"`
+			Digest             string `json:"digest"`
+		} `json:"assets"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]map[string]interface{}, 0, len(raw.Assets))
+	for _, a := range raw.Assets {
+		out = append(out, map[string]interface{}{
+			"name":                 a.Name,
+			"browser_download_url": a.BrowserDownloadURL,
+			"digest":               a.Digest,
+		})
+	}
+	return out, nil
+}
+
+// releaseAssetDigest 从 release 资产列表里取目标文件的官方 sha256 摘要
+// （assets[].digest = "sha256:<hex>"）。找不到该文件名或无 digest 返回空串。
+func releaseAssetDigest(assets []map[string]interface{}, filename string) string {
+	for _, a := range assets {
+		name, _ := a["name"].(string)
+		if name != filename && filepath.Base(name) != filename {
+			continue
+		}
+		digest, _ := a["digest"].(string)
+		digest = strings.TrimSpace(digest)
+		const prefix = "sha256:"
+		if !strings.HasPrefix(strings.ToLower(digest), prefix) {
+			return ""
+		}
+		hexPart := strings.TrimPrefix(digest[len(prefix):], "")
+		if checksumHexRe.MatchString(hexPart) {
+			return strings.ToLower(hexPart)
+		}
+		return ""
+	}
+	return ""
 }
 
 // extractSingleBinary 从 zip 中提取唯一的可执行文件（astrbot / astrbot.exe）。
@@ -385,4 +624,112 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Sync()
+}
+
+// changelogCachePath / changelogBodyPath 是 changelog 的本地缓存位置：
+// releases 列表整体缓存在 data/changelogs.json，单版本 body 缓存为
+// data/changelogs/v<version>.md（对齐 Python stat_service 的 v<version>.md
+// 命名）。
+func (s *Server) changelogCachePath() string {
+	return filepath.Join(s.kbDataDir(), "changelogs.json")
+}
+
+func (s *Server) changelogBodyPath(version string) string {
+	return filepath.Join(s.kbDataDir(), "changelogs", "v"+version+".md")
+}
+
+// changelogCacheTTL 控制 changelog 列表缓存的刷新间隔。
+const changelogCacheTTL = 10 * time.Minute
+
+// changelogVersionRe 白名单校验 changelog 版本号（防路径穿越）。
+var changelogVersionRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// fileExistsLocal reports whether a file exists.
+func fileExistsLocal(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// fetchCachedChangelogReleases 从 GitHub 拉取 releases 并缓存到 data/
+// （TTL 内直接读缓存，离线时回退缓存）。
+func (s *Server) fetchCachedChangelogReleases() []map[string]interface{} {
+	path := s.changelogCachePath()
+	if data, err := os.ReadFile(path); err == nil {
+		var cached struct {
+			FetchedAt time.Time                `json:"fetched_at"`
+			Releases  []map[string]interface{} `json:"releases"`
+		}
+		if json.Unmarshal(data, &cached) == nil && cached.Releases != nil {
+			if time.Since(cached.FetchedAt) < changelogCacheTTL || len(cached.Releases) == 0 {
+				return cached.Releases
+			}
+		}
+	}
+	releases, err := s.fetchGithubReleases("")
+	if err != nil {
+		// 拉取失败时回退到已有缓存（若有）。
+		if data, rerr := os.ReadFile(path); rerr == nil {
+			var cached struct {
+				Releases []map[string]interface{} `json:"releases"`
+			}
+			if json.Unmarshal(data, &cached) == nil && cached.Releases != nil {
+				return cached.Releases
+			}
+		}
+		return nil
+	}
+	if payload, err := json.MarshalIndent(map[string]interface{}{
+		"fetched_at": time.Now(),
+		"releases":   releases,
+	}, "", "  "); err == nil {
+		_ = writeFileAtomic(path, payload, 0o644)
+	}
+	return releases
+}
+
+// handleChangelogs implements GET /changelogs 与 GET /changelogs/{version}：
+// 版本列表来自 GitHub releases（v 前缀剥离），单版本内容为 release body。
+func (s *Server) handleChangelogs(w http.ResponseWriter, r *http.Request, parts []string) {
+	if len(parts) > 0 && parts[0] != "" {
+		version := strings.TrimPrefix(parts[0], "v")
+		if !changelogVersionRe.MatchString(version) || strings.Contains(version, "..") {
+			writeJSON(w, http.StatusOK, apiError("Invalid version format"))
+			return
+		}
+		// 优先读本地缓存文件，其次从 releases 缓存取 body 落盘。
+		if bodyPath := s.changelogBodyPath(version); fileExistsLocal(bodyPath) {
+			if content, err := os.ReadFile(bodyPath); err == nil {
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"content": string(content),
+					"version": version,
+				}))
+				return
+			}
+		}
+		releases := s.fetchCachedChangelogReleases()
+		for _, rel := range releases {
+			tag, _ := rel["tag_name"].(string)
+			if strings.TrimPrefix(tag, "v") == version {
+				body, _ := rel["body"].(string)
+				_ = os.MkdirAll(filepath.Dir(s.changelogBodyPath(version)), 0o755)
+				_ = writeFileAtomic(s.changelogBodyPath(version), []byte(body), 0o644)
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"content": body,
+					"version": version,
+				}))
+				return
+			}
+		}
+		writeJSON(w, http.StatusNotFound, apiError("Changelog for version "+version+" not found"))
+		return
+	}
+	releases := s.fetchCachedChangelogReleases()
+	versions := make([]string, 0, len(releases))
+	for _, rel := range releases {
+		tag, _ := rel["tag_name"].(string)
+		if tag != "" {
+			versions = append(versions, strings.TrimPrefix(tag, "v"))
+		}
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"versions": versions}))
 }

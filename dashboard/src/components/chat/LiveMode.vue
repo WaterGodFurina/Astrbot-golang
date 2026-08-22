@@ -56,6 +56,8 @@
 import { ref, computed, onBeforeUnmount, watch } from 'vue';
 import { useTheme } from 'vuetify';
 import { chatApi } from '@/api/v1';
+import { getToken } from '@/utils/token';
+import { getWSTicket } from '@/utils/wsTicket';
 import { useVADRecording } from '@/composables/useVADRecording';
 import SiriOrb from './LiveOrb.vue';
 
@@ -275,39 +277,50 @@ async function stopLiveMode() {
 function connectWebSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
         // 获取存储的 token
-        const token = localStorage.getItem('token');
+        const token = getToken();
         if (!token) {
             reject(new Error('未登录，请先登录'));
             return;
         }
 
-        const wsUrl = chatApi.liveWebSocketUrl(token);
-
-        // nosemgrep: websocket
-        ws = new WebSocket(wsUrl);
-
-        ws.onopen = () => {
-            console.log('[Live Mode] WebSocket 连接成功');
-            resolve();
-        };
-
-        ws.onerror = (error) => {
-            console.error('[Live Mode] WebSocket 错误:', error);
-            reject(error);
-        };
-
-        ws.onmessage = handleWebSocketMessage;
-
-        ws.onclose = () => {
-            console.log('[Live Mode] WebSocket 连接关闭');
-        };
-
-        // 超时处理
-        setTimeout(() => {
-            if (ws?.readyState !== WebSocket.OPEN) {
-                reject(new Error('WebSocket 连接超时'));
+        // 换取一次性票据后连接；票据不可用（后端过旧/网络异常）时拒绝
+        // 连接，绝不把长效 token 放进 URL。
+        getWSTicket().then((ticket) => {
+            if (!ticket) {
+                reject(new Error('后端不支持一次性 ws-ticket，请升级后端后重试'));
+                return;
             }
-        }, 5000);
+            const wsUrl = chatApi.liveWebSocketUrl(ticket);
+
+            // nosemgrep: websocket
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('[Live Mode] WebSocket 连接成功');
+                resolve();
+            };
+
+            ws.onerror = (error) => {
+                console.error('[Live Mode] WebSocket 错误:', error);
+                reject(error);
+            };
+
+            ws.onmessage = handleWebSocketMessage;
+
+            ws.onclose = () => {
+                console.log('[Live Mode] WebSocket 连接关闭');
+            };
+
+            // 超时处理
+            setTimeout(() => {
+                if (ws?.readyState !== WebSocket.OPEN) {
+                    reject(new Error('WebSocket 连接超时'));
+                }
+            }, 5000);
+        }).catch((error) => {
+            console.error('[Live Mode] 获取 ws-ticket 失败:', error);
+            reject(new Error('无法获取 WebSocket 连接票据，请升级后端后重试'));
+        });
     });
 }
 
