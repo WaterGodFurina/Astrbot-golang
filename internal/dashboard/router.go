@@ -221,6 +221,12 @@ func (s *Server) apiAuthAllowed(r *http.Request) bool {
 		if len(parts) >= 2 && parts[1] == "logo" {
 			return true
 		}
+		if len(parts) >= 4 && parts[1] == "page-content" {
+			// 插件页面资产：iframe 与其子资源（css/js/img）无法携带
+			// Authorization 头，凭入口端点签发的短期 asset_token（query）
+			// 或专用 Cookie 放行（对齐 Python 的 asset_token 机制）。
+			return s.pluginPageAssetAllowed(r, parts[2:])
+		}
 		return s.auth.IsAuthenticated(extractToken(r))
 	case "webhooks":
 		// 统一 webhook 回调入口 /api/v1/webhooks/platforms/{uuid}：外部平台

@@ -45,6 +45,7 @@ type PasswordManager struct {
 	configMgr              *config.ConfigManager // 注入后 auth 持久化统一走 ConfigManager（M-08）
 	username               string
 	hashedPassword         string // PBKDF2 hash（dashboard.password 字段）
+	initialPassword        string // 启动生成/重置的初始密码明文（仅内存，供 setup 校验与测试）
 	passwordChangeRequired bool
 	jwtSecret              string
 	tokens                 map[string]bool // active session tokens
@@ -206,6 +207,7 @@ func (pm *PasswordManager) generateAndStorePassword() {
 		pm.username = Username
 	}
 	pm.hashedPassword = hashed
+	pm.initialPassword = password
 	pm.passwordChangeRequired = true
 	pm.mu.Unlock()
 
@@ -477,6 +479,14 @@ func (pm *PasswordManager) PasswordChangeRequired() bool {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 	return pm.passwordChangeRequired
+}
+
+// InitialPassword 返回启动生成/重置的初始密码明文（仅内存）。供 setup 端点
+// 校验初始密码与测试使用；从未生成过时返回空串。
+func (pm *PasswordManager) InitialPassword() string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.initialPassword
 }
 
 // generateRandomPassword creates a strong random password.

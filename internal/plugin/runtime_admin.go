@@ -459,10 +459,6 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 	}
 	m.manifestMu.Unlock()
 
-	if entry == nil && m.Get(id) == nil {
-		return fmt.Errorf("插件 %s 未安装", id)
-	}
-
 	// 二进制目录（始终删除）。
 	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id)))
 	// 插件本体源码目录（Go/Python 统一在 plugins/<id>，始终删除）。

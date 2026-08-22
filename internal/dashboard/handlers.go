@@ -2107,7 +2107,12 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		}
 		writeJSON(w, http.StatusOK, apiOK(market))
 	case "page":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+		// 插件自带页面入口（对齐 Python get_plugin_page_entry_config）。
+		s.handlePluginPage(w, r)
+	case "page-content":
+		// 插件页面资产。请求已由 apiAuthAllowed 用 asset_token / 专用
+		// Cookie 放行（iframe 子资源无法携带 Authorization 头）。
+		s.servePluginPageContent(w, r, parts[1:])
 	case "readme":
 		s.handlePluginDocs(w, r, s.subPluginMgr.Readme)
 	case "extensions":
@@ -7117,7 +7122,27 @@ func (s *Server) handleSubagents(w http.ResponseWriter, r *http.Request, parts [
 		}
 		writeJSON(w, http.StatusOK, apiOK(subCfg))
 	case "available-tools":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"tools": []interface{}{}}))
+		// 对齐 Python SubAgentService.get_available_tools：列出全部 LLM 工具，
+		// 剔除 subagent 内部注入的 handoff 工具（transfer_to_*）。
+		tools := []interface{}{}
+		for _, row := range s.listTools() {
+			m, ok := row.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["name"].(string)
+			if strings.HasPrefix(name, "transfer_to_") {
+				continue
+			}
+			tools = append(tools, map[string]interface{}{
+				"name":                name,
+				"description":         m["description"],
+				"parameters":          m["parameters"],
+				"active":              m["active"],
+				"handler_module_path": m["origin_name"],
+			})
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"tools": tools}))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
@@ -9538,9 +9563,8 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 			"deleted": deleted,
 		}))
 	case "export":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"data": []interface{}{},
-		}))
+		// 对齐 Python ConversationService.export_conversations：导出 JSONL。
+		s.handleConversationsExport(w, r)
 	default:
 		// Direct conversation-id form (matches the OpenAPI generated client):
 		// /conversations/{conversation_id} and
@@ -9762,4 +9786,75 @@ func countEnabledBots(platforms []interface{}) int {
 		}
 	}
 	return n
+}
+
+// handleConversationsExport implements POST /conversations/export（对齐 Python
+// ConversationService.export_conversations）：按 {user_id(=unified_msg_origin),
+// cid} 列表把会话连同历史导出为 JSONL 附件下载。
+func (s *Server) handleConversationsExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiError("仅支持 POST"))
+		return
+	}
+	var body struct {
+		Conversations []struct {
+			UserID string `json:"user_id"`
+			CID    string `json:"cid"`
+		} `json:"conversations"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
+	if len(body.Conversations) == 0 {
+		writeJSON(w, http.StatusBadRequest, apiError("导出列表不能为空"))
+		return
+	}
+	m := s.conversationManager()
+	if m == nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("会话管理器不可用"))
+		return
+	}
+	var b strings.Builder
+	exported := 0
+	for _, item := range body.Conversations {
+		if item.UserID == "" || item.CID == "" {
+			continue
+		}
+		conv := m.FindByCID(item.CID)
+		// 与 Python 一致：按 user_id(=unified_msg_origin) 校验会话归属，
+		// 不能导出他人的会话。
+		if conv == nil || (conv.UserID != item.UserID && conv.UnifiedMsgOrigin != item.UserID) {
+			continue
+		}
+		history := conv.History
+		if history == nil {
+			history = []map[string]interface{}{}
+		}
+		line, err := json.Marshal(map[string]interface{}{
+			"cid":         conv.CID,
+			"user_id":     conv.UserID,
+			"platform_id": conv.PlatformID,
+			"title":       conv.Title,
+			"persona_id":  conv.Persona,
+			"created_at":  conv.CreatedAt,
+			"updated_at":  conv.UpdatedAt,
+			"content":     history,
+		})
+		if err != nil {
+			continue
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+		exported++
+	}
+	if exported == 0 {
+		writeJSON(w, http.StatusInternalServerError, apiError("没有成功导出任何对话"))
+		return
+	}
+	filename := "astrbot_conversations_export_" + time.Now().Format("20060102_150405") + ".jsonl"
+	w.Header().Set("Content-Type", "application/jsonl")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(b.String()))
 }

@@ -9,10 +9,10 @@ import (
 )
 
 func TestDefaultPort(t *testing.T) {
-	// 未配置端口时应使用独立默认端口 6195，避免与 dashboard 的 6185 冲突（M-56 回归）。
+	// 未配置端口时应使用独立默认端口 6193，避免与企业微信回调端口（6195）冲突。
 	a := New(map[string]interface{}{"id": "webchat-test"}, nil, nil)
-	if a.Port != 6195 {
-		t.Errorf("期望默认端口 6195，实际 %d", a.Port)
+	if a.Port != 6193 {
+		t.Errorf("期望默认端口 6193，实际 %d", a.Port)
 	}
 
 	// 显式配置端口时应生效

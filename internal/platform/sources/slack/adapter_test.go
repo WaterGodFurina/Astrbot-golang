@@ -344,10 +344,11 @@ func TestWebhookCallbackBodyTooLarge(t *testing.T) {
 
 func TestWebhookCallbackEventDispatch(t *testing.T) {
 	secret := "hook-secret"
-	got := ""
+	gotCh := make(chan string, 1)
 	server := NewSlackWebhookServer(secret, "/slack/events", func(eventData map[string]interface{}) {
 		if ev, ok := eventData["event"].(map[string]interface{}); ok {
-			got, _ = ev["text"].(string)
+			text, _ := ev["text"].(string)
+			gotCh <- text
 		}
 	})
 	body := `{"type":"event_callback","event":{"type":"message","text":"hello slack","user":"U1","channel":"C1","client_msg_id":"CM9"}}`
@@ -360,8 +361,13 @@ func TestWebhookCallbackEventDispatch(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("合法事件应返回 200，实际 %d", w.Code)
 	}
-	if got != "hello slack" {
-		t.Errorf("事件处理函数应收到消息，实际 %q", got)
+	select {
+	case got := <-gotCh:
+		if got != "hello slack" {
+			t.Errorf("事件处理函数应收到消息，实际 %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("异步事件处理应在超时前收到消息")
 	}
 }
 
