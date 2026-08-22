@@ -190,16 +190,6 @@ jobs:
         if: runner.os != 'Windows'
         run: zip "astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip" "astrbot${{ matrix.ext }}"
 
-      # 审查项 3.2-3：为每个平台产物生成 sha256 校验文件（<产物>.sha256），
-      # 供自动更新在解压替换前做完整性校验（internal/dashboard/update.go）。
-      # Windows runner 上 shell: bash 走 Git Bash，自带 sha256sum。
-      - name: 生成 sha256 校验文件
-        shell: bash
-        run: |
-          ZIP="astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip"
-          sha256sum "$ZIP" > "$ZIP.sha256"
-          cat "$ZIP.sha256"
-
       - name: 上传到最新 Release（不存在则跳过）
         id: release_upload
         shell: bash
@@ -208,7 +198,7 @@ jobs:
           VERSION: ${{ needs.release-meta.outputs.version }}
         run: |
           if gh release view "$VERSION" >/dev/null 2>&1; then
-            gh release upload "$VERSION" "astrbot-golang-$VERSION-${{ matrix.resource }}.zip" "astrbot-golang-$VERSION-${{ matrix.resource }}.zip.sha256" --clobber
+            gh release upload "$VERSION" "astrbot-golang-$VERSION-${{ matrix.resource }}.zip" --clobber
             echo "uploaded=true" >> "$GITHUB_OUTPUT"
             echo "已上传到 Release $VERSION (${{ matrix.resource }})"
           else
@@ -223,5 +213,4 @@ jobs:
           name: astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}
           path: |
             astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip
-            astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip.sha256
           if-no-files-found: error

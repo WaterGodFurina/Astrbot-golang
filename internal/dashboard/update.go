@@ -381,79 +381,26 @@ func (s *Server) downloadFile(url, dst, progressID string) error {
 // checksumHexRe 匹配合法的 sha256 十六进制摘要（64 位），用于解析校验文件。
 var checksumHexRe = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 
-// extractChecksumForFile 从 sha256sum 格式的校验文件内容中解析与 filename
-// 对应的摘要：兼容三种形态——每产物一个 <hex>  <文件名> 的 .sha256 文件、
-// 多行汇总的 checksums.txt（按文件名精确匹配）、以及纯 <hex> 单行。找不到
-// 返回 ""。
-func extractChecksumForFile(content, filename string) string {
-	bare := ""
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) == 1 {
-			// 纯摘要行（部分发布流程只写 hash 不写文件名）。
-			if checksumHexRe.MatchString(fields[0]) && bare == "" {
-				bare = strings.ToLower(fields[0])
-			}
-			continue
-		}
-		hash := fields[0]
-		name := strings.TrimPrefix(fields[len(fields)-1], "*") // sha256sum 二进制模式文件名带 * 前缀
-		if checksumHexRe.MatchString(hash) && (name == filename || filepath.Base(name) == filename) {
-			return strings.ToLower(hash)
-		}
-	}
-	return bare
-}
-
-// verifyUpdateChecksum 校验下载的升级包完整性（审查项 3.2-3）。校验源获取
-// 顺序：先试与产物同目录的 <downloadURL>.sha256（发布工作流随产物生成），
-// 404 再从 release 的 assets 列表里找名字含 checksum/.sha256 的资产下载解析。
-// 摘要比对使用常量时间比较，不匹配返回错误（调用方必须中止更新）。release
-// 完全没有校验资产（历史旧版本）时仅告警放行，保持旧版本仍可升级。
+// verifyUpdateChecksum 校验下载的升级包完整性（审查项 3.2-3）。校验源是
+// GitHub 官方数据：GET /repos/{owner}/{repo}/releases/tags/{tag} 响应里的
+// assets[].digest（"sha256:<hex>"，GitHub 在资产上传时自动计算），按文件名
+// 匹配目标 zip 后做常量时间比对。API 拉取失败或历史版本无 digest 时告警
+// 放行（不能砍死更新功能）；digest 存在但不匹配则硬失败中止。
 func (s *Server) verifyUpdateChecksum(downloadURL, zipPath, tag, proxy string) error {
 	zipName := filepath.Base(downloadURL)
-	// 校验源 1：与产物同目录的 .sha256 文件（downloadURL 已含代理前缀）。
-	if content, err := s.fetchChecksumText(downloadURL + ".sha256"); err == nil {
-		if want := extractChecksumForFile(content, zipName); want != "" {
-			return compareUpdateChecksum(zipPath, want)
-		}
-		return fmt.Errorf("校验文件 %s.sha256 内容无法解析", zipName)
-	}
-	// 校验源 2：release assets 中的校验资产（checksums.txt 汇总等）。
 	assets, err := s.fetchGithubReleaseAssets(tag, proxy)
 	if err != nil {
-		updateLogger.Warn("获取 release %s 资产列表失败: %v", tag, err)
-	} else {
-		for _, a := range assets {
-			name, _ := a["name"].(string)
-			lower := strings.ToLower(name)
-			if !strings.Contains(lower, "checksum") && !strings.HasSuffix(lower, ".sha256") {
-				continue
-			}
-			u, _ := a["browser_download_url"].(string)
-			if u == "" {
-				continue
-			}
-			if proxy != "" {
-				u = strings.TrimRight(proxy, "/") + "/" + u
-			}
-			content, cerr := s.fetchChecksumText(u)
-			if cerr != nil {
-				updateLogger.Warn("下载校验资产 %s 失败: %v", name, cerr)
-				continue
-			}
-			if want := extractChecksumForFile(content, zipName); want != "" {
-				return compareUpdateChecksum(zipPath, want)
-			}
-			return fmt.Errorf("校验资产 %s 内容无法解析", name)
-		}
+		updateLogger.Warn("获取 release %s 资产失败，跳过完整性校验: %v", tag, err)
+		return nil
 	}
-	// 历史旧版本 release 未提供任何校验资产：告警后放行（不能砍死更新功能）。
-	updateLogger.I18nWarn("版本 %s 未提供 checksum，跳过完整性校验", tag)
+	want := releaseAssetDigest(assets, zipName)
+	if want == "" {
+		updateLogger.I18nWarn("版本 %s 的 %s 无官方 digest，跳过完整性校验", tag, zipName)
+		return nil
+	}
+	if err := compareUpdateChecksum(zipPath, want); err != nil {
+		return fmt.Errorf("升级包与 GitHub 官方摘要不一致: %w", err)
+	}
 	return nil
 }
 
@@ -480,36 +427,11 @@ func compareUpdateChecksum(zipPath, wantHex string) error {
 	return nil
 }
 
-// fetchChecksumText 下载校验文件内容（64KB 上限防超大响应），供升级包完整
-// 性校验解析。HTTP >= 400 或网络错误均返回错误，由调用方决定回退。
-func (s *Server) fetchChecksumText(url string) (string, error) {
-	// 出站 URL 校验防 SSRF（校验文件地址与下载地址同前缀，可能含代理）。
-	if err := validateOutboundURL(url); err != nil {
-		return "", err
-	}
-	client := newOutboundClient(30 * time.Second)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
-}
-
-// fetchGithubReleaseAssets 拉取指定 tag 的 release 资产列表（name 与
-// browser_download_url）。fetchGithubReleases 的返回直接面向前端列表接口
-// 且不含 assets，故此处单独请求单版本详情，供完整性校验寻找校验资产。
+// fetchGithubReleaseAssets 拉取指定 tag 的 release 资产列表（name、
+// browser_download_url 与 GitHub 官方摘要 digest）。fetchGithubReleases 的
+// 返回直接面向前端列表接口且不含 assets，故此处单独请求单版本详情
+// （GET /repos/{owner}/{repo}/releases/tags/{tag}），供完整性校验取
+// assets[].digest（形如 "sha256:<64位hex>"，GitHub 上传资产时自动计算）。
 func (s *Server) fetchGithubReleaseAssets(tag, proxy string) ([]map[string]interface{}, error) {
 	url := updateRepoAPI + "/tags/" + tag // tag 已过 updateTagRe 白名单，无注入风险
 	if proxy != "" {
@@ -541,6 +463,7 @@ func (s *Server) fetchGithubReleaseAssets(tag, proxy string) ([]map[string]inter
 		Assets []struct {
 			Name               string `json:"name"`
 			BrowserDownloadURL string `json:"browser_download_url"`
+			Digest             string `json:"digest"`
 		} `json:"assets"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -551,9 +474,33 @@ func (s *Server) fetchGithubReleaseAssets(tag, proxy string) ([]map[string]inter
 		out = append(out, map[string]interface{}{
 			"name":                 a.Name,
 			"browser_download_url": a.BrowserDownloadURL,
+			"digest":               a.Digest,
 		})
 	}
 	return out, nil
+}
+
+// releaseAssetDigest 从 release 资产列表里取目标文件的官方 sha256 摘要
+// （assets[].digest = "sha256:<hex>"）。找不到该文件名或无 digest 返回空串。
+func releaseAssetDigest(assets []map[string]interface{}, filename string) string {
+	for _, a := range assets {
+		name, _ := a["name"].(string)
+		if name != filename && filepath.Base(name) != filename {
+			continue
+		}
+		digest, _ := a["digest"].(string)
+		digest = strings.TrimSpace(digest)
+		const prefix = "sha256:"
+		if !strings.HasPrefix(strings.ToLower(digest), prefix) {
+			return ""
+		}
+		hexPart := strings.TrimPrefix(digest[len(prefix):], "")
+		if checksumHexRe.MatchString(hexPart) {
+			return strings.ToLower(hexPart)
+		}
+		return ""
+	}
+	return ""
 }
 
 // extractSingleBinary 从 zip 中提取唯一的可执行文件（astrbot / astrbot.exe）。

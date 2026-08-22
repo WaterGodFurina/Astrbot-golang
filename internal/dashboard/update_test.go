@@ -1,7 +1,7 @@
 package dashboard
 
-// 升级包完整性校验（审查项 3.2-3）的单元测试：sha256 匹配通过 / 不匹配
-// 拒绝 / release 无校验资产时告警放行 / assets 兜底（checksums.txt）解析。
+// 升级包完整性校验（审查项 3.2-3）的单元测试：GitHub release 资产 digest
+// 匹配通过 / 不匹配拒绝 / 无 digest 时告警放行 / assets 解析。
 
 import (
 	"crypto/sha256"
@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -34,161 +33,93 @@ func writeTestZip(t *testing.T, content []byte) string {
 	return path
 }
 
-func TestExtractChecksumForFile(t *testing.T) {
-	hash := sha256Hex([]byte("payload"))
-	other := sha256Hex([]byte("other payload"))
-	cases := []struct {
-		name     string
-		content  string
-		filename string
-		want     string
-	}{
-		{"sidecar 带文件名", hash + "  " + testZipName + "\n", testZipName, hash},
-		{"二进制模式星号前缀", hash + " *" + testZipName, testZipName, hash},
-		{"checksums 多行取匹配行", other + "  other.zip\n" + hash + "  " + testZipName + "\n", testZipName, hash},
-		{"纯摘要单行", hash, testZipName, hash},
-		{"大写摘要归一化", strings.ToUpper(hash) + "  " + testZipName, testZipName, hash},
-		{"仅其它文件名", other + "  other.zip\n", testZipName, ""},
-		{"垃圾内容", "not a checksum at all", testZipName, ""},
-		{"截断摘要", hash[:63] + "  " + testZipName, testZipName, ""},
-	}
-	for _, c := range cases {
-		if got := extractChecksumForFile(c.content, c.filename); got != c.want {
-			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
-		}
-	}
+// newDigestTestServer 起一个模拟 GitHub release API 的 httptest 服务，
+// assets 返回调用方给定的列表；返回 server 与指向它的 Server（proxy 前缀
+// 指向测试服务器，绕过 validateOutboundURL 的私网拒绝——httptest 监听
+// 127.0.0.1，而 isBlockedIP 放行回环）。
+func newDigestTestServer(t *testing.T, tag string, assetsJSON string) (*httptest.Server, *Server) {
+	t.Helper()
+	mux := http.NewServeMux()
+	// ghproxy 风格代理：前缀 + 完整原始 URL（Go 1.17+ ServeMux 会把
+	// "//" 清理成 "/"，故匹配单斜杠形式）。
+	// ghproxy 风格代理：前缀 + 完整原始 URL；ServeMux 把 "//" 清洗为 "/"，
+	// 故 "https://" 变成 "/https:/"。
+	mux.HandleFunc("/https:/api.github.com/repos/WaterGodFurina/Astrbot-golang/releases/tags/"+tag, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"assets": ` + assetsJSON + `}`))
+	})
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	s := &Server{}
+	return ts, s
 }
 
-func TestCompareUpdateChecksum(t *testing.T) {
-	content := []byte("fake release zip payload")
+func TestCompareUpdateChecksumMatches(t *testing.T) {
+	content := []byte("payload")
 	path := writeTestZip(t, content)
-	correct := sha256Hex(content)
-
-	if err := compareUpdateChecksum(path, correct); err != nil {
-		t.Errorf("匹配摘要应通过, got: %v", err)
-	}
-	wrong := strings.Repeat("0", 64)
-	if err := compareUpdateChecksum(path, wrong); err == nil {
-		t.Error("不匹配摘要必须拒绝")
-	} else if !strings.Contains(err.Error(), "SHA-256") {
-		t.Errorf("错误信息应说明 SHA-256 不匹配, got: %v", err)
+	if err := compareUpdateChecksum(path, sha256Hex(content)); err != nil {
+		t.Fatalf("matching digest must pass: %v", err)
 	}
 }
 
-// TestVerifyUpdateChecksumSidecar 覆盖校验源 1：<downloadURL>.sha256 同目录
-// 约定——匹配通过。
-func TestVerifyUpdateChecksumSidecar(t *testing.T) {
-	zipBytes := []byte("fake release zip payload")
-	zipPath := writeTestZip(t, zipBytes)
-	s := &Server{}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, ".sha256") {
-			fmt.Fprintf(w, "%s  %s\n", sha256Hex(zipBytes), testZipName)
-			return
-		}
-		_, _ = w.Write(zipBytes)
-	}))
-	defer srv.Close()
-
-	if err := s.verifyUpdateChecksum(srv.URL+"/"+testZipName, zipPath, "v1.0.0", ""); err != nil {
-		t.Errorf("sha256 匹配应通过, got: %v", err)
+func TestCompareUpdateChecksumMismatch(t *testing.T) {
+	path := writeTestZip(t, []byte("payload"))
+	want := sha256Hex([]byte("other payload"))
+	if err := compareUpdateChecksum(path, want); err == nil {
+		t.Fatal("mismatched digest must fail")
 	}
 }
 
-// TestVerifyUpdateChecksumSidecarMismatch 校验文件存在但摘要错误 → 硬失败。
-func TestVerifyUpdateChecksumSidecarMismatch(t *testing.T) {
-	zipBytes := []byte("tampered zip payload")
-	zipPath := writeTestZip(t, zipBytes)
-	s := &Server{}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, ".sha256") {
-			fmt.Fprintf(w, "%s  %s\n", sha256Hex([]byte("original payload")), testZipName)
-			return
-		}
-		_, _ = w.Write(zipBytes)
-	}))
-	defer srv.Close()
-
-	err := s.verifyUpdateChecksum(srv.URL+"/"+testZipName, zipPath, "v1.0.0", "")
-	if err == nil {
-		t.Fatal("摘要不匹配必须硬失败，绝不放行替换")
-	}
-	if !strings.Contains(err.Error(), "SHA-256") {
-		t.Errorf("错误应说明摘要不匹配, got: %v", err)
+func TestVerifyUpdateChecksumDigestMatch(t *testing.T) {
+	content := []byte("payload")
+	path := writeTestZip(t, content)
+	ts, s := newDigestTestServer(t, "v1.0.0",
+		fmt.Sprintf(`[{"name": %q, "digest": "sha256:%s"}]`, testZipName, sha256Hex(content)))
+	if err := s.verifyUpdateChecksum(
+		buildDownloadURL("v1.0.0", "linux-x86_64-gnu"), path, "v1.0.0", ts.URL,
+	); err != nil {
+		t.Fatalf("digest match must pass: %v", err)
 	}
 }
 
-// TestVerifyUpdateChecksumNoAssetsWarnPass 历史旧版本：.sha256 404 且 release
-// assets 里没有任何 checksum 资产 → 告警后放行（不能砍死旧版本更新）。
-func TestVerifyUpdateChecksumNoAssetsWarnPass(t *testing.T) {
-	zipBytes := []byte("legacy release zip")
-	zipPath := writeTestZip(t, zipBytes)
-	s := &Server{}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 代理前缀形态：/https://api.github.com/repos/.../releases/tags/<tag>
-		if strings.Contains(r.URL.Path, "/releases/tags/") {
-			fmt.Fprintf(w, `{"assets":[{"name":%q,"browser_download_url":"https://github.com/x/%s"}]}`, testZipName, testZipName)
-			return
-		}
-		http.NotFound(w, r) // <zip>.sha256 → 404，触发 assets 兜底
-	}))
-	defer srv.Close()
-
-	// proxy 指向假服务，使 release API 请求也落在本地。
-	if err := s.verifyUpdateChecksum(srv.URL+"/"+testZipName, zipPath, "v1.0.0", srv.URL); err != nil {
-		t.Errorf("无校验资产应告警放行, got: %v", err)
+func TestVerifyUpdateChecksumDigestMismatchHardFail(t *testing.T) {
+	path := writeTestZip(t, []byte("tampered payload"))
+	want := sha256Hex([]byte("original payload"))
+	ts, s := newDigestTestServer(t, "v1.0.0",
+		fmt.Sprintf(`[{"name": %q, "digest": "sha256:%s"}]`, testZipName, want))
+	if err := s.verifyUpdateChecksum(
+		buildDownloadURL("v1.0.0", "linux-x86_64-gnu"), path, "v1.0.0", ts.URL,
+	); err == nil {
+		t.Fatal("digest mismatch must hard-fail the update")
 	}
 }
 
-// TestVerifyUpdateChecksumAssetsFallback 校验源 2：.sha256 404 时从 release
-// assets 里找 checksums.txt 汇总文件解析比对——多行按 zip 文件名取行，匹配
-// 通过。
-func TestVerifyUpdateChecksumAssetsFallback(t *testing.T) {
-	zipBytes := []byte("assets fallback payload")
-	zipPath := writeTestZip(t, zipBytes)
-	s := &Server{}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "checksums.txt"):
-			// 汇总文件多行，须按 zip 文件名取对应行。
-			fmt.Fprintf(w, "%s  other.zip\n%s  %s\n", sha256Hex([]byte("x")), sha256Hex(zipBytes), testZipName)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			fmt.Fprint(w, `{"assets":[{"name":"checksums.txt","browser_download_url":"https://github.com/x/checksums.txt"}]}`)
-		default:
-			http.NotFound(w, r) // <zip>.sha256 → 404
-		}
-	}))
-	defer srv.Close()
-
-	if err := s.verifyUpdateChecksum(srv.URL+"/"+testZipName, zipPath, "v1.0.0", srv.URL); err != nil {
-		t.Errorf("assets 兜底 sha256 匹配应通过, got: %v", err)
+func TestVerifyUpdateChecksumNoDigestWarnPass(t *testing.T) {
+	path := writeTestZip(t, []byte("payload"))
+	// 历史版本资产无 digest 字段 → 告警放行。
+	ts, s := newDigestTestServer(t, "1.1.0",
+		fmt.Sprintf(`[{"name": %q}]`, testZipName))
+	if err := s.verifyUpdateChecksum(
+		buildDownloadURL("1.1.0", "linux-x86_64-gnu"), path, "1.1.0", ts.URL,
+	); err != nil {
+		t.Fatalf("missing digest must warn-and-pass: %v", err)
 	}
 }
 
-// TestVerifyUpdateChecksumAssetsFallbackMismatch assets 兜底路径的摘要不匹
-// 配同样必须硬失败（资产名后缀 .sha256 也应命中校验资产匹配）。
-func TestVerifyUpdateChecksumAssetsFallbackMismatch(t *testing.T) {
-	zipBytes := []byte("tampered assets payload")
-	zipPath := writeTestZip(t, zipBytes)
-	s := &Server{}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.Contains(r.URL.Path, "a.sha256"):
-			fmt.Fprintf(w, "%s  %s\n", sha256Hex([]byte("original payload")), testZipName)
-		case strings.Contains(r.URL.Path, "/releases/tags/"):
-			fmt.Fprint(w, `{"assets":[{"name":"astrbot-golang-v1.0.0.zip.sha256","browser_download_url":"https://github.com/x/a.sha256"}]}`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer srv.Close()
-
-	if err := s.verifyUpdateChecksum(srv.URL+"/"+testZipName, zipPath, "v1.0.0", srv.URL); err == nil {
-		t.Fatal("assets 兜底摘要不匹配必须硬失败")
+func TestReleaseAssetDigest(t *testing.T) {
+	hexSum := "2151b604e3429bff440b9fbc03eb3617bc2603cda96c95b9bb05277f9ddba255"
+	assets := []map[string]interface{}{
+		{"name": testZipName, "digest": "sha256:" + hexSum},
+	}
+	if got := releaseAssetDigest(assets, testZipName); got != hexSum {
+		t.Fatalf("releaseAssetDigest = %q, want %q", got, hexSum)
+	}
+	// 非 sha256 前缀 / 非法 hex / 缺失文件名均返回空串。
+	bad := []map[string]interface{}{{"name": testZipName, "digest": "md5:abc"}}
+	if got := releaseAssetDigest(bad, testZipName); got != "" {
+		t.Fatalf("non-sha256 digest must be ignored, got %q", got)
+	}
+	if got := releaseAssetDigest(nil, testZipName); got != "" {
+		t.Fatalf("empty assets must yield empty digest, got %q", got)
 	}
 }
