@@ -18,6 +18,9 @@ on:
 jobs:
   go-test:
     name: Go 测试
+    # 依赖前端构建：二进制 //go:embed 嵌入 internal/dashboard/web/dist，必须
+    # 等前端构建并同步 dist 到仓库后再编译/测试，保证产物嵌入最新前端。
+    needs: frontend
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -25,7 +28,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          # 前端 job 若推送了新 dist 会产生新提交：用其输出的 SHA 检出，
+          # 保证编译/测试与嵌入的 dist 同源。
+          ref: ${{ inputs.ref || needs.frontend.outputs.sha }}
           fetch-depth: 0
 
       - name: 设置 Go 版本（自动跟随 go.mod）
@@ -145,6 +150,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      # dist 推送后的提交 SHA（无变更 = 原 checkout SHA），供 go-test 检出
+      sha: ${{ steps.push_dist.outputs.sha || inputs.ref || github.sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -184,7 +192,9 @@ jobs:
 
       - name: 同步 dist 到内嵌目录并推送（[skip ci] 防递归触发）
         # 前端构建产物嵌入 internal/dashboard/web/dist（//go:embed），由本 job
-        # 在 runner 上构建后推回仓库，服务器无需 pnpm 编译。
+        # 在 runner 上构建后推回仓库，服务器无需 pnpm 编译。go-test job 依赖
+        # 本 job 并检出推送后的 SHA，保证二进制嵌入最新前端。
+        id: push_dist
         run: |
           rm -rf internal/dashboard/web/dist
           mkdir -p internal/dashboard/web/dist
@@ -199,6 +209,7 @@ jobs:
           else
             echo "前端产物无变更"
           fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: 上传前端构建产物
         uses: actions/upload-artifact@v5
