@@ -129,7 +129,6 @@ func (e *Exporter) Export(destPath string) error {
 		}
 	}
 
-	logger.Info("Backup exported to %s", destPath)
 	// 显式收尾 zip：zw.Close 写入中央目录（错误必须上报，否则导出的归档
 	// 缺条目却提示成功），随后 fsync 落盘再关闭文件。
 	if err := zw.Close(); err != nil {
@@ -138,7 +137,13 @@ func (e *Exporter) Export(destPath string) error {
 	if err := zipFile.Sync(); err != nil {
 		return fmt.Errorf("sync zip: %w", err)
 	}
-	return zipFile.Close()
+	if err := zipFile.Close(); err != nil {
+		return err
+	}
+	// 成功日志必须在 Close/Sync 全部成功之后打印，避免收尾失败时用户已看到
+	// "导出成功"（错误传播逻辑不变，仅调整日志位置）。
+	logger.Info("Backup exported to %s", destPath)
+	return nil
 }
 
 // buildManifest assembles the backup manifest (mirrors Python exporter's

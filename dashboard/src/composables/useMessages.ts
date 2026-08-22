@@ -2,6 +2,7 @@ import { computed, onBeforeUnmount, reactive, ref, type Ref } from "vue";
 import { chatApi, fileApi } from "@/api/v1";
 import { fetchWithAuth } from "@/api/http";
 import { getToken } from "@/utils/token";
+import { getWSTicket } from "@/utils/wsTicket";
 
 export type TransportMode = "sse" | "websocket";
 
@@ -145,6 +146,7 @@ export function useMessages(options: UseMessagesOptions) {
   const loadedSessions = reactive<Record<string, boolean>>({});
   const activeConnections = reactive<Record<string, ActiveConnection>>({});
   const chatWebSockets: Record<string, WebSocket> = {};
+  const pendingChatWebSockets: Record<string, Promise<WebSocket>> = {};
   const closingChatWebSockets = new WeakSet<WebSocket>();
   const deferredBotAnchors = new WeakMap<ChatRecord, ChatRecord>();
   const attachmentBlobCache = new Map<string, Promise<string>>();
@@ -383,7 +385,7 @@ export function useMessages(options: UseMessagesOptions) {
     llmCheckpointId = null,
   }: SendMessageStreamOptions) {
     if (transport === "websocket") {
-      startWebSocketStream(
+      void startWebSocketStream(
         sessionId,
         messageId,
         parts,
@@ -765,7 +767,7 @@ export function useMessages(options: UseMessagesOptions) {
     })();
   }
 
-  function startWebSocketStream(
+  async function startWebSocketStream(
     sessionId: string,
     messageId: string,
     parts: MessagePart[],
@@ -775,7 +777,7 @@ export function useMessages(options: UseMessagesOptions) {
     selectedProvider: string,
     selectedModel: string,
   ) {
-    const ws = getOrCreateChatWebSocket(sessionId);
+    const ws = await getOrCreateChatWebSocket(sessionId);
 
     const connection: ActiveConnection = {
       sessionId,
@@ -791,7 +793,7 @@ export function useMessages(options: UseMessagesOptions) {
     };
     activeConnections[messageId] = connection;
 
-    sendWebSocketPayload(sessionId, messageId, {
+    await sendWebSocketPayload(sessionId, messageId, {
       ct: "chat",
       t: "send",
       session_id: sessionId,
@@ -812,7 +814,7 @@ export function useMessages(options: UseMessagesOptions) {
     );
   }
 
-  function getOrCreateChatWebSocket(sessionId: string) {
+  async function getOrCreateChatWebSocket(sessionId: string) {
     const existing = chatWebSockets[sessionId];
     if (
       existing &&
@@ -822,51 +824,66 @@ export function useMessages(options: UseMessagesOptions) {
       return existing;
     }
 
-    const token = getToken() || "";
-    // nosemgrep: websocket
-    const ws = new WebSocket(chatApi.unifiedWebSocketUrl(token));
-    chatWebSockets[sessionId] = ws;
+    const pending = pendingChatWebSockets[sessionId];
+    if (pending) {
+      return pending;
+    }
 
-    ws.onmessage = (event) => {
-      handleWebSocketMessage(sessionId, event);
-    };
-    ws.onerror = () => {
-      for (const connection of getWebSocketConnections(sessionId, ws)) {
-        if (!connection.botRecord) continue;
-        connection.errorShown = true;
-        ensureBotRecordVisible(connection);
-        appendPlain(connection.botRecord, "\n\nWebSocket connection failed.");
-      }
-    };
-    ws.onclose = async () => {
-      if (chatWebSockets[sessionId] === ws) {
-        delete chatWebSockets[sessionId];
-      }
+    const create = (async () => {
+      const ticket = await getWSTicket();
+      const token = getToken() || "";
+      // nosemgrep: websocket
+      const ws = new WebSocket(chatApi.unifiedWebSocketUrl(ticket, token));
+      chatWebSockets[sessionId] = ws;
 
-      const connections = getWebSocketConnections(sessionId, ws);
-      for (const connection of connections) {
-        if (
-          !connection.completed &&
-          !connection.errorShown &&
-          !closingChatWebSockets.has(ws) &&
-          connection.botRecord
-        ) {
+      ws.onmessage = (event) => {
+        handleWebSocketMessage(sessionId, event);
+      };
+      ws.onerror = () => {
+        for (const connection of getWebSocketConnections(sessionId, ws)) {
+          if (!connection.botRecord) continue;
+          connection.errorShown = true;
           ensureBotRecordVisible(connection);
-          appendPlain(connection.botRecord, "\n\nWebSocket connection closed.");
+          appendPlain(connection.botRecord, "\n\nWebSocket connection failed.");
         }
-        delete activeConnections[connection.messageId];
-      }
-      if (connections.length) await options.onSessionsChanged?.();
-    };
-    return ws;
+      };
+      ws.onclose = async () => {
+        if (chatWebSockets[sessionId] === ws) {
+          delete chatWebSockets[sessionId];
+        }
+
+        const connections = getWebSocketConnections(sessionId, ws);
+        for (const connection of connections) {
+          if (
+            !connection.completed &&
+            !connection.errorShown &&
+            !closingChatWebSockets.has(ws) &&
+            connection.botRecord
+          ) {
+            ensureBotRecordVisible(connection);
+            appendPlain(connection.botRecord, "\n\nWebSocket connection closed.");
+          }
+          delete activeConnections[connection.messageId];
+        }
+        if (connections.length) await options.onSessionsChanged?.();
+      };
+      return ws;
+    })();
+
+    pendingChatWebSockets[sessionId] = create;
+    try {
+      return await create;
+    } finally {
+      delete pendingChatWebSockets[sessionId];
+    }
   }
 
-  function sendWebSocketPayload(
+  async function sendWebSocketPayload(
     sessionId: string,
     messageId: string,
     payload: Record<string, unknown>,
   ) {
-    const ws = getOrCreateChatWebSocket(sessionId);
+    const ws = await getOrCreateChatWebSocket(sessionId);
     const send = () => {
       const connection = activeConnections[messageId];
       if (

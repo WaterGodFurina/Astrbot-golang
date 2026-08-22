@@ -3024,9 +3024,23 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 				s.handleKBDocuments(w, r, kbID, parts[2:])
 				return
 			case "chunks":
-				// List chunks from the SQLite index (list source of truth).
+				// List chunks from the SQLite index (list source of truth),
+				// with real pagination（对齐前端 page/page_size 参数，避免大 KB
+				// 全量返回）。
 				docID := r.URL.Query().Get("doc_id")
-				chunks, err := s.database.ListKBChunks(kbID, docID)
+				page := parseIntDefault(r.URL.Query().Get("page"), 1)
+				pageSize := parseIntDefault(r.URL.Query().Get("page_size"), 50)
+				if page < 1 {
+					page = 1
+				}
+				if pageSize < 1 || pageSize > 200 {
+					pageSize = 50
+				}
+				total := 0
+				if n, err := s.database.CountKBChunks(kbID, docID); err == nil {
+					total = n
+				}
+				chunks, err := s.database.ListKBChunksPage(kbID, docID, pageSize, (page-1)*pageSize)
 				items := []interface{}{}
 				if err == nil {
 					for _, c := range chunks {
@@ -3039,11 +3053,16 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 						})
 					}
 				}
+				totalPages := 0
+				if total > 0 {
+					totalPages = (total + pageSize - 1) / pageSize
+				}
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"items":     items,
-					"page":      1,
-					"page_size": len(items),
-					"total":     len(items),
+					"items":       items,
+					"page":        page,
+					"page_size":   pageSize,
+					"total":       total,
+					"total_pages": totalPages,
 				}))
 				return
 			case "stats":
@@ -3211,444 +3230,27 @@ func (s *Server) getKBTask(taskID string) *kbUploadTask {
 	return s.kbTasks[taskID]
 }
 
-// recordKBTask stores a knowledge-base upload task state.
-func (s *Server) recordKBTask(t *kbUploadTask) {
-	if t == nil || t.TaskID == "" {
-		return
-	}
-	s.mu.Lock()
-	s.kbTasks[t.TaskID] = t
-	s.mu.Unlock()
-	if t.Status == "completed" || t.Status == "failed" {
-		// 终态在 TTL 后自动清除（仅当仍是本条记录时），避免 map 只增不删。
-		time.AfterFunc(kbTaskCleanupTTL, func() {
-			s.mu.Lock()
-			if s.kbTasks[t.TaskID] == t {
-				delete(s.kbTasks, t.TaskID)
-			}
-			s.mu.Unlock()
-		})
-	}
-}
-
 // handleKBDocuments handles document endpoints: list (GET), upload (POST
 // multipart), and URL import. kbID comes from the RESTful path
 // /knowledge-bases/{kb_id}/documents; for the legacy sub-path form the caller
-// passes it via parts[0].
+// passes it via parts[0]. 本函数只做子资源分发，各分支实现拆分在
+// kb_documents.go：import-url 导入、单文档详情/删除、multipart 上传、目录列表。
 func (s *Server) handleKBDocuments(w http.ResponseWriter, r *http.Request, kbID string, parts []string) {
 	if len(parts) > 0 && parts[0] == "import-url" {
-		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		url, _ := body["url"].(string)
-		if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
-			writeJSON(w, http.StatusOK, apiError("缺少或无效的参数 url"))
-			return
-		}
-		if err := validateOutboundURL(url); err != nil {
-			writeJSON(w, http.StatusOK, apiError("下载文档失败: "+err.Error()))
-			return
-		}
-		chunkSize := 512
-		chunkOverlap := 50
-		if v, ok := body["chunk_size"].(float64); ok && v > 0 {
-			chunkSize = int(v)
-		}
-		if v, ok := body["chunk_overlap"].(float64); ok && v >= 0 {
-			chunkOverlap = int(v)
-		}
-
-		// Download the remote content with a bounded timeout and size limit.
-		ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			writeJSON(w, http.StatusOK, apiError("创建下载请求失败: "+err.Error()))
-			return
-		}
-		client := newOutboundClient(60 * time.Second)
-		resp, err := client.Do(req)
-		if err != nil {
-			writeJSON(w, http.StatusOK, apiError("下载文档失败: "+err.Error()))
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			writeJSON(w, http.StatusOK, apiError(fmt.Sprintf("下载文档失败: HTTP %d", resp.StatusCode)))
-			return
-		}
-		content, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-		if err != nil {
-			writeJSON(w, http.StatusOK, apiError("读取文档内容失败: "+err.Error()))
-			return
-		}
-		if len(content) == 0 {
-			writeJSON(w, http.StatusOK, apiError("下载的文档内容为空"))
-			return
-		}
-
-		// Save under the KB documents directory like the multipart upload path.
-		dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			writeJSON(w, http.StatusOK, apiError("创建知识库数据目录失败: "+err.Error()))
-			return
-		}
-		name := filepath.Base(strings.TrimRight(url, "/"))
-		if name == "" || name == "." || name == "/" {
-			name = "imported"
-		}
-		dst := filepath.Join(dir, sanitizePath(name))
-		if err := os.WriteFile(dst, content, 0o644); err != nil {
-			writeJSON(w, http.StatusOK, apiError("保存文档失败: "+err.Error()))
-			return
-		}
-		mod := time.Now().UnixNano()
-		docID := fmt.Sprintf("doc_%d_%s", mod, name)
-		taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
-		s.recordKBTask(&kbUploadTask{
-			TaskID: taskID,
-			KBID:   kbID,
-			Status: "processing",
-			Stage:  "chunking",
-			Total:  100,
-		})
-
-		// Index asynchronously (chunk → embed → dual write), same as uploads.
-		go func() {
-			if _, err := s.indexKBFile(kbID, docID, name, content, chunkSize, chunkOverlap); err != nil {
-				s.recordKBTask(&kbUploadTask{
-					TaskID:       taskID,
-					KBID:         kbID,
-					Status:       "completed",
-					Stage:        "embedding_failed",
-					Current:      100,
-					Total:        100,
-					SuccessCount: 0,
-					FailedCount:  1,
-					Error:        err.Error(),
-				})
-				return
-			}
-			s.recordKBTask(&kbUploadTask{
-				TaskID:       taskID,
-				KBID:         kbID,
-				Status:       "completed",
-				Stage:        "completed",
-				Current:      100,
-				Total:        100,
-				SuccessCount: 1,
-				FailedCount:  0,
-			})
-		}()
-
-		writeJSON(w, http.StatusOK, apiOKMsg("文档导入任务已创建", map[string]interface{}{
-			"task_id":    taskID,
-			"file_count": 1,
-			"documents": []map[string]interface{}{{
-				"doc_id":    docID,
-				"doc_name":  name,
-				"file_size": len(content),
-			}},
-		}))
+		s.kbDocImportURL(w, r, kbID)
 		return
 	}
 	// GET /knowledge-bases/{kb_id}/documents/{document_id} — single doc detail.
 	if len(parts) > 0 && (r.Method == http.MethodGet || r.Method == http.MethodDelete) {
-		docID := parts[0]
-		if r.Method == http.MethodDelete {
-			// Delete nanovec vectors first, then SQLite chunk rows, then the
-			// on-disk file.
-			if err := s.kbDeleteDoc(kbID, docID); err != nil {
-				logger.I18nWarn("删除文档 %s 失败: %v", docID, err)
-				writeJSON(w, http.StatusInternalServerError, apiError("删除文档失败: "+err.Error()))
-				return
-			}
-			dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-			if doc := s.kbDocumentByID(kbID, docID); doc != nil {
-				if err := os.Remove(filepath.Join(dir, sanitizePath(anyStr(doc["doc_name"])))); err != nil {
-					logger.I18nWarn("删除文档文件 %s 失败: %v", docID, err)
-				}
-			}
-			writeJSON(w, http.StatusOK, apiOKMsg("文档已删除", map[string]interface{}{}))
-			return
-		}
-		if doc := s.kbDocumentByID(kbID, docID); doc != nil {
-			writeJSON(w, http.StatusOK, apiOK(doc))
-			return
-		}
-		writeJSON(w, http.StatusOK, apiError("文档不存在"))
+		s.kbDocDetail(w, r, kbID, parts[0])
 		return
 	}
 	if r.Method == http.MethodPost {
-		// Multipart upload: save the files under the KB's data directory, then
-		// index them asynchronously (chunk → embed → SQLite + nanovec dual
-		// write). The WebUI polls the returned task for progress.
-		r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
-		if err := r.ParseMultipartForm(64 << 20); err != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
-				writeJSON(w, http.StatusRequestEntityTooLarge, apiError("上传文件过大（上限 256MB）"))
-				return
-			}
-			writeJSON(w, http.StatusOK, apiError("解析上传文件失败: "+err.Error()))
-			return
-		}
-		chunkSize := 512
-		chunkOverlap := 50
-		if v := r.FormValue("chunk_size"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				chunkSize = n
-			}
-		}
-		if v := r.FormValue("chunk_overlap"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-				chunkOverlap = n
-			}
-		}
-
-		dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			writeJSON(w, http.StatusOK, apiError("创建知识库数据目录失败: "+err.Error()))
-			return
-		}
-		var docs []struct {
-			DocID string
-			Name  string
-			Path  string
-		}
-		for key, files := range r.MultipartForm.File {
-			if key != "file" && !strings.HasPrefix(key, "file") && key != "files[]" {
-				continue
-			}
-			for _, fh := range files {
-				src, err := fh.Open()
-				if err != nil {
-					continue
-				}
-				name := filepath.Base(fh.Filename)
-				if name == "" || name == "." {
-					name = "document"
-				}
-				dst := filepath.Join(dir, sanitizePath(name))
-				out, err := os.Create(dst)
-				if err != nil {
-					_ = src.Close()
-					continue
-				}
-				n, err := io.Copy(out, io.LimitReader(src, maxKBDocFileSize+1))
-				if err != nil {
-					_ = out.Close()
-					_ = src.Close()
-					_ = os.Remove(dst)
-					continue
-				}
-				_ = out.Close()
-				_ = src.Close()
-				if n > maxKBDocFileSize {
-					_ = os.Remove(dst)
-					continue
-				}
-				info, _ := os.Stat(dst)
-				mod := int64(0)
-				if info != nil {
-					mod = info.ModTime().UnixNano()
-				}
-				docID := fmt.Sprintf("doc_%d_%s", mod, name)
-				docs = append(docs, struct {
-					DocID string
-					Name  string
-					Path  string
-				}{DocID: docID, Name: name, Path: dst})
-			}
-		}
-		if len(docs) == 0 {
-			writeJSON(w, http.StatusOK, apiError("缺少文件"))
-			return
-		}
-		taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
-		s.recordKBTask(&kbUploadTask{
-			TaskID: taskID,
-			KBID:   kbID,
-			Status: "processing",
-			Stage:  "chunking",
-			Total:  len(docs) * 100,
-		})
-
-		saved := make([]map[string]interface{}, 0, len(docs))
-		for _, d := range docs {
-			saved = append(saved, map[string]interface{}{
-				"doc_id":   d.DocID,
-				"doc_name": d.Name,
-				"file_size": func() int64 {
-					if fi, err := os.Stat(d.Path); err == nil {
-						return fi.Size()
-					}
-					return 0
-				}(),
-			})
-		}
-
-		// Index asynchronously: chunk each file, embed, dual-write.
-		go func() {
-			success, failed := 0, 0
-			total := len(docs)
-			for i, d := range docs {
-				s.recordKBTask(&kbUploadTask{
-					TaskID:       taskID,
-					KBID:         kbID,
-					Status:       "processing",
-					Stage:        "chunking",
-					FileIndex:    i,
-					Current:      i * 100,
-					Total:        total * 100,
-					SuccessCount: success,
-					FailedCount:  failed,
-				})
-				content, err := os.ReadFile(d.Path)
-				if err != nil {
-					failed++
-					continue
-				}
-				if _, err := s.indexKBFile(kbID, d.DocID, d.Name, content, chunkSize, chunkOverlap); err != nil {
-					// The file is saved; SQLite records may exist. Report failure
-					// for the vector index but keep the doc listed.
-					failed++
-					s.recordKBTask(&kbUploadTask{
-						TaskID:       taskID,
-						KBID:         kbID,
-						Status:       "processing",
-						Stage:        "embedding_failed",
-						FileIndex:    i,
-						Current:      (i + 1) * 100,
-						Total:        total * 100,
-						SuccessCount: success,
-						FailedCount:  failed,
-						Error:        err.Error(),
-					})
-					continue
-				}
-				success++
-			}
-			status := "completed"
-			if failed > 0 {
-				status = "failed"
-			}
-			s.recordKBTask(&kbUploadTask{
-				TaskID:       taskID,
-				KBID:         kbID,
-				Status:       status,
-				Stage:        "completed",
-				Current:      total * 100,
-				Total:        total * 100,
-				SuccessCount: success,
-				FailedCount:  failed,
-			})
-		}()
-
-		writeJSON(w, http.StatusOK, apiOKMsg("文档上传成功，正在后台分块", map[string]interface{}{
-			"task_id":    taskID,
-			"file_count": len(docs),
-			"documents":  saved,
-		}))
+		s.kbDocUpload(w, r, kbID)
 		return
 	}
 	// GET: list documents stored under the KB data directory.
-	dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-	items := []interface{}{}
-	if entries, err := os.ReadDir(dir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-			info, _ := e.Info()
-			size := int64(0)
-			mod := int64(0)
-			modTime := time.Time{}
-			if info != nil {
-				size = info.Size()
-				mod = info.ModTime().UnixNano()
-				modTime = info.ModTime()
-			}
-			docID := fmt.Sprintf("doc_%d_%s", mod, e.Name())
-			chunkCount := 0
-			if s.database != nil {
-				if n, err := s.database.CountKBChunks(kbID, docID); err == nil {
-					chunkCount = n
-				}
-			}
-			items = append(items, map[string]interface{}{
-				"doc_id":      docID,
-				"doc_name":    e.Name(),
-				"file_type":   strings.TrimPrefix(filepath.Ext(e.Name()), "."),
-				"file_size":   size,
-				"created_at":  modTime.Format(time.RFC3339),
-				"chunk_count": chunkCount,
-			})
-		}
-	}
-	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-		"items":     items,
-		"page":      1,
-		"page_size": len(items),
-		"total":     len(items),
-	}))
-}
-
-// kbDocumentByID finds a document file in a KB's data directory by its doc_id.
-// The doc_id encodes "<modtime>_<filename>"; the file name is the part after
-// the first underscore so re-listing and detail both resolve to the same doc.
-func (s *Server) kbDocumentByID(kbID, docID string) map[string]interface{} {
-	dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		info, _ := e.Info()
-		mod := int64(0)
-		if info != nil {
-			mod = info.ModTime().UnixNano()
-		}
-		candidate := fmt.Sprintf("doc_%d_%s", mod, e.Name())
-		if candidate != docID {
-			continue
-		}
-		size := int64(0)
-		if info != nil {
-			size = info.Size()
-		}
-		content, _ := os.ReadFile(filepath.Join(dir, e.Name()))
-		chunkCount := 0
-		if s.database != nil {
-			if n, err := s.database.CountKBChunks(kbID, candidate); err == nil {
-				chunkCount = n
-			}
-		}
-		created := ""
-		if info != nil {
-			created = info.ModTime().Format(time.RFC3339)
-		}
-		return map[string]interface{}{
-			"doc_id":      candidate,
-			"doc_name":    e.Name(),
-			"file_type":   strings.TrimPrefix(filepath.Ext(e.Name()), "."),
-			"file_size":   size,
-			"content":     string(content),
-			"chunk_count": chunkCount,
-			"created_at":  created,
-		}
-	}
-	return nil
-}
-
-// anyStr extracts a string from an interface value.
-func anyStr(v interface{}) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return ""
+	s.kbDocList(w, r, kbID)
 }
 
 // getKBByID returns a single knowledge base as a serializable map.
@@ -5890,13 +5492,23 @@ func (s *Server) markBackupAsUploaded(zipPath string) {
 // Auth via Authorization header or ?token= (browsers cannot set headers for
 // <a download>), mirroring Python download_backup.
 func (s *Server) handleBackupsDownload(w http.ResponseWriter, r *http.Request, filename string) {
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		token = extractToken(r)
-	}
-	if token == "" || s.auth == nil || !s.auth.IsAuthenticated(token) {
-		writeJSON(w, http.StatusUnauthorized, apiError("未认证"))
-		return
+	// 复核开放项 10-2：浏览器原生下载无法携带 Authorization 头，URL 凭据
+	// 优先用一次性 ws-ticket（30s、单次使用），长效 JWT 仅作旧前端回退，
+	// 避免其进入代理/服务端访问日志。
+	if ticket := r.URL.Query().Get("ticket"); ticket != "" {
+		if s.auth == nil || !s.consumeWSTicket(ticket) {
+			writeJSON(w, http.StatusUnauthorized, apiError("票据无效或已使用"))
+			return
+		}
+	} else {
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			token = extractToken(r)
+		}
+		if token == "" || s.auth == nil || !s.auth.IsAuthenticated(token) {
+			writeJSON(w, http.StatusUnauthorized, apiError("未认证"))
+			return
+		}
 	}
 	zipPath := filepath.Join(s.backupDir(), filename)
 	if _, err := os.Stat(zipPath); err != nil {
@@ -9792,6 +9404,15 @@ func countEnabledBots(platforms []interface{}) int {
 		}
 	}
 	return n
+}
+
+// parseIntDefault parses an int query parameter, falling back to def when
+// empty or invalid.
+func parseIntDefault(v string, def int) int {
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	return def
 }
 
 // handleConversationsExport implements POST /conversations/export（对齐 Python

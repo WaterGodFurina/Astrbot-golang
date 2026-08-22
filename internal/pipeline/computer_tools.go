@@ -940,17 +940,29 @@ func executeLocalPython(umo, code string, timeout int) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", "-c", code) // #nosec G204 -- astrbot_execute_python 工具核心：执行 AI 指令给定的 Python 代码（host 本地运行，功能明确，前端已警示）
 	cmd.Dir = ws
-	out, err := cmd.CombinedOutput()
+	// 与同步 shell 路径一致：输出经 cappedWriter 限幅，防止超时窗口内
+	// print 风暴把宿主进程 OOM。
+	cw := &cappedWriter{max: maxShellOutput}
+	cmd.Stdout = cw
+	cmd.Stderr = cw
+	if err := cmd.Start(); err != nil {
+		return "error: code execution failed to start: " + err.Error()
+	}
+	waitErr := cmd.Wait()
+	out := string(cw.Bytes())
+	if cw.truncated {
+		out += fmt.Sprintf("\n[输出超过 %d 字节已截断]", maxShellOutput)
+	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Sprintf("Code execution timed out after %d seconds. Output so far:\n%s", timeout, string(out))
+		return fmt.Sprintf("Code execution timed out after %d seconds. Output so far:\n%s", timeout, out)
 	}
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return fmt.Sprintf("error: code execution failed with exit code %d\n%s", ee.ExitCode(), string(out))
+	if waitErr != nil {
+		if ee, ok := waitErr.(*exec.ExitError); ok {
+			return fmt.Sprintf("error: code execution failed with exit code %d\n%s", ee.ExitCode(), out)
 		}
-		return "error: code execution failed: " + err.Error()
+		return "error: code execution failed: " + waitErr.Error()
 	}
-	return string(out)
+	return out
 }
 
 // maxFileReadBytes caps how much of a file executeFileRead loads into memory

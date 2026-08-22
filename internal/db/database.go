@@ -1213,6 +1213,12 @@ func (d *Database) InsertKBChunk(c KBChunk) error {
 
 // ListKBChunks returns chunk records for a KB, optionally filtered by doc_id.
 func (d *Database) ListKBChunks(kbID, docID string) ([]KBChunk, error) {
+	return d.ListKBChunksPage(kbID, docID, 0, 0)
+}
+
+// ListKBChunksPage returns one page of chunk records for a KB (limit<=0 =
+// no limit), optionally filtered by doc_id.
+func (d *Database) ListKBChunksPage(kbID, docID string, limit, offset int) ([]KBChunk, error) {
 	query := `SELECT chunk_id, kb_id, doc_id, COALESCE(doc_name,''), content, chunk_index
 		FROM knowledge_base_chunks WHERE kb_id=?`
 	args := []any{kbID}
@@ -1221,6 +1227,10 @@ func (d *Database) ListKBChunks(kbID, docID string) ([]KBChunk, error) {
 		args = append(args, docID)
 	}
 	query += ` ORDER BY chunk_index ASC`
+	if limit > 0 {
+		query += ` LIMIT ? OFFSET ?`
+		args = append(args, limit, offset)
+	}
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -1248,6 +1258,28 @@ func (d *Database) CountKBChunks(kbID, docID string) (int, error) {
 	var n int
 	err := d.db.QueryRow(query, args...).Scan(&n)
 	return n, err
+}
+
+// CountKBChunksByDoc returns chunk counts grouped by doc_id for a KB in a
+// single query（文档列表统计的聚合版，替代逐文档 N+1 的 CountKBChunks）。
+func (d *Database) CountKBChunksByDoc(kbID string) (map[string]int, error) {
+	rows, err := d.db.Query(
+		`SELECT doc_id, COUNT(*) FROM knowledge_base_chunks WHERE kb_id=? GROUP BY doc_id`,
+		kbID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var docID string
+		var n int
+		if err := rows.Scan(&docID, &n); err != nil {
+			return nil, err
+		}
+		out[docID] = n
+	}
+	return out, rows.Err()
 }
 
 // DeleteKBChunks removes all chunks for a KB (optionally per doc).

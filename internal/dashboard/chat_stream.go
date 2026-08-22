@@ -597,8 +597,9 @@ var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	// Origin 白名单：仅允许同源连接（浏览器 WebSocket 无法设置自定义
-	// Authorization 头，token 只能走 query，故用 Origin 校验防跨站 CSWSH）。
-	// 无 Origin 头的非浏览器客户端（curl/脚本）放行。
+	// Authorization 头，token 只能走 query——一次性 ws-ticket 或遗留 JWT，
+	// 故用 Origin 校验防跨站 CSWSH）。无 Origin 头的非浏览器客户端
+	// （curl/脚本）放行。
 	CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
 		if origin == "" {
@@ -641,7 +642,9 @@ var wsPingInterval = 4 * time.Minute
 // run_started / plain / complete / end), each carrying the message_id.
 func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
-	if s.auth == nil || !s.auth.IsAuthenticated(token) {
+	// 鉴权（复核开放项 10-2）：优先一次性 ws-ticket（30s、单次使用，避免
+	// 长效 JWT 进 URL / 代理日志），回退 JWT ?token= 校验（兼容旧客户端）。
+	if s.auth == nil || !(s.consumeWSTicket(token) || s.auth.IsAuthenticated(token)) {
 		writeJSON(w, http.StatusUnauthorized, apiError("未认证"))
 		return
 	}

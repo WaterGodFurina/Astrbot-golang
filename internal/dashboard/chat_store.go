@@ -191,6 +191,10 @@ func (cs *chatStore) deleteSessions(ids []string) int {
 	return deleted
 }
 
+// maxSessionMessages 限制单个会话在 chat_sessions.json 中保留的消息条数，
+// 防止文件随使用无限增长（每条消息都会全量重写该文件，代价 O(全部历史)）。
+const maxSessionMessages = 1000
+
 // appendMessage adds a message to a session.
 func (cs *chatStore) appendMessage(id string, msg map[string]interface{}) bool {
 	cs.mu.Lock()
@@ -198,6 +202,11 @@ func (cs *chatStore) appendMessage(id string, msg map[string]interface{}) bool {
 	for _, s := range cs.data.Sessions {
 		if s.SessionID == id {
 			s.Messages = append(s.Messages, msg)
+			if len(s.Messages) > maxSessionMessages {
+				s.Messages = append(
+					make([]map[string]interface{}, 0, maxSessionMessages),
+					s.Messages[len(s.Messages)-maxSessionMessages:]...)
+			}
 			s.UpdatedAt = time.Now().Format(time.RFC3339)
 			_ = cs.save()
 			return true

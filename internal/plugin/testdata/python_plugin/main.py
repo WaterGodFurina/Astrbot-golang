@@ -32,7 +32,13 @@ class TestPlugin(Star):
     @filter.command("pycfg")
     async def cfg(self, event: AstrMessageEvent):
         cfg = self.context.get_config() if self.context else {}
-        yield event.plain_result("config=" + json.dumps(dict(cfg), ensure_ascii=False))
+        # 敏感键脱敏：完整配置可能包含 provider 的 api_key，不能原样发到聊天会话。
+        sensitive = ("key", "token", "secret", "password")
+        safe = {
+            k: ("***" if any(s in str(k).lower() for s in sensitive) else v)
+            for k, v in dict(cfg).items()
+        }
+        yield event.plain_result("config=" + json.dumps(safe, ensure_ascii=False))
 
     @filter.command("pyadd")
     async def add(self, event: AstrMessageEvent, a: int, b: int):

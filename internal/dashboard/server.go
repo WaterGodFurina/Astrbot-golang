@@ -111,6 +111,11 @@ type Server struct {
 	// 对齐 Python active_event_registry.request_agent_stop_all。
 	chatRunMu sync.Mutex
 	chatRuns  map[string]map[string]context.CancelFunc
+	// ticketMu/wsTickets：一次性 ws-ticket 表（见 auth.go issueWSTicket /
+	// consumeWSTicket），用于 WebSocket 连接与下载 URL 鉴权，避免长效 JWT
+	// 进 query。惰性清理过期/已用条目。
+	ticketMu  sync.Mutex
+	wsTickets map[string]*wsTicket
 }
 
 // RegisterWebhook registers a unified-webhook callback by uuid.
@@ -295,6 +300,7 @@ func NewServer(port int, configPath string) *Server {
 	s.backupTasks = make(map[string]*backupTaskState)
 	s.uploadSessions = make(map[string]*uploadSession)
 	s.chatRuns = make(map[string]map[string]context.CancelFunc)
+	s.wsTickets = make(map[string]*wsTicket)
 	s.loginLimiter = newLoginRateLimiter()
 	s.setupRoutes()
 	s.srv = &http.Server{
@@ -457,6 +463,8 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, parts []stri
 		s.handleSetupStatus(w, r)
 	case "setup":
 		s.handleSetup(w, r)
+	case "ws-ticket":
+		s.handleWSTicket(w, r)
 	case "totp":
 		s.handleTOTP(w, r, parts[1:])
 	case "account":
@@ -531,6 +539,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, apiError("签发会话令牌失败: "+err.Error()))
 			return
 		}
+		// 除 JSON 返回外，同步种下 HttpOnly Cookie（Path=/、SameSite=Lax，
+		// HTTPS 时 Secure），供前端迁移后无需再在 sessionStorage 保存 token；
+		// 现有前端经 Authorization 头鉴权的路径继续可用（Cookie 是新增途径）。
+		s.setSessionCookie(w, token)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"token":                     token,
 			"username":                  s.auth.Username(),
@@ -549,7 +561,62 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if s.auth != nil && token != "" {
 		s.auth.Logout(token)
 	}
+	// 无论 token 来自 Cookie 还是 Authorization 头，登出都清除 Cookie。
+	s.clearSessionCookie(w)
 	writeJSON(w, http.StatusOK, apiOK(nil))
+}
+
+// sessionCookieName 是登录成功后种下的会话 Cookie 名（复核开放项 10-1）：
+// HttpOnly 防 JS 读取（前端 token 从 sessionStorage 迁向 Cookie 的长期方案），
+// 与 Authorization Bearer / ?token= 并存，互为回退。
+const sessionCookieName = "astrbot_token"
+
+// setSessionCookie 写入会话 Cookie：Path=/、HttpOnly、SameSite=Lax；仅在
+// dashboard.ssl 实际启用 HTTPS（enable + cert_file + key_file 齐备，与
+// Start 的 ServeTLS 分支条件一致）时附加 Secure。HTTP 部署下不加 Secure，
+// 避免本地 HTTP 调试时浏览器静默丢弃 Cookie。
+func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
+	c := &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  time.Now().Add(tokenTTL),
+	}
+	if enable, cert, key := s.sslConfig(); enable && cert != "" && key != "" {
+		c.Secure = true
+	}
+	http.SetCookie(w, c)
+}
+
+// clearSessionCookie 清除会话 Cookie（登出）。
+func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+	})
+}
+
+// handleWSTicket 处理 POST /api/v1/auth/ws-ticket：已认证会话换取一次性
+// 短期票据（30s、单次使用），供 WebSocket 连接 / 下载 URL 携带，避免长效
+// JWT 进 query（会进代理/服务端日志）。路由已由 apiAuthAllowed 保证需已
+// 认证会话（JWT/Cookie；API key 拒绝——auth 子端点 systemOnly 语义）。
+func (s *Server) handleWSTicket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	ticket := s.issueWSTicket()
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"ticket":     ticket,
+		"expires_in": int(wsTicketTTL.Seconds()),
+	}))
 }
 
 // handleCheck handles GET /api/auth/check.
@@ -703,6 +770,8 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	token := generateRandomToken(32)
 	s.auth.RegisterToken(token)
+	// 首次安装/重置流程完成即建立会话：与登录一致，同步种下 HttpOnly Cookie。
+	s.setSessionCookie(w, token)
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 		"token":                     token,
 		"username":                  s.auth.Username(),
@@ -1438,21 +1507,29 @@ func apiError(message string) map[string]interface{} {
 	}
 }
 
-// extractToken gets the Bearer token from the Authorization header.
+// extractToken 提取会话 token（复核开放项 10-1）：优先 HttpOnly Cookie
+// astrbot_token（新增鉴权途径，前端迁移中），其次 Authorization Bearer，
+// 最后回退 ?token= query（兼容旧 WebSocket / 备份下载客户端）。
 // Authorization 以 "ApiKey " 开头时按 API key 处理（对齐 Python
 // _extract_dashboard_jwt 语义），不视为 JWT / legacy token。
 func extractToken(r *http.Request) string {
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
 	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		return ""
+	if auth != "" {
+		if strings.HasPrefix(auth, "Bearer ") {
+			return strings.TrimPrefix(auth, "Bearer ")
+		}
+		if strings.HasPrefix(auth, "ApiKey ") {
+			return ""
+		}
+		return auth
 	}
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimPrefix(auth, "Bearer ")
+	if v := strings.TrimSpace(r.URL.Query().Get("token")); v != "" {
+		return v
 	}
-	if strings.HasPrefix(auth, "ApiKey ") {
-		return ""
-	}
-	return auth
+	return ""
 }
 
 // Start begins serving.
@@ -1584,10 +1661,13 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	if len(s) > 300 {
 		s = s[:300] + "...(truncated)"
 	}
-	// 敏感响应体（登录/重置返回的 token、TOTP 密钥/otpauth 链接与恢复码）
-	// 不写入访问日志；writeJSON 无请求上下文，按响应中的敏感键名就地脱敏。
-	if strings.Contains(s, `"token":`) || strings.Contains(s, `"secret":`) ||
-		strings.Contains(s, `"recovery_codes":`) || strings.Contains(s, `"otpauth_url":`) {
+	// 敏感响应体（登录/重置返回的 token、一次性 ws-ticket、TOTP 密钥/otpauth
+	// 链接与恢复码、provider 配置里的 API key）不写入访问日志；writeJSON 无
+	// 请求上下文，按响应中的敏感键名就地脱敏。
+	if strings.Contains(s, `"token":`) || strings.Contains(s, `"ticket":`) ||
+		strings.Contains(s, `"secret":`) ||
+		strings.Contains(s, `"recovery_codes":`) || strings.Contains(s, `"otpauth_url":`) ||
+		strings.Contains(s, `"key":`) || strings.Contains(s, `"api_key":`) {
 		s = `"<redacted>"`
 	}
 	logger.Debug("API response: %s", s)

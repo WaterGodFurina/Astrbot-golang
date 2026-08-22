@@ -667,6 +667,61 @@ func (pm *PasswordManager) verifyJWT(token string) (string, string, bool) {
 	return claims.Username, claims.ID, true
 }
 
+// ───────────────────────────────────────────────────────────────
+// ws-ticket 一次性票据（复核开放项 10-2）
+// ───────────────────────────────────────────────────────────────
+
+// wsTicket 是一次性短期票据：已认证用户经 POST /api/v1/auth/ws-ticket 换取，
+// 用于 WebSocket 连接 / 下载 URL 的 ?token= 鉴权，避免长效 JWT 出现在 URL
+// （会进代理/服务端日志）。命中即消耗，单次使用。
+type wsTicket struct {
+	expiresAt time.Time
+	used      bool
+}
+
+// wsTicketTTL 票据有效期：足够完成连接建立/下载发起，短到泄露后危害可控。
+const wsTicketTTL = 30 * time.Second
+
+// issueWSTicket 为已认证用户签发一次性短期票据，返回随机 32 字节 hex 值。
+func (s *Server) issueWSTicket() string {
+	t := generateRandomToken(32)
+	s.ticketMu.Lock()
+	defer s.ticketMu.Unlock()
+	s.gcWSTicketsLocked()
+	s.wsTickets[t] = &wsTicket{expiresAt: time.Now().Add(wsTicketTTL)}
+	return t
+}
+
+// consumeWSTicket 校验并消耗一次性票据：命中、未过期且未用 → 标记 used 并
+// 返回 true；重复使用或过期一律拒绝（返回 false 由调用方回退 JWT 校验）。
+func (s *Server) consumeWSTicket(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	s.ticketMu.Lock()
+	defer s.ticketMu.Unlock()
+	s.gcWSTicketsLocked()
+	tk, ok := s.wsTickets[raw]
+	if !ok {
+		return false
+	}
+	if tk.used || time.Now().After(tk.expiresAt) {
+		return false
+	}
+	tk.used = true
+	return true
+}
+
+// gcWSTicketsLocked 惰性清理已用/过期票据，防止 map 只增不删（调用方持锁）。
+func (s *Server) gcWSTicketsLocked() {
+	now := time.Now()
+	for k, tk := range s.wsTickets {
+		if tk.used || now.After(tk.expiresAt) {
+			delete(s.wsTickets, k)
+		}
+	}
+}
+
 // loadRevoked 从 revokedPath 加载持久化的 jti 黑名单。文件缺失或损坏时忽略
 // （损坏文件视为空黑名单），不阻断启动。
 func (pm *PasswordManager) loadRevoked() {

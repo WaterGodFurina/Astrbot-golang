@@ -247,7 +247,7 @@ func FileToBase64(path string) (string, error) {
 
 // base64Encode wraps standard base64 encoding.
 func base64Encode(data []byte) string {
-	return base64StdEncoding(data)
+	return base64.StdEncoding.EncodeToString(data)
 }
 
 // IsURL checks if a string looks like a URL.
@@ -287,14 +287,4 @@ func GetLocalIPAddresses() []string {
 		}
 	}
 	return ips
-}
-
-// base64StdEncoding uses encoding/base64.
-func base64StdEncoding(data []byte) string {
-	return base64EncodeBytes(data)
-}
-
-// base64EncodeBytes is split to avoid import cycle issues in tests.
-func base64EncodeBytes(data []byte) string {
-	return base64.StdEncoding.EncodeToString(data)
 }

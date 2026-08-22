@@ -17,7 +17,8 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	// Global auth gate: every endpoint except the public whitelist below
 	// requires a valid session token (JWT or legacy in-memory token). The
 	// WebUI attaches "Authorization: Bearer <token>" to all requests via its
-	// axios request interceptor.
+	// axios request interceptor; extractToken 也接受 HttpOnly Cookie
+	// astrbot_token（前端迁移中，见 server.go setSessionCookie）。
 	if !s.apiAuthAllowed(r) {
 		writeJSON(w, http.StatusUnauthorized, apiError("未认证"))
 		return
@@ -182,7 +183,8 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 // Public endpoints: auth login/check/setup-status, first-install auth/setup
 // (password change still required), and the WebSocket chat transports, which
 // authenticate themselves via their own ?token= query check (browsers cannot
-// set Authorization headers on WebSocket upgrades).
+// set Authorization headers on WebSocket upgrades); ws-ticket 换取端点
+// auth/ws-ticket 需已认证会话（JWT/Cookie，API key 拒绝）。
 //
 // 其余端点双层鉴权（对齐 Python require_scope / require_system_scope）：
 //   - 携带 API key（ApiKey 头 / X-API-Key / ?api_key= / ?key=）→ 按 key 的
@@ -220,7 +222,8 @@ func (s *Server) apiAuthAllowed(r *http.Request) bool {
 		// totp / account 等子端点：system 级，仅 JWT。
 		return s.auth.IsAuthenticated(extractToken(r))
 	case "unified-chat", "live-chat":
-		// WebSocket transport validates its own token query parameter.
+		// WebSocket transport validates its own ?token= (一次性 ws-ticket
+		// 或遗留 JWT，见 chat_stream.go handleUnifiedChatWS）。
 		return true
 	case "plugins":
 		// 插件 logo（GET /api/v1/plugins/logo）供 WebUI <img src> 直接加载：
