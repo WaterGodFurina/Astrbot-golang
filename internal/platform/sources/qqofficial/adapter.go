@@ -68,6 +68,9 @@ type Adapter struct {
 	mu             sync.Mutex
 	accessToken    string
 	tokenExpiresAt time.Time
+	// tokenFlight 并发刷新 access_token 时只发起一次请求（single-flight），
+	// 其余并发调用等待共享结果，避免 token 过期瞬间的并发刷新风暴。
+	tokenFlight    tokenSingleFlight
 	ws             *websocket.Conn
 	wsSessionID    string
 	lastSeq        int
@@ -187,9 +190,43 @@ func (a *Adapter) getAccessToken() (string, error) {
 	expires := a.tokenExpiresAt
 	a.mu.Unlock()
 	if token == "" || time.Now().After(expires) {
-		return a.fetchAccessToken()
+		return a.tokenFlight.get(func() (string, error) { return a.fetchAccessToken() })
 	}
 	return token, nil
+}
+
+// tokenSingleFlight 并发刷新 access_token 的 single-flight 实现（仅用标准库）：
+// 第一个调用者真正发起 fetchAccessToken，其余并发调用者等待其完成后共享结果。
+type tokenSingleFlight struct {
+	mu    sync.Mutex
+	busy  bool
+	done  chan struct{}
+	token string
+	err   error
+}
+
+func (f *tokenSingleFlight) get(fetch func() (string, error)) (string, error) {
+	f.mu.Lock()
+	if f.busy {
+		done := f.done
+		f.mu.Unlock()
+		<-done
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.token, f.err
+	}
+	f.busy = true
+	f.done = make(chan struct{})
+	f.mu.Unlock()
+
+	token, err := fetch()
+
+	f.mu.Lock()
+	f.token, f.err = token, err
+	f.busy = false
+	close(f.done)
+	f.mu.Unlock()
+	return token, err
 }
 
 // fetchGateway returns the WebSocket gateway URL.
@@ -271,6 +308,8 @@ func (a *Adapter) connectOnce(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("websocket 连接失败: %v", err)
 	}
+	// 限制单连接消息体大小，防止异常对端放大内存占用。
+	ws.SetReadLimit(1 << 20)
 	a.mu.Lock()
 	a.ws = ws
 	prevSession := a.wsSessionID
@@ -371,8 +410,13 @@ func (a *Adapter) heartbeatLoop(ctx context.Context, interval time.Duration) {
 			err := ws.WriteMessage(websocket.TextMessage, data)
 			a.writeMu.Unlock()
 			if err != nil {
+				// 写失败说明连接已不可用：关闭连接让读循环解除阻塞并触发重连。
+				_ = ws.Close()
 				return
 			}
+			// 每次心跳写成功后重置读超时：半开连接（对端无响应）时心跳写仍可能
+			// 成功，读循环在超时后报错退出，触发 runLoop 重连，避免连接假活。
+			_ = ws.SetReadDeadline(time.Now().Add(3 * interval))
 		}
 	}
 }

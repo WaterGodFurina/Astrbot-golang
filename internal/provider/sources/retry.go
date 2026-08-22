@@ -217,9 +217,14 @@ func DoWithRetry(
 			retryLogger.Warn("[%s] Retryable status %d (attempt %d/%d): %s",
 				providerLabel, status, attempt, cfg.MaxAttempts,
 				truncate(lastErr.Error(), 200))
-			// Respect Retry-After for 429.
+			// Respect Retry-After for 429, capped at MaxDelay so a huge or
+			// mis-united header value (e.g. 60000 ms read as seconds) cannot
+			// stall the caller for hours.
 			if status == http.StatusTooManyRequests {
 				if d := ParseRetryAfter(resp.Header.Get("Retry-After")); d > 0 {
+					if d > cfg.MaxDelay {
+						d = cfg.MaxDelay
+					}
 					retryLogger.Debug("[%s] Retry-After: waiting %v before next attempt", providerLabel, d)
 					sleepWithContext(ctx, d)
 					continue

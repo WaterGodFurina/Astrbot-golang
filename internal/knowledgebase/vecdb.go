@@ -171,15 +171,18 @@ func ChunkText(text string, chunkSize, chunkOverlap int) []string {
 		}
 		content := string(runes[start:end])
 		consumed := end
-		if nl := strings.LastIndex(content, "\n"); nl > chunkSize/2 {
-			content = content[:nl]
-			consumed = start + nl
+		if nl := strings.LastIndex(content, "\n"); nl >= 0 {
+			prefix := []rune(content[:nl])
+			if len(prefix) > chunkSize/2 {
+				content = string(prefix)
+				consumed = start + len(prefix)
+			}
 		}
 		content = strings.TrimSpace(content)
 		if content != "" {
 			chunks = append(chunks, content)
 		}
-		if end == len(runes) {
+		if consumed >= len(runes) {
 			break
 		}
 		// 下一 chunk 起点为 max(start+step, 实际消费位置) 中的较小者：若换行

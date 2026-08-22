@@ -301,6 +301,49 @@ func (r *StarHandlerRegistry) Enable(fullName string) {
 	}
 }
 
+// Mutate applies fn to the handler under the registry write lock. No-op when
+// the handler does not exist. 供 dashboard HTTP goroutine 等运行期写入口使用，
+// 与消息管线的 GetFilterHandlers（RLock 遍历）互斥。
+func (r *StarHandlerRegistry) Mutate(fullName string, fn func(*StarHandlerMetadata)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if h := r.handlersMap[fullName]; h != nil {
+		fn(h)
+	}
+}
+
+// setPermissionLocked 在持有 registry 写锁时更新（或插入）handler 的权限
+// 过滤器，不会与并发读的过滤器遍历交错。
+func setPermissionLocked(h *StarHandlerMetadata, perm string) {
+	var target PermissionType
+	switch perm {
+	case "admin":
+		target = PermissionAdmin
+	default:
+		target = PermissionMember
+	}
+	for i, filter := range h.EventFilters {
+		if _, ok := filter.(*PermissionFilter); ok {
+			h.EventFilters[i] = NewPermissionFilter(target)
+			return
+		}
+	}
+	h.EventFilters = append(h.EventFilters, NewPermissionFilter(target))
+}
+
+// SetHandlerPermission updates the permission filter of a handler under the
+// registry write lock. Returns false when the handler does not exist.
+func (r *StarHandlerRegistry) SetHandlerPermission(fullName, perm string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	h, ok := r.handlersMap[fullName]
+	if !ok {
+		return false
+	}
+	setPermissionLocked(h, perm)
+	return true
+}
+
 // Clear removes all handlers.
 func (r *StarHandlerRegistry) Clear() {
 	r.mu.Lock()

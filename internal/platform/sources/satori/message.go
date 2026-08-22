@@ -684,15 +684,15 @@ func convertComponentToSatori(comp message.Component) string {
 		return text
 	case *message.At:
 		if c.TargetID != "" {
-			return fmt.Sprintf(`<at id="%s"/>`, c.TargetID)
+			return fmt.Sprintf(`<at id="%s"/>`, escapeAttrValue(c.TargetID))
 		}
 		if c.Name != "" {
-			return fmt.Sprintf(`<at name="%s"/>`, c.Name)
+			return fmt.Sprintf(`<at name="%s"/>`, escapeAttrValue(c.Name))
 		}
 	case *message.Image:
 		dataURL, err := imageToDataURL(c)
 		if err == nil && dataURL != "" {
-			return fmt.Sprintf(`<img src="%s"/>`, dataURL)
+			return fmt.Sprintf(`<img src="%s"/>`, escapeAttrValue(dataURL))
 		}
 		logger.Error("图片转换为base64失败: %v", err)
 	case *message.File:
@@ -704,15 +704,15 @@ func convertComponentToSatori(comp message.Component) string {
 		if ref == "" {
 			ref = c.Path
 		}
-		return fmt.Sprintf(`<file src="%s" name="%s"/>`, ref, name)
+		return fmt.Sprintf(`<file src="%s" name="%s"/>`, escapeAttrValue(ref), escapeAttrValue(name))
 	case *message.Record:
 		b64, err := recordToBase64(c)
 		if err == nil && b64 != "" {
-			return fmt.Sprintf(`<audio src="data:audio/wav;base64,%s"/>`, b64)
+			return fmt.Sprintf(`<audio src="data:audio/wav;base64,%s"/>`, escapeAttrValue(b64))
 		}
 		logger.Error("语音转换为base64失败: %v", err)
 	case *message.Reply:
-		return fmt.Sprintf(`<reply id="%s"/>`, c.MessageID)
+		return fmt.Sprintf(`<reply id="%s"/>`, escapeAttrValue(c.MessageID))
 	case *message.Video:
 		// 优先 URL：<video src> 是交给 Satori 网关解析的资源引用，materialize
 		// 会把同一 URL 同时填充为本地临时 Path，而该临时文件在 Send 返回后即被
@@ -724,9 +724,9 @@ func convertComponentToSatori(comp message.Component) string {
 		if ref == "" {
 			ref = c.FileID
 		}
-		return fmt.Sprintf(`<video src="%s"/>`, ref)
+		return fmt.Sprintf(`<video src="%s"/>`, escapeAttrValue(ref))
 	case *message.Forward:
-		return fmt.Sprintf(`<message id="%s" forward/>`, c.ID)
+		return fmt.Sprintf(`<message id="%s" forward/>`, escapeAttrValue(c.ID))
 	}
 	// 对于其他未处理的组件类型，返回空字符串
 	return ""
@@ -747,10 +747,10 @@ func convertNodeToSatori(node *message.Node) string {
 	// 构建 Satori 格式的转发节点
 	authorAttrs := []string{}
 	if node.UIN != "" {
-		authorAttrs = append(authorAttrs, fmt.Sprintf(`id="%s"`, node.UIN))
+		authorAttrs = append(authorAttrs, fmt.Sprintf(`id="%s"`, escapeAttrValue(node.UIN)))
 	}
 	if node.Name != "" {
-		authorAttrs = append(authorAttrs, fmt.Sprintf(`name="%s"`, node.Name))
+		authorAttrs = append(authorAttrs, fmt.Sprintf(`name="%s"`, escapeAttrValue(node.Name)))
 	}
 	return fmt.Sprintf(`<message><author %s/>%s</message>`, strings.Join(authorAttrs, " "), s)
 }

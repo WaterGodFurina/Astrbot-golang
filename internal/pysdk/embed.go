@@ -393,11 +393,16 @@ func pyDownloadURL(archive string) string {
 	return u
 }
 
+// dlClient 是 Python 解释器下载专用 HTTP 客户端：30 分钟超时防止镜像源
+// 挂起时下载永远阻塞（与 Go 工具链下载对齐）。Transport 沿用默认配置，
+// 仍会走宿主的全局代理。
+var dlClient = &http.Client{Timeout: 30 * time.Minute}
+
 // downloadFile streams url to dest with 10%-step progress logs and the stage
 // callback (download phase text). The default http.Client transport honors
 // the host's global proxy configuration.
 func downloadFile(url, dest string, stage func(string)) error {
-	resp, err := http.Get(url)
+	resp, err := dlClient.Get(url)
 	if err != nil {
 		return err
 	}
@@ -516,7 +521,16 @@ func extractTarGzKeepTop(src, dir string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
+			link := hdr.Linkname
+			// 拒绝绝对路径目标与逃逸根目录的相对目标，防止恶意归档利用
+			// symlink 把后续条目写到根目录之外。
+			if filepath.IsAbs(link) {
+				return fmt.Errorf("symlink %q -> absolute target %q rejected", name, link)
+			}
+			if _, err := safeJoin(filepath.Dir(target), link); err != nil {
+				return fmt.Errorf("symlink %q -> %q escapes root: %w", name, link, err)
+			}
+			if err := os.Symlink(link, target); err != nil {
 				return err
 			}
 		}

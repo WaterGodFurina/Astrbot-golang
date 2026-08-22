@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -105,6 +106,22 @@ func (a *chatStreamAdapter) unsubscribe(sessionID string, seq uint64, ch chan *m
 	}
 }
 
+// chatStreamRequest describes one SSE chat run (POST /api/v1/chat 与
+// regenerate/thread 消息共用同一管线)。
+type chatStreamRequest struct {
+	SessionID        string
+	Parts            []map[string]interface{}
+	Files            []interface{}
+	SelectedProvider string
+	SelectedModel    string
+	Flags            map[string]interface{}
+	// PersistUser 为 false 时（regenerate）不再落盘 user 消息（历史中已存在）。
+	PersistUser bool
+	// ThreadID 非空时消息写入线程历史而非会话历史（对齐 Python
+	// platform_history_id="webchat_thread"）。
+	ThreadID string
+}
+
 // handleChatSend streams a chat reply over SSE.
 // POST /api/v1/chat  body: {session_id, message:[parts], selected_provider, selected_model, flags}
 func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
@@ -116,6 +133,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		SelectedProvider string                   `json:"selected_provider"`
 		SelectedModel    string                   `json:"selected_model"`
 		Flags            map[string]interface{}   `json:"flags"`
+		SkipUserHistory  bool                     `json:"_skip_user_history"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
@@ -134,31 +152,73 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 0 {
 		parts = filePartsToMessage(body.Files)
 	}
-	text := plainTextFromParts(parts)
-	if text == "" {
+	// 对齐 Python 原版 webchat_message_parts_have_content：纯媒体消息
+	// （仅图片/文件 part，无 plain 文本）也允许发送。
+	if !partsHaveContent(parts, body.Files) {
 		writeJSON(w, http.StatusBadRequest, apiError("Message content is empty"))
 		return
 	}
+	s.runChatSSEStream(w, r, chatStreamRequest{
+		SessionID:        sessionID,
+		Parts:            parts,
+		Files:            body.Files,
+		SelectedProvider: body.SelectedProvider,
+		SelectedModel:    body.SelectedModel,
+		Flags:            body.Flags,
+		// 编辑后"继续对话"（continueEditedMessage）会带 _skip_user_history：
+		// user 消息已存在于历史中，不再重复落盘（对齐 Python _skip_user_history）。
+		PersistUser: !body.SkipUserHistory,
+	})
+}
 
-	// Persist the user message into the chat session store (WebUI history).
-	savedUserID := fmt.Sprintf("u_%d", time.Now().UnixNano())
-	userRecord := map[string]interface{}{
-		"id":          savedUserID,
-		"session_id":  sessionID,
-		"sender_id":   "dashboard",
-		"sender_name": "dashboard",
-		"role":        "user",
-		"type":        "user",
-		"content":     map[string]interface{}{"type": "user", "message": parts},
-		"created_at":  time.Now().Format(time.RFC3339Nano),
+// partsHaveContent 校验消息有真实内容（plain 文本或媒体 part），对齐
+// webchat_message_parts_have_content；files 兜底用于纯附件消息。
+func partsHaveContent(parts []map[string]interface{}, files []interface{}) bool {
+	if len(parts) == 0 && len(files) > 0 {
+		return true
 	}
-	s.chat.appendMessage(sessionID, userRecord)
+	text := plainTextFromParts(parts)
+	if text == "" && !partsHaveMediaContent(parts) {
+		return false
+	}
+	return true
+}
+
+// runChatSSEStream runs a chat reply through the pipeline and streams it over
+// SSE (events: session_id -> user_message_saved -> run_started -> plain ->
+// complete -> end), mirroring Python build_chat_stream. The run is registered
+// in the session run registry so POST /chat/sessions/{id}/stop can cancel it.
+func (s *Server) runChatSSEStream(w http.ResponseWriter, r *http.Request, req chatStreamRequest) {
+	sessionID := req.SessionID
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, apiError("streaming not supported"))
 		return
 	}
+
+	// Persist the user message (skipped for regenerate: the message already
+	// exists in history).
+	savedUserID := fmt.Sprintf("u_%d", time.Now().UnixNano())
+	llmCheckpointID := fmt.Sprintf("c_%d", time.Now().UnixNano())
+	if req.PersistUser {
+		userRecord := map[string]interface{}{
+			"id":          savedUserID,
+			"session_id":  sessionID,
+			"sender_id":   "dashboard",
+			"sender_name": "dashboard",
+			"role":        "user",
+			"type":        "user",
+			"content":     map[string]interface{}{"type": "user", "message": req.Parts},
+			"created_at":  time.Now().Format(time.RFC3339Nano),
+		}
+		if req.ThreadID != "" {
+			s.threads.appendThreadMessage(req.ThreadID, userRecord)
+		} else {
+			s.chat.appendMessage(sessionID, userRecord)
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -170,19 +230,26 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		"data":       nil,
 		"session_id": sessionID,
 	})
-	sendSSE(w, flusher, map[string]interface{}{
-		"type": "user_message_saved",
-		"data": map[string]interface{}{
-			"id":                savedUserID,
-			"created_at":        time.Now().Format(time.RFC3339Nano),
-			"llm_checkpoint_id": fmt.Sprintf("c_%d", time.Now().UnixNano()),
-		},
-	})
+	if req.PersistUser {
+		sendSSE(w, flusher, map[string]interface{}{
+			"type": "user_message_saved",
+			"data": map[string]interface{}{
+				"id":                savedUserID,
+				"created_at":        time.Now().Format(time.RFC3339Nano),
+				"llm_checkpoint_id": llmCheckpointID,
+			},
+		})
+	}
 	runID := fmt.Sprintf("r_%d", time.Now().UnixNano())
 	sendSSE(w, flusher, map[string]interface{}{
 		"type": "run_started",
 		"data": map[string]interface{}{"run_id": runID},
 	})
+
+	// 注册 run 取消（stop 端点按 session 取消），并绑定到本请求上下文。
+	runCtx, runCancel := context.WithCancel(r.Context())
+	s.registerChatRun(sessionID, runID, runCancel)
+	defer s.unregisterChatRun(sessionID, runID)
 
 	// Subscribe to the pipeline reply for this session. runID 标识本次 run，
 	// 即使同一 session 并发发送也不会把别的请求的回复累积进来。
@@ -191,7 +258,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 
 	// Run the user message through the pipeline; done is closed when the
 	// event finishes processing.
-	done := s.processChatEvent(r.Context(), sessionID, runID, text, body.SelectedProvider, body.SelectedModel, body.Flags)
+	done := s.processChatEvent(runCtx, sessionID, runID, plainTextFromParts(req.Parts), req.SelectedProvider, req.SelectedModel, req.Flags, req.Files)
 	if done == nil {
 		sendSSE(w, flusher, map[string]interface{}{"type": "error", "data": "对话管道不可用"})
 		sendSSE(w, flusher, map[string]interface{}{"type": "end", "data": nil})
@@ -222,7 +289,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 			}
 		done:
 			if full.Len() > 0 {
-				// Persist the bot reply into the chat session store.
+				// Persist the bot reply into the chat session/thread store.
 				botID := fmt.Sprintf("b_%d", time.Now().UnixNano())
 				botRecord := map[string]interface{}{
 					"id":          botID,
@@ -237,7 +304,11 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 					},
 					"created_at": time.Now().Format(time.RFC3339Nano),
 				}
-				s.chat.appendMessage(sessionID, botRecord)
+				if req.ThreadID != "" {
+					s.threads.appendThreadMessage(req.ThreadID, botRecord)
+				} else {
+					s.chat.appendMessage(sessionID, botRecord)
+				}
 				sendSSE(w, flusher, map[string]interface{}{
 					"type": "message_saved",
 					"data": map[string]interface{}{"id": botID, "created_at": time.Now().Format(time.RFC3339Nano)},
@@ -274,12 +345,17 @@ func emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full *strings.Bui
 // core.PipelineDone signal that the bus closes once the event is dispatched.
 // Fallback: when the bus is unavailable (queue full / no scheduler), run the
 // event through the scheduler directly in a goroutine.
-func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, providerID, model string, flags map[string]interface{}) <-chan struct{} {
+func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, providerID, model string, flags map[string]interface{}, files []interface{}) <-chan struct{} {
 	bus, ok := s.eventBus.(*core.EventBus)
 	if !ok || bus == nil {
 		return nil
 	}
 	chain := message.NewMessageChain(&message.Plain{Text: text})
+	// 上传的文件转成真实组件追加到链上，让管线能消费本地文件
+	// （LLM 视觉上下文、平台转发等），而不是只留占位文本。
+	if comps := s.filesToChainComponents(files); len(comps) > 0 {
+		chain.Chain = append(chain.Chain, comps...)
+	}
 	event := &core.Event{
 		Type: core.EventMessage,
 		Source: core.EventSource{
@@ -396,19 +472,120 @@ func plainTextFromParts(parts []map[string]interface{}) string {
 	return b.String()
 }
 
-// filePartsToMessage converts a files array (path strings) into plain text
-// placeholders (best effort; attachment parsing is out of scope here).
+// partsHaveMediaContent reports whether parts carry real content (plain text
+// or a media part with attachment_id/filename). 对齐 Python 原版
+// webchat_message_parts_have_content：纯图片/文件消息（无文本）也应放行。
+func partsHaveMediaContent(parts []map[string]interface{}) bool {
+	for _, p := range parts {
+		switch t, _ := p["type"].(string); t {
+		case "plain", "":
+			if text, _ := p["text"].(string); text != "" {
+				return true
+			}
+		case "image", "record", "file", "video":
+			if id, _ := p["attachment_id"].(string); id != "" {
+				return true
+			}
+			if name, _ := p["filename"].(string); name != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// filePartsToMessage converts a files array (uploaded attachments or legacy
+// path strings) into message parts. Each element may be a string (legacy
+// path) or a map carrying attachment_id/filename/type; recognizable types
+// become real parts the WebUI renders via contentUrl/byNameUrl, while
+// unrecognized entries fall back to the "[FILE] path" placeholder.
 func filePartsToMessage(files []interface{}) []map[string]interface{} {
 	if len(files) == 0 {
 		return nil
 	}
 	out := make([]map[string]interface{}, 0, len(files))
 	for _, f := range files {
-		if s, ok := f.(string); ok {
-			out = append(out, map[string]interface{}{"type": "plain", "text": "[FILE] " + s})
+		switch v := f.(type) {
+		case string:
+			out = append(out, map[string]interface{}{"type": "plain", "text": "[FILE] " + v})
+		case map[string]interface{}:
+			typ, _ := v["type"].(string)
+			id, _ := v["attachment_id"].(string)
+			name, _ := v["filename"].(string)
+			if name == "" {
+				if p, ok := v["path"].(string); ok {
+					name = p
+				}
+			}
+			part := map[string]interface{}{
+				"type":          typ,
+				"attachment_id": id,
+				"filename":      name,
+			}
+			if u, ok := v["url"].(string); ok && u != "" {
+				part["embedded_url"] = u
+			}
+			switch typ {
+			case "image", "record", "video", "file":
+				out = append(out, part)
+			default:
+				// 无法识别类型：回退占位文本。
+				out = append(out, map[string]interface{}{"type": "plain", "text": "[FILE] " + name})
+			}
+		default:
+			out = append(out, map[string]interface{}{"type": "plain", "text": "[FILE] " + fmt.Sprint(f)})
 		}
 	}
 	return out
+}
+
+// filesToChainComponents converts a files array (uploaded attachments) into
+// message chain components so the pipeline receives the actual local files
+// (image vision / platform forwarding) instead of dropping them. attachment_id
+// maps to the file under data/webui_files; entries without one fall back to
+// their path/file/url fields. Unresolvable entries are skipped.
+func (s *Server) filesToChainComponents(files []interface{}) []message.Component {
+	var comps []message.Component
+	for _, f := range files {
+		m, ok := f.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		typ, _ := m["type"].(string)
+		id, _ := m["attachment_id"].(string)
+		path := ""
+		if id != "" && safeAttachmentName(id) {
+			path = filepath.Join(s.webuiFilesDir(), id)
+		}
+		if path == "" {
+			for _, k := range []string{"path", "file"} {
+				if p, ok := m[k].(string); ok && p != "" {
+					path = p
+					break
+				}
+			}
+		}
+		if path == "" {
+			if u, ok := m["url"].(string); ok && u != "" {
+				path = u
+			}
+		}
+		if path == "" {
+			continue
+		}
+		switch typ {
+		case "image":
+			comps = append(comps, &message.Image{Path: path, File: path, FileID: id})
+		case "record":
+			comps = append(comps, &message.Record{Path: path, File: path, FileID: id})
+		case "video":
+			comps = append(comps, &message.Video{Path: path, FileID: id})
+		case "file":
+			name, _ := m["filename"].(string)
+			comps = append(comps, &message.File{Path: path, FileID: id, Name: name})
+		}
+	}
+	return comps
 }
 
 // compile-time interface check: chatStreamAdapter must satisfy
@@ -420,8 +597,9 @@ var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	// Origin 白名单：仅允许同源连接（浏览器 WebSocket 无法设置自定义
-	// Authorization 头，token 只能走 query，故用 Origin 校验防跨站 CSWSH）。
-	// 无 Origin 头的非浏览器客户端（curl/脚本）放行。
+	// Authorization 头，token 只能走 query——一次性 ws-ticket 或遗留 JWT，
+	// 故用 Origin 校验防跨站 CSWSH）。无 Origin 头的非浏览器客户端
+	// （curl/脚本）放行。
 	CheckOrigin: func(r *http.Request) bool {
 		origin := r.Header.Get("Origin")
 		if origin == "" {
@@ -464,7 +642,9 @@ var wsPingInterval = 4 * time.Minute
 // run_started / plain / complete / end), each carrying the message_id.
 func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
-	if s.auth == nil || !s.auth.IsAuthenticated(token) {
+	// 鉴权（复核开放项 10-2）：优先一次性 ws-ticket（30s、单次使用，避免
+	// 长效 JWT 进 URL / 代理日志），回退 JWT ?token= 校验（兼容旧客户端）。
+	if s.auth == nil || !(s.consumeWSTicket(token) || s.auth.IsAuthenticated(token)) {
 		writeJSON(w, http.StatusUnauthorized, apiError("未认证"))
 		return
 	}
@@ -516,6 +696,7 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 			SessionID        string                   `json:"session_id"`
 			MessageID        string                   `json:"message_id"`
 			Message          []map[string]interface{} `json:"message"`
+			Files            []interface{}            `json:"files"`
 			Flags            map[string]interface{}   `json:"flags"`
 			SelectedProvider string                   `json:"selected_provider"`
 			SelectedModel    string                   `json:"selected_model"`
@@ -604,6 +785,7 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 	SessionID        string                   `json:"session_id"`
 	MessageID        string                   `json:"message_id"`
 	Message          []map[string]interface{} `json:"message"`
+	Files            []interface{}            `json:"files"`
 	Flags            map[string]interface{}   `json:"flags"`
 	SelectedProvider string                   `json:"selected_provider"`
 	SelectedModel    string                   `json:"selected_model"`
@@ -645,19 +827,22 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 
 	// Derive a per-run context from the connection so an interrupt can cancel
 	// this specific run (registered by message_id) without tearing down the
-	// whole connection.
+	// whole connection. Also register in the session-level registry so the
+	// HTTP stop endpoint can cancel it.
 	runCtx, runCancel := context.WithCancel(c.ctx)
 	c.runMu.Lock()
 	c.runs[messageID] = runCancel
 	c.runMu.Unlock()
+	s.registerChatRun(sessionID, messageID, runCancel)
 	defer func() {
+		s.unregisterChatRun(sessionID, messageID)
 		c.runMu.Lock()
 		delete(c.runs, messageID)
 		c.runMu.Unlock()
 		runCancel()
 	}()
 
-	done := s.processChatEvent(runCtx, sessionID, messageID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags)
+	done := s.processChatEvent(runCtx, sessionID, messageID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags, msg.Files)
 	if done == nil {
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "error", "data": "对话管道不可用", "message_id": messageID})
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})

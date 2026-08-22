@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -468,9 +469,14 @@ func TestSetupChangesPasswordToHashAndOverridesUsername(t *testing.T) {
 		t.Fatal("failed to set up waiting state")
 	}
 
-	// 通过 setup 端点显式填用户名 + 密码（首次设置，无需旧密码）。
+	// 通过 setup 端点显式填用户名 + 密码（首次设置需提供启动时生成的初始密码，
+	// 防止窗口期内未授权者抢注管理员账户）。
+	initPwd := pm.InitialPassword()
+	if initPwd == "" {
+		t.Fatal("expected an initial password to be generated")
+	}
 	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup",
-		strings.NewReader(`{"username":"myadmin","password":"HashMe@123","confirm_password":"HashMe@123"}`))
+		strings.NewReader(fmt.Sprintf(`{"username":"myadmin","password":"HashMe@123","confirm_password":"HashMe@123","old_password":%q}`, initPwd)))
 	w := httptest.NewRecorder()
 	s.mux.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {

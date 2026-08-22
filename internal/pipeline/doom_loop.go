@@ -133,7 +133,6 @@ func (s *ProcessStage) checkDoomLoop(event *core.Event, toolName string) bool {
 	}
 	umo := event.UnifiedMsgOrigin()
 	s.doomMu.Lock()
-	defer s.doomMu.Unlock()
 	// Lazy TTL sweep: drop trackers of sessions idle beyond the TTL before
 	// touching this session's entry.
 	s.pruneDoomTrackers()
@@ -145,6 +144,7 @@ func (s *ProcessStage) checkDoomLoop(event *core.Event, toolName string) bool {
 	tr.lastSeen = time.Now()
 	// If this exact tool is already paused, refuse to run it.
 	if tr.pausedTool == toolName {
+		s.doomMu.Unlock()
 		return false
 	}
 	if tr.lastTool == toolName {
@@ -157,10 +157,13 @@ func (s *ProcessStage) checkDoomLoop(event *core.Event, toolName string) bool {
 		tr.pausedTool = toolName
 		tr.askSender = event.Source.SenderID
 		tr.resumePrompt = event.PlainText
-		// Ask the session owner (async; only they may answer).
+		// 先释放锁再询问会话所有者：askDoomConfirm 的发送是网络 IO，不能
+		// 持全局锁进行；此后不再访问 doomMu 保护的共享状态。
+		s.doomMu.Unlock()
 		s.askDoomConfirm(event, toolName)
 		return false
 	}
+	s.doomMu.Unlock()
 	return true
 }
 

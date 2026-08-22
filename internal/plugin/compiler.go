@@ -390,7 +390,11 @@ func sanitizeID(id string) string {
 			b.WriteByte('_')
 		}
 	}
-	return b.String()
+	s := b.String()
+	if s == "." || s == ".." {
+		return "plugin"
+	}
+	return s
 }
 
 // artifactName returns the compiled binary file name for the current platform.

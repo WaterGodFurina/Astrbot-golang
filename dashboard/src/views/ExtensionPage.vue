@@ -75,6 +75,7 @@ const {
   showSourceManagerDialog,
   sourceName,
   sourceUrl,
+  sourceType,
   sourceResolving,
   sourceResolveVisible,
   sourceMarketMeta,
@@ -1355,6 +1356,9 @@ const updateDialogPluginLogo = computed(() => {
             <v-radio label="Golang" value="golang"></v-radio>
             <v-radio label="Python" value="python"></v-radio>
           </v-radio-group>
+          <div class="text-caption text-medium-emphasis mt-1">
+            {{ tm("market.sourceTypeHint") }}
+          </div>
 
           <v-alert
             v-if="sourceResolveVisible && sourceResolveCurrent"

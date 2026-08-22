@@ -867,7 +867,7 @@ function clearCompositionState({ keepLastEndAt = false } = {}) {
 }
 
 function handleKeyUp(e: KeyboardEvent) {
-  if (e.keyCode === 66) {
+  if (e.keyCode === 66 && e.ctrlKey) {
     ctrlKeyDown.value = false;
 
     if (ctrlKeyTimer.value) {

@@ -16,7 +16,7 @@ func groupCtxConfig() map[string]interface{} {
 			"active_reply": map[string]interface{}{
 				"enable": true, "method": "possibility_reply",
 				"possibility_reply": 1.0, // always reply for tests
-				"whitelist":         []interface{}{"telegram:g1"},
+				"whitelist":         []interface{}{"telegram:GroupMessage:g1"},
 			},
 		},
 	}
@@ -91,7 +91,7 @@ func TestGroupContextRemoveSession(t *testing.T) {
 	g := NewGroupChatContext(groupCtxConfig())
 	g.HandleMessage(groupEvent("m1"))
 	g.HandleMessage(groupEvent("m2"))
-	if n := g.RemoveSession("telegram:g1"); n != 2 {
+	if n := g.RemoveSession("telegram:GroupMessage:g1"); n != 2 {
 		t.Errorf("expected 2 records removed, got %d", n)
 	}
 	req := &provider.ProviderRequest{}

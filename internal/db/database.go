@@ -555,6 +555,99 @@ func (d *Database) UpdateConversationContent(convID, content string) error {
 	return err
 }
 
+// ConversationFilter mirrors the dashboard conversation list query params
+// (aligned with Python sqlite.get_filtered_conversations).
+type ConversationFilter struct {
+	Platforms        []string // platform_id IN (...)
+	MessageTypes     []string // user_id LIKE '%:<type>:%' (UMO segment match)
+	Search           string   // title/user_id/conversation_id/content LIKE %q%
+	ExcludeIDs       []string // user_id NOT LIKE '<id>%'
+	ExcludePlatforms []string // platform_id NOT IN (...)
+	Page             int
+	PageSize         int
+}
+
+// GetFilteredConversations returns a filtered, paginated conversation list
+// plus the total count matching the filter.
+func (d *Database) GetFilteredConversations(f ConversationFilter) ([]ConversationRow, int, error) {
+	page := f.Page
+	if page < 1 {
+		page = 1
+	}
+	size := f.PageSize
+	if size < 1 {
+		size = 20
+	}
+	if size > 100 {
+		size = 100
+	}
+
+	where := []string{"1=1"}
+	var args []interface{}
+	if len(f.Platforms) > 0 {
+		where = append(where, fmt.Sprintf("platform_id IN (%s)", placeholders(len(f.Platforms), &args, f.Platforms)))
+	}
+	if len(f.MessageTypes) > 0 {
+		conds := make([]string, 0, len(f.MessageTypes))
+		for _, mt := range f.MessageTypes {
+			conds = append(conds, "user_id LIKE ?")
+			args = append(args, "%:"+mt+":%")
+		}
+		where = append(where, "("+strings.Join(conds, " OR ")+")")
+	}
+	if s := strings.TrimSpace(f.Search); s != "" {
+		like := "%" + s + "%"
+		where = append(where, "(title LIKE ? OR user_id LIKE ? OR conversation_id LIKE ? OR content LIKE ?)")
+		for i := 0; i < 4; i++ {
+			args = append(args, like)
+		}
+	}
+	for _, ex := range f.ExcludeIDs {
+		if ex == "" {
+			continue
+		}
+		where = append(where, "user_id NOT LIKE ?")
+		args = append(args, ex+"%")
+	}
+	if len(f.ExcludePlatforms) > 0 {
+		where = append(where, fmt.Sprintf("platform_id NOT IN (%s)", placeholders(len(f.ExcludePlatforms), &args, f.ExcludePlatforms)))
+	}
+	whereSQL := strings.Join(where, " AND ")
+
+	var total int
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM conversations WHERE "+whereSQL, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	query := `SELECT inner_conversation_id, conversation_id, platform_id, user_id, content, title, persona_id, created_at, updated_at
+		 FROM conversations WHERE ` + whereSQL + ` ORDER BY updated_at DESC, inner_conversation_id DESC LIMIT ? OFFSET ?`
+	args = append(args, size, (page-1)*size)
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var result []ConversationRow
+	for rows.Next() {
+		var row ConversationRow
+		if err := rows.Scan(&row.InnerID, &row.ConversationID, &row.PlatformID, &row.UserID, &row.Content, &row.Title, &row.PersonaID, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		result = append(result, row)
+	}
+	return result, total, rows.Err()
+}
+
+// placeholders expands n bind placeholders and appends values to args.
+func placeholders(n int, args *[]interface{}, vals []string) string {
+	out := make([]string, n)
+	for i, v := range vals {
+		out[i] = "?"
+		*args = append(*args, v)
+	}
+	return strings.Join(out, ",")
+}
+
 // UpdateConversationPersona updates a conversation's persona id.
 func (d *Database) UpdateConversationPersona(convID, personaID string) error {
 	_, err := d.db.Exec(
@@ -634,6 +727,27 @@ func (d *Database) ListPreferencesByScope(scope string) ([]PreferenceRow, error)
 	rows, err := d.db.Query(
 		`SELECT scope, scope_id, key, value FROM preferences WHERE scope = ? ORDER BY scope_id, key`,
 		scope,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PreferenceRow
+	for rows.Next() {
+		var r PreferenceRow
+		if err := rows.Scan(&r.Scope, &r.ScopeID, &r.Key, &r.Value); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ListPreferencesByScopeID returns every row for a scope + scope_id.
+func (d *Database) ListPreferencesByScopeID(scope, scopeID string) ([]PreferenceRow, error) {
+	rows, err := d.db.Query(
+		`SELECT scope, scope_id, key, value FROM preferences WHERE scope = ? AND scope_id = ? ORDER BY key`,
+		scope, scopeID,
 	)
 	if err != nil {
 		return nil, err
@@ -1118,7 +1232,11 @@ func (d *Database) GetKB(kbID string) (*KBRow, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	if !rows.Next() {
+	found := rows.Next()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if !found {
 		return nil, fmt.Errorf("knowledge base %s not found", kbID)
 	}
 	return scanKBRow(rows)
@@ -1188,6 +1306,12 @@ func (d *Database) InsertKBChunk(c KBChunk) error {
 
 // ListKBChunks returns chunk records for a KB, optionally filtered by doc_id.
 func (d *Database) ListKBChunks(kbID, docID string) ([]KBChunk, error) {
+	return d.ListKBChunksPage(kbID, docID, 0, 0)
+}
+
+// ListKBChunksPage returns one page of chunk records for a KB (limit<=0 =
+// no limit), optionally filtered by doc_id.
+func (d *Database) ListKBChunksPage(kbID, docID string, limit, offset int) ([]KBChunk, error) {
 	query := `SELECT chunk_id, kb_id, doc_id, COALESCE(doc_name,''), content, chunk_index
 		FROM knowledge_base_chunks WHERE kb_id=?`
 	args := []any{kbID}
@@ -1196,6 +1320,10 @@ func (d *Database) ListKBChunks(kbID, docID string) ([]KBChunk, error) {
 		args = append(args, docID)
 	}
 	query += ` ORDER BY chunk_index ASC`
+	if limit > 0 {
+		query += ` LIMIT ? OFFSET ?`
+		args = append(args, limit, offset)
+	}
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
 		return nil, err
@@ -1223,6 +1351,28 @@ func (d *Database) CountKBChunks(kbID, docID string) (int, error) {
 	var n int
 	err := d.db.QueryRow(query, args...).Scan(&n)
 	return n, err
+}
+
+// CountKBChunksByDoc returns chunk counts grouped by doc_id for a KB in a
+// single query（文档列表统计的聚合版，替代逐文档 N+1 的 CountKBChunks）。
+func (d *Database) CountKBChunksByDoc(kbID string) (map[string]int, error) {
+	rows, err := d.db.Query(
+		`SELECT doc_id, COUNT(*) FROM knowledge_base_chunks WHERE kb_id=? GROUP BY doc_id`,
+		kbID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var docID string
+		var n int
+		if err := rows.Scan(&docID, &n); err != nil {
+			return nil, err
+		}
+		out[docID] = n
+	}
+	return out, rows.Err()
 }
 
 // DeleteKBChunks removes all chunks for a KB (optionally per doc).

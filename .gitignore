@@ -1,5 +1,6 @@
 # 忽略编译文件
 bin/
+astrbot
 
 # 忽略用户数据文件
 data/
@@ -8,6 +9,7 @@ data/
 memory.md
 tmp/
 bug.md
+start-astrbot.sh
 
 # Python 插件误写仓库根的数据目录（正确位置 data/plugin_data）
 plugin_data/

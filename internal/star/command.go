@@ -85,6 +85,16 @@ func (cf *CommandFilter) HasParentCommand() bool {
 	return cf.parentGroup != nil
 }
 
+// ParentGroupName returns the immediate parent group's name ("" = top-level).
+func (cf *CommandFilter) ParentGroupName() string {
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+	if cf.parentGroup == nil {
+		return ""
+	}
+	return cf.parentGroup.GroupName()
+}
+
 // Aliases returns the registered aliases.
 func (cf *CommandFilter) Aliases() []string {
 	cf.mu.RLock()
@@ -202,6 +212,16 @@ func (gf *CommandGroupFilter) GroupName() string {
 	gf.mu.RLock()
 	defer gf.mu.RUnlock()
 	return gf.groupName
+}
+
+// ParentGroupName returns the parent group's name ("" = top-level group).
+func (gf *CommandGroupFilter) ParentGroupName() string {
+	gf.mu.RLock()
+	defer gf.mu.RUnlock()
+	if gf.parentGroup == nil {
+		return ""
+	}
+	return gf.parentGroup.GroupName()
 }
 
 // SetGroupName updates the group name and recursively invalidates all
@@ -436,6 +456,10 @@ func BuildDescriptor(registry HandlerLookup, handler *StarHandlerMetadata) *Comm
 			desc.CommandType = "command"
 			desc.CurrentFragment = f.CommandName()
 			desc.EffectiveCommand = f.GetCompleteCommandNames()[0]
+			if pg := f.ParentGroupName(); pg != "" {
+				desc.IsSubCommand = true
+				desc.ParentSignature = pg
+			}
 		case *CommandGroupFilter:
 			desc.CommandType = "group"
 			desc.IsGroup = true
@@ -443,6 +467,10 @@ func BuildDescriptor(registry HandlerLookup, handler *StarHandlerMetadata) *Comm
 			names := f.GetCompleteCommandNames()
 			if len(names) > 0 {
 				desc.EffectiveCommand = names[0]
+			}
+			if pg := f.ParentGroupName(); pg != "" {
+				desc.IsSubCommand = true
+				desc.ParentSignature = pg
 			}
 		}
 	}

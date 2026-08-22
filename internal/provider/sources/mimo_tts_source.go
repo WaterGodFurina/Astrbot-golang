@@ -35,12 +35,20 @@ type MiMoTTSApiSource struct {
 // NewMiMoTTSApiSource creates a MiMo TTS provider.
 func NewMiMoTTSApiSource(config, settings map[string]interface{}) *MiMoTTSApiSource {
 	bp := provider.NewBaseProvider(config, settings)
+	// 音频格式会拼进输出文件名: 白名单收敛, 防止注入路径分隔符。
+	audioFormat := strings.ToLower(configString(config, "mimo-tts-format", "wav"))
+	switch audioFormat {
+	case "wav", "mp3", "opus", "pcm":
+	default:
+		logger.Warn("MiMo TTS: 不支持的音频格式 %q, 回退到 wav", audioFormat)
+		audioFormat = "wav"
+	}
 	s := &MiMoTTSApiSource{
 		BaseProvider: bp,
 		apiKey:       configString(config, "api_key", ""),
 		apiBase:      configString(config, "api_base", mimoDefaultAPIBase),
 		voice:        configString(config, "mimo-tts-voice", mimoDefaultTTSVoice),
-		audioFormat:  configString(config, "mimo-tts-format", "wav"),
+		audioFormat:  audioFormat,
 		stylePrompt:  configString(config, "mimo-tts-style-prompt", ""),
 		dialect:      configString(config, "mimo-tts-dialect", ""),
 		seedText:     configString(config, "mimo-tts-seed-text", mimoDefaultTTSSeed),

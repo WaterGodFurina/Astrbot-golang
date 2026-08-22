@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -246,7 +247,7 @@ func FileToBase64(path string) (string, error) {
 
 // base64Encode wraps standard base64 encoding.
 func base64Encode(data []byte) string {
-	return base64StdEncoding(data)
+	return base64.StdEncoding.EncodeToString(data)
 }
 
 // IsURL checks if a string looks like a URL.
@@ -286,40 +287,4 @@ func GetLocalIPAddresses() []string {
 		}
 	}
 	return ips
-}
-
-// base64StdEncoding uses encoding/base64.
-func base64StdEncoding(data []byte) string {
-	return base64EncodeBytes(data)
-}
-
-// base64EncodeBytes is split to avoid import cycle issues in tests.
-func base64EncodeBytes(data []byte) string {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-	result := make([]byte, 0, (len(data)+2)/3*4)
-	for i := 0; i < len(data); i += 3 {
-		var b0, b1, b2 byte
-		b0 = data[i]
-		if i+1 < len(data) {
-			b1 = data[i+1]
-		}
-		if i+2 < len(data) {
-			b2 = data[i+2]
-		}
-		result = append(result,
-			chars[b0>>2],
-			chars[((b0&0x03)<<4)|(b1>>4)],
-			chars[((b1&0x0f)<<2)|(b2>>6)],
-			chars[b2&0x3f],
-		)
-	}
-	// Pad
-	pad := len(data) % 3
-	if pad == 1 {
-		result[len(result)-2] = '='
-		result[len(result)-1] = '='
-	} else if pad == 2 {
-		result[len(result)-1] = '='
-	}
-	return string(result)
 }

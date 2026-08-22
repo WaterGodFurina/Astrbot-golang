@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -85,7 +86,7 @@ func TestAIBotURLVerification(t *testing.T) {
 	echostr := ""
 	// 使用 API 客户端的加解密器构造 echostr
 	_, echostr = a.apiClient.wxcpt.encrypt("echo_verify_123")
-	timestamp := "1700000000"
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 	nonce := "nonce123"
 	_, sig := a.apiClient.wxcpt.GetSHA1(timestamp, nonce, echostr)
 
@@ -124,14 +125,15 @@ func TestAIBotCallbackTextMessage(t *testing.T) {
 
 	// 构造明文消息并加密
 	plain := `{"chattype":"single","msgtype":"text","text":{"content":"你好"},"from":{"userid":"user_1"}}`
-	ret, encrypted := crypt.EncryptMsg(plain, "nonce1", "1700000001")
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	ret, encrypted := crypt.EncryptMsg(plain, "nonce1", ts)
 	if ret != MsgCryptOK {
 		t.Fatal("加密失败")
 	}
 	postData := []byte(`{"encrypt":"` + extractEncryptField(t, encrypted) + `"}`)
-	_, sig := crypt.GetSHA1("1700000001", "nonce1", extractEncryptField(t, encrypted))
+	_, sig := crypt.GetSHA1(ts, "nonce1", extractEncryptField(t, encrypted))
 
-	req := httptest.NewRequest(http.MethodPost, "/webhook/wecom-ai-bot?msg_signature="+sig+"&timestamp=1700000001&nonce=nonce1",
+	req := httptest.NewRequest(http.MethodPost, "/webhook/wecom-ai-bot?msg_signature="+sig+"&timestamp="+ts+"&nonce=nonce1",
 		strings.NewReader(string(postData)))
 	w := httptest.NewRecorder()
 	a.server.handleCallback(w, req)

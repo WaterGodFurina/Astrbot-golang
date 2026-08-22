@@ -517,8 +517,10 @@ const jobUmoFilterOptions = computed(() => [
 ]);
 
 const filteredJobs = computed(() => {
-  const query = taskSearch.value.trim().toLowerCase();
-  const umo = selectedUmoFilter.value;
+  // clearable 搜索框清除时 v-model 可能是 null/undefined 而非空串，
+  // 直接 .trim() 会让整个 computed 抛错导致列表空白。
+  const query = String(taskSearch.value ?? "").trim().toLowerCase();
+  const umo = String(selectedUmoFilter.value ?? "");
   return jobs.value.filter((job) => {
     const session = getJobSession(job);
     if (umo === NO_DELIVERY_TARGET_FILTER && session) {

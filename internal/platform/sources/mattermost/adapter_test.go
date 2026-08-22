@@ -352,7 +352,7 @@ func TestConvertMessageGroup(t *testing.T) {
 		"message": "@astrbot 你好", "create_at": float64(1730000000000),
 	}
 	data := map[string]interface{}{"channel_type": "O", "sender_name": "@alice"}
-	abm := adapter.convertMessage(post, data)
+	abm := adapter.convertMessage(context.Background(), post, data)
 	if abm == nil {
 		t.Fatal("转换失败")
 	}
@@ -386,7 +386,7 @@ func TestConvertMessageDirect(t *testing.T) {
 		"id": "p1", "user_id": "u1", "channel_id": "c1", "message": "hi",
 	}
 	data := map[string]interface{}{"channel_type": "D"}
-	abm := adapter.convertMessage(post, data)
+	abm := adapter.convertMessage(context.Background(), post, data)
 	if abm.Type != "FriendMessage" {
 		t.Fatalf("私聊类型错误: %s", abm.Type)
 	}

@@ -45,30 +45,42 @@ var logger = log.GetDefault().WithComponent("Dashboard")
 
 // Server is the WebUI API server.
 type Server struct {
-	mux                *http.ServeMux
-	srv                *http.Server
-	mu                 sync.RWMutex
-	handlers           map[string]http.HandlerFunc
-	auth               *PasswordManager
-	port               int
-	webuiDir           string
-	dataDir            string
-	configMgr          interface{} // *config.ConfigManager
-	providerMgr        interface{} // *provider.ProviderManager
-	platformMgr        interface{} // *platform.PlatformManager
-	eventBus           interface{} // *core.EventBus
-	chatAdapter        *chatStreamAdapter
-	chatBus            *core.EventBus
-	conversationMgr    interface{} // *conversation.Manager
-	cronMgr            interface{} // *cron.CronJobManager
-	subPluginMgr       *plugin.SubprocessManager
-	kbMgr              interface{}              // *knowledgebase.Manager
-	kbTasks            map[string]*kbUploadTask // knowledge base upload task states
-	skillMgr           interface{}              // *skills.SkillManager
-	personaMgr         interface{}              // *persona.PersonaManager
-	personas           *personaStore
-	chat               *chatStore
-	mcp                *mcpStore
+	mux *http.ServeMux
+	srv *http.Server
+	mu  sync.RWMutex
+	// configMu 串行化"快照→修改→整键回写"的配置保存组合（upsertProvider 等），
+	// 防止并发保存请求基于同一旧快照互相覆盖导致配置丢失。
+	configMu        sync.Mutex
+	handlers        map[string]http.HandlerFunc
+	auth            *PasswordManager
+	port            int
+	webuiDir        string
+	dataDir         string
+	configMgr       interface{} // *config.ConfigManager
+	providerMgr     interface{} // *provider.ProviderManager
+	platformMgr     interface{} // *platform.PlatformManager
+	eventBus        interface{} // *core.EventBus
+	chatAdapter     *chatStreamAdapter
+	chatBus         *core.EventBus
+	conversationMgr interface{} // *conversation.Manager
+	cronMgr         interface{} // *cron.CronJobManager
+	subPluginMgr    *plugin.SubprocessManager
+	kbMgr           interface{}              // *knowledgebase.Manager
+	kbTasks         map[string]*kbUploadTask // knowledge base upload task states
+	skillMgr        interface{}              // *skills.SkillManager
+	personaMgr      interface{}              // *persona.PersonaManager
+	personas        *personaStore
+	chat            *chatStore
+	threads         *threadStore
+	projects        *projectStore
+	apiKeys         *apiKeyStore
+	mcp             *mcpStore
+	// backupTaskMu/backupTasks 跟踪后台备份任务（导出/导入）进度。
+	backupTaskMu sync.Mutex
+	backupTasks  map[string]*backupTaskState
+	// uploadMu/uploadSessions 跟踪备份分片上传会话。
+	uploadMu           sync.Mutex
+	uploadSessions     map[string]*uploadSession
 	starMgr            interface{} // *star.Manager
 	database           *db.Database
 	startTime          time.Time
@@ -94,6 +106,16 @@ type Server struct {
 	// updateProgress 跟踪"切换版本"升级进度（keyed by progress_id），供前端轮询。
 	updateProgressMu sync.Mutex
 	updateProgress   map[string]*installStatus
+	// chatRuns 跟踪每个 chat session 正在进行的 run（sessionID -> runID ->
+	// cancel），POST /chat/sessions/{id}/stop 与 WebSocket interrupt 复用，
+	// 对齐 Python active_event_registry.request_agent_stop_all。
+	chatRunMu sync.Mutex
+	chatRuns  map[string]map[string]context.CancelFunc
+	// ticketMu/wsTickets：一次性 ws-ticket 表（见 auth.go issueWSTicket /
+	// consumeWSTicket），用于 WebSocket 连接与下载 URL 鉴权，避免长效 JWT
+	// 进 query。惰性清理过期/已用条目。
+	ticketMu  sync.Mutex
+	wsTickets map[string]*wsTicket
 }
 
 // RegisterWebhook registers a unified-webhook callback by uuid.
@@ -125,6 +147,43 @@ func (s *Server) UnregisterWebhook(uuid string) {
 	s.webhookMu.Lock()
 	defer s.webhookMu.Unlock()
 	delete(s.webhookHandlers, uuid)
+}
+
+// registerChatRun tracks a run's cancel func for a chat session.
+func (s *Server) registerChatRun(sessionID, runID string, cancel context.CancelFunc) {
+	s.chatRunMu.Lock()
+	defer s.chatRunMu.Unlock()
+	if s.chatRuns[sessionID] == nil {
+		s.chatRuns[sessionID] = make(map[string]context.CancelFunc)
+	}
+	s.chatRuns[sessionID][runID] = cancel
+}
+
+// unregisterChatRun removes a finished run from the registry.
+func (s *Server) unregisterChatRun(sessionID, runID string) {
+	s.chatRunMu.Lock()
+	defer s.chatRunMu.Unlock()
+	if runs, ok := s.chatRuns[sessionID]; ok {
+		delete(runs, runID)
+		if len(runs) == 0 {
+			delete(s.chatRuns, sessionID)
+		}
+	}
+}
+
+// cancelChatRuns cancels every in-flight run of a session (POST stop /
+// session delete) and returns the number of runs stopped. Mirrors Python
+// active_event_registry.request_agent_stop_all.
+func (s *Server) cancelChatRuns(sessionID string) int {
+	s.chatRunMu.Lock()
+	runs := s.chatRuns[sessionID]
+	stopped := len(runs)
+	for _, cancel := range runs {
+		cancel()
+	}
+	delete(s.chatRuns, sessionID)
+	s.chatRunMu.Unlock()
+	return stopped
 }
 
 // handleWebhooks dispatches GET/POST /api/v1/webhooks/platforms/{webhook_uuid}.
@@ -229,12 +288,19 @@ func NewServer(port int, configPath string) *Server {
 	s.auth = NewPasswordManager(configPath)
 	s.personas = newPersonaStore(filepath.Dir(configPath))
 	s.chat = newChatStore(filepath.Dir(configPath))
+	s.threads = newThreadStore(filepath.Dir(configPath))
+	s.projects = newProjectStore(filepath.Dir(configPath))
+	s.apiKeys = newAPIKeyStore(filepath.Dir(configPath))
 	s.chatAdapter = newChatStreamAdapter()
 	s.mcp = newMCPStore(filepath.Dir(configPath))
 	s.updateProgress = make(map[string]*installStatus)
 	s.installProgress = make(map[string]*installStatus)
 	s.marketCache = make(map[string]*marketCacheEntry)
 	s.kbTasks = make(map[string]*kbUploadTask)
+	s.backupTasks = make(map[string]*backupTaskState)
+	s.uploadSessions = make(map[string]*uploadSession)
+	s.chatRuns = make(map[string]map[string]context.CancelFunc)
+	s.wsTickets = make(map[string]*wsTicket)
 	s.loginLimiter = newLoginRateLimiter()
 	s.setupRoutes()
 	s.srv = &http.Server{
@@ -257,6 +323,12 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		if v, ok := managers["config"]; ok {
 			s.configMgr = v
 			s.auth.SetConfigManager(v)
+			// NewPasswordManager 在 CM 加载之后运行，可能因空值规则重置过
+			// 凭据（直写磁盘）：把最新 auth 状态回填进 CM 快照并落盘一次，
+			// 消除"auth 直写磁盘 vs CM 旧快照（username/change_required 为
+			// 重置前的值）"的不一致窗口——否则首次配置保存就会把重置状态
+			// 冲掉。
+			s.syncAuthToConfig()
 		}
 		if v, ok := managers["provider"]; ok {
 			s.providerMgr = v
@@ -397,6 +469,8 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, parts []stri
 		s.handleSetupStatus(w, r)
 	case "setup":
 		s.handleSetup(w, r)
+	case "ws-ticket":
+		s.handleWSTicket(w, r)
 	case "totp":
 		s.handleTOTP(w, r, parts[1:])
 	case "account":
@@ -445,6 +519,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if creds.Username == s.auth.Username() && s.auth.VerifyPassword(creds.Password) {
+		// 旧版无盐 MD5 哈希登录成功后立即升级为 PBKDF2 重新落盘（不注销会话）。
+		upgradeRequired := false
+		if isMD5Hash(s.auth.HashedPassword()) {
+			s.auth.SetPasswordKeepUsername(creds.Password)
+			upgradeRequired = true
+		}
 		// TOTP 双因素：启用后登录必须携带验证码（或恢复码）。
 		// 使用恢复码登录会一次性禁用双因素（对齐 Python 语义）。
 		if s.auth.TOTPEnabled() {
@@ -465,10 +545,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, apiError("签发会话令牌失败: "+err.Error()))
 			return
 		}
+		// 除 JSON 返回外，同步种下 HttpOnly Cookie（Path=/、SameSite=Lax，
+		// HTTPS 时 Secure），供前端迁移后无需再在 sessionStorage 保存 token；
+		// 现有前端经 Authorization 头鉴权的路径继续可用（Cookie 是新增途径）。
+		s.setSessionCookie(w, token)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"token":                     token,
 			"username":                  s.auth.Username(),
-			"password_upgrade_required": false,
+			"password_upgrade_required": upgradeRequired,
 			"md5_pwd_hint":              false,
 			"change_pwd_hint":           s.auth.PasswordChangeRequired(),
 		}))
@@ -483,7 +567,62 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if s.auth != nil && token != "" {
 		s.auth.Logout(token)
 	}
+	// 无论 token 来自 Cookie 还是 Authorization 头，登出都清除 Cookie。
+	s.clearSessionCookie(w)
 	writeJSON(w, http.StatusOK, apiOK(nil))
+}
+
+// sessionCookieName 是登录成功后种下的会话 Cookie 名（复核开放项 10-1）：
+// HttpOnly 防 JS 读取（前端 token 从 sessionStorage 迁向 Cookie 的长期方案），
+// 与 Authorization Bearer / ?token= 并存，互为回退。
+const sessionCookieName = "astrbot_token"
+
+// setSessionCookie 写入会话 Cookie：Path=/、HttpOnly、SameSite=Lax；仅在
+// dashboard.ssl 实际启用 HTTPS（enable + cert_file + key_file 齐备，与
+// Start 的 ServeTLS 分支条件一致）时附加 Secure。HTTP 部署下不加 Secure，
+// 避免本地 HTTP 调试时浏览器静默丢弃 Cookie。
+func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
+	c := &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Expires:  time.Now().Add(tokenTTL),
+	}
+	if enable, cert, key := s.sslConfig(); enable && cert != "" && key != "" {
+		c.Secure = true
+	}
+	http.SetCookie(w, c)
+}
+
+// clearSessionCookie 清除会话 Cookie（登出）。
+func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+	})
+}
+
+// handleWSTicket 处理 POST /api/v1/auth/ws-ticket：已认证会话换取一次性
+// 短期票据（30s、单次使用），供 WebSocket 连接 / 下载 URL 携带，避免长效
+// JWT 进 query（会进代理/服务端日志）。路由已由 apiAuthAllowed 保证需已
+// 认证会话（JWT/Cookie；API key 拒绝——auth 子端点 systemOnly 语义）。
+func (s *Server) handleWSTicket(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	ticket := s.issueWSTicket()
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"ticket":     ticket,
+		"expires_in": int(wsTicketTTL.Seconds()),
+	}))
 }
 
 // handleCheck handles GET /api/auth/check.
@@ -493,7 +632,10 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	username := ""
 	if s.auth != nil {
 		loggedIn = s.auth.IsAuthenticated(token)
-		username = s.auth.Username()
+		if loggedIn {
+			// 未认证请求不返回管理员用户名，避免泄露账户名
+			username = s.auth.Username()
+		}
 	}
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 		"loggedin": loggedIn,
@@ -511,6 +653,9 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		"setup_required":             setupRequired,
 		"skip_default_password_auth": false,
 		"password_upgrade_required":  false,
+		// 首次安装/重置窗口内 setup 必须提供启动时打印在控制台的初始密码
+		// （防窗口期内未授权者抢注管理员账户），前端据此显示初始密码输入框。
+		"require_initial_password": setupRequired && s.auth.InitialPassword() != "",
 	}))
 }
 
@@ -614,7 +759,14 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	// Outside the first-install onboarding flow (a random password was set and
 	// a change is required), the caller must prove knowledge of the current
 	// password so this endpoint cannot be used to hijack the account.
-	if !s.auth.PasswordChangeRequired() && !s.auth.VerifyPassword(body.OldPassword) {
+	if s.auth.PasswordChangeRequired() {
+		// 首次安装/重置密码窗口内 setup 端点公开，但仍必须提供启动时生成并
+		// 打印在控制台的初始密码，防止窗口期内任何人抢注管理员账户。
+		if !s.auth.VerifyPassword(body.OldPassword) {
+			writeJSON(w, http.StatusUnauthorized, apiError("请提供初始密码（见启动控制台）"))
+			return
+		}
+	} else if !s.auth.VerifyPassword(body.OldPassword) {
 		writeJSON(w, http.StatusUnauthorized, apiError("旧密码错误"))
 		return
 	}
@@ -627,6 +779,8 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	token := generateRandomToken(32)
 	s.auth.RegisterToken(token)
+	// 首次安装/重置流程完成即建立会话：与登录一致，同步种下 HttpOnly Cookie。
+	s.setSessionCookie(w, token)
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 		"token":                     token,
 		"username":                  s.auth.Username(),
@@ -724,13 +878,17 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 		}
 		s.handleGhproxyTest(w, r)
 	case "storage":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"total": 0,
-		}))
+		if len(parts) > 1 && parts[1] == "cleanup" {
+			if r.Method == http.MethodPost {
+				s.cleanupStorage(w, r)
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(s.getStorageStatus()))
 	case "storage-cleanup", "cleanup":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"cleaned": 0,
-		}))
+		s.cleanupStorage(w, r)
 	case "provider-tokens":
 		days := 1
 		if v := r.URL.Query().Get("days"); v != "" {
@@ -744,9 +902,188 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 	}
 }
 
+// storageDirStat 统计一个目录下的文件大小/数量（对齐 Python
+// StorageCleaner._summarize_files）。
+func storageDirStat(dir string) (sizeBytes int64, fileCount int) {
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		fileCount++
+		sizeBytes += info.Size()
+		return nil
+	})
+	return sizeBytes, fileCount
+}
+
+// storageDirEntries 收集目录下全部文件路径（对齐 Python _iter_files）。
+func storageDirEntries(dir string) []string {
+	var out []string
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		out = append(out, path)
+		return nil
+	})
+	return out
+}
+
+// getStorageStatus 返回 logs/temp 两个清理目标的占用统计
+// （对齐 Python StorageCleaner.get_status，frontend StorageCleanupPanel 消费）。
+func (s *Server) getStorageStatus() map[string]interface{} {
+	logsDir := filepath.Join(s.kbDataDir(), "logs")
+	tempDir := filepath.Join(s.kbDataDir(), "temp")
+	logsBytes, logsCount := storageDirStat(logsDir)
+	cacheBytes, cacheCount := storageDirStat(tempDir)
+	_, logsExists := os.Stat(logsDir)
+	_, tempExists := os.Stat(tempDir)
+	return map[string]interface{}{
+		"logs": map[string]interface{}{
+			"size_bytes": logsBytes,
+			"file_count": logsCount,
+			"path":       logsDir,
+			"exists":     logsExists == nil,
+		},
+		"cache": map[string]interface{}{
+			"size_bytes": cacheBytes,
+			"file_count": cacheCount,
+			"path":       tempDir,
+			"exists":     tempExists == nil,
+		},
+		"total_bytes": logsBytes + cacheBytes,
+	}
+}
+
+// cleanupStorage implements POST /stats/storage/cleanup：按 target
+// （logs/cache/all）清理 data/logs 与 data/temp（对齐 Python
+// StorageCleaner.cleanup）。启用的日志文件（log_file_enable/trace_log_enable）
+// 只截断不删除。
+func (s *Server) cleanupStorage(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Target string `json:"target"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	target := strings.ToLower(strings.TrimSpace(body.Target))
+	if target == "" {
+		target = "all"
+	}
+	if target != "logs" && target != "cache" && target != "all" {
+		writeJSON(w, http.StatusBadRequest, apiError("Unsupported cleanup target: "+body.Target))
+		return
+	}
+	cfg := s.getConfigData("default")
+	logFileEnabled, _ := cfg["log_file_enable"].(bool)
+	traceLogEnabled, _ := cfg["trace_log_enable"].(bool)
+	resolveLogPath := func(key, def string) string {
+		if v, ok := cfg[key].(string); ok && v != "" {
+			if filepath.IsAbs(v) {
+				return v
+			}
+			return filepath.Join(s.kbDataDir(), filepath.FromSlash(v))
+		}
+		return filepath.Join(s.kbDataDir(), filepath.FromSlash(def))
+	}
+	activeLogs := map[string]bool{}
+	if logFileEnabled {
+		activeLogs[resolveLogPath("log_file_path", "logs/astrbot.log")] = true
+	}
+	if traceLogEnabled {
+		activeLogs[resolveLogPath("trace_log_path", "logs/astrbot.trace.log")] = true
+	}
+
+	cleanTarget := func(name string) map[string]interface{} {
+		var files []string
+		if name == "logs" {
+			files = storageDirEntries(filepath.Join(s.kbDataDir(), "logs"))
+		} else {
+			files = storageDirEntries(filepath.Join(s.kbDataDir(), "temp"))
+		}
+		removedBytes, deletedFiles, truncatedFiles, failedFiles := int64(0), 0, 0, 0
+		for _, f := range files {
+			info, err := os.Lstat(f)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			size := info.Size()
+			if activeLogs[f] {
+				if err := os.WriteFile(f, nil, 0o644); err == nil {
+					truncatedFiles++
+					removedBytes += size
+				} else {
+					failedFiles++
+				}
+				continue
+			}
+			if err := os.Remove(f); err == nil {
+				deletedFiles++
+				removedBytes += size
+			} else {
+				failedFiles++
+			}
+		}
+		return map[string]interface{}{
+			"removed_bytes":   removedBytes,
+			"processed_files": deletedFiles + truncatedFiles,
+			"deleted_files":   deletedFiles,
+			"truncated_files": truncatedFiles,
+			"failed_files":    failedFiles,
+		}
+	}
+
+	results := map[string]interface{}{}
+	aggregates := map[string]interface{}{
+		"removed_bytes":   int64(0),
+		"processed_files": 0,
+		"deleted_files":   0,
+		"truncated_files": 0,
+		"failed_files":    0,
+	}
+	names := []string{target}
+	if target == "all" {
+		names = []string{"logs", "cache"}
+	}
+	for _, name := range names {
+		res := cleanTarget(name)
+		results[name] = res
+		for _, k := range []string{"removed_bytes", "processed_files", "deleted_files", "truncated_files", "failed_files"} {
+			aggregates[k] = sumCleanupMetrics(aggregates[k], res[k])
+		}
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"target":          target,
+		"results":         results,
+		"status":          s.getStorageStatus(),
+		"removed_bytes":   aggregates["removed_bytes"],
+		"processed_files": aggregates["processed_files"],
+		"deleted_files":   aggregates["deleted_files"],
+		"truncated_files": aggregates["truncated_files"],
+		"failed_files":    aggregates["failed_files"],
+	}))
+}
+
+// sumCleanupMetrics 累加清理结果指标（int64/int 混合）。
+func sumCleanupMetrics(a, b interface{}) interface{} {
+	switch av := a.(type) {
+	case int64:
+		switch bv := b.(type) {
+		case int64:
+			return av + bv
+		case int:
+			return av + int64(bv)
+		}
+	case int:
+		switch bv := b.(type) {
+		case int64:
+			return int64(av) + bv
+		case int:
+			return av + bv
+		}
+	}
+	return a
+}
+
 // handleGhproxyTest 测 GitHub 加速地址连通性（对齐 Python
-// stat_service.test_ghproxy_connection）：GET <proxy>/https://github.com/...
-// 的测试文件测延迟（毫秒）。proxy_url 支持 query 与 POST body 两种传参。
 func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
 	proxyURL := strings.TrimSpace(r.URL.Query().Get("proxy_url"))
 	if proxyURL == "" {
@@ -762,11 +1099,17 @@ func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
 	}
 	testURL := strings.TrimRight(proxyURL, "/") +
 		"/https://github.com/AstrBotDevs/AstrBot/raw/refs/heads/master/.python-version"
+	// 校验出站 URL 防 SSRF：仅 http/https，拒绝内网/回环/元数据地址与
+	// localhost 主机名（对齐 market.go validateOutboundURL）。
+	if err := validateOutboundURL(testURL); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("proxy_url 校验失败: "+err.Error()))
+		return
+	}
 	start := time.Now()
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := newOutboundClient(10 * time.Second)
 	// #nosec tainted-url-host -- 测速端点需 dashboard 登录鉴权（apiAuthAllowed），仅管理员可调用；
 	// 目标路径固定为 GitHub raw 文件（对齐 Python stat_service.test_ghproxy_connection），
-	// 响应体被丢弃（只上报延迟/状态码），非通用 SSRF 探测原语。
+	// 响应体被丢弃（只上报延迟/状态码），且 testURL 已通过 validateOutboundURL（防 SSRF）。
 	resp, err := client.Get(testURL) // nosemgrep: go.lang.security.injection.tainted-url-host.tainted-url-host
 	if err != nil {
 		logger.I18nWarn("ghproxy 测速失败 %s: %v", proxyURL, err)
@@ -1173,16 +1516,29 @@ func apiError(message string) map[string]interface{} {
 	}
 }
 
-// extractToken gets the Bearer token from the Authorization header.
+// extractToken 提取会话 token（复核开放项 10-1）：优先 HttpOnly Cookie
+// astrbot_token（新增鉴权途径，前端迁移中），其次 Authorization Bearer，
+// 最后回退 ?token= query（兼容旧 WebSocket / 备份下载客户端）。
+// Authorization 以 "ApiKey " 开头时按 API key 处理（对齐 Python
+// _extract_dashboard_jwt 语义），不视为 JWT / legacy token。
 func extractToken(r *http.Request) string {
+	if c, err := r.Cookie(sessionCookieName); err == nil && c.Value != "" {
+		return c.Value
+	}
 	auth := r.Header.Get("Authorization")
-	if auth == "" {
-		return ""
+	if auth != "" {
+		if strings.HasPrefix(auth, "Bearer ") {
+			return strings.TrimPrefix(auth, "Bearer ")
+		}
+		if strings.HasPrefix(auth, "ApiKey ") {
+			return ""
+		}
+		return auth
 	}
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimPrefix(auth, "Bearer ")
+	if v := strings.TrimSpace(r.URL.Query().Get("token")); v != "" {
+		return v
 	}
-	return auth
+	return ""
 }
 
 // Start begins serving.
@@ -1313,6 +1669,15 @@ func writeJSON(w http.ResponseWriter, code int, data interface{}) {
 	s := mustMarshal(data)
 	if len(s) > 300 {
 		s = s[:300] + "...(truncated)"
+	}
+	// 敏感响应体（登录/重置返回的 token、一次性 ws-ticket、TOTP 密钥/otpauth
+	// 链接与恢复码、provider 配置里的 API key）不写入访问日志；writeJSON 无
+	// 请求上下文，按响应中的敏感键名就地脱敏。
+	if strings.Contains(s, `"token":`) || strings.Contains(s, `"ticket":`) ||
+		strings.Contains(s, `"secret":`) ||
+		strings.Contains(s, `"recovery_codes":`) || strings.Contains(s, `"otpauth_url":`) ||
+		strings.Contains(s, `"key":`) || strings.Contains(s, `"api_key":`) {
+		s = `"<redacted>"`
 	}
 	logger.Debug("API response: %s", s)
 }
@@ -1509,16 +1874,64 @@ func (s *Server) setConfigDataAll(updates map[string]interface{}) error {
 	return nil
 }
 
+// mutateConfig 在单一临界区内完成"快照→修改→整键回写"，使读-改-写组合
+// （upsertProvider/setProviderEnabled/upsertBot 等）对并发保存请求串行化，
+// 避免两个请求都基于同一旧快照、后写者覆盖前写者导致配置丢失。
+func (s *Server) mutateConfig(fn func(cfg map[string]interface{}) error) error {
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	cfg := s.getConfigSnapshot()
+	if err := fn(cfg); err != nil {
+		return err
+	}
+	return s.setConfigDataAll(cfg)
+}
+
+// syncAuthToConfig 把 PasswordManager 的当前凭据状态回填进 ConfigManager
+// 快照并落盘（启动时 SetConfigManager 之后调用一次）。
+func (s *Server) syncAuthToConfig() {
+	if s.configMgr == nil || s.auth == nil {
+		return
+	}
+	cm, ok := s.configMgr.(*config.ConfigManager)
+	if !ok {
+		return
+	}
+	cfg := cm.Get("default")
+	if cfg == nil {
+		return
+	}
+	dash, _ := cfg.Get("dashboard").(map[string]interface{})
+	if dash == nil {
+		dash = map[string]interface{}{}
+	}
+	s.injectAuthFields(dash)
+	if err := cfg.Update(map[string]interface{}{"dashboard": dash}); err != nil {
+		return
+	}
+	_ = cfg.Save()
+}
+
 // injectAuthFields re-asserts the dashboard auth fields from the password
 // manager so config saves never wipe them out.
 func (s *Server) injectAuthFields(dash map[string]interface{}) {
 	if s.auth == nil {
 		return
 	}
-	dash["username"] = s.auth.Username()
+	// 等待状态（初始密码已生成、用户尚未完成 setup）下不回填 username：
+	// 重置只落密码哈希，username 键保持缺失，下次启动按"无键=等待状态"
+	// 语义处理而不是误判为已设置账号。
+	if !s.auth.PasswordChangeRequired() {
+		dash["username"] = s.auth.Username()
+	} else {
+		delete(dash, "username")
+	}
 	if h := s.auth.HashedPassword(); h != "" {
 		dash["password"] = h
 	}
+	// change_required 必须随保存回填：否则用户手改 password 为空触发重置后，
+	// ConfigManager 用旧快照（false）覆盖掉重置流程写入的 true，等待状态丢失。
+	dash["password_change_required"] = s.auth.PasswordChangeRequired()
 	// 明文密码不再持久化：password 字段只存哈希，配置保存（会剔除 password
 	// 键）不会丢失凭据。
 	if sec := s.auth.JWTSecret(); sec != "" {

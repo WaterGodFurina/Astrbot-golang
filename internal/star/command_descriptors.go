@@ -45,23 +45,59 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 		}
 		// permission
 		desc.Permission = permissionFor(h)
-		// sub_command marker (bridge registers group commands as plain filters)
+		// 组命令 type 统一为 "group"（对齐 Python command_management 的
+		// command_type，WebUI 类型筛选按该值匹配）。
 		if desc.IsGroup {
-			desc.CommandType = "command_group"
+			desc.CommandType = "group"
 		}
 		descriptors = append(descriptors, desc)
 	}
 
-	// conflict detection: same effective_command from different handlers
+	// conflict detection: same effective_command from different handlers.
+	// 只统计启用的指令（对齐 Python _group_conflicts）。
 	seen := map[string]int{}
 	for _, d := range descriptors {
-		if d.EffectiveCommand != "" {
+		if d.EffectiveCommand != "" && d.Enabled {
 			seen[d.EffectiveCommand]++
 		}
 	}
 	for _, d := range descriptors {
-		if d.EffectiveCommand != "" && seen[d.EffectiveCommand] > 1 {
+		if d.EffectiveCommand != "" && d.Enabled && seen[d.EffectiveCommand] > 1 {
 			d.HasConflict = true
+		}
+	}
+
+	// 聚合子命令到虚拟组条目：子进程插件协议只上报子命令的 parent_group
+	// （组本身不是 handler），这里按 "pluginID + parent_group" 合成组节点
+	//（type=group），并把子命令挂到其 sub_commands；组节点的 effective
+	// command = 组名，enabled = 任一子命令启用。
+	groups := map[string]*CommandDescriptor{}
+	var groupOrder []string
+	for _, d := range descriptors {
+		if !d.IsSubCommand || d.ParentSignature == "" {
+			continue
+		}
+		key := d.PluginName + "\x00" + d.ParentSignature
+		g, ok := groups[key]
+		if !ok {
+			g = &CommandDescriptor{
+				HandlerFullName:  "plugin_" + d.PluginName + "_group_" + d.ParentSignature,
+				HandlerName:      d.ParentSignature,
+				PluginName:       d.PluginName,
+				CommandType:      "group",
+				IsGroup:          true,
+				CurrentFragment:  d.ParentSignature,
+				EffectiveCommand: d.ParentSignature,
+				OriginalCommand:  d.ParentSignature,
+				Enabled:          false,
+				SubCommands:      []*CommandDescriptor{},
+			}
+			groups[key] = g
+			groupOrder = append(groupOrder, key)
+		}
+		g.SubCommands = append(g.SubCommands, d)
+		if d.Enabled {
+			g.Enabled = true
 		}
 	}
 
@@ -76,7 +112,19 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 		}
 		return a < b
 	})
-	return descriptors
+
+	result := make([]*CommandDescriptor, 0, len(descriptors)+len(groupOrder))
+	for _, key := range groupOrder {
+		result = append(result, groups[key])
+	}
+	for _, d := range descriptors {
+		// 子命令已挂到组条目的 sub_commands，不再平铺输出。
+		if d.IsSubCommand && d.ParentSignature != "" {
+			continue
+		}
+		result = append(result, d)
+	}
+	return result
 }
 
 // pluginNameFor derives the owning plugin name for a handler.
@@ -118,29 +166,10 @@ func permissionFor(h *StarHandlerMetadata) string {
 	return "member"
 }
 
-// SetHandlerPermission updates (or inserts) the permission filter of a handler.
-func SetHandlerPermission(h *StarHandlerMetadata, permission string) {
-	if h == nil {
-		return
-	}
-	var target PermissionType
-	switch permission {
-	case "admin":
-		target = PermissionAdmin
-	default:
-		target = PermissionMember
-	}
-	for i, filter := range h.EventFilters {
-		if _, ok := filter.(*PermissionFilter); ok {
-			h.EventFilters[i] = NewPermissionFilter(target)
-			return
-		}
-	}
-	h.EventFilters = append(h.EventFilters, NewPermissionFilter(target))
-}
-
 // ApplyCommandConfigs applies persisted command configs (enabled / renamed /
-// permission) to the runtime handlers at startup.
+// permission) to the runtime handlers at startup. All mutations go through the
+// registry's locked entry points so they cannot race the message pipeline's
+// GetFilterHandlers reads.
 // records: map[handler_full_name] -> {enabled, effective_command, permission}
 func ApplyCommandConfigs(registry *StarHandlerRegistry, records map[string]interface{}) {
 	if registry == nil || records == nil {
@@ -151,18 +180,18 @@ func ApplyCommandConfigs(registry *StarHandlerRegistry, records map[string]inter
 		if !ok {
 			continue
 		}
-		handler := registry.Get(fullName)
-		if handler == nil {
-			continue
-		}
 		if enabled, ok := rec["enabled"].(bool); ok {
-			handler.Enabled = enabled
+			if enabled {
+				registry.Enable(fullName)
+			} else {
+				registry.Disable(fullName)
+			}
 		}
 		if cmd, ok := rec["effective_command"].(string); ok && cmd != "" {
 			_, _ = RenameCommand(registry, fullName, cmd)
 		}
 		if perm, ok := rec["permission"].(string); ok && perm != "" {
-			SetHandlerPermission(handler, perm)
+			registry.SetHandlerPermission(fullName, perm)
 		}
 	}
 }

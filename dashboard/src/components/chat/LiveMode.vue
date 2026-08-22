@@ -56,6 +56,8 @@
 import { ref, computed, onBeforeUnmount, watch } from 'vue';
 import { useTheme } from 'vuetify';
 import { chatApi } from '@/api/v1';
+import { getToken } from '@/utils/token';
+import { getWSTicket } from '@/utils/wsTicket';
 import { useVADRecording } from '@/composables/useVADRecording';
 import SiriOrb from './LiveOrb.vue';
 
@@ -275,39 +277,42 @@ async function stopLiveMode() {
 function connectWebSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
         // 获取存储的 token
-        const token = localStorage.getItem('token');
+        const token = getToken();
         if (!token) {
             reject(new Error('未登录，请先登录'));
             return;
         }
 
-        const wsUrl = chatApi.liveWebSocketUrl(token);
+        // 换取一次性票据后连接，票据失败时回退 ?token=（后端兼容）
+        getWSTicket().then((ticket) => {
+            const wsUrl = chatApi.liveWebSocketUrl(ticket, token);
 
-        // nosemgrep: websocket
-        ws = new WebSocket(wsUrl);
+            // nosemgrep: websocket
+            ws = new WebSocket(wsUrl);
 
-        ws.onopen = () => {
-            console.log('[Live Mode] WebSocket 连接成功');
-            resolve();
-        };
+            ws.onopen = () => {
+                console.log('[Live Mode] WebSocket 连接成功');
+                resolve();
+            };
 
-        ws.onerror = (error) => {
-            console.error('[Live Mode] WebSocket 错误:', error);
-            reject(error);
-        };
+            ws.onerror = (error) => {
+                console.error('[Live Mode] WebSocket 错误:', error);
+                reject(error);
+            };
 
-        ws.onmessage = handleWebSocketMessage;
+            ws.onmessage = handleWebSocketMessage;
 
-        ws.onclose = () => {
-            console.log('[Live Mode] WebSocket 连接关闭');
-        };
+            ws.onclose = () => {
+                console.log('[Live Mode] WebSocket 连接关闭');
+            };
 
-        // 超时处理
-        setTimeout(() => {
-            if (ws?.readyState !== WebSocket.OPEN) {
-                reject(new Error('WebSocket 连接超时'));
-            }
-        }, 5000);
+            // 超时处理
+            setTimeout(() => {
+                if (ws?.readyState !== WebSocket.OPEN) {
+                    reject(new Error('WebSocket 连接超时'));
+                }
+            }, 5000);
+        });
     });
 }
 

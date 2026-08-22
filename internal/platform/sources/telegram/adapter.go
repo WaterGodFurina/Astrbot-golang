@@ -3,14 +3,15 @@
 package telegram
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,6 +37,11 @@ type Adapter struct {
 	SelfID   string
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// workerMu 保护 workers；workers 按 chat_id 串行处理 update 的队列
+	//（见 dispatchUpdate）。
+	workerMu sync.Mutex
+	workers  map[string]chan map[string]interface{}
 }
 
 // New creates a Telegram adapter.
@@ -225,33 +231,37 @@ func (a *Adapter) sendMediaUpload(ctx context.Context, sessionID, method, field,
 	if err != nil {
 		return fmt.Errorf("open media %s: %w", filePath, err)
 	}
-	defer f.Close()
 
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile(field, filepath.Base(filePath))
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(part, f); err != nil {
-		return err
-	}
-	if err := writer.WriteField("chat_id", sessionID); err != nil {
-		return err
-	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
+	// io.Pipe 流式构造 multipart 请求体，避免整个文件读入内存。
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	go func() {
+		defer f.Close()
+		defer pw.Close()
+		part, werr := writer.CreateFormFile(field, filepath.Base(filePath))
+		if werr != nil {
+			return
+		}
+		if _, werr = io.Copy(part, f); werr != nil {
+			return
+		}
+		if werr = writer.WriteField("chat_id", sessionID); werr != nil {
+			return
+		}
+		_ = writer.Close()
+	}()
 
-	req, err := http.NewRequestWithContext(ctx, "POST", a.apiBase+"/"+method, body)
+	req, err := http.NewRequestWithContext(ctx, "POST", a.apiBase+"/"+method, pr)
 	if err != nil {
+		_ = pr.Close()
 		return err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	resp, err := a.client.Do(req)
+	_ = pr.Close()
 	if err != nil {
-		return err
+		return fmt.Errorf("telegram %s upload request failed: %s", method, sanitizeURLErr(err))
 	}
 	defer resp.Body.Close()
 	var result map[string]interface{}
@@ -295,6 +305,8 @@ func (a *Adapter) pollLoop(ctx context.Context) {
 
 		updates, ok := resp["result"].([]interface{})
 		if !ok {
+			// 响应异常/空 result：短暂退避再轮询，避免空转轰炸。
+			time.Sleep(5 * time.Second)
 			continue
 		}
 
@@ -306,8 +318,53 @@ func (a *Adapter) pollLoop(ctx context.Context) {
 			if updateID, ok := updateMap["update_id"].(float64); ok {
 				offset = int(updateID) + 1
 			}
-			a.handleUpdate(ctx, updateMap)
+			a.dispatchUpdate(ctx, updateMap)
 		}
+	}
+}
+
+// dispatchUpdate 把 update 交给对应会话的 worker goroutine 串行处理
+// （每 chat_id 一个 channel + worker）：语音下载等慢操作不再阻塞轮询，
+// 同时保持同一会话内消息的处理顺序。
+func (a *Adapter) dispatchUpdate(ctx context.Context, update map[string]interface{}) {
+	chatID := ""
+	if msg, ok := update["message"].(map[string]interface{}); ok {
+		if chat, ok := msg["chat"].(map[string]interface{}); ok {
+			if id, ok := chat["id"].(float64); ok {
+				chatID = fmt.Sprintf("%d", int64(id))
+			}
+		}
+	}
+	if chatID == "" {
+		chatID = "unknown"
+	}
+	a.workerMu.Lock()
+	if a.workers == nil {
+		a.workers = make(map[string]chan map[string]interface{})
+	}
+	ch, ok := a.workers[chatID]
+	if !ok {
+		ch = make(chan map[string]interface{}, 64)
+		a.workers[chatID] = ch
+		go func(c chan map[string]interface{}) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case u, ok := <-c:
+					if !ok {
+						return
+					}
+					a.handleUpdate(ctx, u)
+				}
+			}
+		}(ch)
+	}
+	a.workerMu.Unlock()
+	select {
+	case ch <- update:
+	default:
+		logger.Warn("Telegram chat %s 的 update 队列已满，丢弃 update_id=%v", chatID, update["update_id"])
 	}
 }
 
@@ -550,7 +607,7 @@ func (a *Adapter) apiCall(ctx context.Context, method string, params map[string]
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("telegram %s request failed: %s", method, sanitizeURLErr(err))
 	}
 	defer resp.Body.Close()
 
@@ -564,5 +621,22 @@ func (a *Adapter) apiCall(ctx context.Context, method string, params map[string]
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
+	// HTTP 401/409/429 等错误也可能带 200 状态码：ok=false 时按失败处理，
+	// 否则 Send 会把失败响应当成功，pollLoop 也会对空 result 立即重发轰炸。
+	if ok, _ := result["ok"].(bool); !ok {
+		desc, _ := result["description"].(string)
+		return nil, fmt.Errorf("telegram %s failed: %s", method, desc)
+	}
+
 	return result, nil
+}
+
+// sanitizeURLErr 去除 *url.Error 中的完整 URL（bot token 内嵌于 URL），
+// 仅保留底层错误与操作名，避免 token 泄漏进日志。
+func sanitizeURLErr(err error) string {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Sprintf("%s: %v", ue.Err, ue.Op)
+	}
+	return err.Error()
 }

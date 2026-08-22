@@ -5,7 +5,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
+
+// wsGitMu 按工作区串行化 git 操作：并发 git add 会争抢 index.lock 互相
+// 阻塞或失败。条目（dir → *sync.Mutex）常驻，数量 = 使用过快照的工作区数。
+var wsGitMu sync.Map
+
+// wsGitLock returns the per-workspace mutex for dir.
+func wsGitLock(dir string) *sync.Mutex {
+	mu, _ := wsGitMu.LoadOrStore(dir, &sync.Mutex{})
+	return mu.(*sync.Mutex)
+}
 
 // gitTreeHash snapshots the directory's tracked content and returns a git tree
 // hash. The repo is initialized on first use. Returns "" on any failure.
@@ -13,8 +24,13 @@ func gitTreeHash(dir string) string {
 	if dir == "" {
 		return ""
 	}
+	mu := wsGitLock(dir)
+	mu.Lock()
+	defer mu.Unlock()
 	gitInitIfNeeded(dir)
-	_ = gitRun(dir, "add", "-A")
+	if err := gitRun(dir, "add", "-A"); err != nil {
+		logger.I18nWarn("工作区 %s 快照 git add 失败: %v", dir, err)
+	}
 	out, err := gitRunOut(dir, "write-tree")
 	if err != nil || strings.TrimSpace(out) == "" {
 		return ""
@@ -30,7 +46,12 @@ func gitDiffTree(dir, oldHash string) string {
 	if dir == "" || oldHash == "" {
 		return ""
 	}
-	_ = gitRun(dir, "add", "-A")
+	mu := wsGitLock(dir)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := gitRun(dir, "add", "-A"); err != nil {
+		logger.I18nWarn("工作区 %s 快照 git add 失败: %v", dir, err)
+	}
 	out, err := gitRunOut(dir, "diff", oldHash)
 	if err != nil {
 		return ""

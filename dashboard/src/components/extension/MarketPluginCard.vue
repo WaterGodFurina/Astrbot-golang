@@ -51,6 +51,18 @@ const hasDownloadCount = computed(() => {
   );
 });
 
+const safeUrl = (value) => {
+  const raw = String(value || "").trim();
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+      ? parsed.href
+      : "";
+  } catch {
+    return "";
+  }
+};
+
 const handleInstall = (plugin) => {
   if (!canInstallPlugin.value) return;
   emit("install", plugin);
@@ -117,8 +129,9 @@ const handleOpen = () => {
           ></v-icon>
           <a
             v-if="plugin?.social_link"
-            :href="plugin.social_link"
+            :href="safeUrl(plugin.social_link)"
             target="_blank"
+            rel="noopener noreferrer"
             @click.stop
             class="text-subtitle-2 font-weight-medium"
             style="
@@ -193,8 +206,9 @@ const handleOpen = () => {
         size="small"
         variant="tonal"
         class="market-action-btn"
-        :href="plugin.repo"
+        :href="safeUrl(plugin.repo)"
         target="_blank"
+        rel="noopener noreferrer"
         style="height: 32px"
       >
         <v-icon icon="mdi-github" start size="small"></v-icon>

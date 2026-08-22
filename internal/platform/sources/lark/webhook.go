@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"sync"
 )
 
 // LarkWebhookServer implements the Lark webhook event subscription:
@@ -22,7 +21,6 @@ type LarkWebhookServer struct {
 	verifyToken string
 	cipher      cipher.Block
 	callback    func(map[string]interface{})
-	warnOnce    sync.Once
 }
 
 // NewLarkWebhookServer creates a webhook server.
@@ -145,11 +143,11 @@ func (s *LarkWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reques
 	}
 
 	// 未配置 encrypt_key 与 verification_token 时, 事件无法通过任何签名/令牌校验,
-	// 仅提示配置风险, 不阻断流程。
+	// 直接拒绝处理, 避免被伪造的事件进入消息管线。
 	if s.encryptKey == "" && s.verifyToken == "" {
-		s.warnOnce.Do(func() {
-			logger.Warn("飞书 Webhook 未配置 encrypt_key 与 verification_token, 事件无法被签名/令牌校验, 存在被伪造的风险")
-		})
+		logger.Error("飞书 Webhook 未配置 encrypt_key 与 verification_token, 拒绝处理事件")
+		writeWebhookError(w, http.StatusServiceUnavailable, "encrypt_key or verification_token required")
+		return
 	}
 
 	// URL verification (challenge).

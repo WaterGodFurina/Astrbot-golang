@@ -78,7 +78,10 @@ func TestDoomConfirmResumesAndWakes(t *testing.T) {
 // timeout error and the main path is not blocked (M-12).
 func TestToolCallTimeoutApplies(t *testing.T) {
 	s := testProcessStageWithConfig(t, map[string]interface{}{
-		"provider_settings": map[string]interface{}{"tool_call_timeout": 1},
+		"provider_settings": map[string]interface{}{
+			"tool_call_timeout":            1,
+			"computer_use_allowed_senders": []interface{}{"u1"},
+		},
 	})
 	if got := s.toolCallTimeout(); got != time.Second {
 		t.Fatalf("toolCallTimeout = %v, want 1s", got)

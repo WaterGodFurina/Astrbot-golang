@@ -188,11 +188,17 @@ func New(configPath string, defaults map[string]interface{}, schema map[string]i
 	return cfg, nil
 }
 
-// Get retrieves a value by key. Returns nil if not found.
+// Get retrieves a value by key. Returns nil if not found. Nested maps are
+// deep-copied so callers can never mutate the live config data (and their
+// reads cannot race concurrent Set/Update writes).
 func (c *AstrBotConfig) Get(key string) interface{} {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.data[key]
+	v := c.data[key]
+	c.mu.RUnlock()
+	if m, ok := v.(map[string]interface{}); ok {
+		return copyMap(m)
+	}
+	return v
 }
 
 // GetString returns a string value, or "" if not a string.

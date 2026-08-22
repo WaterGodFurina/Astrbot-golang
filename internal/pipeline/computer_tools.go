@@ -18,12 +18,30 @@ import (
 	"sync"
 	"time"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 )
 
+// computerUseAllowed reports whether the event's sender is allowed to use the
+// computer-use local runtime tools. The allow list comes from
+// provider_settings.computer_use_allowed_senders; an empty list denies everyone.
+func computerUseAllowed(cfg map[string]interface{}, event *core.Event) bool {
+	ps, _ := cfg["provider_settings"].(map[string]interface{})
+	allow, _ := ps["computer_use_allowed_senders"].([]interface{})
+	for _, v := range allow {
+		if s, ok := v.(string); ok && s == event.GetSenderID() {
+			return true
+		}
+	}
+	return false
+}
+
 // errStopGrep stops a directory walk once the result limit is reached.
 var errStopGrep = fmt.Errorf("grep result limit reached")
+
+// workspaceSanitizeRe sanitizes a conversation id for use as a directory name.
+var workspaceSanitizeRe = regexp.MustCompile(`[^A-Za-z0-9_.\-]`)
 
 // --- sandbox executors ---
 // These route computer-use operations into the Docker-backed sandbox runtime.
@@ -165,7 +183,7 @@ func sandboxGrep(ctx context.Context, mgr *sandbox.Manager, pattern, path string
 // executors all agree on the same base regardless of the process working
 // directory at call time.
 func workspaceRoot(umo string) string {
-	sanitized := regexp.MustCompile(`[^A-Za-z0-9_.\-]`).ReplaceAllString(umo, "_")
+	sanitized := workspaceSanitizeRe.ReplaceAllString(umo, "_")
 	dir := filepath.Join("data", "workspaces", sanitized)
 	if abs, err := filepath.Abs(dir); err == nil {
 		dir = abs
@@ -634,7 +652,43 @@ func (s *shellSession) status() map[string]interface{} {
 	}
 }
 
-func executeLocalShell(umo, command string, background bool, timeout int) string {
+// cappedWriter caps buffered output at max bytes, flagging truncation instead
+// of growing without bound.
+type cappedWriter struct {
+	buf       bytes.Buffer
+	max       int
+	truncated bool
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	if w.buf.Len() >= w.max {
+		w.truncated = true
+		return len(p), nil
+	}
+	n := len(p)
+	if room := w.max - w.buf.Len(); room < n {
+		n = room
+		w.truncated = true
+	}
+	w.buf.Write(p[:n])
+	return len(p), nil
+}
+
+// Bytes returns the buffered output (a byte slice sharing the underlying
+// buffer; callers must not mutate it).
+func (w *cappedWriter) Bytes() []byte { return w.buf.Bytes() }
+
+// maxShellOutput caps how much of a synchronous shell command's output is
+// buffered in memory.
+const maxShellOutput = 1 << 20
+
+// sessionOwnedBy reports whether the session belongs to the given conversation
+// (umo) AND the given sender who started it.
+func sessionOwnedBy(s *shellSession, umo, senderID string) bool {
+	return s.Owner == umo+"\x00"+senderID
+}
+
+func executeLocalShell(umo, senderID, command string, background bool, timeout int) string {
 	if strings.TrimSpace(command) == "" {
 		return "Error executing command: `command` must be a non-empty string."
 	}
@@ -664,6 +718,8 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 		cmd.Stdout = f
 		cmd.Stderr = f
 		stdin, stdinErr := cmd.StdinPipe()
+		// 后台会话同样放入独立进程组，terminate 时按组回收整棵进程树。
+		utils.SetProcessGroup(cmd)
 		if err := cmd.Start(); err != nil {
 			_ = f.Close()
 			if stdin != nil {
@@ -684,7 +740,7 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 			StartTime:  time.Now(),
 			Cmd:        cmd,
 			Stdin:      stdin,
-			Owner:      umo,
+			Owner:      umo + "\x00" + senderID,
 		}
 		shellSessionsMu.Lock()
 		shellSessions[id] = ses
@@ -729,9 +785,10 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 	// inherit the output pipes would keep CombinedOutput blocked and survive as
 	// orphans. Start first so cmd.Process is set before the kill goroutine
 	// reads it, then kill the whole process group the moment the timeout fires.
-	var outBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &outBuf
+	var outCap cappedWriter
+	outCap.max = maxShellOutput
+	cmd.Stdout = &outCap
+	cmd.Stderr = &outCap
 	if err := cmd.Start(); err != nil {
 		return "Error executing command: " + err.Error()
 	}
@@ -745,7 +802,10 @@ func executeLocalShell(umo, command string, background bool, timeout int) string
 	}()
 	err := cmd.Wait()
 	close(groupDone)
-	out := outBuf.Bytes()
+	out := outCap.Bytes()
+	if outCap.truncated {
+		out = append(out, []byte("\n...(output truncated)\n")...)
+	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("Command timed out after %d seconds. Output so far:\n%s", timeout, string(out))
 	}
@@ -771,14 +831,14 @@ func shellPath() string {
 	return "/bin/sh"
 }
 
-func executeShellSession(umo, action, sessionID, data string) string {
+func executeShellSession(umo, senderID, action, sessionID, data string) string {
 	action = strings.ToLower(strings.TrimSpace(action))
 	switch action {
 	case "list":
 		shellSessionsMu.Lock()
 		items := make([]map[string]interface{}, 0, len(shellSessions))
 		for _, s := range shellSessions {
-			if s.Owner == umo {
+			if sessionOwnedBy(s, umo, senderID) {
 				items = append(items, s.status())
 			}
 		}
@@ -789,26 +849,26 @@ func executeShellSession(umo, action, sessionID, data string) string {
 		out, _ := json.Marshal(items)
 		return string(out)
 	case "poll", "get", "status":
-		return shellSessionPoll(sessionID, umo)
+		return shellSessionPoll(sessionID, umo, senderID)
 	case "write", "write_line":
-		return shellSessionWrite(sessionID, data, umo)
+		return shellSessionWrite(sessionID, data, umo, senderID)
 	case "interrupt":
-		return shellSessionSignal(sessionID, false, umo)
+		return shellSessionSignal(sessionID, false, umo, senderID)
 	case "terminate", "kill":
-		return shellSessionSignal(sessionID, true, umo)
+		return shellSessionSignal(sessionID, true, umo, senderID)
 	default:
 		return fmt.Sprintf("Unknown action %q. Valid actions: list, poll, write, write_line, interrupt, terminate.", action)
 	}
 }
 
-func shellSessionPoll(sessionID, umo string) string {
+func shellSessionPoll(sessionID, umo, senderID string) string {
 	shellSessionsMu.Lock()
 	s, ok := shellSessions[sessionID]
 	shellSessionsMu.Unlock()
 	if !ok {
 		return "Session not found: " + sessionID
 	}
-	if s.Owner != umo {
+	if !sessionOwnedBy(s, umo, senderID) {
 		return "Session " + sessionID + " does not belong to the current user."
 	}
 	tail := ""
@@ -823,14 +883,14 @@ func shellSessionPoll(sessionID, umo string) string {
 	return string(st) + "\nOutput:\n" + tail
 }
 
-func shellSessionWrite(sessionID, data, umo string) string {
+func shellSessionWrite(sessionID, data, umo, senderID string) string {
 	shellSessionsMu.Lock()
 	s, ok := shellSessions[sessionID]
 	shellSessionsMu.Unlock()
 	if !ok {
 		return "Session not found: " + sessionID
 	}
-	if s.Owner != umo {
+	if !sessionOwnedBy(s, umo, senderID) {
 		return "Session " + sessionID + " does not belong to the current user."
 	}
 	if s.Stdin == nil {
@@ -842,21 +902,22 @@ func shellSessionWrite(sessionID, data, umo string) string {
 	return "Written to session " + sessionID + "."
 }
 
-func shellSessionSignal(sessionID string, kill bool, umo string) string {
+func shellSessionSignal(sessionID string, kill bool, umo, senderID string) string {
 	shellSessionsMu.Lock()
 	s, ok := shellSessions[sessionID]
 	shellSessionsMu.Unlock()
 	if !ok {
 		return "Session not found: " + sessionID
 	}
-	if s.Owner != umo {
+	if !sessionOwnedBy(s, umo, senderID) {
 		return "Session " + sessionID + " does not belong to the current user."
 	}
 	if s.Cmd == nil || s.Cmd.Process == nil {
 		return "Session " + sessionID + " is not running."
 	}
 	if kill {
-		if err := s.Cmd.Process.Kill(); err != nil {
+		// 按进程组终止，回收整棵进程树（含后台再拉起的子进程）。
+		if err := utils.KillProcessGroup(s.Cmd); err != nil {
 			return "Error terminating session: " + err.Error()
 		}
 		return "Session " + sessionID + " terminated."
@@ -879,18 +940,34 @@ func executeLocalPython(umo, code string, timeout int) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", "-c", code) // #nosec G204 -- astrbot_execute_python 工具核心：执行 AI 指令给定的 Python 代码（host 本地运行，功能明确，前端已警示）
 	cmd.Dir = ws
-	out, err := cmd.CombinedOutput()
+	// 与同步 shell 路径一致：输出经 cappedWriter 限幅，防止超时窗口内
+	// print 风暴把宿主进程 OOM。
+	cw := &cappedWriter{max: maxShellOutput}
+	cmd.Stdout = cw
+	cmd.Stderr = cw
+	if err := cmd.Start(); err != nil {
+		return "error: code execution failed to start: " + err.Error()
+	}
+	waitErr := cmd.Wait()
+	out := string(cw.Bytes())
+	if cw.truncated {
+		out += fmt.Sprintf("\n[输出超过 %d 字节已截断]", maxShellOutput)
+	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Sprintf("Code execution timed out after %d seconds. Output so far:\n%s", timeout, string(out))
+		return fmt.Sprintf("Code execution timed out after %d seconds. Output so far:\n%s", timeout, out)
 	}
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return fmt.Sprintf("error: code execution failed with exit code %d\n%s", ee.ExitCode(), string(out))
+	if waitErr != nil {
+		if ee, ok := waitErr.(*exec.ExitError); ok {
+			return fmt.Sprintf("error: code execution failed with exit code %d\n%s", ee.ExitCode(), out)
 		}
-		return "error: code execution failed: " + err.Error()
+		return "error: code execution failed: " + waitErr.Error()
 	}
-	return string(out)
+	return out
 }
+
+// maxFileReadBytes caps how much of a file executeFileRead loads into memory
+// at once; larger files must be read in chunks via offset/limit.
+const maxFileReadBytes = 1 << 20
 
 func executeFileRead(path, umo string, offset, limit int) string {
 	resolved, err := resolveLocalPath(path, umo, false)
@@ -904,6 +981,11 @@ func executeFileRead(path, umo string, offset, limit int) string {
 	if info.IsDir() {
 		return fmt.Sprintf("Error: '%s' is a directory, not a file. "+
 			"Use a file path instead, or use 'astrbot_execute_shell' to list directory contents.", resolved)
+	}
+	// 先 stat 判断大小：超限文件拒绝整体读入内存，提示用 offset/limit 分段读取。
+	if info.Size() > maxFileReadBytes {
+		return fmt.Sprintf("Error reading file: %s is %d bytes, exceeds the %d-byte read limit. "+
+			"Use offset/limit to read a portion of the file.", resolved, info.Size(), maxFileReadBytes)
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil {
@@ -1009,7 +1091,13 @@ func executeGrep(pattern, path, glob string, resultLimit int, umo string) string
 				return nil
 			}
 		}
-		data, err := os.ReadFile(p)
+		// 每文件限读：只扫描前 1MB，超大文件不会整体读入内存。
+		f, err := os.Open(p)
+		if err != nil {
+			return nil
+		}
+		data, err := io.ReadAll(io.LimitReader(f, maxFileReadBytes))
+		_ = f.Close()
 		if err != nil {
 			return nil
 		}

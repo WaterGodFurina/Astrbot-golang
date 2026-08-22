@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
@@ -27,6 +28,10 @@ type FishAudioTTSSource struct {
 	apiBase     string
 	referenceID string
 	character   string
+	// refMu 保护 reference ID 的一次性在线解析结果缓存。
+	refMu       sync.Mutex
+	cachedRefID string
+	refResolved bool
 }
 
 // NewFishAudioTTSSource creates a FishAudio TTS provider.
@@ -70,6 +75,11 @@ func (s *FishAudioTTSSource) lookupReferenceID(ctx context.Context) (string, err
 		if err != nil {
 			return "", err
 		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+			_ = resp.Body.Close()
+			return "", fmt.Errorf("fishaudio model lookup failed: HTTP %d: %s", resp.StatusCode, string(body))
+		}
 		var data struct {
 			Total int `json:"total"`
 			Items []struct {
@@ -95,15 +105,29 @@ func (s *FishAudioTTSSource) lookupReferenceID(ctx context.Context) (string, err
 }
 
 // resolveReferenceID returns the configured reference_id or resolves it from
-// the character name.
+// the character name. The lookup result is cached so it only happens once.
 func (s *FishAudioTTSSource) resolveReferenceID(ctx context.Context) (string, error) {
-	if rid := strings.TrimSpace(s.referenceID); rid != "" {
-		if !fishReferenceIDPattern.MatchString(rid) {
-			return "", fmt.Errorf("无效的FishAudio参考模型ID: %q, 应为32位十六进制字符串", rid)
-		}
-		return rid, nil
+	s.refMu.Lock()
+	defer s.refMu.Unlock()
+	if s.refResolved {
+		return s.cachedRefID, nil
 	}
-	return s.lookupReferenceID(ctx)
+	var rid string
+	var err error
+	if r := strings.TrimSpace(s.referenceID); r != "" {
+		if !fishReferenceIDPattern.MatchString(r) {
+			return "", fmt.Errorf("无效的FishAudio参考模型ID: %q, 应为32位十六进制字符串", r)
+		}
+		rid = r
+	} else {
+		rid, err = s.lookupReferenceID(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
+	s.refResolved = true
+	s.cachedRefID = rid
+	return rid, nil
 }
 
 // buildMsgpackRequest builds the MessagePack encoded /v1/tts request body.

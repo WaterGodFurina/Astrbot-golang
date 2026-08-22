@@ -23,7 +23,7 @@ import (
 type sessionWaitEntry struct {
 	// pluginName 是等待所属插件的注册名（SDK 侧从连接身份注入）。
 	pluginName string
-	// umo 是等待监听的会话标识（platform:conversation_id）。
+	// umo 是等待监听的三段式会话标识（platform_id:MessageType:session_id）。
 	umo string
 }
 
@@ -34,6 +34,10 @@ type SessionWaitTarget struct {
 	// PluginName 是等待所属插件的注册名（定位运行实例用）。
 	PluginName string
 }
+
+// maxSessionWaits 是会话等待注册表的上限：插件异常反复注册时防止注册表
+// 无限增长（超时/卸载兜底清理只覆盖正常路径）。
+const maxSessionWaits = 10000
 
 // RegisterSessionWait 注册插件对 umo 的会话等待并返回 wait_id（subMgr 为
 // nil 时返回空串 = 宿主不支持）。timeoutSeconds > 0 时超时自动注销，
@@ -47,6 +51,10 @@ func (m *SubprocessManager) RegisterSessionWait(pluginName, umo string, timeoutS
 	waitID := fmt.Sprintf("%s-%d", sanitizeID(pluginName), n)
 
 	m.sessionWaitMu.Lock()
+	if len(m.sessionWaitReg) >= maxSessionWaits {
+		m.sessionWaitMu.Unlock()
+		return ""
+	}
 	m.sessionWaitReg[waitID] = &sessionWaitEntry{pluginName: pluginName, umo: umo}
 	m.sessionWaitMu.Unlock()
 

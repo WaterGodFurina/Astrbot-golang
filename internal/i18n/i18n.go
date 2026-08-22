@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -107,33 +108,42 @@ func (t *Translator) SetLocale(locale string) {
 	t.mu.Unlock()
 }
 
+// safeSprintf 将 args 格式化进 format；当 format 不含格式化动词（译文原文
+// 直接透传、含字面 % 等）时 fmt 会输出 "%!..." 占位符，此时回退为直接拼接。
+func safeSprintf(format string, args ...interface{}) string {
+	if len(args) == 0 {
+		return format
+	}
+	out := fmt.Sprintf(format, args...)
+	if strings.Contains(out, "%!") {
+		var sb strings.Builder
+		sb.WriteString(format)
+		for _, a := range args {
+			sb.WriteString(fmt.Sprint(a))
+		}
+		return sb.String()
+	}
+	return out
+}
+
 // Get returns the translation for the given key.
 func (t *Translator) Get(key string, args ...interface{}) string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if translations, ok := t.locales[t.current]; ok {
 		if text, ok := translations[key]; ok {
-			if len(args) > 0 {
-				return fmt.Sprintf(text, args...)
-			}
-			return text
+			return safeSprintf(text, args...)
 		}
 	}
 	if t.fallback != "" && t.fallback != t.current {
 		if translations, ok := t.locales[t.fallback]; ok {
 			if text, ok := translations[key]; ok {
-				if len(args) > 0 {
-					return fmt.Sprintf(text, args...)
-				}
-				return text
+				return safeSprintf(text, args...)
 			}
 		}
 	}
 	// 未找到翻译：key 即中文原文（zh 场景直接输出），有参数则格式化
-	if len(args) > 0 {
-		return fmt.Sprintf(key, args...)
-	}
-	return key
+	return safeSprintf(key, args...)
 }
 
 // AvailableLocales returns all loaded locale names.

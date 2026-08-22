@@ -189,8 +189,8 @@ func processEncryptedImage(imageURL, aesKeyBase64 string) (bool, string) {
 
 	// 去除 PKCS7 填充（Python: pad_len = decrypted_data[-1]; if pad_len > 32: raise）
 	padLen := int(decryptedData[len(decryptedData)-1])
-	if padLen > 32 {
-		return false, "参数错误: 无效的填充长度 (大于32字节)"
+	if padLen < 1 || padLen > 32 || padLen > len(decryptedData) {
+		return false, "参数错误: 无效的填充长度"
 	}
 	decryptedData = decryptedData[:len(decryptedData)-padLen]
 	logger.I18nInfo("图片解密成功，解密后大小: %d 字节", len(decryptedData))

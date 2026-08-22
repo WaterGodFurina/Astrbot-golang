@@ -238,7 +238,7 @@ func (tc *Toolchain) verifyChecksum(dest, archive string) error {
 		return nil
 	}
 	sumURL := checksumURL(archive)
-	resp, err := http.Get(sumURL)
+	resp, err := dlClient.Get(sumURL)
 	if err != nil {
 		return fmt.Errorf("fetch checksum: %w", err)
 	}
@@ -368,11 +368,14 @@ func UserStateDir() string {
 	return "."
 }
 
+// dlClient 是工具链下载/校验专用的 HTTP 客户端（30 分钟超时），防止镜像
+// 源挂起时下载与 checksum 请求无限期阻塞。
+var dlClient = &http.Client{Timeout: 30 * time.Minute}
+
 // downloadFile streams a URL to dest with a progress timeout, logging and
 // reporting download progress every ~10%.
 func downloadFile(url, dest string, progress ProgressFunc) error {
-	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Get(url)
+	resp, err := dlClient.Get(url)
 	if err != nil {
 		return err
 	}

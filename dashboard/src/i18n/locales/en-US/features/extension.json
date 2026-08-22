@@ -184,7 +184,8 @@
     "sourceResolved": "Source resolved successfully",
     "installPlugin": "Install Plugin",
     "randomPlugins": "🎲 Random Plugins",
-    "sourceSafetyWarning": "Even with the default source, plugin stability and security cannot be fully guaranteed. Please verify carefully before use."
+    "sourceSafetyWarning": "Even with the default source, plugin stability and security cannot be fully guaranteed. Please verify carefully before use.",
+    "sourceTypeHint": "Choose the plugin type of this source: Golang sources list Go plugins (compatibility checked against the Go version); Python sources list Python plugins (checked against the tracked Python version). This affects the install method (direct zip download vs git clone) and version compatibility checks."
   },
   "sort": {
     "by": "Sort by",

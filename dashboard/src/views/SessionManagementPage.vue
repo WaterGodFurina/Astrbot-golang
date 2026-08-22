@@ -1294,6 +1294,7 @@ export default {
 
         if (response.data.status === 'ok') {
           this.showSuccess(this.tm('messages.saveSuccess'))
+          this.closeRuleEditor()
           this.editingRules.session_service_config = config
 
           // 更新或添加到列表
@@ -1352,6 +1353,7 @@ export default {
         if (allTasks.length > 0) {
           await Promise.all(allTasks)
           this.showSuccess(this.tm('messages.saveSuccess'))
+          this.closeRuleEditor()
 
           // 更新或添加到列表
           let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
@@ -1401,6 +1403,7 @@ export default {
             if (item) delete item.rules.session_plugin_config
           }
           this.showSuccess(this.tm('messages.saveSuccess'))
+          this.closeRuleEditor()
         } else {
           const response = await sessionApi.upsertRule({
             umo: this.selectedUmo.umo,
@@ -1410,6 +1413,7 @@ export default {
 
           if (response.data.status === 'ok') {
             this.showSuccess(this.tm('messages.saveSuccess'))
+            this.closeRuleEditor()
             this.editingRules.session_plugin_config = config
 
             let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
@@ -1455,6 +1459,7 @@ export default {
             if (item) delete item.rules.kb_config
           }
           this.showSuccess(this.tm('messages.saveSuccess'))
+          this.closeRuleEditor()
         } else {
           const response = await sessionApi.upsertRule({
             umo: this.selectedUmo.umo,
@@ -1464,6 +1469,7 @@ export default {
 
           if (response.data.status === 'ok') {
             this.showSuccess(this.tm('messages.saveSuccess'))
+            this.closeRuleEditor()
             this.editingRules.kb_config = config
 
             let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)

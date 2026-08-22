@@ -54,7 +54,8 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		a.Port = int(port)
 	}
 	if a.Port == 0 {
-		a.Port = 6195
+		// 独立默认端口，避免与企业微信回调端口（6195）冲突
+		a.Port = 6193
 	}
 	a.AuthToken, _ = config["auth_token"].(string)
 	return a
@@ -83,7 +84,8 @@ func (a *Adapter) Start(ctx context.Context) error {
 	go func() {
 		logger.I18nInfo("WebChat 适配器正在监听 %s:%d", a.Host, a.Port)
 		if err := a.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.Error("WebChat server error: %v", err)
+			// 端口冲突提示：与其他适配器（如企业微信默认 6195）或系统服务同端口时给出线索
+			logger.Error("WebChat server error: %v (若为端口被占用, 请检查是否与其他适配器/服务的端口冲突)", err)
 		}
 	}()
 

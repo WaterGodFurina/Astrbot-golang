@@ -49,7 +49,9 @@ type pendingFetch struct {
 type RolesRecord struct {
 	mu sync.Mutex
 
-	botID      string
+	botID string
+	token string
+
 	httpClient *http.Client
 
 	cache   map[int64]*rolesCacheEntry // 频道 id -> 缓存 (LRU)
@@ -71,6 +73,13 @@ func (r *RolesRecord) SetBotID(botID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.botID = botID
+}
+
+// SetToken 设置机器人 token (请求 /user/view 时携带 Authorization: Bot <token>)。
+func (r *RolesRecord) SetToken(token string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.token = token
 }
 
 // ClearGuildRolesCache 清除指定频道的角色缓存 (对应 Python clear_guild_roles_cache)。
@@ -112,6 +121,7 @@ func (r *RolesRecord) fetchRolesByGuildID(ctx context.Context, guildID int64) ma
 		logger.I18nError("[KOOK] 获取机器人在频道 %q 的角色id信息时请求异常: %v", fmt.Sprintf("%d", guildID), err)
 		return nil
 	}
+	req.Header.Set("Authorization", "Bot "+r.token)
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		logger.I18nError("[KOOK] 获取机器人在频道 %q 的角色id信息时请求异常: %v", fmt.Sprintf("%d", guildID), err)

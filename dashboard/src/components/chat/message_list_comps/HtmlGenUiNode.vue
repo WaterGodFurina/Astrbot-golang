@@ -42,8 +42,7 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 
 const RENDER_THROTTLE_MS = 500;
-const sandboxPolicy =
-  "allow-forms allow-modals allow-pointer-lock allow-popups allow-scripts";
+const sandboxPolicy = "allow-scripts";
 
 const props = defineProps<{
   node?: {
@@ -153,6 +152,7 @@ function buildHeadExtras(dark: boolean) {
   const bg = dark ? "#111827" : "#ffffff";
   const fg = dark ? "#f9fafb" : "#111827";
   return `<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https:">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <base target="_blank">
 <style>
