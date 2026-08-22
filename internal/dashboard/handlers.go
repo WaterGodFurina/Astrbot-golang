@@ -7189,6 +7189,13 @@ func descriptorToDict(d *star.CommandDescriptor) map[string]interface{} {
 	if aliases == nil {
 		aliases = []string{}
 	}
+	subs := make([]interface{}, 0, len(d.SubCommands))
+	for _, sub := range d.SubCommands {
+		subItem := descriptorToDict(sub)
+		// 子命令不再嵌套自己的 sub_commands（组层级由顶层条目承载）。
+		subItem["sub_commands"] = []interface{}{}
+		subs = append(subs, subItem)
+	}
 	return map[string]interface{}{
 		"handler_full_name":   d.HandlerFullName,
 		"handler_name":        d.HandlerName,
@@ -7207,7 +7214,7 @@ func descriptorToDict(d *star.CommandDescriptor) map[string]interface{} {
 		"is_group":            d.IsGroup,
 		"has_conflict":        d.HasConflict,
 		"reserved":            d.Reserved,
-		"sub_commands":        []interface{}{},
+		"sub_commands":        subs,
 	}
 }
 

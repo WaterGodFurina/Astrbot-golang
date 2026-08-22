@@ -23,7 +23,7 @@ import (
 type sessionWaitEntry struct {
 	// pluginName 是等待所属插件的注册名（SDK 侧从连接身份注入）。
 	pluginName string
-	// umo 是等待监听的会话标识（platform:conversation_id）。
+	// umo 是等待监听的三段式会话标识（platform_id:MessageType:session_id）。
 	umo string
 }
 

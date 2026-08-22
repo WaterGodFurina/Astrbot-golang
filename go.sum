@@ -25,10 +25,10 @@ github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5 h1:bBmmB7he0i
 github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5/go.mod h1:0UcFaCkhp6vZw6l5Dpq0Dp673CoF9GdvA8lTfst0GiU=
 github.com/STARRY-S/zip v0.2.3 h1:luE4dMvRPDOWQdeDdUxUoZkzUIpTccdKdhHHsQJ1fm4=
 github.com/STARRY-S/zip v0.2.3/go.mod h1:lqJ9JdeRipyOQJrYSOtpNAiaesFO6zVDsE8GIGFaoSk=
-github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.3.2 h1:gSPx+X10oF+NEGsZpWx1xcY+FXl69gDfrF7QJBCD/Rk=
-github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.3.2/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
-github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.4.1 h1:uRl6WFXHOLhCzIaBJoTzNMygghJ2IqdKsaL80bMMxTA=
-github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.4.1/go.mod h1:Ici1h1XuueS5HROwbsEkd+Q99MB303WmmLKQzgS1v6c=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.3.3 h1:e8D7f0SXDyaqfN0PtUGY6CVdC+Rxj2Bo7a4TEX4a1i8=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.3.3/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
+github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.4.2 h1:0pgqK7kIRSbV+AL6O+ktJUqRLyo4FxpH5vk2BPMkA4I=
+github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.4.2/go.mod h1:Ici1h1XuueS5HROwbsEkd+Q99MB303WmmLKQzgS1v6c=
 github.com/WaterGodFurina/nanovec v1.0.1 h1:ooxW9HHgubXg5Sw/LakyBZDca3EK3x2ia7XhSWyC9uI=
 github.com/WaterGodFurina/nanovec v1.0.1/go.mod h1:doZwEzURN2t8myIZADAy4cyEomjYQTeZsW0NwtElyMI=
 github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwToPjQ=
@@ -244,7 +244,6 @@ github.com/yitsushi/go-misskey v1.1.6/go.mod h1:FeLNMTVebkWTbjRt5X1YqkKc61dOjgTy
 github.com/yosida95/uritemplate/v3 v3.0.2 h1:Ed3Oyj9yrmi9087+NczuL5BwkIc4wvTb5zIM+UJPGz4=
 github.com/yosida95/uritemplate/v3 v3.0.2/go.mod h1:ILOh0sOhIJR3+L/8afwt/kE++YT040gmv5BQTMR2HP4=
 github.com/youkale/go-querystruct v1.0.0 h1:26xJ3FExWO/zZDnPvbKd5Vc3Rct0aRB9Pzn9Opt1QZY=
-github.com/youkale/go-querystruct v1.0.0 h1:dnjQNcihY6JFWZXXs9Xr3QO51PIF+f787ONokkIKlHk=
 github.com/youkale/go-querystruct v1.0.0/go.mod h1:xNATC2kLfAGWFTDkrBVOnW+DFjrgXrbqMtcID37lFZY=
 github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
 github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=

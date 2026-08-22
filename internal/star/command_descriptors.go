@@ -53,16 +53,51 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 		descriptors = append(descriptors, desc)
 	}
 
-	// conflict detection: same effective_command from different handlers
+	// conflict detection: same effective_command from different handlers.
+	// 只统计启用的指令（对齐 Python _group_conflicts）。
 	seen := map[string]int{}
 	for _, d := range descriptors {
-		if d.EffectiveCommand != "" {
+		if d.EffectiveCommand != "" && d.Enabled {
 			seen[d.EffectiveCommand]++
 		}
 	}
 	for _, d := range descriptors {
-		if d.EffectiveCommand != "" && seen[d.EffectiveCommand] > 1 {
+		if d.EffectiveCommand != "" && d.Enabled && seen[d.EffectiveCommand] > 1 {
 			d.HasConflict = true
+		}
+	}
+
+	// 聚合子命令到虚拟组条目：子进程插件协议只上报子命令的 parent_group
+	// （组本身不是 handler），这里按 "pluginID + parent_group" 合成组节点
+	//（type=group），并把子命令挂到其 sub_commands；组节点的 effective
+	// command = 组名，enabled = 任一子命令启用。
+	groups := map[string]*CommandDescriptor{}
+	var groupOrder []string
+	for _, d := range descriptors {
+		if !d.IsSubCommand || d.ParentSignature == "" {
+			continue
+		}
+		key := d.PluginName + "\x00" + d.ParentSignature
+		g, ok := groups[key]
+		if !ok {
+			g = &CommandDescriptor{
+				HandlerFullName:  "plugin_" + d.PluginName + "_group_" + d.ParentSignature,
+				HandlerName:      d.ParentSignature,
+				PluginName:       d.PluginName,
+				CommandType:      "group",
+				IsGroup:          true,
+				CurrentFragment:  d.ParentSignature,
+				EffectiveCommand: d.ParentSignature,
+				OriginalCommand:  d.ParentSignature,
+				Enabled:          false,
+				SubCommands:      []*CommandDescriptor{},
+			}
+			groups[key] = g
+			groupOrder = append(groupOrder, key)
+		}
+		g.SubCommands = append(g.SubCommands, d)
+		if d.Enabled {
+			g.Enabled = true
 		}
 	}
 
@@ -77,7 +112,19 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 		}
 		return a < b
 	})
-	return descriptors
+
+	result := make([]*CommandDescriptor, 0, len(descriptors)+len(groupOrder))
+	for _, key := range groupOrder {
+		result = append(result, groups[key])
+	}
+	for _, d := range descriptors {
+		// 子命令已挂到组条目的 sub_commands，不再平铺输出。
+		if d.IsSubCommand && d.ParentSignature != "" {
+			continue
+		}
+		result = append(result, d)
+	}
+	return result
 }
 
 // pluginNameFor derives the owning plugin name for a handler.

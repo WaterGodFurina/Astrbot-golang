@@ -3387,9 +3387,8 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				}
 			}
 		case "future_task":
-			// 存三段式 PythonUMO（platform_id:MessageType:session_id），对齐
-			// Python future_task 与 WebUI 的 umo 解析；两段式 UnifiedMsgOrigin
-			// 会让前端 message_type/session_id 错位。
+			// 存三段式 unified_msg_origin（platform_id:MessageType:session_id），
+			// 保证 WebUI/Python future_task 解析时 message_type 与 session_id 对位。
 			result = executeFutureTask(s.cronMgr, event.PythonUMO(), event.GetSenderID(), args)
 		case "web_search_tavily":
 			result = executeWebSearchTavily(s.config, args)

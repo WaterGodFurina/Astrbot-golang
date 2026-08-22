@@ -37,7 +37,7 @@ const (
 // EventContext holds metadata for an incoming message event.
 type EventContext struct {
 	MessageID        string
-	UnifiedMsgOrigin string // platform:conversation_id
+	UnifiedMsgOrigin string // platform_id:MessageType:session_id
 	SenderID         string
 	SenderName       string
 	SelfID           string // bot's own ID on this platform

@@ -3,7 +3,7 @@
 //
 // Bug fix for issue #9377: session_waiter not bound to sender.
 // The Python DefaultSessionFilter.filter() returned event.unified_msg_origin
-// (platform:conversation_id), which in group chats matches ANY member.
+// (platform_id:MessageType:session_id), which in group chats matches ANY member.
 // A non-initiating member's message would trigger the handler and consume
 // the session. The fix binds the session key to BOTH conversation AND sender.
 package session
@@ -124,9 +124,9 @@ type SessionFilter interface {
 	Filter(event Event) string
 }
 
-// DefaultSessionFilter uses platform:conversation_id:sender_id as the key.
-// FIXED #9377: Previously used only platform:conversation_id, allowing any
-// group member to trigger another member's session waiter.
+// DefaultSessionFilter uses platform_id:MessageType:session_id:sender_id as the key.
+// FIXED #9377: Previously keyed only on the conversation-level umo without a
+// sender suffix, allowing any group member to trigger another member's waiter.
 type DefaultSessionFilter struct{}
 
 func (f *DefaultSessionFilter) Filter(event Event) string {

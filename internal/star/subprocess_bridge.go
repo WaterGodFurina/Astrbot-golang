@@ -146,6 +146,22 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 	meta := inst.Meta
 	pluginID := inst.ID
 
+	// 组命令映射：meta.Commands 中带 parent_group 的子命令挂到对应
+	// CommandGroupFilter 上——GetCompleteCommandNames 据此计算
+	// "<group> <cmd>" 完整名，消息匹配与 WebUI 分组展示都依赖它。
+	groupFilters := map[string]*CommandGroupFilter{}
+	groupOrder := []string{}
+	for _, cmd := range meta.Commands {
+		pg := strings.TrimSpace(cmd.ParentGroup)
+		if pg == "" {
+			continue
+		}
+		if _, ok := groupFilters[pg]; !ok {
+			groupFilters[pg] = NewCommandGroupFilter(pg, nil, nil)
+			groupOrder = append(groupOrder, pg)
+		}
+	}
+
 	for _, cmd := range meta.Commands {
 		cmd := cmd
 		handler := &StarHandlerMetadata{
@@ -201,10 +217,13 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				e.Result.Chain = []message.Component{&message.Plain{Text: text}}
 				return nil
 			},
-			EventType:    EventTypeFilter,
-			EventFilters: []HandlerFilter{NewCommandFilter(cmd.Name, cmd.Aliases, nil)},
-			Desc:         cmd.Description,
-			Enabled:      true,
+			EventType: EventTypeFilter,
+			EventFilters: func() []HandlerFilter {
+				cf := NewCommandFilter(cmd.Name, cmd.Aliases, groupFilters[strings.TrimSpace(cmd.ParentGroup)])
+				return []HandlerFilter{cf}
+			}(),
+			Desc:    cmd.Description,
+			Enabled: true,
 		}
 		// 应用 WebUI 持久化重命名：插件重载后指令按 meta 原始名桥接，若不
 		// 恢复重命名，运行时匹配仍用旧名（与另一同名指令真冲突、双触发），

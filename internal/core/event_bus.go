@@ -130,7 +130,7 @@ func (e *Event) PythonUMO() string {
 	return e.UnifiedMsgOrigin()
 }
 
-// GetUnifiedMsgOrigin returns platform:conversation_id (alias).
+// GetUnifiedMsgOrigin returns the three-part unified_msg_origin (alias).
 func (e *Event) GetUnifiedMsgOrigin() string {
 	return e.UnifiedMsgOrigin()
 }
