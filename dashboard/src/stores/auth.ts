@@ -125,12 +125,14 @@ export const useAuthStore = defineStore("auth", {
       username: string,
       password: string,
       confirmPassword: string,
+      initialPassword = '',
     ): Promise<void> {
       try {
         const res = await authApi.setup({
           username,
           password,
           confirm_password: confirmPassword,
+          old_password: initialPassword || undefined,
         });
 
         if (res.data.status === 'error') {

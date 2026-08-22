@@ -8,6 +8,7 @@ data/
 memory.md
 tmp/
 bug.md
+start-astrbot.sh
 
 # Python 插件误写仓库根的数据目录（正确位置 data/plugin_data）
 plugin_data/

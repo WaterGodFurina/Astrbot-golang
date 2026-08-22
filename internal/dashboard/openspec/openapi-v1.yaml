@@ -5370,6 +5370,11 @@ components:
           type: string
         confirm_password:
           type: string
+        old_password:
+          type: string
+          description: >-
+            Initial password printed to the console at first install / reset
+            (required while password_change_required is true).
       additionalProperties: false
 
     UpdateAccountRequest:

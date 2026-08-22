@@ -323,6 +323,12 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		if v, ok := managers["config"]; ok {
 			s.configMgr = v
 			s.auth.SetConfigManager(v)
+			// NewPasswordManager 在 CM 加载之后运行，可能因空值规则重置过
+			// 凭据（直写磁盘）：把最新 auth 状态回填进 CM 快照并落盘一次，
+			// 消除"auth 直写磁盘 vs CM 旧快照（username/change_required 为
+			// 重置前的值）"的不一致窗口——否则首次配置保存就会把重置状态
+			// 冲掉。
+			s.syncAuthToConfig()
 		}
 		if v, ok := managers["provider"]; ok {
 			s.providerMgr = v
@@ -647,6 +653,9 @@ func (s *Server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		"setup_required":             setupRequired,
 		"skip_default_password_auth": false,
 		"password_upgrade_required":  false,
+		// 首次安装/重置窗口内 setup 必须提供启动时打印在控制台的初始密码
+		// （防窗口期内未授权者抢注管理员账户），前端据此显示初始密码输入框。
+		"require_initial_password": setupRequired && s.auth.InitialPassword() != "",
 	}))
 }
 
@@ -1878,16 +1887,51 @@ func (s *Server) mutateConfig(fn func(cfg map[string]interface{}) error) error {
 	return s.setConfigDataAll(cfg)
 }
 
+// syncAuthToConfig 把 PasswordManager 的当前凭据状态回填进 ConfigManager
+// 快照并落盘（启动时 SetConfigManager 之后调用一次）。
+func (s *Server) syncAuthToConfig() {
+	if s.configMgr == nil || s.auth == nil {
+		return
+	}
+	cm, ok := s.configMgr.(*config.ConfigManager)
+	if !ok {
+		return
+	}
+	cfg := cm.Get("default")
+	if cfg == nil {
+		return
+	}
+	dash, _ := cfg.Get("dashboard").(map[string]interface{})
+	if dash == nil {
+		dash = map[string]interface{}{}
+	}
+	s.injectAuthFields(dash)
+	if err := cfg.Update(map[string]interface{}{"dashboard": dash}); err != nil {
+		return
+	}
+	_ = cfg.Save()
+}
+
 // injectAuthFields re-asserts the dashboard auth fields from the password
 // manager so config saves never wipe them out.
 func (s *Server) injectAuthFields(dash map[string]interface{}) {
 	if s.auth == nil {
 		return
 	}
-	dash["username"] = s.auth.Username()
+	// 等待状态（初始密码已生成、用户尚未完成 setup）下不回填 username：
+	// 重置只落密码哈希，username 键保持缺失，下次启动按"无键=等待状态"
+	// 语义处理而不是误判为已设置账号。
+	if !s.auth.PasswordChangeRequired() {
+		dash["username"] = s.auth.Username()
+	} else {
+		delete(dash, "username")
+	}
 	if h := s.auth.HashedPassword(); h != "" {
 		dash["password"] = h
 	}
+	// change_required 必须随保存回填：否则用户手改 password 为空触发重置后，
+	// ConfigManager 用旧快照（false）覆盖掉重置流程写入的 true，等待状态丢失。
+	dash["password_change_required"] = s.auth.PasswordChangeRequired()
 	// 明文密码不再持久化：password 字段只存哈希，配置保存（会剔除 password
 	// 键）不会丢失凭据。
 	if sec := s.auth.JWTSecret(); sec != "" {

@@ -610,6 +610,7 @@ export type SetupAuthRequest = {
     username: string;
     password: string;
     confirm_password: string;
+    old_password?: string;
 };
 
 export type SkillPatchRequest = {
