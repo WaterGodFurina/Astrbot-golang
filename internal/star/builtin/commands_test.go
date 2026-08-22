@@ -107,7 +107,7 @@ func TestNewConversationCommand(t *testing.T) {
 	if e.Result == nil {
 		t.Fatal("new command produced no result")
 	}
-	cid := deps.ConversationMgr.GetCurrConversationID("qq_official:conv1")
+	cid := deps.ConversationMgr.GetCurrConversationID("qq_official:FriendMessage:conv1")
 	if cid == "" {
 		t.Fatal("new conversation was not created")
 	}
@@ -149,7 +149,7 @@ func TestSetUnsetVariables(t *testing.T) {
 		}
 	}
 	state.mu.Lock()
-	vars := state.sessionVars["qq_official:conv1"]
+	vars := state.sessionVars["qq_official:FriendMessage:conv1"]
 	state.mu.Unlock()
 	if vars == nil || vars["mykey"] != "hello world" {
 		t.Fatalf("session variable not stored correctly: %v", vars)

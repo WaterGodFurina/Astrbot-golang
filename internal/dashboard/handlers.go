@@ -9219,6 +9219,15 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 		// 过滤语义对齐 Python ConversationService.list_conversations /
 		// sqlite.get_filtered_conversations：platforms/message_types/search/
 		// exclude_ids/exclude_platforms。
+		if s.database == nil {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"conversations": []interface{}{},
+				"pagination": map[string]interface{}{
+					"page": page, "page_size": pageSize, "total": 0, "total_pages": 1,
+				},
+			}))
+			return
+		}
 		rows, total, err := s.database.GetFilteredConversations(db.ConversationFilter{
 			Platforms:        splitCSV("platforms"),
 			MessageTypes:     splitCSV("message_types"),

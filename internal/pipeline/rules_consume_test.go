@@ -17,7 +17,7 @@ func TestFilterHandlersBySession(t *testing.T) {
 	}
 	defer database.Close()
 	cm := conversation.NewManager(database)
-	umo := "qq:group:1"
+	umo := "qq:GroupMessage:group:1"
 	if err := cm.SetSessionRule(umo, conversation.RulePluginConfig, map[string]interface{}{
 		"disabled_plugins": []string{"plugin_a"},
 		"enabled_plugins":  []string{},
@@ -28,7 +28,7 @@ func TestFilterHandlersBySession(t *testing.T) {
 	s := NewProcessStage()
 	s.convMgr = cm
 	event := &core.Event{
-		Source: core.EventSource{Platform: "qq", ConvID: "group:1"},
+		Source: core.EventSource{Platform: "qq", ConvID: "group:1", IsGroup: true},
 	}
 	handlers := []*star.StarHandlerMetadata{
 		{HandlerFullName: "h1", PluginName: "plugin_a"},
