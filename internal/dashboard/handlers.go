@@ -8239,9 +8239,10 @@ func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request, parts []s
 			s.createAPIKey(w, r)
 			return
 		}
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"keys": s.serializeAPIKeys(),
-		}))
+		// data 直接是数组（对齐 Python list_api_keys：ok(await
+		// service.list_api_keys())），WebUI Settings 页把 res.data.data 当
+		// 数组遍历渲染表格。
+		writeJSON(w, http.StatusOK, apiOK(s.serializeAPIKeys()))
 		return
 	}
 	if parts[0] == "by-id" {

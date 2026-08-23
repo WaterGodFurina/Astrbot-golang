@@ -39,9 +39,15 @@ export const useExtensionPage = (initialTab = "installed") => {
 
   const getSelectedGitHubProxy = () => {
     if (typeof window === "undefined" || !window.localStorage) return "";
-    return localStorage.getItem("githubProxyRadioValue") === "1"
-      ? localStorage.getItem("selectedGitHubProxy") || ""
-      : "";
+    // 用户在弹窗里显式选择"使用代理"→ 用弹窗选择；
+    // 显式选"不使用"→ 空串；从未碰过弹窗 → 回退设置里的 github_proxy。
+    if (localStorage.getItem("githubProxyRadioValue") === "1") {
+      return localStorage.getItem("selectedGitHubProxy") || "";
+    }
+    if (localStorage.getItem("githubProxyRadioValue") === "0") {
+      return "";
+    }
+    return commonStore.githubProxyConfig || "";
   };
 
   // 检查指令冲突并提示
@@ -974,6 +980,8 @@ export const useExtensionPage = (initialTab = "installed") => {
   };
 
   const openUpdateConfirmDialog = (extensionName, forceUpdate = false) => {
+    // 预取设置里的 github_proxy，代理选择弹窗默认选中它。
+    commonStore.fetchGithubProxyConfig().catch(() => {});
     updateConfirmDialog.extensionName = extensionName;
     updateConfirmDialog.forceUpdate = forceUpdate;
     updateConfirmDialog.show = true;
@@ -1443,6 +1451,8 @@ export const useExtensionPage = (initialTab = "installed") => {
 
   // 为表格视图创建一个处理安装插件的函数
   const handleInstallPlugin = async (plugin) => {
+    // 预取设置里的 github_proxy，代理选择弹窗默认选中它。
+    commonStore.fetchGithubProxyConfig().catch(() => {});
     if (plugin.tags && plugin.tags.includes("danger")) {
       selectedDangerPlugin.value = plugin;
       dangerConfirmDialog.value = true;

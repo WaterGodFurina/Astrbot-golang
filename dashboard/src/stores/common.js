@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { logApi, pluginApi, statsApi } from "@/api/v1";
+import { logApi, pluginApi, statsApi, systemConfigApi } from "@/api/v1";
 import { fetchWithAuth } from "@/api/http";
 import { getToken } from "@/utils/token";
 
@@ -17,6 +17,9 @@ export const useCommonStore = defineStore("common", {
     dashboardVersion: "",
     pythonVersion: "",
     goVersion: "",
+    // 设置里的 github_proxy（system-config 持久化值）：安装插件/切换版本的
+    // GitHub 加速弹窗默认选中项，用户在弹窗里的单次选择可临时覆盖。
+    githubProxyConfig: "",
 
     pluginMarketData: [],
     pluginMarketDataBySource: {},
@@ -168,6 +171,21 @@ export const useCommonStore = defineStore("common", {
       this.dashboardVersion = String(dashboardVersion || "");
       this.pythonVersion = String(pythonVersion || "").replace(/^v/i, "");
       this.goVersion = String(goVersion || "").replace(/^go/i, "");
+    },
+    // 拉取设置里的 github_proxy（缓存到 githubProxyConfig），供代理选择
+    // 弹窗作为默认选中项。失败静默（弹窗回退 localStorage/空）。
+    async fetchGithubProxyConfig(force = false) {
+      if (!force && this.githubProxyConfig) {
+        return this.githubProxyConfig;
+      }
+      try {
+        const res = await systemConfigApi.get();
+        const cfg = res.data?.data?.config || {};
+        this.githubProxyConfig = String(cfg.github_proxy || "").trim();
+      } catch {
+        // keep current value
+      }
+      return this.githubProxyConfig;
     },
     async fetchAstrBotVersion(force = false) {
       if (!force && this.astrbotVersion) {

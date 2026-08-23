@@ -1026,6 +1026,7 @@ const updateDialogPluginLogo = computed(() => {
 
           <ProxySelector
             v-if="installUsesGithubArchiveSource"
+            :model-value="commonStore.githubProxyConfig"
             class="mt-4"
           />
         </div>
@@ -1204,6 +1205,7 @@ const updateDialogPluginLogo = computed(() => {
 
                 <ProxySelector
                   v-if="installUsesGithubArchiveSource"
+                  :model-value="commonStore.githubProxyConfig"
                 ></ProxySelector>
               </div>
             </v-window-item>
@@ -1510,6 +1512,7 @@ const updateDialogPluginLogo = computed(() => {
 
           <ProxySelector
             v-if="updateUsesGithubArchiveSource"
+            :model-value="commonStore.githubProxyConfig"
             class="mt-4"
           />
         </div>
