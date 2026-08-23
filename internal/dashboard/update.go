@@ -48,7 +48,7 @@ func (s *Server) githubUpdateProxy(reqProxy string) string {
 }
 
 // updateProgressSet 记录切换版本进度（供前端轮询）。
-func (s *Server) updateProgressSet(id string, st *installStatus) {
+func (s *Server) updateProgressSet(id string, st *updateProgress) {
 	if id == "" {
 		return
 	}
@@ -58,7 +58,7 @@ func (s *Server) updateProgressSet(id string, st *installStatus) {
 }
 
 // updateProgressGet 读取切换版本进度。
-func (s *Server) updateProgressGet(id string) *installStatus {
+func (s *Server) updateProgressGet(id string) *updateProgress {
 	s.updateProgressMu.Lock()
 	defer s.updateProgressMu.Unlock()
 	st := s.updateProgress[id]
@@ -191,9 +191,14 @@ func (s *Server) handleUpdateCheck(proxy string) map[string]interface{} {
 // doUpdateCore 执行"切换版本"：根据 version + 当前平台选择 zip 下载，
 // 解压替换本进程二进制并触发重启。
 func (s *Server) doUpdateCore(w http.ResponseWriter, progressID, tag, proxy string) {
+	setErr := func(msg string) {
+		p := newUpdateProgress(progressID, tag)
+		p.Status, p.Message = "error", msg
+		s.updateProgressSet(progressID, p)
+	}
 	resource := resourceForPlatform(runtime.GOOS, runtime.GOARCH)
 	if resource == "" {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "当前平台暂不支持自动升级"})
+		setErr("当前平台暂不支持自动升级")
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"status": "error", "message": "当前平台暂不支持自动升级",
 		}))
@@ -202,21 +207,23 @@ func (s *Server) doUpdateCore(w http.ResponseWriter, progressID, tag, proxy stri
 
 	tag = strings.TrimSpace(tag)
 	if tag == "" {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "缺少目标版本号"})
+		setErr("缺少目标版本号")
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"status": "error", "message": "缺少目标版本号",
 		}))
 		return
 	}
 	if !updateTagRe.MatchString(tag) {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "非法版本号格式"})
+		setErr("非法版本号格式")
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"status": "error", "message": "非法版本号格式",
 		}))
 		return
 	}
 
-	// 异步执行下载 + 替换 + 重启，先返回让前端开始轮询进度。
+	// 初始化富结构进度（对齐 Python _init_update_progress），异步执行下载 +
+	// 替换 + 重启，先返回让前端开始轮询进度。
+	s.updateProgressSet(progressID, newUpdateProgress(progressID, tag))
 	go s.performUpdate(progressID, tag, resource, proxy)
 
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -224,16 +231,64 @@ func (s *Server) doUpdateCore(w http.ResponseWriter, progressID, tag, proxy stri
 	}))
 }
 
-// performUpdate 在后台执行下载→解压→替换→重启。
+// performUpdate 在后台执行下载→解压→替换→重启。进度以富结构写入（对齐
+// Python UpdateService：stage=core 的下载阶段带字节/速度/百分比）。
 func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
-	setp := func(pct int, text string) {
-		s.updateProgressSet(progressID, &installStatus{Status: "downloading", Percent: pct, Text: text})
+	// setStage 更新当前阶段状态/消息/总进度。
+	setStage := func(stage, status, message string, overall int) {
+		p := s.updateProgressGet(progressID)
+		if p == nil {
+			p = newUpdateProgress(progressID, tag)
+		}
+		p.Stage = stage
+		p.Status = status
+		p.Message = message
+		if overall > 0 {
+			p.OverallPercent = overall
+		}
+		if _, ok := p.Stages[stage]; !ok {
+			p.Stages[stage] = &downloadStageInfo{Status: "pending"}
+		}
+		s.updateProgressSet(progressID, p)
 	}
-	setp(2, "准备下载 "+tag)
+	// setErr 写入错误终态。
+	setErr := func(msg string) {
+		p := s.updateProgressGet(progressID)
+		if p == nil {
+			p = newUpdateProgress(progressID, tag)
+		}
+		p.Status, p.Message = "error", msg
+		s.updateProgressSet(progressID, p)
+	}
+	// 下载进度回调：更新 core 阶段的字节/速度/百分比。
+	dlProgress := func(downloaded, total int64, speedKiBs int64) {
+		p := s.updateProgressGet(progressID)
+		if p == nil {
+			return
+		}
+		st := p.Stages["core"]
+		if st == nil {
+			st = &downloadStageInfo{}
+			p.Stages["core"] = st
+		}
+		st.Status = "downloading"
+		st.Downloaded = downloaded
+		st.Total = total
+		if total > 0 {
+			st.Percent = int(100 * downloaded / total)
+		}
+		st.Speed = speedKiBs
+		p.Stage = "core"
+		p.OverallPercent = 5 + int(70*float64(downloaded)/float64(total+1))
+		p.Message = fmt.Sprintf("下载中 %d%%", st.Percent)
+		s.updateProgressSet(progressID, p)
+	}
+
+	setStage("preparing", "running", "准备下载 "+tag, 2)
 
 	exe, err := os.Executable()
 	if err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "定位可执行文件失败: " + err.Error()})
+		setErr("定位可执行文件失败: " + err.Error())
 		return
 	}
 
@@ -243,39 +298,39 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 	}
 	// 出站 URL 校验防 SSRF（proxy 为管理员输入，tag 已过白名单）。
 	if err := validateOutboundURL(downloadURL); err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "下载地址校验失败: " + err.Error()})
+		setErr("下载地址校验失败: " + err.Error())
 		return
 	}
-	setp(5, "下载 "+downloadURL)
+	setStage("core", "downloading", "下载 "+downloadURL, 5)
 
 	tmpDir, err := os.MkdirTemp("", "astrbot-update-*")
 	if err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "创建临时目录失败: " + err.Error()})
+		setErr("创建临时目录失败: " + err.Error())
 		return
 	}
 	defer os.RemoveAll(tmpDir)
 
 	zipPath := filepath.Join(tmpDir, "release.zip")
-	if err := s.downloadFile(downloadURL, zipPath, progressID); err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "下载失败: " + err.Error()})
+	if err := s.downloadFile(downloadURL, zipPath, dlProgress); err != nil {
+		setErr("下载失败: " + err.Error())
 		return
 	}
 
-	// 审查项 3.2-3：解压替换前校验升级包 sha256 完整性（发布工作流为每个
-	// 产物附带 .sha256 校验文件），不匹配则硬失败中止，绝不替换运行中的
-	// 二进制——防止被劫持的代理会话完成持久化替换。
-	setp(72, "校验升级包完整性")
+	// 审查项 3.2-3：解压替换前校验升级包完整性（GitHub 官方 assets digest，
+	// 见 verifyUpdateChecksum），不匹配则硬失败中止，绝不替换运行中的二进制
+	// ——防止被劫持的代理会话完成持久化替换。
+	setStage("core", "done", "校验升级包完整性", 72)
 	if err := s.verifyUpdateChecksum(downloadURL, zipPath, tag, proxy); err != nil {
 		updateLogger.Error("升级包完整性校验失败: %v", err)
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "完整性校验失败: " + err.Error()})
+		setErr("完整性校验失败: " + err.Error())
 		return
 	}
 
-	setp(75, "解压并替换")
+	setStage("dependencies", "running", "解压并替换", 75)
 
 	newBin, err := extractSingleBinary(zipPath, tmpDir)
 	if err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "解压失败: " + err.Error()})
+		setErr("解压失败: " + err.Error())
 		return
 	}
 
@@ -283,12 +338,12 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 	exeDir := filepath.Dir(exe)
 	tmpExe := filepath.Join(exeDir, ".astrbot-update-bin"+filepath.Ext(exe))
 	if err := copyFile(newBin, tmpExe); err != nil {
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "写入新二进制失败: " + err.Error()})
+		setErr("写入新二进制失败: " + err.Error())
 		return
 	}
 	if err := os.Chmod(tmpExe, 0o755); err != nil {
 		_ = os.Remove(tmpExe)
-		s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "设置权限失败: " + err.Error()})
+		setErr("设置权限失败: " + err.Error())
 		return
 	}
 	if runtime.GOOS == "windows" {
@@ -299,25 +354,25 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 		_ = os.Remove(oldExe) // 清理上次升级残留
 		if err := os.Rename(exe, oldExe); err != nil {
 			_ = os.Remove(tmpExe)
-			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败（无法改名运行中的 exe）: " + err.Error()})
+			setErr("替换二进制失败（无法改名运行中的 exe）: " + err.Error())
 			return
 		}
 		if err := os.Rename(tmpExe, exe); err != nil {
 			// 回滚：把旧 exe 移回原位，避免留下"无主 exe"。
 			_ = os.Rename(oldExe, exe)
 			_ = os.Remove(tmpExe)
-			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败: " + err.Error()})
+			setErr("替换二进制失败: " + err.Error())
 			return
 		}
 	} else {
 		if err := os.Rename(tmpExe, exe); err != nil {
 			_ = os.Remove(tmpExe)
-			s.updateProgressSet(progressID, &installStatus{Status: "error", Text: "替换二进制失败: " + err.Error()})
+			setErr("替换二进制失败: " + err.Error())
 			return
 		}
 	}
 
-	s.updateProgressSet(progressID, &installStatus{Status: "done", Percent: 100, Text: "升级完成，正在重启…"})
+	setStage("restart", "running", "升级完成，正在重启…", 98)
 
 	// 触发核心自重启（spawn 新实例 → 优雅停机 → 退出）。
 	if s.restartFunc != nil {
@@ -326,7 +381,7 @@ func (s *Server) performUpdate(progressID, tag, resource, proxy string) {
 }
 
 // downloadFile 流式下载 URL 到 dst，并更新进度。
-func (s *Server) downloadFile(url, dst, progressID string) error {
+func (s *Server) downloadFile(url, dst string, onProgress func(downloaded, total int64, speedKiBs int64)) error {
 	// 下载前再次校验出站 URL 防 SSRF。
 	if err := validateOutboundURL(url); err != nil {
 		return err
@@ -352,6 +407,8 @@ func (s *Server) downloadFile(url, dst, progressID string) error {
 	defer out.Close()
 	buf := make([]byte, 64*1024)
 	var written int64
+	start := time.Now()
+	lastReport := time.Now()
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
@@ -362,11 +419,16 @@ func (s *Server) downloadFile(url, dst, progressID string) error {
 			if _, werr := out.Write(buf[:n]); werr != nil {
 				return werr
 			}
-			pct := 5
-			if total > 0 {
-				pct = 5 + int(70*float64(written)/float64(total))
+			// 每 300ms 上报一次下载进度（字节/速度），避免高频锁竞争。
+			if onProgress != nil && time.Since(lastReport) >= 300*time.Millisecond {
+				elapsed := time.Since(start).Seconds()
+				speedKiBs := int64(0)
+				if elapsed > 0 {
+					speedKiBs = int64(float64(written)/elapsed) / 1024
+				}
+				onProgress(written, total, speedKiBs)
+				lastReport = time.Now()
 			}
-			s.updateProgressSet(progressID, &installStatus{Status: "downloading", Percent: pct, Text: fmt.Sprintf("下载中 %d%%", pct)})
 		}
 		if rerr == io.EOF {
 			break
@@ -374,6 +436,10 @@ func (s *Server) downloadFile(url, dst, progressID string) error {
 		if rerr != nil {
 			return rerr
 		}
+	}
+	// 完成时上报最终状态（100%）。
+	if onProgress != nil && total > 0 {
+		onProgress(total, total, 0)
 	}
 	return nil
 }

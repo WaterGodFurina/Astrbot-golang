@@ -105,7 +105,7 @@ type Server struct {
 	webhookHandlers map[string]func(http.ResponseWriter, *http.Request)
 	// updateProgress 跟踪"切换版本"升级进度（keyed by progress_id），供前端轮询。
 	updateProgressMu sync.Mutex
-	updateProgress   map[string]*installStatus
+	updateProgress   map[string]*updateProgress
 	// chatRuns 跟踪每个 chat session 正在进行的 run（sessionID -> runID ->
 	// cancel），POST /chat/sessions/{id}/stop 与 WebSocket interrupt 复用，
 	// 对齐 Python active_event_registry.request_agent_stop_all。
@@ -232,6 +232,43 @@ type installStatus struct {
 	Total      int64  `json:"total"`
 }
 
+// updateProgress 是切换版本进度的富结构（对齐 Python UpdateService
+// update_progress：分 dashboard/core 两个下载阶段，各带字节/速度/百分比，
+// 外层 overall_percent 汇总），供 WebUI 更新对话框渲染逐阶段进度条。
+type updateProgress struct {
+	ID             string                        `json:"id"`
+	Status         string                        `json:"status"` // running | success | error
+	Stage          string                        `json:"stage"`  // preparing | core | dependencies | restart | done
+	Version        string                        `json:"version"`
+	Message        string                        `json:"message"`
+	OverallPercent int                           `json:"overall_percent"`
+	Stages         map[string]*downloadStageInfo `json:"stages"`
+}
+
+// downloadStageInfo 单个阶段的下载进度。
+type downloadStageInfo struct {
+	Status     string `json:"status"` // pending | downloading | done
+	Downloaded int64  `json:"downloaded"`
+	Total      int64  `json:"total"`
+	Percent    int    `json:"percent"`
+	Speed      int64  `json:"speed"` // KiB/s
+}
+
+// newUpdateProgress 构造 Python 形状的初始进度（两阶段均 pending）。
+func newUpdateProgress(id, version string) *updateProgress {
+	return &updateProgress{
+		ID:      id,
+		Status:  "running",
+		Stage:   "preparing",
+		Version: version,
+		Message: "正在准备更新...",
+		Stages: map[string]*downloadStageInfo{
+			"dashboard": {Status: "pending"},
+			"core":      {Status: "pending"},
+		},
+	}
+}
+
 // 状态 map（kbTasks / installProgress）的终态条目在 TTL 后自动清除，防止只增不删。
 const (
 	kbTaskCleanupTTL = 10 * time.Minute
@@ -293,7 +330,7 @@ func NewServer(port int, configPath string) *Server {
 	s.apiKeys = newAPIKeyStore(filepath.Dir(configPath))
 	s.chatAdapter = newChatStreamAdapter()
 	s.mcp = newMCPStore(filepath.Dir(configPath))
-	s.updateProgress = make(map[string]*installStatus)
+	s.updateProgress = make(map[string]*updateProgress)
 	s.installProgress = make(map[string]*installStatus)
 	s.marketCache = make(map[string]*marketCacheEntry)
 	s.kbTasks = make(map[string]*kbUploadTask)

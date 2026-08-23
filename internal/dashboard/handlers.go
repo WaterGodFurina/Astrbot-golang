@@ -6653,11 +6653,10 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []st
 			}))
 			return
 		}
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"progress": st.Percent,
-			"status":   st.Status,
-			"message":  st.Text,
-		}))
+		// 富结构对齐 Python UpdateService.get_update_progress：WebUI 更新
+		// 对话框按 stages.dashboard / stages.core 渲染逐阶段下载进度条，
+		// overall_percent 为总进度。
+		writeJSON(w, http.StatusOK, apiOK(st))
 	case "do", "core":
 		var body struct {
 			Version    string `json:"version"`
