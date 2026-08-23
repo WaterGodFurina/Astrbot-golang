@@ -653,6 +653,11 @@ export const authApi = {
       httpClient.post<ApiEnvelope<any>>('/api/auth/totp/setup', payload),
     );
   },
+  disableTotp() {
+    // spec 未收录 totp/disable 端点，直接走 httpClient（后端 handleTOTP
+    // 的 "disable" 分支已存在）。
+    return httpClient.post<ApiEnvelope<any>>('/api/auth/totp/disable');
+  },
   recoverTotp() {
     return withLegacyFallback<any>(openApiV1.recoverTotp(), () =>
       httpClient.post<ApiEnvelope<any>>('/api/auth/totp/recovery'),

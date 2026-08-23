@@ -154,11 +154,15 @@ func NewPasswordManager(configPath string) *PasswordManager {
 					if enable, ok := totpCfg["enable"].(bool); ok {
 						pm.totpEnabled = enable
 					}
-					if secret, ok := totpCfg["secret"].(string); ok && secret != "" {
-						pm.totpSecret = secret
-						// 存在 secret 但未显式开启时按已启用处理，保证两者一致。
-						if !pm.totpEnabled {
-							pm.totpEnabled = true
+					// ⚠️ 严格按 enable 字段决定启用状态。不要"存在 secret 就
+					// 视为已启用"——setup 两步流程（生成密钥→验证码确认）中，
+					// 用户生成密钥后未完成验证即关闭弹窗会留下
+					// {enable:false, secret:...} 的半启用状态；此时若自动置
+					// true，重启后登录要求 TOTP 但验证器从未绑定，直接死锁。
+					pm.totpSecret = ""
+					if pm.totpEnabled {
+						if secret, ok := totpCfg["secret"].(string); ok && secret != "" {
+							pm.totpSecret = secret
 						}
 					}
 					if rh, ok := totpCfg["recovery_code_hash"].(string); ok && rh != "" {

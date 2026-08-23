@@ -205,12 +205,21 @@ function resetState() {
 
 function onVisibilityChange(val) {
   if (!val) {
+    // 未完成验证码确认就关闭弹窗：作废未确认的 secret（后端 disable 会
+    // 清掉 totp 段并把 enable 置 false），防止残留半启用状态——否则重启
+    // 后加载"有 secret 即视为启用"会导致登录死锁（验证器从未绑定）。
+    if (newSecret.value) {
+      authApi.disableTotp?.().catch(() => {});
+    }
     resetState()
   }
   emit('update:modelValue', val)
 }
 
 function onCancel() {
+  if (newSecret.value) {
+    authApi.disableTotp?.().catch(() => {});
+  }
   resetState()
   emit('update:modelValue', false)
 }
