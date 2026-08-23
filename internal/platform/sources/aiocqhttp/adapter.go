@@ -162,8 +162,9 @@ func (a *Adapter) SetEventBus(bus platform.EventBus) {
 
 // Start starts the HTTP server for reverse WebSocket connections.
 func (a *Adapter) Start(ctx context.Context) error {
-	// 未配置 ws_reverse_token 时仅告警（对齐 Python：0.0.0.0 照常监听，
-	// Docker/跨服务器部署依赖全网卡可达），不强制降级回环地址。
+	// ⚠️ 不要把 Host 强制改成 127.0.0.1（曾作为"secure-by-default"引入后
+	// 已撤销）：0.0.0.0 监听是 Docker 桥接与跨服务器 OneBot 客户端（反向
+	// WS）的硬需求，缺 token 只告警——对齐 Python 原版 run() 的行为。
 	if a.Token == "" {
 		logger.I18nWarn("aiocqhttp: 未配置 ws_reverse_token，事件入口（GET /ws）未做访问鉴权。若本端口可被公网访问，请配置访问令牌")
 	}
