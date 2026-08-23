@@ -162,11 +162,10 @@ func (a *Adapter) SetEventBus(bus platform.EventBus) {
 
 // Start starts the HTTP server for reverse WebSocket connections.
 func (a *Adapter) Start(ctx context.Context) error {
-	// 未配置 ws_reverse_token 时事件入口默认仅监听回环地址（secure-by-default），
-	// 避免无鉴权的事件入口暴露在公网。
-	if a.Token == "" && a.Host == "0.0.0.0" {
-		a.Host = "127.0.0.1"
-		logger.I18nWarn("aiocqhttp: 未配置 ws_reverse_token，事件入口仅监听 127.0.0.1")
+	// 未配置 ws_reverse_token 时仅告警（对齐 Python：0.0.0.0 照常监听，
+	// Docker/跨服务器部署依赖全网卡可达），不强制降级回环地址。
+	if a.Token == "" {
+		logger.I18nWarn("aiocqhttp: 未配置 ws_reverse_token，事件入口（GET /ws）未做访问鉴权。若本端口可被公网访问，请配置访问令牌")
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", a.handleHTTP)
