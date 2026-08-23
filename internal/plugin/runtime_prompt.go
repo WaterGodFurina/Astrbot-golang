@@ -61,7 +61,12 @@ func (e *RuntimePromptError) Error() string {
 	if e.Android {
 		switch e.Kind {
 		case RuntimePromptPython:
-			return "无法准备 Python 运行时。请在 Termux 中执行 pkg install python 后重试，或选择自动下载 CPython"
+			// Android/Termux 上 Python 运行时准备失败的常见根因：宿主基础
+			// 依赖里的 C 扩展包（grpcio/cryptography/pillow/psutil）在
+			// Termux 无预编译 wheel、pip 本地编译失败——而非缺解释器本身。
+			// 这 4 个包 Termux 官方仓库有预编译包；其余依赖均为纯 Python/
+			// 有 wheel，pip 直接装无需 clang。
+			return "无法准备 Python 插件运行环境。请在 Termux 中执行 pkg install python python-grpcio python-cryptography python-pillow python-psutil 安装预编译依赖后重试"
 		default:
 			return "未检测到可用的 Go 工具链/SDK。请在 Termux 中执行 pkg install golang 后重试，或选择自动下载 Go 工具链"
 		}
@@ -232,7 +237,7 @@ func (m *SubprocessManager) pythonRuntimeForInstall(opts InstallOptions) (*pysdk
 	switch choice {
 	case "cancel":
 		if runtime.GOOS == "android" {
-			return nil, errors.New("已取消安装：请先在 Termux 中执行 pkg install python 安装 Python，然后重新安装该插件")
+			return nil, errors.New("已取消安装：请在 Termux 中执行 pkg install python python-grpcio python-cryptography python-pillow python-psutil 后重新安装该插件")
 		}
 		return nil, errors.New("已取消安装：请先手动安装 Python（或允许自动下载 CPython）后再安装该插件")
 	case "":

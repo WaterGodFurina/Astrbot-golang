@@ -158,6 +158,27 @@ func pyTarget() (string, error) {
 	return pyTargetFor(runtime.GOOS, runtime.GOARCH)
 }
 
+// termuxPrebuiltPkgs 是 Android/Termux 上宿主基础依赖中含 C 扩展、pip 无
+// 预编译 wheel 的包对应的 Termux 预编译软件包（pkg install 即装好，免去
+// 本地编译对 clang 的要求）。
+var termuxPrebuiltPkgs = []string{
+	"python-grpcio", "python-cryptography", "python-pillow", "python-psutil",
+}
+
+// pkgInstallTermuxPrebuilt 在 Termux 上预装 C 扩展依赖的预编译包。任一失败
+// 仅告警（后续 pip 安装仍会尝试，失败时由上层转为运行时下载提示）。
+func pkgInstallTermuxPrebuilt() {
+	for _, pkg := range termuxPrebuiltPkgs {
+		cmd := exec.Command("/data/data/com.termux/files/usr/bin/pkg", "install", "-y", pkg)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			logger.Warn("pkg install %s 失败: %v\n%s", pkg, err, strings.TrimSpace(string(out)))
+			continue
+		}
+		logger.Info("已安装 Termux 预编译包: %s", pkg)
+	}
+}
+
 // pyTargetFor is pyTarget's pure logic (testable across platforms).
 func pyTargetFor(goos, goarch string) (string, error) {
 	archMap := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}
@@ -822,7 +843,17 @@ func ensureVenvReady(dataDir string) (string, error) {
 		logger.Warn("venv 宿主依赖不完整（标记缺失/不匹配），锁内重新安装…")
 	} else {
 		logger.Info("Python %s 缺少宿主基础依赖，创建独立 venv 安装…", base)
-		if err := exec.Command(base, "-m", "venv", root).Run(); err != nil { // #nosec G204 -- Python SDK venv 初始化核心：base 为宿主探测到的解释器，root 为宿主生成的目录路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+		// Android/Termux：grpcio/cryptography/pillow/psutil 等 C 扩展包无
+		// 预编译 wheel，pip 本地编译几乎必失败；Termux 官方仓库有预编译包，
+		// 先 pkg install 它们，并让 venv 以 --system-site-packages 创建以
+		// 继承这些系统级包（其余纯 Python 依赖仍由 pip 装进 venv）。
+		venvArgs := []string{"-m", "venv"}
+		if runtime.GOOS == "android" {
+			pkgInstallTermuxPrebuilt()
+			venvArgs = append(venvArgs, "--system-site-packages")
+		}
+		venvArgs = append(venvArgs, root)
+		if err := exec.Command(base, venvArgs...).Run(); err != nil { // #nosec G204 -- Python SDK venv 初始化核心：base 为宿主探测到的解释器，root/venvArgs 由宿主生成; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 			logger.Warn("创建 venv 失败: %v（插件将无法启动）", err)
 			return "", fmt.Errorf("创建 venv 失败: %w", err)
 		}
@@ -957,7 +988,24 @@ func hasHostDeps(pythonBin string) bool {
 }
 
 func installHostDeps(pythonBin string) error {
-	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, hostBaseDeps...)
+	deps := hostBaseDeps
+	if runtime.GOOS == "android" {
+		// Termux：跳过已有预编译系统包的 C 扩展（pkg install 装的
+		// grpcio/cryptography/pillow/psutil 经 --system-site-packages 可见），
+		// 避免 pip 重复安装触发本地编译失败。
+		skip := map[string]bool{}
+		for _, p := range termuxPrebuiltPkgs {
+			skip[strings.TrimPrefix(p, "python-")] = true
+		}
+		filtered := make([]string, 0, len(deps))
+		for _, d := range deps {
+			if !skip[d] {
+				filtered = append(filtered, d)
+			}
+		}
+		deps = filtered
+	}
+	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, deps...)
 	args = append(args, "-i", PyPIIndex())
 	out, err := exec.Command(pythonBin, args...).CombinedOutput() // #nosec G204 -- pip 安装插件宿主基础依赖：args 由固定常量 hostBaseDeps + 固定 pip 参数组成，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	if err != nil {
