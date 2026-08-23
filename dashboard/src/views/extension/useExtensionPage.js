@@ -217,6 +217,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     android: false,
     mirrors: [],
     selectedMirror: "",
+    command: "",
   });
   // 用户选择的 Python 运行时处理（download / cancel）
   const pythonChoice = ref("");
@@ -2370,6 +2371,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       pythonRuntimeDialog.mirrors = Array.isArray(data.mirrors)
         ? data.mirrors
         : [];
+      pythonRuntimeDialog.command = String(data.command || "");
       pythonRuntimeDialog.selectedMirror = pythonRuntimeDialog.mirrors[0] || "";
       pythonRuntimeDialog.show = true;
       await refreshExtensionsAfterInstallFailure();

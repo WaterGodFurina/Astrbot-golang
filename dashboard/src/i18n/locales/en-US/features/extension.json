@@ -270,7 +270,7 @@
     "python_runtime": {
       "title": "Python Runtime Required",
       "message": "This plugin requires the Python runtime to run.",
-      "android_hint": "Install Python in Termux with the following command:",
+      "android_hint": "Run the following command in Termux to install the missing prebuilt dependencies:",
       "download_hint": "Automatically download CPython?",
       "mirrorLabel": "Download mirror",
       "download": "Auto Download",

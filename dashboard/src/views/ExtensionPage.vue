@@ -855,11 +855,11 @@ const updateDialogPluginLogo = computed(() => {
             {{ tm("dialogs.python_runtime.android_hint") }}
           </div>
           <div class="d-flex align-center mb-2">
-            <code class="flex-grow-1">pkg update && pkg install python</code>
+            <code class="flex-grow-1">{{ pythonRuntimeDialog.command || "pkg update && pkg install python" }}</code>
             <v-btn
               size="small"
               variant="tonal"
-              @click="copyPkgCommand('pkg update && pkg install python')"
+              @click="copyPkgCommand(pythonRuntimeDialog.command || 'pkg update && pkg install python')"
             >
               {{ tm("dialogs.python_runtime.copy") }}
             </v-btn>

@@ -270,7 +270,7 @@
     "python_runtime": {
       "title": "需要 Python 运行时",
       "message": "该插件需要 Python 运行时才能运行。",
-      "android_hint": "请在 Termux 中执行以下命令安装 Python：",
+      "android_hint": "请在 Termux 中执行以下命令安装缺失的预编译依赖：",
       "download_hint": "是否自动下载 CPython？",
       "mirrorLabel": "加速下载镜像",
       "download": "自动下载",
