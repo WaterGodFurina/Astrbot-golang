@@ -565,6 +565,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// TOTP 双因素：启用后登录必须携带验证码（或恢复码）。
 		// 使用恢复码登录会一次性禁用双因素（对齐 Python 语义）。
 		if s.auth.TOTPEnabled() {
+			if creds.Code == "" {
+				// 密码正确但未提供验证码：告知前端进入 TOTP 输入阶段
+				// （对齐 Python：data={"totp_required": true}，401）。
+				writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+					"status":  "error",
+					"message": "需要 TOTP 验证",
+					"data":    map[string]interface{}{"totp_required": true},
+				})
+				return
+			}
 			ok, usedRecovery := s.auth.VerifyTOTPEx(creds.Code)
 			if !ok {
 				writeJSON(w, http.StatusUnauthorized, apiError("TOTP 验证码错误"))
