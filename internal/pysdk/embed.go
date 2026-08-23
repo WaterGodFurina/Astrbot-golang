@@ -163,6 +163,7 @@ func pyTarget() (string, error) {
 // 本地编译对 clang 的要求）。
 var termuxPrebuiltPkgs = []string{
 	"python-grpcio", "python-cryptography", "python-pillow", "python-psutil",
+	"resolv-conf",
 }
 
 // pkgInstallTermuxPrebuilt 在 Termux 上预装 C 扩展依赖的预编译包。任一失败
@@ -254,7 +255,6 @@ func pythonUsable(p string) bool {
 	}
 	ver := probeMinor(p)
 	if ver == "" {
-		logger.Warn("Python %s 版本探测失败（不可执行/超时/输出异常），跳过", p)
 		return false
 	}
 	if !minorAtLeast(ver, minSupportedPythonMinor) {
@@ -273,13 +273,6 @@ func probeMinor(p string) string {
 	cmd := exec.CommandContext(ctx, p, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')")
 	out, err := cmd.Output()
 	if err != nil {
-		// 带上退出码/stderr 便于定位 Termux 等环境的探测失败根因。
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			logger.Warn("Python 探测失败: %s exit=%d stderr=%s", p, ee.ExitCode(), strings.TrimSpace(string(ee.Stderr)))
-		} else {
-			logger.Warn("Python 探测失败: %s: %v", p, err)
-		}
 		return ""
 	}
 	return strings.TrimSpace(string(out))

@@ -157,7 +157,7 @@ jobs:
           - { runner: ubuntu-latest,  target: loongarch64-unknown-linux-musl, resource: linux-loongarch64-musl, goos: linux, goarch: loong64, ext: '', libc: musl }
           - { runner: macos-15-intel, target: x86_64-apple-darwin,   resource: macos-x86_64,   goos: darwin, goarch: amd64,  ext: '', libc: '' }
           - { runner: macos-14,       target: aarch64-apple-darwin,  resource: macos-aarch64,  goos: darwin, goarch: arm64,  ext: '', libc: '' }
-          - { runner: ubuntu-latest,  target: aarch64-linux-android, resource: android-aarch64, goos: android, goarch: arm64, ext: '', libc: '' }
+          - { runner: ubuntu-latest,  target: aarch64-linux-android, resource: android-aarch64, goos: android, goarch: arm64, ext: '',   libc: bionic }
 
     steps:
       - name: Checkout repository
@@ -171,15 +171,32 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      - name: 安装 Android NDK（仅 android target）
+        if: matrix.goos == 'android'
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
       - name: 交叉编译 AstrBot（CGO_ENABLED=0，纯 Go，modernc.org/sqlite）
+        shell: bash
         env:
-          CGO_ENABLED: '0'
+          CGO_ENABLED: ${{ matrix.libc == 'bionic' && '1' || '0' }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM64: v8.0
+          CC: ${{ matrix.libc == 'bionic' && format('{0}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang', steps.setup-ndk.outputs.ndk-path) || '' }}
+          CXX: ${{ matrix.libc == 'bionic' && format('{0}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang++', steps.setup-ndk.outputs.ndk-path) || '' }}
+          CGO_CFLAGS: ''
+          CGO_CPPFLAGS: ''
+          CGO_CXXFLAGS: ''
+          CGO_LDFLAGS: ''
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
-        run: go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ needs.release-meta.outputs.version }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ needs.release-meta.outputs.python_version }}" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
+        run: |
+          go build -buildmode=exe -compiler=gc -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ needs.release-meta.outputs.version }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ needs.release-meta.outputs.python_version }}" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
 
       - name: 打包 zip（Windows）
         if: runner.os == 'Windows'
