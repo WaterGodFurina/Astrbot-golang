@@ -24,7 +24,7 @@ const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 // sdkModuleVersion 是宿主内置的插件 SDK 版本（与宿主 go.mod 的 require 一致，
 // 发版时同步 bump）。发布版宿主进程的 CWD 下没有 go.mod，SDK 解析与下载在
 // 找不到 go.mod 时以该常量兜底定位模块缓存，不再依赖进程工作目录。
-const sdkModuleVersion = "1.4.0"
+const sdkModuleVersion = "v1.4.0"
 
 // Compiler builds plugin source into a platform-native executable using the
 // bundled Go toolchain. It also performs static safety checks (import
