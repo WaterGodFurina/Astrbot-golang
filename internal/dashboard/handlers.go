@@ -6656,6 +6656,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []st
 		if progressID == "" {
 			progressID = r.URL.Query().Get("progress_id")
 		}
+		if progressID == "" && len(parts) > 1 {
+			// OpenAPI 客户端（openApiV1.getUpdateProgress）用路径参数调用
+			// /api/v1/updates/progress/{task_id}。
+			progressID = parts[1]
+		}
 		st := s.updateProgressGet(progressID)
 		if st == nil {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
