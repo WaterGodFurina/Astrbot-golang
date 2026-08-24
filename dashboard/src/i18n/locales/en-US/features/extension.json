@@ -517,5 +517,15 @@
   },
   "pluginChangelog": {
     "menuTitle": "View Changelog"
+  },
+  "adminList": {
+    "manage": "Manage Plugin Admins",
+    "hint": "Authorize specific plugins to manage other plugins (install/uninstall/enable/disable). Unauthorized plugins can only manage themselves. Leave empty for no admin plugins.",
+    "label": "Plugin names (comma-separated)",
+    "placeholder": "astrbot_plugin_xxx_python, astrbot_plugin_yyy_go",
+    "example": "Plugin name format: name_language (e.g. astrbot_plugin_box_python). Takes effect after plugin restart.",
+    "save": "Save",
+    "cancel": "Cancel",
+    "saved": "Plugin admin list saved"
   }
 }

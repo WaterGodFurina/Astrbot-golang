@@ -1,6 +1,7 @@
 <script setup>
 import ExtensionCard from "@/components/shared/ExtensionCard.vue";
 import { normalizeTextInput } from "@/utils/inputValue";
+import { systemConfigApi } from "@/api/v1";
 import {
   readPinnedExtensions,
   writePinnedExtensions,
@@ -167,6 +168,47 @@ const openPluginWebui = (extension) => {
   });
 };
 
+const adminListDialog = ref(false);
+const adminListText = ref("");
+const adminListLoading = ref(false);
+
+const openAdminListDialog = async () => {
+  adminListDialog.value = true;
+  adminListLoading.value = true;
+  try {
+    const res = await systemConfigApi.get();
+    const cfg = res.data?.data?.config || {};
+    const list = Array.isArray(cfg.plugin_admin_list)
+      ? cfg.plugin_admin_list
+      : [];
+    adminListText.value = list.join(", ");
+  } catch (e) {
+    toast(e, "error");
+    adminListDialog.value = false;
+  } finally {
+    adminListLoading.value = false;
+  }
+};
+
+const saveAdminList = async () => {
+  adminListLoading.value = true;
+  try {
+    const res = await systemConfigApi.get();
+    const cfg = res.data?.data?.config || {};
+    cfg.plugin_admin_list = adminListText.value
+      .split(/[,，]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    await systemConfigApi.update(cfg);
+    toast(tm("adminList.saved"), "success");
+    adminListDialog.value = false;
+  } catch (e) {
+    toast(e, "error");
+  } finally {
+    adminListLoading.value = false;
+  }
+};
+
 const pinnedExtensionNames = ref(readPinnedExtensions());
 
 const pinnedExtensionOrder = computed(() => {
@@ -248,6 +290,15 @@ const togglePinnedExtension = (extension) => {
         </v-tabs>
 
         <div class="installed-search-wrap d-flex align-center ml-auto">
+          <v-btn
+            variant="tonal"
+            density="comfortable"
+            prepend-icon="mdi-shield-key-outline"
+            class="mr-2 text-none"
+            @click="openAdminListDialog"
+          >
+            {{ tm("adminList.manage") }}
+          </v-btn>
           <v-text-field
             :model-value="pluginSearch"
             @update:model-value="pluginSearch = normalizeTextInput($event)"
@@ -563,6 +614,47 @@ const togglePinnedExtension = (extension) => {
       </template>
     </v-tooltip>
   </v-tab-item>
+
+  <v-dialog v-model="adminListDialog" max-width="560">
+    <v-card>
+      <v-card-title class="d-flex align-center">
+        <v-icon class="mr-2">mdi-shield-key-outline</v-icon>
+        {{ tm("adminList.manage") }}
+      </v-card-title>
+      <v-card-text>
+        <div class="text-body-2 mb-2">
+          {{ tm("adminList.hint") }}
+        </div>
+        <v-text-field
+          v-model="adminListText"
+          density="compact"
+          variant="outlined"
+          :label="tm('adminList.label')"
+          :loading="adminListLoading"
+          :placeholder="tm('adminList.placeholder')"
+          clearable
+          :disabled="adminListLoading"
+        />
+        <div class="text-caption text-medium-emphasis">
+          {{ tm("adminList.example") }}
+        </div>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="adminListDialog = false">
+          {{ tm("adminList.cancel") }}
+        </v-btn>
+        <v-btn
+          color="primary"
+          variant="tonal"
+          :loading="adminListLoading"
+          @click="saveAdminList"
+        >
+          {{ tm("adminList.save") }}
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
 </template>
 
 <style scoped>

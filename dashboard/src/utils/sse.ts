@@ -1,6 +1,6 @@
 export async function readSseStream(
   body: ReadableStream<Uint8Array>,
-  onPayload: (payload: unknown) => void,
+  onPayload: (payload: any) => void,
 ) {
   const reader = body.getReader();
   const decoder = new TextDecoder();

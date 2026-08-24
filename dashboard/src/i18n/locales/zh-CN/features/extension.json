@@ -517,5 +517,15 @@
   },
   "pluginChangelog": {
     "menuTitle": "查看更新日志"
+  },
+  "adminList": {
+    "manage": "管理插件授权",
+    "hint": "授权指定插件管理其他插件（安装/卸载/启停）。未授权的插件只能操作自身。留空表示无管理插件。",
+    "label": "插件注册名（逗号分隔）",
+    "placeholder": "astrbot_plugin_xxx_python, astrbot_plugin_yyy_go",
+    "example": "插件注册名格式：插件名_语言（如 astrbot_plugin_box_python）。需重启插件后生效。",
+    "save": "保存",
+    "cancel": "取消",
+    "saved": "已保存插件授权名单"
   }
 }
