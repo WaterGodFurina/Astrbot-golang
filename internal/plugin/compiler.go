@@ -21,6 +21,11 @@ import (
 // plugin links against. Builds `replace` it to the local copy.
 const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 
+// sdkModuleVersion 是宿主内置的插件 SDK 版本（与宿主 go.mod 的 require 一致，
+// 发版时同步 bump）。发布版宿主进程的 CWD 下没有 go.mod，SDK 解析与下载在
+// 找不到 go.mod 时以该常量兜底定位模块缓存，不再依赖进程工作目录。
+const sdkModuleVersion = "1.4.0"
+
 // Compiler builds plugin source into a platform-native executable using the
 // bundled Go toolchain. It also performs static safety checks (import
 // blacklist) and `go vet` before compiling.
@@ -302,6 +307,10 @@ func findSDKDirWithGo(goBin string) (string, error) {
 			break
 		}
 		dir = parent
+	}
+	// 兜底：发布版宿主无 go.mod（CWD 任意），用内置 SDK 版本直接查模块缓存。
+	if p, err := sdkInModCache(goBin, "", sdkModuleVersion); err == nil {
+		return p, nil
 	}
 	return "", fmt.Errorf("no go.mod with the AstrBot SDK replace found (set %s)", "ASTRBOT_GO_SDK")
 }

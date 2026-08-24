@@ -201,12 +201,13 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 			version = sdkRequireFromGoMod(data)
 		}
 	}
-	target := sdkModulePath
-	if version != "" {
-		target += "@" + version
-	} else {
-		target += "@latest"
+	// 发布版宿主 CWD 下没有 go.mod：回退内置 SDK 版本常量（与 go.mod require
+	// 同步），保证 go mod download 与后续模块缓存定位使用同一版本。
+	if version == "" {
+		version = sdkModuleVersion
+		logger.Debug("SDK 解析：未找到宿主 go.mod，使用内置 SDK 版本 %s", version)
 	}
+	target := sdkModulePath + "@" + version
 	tmp, err := os.MkdirTemp("", "astrbot-go-sdk-*")
 	if err != nil {
 		return err
