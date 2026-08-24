@@ -270,12 +270,12 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 					finalToolCalls = append(finalToolCalls, acc)
 					delete(toolBuf, event.Index)
 				}
-case "message_delta":
-			// message_delta 的 usage 只携带 output_tokens（对齐 Python
-			// _update_usage：input 字段缺失时保留 message_start 的值）。
-			if event.Usage != nil {
-				usage.Output = event.Usage.OutputTokens
-			}
+			case "message_delta":
+				// message_delta 的 usage 只携带 output_tokens（对齐 Python
+				// _update_usage：input 字段缺失时保留 message_start 的值）。
+				if event.Usage != nil {
+					usage.Output = event.Usage.OutputTokens
+				}
 			case "message_stop":
 				ch <- buildFinal()
 				sentFinal = true
