@@ -183,8 +183,12 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 		goBin = b
 	}
 	// SDK 已可 resolve（ASTRBOT_GO_SDK / 本地 replace / 模块缓存）→ 无需下载。
+	logger.Debug("SDK 解析：使用 go=%s 探测 SDK（版本来自宿主 go.mod）", goBin)
 	if _, err := findSDKDirWithGo(goBin); err == nil {
+		logger.Debug("SDK 解析：SDK 已可 resolve，跳过下载")
 		return nil
+	} else {
+		logger.Debug("SDK 解析：SDK 未 resolve: %v，准备下载", err)
 	}
 	if opts.Stage != nil {
 		opts.Stage("下载插件 SDK…")
@@ -212,6 +216,7 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte("module astrbot-sdk-download\n\ngo 1.23\n"), 0o644); err != nil { // #nosec G306 -- 临时模块文件，常规权限即可
 		return err
 	}
+	logger.Debug("SDK 解析：执行 go mod download %s（GOPROXY=%s）", target, m.compiler.goproxyEnv())
 	cmd := exec.CommandContext(ctx, goBin, "mod", "download", target) // #nosec G204 -- 下载固定的插件 SDK 模块（target 由固定 module path + 宿主 go.mod 版本拼装）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = tmp
 	cmd.Env = append(os.Environ(),
@@ -220,13 +225,17 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		logger.Debug("SDK 解析：go mod download 失败: %v\n%s", err, strings.TrimSpace(string(out)))
 		return fmt.Errorf("下载插件 SDK 失败: %w\n%s", err, strings.TrimSpace(string(out)))
 	}
+	logger.Debug("SDK 解析：go mod download 成功（%s）", target)
 	// 校验下载后 SDK 确实可 resolve，否则后续 Prepare 仍会失败（给出明确错误
 	// 而非笼统的 "no go.mod with the AstrBot SDK replace found"）。
 	if _, err := findSDKDirWithGo(goBin); err != nil {
+		logger.Debug("SDK 解析：下载后仍无法 resolve: %v", err)
 		return fmt.Errorf("插件 SDK 下载后仍无法解析: %w", err)
 	}
+	logger.Debug("SDK 解析：SDK 下载后可 resolve")
 	return nil
 }
 

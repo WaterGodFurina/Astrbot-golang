@@ -345,8 +345,10 @@ func sdkInModCache(goBin, workDir, version string) (string, error) {
 	// 不依赖网络，Windows 网络差时 go list -m 加载完整模块图会失败）。
 	if version != "" {
 		if dir := sdkInModuleCacheDir(goBin, version); dir != "" {
+			logger.Debug("SDK 解析：命中模块缓存目录 %s", dir)
 			return dir, nil
 		}
+		logger.Debug("SDK 解析：模块缓存未命中（version=%s），回退 go list -m", version)
 	}
 	// 回退：go list -m 解析（完整依赖图，网络好时也能命中本地 replace 场景）。
 	if goBin == "" {
@@ -357,6 +359,12 @@ func sdkInModCache(goBin, workDir, version string) (string, error) {
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
 	out, err := cmd.Output()
 	if err != nil {
+		// stderr 里通常是依赖图加载失败的根因（缺失模块 go.mod / 网络错误）。
+		var stderr []byte
+		if ee, ok := err.(*exec.ExitError); ok {
+			stderr = ee.Stderr
+		}
+		logger.Debug("SDK 解析：go list -m 失败（go=%s dir=%s）: %v %s", goBin, workDir, err, strings.TrimSpace(string(stderr)))
 		return "", fmt.Errorf("locate SDK %s@%s in module cache: %w", sdkModulePath, version, err)
 	}
 	dir := strings.TrimSpace(string(out))
@@ -378,15 +386,20 @@ func sdkInModuleCacheDir(goBin, version string) string {
 	}
 	out, err := exec.Command(goBin, "env", "GOMODCACHE").Output() // #nosec G204 -- 固定参数，无注入面
 	if err != nil {
+		logger.Debug("SDK 解析：go env GOMODCACHE 失败（go=%s）: %v", goBin, err)
 		return ""
 	}
 	modcache := strings.TrimSpace(string(out))
 	if modcache == "" {
+		logger.Debug("SDK 解析：go env GOMODCACHE 返回空（go=%s）", goBin)
 		return ""
 	}
 	dir := filepath.Join(modcache, moduleCachePath(sdkModulePath, version))
+	logger.Debug("SDK 解析：检查模块缓存 %s", dir)
 	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
 		return dir
+	} else {
+		logger.Debug("SDK 解析：%s 不存在（%v）", dir, err)
 	}
 	return ""
 }
