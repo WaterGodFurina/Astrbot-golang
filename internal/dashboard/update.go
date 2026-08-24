@@ -82,6 +82,8 @@ func (s *Server) fetchGithubReleases(proxy string) ([]map[string]interface{}, er
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	// GitHub API 强制要求 User-Agent，缺失会直接 403（未认证 rate limit 也更易触发）。
+	req.Header.Set("User-Agent", "AstrBot-Go")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -513,6 +515,8 @@ func (s *Server) fetchGithubReleaseAssets(tag, proxy string) ([]map[string]inter
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	// GitHub API 强制要求 User-Agent，缺失会直接 403（未认证 rate limit 也更易触发）。
+	req.Header.Set("User-Agent", "AstrBot-Go")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

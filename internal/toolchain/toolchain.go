@@ -16,6 +16,7 @@ import (
 	"archive/tar"
 	"archive/zip"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -118,6 +119,19 @@ func (tc *Toolchain) EnsureWithProgress(progress ProgressFunc) (string, error) {
 	if bin, err := tc.GoBin(); err == nil {
 		return bin, nil
 	}
+	// 残缺工具链自愈：fast path 只 stat 文件存在，解压被中断/被杀软破坏的
+	// go 二进制仍会命中。这里对 bundled go 做一次 `go version` 快速探测
+	//（~100ms），跑不动则删除重装，避免后续 go mod download / go list 以
+	// 残缺工具链失败、报"SDK 无法解析"。
+	if root := tc.BundledRoot(); root != "" {
+		bin := filepath.Join(root, "bin", exe("go"))
+		if tc.isExecutable(bin) && !goBinaryUsable(bin) {
+			logger.I18nWarn("检测到 bundled Go 工具链不可用（go version 失败），自动重新下载…")
+			if err := os.RemoveAll(root); err != nil {
+				logger.I18nWarn("清理损坏的 Go 工具链失败: %v", err)
+			}
+		}
+	}
 	return tc.downloadAndExtract(progress)
 }
 
@@ -187,6 +201,16 @@ func CGOEnabled() bool {
 	return false
 }
 
+// goBinaryUsable 快速探测 go 二进制能否正常运行（`go version`，10s 超时）。
+// 残缺/被破坏的工具链会在此失败，供 EnsureWithProgress 触发自动重装。
+func goBinaryUsable(bin string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, "version") // #nosec G204 -- 固定参数，无注入面
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) != ""
+}
+
 // downloadAndExtract provisions the official Go distribution under BaseDir.
 func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	if !supportsBundledGo() {
@@ -201,6 +225,9 @@ func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	archive := archiveName(tc.Version)
 	dest := filepath.Join(base, archive)
 	url := downloadURL(archive)
+
+	// 上次解压中断留下的 staging 先清理，避免半成品目录残留。
+	_ = os.RemoveAll(base + ".staging")
 
 	logger.Info("Downloading Go toolchain %s from %s", archive, url)
 	if err := downloadFile(url, dest, progress); err != nil {
@@ -219,7 +246,7 @@ func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	// 不会留下残缺 bundle（残缺的 <base>/go/bin/go 会让后续所有 Ensure 在
 	// GoBin 处直接命中并返回，插件编译持续失败）。
 	staging := base + ".staging"
-	if err := extractArchive(dest, staging); err != nil {
+	if err := extractArchive(dest, staging, progress); err != nil {
 		_ = os.RemoveAll(staging)
 		_ = os.Remove(dest)
 		return "", fmt.Errorf("extract %s: %w", archive, err)
@@ -418,6 +445,11 @@ func downloadFile(url, dest string, progress ProgressFunc) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
+	// 幂等：已下载且大小与远端一致时跳过（避免解压期间重复触发下载 83MB）。
+	if info, err := os.Stat(dest); err == nil && !info.IsDir() && resp.ContentLength > 0 && info.Size() == resp.ContentLength {
+		logger.Info("Go toolchain archive already downloaded: %s", dest)
+		return nil
+	}
 	f, err := os.Create(dest) // #nosec G304 -- dest is the private BaseDir archive path constructed from tc.Version
 	if err != nil {
 		return err
@@ -475,15 +507,30 @@ func humanSize(n int64) string {
 }
 
 // extractArchive unpacks a Go official archive (tar.gz or zip) into dir,
-// preserving the leading "go/" component so GOROOT becomes dir/go.
-func extractArchive(src, dir string) error {
+// preserving the leading "go/" component so GOROOT becomes dir/go. progress
+// reports extracted-file count / total count (percentages match download).
+func extractArchive(src, dir string, progress ProgressFunc) error {
 	if strings.HasSuffix(src, ".zip") {
-		return extractZip(src, dir)
+		return extractZip(src, dir, progress)
 	}
-	return extractTarGz(src, dir)
+	return extractTarGz(src, dir, progress)
 }
 
-func extractTarGz(src, dir string) error {
+// extractProgress 按已解压文件数推进进度回调并每 10% 打日志，让解压阶段
+// （Windows 杀软实时扫描下可能较慢）有可见反馈，避免误判卡死。
+func extractProgress(done, total int64, progress ProgressFunc) {
+	if progress != nil {
+		progress(done, total)
+	}
+	if total > 0 {
+		pct := int(done * 100 / total)
+		if pct%10 == 0 && pct >= 0 && pct <= 100 {
+			logger.Info("Extracting Go toolchain: %d%% (%d / %d files)", pct, done, total)
+		}
+	}
+}
+
+func extractTarGz(src, dir string, progress ProgressFunc) error {
 	f, err := os.Open(src) // #nosec G304 -- src is the verified archive under the private BaseDir
 	if err != nil {
 		return err
@@ -496,6 +543,17 @@ func extractTarGz(src, dir string) error {
 	defer gz.Close()
 
 	tr := tar.NewReader(gz)
+	total, done := int64(0), int64(0)
+	for {
+		if _, err := tr.Next(); err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+		total++
+	}
+	gz.Reset(f)
+	tr = tar.NewReader(gz)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -504,6 +562,8 @@ func extractTarGz(src, dir string) error {
 		if err != nil {
 			return err
 		}
+		done++
+		extractProgress(done, total, progress)
 		target, err := safeJoin(dir, hdr.Name)
 		if err != nil {
 			return err
@@ -532,13 +592,17 @@ func extractTarGz(src, dir string) error {
 	}
 }
 
-func extractZip(src, dir string) error {
+func extractZip(src, dir string, progress ProgressFunc) error {
 	zr, err := zip.OpenReader(src)
 	if err != nil {
 		return err
 	}
 	defer zr.Close()
+	total := int64(len(zr.File))
+	var done int64
 	for _, zf := range zr.File {
+		done++
+		extractProgress(done, total, progress)
 		target, err := safeJoin(dir, zf.Name)
 		if err != nil {
 			return err
