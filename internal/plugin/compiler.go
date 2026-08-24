@@ -341,6 +341,14 @@ func sdkRequireFromGoMod(data []byte) string {
 // only used by toolchain-less test helpers); workDir pins the command's working
 // directory to the go.mod location instead of the process CWD.
 func sdkInModCache(goBin, workDir, version string) (string, error) {
+	// 主路径：按 GOMODCACHE 布局直接文件系统定位（不加载宿主依赖图、
+	// 不依赖网络，Windows 网络差时 go list -m 加载完整模块图会失败）。
+	if version != "" {
+		if dir := sdkInModuleCacheDir(goBin, version); dir != "" {
+			return dir, nil
+		}
+	}
+	// 回退：go list -m 解析（完整依赖图，网络好时也能命中本地 replace 场景）。
 	if goBin == "" {
 		goBin = "go"
 	}
@@ -359,6 +367,43 @@ func sdkInModCache(goBin, workDir, version string) (string, error) {
 		return "", fmt.Errorf("SDK source %q missing go.mod: %w", dir, err)
 	}
 	return dir, nil
+}
+
+// sdkInModuleCacheDir 直接按 GOMODCACHE 目录布局定位 SDK 源码目录
+// （$GOMODCACHE/<module-path>@<version>，大写字母按 Go 规范转 !x! 编码）。
+// go env GOMODCACHE 只读本地配置，不加载模块图、不联网。
+func sdkInModuleCacheDir(goBin, version string) string {
+	if goBin == "" {
+		goBin = "go"
+	}
+	out, err := exec.Command(goBin, "env", "GOMODCACHE").Output() // #nosec G204 -- 固定参数，无注入面
+	if err != nil {
+		return ""
+	}
+	modcache := strings.TrimSpace(string(out))
+	if modcache == "" {
+		return ""
+	}
+	dir := filepath.Join(modcache, moduleCachePath(sdkModulePath, version))
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+		return dir
+	}
+	return ""
+}
+
+// moduleCachePath 把模块路径+版本转为 GOMODCACHE 目录名：大写字母前缀
+// "!" 并转小写（如 WaterGodFurina → !water!god!furina）。
+func moduleCachePath(modPath, version string) string {
+	var sb strings.Builder
+	for _, r := range modPath {
+		if r >= 'A' && r <= 'Z' {
+			sb.WriteByte('!')
+			sb.WriteRune(r - 'A' + 'a')
+		} else {
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String() + "@" + version
 }
 
 // sdkReplaceFromGoMod extracts the SDK replace target from go.mod contents
