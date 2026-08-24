@@ -445,15 +445,29 @@ func SetPythonMirror(prefix string) {
 
 // pyDownloadURL applies the mirror prefix to the official release URL: the
 // SetPythonMirror override wins, then ASTRBOT_PYTHON_MIRROR.
+//
+// 镜像分两种风格（对齐 zig/Go 的 SetGoMirror 处理）：
+//   - 前缀风格（gh-proxy.com / ghfast.top / ghproxy.net）：官方完整 URL 跟在
+//     代理前缀后，即 <mirror>/<官方完整 URL>；
+//   - base 风格（官方完整 URL 本身）：直接作为下载 base，不再重复拼接官方
+//     前缀，否则会出现 URL 双段重复（404）。
 func pyDownloadURL(archive string) string {
-	u := pyBuildStandaloneURL + "/" + pyVersion() + "/" + archive
+	prefix := ""
 	if pyMirrorOverride != "" {
-		return pyMirrorOverride + "/" + u
+		prefix = pyMirrorOverride
+	} else if m := strings.TrimSpace(os.Getenv(EnvPythonMirror)); m != "" {
+		prefix = strings.TrimRight(m, "/")
 	}
-	if m := strings.TrimSpace(os.Getenv(EnvPythonMirror)); m != "" {
-		return strings.TrimRight(m, "/") + "/" + u
+	suffix := pyVersion() + "/" + archive
+	if prefix == "" {
+		return pyBuildStandaloneURL + "/" + suffix
 	}
-	return u
+	// 镜像已含官方发布路径（官方完整 URL 或其子集）→ 直接作 base。
+	if strings.Contains(prefix, "python-build-standalone/releases/download") {
+		return prefix + "/" + suffix
+	}
+	// 前缀风格：代理前缀 + 官方完整 URL。
+	return prefix + "/" + pyBuildStandaloneURL + "/" + suffix
 }
 
 // dlClient 是 Python 解释器下载专用 HTTP 客户端：30 分钟超时防止镜像源
