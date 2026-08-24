@@ -1242,5 +1242,25 @@ func (r *RuntimeEnv) Env(pluginDir, dataDir string) []string {
 		"ASTRBOT_DATA_PATH="+dataDir,
 		"ASTRBOT_PLUGIN_DATA_DIR="+filepath.Join(dataDir, "plugins_data"),
 	)
+	if runtime.GOOS == "windows" {
+		// Windows 子进程管道输出默认走 ANSI 代码页（GBK/cp936），Go 侧按
+		// UTF-8 读取 stderr 日志会乱码。强制 Python UTF-8 模式（Python
+		// 3.7+）使插件日志/异常文本统一 UTF-8。
+		env = setEnvKey(env, "PYTHONUTF8", "1")
+		env = setEnvKey(env, "PYTHONIOENCODING", "utf-8")
+	}
 	return env
+}
+
+// setEnvKey 覆盖或追加环境变量键值（os.Environ 可能已含同名键，重复键在
+// 子进程环境块中行为未定义，必须显式覆盖）。
+func setEnvKey(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
