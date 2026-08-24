@@ -138,7 +138,8 @@
       "astrbotVersion": "Требуемая версия AstrBot",
       "supportPlatforms": "Поддерживаемые платформы",
       "authorWebsite": "Сайт автора",
-      "repository": "Репозиторий"
+      "repository": "Репозиторий",
+      "pluginLanguage": "Язык плагина"
     },
     "sleep": {
       "globalLabel": "Глобальный авто-сон при простое",

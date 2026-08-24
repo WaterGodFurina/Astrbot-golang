@@ -97,6 +97,7 @@
     "globalLabel": "全局闲置自动休眠",
     "globalDesc": "开启后，闲置超过 10 分钟的插件进程自动卸载（内存回收），触发时自动唤醒",
     "columnPlugin": "插件",
+    "columnLanguage": "插件语言",
     "columnAllow": "允许休眠",
     "noPlugins": "暂无已启用的插件",
     "globalSaved": "全局休眠策略已更新",

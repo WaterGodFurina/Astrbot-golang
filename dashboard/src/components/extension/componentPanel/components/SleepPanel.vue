@@ -17,12 +17,24 @@ const props = withDefaults(defineProps<{ active?: boolean }>(), {
 const { tm } = useModuleI18n("features/command");
 
 interface SleepPluginItem {
-  name: string;
+  id: string;
   displayName: string;
+  language: string;
   enabled: boolean;
   blocked: boolean;
   version: string;
 }
+
+// 插件语言从 id 后缀（_go/_python）推断，优先用后端 language 字段。
+const languageOf = (p: Record<string, unknown>) => {
+  const lang = String(p.language || "").toLowerCase();
+  if (lang === "python") return "python";
+  if (lang === "go" || lang === "golang") return "golang";
+  const id = String(p.id || p.name || "");
+  if (/_python$/i.test(id)) return "python";
+  if (/_go$/i.test(id)) return "golang";
+  return "";
+};
 
 const loading = ref(false);
 const saving = ref(false);
@@ -59,8 +71,9 @@ const fetchData = async () => {
       plugins.value = items
         .filter((p) => p.enabled)
         .map((p) => ({
-          name: String(p.name || p.id || ""),
+          id: String(p.id || p.name || ""),
           displayName: String(p.display_name || p.name || p.id || ""),
+          language: languageOf(p),
           enabled: Boolean(p.enabled),
           blocked: Boolean(p.idle_unload_blocked),
           version: String(p.version || ""),
@@ -93,10 +106,10 @@ const toggleGlobal = async (enabled: boolean) => {
 };
 
 const togglePlugin = async (item: SleepPluginItem, allowSleep: boolean) => {
-  if (saving.value || !item.name) return;
+  if (saving.value || !item.id) return;
   saving.value = true;
   try {
-    const res = await pluginApi.setIdleSleep(item.name, allowSleep);
+    const res = await pluginApi.setIdleSleep(item.id, allowSleep);
     if (res.data.status === "ok") {
       item.blocked = !allowSleep;
       toast(tm("sleep.pluginSaved"));
@@ -146,11 +159,12 @@ onMounted(async () => {
           <thead>
             <tr>
               <th>{{ tm("sleep.columnPlugin") }}</th>
+              <th>{{ tm("sleep.columnLanguage") }}</th>
               <th>{{ tm("sleep.columnAllow") }}</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="item in plugins" :key="item.name">
+            <tr v-for="item in plugins" :key="item.id">
               <td class="sleep-table__name">
                 <div class="d-flex align-center ga-2">
                   <span class="text-body-2">{{ item.displayName }}</span>
@@ -158,6 +172,9 @@ onMounted(async () => {
                     v{{ item.version }}
                   </span>
                 </div>
+              </td>
+              <td>
+                <span class="text-body-2">{{ item.language }}</span>
               </td>
               <td class="sleep-table__toggle">
                 <v-switch

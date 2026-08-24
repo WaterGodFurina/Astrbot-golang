@@ -138,7 +138,8 @@
       "astrbotVersion": "AstrBot 版本要求",
       "supportPlatforms": "支持平台",
       "authorWebsite": "作者网站",
-      "repository": "仓库"
+      "repository": "仓库",
+      "pluginLanguage": "插件语言"
     },
     "sleep": {
       "globalLabel": "全局闲置自动休眠",

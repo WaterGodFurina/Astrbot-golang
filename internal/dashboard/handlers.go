@@ -2028,8 +2028,8 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if s.subPluginMgr != nil {
-			if _, _, ok := s.resolveSubprocessPlugin(body.PluginID); ok {
-				if err := s.subPluginMgr.SetIdleUnloadBlocked(body.PluginID, !body.AllowSleep); err != nil {
+			if pid, _, ok := s.resolveSubprocessPlugin(body.PluginID); ok {
+				if err := s.subPluginMgr.SetIdleUnloadBlocked(pid, !body.AllowSleep); err != nil {
 					writeJSON(w, http.StatusOK, apiError(err.Error()))
 					return
 				}

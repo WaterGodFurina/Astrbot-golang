@@ -187,6 +187,17 @@ const repoUrl = computed(
   () => pluginData.value?.repo || props.marketPlugin?.repo || "",
 );
 
+// 插件语言：优先用后端 language 字段，否则从插件 id 后缀（_go/_python）推断。
+const languageDisplay = computed(() => {
+  const lang = String(pluginData.value?.language || "").toLowerCase();
+  if (lang === "python") return "python";
+  if (lang === "go" || lang === "golang") return "golang";
+  const id = String(pluginData.value?.id || "");
+  if (/_python$/i.test(id)) return "python";
+  if (/_go$/i.test(id)) return "golang";
+  return "";
+});
+
 const firstPresentValue = (...values) =>
   values.find(
     (value) =>
@@ -311,6 +322,11 @@ const infoRows = computed(() => {
       label: tm("detail.info.repository"),
       value: repoUrl.value,
       href: repoUrl.value,
+      optional: true,
+    },
+    {
+      label: tm("detail.info.pluginLanguage"),
+      value: languageDisplay.value,
       optional: true,
     },
   ];

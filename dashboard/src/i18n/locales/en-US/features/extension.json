@@ -138,7 +138,8 @@
       "astrbotVersion": "AstrBot Version Requirement",
       "supportPlatforms": "Supported Platforms",
       "authorWebsite": "Author Website",
-      "repository": "Repository"
+      "repository": "Repository",
+      "pluginLanguage": "Plugin Language"
     },
     "sleep": {
       "globalLabel": "Global idle auto-sleep",
