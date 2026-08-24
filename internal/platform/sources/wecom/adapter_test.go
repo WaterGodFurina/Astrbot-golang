@@ -369,6 +369,9 @@ func TestSendChainAppMode(t *testing.T) {
 
 // TestSendChainURLOnlyFileVideo URL-only 文件/视频组件应能解析下载并发送（回归 M-45）。
 func TestSendChainURLOnlyFileVideo(t *testing.T) {
+	// 发送链路 SSRF 防护默认拒绝回环地址：本地 httptest 服务需测试豁免。
+	platform.SafeDownloadAllowLoopback = true
+	t.Cleanup(func() { platform.SafeDownloadAllowLoopback = false })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/file.bin":

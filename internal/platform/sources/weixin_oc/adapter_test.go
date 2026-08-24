@@ -7,6 +7,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 	ilink "github.com/dobest1024/go-weixin-ilink"
 )
@@ -139,6 +140,9 @@ func TestResolveMediaBase64AndFile(t *testing.T) {
 
 // TestDownloadMedia: URL 下载成功与失败分支。
 func TestDownloadMedia(t *testing.T) {
+	// 发送链路 SSRF 防护默认拒绝回环地址：本地 httptest 服务需测试豁免。
+	platform.SafeDownloadAllowLoopback = true
+	t.Cleanup(func() { platform.SafeDownloadAllowLoopback = false })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/bad" {
 			w.WriteHeader(http.StatusInternalServerError)

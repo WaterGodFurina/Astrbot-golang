@@ -17,6 +17,10 @@ import (
 // safeDownloadTimeout 限制发送链路对出站媒体 URL 的单次下载时长。
 const safeDownloadTimeout = 30 * time.Second
 
+// SafeDownloadAllowLoopback 仅供测试：允许回环地址下载（本地 httptest
+// 服务）。生产代码不设置此变量，发送链路默认拒绝内网/保留地址。
+var SafeDownloadAllowLoopback bool
+
 // maxDownloadRedirects 限制下载重定向次数，防止 SSRF 通过跳转逃逸主机校验。
 const maxDownloadRedirects = 10
 
@@ -82,11 +86,14 @@ func validateDownloadHost(host string) error {
 			continue
 		}
 		addr = addr.Unmap()
-		for _, p := range blockedDownloadPrefixes {
-			if p.Contains(addr) {
-				return fmt.Errorf("拒绝下载内网/保留地址 %s", addr)
+for _, p := range blockedDownloadPrefixes {
+		if p.Contains(addr) {
+			if SafeDownloadAllowLoopback && addr.IsLoopback() {
+				continue
 			}
+			return fmt.Errorf("拒绝下载内网/保留地址 %s", addr)
 		}
+	}
 	}
 	return nil
 }

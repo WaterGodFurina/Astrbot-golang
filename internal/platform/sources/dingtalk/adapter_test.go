@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -695,16 +694,14 @@ func TestSendMaterializedURLMediaThroughManager(t *testing.T) {
 		t.Fatalf("上传的语音内容 = %q, 期望 %q", voiceBody, "voice-bytes")
 	}
 
-	// Send 返回后，materialize 的临时文件应被 PlatformManager.Send 的 cleanup 删除
+	// Send 返回后，materialize 的临时文件应已被 PlatformManager.Send 的
+	// cleanup 删除，且组件字段还原为原值（二次发送可重新物化）。
 	rec := chain.Chain[0].(*message.Record)
-	if rec.File == "" {
-		t.Fatal("语音应已物化为本地临时文件")
-	}
-	if _, err := os.Stat(rec.File); !os.IsNotExist(err) {
-		t.Fatalf("语音临时文件 %s 应在 Send 后被清理, stat err = %v", rec.File, err)
+	if rec.File != "" || rec.Path != "" {
+		t.Fatalf("语音组件字段应在清理后被还原, got File=%q Path=%q", rec.File, rec.Path)
 	}
 	img := chain.Chain[1].(*message.Image)
-	if _, err := os.Stat(img.Path); !os.IsNotExist(err) {
-		t.Fatalf("图片临时文件 %s 应在 Send 后被清理, stat err = %v", img.Path, err)
+	if img.Path != "" || img.File != "" {
+		t.Fatalf("图片组件字段应在清理后被还原, got Path=%q File=%q", img.Path, img.File)
 	}
 }
