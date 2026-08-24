@@ -528,7 +528,7 @@ func extractProgress(done, total int64, progress ProgressFunc) {
 	if total > 0 {
 		pct := int(done * 100 / total)
 		if pct%10 == 0 && pct >= 0 && pct <= 100 {
-			logger.Info("Extracting Go toolchain: %d%% (%d / %d files)", pct, done, total)
+			logger.Debug("Extracting Go toolchain: %d%% (%d / %d files)", pct, done, total)
 		}
 	}
 }

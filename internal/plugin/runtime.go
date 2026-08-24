@@ -947,7 +947,13 @@ func (m *SubprocessManager) pipInstall(ctx context.Context, env *pysdk.RuntimeEn
 	defer cancel()
 	cmd := exec.CommandContext(ctx, env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = pluginDir
+	logger.Debug("pip install: %s %s", env.PythonBin, strings.Join(args, " "))
 	out, err := cmd.CombinedOutput()
+	// pip 过程输出统一走 DEBUG（正常安装时的下载/构建细节；失败时错误信息
+	// 已包含输出）。
+	if len(strings.TrimSpace(string(out))) > 0 {
+		logger.Debug("pip install 输出: %s", strings.TrimSpace(string(out)))
+	}
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}

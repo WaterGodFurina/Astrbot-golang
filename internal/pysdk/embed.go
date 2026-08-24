@@ -906,7 +906,13 @@ func extractTarGzStripTop(src, dir string) error {
 // mismatched markers trigger a host-deps reinstall under a cross-process lock
 // (pip 并发安全；见 venv_lock_*.go)。
 func EnsureVenv(dataDir string) string {
-	venvPython, err := ensureVenvReady(dataDir)
+	return EnsureVenvWithStage(dataDir, nil)
+}
+
+// EnsureVenvWithStage is EnsureVenv with a stage callback for install-dialog
+// progress ("创建 venv 并安装宿主 Python 依赖…").
+func EnsureVenvWithStage(dataDir string, stage func(string)) string {
+	venvPython, err := ensureVenvReady(dataDir, stage)
 	if err != nil {
 		logger.Warn("Python venv 准备失败: %v（插件将无法启动）", err)
 		return ""
@@ -924,7 +930,7 @@ var venvLockTimeout = 10 * time.Minute
 // incomplete venvs (marker missing/mismatched, or a legacy venv without
 // environment.json whose deps probe fails) are re-provisioned under the venv
 // lock. 返回 "" 语义由调用方（EnsureVenv）处理。
-func ensureVenvReady(dataDir string) (string, error) {
+func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 	cacheDir := userCacheDir()
 	if cacheDir == "" {
 		cacheDir = filepath.Join(dataDir, SDKRootName)
@@ -996,6 +1002,9 @@ func ensureVenvReady(dataDir string) (string, error) {
 		logger.Warn("venv 宿主依赖不完整（标记缺失/不匹配），锁内重新安装…")
 	} else {
 		logger.Info("Python %s 缺少宿主基础依赖，创建独立 venv 安装…", base)
+		if stage != nil {
+			stage("创建 venv 并安装宿主 Python 依赖…")
+		}
 		// Android/Termux：grpcio/cryptography/pillow/psutil 等 C 扩展包无
 		// 预编译 wheel，pip 本地编译几乎必失败；Termux 官方仓库有预编译包，
 		// 先 pkg install 它们，并让 venv 以 --system-site-packages 创建以
@@ -1011,7 +1020,7 @@ func ensureVenvReady(dataDir string) (string, error) {
 			return "", fmt.Errorf("创建 venv 失败: %w", err)
 		}
 	}
-	if err := installHostDeps(venvPython); err != nil {
+	if err := installHostDeps(venvPython, stage); err != nil {
 		// 安装失败：移除 READY，下次启动重试。
 		_ = os.Remove(readyPath(root))
 		return "", fmt.Errorf("venv 安装宿主依赖失败: %w", err)
@@ -1140,7 +1149,7 @@ func hasHostDeps(pythonBin string) bool {
 	return cmd.Run() == nil
 }
 
-func installHostDeps(pythonBin string) error {
+func installHostDeps(pythonBin string, stage func(string)) error {
 	deps := hostBaseDeps
 	if runtime.GOOS == "android" {
 		// Termux：跳过已有预编译系统包的 C 扩展（pkg install 装的
@@ -1160,9 +1169,15 @@ func installHostDeps(pythonBin string) error {
 	}
 	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, deps...)
 	args = append(args, "-i", PyPIIndex())
+	logger.Debug("pip install: %s %s", pythonBin, strings.Join(args, " "))
 	out, err := exec.Command(pythonBin, args...).CombinedOutput() // #nosec G204 -- pip 安装插件宿主基础依赖：args 由固定常量 hostBaseDeps + 固定 pip 参数组成，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	// pip 过程输出统一走 DEBUG（正常安装时的下载/构建细节；失败时下面再报
+	// 错误信息）。
+	if len(strings.TrimSpace(string(out))) > 0 {
+		logger.Debug("pip install 输出: %s", strings.TrimSpace(string(out)))
+	}
 	if err != nil {
-		logger.Warn("pip install 输出: %s", strings.TrimSpace(string(out)))
+		logger.Warn("pip install 失败: %v", err)
 		return err
 	}
 	logger.Info("venv 宿主基础依赖安装完成（grpcio/protobuf + 本体常驻依赖）")
@@ -1189,7 +1204,7 @@ func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, e
 		return nil, err
 	}
 	if !hasHostDeps(py) {
-		py = EnsureVenv(dataDir)
+		py = EnsureVenvWithStage(dataDir, stage)
 	}
 	if py == "" {
 		return nil, ErrRuntimeUnavailable
