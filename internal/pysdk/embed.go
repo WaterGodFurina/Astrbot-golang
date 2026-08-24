@@ -386,6 +386,11 @@ func EnsurePythonBin(stage func(string)) (string, error) {
 	if py := DiscoverPythonBin(); py != "" {
 		return py, nil
 	}
+	// 系统解释器缺失：先复用已下载的 bundled CPython（重启后避免重复下载）。
+	if py := bundledPythonBin(); py != "" {
+		logger.Info("Using downloaded bundled Python: %s", py)
+		return py, nil
+	}
 	return downloadPython(stage)
 }
 
