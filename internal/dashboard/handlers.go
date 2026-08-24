@@ -2478,6 +2478,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 				"data": map[string]interface{}{
 					"kind":    string(runtimeErr.Kind),
 					"android": runtimeErr.Android,
+					"primary": runtimeErr.Primary,
 					"mirrors": runtimeErr.Mirrors,
 					"command": runtimeErr.Command,
 				},
@@ -2592,7 +2593,7 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 					Name:    name,
 					Status:  "error",
 					Code:    code,
-					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android, "mirrors": runtimeErr.Mirrors, "command": runtimeErr.Command},
+					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android, "primary": runtimeErr.Primary, "mirrors": runtimeErr.Mirrors, "command": runtimeErr.Command},
 					Message: runtimeErr.Error(),
 				})
 				continue
