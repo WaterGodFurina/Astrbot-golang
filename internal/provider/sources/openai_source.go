@@ -135,7 +135,7 @@ func (s *OpenAISource) TextChat(ctx context.Context, req *provider.ProviderReque
 				Role             string `json:"role"`
 				Content          string `json:"content"`
 				ReasoningContent string `json:"reasoning_content"`
-				ToolCalls []struct {
+				ToolCalls        []struct {
 					ID       string `json:"id"`
 					Type     string `json:"type"`
 					Function struct {

@@ -395,7 +395,7 @@ func zigUnsupportedHint() error {
 }
 
 // zigArchiveSHA256 是默认 zig 版本（0.16.0）各平台归档的 sha256 校验值
-//（来源 https://ziglang.org/download/index.json），下载后校验再解压，防镜像
+// （来源 https://ziglang.org/download/index.json），下载后校验再解压，防镜像
 // 被劫持时执行被篡改的编译器。自定义版本/镜像（ASTRBOT_CLANG_VERSION /
 // ASTRBOT_CLANG_MIRROR）的归档不在表内时跳过校验（best effort）。
 var zigArchiveSHA256 = map[string]string{

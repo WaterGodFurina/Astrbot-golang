@@ -86,14 +86,14 @@ func validateDownloadHost(host string) error {
 			continue
 		}
 		addr = addr.Unmap()
-for _, p := range blockedDownloadPrefixes {
-		if p.Contains(addr) {
-			if SafeDownloadAllowLoopback && addr.IsLoopback() {
-				continue
+		for _, p := range blockedDownloadPrefixes {
+			if p.Contains(addr) {
+				if SafeDownloadAllowLoopback && addr.IsLoopback() {
+					continue
+				}
+				return fmt.Errorf("拒绝下载内网/保留地址 %s", addr)
 			}
-			return fmt.Errorf("拒绝下载内网/保留地址 %s", addr)
 		}
-	}
 	}
 	return nil
 }
