@@ -868,6 +868,23 @@ const updateDialogPluginLogo = computed(() => {
         <div v-else class="text-medium-emphasis">
           {{ tm("dialogs.python_runtime.download_hint") }}
           <div
+            v-if="pythonRuntimeDialog.primary"
+            class="mt-2 text-body-2 font-weight-medium"
+          >
+            {{ tm("dialogs.python_runtime.primaryLabel") }}
+          </div>
+          <v-radio-group
+            v-if="pythonRuntimeDialog.primary"
+            v-model="pythonRuntimeDialog.selectedMirror"
+            hide-details
+            class="mt-1"
+          >
+            <v-radio
+              :label="pythonRuntimeDialog.primary"
+              :value="pythonRuntimeDialog.primary"
+            ></v-radio>
+          </v-radio-group>
+          <div
             v-if="pythonRuntimeDialog.mirrors.length"
             class="mt-2 text-body-2 font-weight-medium"
           >

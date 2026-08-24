@@ -276,7 +276,8 @@
       "download": "自动下载",
       "cancel": "取消",
       "copy": "复制命令",
-      "installed": "我已安装"
+      "installed": "我已安装",
+      "primaryLabel": "加速地址（官方 CDN）"
     },
     "update": {
       "title": "更新插件",

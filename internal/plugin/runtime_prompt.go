@@ -31,11 +31,13 @@ var goSDKMirrors = []string{
 	"https://mirrors.aliyun.com/golang",
 }
 
-// pythonMirrors 是 CPython（python-build-standalone）的下载镜像列表（前缀
-// 风格：镜像前缀直接拼在官方 URL 之前）。构造 Python 下载确认弹窗时随 prompt
-// 返回。
-var pythonMirrors = []string{
-	"https://github.com/astral-sh/python-build-standalone/releases/download",
+// pythonPrimaryURL 是 CPython（python-build-standalone）的官方/主下载地址
+// （base 风格：直接拼版本与归档名）。作为"加速地址"单独列出，可编辑替换。
+const pythonPrimaryURL = "https://github.com/astral-sh/python-build-standalone/releases/download"
+
+// pythonMirrorPrefixes 是 CPython 下载的加速镜像列表（前缀风格：镜像前缀
+// 直接拼在官方完整 URL 之前，如 https://gh-proxy.com/<官方完整 URL>）。
+var pythonMirrorPrefixes = []string{
 	"https://gh-proxy.com/",
 	"https://ghfast.top/",
 	"https://ghproxy.net/",
@@ -46,8 +48,11 @@ var pythonMirrors = []string{
 type RuntimePromptError struct {
 	Kind    RuntimePromptKind `json:"kind"`
 	Android bool              `json:"android"` // runtime.GOOS == "android"
-	// Mirrors 是可供用户选择的下载镜像列表（Go 为 base URL 风格，CPython 为
-	// 前缀风格）。用户选中后随 GoChoice/PythonChoice 一起回传。
+	// Primary 是主下载地址（"加速地址"）：Go 为官方 dl 镜像，CPython 为
+	// python-build-standalone 官方 URL。前端单独列出，可编辑替换。
+	Primary string `json:"primary,omitempty"`
+	// Mirrors 是可供用户选择的加速下载镜像列表（前缀风格）。用户选中后随
+	// GoChoice/PythonChoice 一起回传。
 	Mirrors []string `json:"mirrors"`
 	// Message 是可选的定制提示文案（如"系统 Python 版本过低"场景）；空时用
 	// Error() 的默认文案。
@@ -89,7 +94,8 @@ func newRuntimePromptError(kind RuntimePromptKind, android bool) *RuntimePromptE
 	e := &RuntimePromptError{Kind: kind, Android: android}
 	switch kind {
 	case RuntimePromptPython:
-		e.Mirrors = pythonMirrors
+		e.Primary = pythonPrimaryURL
+		e.Mirrors = pythonMirrorPrefixes
 	default:
 		e.Mirrors = goSDKMirrors
 	}
@@ -261,7 +267,8 @@ func (m *SubprocessManager) pythonRuntimeForInstall(opts InstallOptions) (*pysdk
 			return nil, &RuntimePromptError{
 				Kind:    RuntimePromptPython,
 				Android: runtime.GOOS == "android",
-				Mirrors: pythonMirrors,
+				Primary: pythonPrimaryURL,
+				Mirrors: pythonMirrorPrefixes,
 				Message: fmt.Sprintf("检测到系统 Python %s 版本过低，将自动下载 CPython 3.12", tooLow),
 			}
 		}

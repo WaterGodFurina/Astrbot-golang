@@ -276,7 +276,8 @@
       "download": "Auto Download",
       "cancel": "Cancel",
       "copy": "Copy Command",
-      "installed": "I've Installed"
+      "installed": "I've Installed",
+      "primaryLabel": "Source address (official CDN)"
     },
     "update": {
       "title": "Update Extension",

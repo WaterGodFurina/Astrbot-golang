@@ -215,6 +215,9 @@ export const useExtensionPage = (initialTab = "installed") => {
     show: false,
     message: "",
     android: false,
+    // primary 是主下载地址（"加速地址"，官方 CDN，可编辑替换）
+    primary: "",
+    // mirrors 是加速下载镜像（前缀风格，radio 选择）
     mirrors: [],
     selectedMirror: "",
     command: "",
@@ -2371,8 +2374,11 @@ export const useExtensionPage = (initialTab = "installed") => {
       pythonRuntimeDialog.mirrors = Array.isArray(data.mirrors)
         ? data.mirrors
         : [];
+      pythonRuntimeDialog.primary = String(data.primary || "");
       pythonRuntimeDialog.command = String(data.command || "");
-      pythonRuntimeDialog.selectedMirror = pythonRuntimeDialog.mirrors[0] || "";
+      // 默认选中主地址（官方 CDN），镜像需用户显式选择
+      pythonRuntimeDialog.selectedMirror =
+        pythonRuntimeDialog.primary || pythonRuntimeDialog.mirrors[0] || "";
       pythonRuntimeDialog.show = true;
       await refreshExtensionsAfterInstallFailure();
       return false;

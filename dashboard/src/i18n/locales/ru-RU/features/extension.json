@@ -307,7 +307,8 @@
       "installed": "Уже установлено",
       "message": "Для этого плагина требуется Python runtime.",
       "mirrorLabel": "Зеркало загрузки",
-      "title": "Требуется Python Runtime"
+      "title": "Требуется Python Runtime",
+      "primaryLabel": "Основной адрес (официальный CDN)"
     },
     "risk_warning": {
       "cancel": "Отменить установку",

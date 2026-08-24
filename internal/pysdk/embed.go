@@ -413,7 +413,13 @@ func downloadPython(stage func(string)) (string, error) {
 	}
 	_ = os.Remove(dest)
 
-	bin := filepath.Join(base, "python", "bin", exe("python3"))
+	// python-build-standalone 布局：Unix 为 python/bin/python3(.x)，Windows
+	// 无 bin 目录、解释器在顶层 python/python.exe（3.12 起也提供 python3.exe）。
+	rel := filepath.Join("python", "bin", "python3")
+	if runtime.GOOS == "windows" {
+		rel = filepath.Join("python", "python.exe")
+	}
+	bin := filepath.Join(base, rel)
 	if info, err := os.Stat(bin); err != nil || info.IsDir() {
 		return "", fmt.Errorf("extracted Python missing interpreter: %s", bin)
 	}
