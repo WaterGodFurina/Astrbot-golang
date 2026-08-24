@@ -200,6 +200,21 @@ func pyTargetFor(goos, goarch string) (string, error) {
 		goos, goarch, EnvPythonBin)
 }
 
+// bundledPythonBin 探测已下载的 bundled CPython 解释器路径
+// （python-build-standalone 布局：Unix python/bin/python3，Windows 顶层
+// python/python.exe）。系统解释器缺失但 bundled 已下载时供 venv 准备使用。
+func bundledPythonBin() string {
+	rel := filepath.Join("python", "bin", "python3")
+	if runtime.GOOS == "windows" {
+		rel = filepath.Join("python", "python.exe")
+	}
+	bin := filepath.Join(pythonBaseDir(), pyVersion(), rel)
+	if info, err := os.Stat(bin); err == nil && !info.IsDir() {
+		return bin
+	}
+	return ""
+}
+
 // pyVersion returns the python-build-standalone tag (ASTRBOT_PYTHON_VERSION or
 // the default). The tag is a date (e.g. 20260814); the concrete CPython micro
 // version is pinned by the release itself.
@@ -915,6 +930,11 @@ func ensureVenvReady(dataDir string) (string, error) {
 		cacheDir = filepath.Join(dataDir, SDKRootName)
 	}
 	base := DiscoverPythonBin()
+	if base == "" {
+		// 系统解释器缺失时，回退到已下载的 bundled CPython（EnsurePythonBin
+		// 下载成功但未缓存到系统探测路径的场景，如 Windows 商店桩被拒绝）。
+		base = bundledPythonBin()
+	}
 	if base == "" {
 		return "", errors.New("未找到 Python 解释器（请安装 python3 或设置 " + EnvPythonBin + "）")
 	}
