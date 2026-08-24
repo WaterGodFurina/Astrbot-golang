@@ -74,6 +74,9 @@ type StarHandlerMetadata struct {
 	Desc          string                 `json:"desc,omitempty"`
 	ExtrasConfigs map[string]interface{} `json:"extras_configs,omitempty"`
 	Enabled       bool                   `json:"enabled"`
+	// Source 标记 handler 的来源（"subprocess_cmd"/"subprocess_filter"/
+	// "subprocess_hook"/"so_plugin" 等），供清理函数按显式来源而非全名前缀匹配。
+	Source string `json:"source,omitempty"`
 }
 
 // IsEnabled returns true if the handler is enabled.
@@ -283,6 +286,23 @@ func (r *StarHandlerRegistry) GetFilterHandlers() []*StarHandlerMetadata {
 	return result
 }
 
+// SnapshotFilters 在注册表读锁内拷贝 handler 的 EventFilters 切片与 Enabled
+// 标记，供消息管线等无锁读者使用：Mutate/SetHandlerPermission/Enable/Disable
+// 等写入口都在写锁内修改这些字段，经快照读取即可与写者真正互斥（浅拷贝的
+// 切片头共享底层数组，直接返回会与写者的元素替换并发）。返回 (filters,
+// enabled, ok)，ok=false 表示 handler 不存在。
+func (r *StarHandlerRegistry) SnapshotFilters(fullName string) ([]HandlerFilter, bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	h, ok := r.handlersMap[fullName]
+	if !ok {
+		return nil, false, false
+	}
+	filters := make([]HandlerFilter, len(h.EventFilters))
+	copy(filters, h.EventFilters)
+	return filters, h.Enabled, true
+}
+
 // Disable disables a handler by full name.
 func (r *StarHandlerRegistry) Disable(fullName string) {
 	r.mu.Lock()
@@ -303,7 +323,7 @@ func (r *StarHandlerRegistry) Enable(fullName string) {
 
 // Mutate applies fn to the handler under the registry write lock. No-op when
 // the handler does not exist. 供 dashboard HTTP goroutine 等运行期写入口使用，
-// 与消息管线的 GetFilterHandlers（RLock 遍历）互斥。
+// 与消息管线/命令描述符的 SnapshotFilters（RLock 快照读取）互斥。
 func (r *StarHandlerRegistry) Mutate(fullName string, fn func(*StarHandlerMetadata)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

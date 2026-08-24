@@ -4,11 +4,15 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
+	"time"
 )
 
 // LarkWebhookServer implements the Lark webhook event subscription:
@@ -47,7 +51,7 @@ func (s *LarkWebhookServer) SetCallback(cb func(map[string]interface{})) {
 func (s *LarkWebhookServer) verifySignature(timestamp, nonce, signature string, body []byte) bool {
 	bytesB1 := append([]byte(timestamp+nonce+s.encryptKey), body...)
 	sum := sha256.Sum256(bytesB1)
-	return hex.EncodeToString(sum[:]) == signature
+	return subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(signature)) == 1
 }
 
 // decryptEvent AES-256-CBC decrypts an encrypted event payload.
@@ -109,6 +113,11 @@ func (s *LarkWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reques
 		signature := r.Header.Get("X-Lark-Signature")
 		if timestamp == "" || nonce == "" || signature == "" {
 			writeWebhookError(w, http.StatusUnauthorized, "Missing signature headers")
+			return
+		}
+		// 时间戳新鲜度校验：拒绝与当前时间偏差超过 5 分钟的请求（防重放）。
+		if ts, err := strconv.ParseInt(timestamp, 10, 64); err != nil || math.Abs(float64(time.Now().Unix()-ts)) > 300 {
+			writeWebhookError(w, http.StatusBadRequest, "timestamp expired")
 			return
 		}
 		if !s.verifySignature(timestamp, nonce, signature, body) {

@@ -109,6 +109,7 @@ func ttsUUID() string {
 // ttsSaveAudio streams an audio response body into data/temp and returns the
 // resulting file path.
 func ttsSaveAudio(r io.Reader, prefix, ext string) (string, error) {
+	const maxTTSBytes = 100 << 20 // 100MB，足够任意长语音
 	dir := filepath.Join("data", "temp")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
@@ -118,10 +119,16 @@ func ttsSaveAudio(r io.Reader, prefix, ext string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(f, r); err != nil {
+	n, err := io.Copy(f, io.LimitReader(r, maxTTSBytes+1))
+	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
 		return "", err
+	}
+	if n > maxTTSBytes {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("tts audio exceeds %d bytes", maxTTSBytes)
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(path)

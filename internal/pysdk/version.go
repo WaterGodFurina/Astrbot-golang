@@ -6,7 +6,7 @@ package pysdk
 // <dataDir>/python-sdk when the on-disk copy is missing or its VERSION marker
 // differs, so a released host always picks up the matching SDK and an SDK
 // update only needs a tag bump (no host rebuild).
-const SDKVersion = "0.4.2"
+const SDKVersion = "0.5.0"
 
 // ProtocolVersion is the gRPC protocol version spoken between the host and the
 // Python bridge (_bridge/server.py). It is INDEPENDENT of SDKVersion: an SDK

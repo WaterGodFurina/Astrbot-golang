@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
@@ -24,6 +26,7 @@ type Deps struct {
 	StarMgr         *star.Manager
 	ConfigMgr       *config.ConfigManager
 	ConversationMgr *conversation.Manager
+	Database        *db.Database
 }
 
 // builtinState holds per-session mutable state (provider selection, variables, umo aliases).
@@ -78,7 +81,7 @@ func RegisterBuiltin(deps Deps) {
 	reg("reset", star.PermissionEveryone, i18n.Get("重置当前会话的 LLM 上下文"), func(e *core.Event) { resetCmd(deps, e) })
 	reg("new", star.PermissionEveryone, i18n.Get("创建新对话"), func(e *core.Event) { newCmd(deps, e) })
 	reg("stop", star.PermissionEveryone, i18n.Get("停止当前会话正在运行的任务"), func(e *core.Event) { stopCmd(e) })
-	reg("stats", star.PermissionEveryone, i18n.Get("查看当前对话 Token 用量统计"), func(e *core.Event) { statsCmd(e) })
+	reg("stats", star.PermissionEveryone, i18n.Get("查看当前对话 Token 用量统计"), func(e *core.Event) { statsCmd(deps, e) })
 	reg("provider", star.PermissionAdmin, i18n.Get("查看或切换 LLM Provider"), func(e *core.Event) { providerCmd(deps, e) })
 	reg("set", star.PermissionEveryone, i18n.Get("设置会话变量"), func(e *core.Event) { setCmd(e) })
 	reg("unset", star.PermissionEveryone, i18n.Get("移除会话变量"), func(e *core.Event) { unsetCmd(e) })
@@ -180,7 +183,11 @@ func nameCmd(deps Deps, e *core.Event) {
 	state.mu.Lock()
 	state.umoAliases[umo] = alias
 	state.mu.Unlock()
-	persistUmoAlias(deps, umo, alias)
+	if err := persistUmoAlias(deps, umo, alias); err != nil {
+		logger.Warn("persist umo_alias: %v", err)
+		reply(e, i18n.Get("⚠️ 昵称已生效但持久化失败（%v），重启后可能丢失。", err))
+		return
+	}
 	reply(e, i18n.Get("UMO name set to: %s\nUMO: %s", alias, umo))
 }
 
@@ -196,13 +203,13 @@ func platformNeedsManualName(platform string) bool {
 	return false
 }
 
-func persistUmoAlias(deps Deps, umo, alias string) {
+func persistUmoAlias(deps Deps, umo, alias string) error {
 	if deps.ConfigMgr == nil {
-		return
+		return nil
 	}
 	cfg := deps.ConfigMgr.Get("default")
 	if cfg == nil {
-		return
+		return nil
 	}
 	all := cfg.All()
 	aliases, _ := all["umo_alias"].(map[string]interface{})
@@ -210,8 +217,10 @@ func persistUmoAlias(deps Deps, umo, alias string) {
 		aliases = map[string]interface{}{}
 	}
 	aliases[umo] = alias
-	_ = cfg.Set("umo_alias", aliases)
-	_ = cfg.Save()
+	if err := cfg.Set("umo_alias", aliases); err != nil {
+		return err
+	}
+	return cfg.Save()
 }
 
 // ---------------------------------------------------------------------------
@@ -264,16 +273,35 @@ func newCmd(deps Deps, e *core.Event) {
 // ---------------------------------------------------------------------------
 
 func stopCmd(e *core.Event) {
-	// Go pipeline has no long-running agent registry yet; report idle.
-	reply(e, i18n.Get("✅ No running tasks in the current session."))
+	// Go 版暂无运行中的 agent 任务注册表，无法真正终止任务；与 dashboard_update
+	// 的处理方式一致，诚实提示不支持。
+	reply(e, i18n.Get("❌ Go 版暂不支持 /stop。"))
 }
 
 // ---------------------------------------------------------------------------
 // /stats
 // ---------------------------------------------------------------------------
 
-func statsCmd(e *core.Event) {
-	reply(e, i18n.Get("📊 No stats available for this conversation yet."))
+func statsCmd(deps Deps, e *core.Event) {
+	if deps.Database == nil {
+		reply(e, i18n.Get("📊 No stats available for this conversation yet."))
+		return
+	}
+	umo := e.UnifiedMsgOrigin()
+	records, err := deps.Database.ProviderStatsSince(time.Now().AddDate(0, 0, -7))
+	if err != nil {
+		logger.Warn("statsCmd: ProviderStatsSince: %v", err)
+		reply(e, i18n.Get("📊 No stats available for this conversation yet."))
+		return
+	}
+	var in, out int
+	for _, r := range records {
+		if r.UMO == umo {
+			in += r.InputOther + r.InputCached
+			out += r.Output
+		}
+	}
+	reply(e, i18n.Get("📊 最近 7 天：输入 %d tokens，输出 %d tokens", in, out))
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +366,11 @@ func providerCmd(deps Deps, e *core.Event) {
 	state.mu.Lock()
 	state.selectedLLM[umo] = p.ID
 	state.mu.Unlock()
-	persistSelectedProvider(deps, umo, p.ID)
+	if err := persistSelectedProvider(deps, umo, p.ID); err != nil {
+		logger.Warn("persist provider_selection: %v", err)
+		reply(e, i18n.Get("⚠️ Provider 切换已生效但持久化失败（%v），重启后可能丢失。", err))
+		return
+	}
 	// Record the per-session provider selection as a session rule so the
 	// WebUI "自定义规则" page shows this session's provider override.
 	if deps.ConversationMgr != nil {
@@ -380,13 +412,13 @@ func listProviders(deps Deps) []providerInfo {
 	return result
 }
 
-func persistSelectedProvider(deps Deps, umo, providerID string) {
+func persistSelectedProvider(deps Deps, umo, providerID string) error {
 	if deps.ConfigMgr == nil {
-		return
+		return nil
 	}
 	cfg := deps.ConfigMgr.Get("default")
 	if cfg == nil {
-		return
+		return nil
 	}
 	all := cfg.All()
 	sel, _ := all["provider_selection"].(map[string]interface{})
@@ -394,8 +426,10 @@ func persistSelectedProvider(deps Deps, umo, providerID string) {
 		sel = map[string]interface{}{}
 	}
 	sel[umo] = providerID
-	_ = cfg.Set("provider_selection", sel)
-	_ = cfg.Save()
+	if err := cfg.Set("provider_selection", sel); err != nil {
+		return err
+	}
+	return cfg.Save()
 }
 
 // ---------------------------------------------------------------------------

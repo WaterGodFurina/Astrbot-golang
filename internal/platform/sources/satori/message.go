@@ -486,13 +486,20 @@ func handleSatoriElement(d *xml.Decoder, start xml.StartElement, elements *[]mes
 
 // skipElement 跳过当前元素的完整子树（包括其 EndElement）。
 func skipElement(d *xml.Decoder) error {
+	depth := 0
 	for {
 		tok, err := d.Token()
 		if err != nil {
 			return err
 		}
-		if _, ok := tok.(xml.EndElement); ok {
-			return nil
+		switch tok.(type) {
+		case xml.StartElement:
+			depth++
+		case xml.EndElement:
+			if depth == 0 {
+				return nil
+			}
+			depth--
 		}
 	}
 }
@@ -776,11 +783,26 @@ func convertNodesToSatori(nodes *message.Nodes) string {
 // maxMediaDownloadSize 限制发送时下载外部媒体的大小上限。
 const maxMediaDownloadSize = 20 << 20
 
-// mediaHTTPClient 用于发送时下载外部媒体（带超时，避免 DefaultClient 永久挂起）。
-var mediaHTTPClient = &http.Client{Timeout: 30 * time.Second}
+// mediaHTTPClient 用于发送时下载外部媒体（带超时，避免 DefaultClient 永久挂起；
+// 重定向的每一跳重新做主机校验，防跨主机跳转绕过 SSRF 防线）。
+var mediaHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("too many redirects")
+		}
+		if !platform.MediaHostAllowed(req.URL.String()) {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	},
+}
 
 // fetchMedia 下载媒体 URL 并返回内容与最终 URL 路径（供 MIME 推断）。
 func fetchMedia(rawURL string) ([]byte, string, error) {
+	if !platform.MediaHostAllowed(rawURL) {
+		return nil, "", fmt.Errorf("媒体地址被拒绝: %s", rawURL)
+	}
 	resp, err := mediaHTTPClient.Get(rawURL)
 	if err != nil {
 		return nil, "", err

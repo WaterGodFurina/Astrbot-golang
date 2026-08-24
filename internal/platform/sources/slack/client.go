@@ -202,7 +202,14 @@ func (s *SlackWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reque
 			}
 			// 先返回 200 再异步处理：Slack 要求 3 秒内响应，超时会重推同一事件
 			w.WriteHeader(http.StatusOK)
-			go s.eventHandler(eventData)
+			go func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						webhookServerLogger.I18nError("处理 Slack 事件时出错: %v", rec)
+					}
+				}()
+				s.eventHandler(eventData)
+			}()
 			return
 		}
 	}

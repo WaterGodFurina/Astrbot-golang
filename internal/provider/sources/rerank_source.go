@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -94,6 +95,10 @@ func (s *TEIRerankSource) Rerank(ctx context.Context, query string, documents []
 			Index:          r.Index,
 			RelevanceScore: r.Score,
 		})
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].RelevanceScore > results[j].RelevanceScore })
+	if topN > 0 && len(results) > topN {
+		results = results[:topN]
 	}
 	return results, nil
 }

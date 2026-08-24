@@ -366,6 +366,7 @@ func (l *Logger) PublishTrace(payload map[string]interface{}) {
 	l.mu.Lock()
 	l.history = append(l.history, entry)
 	for len(l.history) > maxHistory {
+		l.historyBytes -= entrySize(l.history[0])
 		l.history = l.history[1:]
 	}
 	// Trace payloads are bounded (~ a few hundred bytes); use a loose cap.

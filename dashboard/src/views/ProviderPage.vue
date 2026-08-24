@@ -240,8 +240,8 @@
         </v-card-text>
         <v-card-actions class="pa-4">
           <v-spacer></v-spacer>
-          <v-btn variant="text" @click="showManualModelDialog = false">取消</v-btn>
-          <v-btn color="primary" variant="tonal" @click="confirmManualModel">添加</v-btn>
+          <v-btn variant="text" @click="showManualModelDialog = false">{{ tm('dialogs.config.cancel') }}</v-btn>
+          <v-btn color="primary" variant="tonal" @click="confirmManualModel">{{ tm('models.manualDialogAddButton') }}</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -317,21 +317,21 @@
       <v-card>
         <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center">
           <v-icon start class="me-2">mdi-information</v-icon>
-          请前往「配置文件」页测试 Agent 执行器
+          {{ tm('agentRunnerDialog.title') }}
         </v-card-title>
         <v-card-text class="py-4 text-body-1 text-medium-emphasis">
-          Agent 执行器的测试请在「配置文件」页进行。
+          {{ tm('agentRunnerDialog.description') }}
           <ol class="ml-4 mt-4 mb-4">
-            <li>找到对应的配置文件并打开。</li>
-            <li>找到 Agent 执行方式部分，修改执行器后点击保存。</li>
-            <li>点击右下角的 💬 聊天按钮进行测试。</li>
+            <li>{{ tm('agentRunnerDialog.step1') }}</li>
+            <li>{{ tm('agentRunnerDialog.step2') }}</li>
+            <li>{{ tm('agentRunnerDialog.step3') }}</li>
           </ol>
-          要让机器人应用这个 Agent 执行器，你也需要前往修改 Agent 执行器。
+          {{ tm('agentRunnerDialog.applyHint') }}
         </v-card-text>
         <v-card-actions>
           <v-spacer></v-spacer>
-          <v-btn color="grey" variant="text" @click="showAgentRunnerDialog = false">好的</v-btn>
-          <v-btn color="primary" variant="tonal" @click="goToConfigPage">点击前往</v-btn>
+          <v-btn color="grey" variant="text" @click="showAgentRunnerDialog = false">{{ tm('agentRunnerDialog.ok') }}</v-btn>
+          <v-btn color="primary" variant="tonal" @click="goToConfigPage">{{ tm('agentRunnerDialog.go') }}</v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>

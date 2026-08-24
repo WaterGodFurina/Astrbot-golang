@@ -11,12 +11,13 @@ import {
 } from '@/api/v1';
 import { httpClient } from '@/api/http';
 import { getToken, removeToken, setToken } from '@/utils/token';
+import { useCommonStore } from '@/stores/common';
 
 export const useAuthStore = defineStore("auth", {
   state: () => ({
     // @ts-ignore
     username: '',
-    returnUrl: null,
+    returnUrl: null as string | null,
   }),
   actions: {
     async finishAuthenticatedSession(data: any): Promise<void> {
@@ -46,9 +47,15 @@ export const useAuthStore = defineStore("auth", {
       }
 
       const onboardingCompleted = await this.checkOnboardingCompleted();
+      const redirect = this.returnUrl;
       this.returnUrl = null;
       if (passwordWarning) {
         router.push('/auth/setup');
+        return;
+      }
+      // 仅允许站内相对路径，防开放重定向。
+      if (redirect && redirect.startsWith('/') && !redirect.startsWith('//')) {
+        router.push(redirect);
         return;
       }
       if (onboardingCompleted) {
@@ -181,6 +188,8 @@ export const useAuthStore = defineStore("auth", {
       localStorage.removeItem('change_pwd_hint');
       localStorage.removeItem('md5_pwd_hint');
       localStorage.removeItem('password_upgrade_required');
+      // 登出后停止日志 SSE，避免后台无限重试
+      useCommonStore().closeEventSource();
       void authApi.logout().catch(() => undefined);
       router.push('/auth/login');
     },

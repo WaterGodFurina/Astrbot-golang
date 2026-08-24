@@ -9,8 +9,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,10 +33,8 @@ var logger = log.GetDefault().WithComponent("WeixinOC")
 const sdkCallTimeout = 30 * time.Second
 
 // maxMediaDownloadSize 限制发送时下载外部媒体的大小上限。
-const maxMediaDownloadSize = 20 << 20
 
-// mediaHTTPClient 用于发送时下载外部媒体（带超时，避免 DefaultClient 永久挂起）。
-var mediaHTTPClient = &http.Client{Timeout: 30 * time.Second}
+const maxMediaDownloadSize = 20 << 20
 
 // Adapter implements the Weixin OC adapter.
 type Adapter struct {
@@ -305,24 +301,9 @@ func messageToEvent(msg *ilink.Message, fromUser string, components []message.Co
 	return event
 }
 
-// downloadMedia 下载媒体 URL 并返回内容（上限 maxMediaDownloadSize）。
+// downloadMedia 下载媒体 URL 并返回内容（经 SSRF 校验，上限 maxMediaDownloadSize）。
 func downloadMedia(rawURL string) ([]byte, error) {
-	resp, err := mediaHTTPClient.Get(rawURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("下载媒体失败: HTTP %d", resp.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxMediaDownloadSize+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > maxMediaDownloadSize {
-		return nil, fmt.Errorf("媒体文件超过大小上限 %d 字节", maxMediaDownloadSize)
-	}
-	return data, nil
+	return platform.SafeDownloadBytes(context.Background(), rawURL, maxMediaDownloadSize)
 }
 
 // saveMedia writes inbound media bytes to a temp file.
@@ -348,30 +329,48 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	ctx, cancel := context.WithTimeout(context.Background(), sdkCallTimeout)
 	defer cancel()
 	var pendingText string
+	flushText := func() error {
+		if strings.TrimSpace(pendingText) == "" {
+			return nil
+		}
+		if err := a.bot.SendText(ctx, sessionID, strings.TrimSpace(pendingText)); err != nil {
+			return err
+		}
+		pendingText = ""
+		return nil
+	}
 	for _, comp := range chain.Chain {
 		switch c := comp.(type) {
 		case *message.Plain:
 			pendingText += c.Text
 		case *message.Image:
+			if err := flushText(); err != nil {
+				return err
+			}
 			if err := a.sendImage(ctx, sessionID, c); err != nil {
 				return err
 			}
-			pendingText = ""
 		case *message.File:
+			if err := flushText(); err != nil {
+				return err
+			}
 			if err := a.sendFile(ctx, sessionID, c); err != nil {
 				return err
 			}
-			pendingText = ""
 		case *message.Video:
+			if err := flushText(); err != nil {
+				return err
+			}
 			if err := a.sendVideo(ctx, sessionID, c); err != nil {
 				return err
 			}
-			pendingText = ""
 		case *message.Record:
+			if err := flushText(); err != nil {
+				return err
+			}
 			if err := a.sendRecord(ctx, sessionID, c); err != nil {
 				return err
 			}
-			pendingText = ""
 		}
 	}
 	if strings.TrimSpace(pendingText) != "" {

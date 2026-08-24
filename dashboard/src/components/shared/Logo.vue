@@ -5,10 +5,11 @@
         <img width="80" src="@/assets/images/plugin_icon.png" alt="AstrBot Logo">
       </div>
       <div class="logo-text">
-        <!-- nosemgrep: avoid-v-html -->
-        <h2 
-          v-html="formatTitle(title || t('core.header.logoTitle'))"
-        ></h2>
+        <h2 class="logo-title">
+          <template v-for="(part, index) in titleParts" :key="index">
+            <wbr v-if="index > 0" />{{ index > 0 ? ' ' : '' }}{{ part }}
+          </template>
+        </h2>
         <h4 class="hint-text">{{ subtitle || t('core.header.accountDialog.title') }}</h4>
       </div>
     </div>
@@ -16,6 +17,7 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue';
 import { useI18n } from '@/i18n/composables';
 
 const { t } = useI18n();
@@ -28,15 +30,19 @@ const props = withDefaults(defineProps<{
   subtitle: ''
 })
 
-// 智能格式化标题，在小屏幕上允许在合适位置换行
-const formatTitle = (title: string) => {
-  // 如果标题包含 "AstrBot" 和其他文字，在它们之间添加换行机会
-  if (title.includes('AstrBot ') || title.includes('AstrBot')) {
-    // 处理 "AstrBot 仪表盘" 或 "AstrBot Dashboard" 等格式
-    return title.replace(/(AstrBot)\s+(.+)/, '$1<wbr> $2');
+// 智能格式化标题，在小屏幕上允许在合适位置换行。
+// 纯文本拆分 + <wbr>，不使用 v-html，避免未净化 HTML 注入。
+const titleParts = computed(() => {
+  const title = props.title || t('core.header.logoTitle');
+  const marker = 'AstrBot ';
+  const idx = title.indexOf(marker);
+  if (idx === -1) {
+    return [title];
   }
-  return title;
-}
+  const before = title.slice(0, idx + 'AstrBot'.length);
+  const after = title.slice(idx + marker.length);
+  return before ? [before, after] : [title];
+});
 </script>
 
 <style scoped>

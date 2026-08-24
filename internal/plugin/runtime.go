@@ -22,6 +22,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	goplugin "github.com/hashicorp/go-plugin"
+	"golang.org/x/mod/module"
 )
 
 // logger 供插件运行时与编译相关路径记录日志。
@@ -135,6 +136,13 @@ type SubprocessManager struct {
 	// BindSource/ReinstallSource/Uninstall），防止并发修改丢条目。与 m.mu 职责
 	// 分离：m.mu 保护内存 map，manifestMu 保护磁盘文件的一致性。
 	manifestMu sync.Mutex
+	// manifestCacheMu 保护 manifest 只读缓存（mtime 失效）：repoURLFor /
+	// IdleUnloadBlocked 等逐插件读 manifest 的高频路径复用同一份解析结果，
+	// 避免 WebUI 详情/行为页的 N+1 全量读盘。写路径 Save 后 mtime 变化自动
+	// 失效，无需显式同步。
+	manifestCacheMu sync.Mutex
+	manifestCache   *Manifest
+	manifestCacheAt time.Time
 	// docMu 保护 docFetchCache（README/CHANGELOG 的远程拉取结果缓存，
 	// 成功与失败（负面）都记录，TTL docFetchCacheTTL，避免 GitHub 不通时
 	// 每次打开详情页都重试，同时不永久阻挡后续（配置加速后）的重新拉取）。
@@ -169,6 +177,10 @@ type SubprocessManager struct {
 	// pythonEnv 是 Python 插件子进程环境（解释器 + SDK 目录），首次启动
 	// Python 插件时惰性解析（可能创建 venv 安装依赖）。nil 表示尚未解析。
 	pythonEnv *pysdk.RuntimeEnv
+	// pythonEnvMu 仅保护 pythonEnv 字段的读改写。运行时准备（CPython 下载/
+	// venv 创建/pip 安装）可长达数分钟，必须移出 m.mu（实例表锁），否则
+	// 首次准备期间所有插件管理操作（Get/List/Load/Unload/清扫/重启）被阻塞。
+	pythonEnvMu sync.Mutex
 
 	// AutoRestart enables automatic restart of crashed plugins.
 	AutoRestart bool
@@ -543,6 +555,14 @@ func (m *SubprocessManager) GoInstall(ctx context.Context, pkg, goproxy string) 
 	if pkg = strings.TrimSpace(pkg); pkg == "" {
 		return "", fmt.Errorf("模块名不能为空")
 	}
+	if strings.HasPrefix(pkg, "-") {
+		return "", fmt.Errorf("非法模块名 %q（不允许以 '-' 开头）", pkg)
+	}
+	if i := strings.Index(pkg, "@"); i > 0 {
+		if err := module.CheckPath(pkg[:i]); err != nil {
+			return "", fmt.Errorf("非法模块路径: %w", err)
+		}
+	}
 	if !strings.Contains(pkg, "@") {
 		pkg += "@latest"
 	}
@@ -736,13 +756,24 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("拷贝插件源码: %w", err)
 	}
-	// 后续 Prepare/Vet/Build 全部基于 staged 成功后：
+	// 提交制换名交换：后续 Prepare/Vet/Build/加载全部成功才删除旧版本源码；
+	// 任一失败则回滚 dest → old，避免更新失败时上一版本源码被销毁。
 	_ = os.Rename(srcDest, old)
 	if err := os.Rename(staged, srcDest); err != nil {
 		_ = os.Rename(old, srcDest)
 		return nil, err
 	}
-	defer os.RemoveAll(old)
+	commit := false
+	defer func() {
+		if commit {
+			_ = os.RemoveAll(old)
+			return
+		}
+		// 回滚：新源码挪回 staged 待清理，旧源码归位。
+		_ = os.Rename(srcDest, staged)
+		_ = os.Rename(old, srcDest)
+		_ = os.RemoveAll(staged)
+	}()
 	if err := m.compiler.Prepare(srcDest, goModuleNameOf(srcDest, meta)); err != nil {
 		return nil, fmt.Errorf("prepare module: %w", err)
 	}
@@ -780,6 +811,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if err != nil {
 		return nil, err
 	}
+	commit = true
 	// metadata.json is the canonical identity: override the runtime-reported
 	// name/version so the WebUI shows the packaged metadata.
 	if meta.Name != "" {
@@ -829,12 +861,23 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("拷贝 Python 插件源码: %w", err)
 	}
+	// 提交制换名交换：与 Go 安装路径一致，加载成功才删除旧版本源码；
+	// 任一失败回滚 dest → old。
 	_ = os.Rename(dest, old)
 	if err := os.Rename(staged, dest); err != nil {
 		_ = os.Rename(old, dest)
 		return nil, err
 	}
-	defer os.RemoveAll(old)
+	commit := false
+	defer func() {
+		if commit {
+			_ = os.RemoveAll(old)
+			return
+		}
+		_ = os.Rename(dest, staged)
+		_ = os.Rename(old, dest)
+		_ = os.RemoveAll(staged)
+	}()
 
 	// requirements.txt → pip install（使用 Python venv；失败仅告警，插件仍可加载）
 	req := filepath.Join(dest, "requirements.txt")
@@ -842,7 +885,7 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 		if opts.Stage != nil {
 			opts.Stage("安装 Python 依赖 (requirements.txt)…")
 		}
-		if err := m.pipInstall(env, dest, req); err != nil {
+		if err := m.pipInstall(ctx, env, dest, req); err != nil {
 			logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
 		}
 	}
@@ -854,6 +897,7 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	if err != nil {
 		return nil, err
 	}
+	commit = true
 	if meta.Name != "" {
 		inst.Name = meta.Name
 	}
@@ -879,8 +923,10 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 // pipInstall runs `pip install -r requirements.txt` inside the plugin's source
 // directory so relative dependencies resolve; the pip index honors
 // ASTRBOT_PYPI_INDEX (or PIP_INDEX_URL). All paths are made absolute because
-// the subprocess cwd differs from the host's.
-func (m *SubprocessManager) pipInstall(env *pysdk.RuntimeEnv, pluginDir, req string) error {
+// the subprocess cwd differs from the host's. ctx 约束整个 pip 子进程：上层
+// 超时（崩溃重启 30s / SetEnabled 60s / dashboard 10min）可终止 pip，内置
+// 5 分钟上限防止网络缓慢时无限重试拖住 startInstance 串行化窗口。
+func (m *SubprocessManager) pipInstall(ctx context.Context, env *pysdk.RuntimeEnv, pluginDir, req string) error {
 	if abs, err := filepath.Abs(req); err == nil {
 		req = abs
 	}
@@ -897,7 +943,9 @@ func (m *SubprocessManager) pipInstall(env *pysdk.RuntimeEnv, pluginDir, req str
 		index = pysdk.PyPIIndex()
 	}
 	args = append(args, "-i", index)
-	cmd := exec.Command(env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = pluginDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1013,6 +1061,23 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 // manifestPath returns the persisted install manifest location.
 func (m *SubprocessManager) manifestPath() string {
 	return filepath.Join(m.dataDir, "plugins-manifest.json")
+}
+
+// cachedManifest 返回 manifest 的只读缓存（mtime 失效：文件变化即重读）。
+// 解析失败时返回空 manifest（调用方按"无插件"处理），与 ListInfo 容错一致。
+func (m *SubprocessManager) cachedManifest() *Manifest {
+	m.manifestCacheMu.Lock()
+	defer m.manifestCacheMu.Unlock()
+	if info, err := os.Stat(m.manifestPath()); err == nil {
+		if m.manifestCache != nil && m.manifestCacheAt.Equal(info.ModTime()) {
+			return m.manifestCache
+		}
+		if man, err := LoadManifest(m.manifestPath()); err == nil {
+			m.manifestCache, m.manifestCacheAt = man, info.ModTime()
+			return man
+		}
+	}
+	return &Manifest{Version: 1}
 }
 
 // Load launches a compiled plugin binary (or Python source tree) as a child
@@ -1239,11 +1304,7 @@ func (m *SubprocessManager) SetIdleUnloadBlocked(id string, blocked bool) error 
 
 // IdleUnloadBlocked reports whether the plugin is exempt from the idle sweep.
 func (m *SubprocessManager) IdleUnloadBlocked(id string) bool {
-	man, err := LoadManifest(m.manifestPath())
-	if err != nil {
-		return false
-	}
-	if e := man.Get(id); e != nil {
+	if e := m.cachedManifest().Get(id); e != nil {
 		return e.IdleUnloadBlocked
 	}
 	return false
@@ -1555,7 +1616,7 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 			_, err := os.Stat(req)
 			return err == nil
 		}() {
-			if err := m.pipInstall(env, abs, req); err != nil {
+			if err := m.pipInstall(ctx, env, abs, req); err != nil {
 				logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
 			}
 		}
@@ -1595,8 +1656,8 @@ func (m *SubprocessManager) pythonRuntime() (*pysdk.RuntimeEnv, error) {
 // pythonRuntimeWithStage is pythonRuntime with a stage callback surfaced to
 // the WebUI install dialog (e.g. "下载 Python 解释器…").
 func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.RuntimeEnv, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.pythonEnvMu.Lock()
+	defer m.pythonEnvMu.Unlock()
 	if m.pythonEnv != nil {
 		// 缓存校验：venv/解释器可能被外部清理（如 ~/.cache 被系统回收、
 		// 用户手动删除），缓存命中但解释器/SDK 目录已不存在时丢弃缓存
@@ -1969,8 +2030,9 @@ func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
-		logger.I18nWarn("LoadInstalled: %v", err)
-		return
+		logger.I18nWarn("LoadInstalled: manifest 损坏（%v），已备份至 %s.corrupt 并重置", err, m.manifestPath())
+		_ = os.Rename(m.manifestPath(), m.manifestPath()+".corrupt")
+		man = &Manifest{Version: 1}
 	}
 	loaded := 0
 	for _, e := range man.Plugins {
@@ -2119,6 +2181,9 @@ func (m *SubprocessManager) migratePluginLayout() {
 				e.Language = lang
 				sid = sanitizeID(stableID)
 				e.Binary = rewritePluginIDPath(e.Binary, oldID, stableID)
+				// 立即写回：不依赖第 5 步条件（Binary 无旧 id 路径段且足迹
+				// 已等于新 id 时第 5 步不触发，ID 变更会丢失并重复迁移）。
+				man.Plugins[i] = e
 				changed = true
 			} else {
 				logger.I18nWarn("插件 %s 归一化 id 冲突（%s 已存在），保留原 id", e.ID, stableID)

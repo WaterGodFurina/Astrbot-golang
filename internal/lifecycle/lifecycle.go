@@ -109,7 +109,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	logger.I18nInfo("数据库已打开（连接池 5，WAL 模式）")
 
 	// 2. Load config
-	cfg := config.NewConfig("data/cmd_config.json", config.DefaultConfig())
+	cfg := config.NewConfig("data/cmd_config.json")
 	if err := cfg.Load(); err != nil {
 		logger.I18nWarn("加载配置失败（文件损坏？），已回退到默认配置继续运行: %v", err)
 		cfg.ResetToDefaults()
@@ -189,6 +189,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		StarMgr:         l.starMgr,
 		ConfigMgr:       l.configMgr,
 		ConversationMgr: l.conversationMgr,
+		Database:        l.database,
 	})
 
 	// 6. Initialize event bus
@@ -493,13 +494,16 @@ func (l *Lifecycle) setDockerOrLocalBooter(sandboxCfg map[string]interface{}) {
 			image = model
 		}
 	}
-	if dockerAvailable() {
-		l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
-		logger.I18nInfo("沙盒启动器已设置（docker, image=%s）", image)
+	// 对齐 Python computer_client.py：用户显式选择容器沙箱（boxlite）时，
+	// docker 不可用必须让沙箱启动失败并给出明确指引，绝不静默降级到无隔离
+	// 的本地执行（LocalBooter 仅限开发/测试场景）。
+	if !dockerAvailable() {
+		l.sandboxMgr.SetBooter(nil)
+		logger.I18nError("boxlite 沙箱需要 Docker，但当前不可用；请安装 Docker 或改用 shipyard_neo 后端")
 		return
 	}
-	l.sandboxMgr.SetBooter(sandbox.NewLocalBooter())
-	logger.I18nInfo("沙盒启动器已设置（local，docker 不可用）")
+	l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
+	logger.I18nInfo("沙盒启动器已设置（docker, image=%s）", image)
 }
 
 // floatValue converts a JSON numeric (float64/int) to float64, returning 0 on
@@ -705,8 +709,8 @@ func (l *Lifecycle) umoAliasResolver(umo string) string {
 	if cfg == nil {
 		return ""
 	}
-	all := cfg.All()
-	aliases, _ := all["umo_alias"].(map[string]interface{})
+	// 按路径取单个键，避免热路径（每条消息调用）全量深拷贝整个配置树。
+	aliases, _ := cfg.GetNested("umo_alias").(map[string]interface{})
 	if aliases == nil {
 		return ""
 	}
@@ -813,7 +817,10 @@ func personaSkillsResolver(personaID string) []string {
 		}
 		list, ok := skillsRaw.([]interface{})
 		if !ok {
-			return nil
+			// 类型错误时按最严格语义处理：技能白名单失效等价于禁止全部技能，
+			// 而不是 fail-open 变成全量放行。
+			logger.I18nWarn("persona %s 的 skills 字段类型错误（应为数组），已按禁止全部技能处理", personaID)
+			return []string{}
 		}
 		result := make([]string, 0, len(list))
 		for _, v := range list {

@@ -59,11 +59,13 @@ export const useCommonStore = defineStore("common", {
 
           const processStream = ({ done, value }) => {
             if (done) {
-              console.log("SSE stream closed");
+              this.sse_connected = false;
+              // 服务端主动关闭也走指数退避，避免固定 2s 打雷式重连
+              const delay = Math.min(30000, 1000 * 2 ** this.sseRetryCount++);
               setTimeout(() => {
                 this.eventSource = null;
                 this.createEventSource();
-              }, 2000);
+              }, delay);
               return;
             }
 
@@ -152,11 +154,12 @@ export const useCommonStore = defineStore("common", {
       // Store controller to allow closing the connection
       this.eventSource = controller;
     },
-    closeEventSourcet() {
+    closeEventSource() {
       if (this.eventSource) {
         this.eventSource.abort();
         this.eventSource = null;
       }
+      this.sse_connected = false;
     },
     getLogCache() {
       return this.log_cache;

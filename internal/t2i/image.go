@@ -2,6 +2,7 @@ package t2i
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -42,8 +43,17 @@ var (
 	emojiDir         string
 	emojiImgCache    sync.Map // codepoint -> image.Image
 	emojiFailedCache sync.Map // codepoint -> bool (negative cache for offline)
+	emojiFlightLocks sync.Map // codepoint -> *sync.Mutex，合并并发下载
 	glyphFontCache   sync.Map // font path -> *truetype.Font
 )
+
+// emojiFlightLock returns the per-codepoint mutex that serializes the
+// download/decode of the same emoji across concurrent renders, so a cache
+// miss only triggers one HTTP request per codepoint.
+func emojiFlightLock(cp string) *sync.Mutex {
+	l, _ := emojiFlightLocks.LoadOrStore(cp, &sync.Mutex{})
+	return l.(*sync.Mutex)
+}
 
 // glyphFont returns a parsed truetype.Font for glyph-existence checks.
 func glyphFont(path string) (*truetype.Font, error) {
@@ -735,6 +745,17 @@ func emojiImage(cluster string) (image.Image, bool) {
 	if _, failed := emojiFailedCache.Load(cp); failed {
 		return nil, false
 	}
+	// per-codepoint 锁合并并发下载：同一未缓存 emoji 只发一次 HTTP 请求。
+	lock := emojiFlightLock(cp)
+	lock.Lock()
+	defer lock.Unlock()
+	// 持锁后再查缓存：等待者可能已完成下载或写入失败缓存。
+	if v, ok := emojiImgCache.Load(cp); ok {
+		return v.(image.Image), true
+	}
+	if _, failed := emojiFailedCache.Load(cp); failed {
+		return nil, false
+	}
 	path := filepath.Join(ensureEmojiDir(), cp+".png")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -995,8 +1016,9 @@ func decodeBase64Image(s string) ([]byte, error) {
 }
 
 func fetchRemoteImage(u string) ([]byte, error) {
-	// SSRF 纵深防御：t2i 服务返回的图片 URL 应指向公网对象存储；仅允许
-	// http/https，拒绝 localhost 回环主机与纯 IP 目标（内网探测面）。
+	// SSRF 防御：t2i 服务返回的图片 URL 应指向公网对象存储。白名单模式——
+	// 在连接建立时按解析出的实际对端 IP 校验，拒绝环回/私网/链路本地/组播/
+	// 未指定/广播地址（同时覆盖域名解析、非点分 IP 文本与重定向目标）。
 	parsed, err := url.Parse(u)
 	if err != nil {
 		return nil, fmt.Errorf("fetch image: invalid URL: %w", err)
@@ -1006,17 +1028,36 @@ func fetchRemoteImage(u string) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("fetch image: unsupported scheme %q", parsed.Scheme)
 	}
-	host := strings.ToLower(parsed.Hostname())
-	if host == "" {
+	if parsed.Hostname() == "" {
 		return nil, fmt.Errorf("fetch image: missing host")
 	}
-	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
-		return nil, fmt.Errorf("fetch image: loopback host %q rejected", host)
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil // 每个重定向目标仍由下面的 dialer 按实际对端 IP 校验
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return nil, fmt.Errorf("fetch image: IP target %q rejected", host)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, err
+			}
+			for _, ip := range ips {
+				if !isPublicTarget(ip.IP) {
+					return nil, fmt.Errorf("fetch image: non-public target %s rejected", ip.IP)
+				}
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
+		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	client := &http.Client{Timeout: 120 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second, Transport: transport, CheckRedirect: checkRedirect}
 	resp, err := client.Get(u)
 	if err != nil {
 		return nil, err
@@ -1033,4 +1074,10 @@ func fetchRemoteImage(u string) ([]byte, error) {
 		return nil, fmt.Errorf("not an image")
 	}
 	return body, nil
+}
+
+// isPublicTarget reports whether ip is a public unicast address (rejects
+// loopback, private, link-local, multicast, unspecified and broadcast).
+func isPublicTarget(ip net.IP) bool {
+	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast()
 }

@@ -406,6 +406,15 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		}
 	}
 
+	// 发送完成后统一关闭本地文件句柄（discordgo 不会代为关闭）。
+	defer func() {
+		for _, f := range files {
+			if rc, ok := f.Reader.(io.Closer); ok {
+				_ = rc.Close()
+			}
+		}
+	}()
+
 	content := strings.Join(contentParts, "")
 	if utf8.RuneCountInString(content) > 2000 {
 		logger.I18nWarn("Discord 消息内容超过 2000 字符，将被截断")
@@ -600,6 +609,21 @@ func (a *Adapter) fileFromMedia(url, path, name string) *discordgo.File {
 // attachment upload limit.
 const maxMediaBytes = 25 << 20
 
+// mediaDownloadClient 下载远程媒体用客户端：重定向的每一跳重新做主机校验，
+// 防跨主机跳转绕过 SSRF 防线。
+var mediaDownloadClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 3 {
+			return fmt.Errorf("too many redirects")
+		}
+		if !platform.MediaHostAllowed(req.URL.String()) {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	},
+}
+
 // openFile opens a local file for upload (nil on failure). The upload name is
 // given a file extension when the source path carries one.
 func openFile(path, name string) *discordgo.File {
@@ -615,6 +639,10 @@ func openFile(path, name string) *discordgo.File {
 // bounded by a context timeout, rejects non-200 responses and caps the body
 // size so a bad or hostile URL cannot hang the sender or exhaust memory.
 func fetchFile(rawURL, name string) *discordgo.File {
+	if !platform.MediaHostAllowed(rawURL) {
+		logger.I18nWarn("下载 URL 失败: 地址被拒绝 %s", rawURL)
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -622,7 +650,7 @@ func fetchFile(rawURL, name string) *discordgo.File {
 		logger.I18nWarn("下载 URL 失败: %v", err)
 		return nil
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := mediaDownloadClient.Do(req)
 	if err != nil {
 		logger.I18nWarn("下载 URL 失败: %v", err)
 		return nil

@@ -204,7 +204,7 @@ func TestShellSessionWriteOwnershipAndData(t *testing.T) {
 	pr, pw := io.Pipe()
 	registerTestShellSession(t, "write1", "alice", pw)
 
-	if out := shellSessionWrite("write1", "hello", "bob", "bob"); !strings.Contains(out, "does not belong") {
+	if out := shellSessionWrite("write1", "hello", "bob", "bob", false); !strings.Contains(out, "does not belong") {
 		t.Errorf("write from wrong owner not blocked: %q", out)
 	}
 	got := make(chan string, 1)
@@ -217,13 +217,13 @@ func TestShellSessionWriteOwnershipAndData(t *testing.T) {
 		}
 		got <- string(buf[:n])
 	}()
-	if out := shellSessionWrite("write1", "hello", "alice", "alice"); !strings.Contains(out, "Written to session") {
+	if out := shellSessionWrite("write1", "hello", "alice", "alice", false); !strings.Contains(out, "Written to session") {
 		t.Errorf("write from owner failed: %q", out)
 	}
 	select {
 	case data := <-got:
-		if data != "hello\n" {
-			t.Errorf("session received %q, want %q", data, "hello\n")
+		if data != "hello" {
+			t.Errorf("session received %q, want %q", data, "hello")
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out reading from stdin pipe")
@@ -271,10 +271,10 @@ func TestBackgroundShellSessionStdinWrite(t *testing.T) {
 	if s == nil || s.Stdin == nil {
 		t.Fatalf("session %s not registered with a stdin pipe", id)
 	}
-	if r := shellSessionWrite(id, "x", "other:user", "other:user"); !strings.Contains(r, "does not belong") {
+	if r := shellSessionWrite(id, "x", "other:user", "other:user", false); !strings.Contains(r, "does not belong") {
 		t.Fatalf("write from wrong owner not blocked: %q", r)
 	}
-	if r := shellSessionWrite(id, "hello world", umo, umo); !strings.Contains(r, "Written to session") {
+	if r := shellSessionWrite(id, "hello world", umo, umo, false); !strings.Contains(r, "Written to session") {
 		t.Fatalf("write to background session failed: %q", r)
 	}
 

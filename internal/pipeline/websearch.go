@@ -262,9 +262,16 @@ func executeWebSearchTavily(cfg map[string]interface{}, args map[string]interfac
 	if query == "" {
 		return "Error: web_search_tavily requires a query."
 	}
+	maxResults := argIntDefault(args, "max_results", 7)
+	if maxResults < 1 {
+		maxResults = 1
+	}
+	if maxResults > 20 {
+		maxResults = 20 // schema 声称 range 5-20，强制钳制防滥用放大账单
+	}
 	payload := map[string]interface{}{
 		"query":           query,
-		"max_results":     argIntDefault(args, "max_results", 7),
+		"max_results":     maxResults,
 		"include_favicon": true,
 		"search_depth":    argStringDefault(args, "search_depth", "basic"),
 		"topic":           argStringDefault(args, "topic", "general"),
@@ -479,9 +486,16 @@ func executeWebSearchFirecrawl(cfg map[string]interface{}, args map[string]inter
 	if query == "" {
 		return "Error: web_search_firecrawl requires a query."
 	}
+	limit := argIntDefault(args, "limit", 5)
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 20 {
+		limit = 20
+	}
 	payload := map[string]interface{}{
 		"query":   query,
-		"limit":   argIntDefault(args, "limit", 5),
+		"limit":   limit,
 		"sources": []string{"web"},
 	}
 	if v := strings.TrimSpace(argString(args, "country")); v != "" {
@@ -661,6 +675,9 @@ func executeWebSearchExa(cfg map[string]interface{}, args map[string]interface{}
 	numResults := argIntDefault(args, "num_results", 10)
 	if numResults < 1 {
 		numResults = 1
+	}
+	if numResults > 20 {
+		numResults = 20
 	}
 	payload := map[string]interface{}{
 		"query":      query,

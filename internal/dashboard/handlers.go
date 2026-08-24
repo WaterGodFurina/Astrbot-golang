@@ -2750,10 +2750,20 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 		http.NotFound(w, r)
 		return
 	}
-	// 有没有注册 Web API？没有则 404（避免无谓 RPC）。
+	// 有没有注册 Web API？实时拉取（运行期 register_web_api 也能被网关
+	// 识别）；旧插件二进制无 ListWebApis RPC 时返回 UNIMPLEMENTED，回退
+	// Register 快照（对齐 ListTools 模式）。
 	hasWebAPI := false
 	if inst.Meta != nil {
 		hasWebAPI = len(inst.Meta.WebApis) > 0
+	}
+	webAPICtx, webAPICancel := context.WithTimeout(r.Context(), 30*time.Second)
+	descs, listErr := inst.Client.ListWebApis(webAPICtx)
+	webAPICancel()
+	if listErr != nil {
+		logger.I18nWarn("plug proxy: 插件 %q ListWebApis 失败: %v", pid, listErr)
+	} else {
+		hasWebAPI = len(descs) > 0
 	}
 	if !hasWebAPI {
 		logger.I18nWarn("plug proxy: 插件 %q 未注册 Web API (path=%s)", pid, pluginPath)

@@ -5,6 +5,7 @@ package sources
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -69,10 +70,10 @@ func (s *OllamaSource) TextChat(ctx context.Context, req *provider.ProviderReque
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return &provider.LLMResponse{
 			Role:           "err",
-			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, string(respBody)),
+			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024)),
 		}, nil
 	}
 	var result struct {
@@ -105,9 +106,9 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024))
 	}
 	ch := make(chan *provider.LLMResponse, 100)
 	go func() {
@@ -199,13 +200,28 @@ func (s *OllamaSource) buildRequestBody(req *provider.ProviderRequest, stream bo
 		})
 	}
 	messages = append(messages, req.Contexts...)
-	messages = append(messages, map[string]interface{}{
-		"role":    "user",
-		"content": req.Prompt,
-	})
-	return map[string]interface{}{
+	// 图片: Ollama 原生协议要求 messages[].images 为 base64 数组（不带 data: 前缀）。
+	var images []string
+	for _, img := range req.ImageURLs {
+		if data, _, err := fetchMediaData(img); err == nil {
+			images = append(images, base64.StdEncoding.EncodeToString(data))
+		} else {
+			logger.Warn("Ollama: 加载图片 %q 失败: %v", img, err)
+		}
+	}
+	userMsg := map[string]interface{}{"role": "user", "content": req.Prompt}
+	if len(images) > 0 {
+		userMsg["images"] = images
+	}
+	messages = append(messages, userMsg)
+	body := map[string]interface{}{
 		"model":    s.GetModel(),
 		"messages": messages,
 		"stream":   stream,
 	}
+	// 工具: 透传 OpenAI function schema（Ollama 的 tools 字段与 OpenAI 结构一致）。
+	if len(req.Tools) > 0 {
+		body["tools"] = req.Tools
+	}
+	return body
 }

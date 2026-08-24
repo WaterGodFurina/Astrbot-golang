@@ -170,6 +170,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 			HandlerFullName: "plugin_" + inst.ID + "_" + cmd.Name,
 			HandlerName:     cmd.Name, HandlerModulePath: "data.plugins",
 			PluginName: inst.ID,
+			Source:     "subprocess_cmd",
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -248,6 +249,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 			HandlerName:       f.Name,
 			HandlerModulePath: "data.plugins",
 			PluginName:        inst.ID,
+			Source:            "subprocess_filter",
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -302,6 +304,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 			HandlerName:       h.Name,
 			HandlerModulePath: "data.plugins",
 			PluginName:        inst.ID,
+			Source:            "subprocess_hook",
 			Handler: func(event interface{}) error {
 				e, ok := event.(*core.Event)
 				if !ok {
@@ -376,7 +379,7 @@ func CoreEventToSDK(e *core.Event) *pluginsdk.Event {
 		PlainText:   e.PlainText,
 		RawMessage:  e.RawMessage,
 		Timestamp:   e.Timestamp.Unix(),
-		Metadata:    e.Metadata,
+		Metadata:    sdkMetadata(e),
 	}
 	if e.MessageObj != nil {
 		out.MessageID = e.MessageObj.MessageID
@@ -394,6 +397,28 @@ var coreEventTypeNames = map[core.EventType]string{
 	core.EventNotice:  "notice",
 	core.EventRequest: "request",
 	core.EventMeta:    "meta",
+}
+
+// sdkMetadata 返回注入角色后的插件事件元数据。Python SDK 优先读
+// metadata.role（admin/owner/member，见 astr_message_event.from_event_json），
+// 缺失时二值化为 admin/member——宿主事件只有 admin/member 维度
+// （event.Role，WakingCheck 阶段设置），注入 role 使权限过滤器的
+// OWNER/GROUP_ADMIN 权限位有对齐的取值基础。为避免共享底层 map 被后续
+// 修改，存在注入需求时拷贝一份。
+func sdkMetadata(e *core.Event) map[string]interface{} {
+	md := e.Metadata
+	if e.Role == "" {
+		return md
+	}
+	if _, exists := md["role"]; exists {
+		return md
+	}
+	copied := make(map[string]interface{}, len(md)+1)
+	for k, v := range md {
+		copied[k] = v
+	}
+	copied["role"] = e.Role
+	return copied
 }
 
 func coreEventTypeName(t core.EventType) string {
@@ -494,14 +519,16 @@ func componentToSDK(c message.Component) pluginsdk.Component {
 }
 
 // RemovePluginCommands removes all subprocess-plugin command handlers from the
-// star registry (prefix "plugin_"). Used when re-bridging after install,
-// unload, reload or crash-restart.
+// star registry (Source "subprocess_cmd"; legacy .so 插件命令 Source
+// "so_plugin"). Used when re-bridging after install, unload, reload or
+// crash-restart. 按显式来源标记匹配，避免宽前缀 "plugin_" 误删
+// plugin_filter_*/plugin_hook_* 类 handler。
 func RemovePluginCommands(starMgr *Manager) {
 	if starMgr == nil || starMgr.Handlers() == nil {
 		return
 	}
 	for _, h := range starMgr.Handlers().All() {
-		if strings.HasPrefix(h.HandlerFullName, "plugin_") {
+		if h.Source == "subprocess_cmd" || h.Source == "so_plugin" {
 			starMgr.Handlers().Remove(h.HandlerFullName)
 		}
 	}
@@ -518,26 +545,26 @@ func RemovePluginMetadata(starMgr *Manager) {
 }
 
 // RemovePluginFilters removes all subprocess-plugin filter handlers from the
-// star registry (prefix "plugin_filter_").
+// star registry (Source "subprocess_filter").
 func RemovePluginFilters(starMgr *Manager) {
 	if starMgr == nil || starMgr.Handlers() == nil {
 		return
 	}
 	for _, h := range starMgr.Handlers().All() {
-		if strings.HasPrefix(h.HandlerFullName, "plugin_filter_") {
+		if h.Source == "subprocess_filter" {
 			starMgr.Handlers().Remove(h.HandlerFullName)
 		}
 	}
 }
 
 // RemovePluginHooks removes all subprocess-plugin hook handlers from the star
-// registry (prefix "plugin_hook_").
+// registry (Source "subprocess_hook").
 func RemovePluginHooks(starMgr *Manager) {
 	if starMgr == nil || starMgr.Handlers() == nil {
 		return
 	}
 	for _, h := range starMgr.Handlers().All() {
-		if strings.HasPrefix(h.HandlerFullName, "plugin_hook_") {
+		if h.Source == "subprocess_hook" {
 			starMgr.Handlers().Remove(h.HandlerFullName)
 		}
 	}

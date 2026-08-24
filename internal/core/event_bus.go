@@ -339,6 +339,7 @@ func (bus *EventBus) Start(ctx context.Context) error {
 			return nil
 		}
 		event := bus.queue[0]
+		bus.queue[0] = nil // release the head reference so the backing array can be GC'd
 		bus.queue = bus.queue[1:]
 		bus.cond.Broadcast() // wake blocked publishers
 		bus.queueMu.Unlock()

@@ -13,10 +13,7 @@ import (
 func newTestDeps(t *testing.T) (Deps, *star.Manager) {
 	t.Helper()
 	cm := config.NewConfigManager()
-	cfg, err := config.New(t.TempDir()+"/cmd_config.json", map[string]interface{}{}, map[string]interface{}{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	cfg := config.NewConfig(t.TempDir() + "/cmd_config.json")
 	cm.Register("default", cfg)
 	sm := star.NewManagerSimple()
 	deps := Deps{

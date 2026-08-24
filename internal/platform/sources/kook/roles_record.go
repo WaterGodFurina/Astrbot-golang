@@ -11,10 +11,10 @@ import (
 
 // 角色缓存相关常量 (对应 Python kook_roles_record.py)。
 const (
-	userViewRequestTimeout = 3 * time.Second // 请求超时, 避免阻塞消息接收太久
-	rolesCacheMaxSize      = 2000            // 缓存最大条目数 (LRU)
-	maxRetryTimes          = 3               // 最大失败重试次数
-	retryIntervalSecond    = 60              // 失败后的重试间隔(秒)
+	userViewRequestTimeout = 3 * time.Second  // 请求超时, 避免阻塞消息接收太久
+	rolesCacheMaxSize      = 2000             // 缓存最大条目数 (LRU)
+	maxRetryTimes          = 3                // 最大失败重试次数
+	retryInterval          = 60 * time.Second // 失败后的重试间隔
 )
 
 // rolesCacheEntry 对应 Python 的 RolesCache 数据类。
@@ -199,7 +199,7 @@ func (r *RolesRecord) doFetch(ctx context.Context, guildID, roleID int64) map[in
 	r.mu.Lock()
 	if cache, ok := r.cache[guildID]; ok {
 		// 失败次数过多且在重试间隔内, 直接放弃本次查询
-		if cache.FailedCount > maxRetryTimes && time.Since(cache.LatestUpdateTime) < retryIntervalSecond {
+		if cache.FailedCount > maxRetryTimes && time.Since(cache.LatestUpdateTime) < retryInterval {
 			r.mu.Unlock()
 			return nil
 		}

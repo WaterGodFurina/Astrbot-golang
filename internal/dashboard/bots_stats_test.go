@@ -17,7 +17,7 @@ func TestBotsStats(t *testing.T) {
 	s := &Server{}
 	// Use a real config manager holding the platform list.
 	cm := config.NewConfigManager()
-	cfg := config.NewConfig("", nil)
+	cfg := config.NewConfig("")
 	_ = cfg.Set("platform", []interface{}{
 		map[string]interface{}{"id": "default_1", "type": "qq_official", "enable": true},
 		map[string]interface{}{"id": "tg", "type": "telegram", "enable": false},

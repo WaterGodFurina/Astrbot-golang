@@ -103,10 +103,12 @@ func snapshotFileMutation(ws, before, toolName, result string) string {
 	if patch == "" {
 		return result
 	}
-	truncated := patch
 	const maxPatch = 800
-	if len(truncated) > maxPatch {
-		truncated = truncated[:maxPatch] + "\n...(截断)"
+	// 按 rune 截断（truncateRunes），避免字节切分切断 UTF-8 多字节字符
+	// 产生非法 UTF-8（中文 diff 超长时必然触发）。
+	truncated := truncateRunes(patch, maxPatch)
+	if len(patch) > len(truncated) {
+		truncated += "\n...(截断)"
 	}
 	logger.I18nInfo("工具 %s 修改了工作区文件（快照变更）:\n%s", toolName, truncated)
 	return result + "\n\n[工作区快照] 工具 " + toolName + " 修改了文件:\n" + truncated

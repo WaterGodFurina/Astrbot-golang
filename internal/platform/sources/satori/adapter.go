@@ -296,8 +296,11 @@ func (a *Adapter) sendIdentify(ws *websocket.Conn) error {
 		"token": a.token, // 字符串
 	}
 	// 只有在有序列号时才添加 sn 字段
-	if a.sequence > 0 {
-		body["sn"] = a.sequence
+	a.mu.Lock()
+	sn := a.sequence
+	a.mu.Unlock()
+	if sn > 0 {
+		body["sn"] = sn
 	}
 	payload := map[string]interface{}{
 		"op":   opIdentify,

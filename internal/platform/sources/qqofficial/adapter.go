@@ -963,11 +963,14 @@ func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType in
 		payload["group_openid"] = targetID
 		path = "/v2/groups/" + targetID + "/files"
 	}
-	// If the file ref looks like a URL, pass it directly
+	// If the file ref looks like a URL, pass it directly; a local path is read
+	// and base64-encoded (对齐 Python 的 os.path.exists + base64 分支)
 	if strings.HasPrefix(fileData, "http://") || strings.HasPrefix(fileData, "https://") {
 		payload["url"] = fileData
+	} else if data, err := os.ReadFile(fileData); err == nil {
+		payload["file_data"] = base64.StdEncoding.EncodeToString(data)
 	} else {
-		payload["file_data"] = fileData
+		payload["file_data"] = fileData // 兼容调用方直接传 base64 的旧路径
 	}
 	return a.apiRequest(http.MethodPost, path, payload)
 }

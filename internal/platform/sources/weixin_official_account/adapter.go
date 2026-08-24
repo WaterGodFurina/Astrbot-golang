@@ -182,6 +182,8 @@ func (a *Adapter) Start(ctx context.Context) error {
 		Addr:              fmt.Sprintf("%s:%d", a.host, a.port),
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	go func() {
 		if err := a.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -341,7 +343,8 @@ func validateCiphertext(encrypt, encodingAESKey string) error {
 		return errors.New("无效的密文长度")
 	}
 	pt := make([]byte, len(raw))
-	cipher.NewCBCDecrypter(block, raw[:aes.BlockSize]).CryptBlocks(pt, raw)
+	// IV 与协议一致（密钥前 16 字节），与 msg.ShouldDecode 的 iv=key[:16] 对齐
+	cipher.NewCBCDecrypter(block, key[:aes.BlockSize]).CryptBlocks(pt, raw)
 	if len(pt) < 20 {
 		return errors.New("密文结构不完整")
 	}

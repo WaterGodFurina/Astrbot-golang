@@ -1,8 +1,8 @@
 import { computed, onBeforeUnmount, reactive, ref, type Ref } from "vue";
 import { chatApi, fileApi } from "@/api/v1";
 import { fetchWithAuth } from "@/api/http";
-import { getToken } from "@/utils/token";
 import { getWSTicket } from "@/utils/wsTicket";
+import { readSseStream } from "@/utils/sse";
 
 export type TransportMode = "sse" | "websocket";
 
@@ -153,6 +153,7 @@ export function useMessages(options: UseMessagesOptions) {
   const sessionProjects = reactive<Record<string, ChatSessionProject | null>>(
     {},
   );
+  let disposed = false;
 
   const activeMessages = computed(() =>
     options.currentSessionId.value
@@ -161,6 +162,7 @@ export function useMessages(options: UseMessagesOptions) {
   );
 
   onBeforeUnmount(() => {
+    disposed = true;
     cleanupConnections();
     for (const promise of attachmentBlobCache.values()) {
       promise.then((url) => URL.revokeObjectURL(url)).catch(() => {});
@@ -204,6 +206,7 @@ export function useMessages(options: UseMessagesOptions) {
 
   async function resolvePartMedia(part: MessagePart): Promise<void> {
     if (part.embedded_url) return;
+    if (disposed) return;
     let url: string;
     let cacheKey: string;
     const storedFilename =
@@ -579,29 +582,6 @@ export function useMessages(options: UseMessagesOptions) {
     });
   }
 
-  function normalizeHistoryRecord(record: any): ChatRecord {
-    const content = record.content || {};
-    const normalizedMessage = normalizeMessageParts(
-      content.message || [],
-      content.reasoning || "",
-    );
-    const normalizedContent: ChatContent = {
-      type: content.type || (record.sender_id === "bot" ? "bot" : "user"),
-      message: normalizedMessage,
-      reasoning: extractReasoningText(
-        normalizedMessage,
-        content.reasoning || "",
-      ),
-      agentStats: content.agentStats || content.agent_stats,
-      refs: content.refs,
-    };
-
-    return {
-      ...record,
-      content: normalizedContent,
-    };
-  }
-
   function attachThreads(records: ChatRecord[], threads: ChatThread[]) {
     const threadsByMessage = new Map<string, ChatThread[]>();
     for (const thread of threads) {
@@ -777,7 +757,24 @@ export function useMessages(options: UseMessagesOptions) {
     selectedProvider: string,
     selectedModel: string,
   ) {
-    const ws = await getOrCreateChatWebSocket(sessionId);
+    let ws: WebSocket;
+    try {
+      ws = await getOrCreateChatWebSocket(sessionId);
+    } catch (error) {
+      // 换取 ws-ticket 失败（后端过旧/网络异常）：不把长效 token 放进 URL，
+      // 直接向用户展示连接失败。
+      console.error("WebSocket credential failed:", error);
+      ensureBotRecordVisible({
+        sessionId,
+        messageId,
+        transport: "websocket",
+        botRecord,
+        userRecord,
+        botVisible: messagesBySession[sessionId]?.includes(botRecord) ?? false,
+      });
+      appendPlain(botRecord, "\n\nWebSocket connection failed. Please upgrade the backend.");
+      return;
+    }
 
     const connection: ActiveConnection = {
       sessionId,
@@ -831,9 +828,14 @@ export function useMessages(options: UseMessagesOptions) {
 
     const create = (async () => {
       const ticket = await getWSTicket();
-      const token = getToken() || "";
+      if (!ticket) {
+        // 旧后端无 ws-ticket 端点：拒绝把长效 token 放进 URL，直接失败。
+        throw new Error(
+          "WebSocket credential unavailable (ws-ticket endpoint missing); please upgrade the backend.",
+        );
+      }
       // nosemgrep: websocket
-      const ws = new WebSocket(chatApi.unifiedWebSocketUrl(ticket, token));
+      const ws = new WebSocket(chatApi.unifiedWebSocketUrl(ticket));
       chatWebSockets[sessionId] = ws;
 
       ws.onmessage = (event) => {
@@ -1018,7 +1020,6 @@ export function useMessages(options: UseMessagesOptions) {
         ? { ...payload, type: payload.type || payload.t }
         : payload;
     const msgType = normalized?.type || normalized?.t;
-    const chainType = normalized?.chain_type;
     const data = normalized?.data ?? "";
 
     if (msgType === "follow_up_captured") {
@@ -1057,134 +1058,17 @@ export function useMessages(options: UseMessagesOptions) {
       }
       return;
     }
-    if (msgType === "session_id" || msgType === "session_bound") return;
+
+    applyStreamPayloadToRecord(botRecord, payload, {
+      userRecord,
+      resolveMedia: resolvePartMedia,
+      onRunSnapshot: (record) => {
+        void resolveRecordMedia([record]);
+      },
+    });
+
     if (connection && msgType !== "user_message_saved" && msgType !== "end") {
       ensureBotRecordVisible(connection);
-    }
-    if (msgType === "run_snapshot") {
-      const snapshot = data && typeof data === "object" ? data : {};
-      const snapshotRecord = normalizeHistoryRecord({
-        id: `active-run-${snapshot.run_id || "unknown"}`,
-        content: snapshot.content || { type: "bot", message: [] },
-        llm_checkpoint_id: snapshot.llm_checkpoint_id || null,
-      });
-      snapshotRecord.content.isLoading =
-        snapshot.status === "running" &&
-        snapshotRecord.content.message.length === 0;
-      botRecord.content = snapshotRecord.content;
-      botRecord.llm_checkpoint_id = snapshotRecord.llm_checkpoint_id;
-      void resolveRecordMedia([botRecord]);
-      return;
-    }
-    if (msgType === "user_message_saved") {
-      if (userRecord) {
-        userRecord.id = data?.id || userRecord.id;
-        userRecord.created_at = data?.created_at || userRecord.created_at;
-        userRecord.llm_checkpoint_id =
-          data?.llm_checkpoint_id || userRecord.llm_checkpoint_id;
-      }
-      return;
-    }
-    if (msgType === "message_saved") {
-      markMessageStarted(botRecord);
-      botRecord.id = data?.id || botRecord.id;
-      botRecord.created_at = data?.created_at || botRecord.created_at;
-      botRecord.llm_checkpoint_id =
-        data?.llm_checkpoint_id || botRecord.llm_checkpoint_id;
-      if (data?.refs) {
-        messageContent(botRecord).refs = data.refs;
-      }
-      return;
-    }
-    if (msgType === "agent_stats" || chainType === "agent_stats") {
-      markMessageStarted(botRecord);
-      messageContent(botRecord).agentStats = data;
-      return;
-    }
-    if (msgType === "error") {
-      markMessageStarted(botRecord);
-      appendPlain(botRecord, `\n\n${String(data)}`);
-      return;
-    }
-    if (msgType === "complete" || msgType === "break") {
-      markMessageStarted(botRecord);
-      const finalText = payloadText(data);
-      const existingText = botRecord.content.message
-        .filter((part) => part.type === "plain")
-        .map((part) => part.text || "")
-        .join("");
-      const missingText = finalText.slice(existingText.length);
-      if (
-        msgType === "complete" &&
-        missingText &&
-        finalText.startsWith(existingText)
-      ) {
-        appendPlain(botRecord, missingText);
-      } else if (finalText && !hasPlainText(botRecord)) {
-        appendPlain(botRecord, finalText, false);
-      }
-      return;
-    }
-    if (msgType === "end") {
-      markMessageStarted(botRecord);
-      return;
-    }
-
-    if (msgType === "plain") {
-      markMessageStarted(botRecord);
-      if (chainType === "reasoning") {
-        appendReasoningPart(botRecord, payloadText(data));
-        return;
-      }
-      if (chainType === "tool_call") {
-        upsertToolCall(botRecord, parseJsonSafe(data));
-        return;
-      }
-      if (chainType === "tool_call_result") {
-        finishToolCall(botRecord, parseJsonSafe(data));
-        return;
-      }
-      appendPlain(botRecord, payloadText(data), normalized.streaming !== false);
-      return;
-    }
-
-    if (["image", "record", "file", "video"].includes(msgType)) {
-      markMessageStarted(botRecord);
-      // Data URLs (e.g. locally rendered text-to-image) are rendered directly
-      // and do not need the file service.
-      if (typeof data === "string" && data.startsWith("data:")) {
-        messageContent(botRecord).message.push({
-          type: msgType,
-          embedded_url: data,
-        });
-        return;
-      }
-      const rawFilename = String(data)
-        .replace("[IMAGE]", "")
-        .replace("[RECORD]", "")
-        .replace("[FILE]", "")
-        .replace("[VIDEO]", "");
-      const separatorIndex = rawFilename.indexOf("|");
-      const storedFilename =
-        separatorIndex >= 0
-          ? rawFilename.slice(0, separatorIndex)
-          : rawFilename;
-      const displayFilename =
-        separatorIndex >= 0
-          ? rawFilename.slice(separatorIndex + 1)
-          : storedFilename;
-      const filename = displayFilename || storedFilename;
-      const mediaPart: MessagePart = { type: msgType, filename };
-      if (storedFilename && storedFilename !== filename) {
-        mediaPart.stored_filename = storedFilename;
-      }
-      if (msgType !== "file") {
-        resolvePartMedia(mediaPart).then(() => {
-          messageContent(botRecord).message.push(mediaPart);
-        });
-      } else {
-        messageContent(botRecord).message.push(mediaPart);
-      }
     }
   }
 
@@ -1403,33 +1287,185 @@ function partToPayload(part: MessagePart) {
   };
 }
 
-async function readSseStream(
-  body: ReadableStream<Uint8Array>,
-  onPayload: (payload: any) => void,
+function normalizeHistoryRecord(record: any): ChatRecord {
+  const content = record.content || {};
+  const normalizedMessage = normalizeMessageParts(
+    content.message || [],
+    content.reasoning || "",
+  );
+  const normalizedContent: ChatContent = {
+    type: content.type || (record.sender_id === "bot" ? "bot" : "user"),
+    message: normalizedMessage,
+    reasoning: extractReasoningText(
+      normalizedMessage,
+      content.reasoning || "",
+    ),
+    agentStats: content.agentStats || content.agent_stats,
+    refs: content.refs,
+  };
+
+  return {
+    ...record,
+    content: normalizedContent,
+  };
+}
+
+function streamPayloadContent(record: ChatRecord): ChatContent {
+  return record.content || { type: "bot", message: [] };
+}
+
+export interface StreamPayloadApplyOptions {
+  userRecord?: ChatRecord;
+  resolveMedia?: (part: MessagePart) => Promise<void> | void;
+  onRunSnapshot?: (record: ChatRecord) => void;
+}
+
+/**
+ * 将单条 SSE payload 应用到机器人消息记录上（主聊天流与线程面板共用，
+ * 避免两份实现漂移）。连接级事件（follow_up_captured/run_started 等）由
+ * useMessages 内部处理，不在此处。
+ */
+export function applyStreamPayloadToRecord(
+  botRecord: ChatRecord,
+  payload: any,
+  opts: StreamPayloadApplyOptions = {},
 ) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const normalized =
+    payload?.ct === "chat"
+      ? { ...payload, type: payload.type || payload.t }
+      : payload;
+  const msgType = normalized?.type || normalized?.t;
+  const chainType = normalized?.chain_type;
+  const data = normalized?.data ?? "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const events = buffer.split("\n\n");
-    buffer = events.pop() || "";
+  if (msgType === "session_id" || msgType === "session_bound") return;
 
-    for (const event of events) {
-      const data = event
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n");
-      if (!data) continue;
-      try {
-        onPayload(JSON.parse(data));
-      } catch (error) {
-        console.error("Failed to parse SSE payload:", error, data);
-      }
+  if (msgType === "run_snapshot") {
+    const snapshot = data && typeof data === "object" ? data : {};
+    const snapshotRecord = normalizeHistoryRecord({
+      id: `active-run-${snapshot.run_id || "unknown"}`,
+      content: snapshot.content || { type: "bot", message: [] },
+      llm_checkpoint_id: snapshot.llm_checkpoint_id || null,
+    });
+    snapshotRecord.content.isLoading =
+      snapshot.status === "running" &&
+      snapshotRecord.content.message.length === 0;
+    botRecord.content = snapshotRecord.content;
+    botRecord.llm_checkpoint_id = snapshotRecord.llm_checkpoint_id;
+    if (opts.onRunSnapshot) {
+      opts.onRunSnapshot(botRecord);
+    }
+    return;
+  }
+  if (msgType === "user_message_saved") {
+    if (opts.userRecord) {
+      opts.userRecord.id = data?.id || opts.userRecord.id;
+      opts.userRecord.created_at =
+        data?.created_at || opts.userRecord.created_at;
+      opts.userRecord.llm_checkpoint_id =
+        data?.llm_checkpoint_id || opts.userRecord.llm_checkpoint_id;
+    }
+    return;
+  }
+  if (msgType === "message_saved") {
+    markMessageStarted(botRecord);
+    botRecord.id = data?.id || botRecord.id;
+    botRecord.created_at = data?.created_at || botRecord.created_at;
+    botRecord.llm_checkpoint_id =
+      data?.llm_checkpoint_id || botRecord.llm_checkpoint_id;
+    if (data?.refs) {
+      streamPayloadContent(botRecord).refs = data.refs;
+    }
+    return;
+  }
+  if (msgType === "agent_stats" || chainType === "agent_stats") {
+    markMessageStarted(botRecord);
+    streamPayloadContent(botRecord).agentStats = data;
+    return;
+  }
+  if (msgType === "error") {
+    markMessageStarted(botRecord);
+    appendPlain(botRecord, `\n\n${String(data)}`);
+    return;
+  }
+  if (msgType === "complete" || msgType === "break") {
+    markMessageStarted(botRecord);
+    const finalText = payloadText(data);
+    const existingText = streamPayloadContent(botRecord).message
+      .filter((part) => part.type === "plain")
+      .map((part) => part.text || "")
+      .join("");
+    const missingText = finalText.slice(existingText.length);
+    if (
+      msgType === "complete" &&
+      missingText &&
+      finalText.startsWith(existingText)
+    ) {
+      appendPlain(botRecord, missingText);
+    } else if (finalText && !hasPlainText(botRecord)) {
+      appendPlain(botRecord, finalText, false);
+    }
+    return;
+  }
+  if (msgType === "end") {
+    markMessageStarted(botRecord);
+    return;
+  }
+
+  if (msgType === "plain") {
+    markMessageStarted(botRecord);
+    if (chainType === "reasoning") {
+      appendReasoningPart(botRecord, payloadText(data));
+      return;
+    }
+    if (chainType === "tool_call") {
+      upsertToolCall(botRecord, parseJsonSafe(data));
+      return;
+    }
+    if (chainType === "tool_call_result") {
+      finishToolCall(botRecord, parseJsonSafe(data));
+      return;
+    }
+    appendPlain(botRecord, payloadText(data), normalized.streaming !== false);
+    return;
+  }
+
+  if (["image", "record", "file", "video"].includes(msgType)) {
+    markMessageStarted(botRecord);
+    // Data URLs (e.g. locally rendered text-to-image) are rendered directly
+    // and do not need the file service.
+    if (typeof data === "string" && data.startsWith("data:")) {
+      streamPayloadContent(botRecord).message.push({
+        type: msgType,
+        embedded_url: data,
+      });
+      return;
+    }
+    const rawFilename = String(data)
+      .replace("[IMAGE]", "")
+      .replace("[RECORD]", "")
+      .replace("[FILE]", "")
+      .replace("[VIDEO]", "");
+    const separatorIndex = rawFilename.indexOf("|");
+    const storedFilename =
+      separatorIndex >= 0
+        ? rawFilename.slice(0, separatorIndex)
+        : rawFilename;
+    const displayFilename =
+      separatorIndex >= 0
+        ? rawFilename.slice(separatorIndex + 1)
+        : storedFilename;
+    const filename = displayFilename || storedFilename;
+    const mediaPart: MessagePart = { type: msgType, filename };
+    if (storedFilename && storedFilename !== filename) {
+      mediaPart.stored_filename = storedFilename;
+    }
+    if (msgType !== "file" && opts.resolveMedia) {
+      Promise.resolve(opts.resolveMedia(mediaPart)).then(() => {
+        streamPayloadContent(botRecord).message.push(mediaPart);
+      });
+    } else {
+      streamPayloadContent(botRecord).message.push(mediaPart);
     }
   }
 }

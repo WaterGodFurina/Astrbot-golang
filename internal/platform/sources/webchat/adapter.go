@@ -79,6 +79,8 @@ func (a *Adapter) Start(ctx context.Context) error {
 		Addr:              fmt.Sprintf("%s:%d", a.Host, a.Port),
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

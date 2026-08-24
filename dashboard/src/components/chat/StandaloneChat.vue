@@ -243,6 +243,7 @@ import {
 import type { Session } from "@/composables/useSessions";
 import { useModuleI18n } from "@/i18n/composables";
 import { useCustomizerStore } from "@/stores/customizer";
+import { useToast } from "@/utils/toast";
 import { buildWebchatUmoDetails } from "@/utils/chatConfigBinding";
 
 const props = withDefaults(defineProps<{ configId?: string | null }>(), {
@@ -252,6 +253,7 @@ const props = withDefaults(defineProps<{ configId?: string | null }>(), {
 registerChatMarkdownComponents();
 
 const { tm } = useModuleI18n("features/chat");
+const toast = useToast();
 const customizer = useCustomizerStore();
 const currSessionId = ref("");
 const currentSession = ref<Session | null>(null);
@@ -412,15 +414,22 @@ async function stopCurrentSession() {
   await stopSession(currSessionId.value);
 }
 
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4GB，与后端上传限制保持一致
+
 async function handleFilesSelected(files: FileList | File[]) {
   const selectedFiles = Array.from(files || []);
-  for (const file of selectedFiles) {
-    if (file.type.startsWith("image/")) {
-      await processAndUploadImage(file);
-    } else {
-      await processAndUploadFile(file);
-    }
+  const oversized = selectedFiles.filter((f) => f.size > MAX_UPLOAD_BYTES);
+  for (const file of oversized) {
+    toast.error(tm("input.fileTooLarge", { name: file.name }));
   }
+  const okFiles = selectedFiles.filter((f) => f.size <= MAX_UPLOAD_BYTES);
+  await Promise.all(
+    okFiles.map((file) =>
+      file.type.startsWith("image/")
+        ? processAndUploadImage(file)
+        : processAndUploadFile(file),
+    ),
+  );
 }
 
 function scrollToBottom() {

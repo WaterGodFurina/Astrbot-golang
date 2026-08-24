@@ -153,7 +153,8 @@ func processEncryptedImage(imageURL, aesKeyBase64 string) (bool, string) {
 		logger.Error("%s", msg)
 		return false, msg
 	}
-	encryptedData, err := io.ReadAll(resp.Body)
+	// 与 webhook.go 的 32MiB 上限对齐, 防止超大图片一次性放大内存
+	encryptedData, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
 		msg := fmt.Sprintf("下载图片失败: %v", err)
 		logger.Error("%s", msg)

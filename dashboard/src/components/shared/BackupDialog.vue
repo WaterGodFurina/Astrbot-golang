@@ -786,27 +786,40 @@ const resetImport = async () => {
 
 // 下载备份（使用浏览器原生下载，可显示下载进度）
 // 复核开放项 10-2：URL 凭据优先一次性 ws-ticket（避免长效 token 进代理/
-// 服务端日志），旧后端无票据端点时回退 ?token= 旧行为。
+// 服务端日志）；旧后端无票据端点时改走 Authorization 头 + blob 下载，
+// 长效 token 绝不进入 URL。
 const downloadBackup = async (filename) => {
-    const token = getToken()
-    if (!token) {
+    if (!getToken()) {
         alert(t('core.common.unauthorized'))
         return
     }
 
-    const ticket = await getWSTicket()
-    const downloadUrl = ticket
-        ? `/api/v1/backups/${encodeURIComponent(filename)}?ticket=${encodeURIComponent(ticket)}`
-        : backupApi.downloadUrl(filename, token)
+    const triggerDownload = (href) => {
+        // 创建隐藏的 a 标签触发下载
+        const link = document.createElement('a')
+        link.href = href
+        link.download = filename
+        link.style.display = 'none'
+        document.body.appendChild(link)
+        link.click()
+        document.body.removeChild(link)
+    }
 
-    // 创建隐藏的 a 标签触发下载
-    const link = document.createElement('a')
-    link.href = downloadUrl
-    link.download = filename
-    link.style.display = 'none'
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
+    try {
+        const ticket = await getWSTicket()
+        if (ticket) {
+            triggerDownload(backupApi.downloadUrl(filename, ticket))
+            return
+        }
+        // 旧后端无 /auth/ws-ticket：Authorization 头 + blob 下载
+        const res = await backupApi.download(filename)
+        const blobUrl = URL.createObjectURL(res.data)
+        triggerDownload(blobUrl)
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 0)
+    } catch (error) {
+        console.error('Failed to download backup:', error)
+        alert('下载失败，请重试')
+    }
 }
 
 // 从列表中恢复备份

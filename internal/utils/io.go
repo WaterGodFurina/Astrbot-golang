@@ -134,11 +134,20 @@ func (h *HTTPClient) DownloadFile(ctx context.Context, urlStr, destPath string, 
 	}
 	defer out.Close()
 
-	if _, err := io.Copy(out, resp.Body); err != nil {
+	// Bound the body by maxDownloadBytes (same 64MB limit as media.go's
+	// DownloadFile) so a huge response cannot fill the disk.
+	written, err := io.Copy(out, io.LimitReader(resp.Body, maxDownloadBytes+1))
+	if err != nil {
 		if err := os.Remove(destPath); err != nil {
 			logger.Debug("cleanup partial file %s failed: %v", destPath, err)
 		}
 		return fmt.Errorf("write file: %w", err)
+	}
+	if written > maxDownloadBytes {
+		if err := os.Remove(destPath); err != nil {
+			logger.Debug("cleanup partial file %s failed: %v", destPath, err)
+		}
+		return fmt.Errorf("download exceeds size limit of %d bytes", maxDownloadBytes)
 	}
 
 	return nil

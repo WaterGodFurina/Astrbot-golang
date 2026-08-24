@@ -26,12 +26,20 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
 var logger = log.GetDefault().WithComponent("Toolchain")
+
+// provisionMu serializes concurrent provisioning: two goroutines calling
+// Ensure at the same time (e.g. dashboard plugin install + startup auto
+// compile) must not download/extract the same archive concurrently — that
+// truncates and interleaves files, and a half-extracted bundle would then be
+// mistaken for a complete toolchain by the GoBin fast path.
+var provisionMu sync.Mutex
 
 // DefaultGoVersion is the Go release bundled when none is pinned via
 // ASTRBOT_GO_VERSION.
@@ -100,6 +108,13 @@ func (tc *Toolchain) Ensure() (string, error) {
 // EnsureWithProgress is like Ensure but also reports download progress through
 // the callback (the download is ~150-200MB on first run).
 func (tc *Toolchain) EnsureWithProgress(progress ProgressFunc) (string, error) {
+	if bin, err := tc.GoBin(); err == nil {
+		return bin, nil
+	}
+	provisionMu.Lock()
+	defer provisionMu.Unlock()
+	// Double check: while waiting for the lock another goroutine may have
+	// completed provisioning.
 	if bin, err := tc.GoBin(); err == nil {
 		return bin, nil
 	}
@@ -200,15 +215,32 @@ func (tc *Toolchain) downloadAndExtract(progress ProgressFunc) (string, error) {
 	}
 
 	logger.Info("Extracting Go toolchain %s", archive)
-	if err := extractArchive(dest, base); err != nil {
+	// 先解压到 staging 目录并校验 go 可执行，再原子替换正式目录：中途失败
+	// 不会留下残缺 bundle（残缺的 <base>/go/bin/go 会让后续所有 Ensure 在
+	// GoBin 处直接命中并返回，插件编译持续失败）。
+	staging := base + ".staging"
+	if err := extractArchive(dest, staging); err != nil {
+		_ = os.RemoveAll(staging)
+		_ = os.Remove(dest)
 		return "", fmt.Errorf("extract %s: %w", archive, err)
 	}
 	_ = os.Remove(dest)
 
-	bin := filepath.Join(base, "go", "bin", exe("go"))
-	if !tc.isExecutable(bin) {
-		return "", fmt.Errorf("extracted toolchain missing go binary: %s", bin)
+	if !tc.isExecutable(filepath.Join(staging, "go", "bin", exe("go"))) {
+		_ = os.RemoveAll(staging)
+		return "", fmt.Errorf("extracted toolchain missing go binary: %s", filepath.Join(staging, "go", "bin", exe("go")))
 	}
+	if err := os.RemoveAll(filepath.Join(base, "go")); err != nil {
+		_ = os.RemoveAll(staging)
+		return "", fmt.Errorf("remove old toolchain: %w", err)
+	}
+	if err := os.Rename(filepath.Join(staging, "go"), filepath.Join(base, "go")); err != nil {
+		_ = os.RemoveAll(staging)
+		return "", fmt.Errorf("install toolchain: %w", err)
+	}
+	_ = os.RemoveAll(staging)
+
+	bin := filepath.Join(base, "go", "bin", exe("go"))
 	return bin, nil
 }
 
@@ -282,9 +314,10 @@ func (tc *Toolchain) isExecutable(p string) bool {
 // SetGoMirror 设置）。非空时优先于环境变量与默认源。
 var goMirrorOverride string
 
-// SetGoMirror overrides the mirror base URL used by downloadURL / checksumURL
-// (called by the host with the user's chosen mirror before a plugin-install
-// download; empty restores env/default resolution).
+// SetGoMirror overrides the mirror base URL used by downloadURL (checksum
+// verification is always anchored to the official source, see checksumURL).
+// Called by the host with the user's chosen mirror before a plugin-install
+// download; empty restores env/default resolution.
 func SetGoMirror(url string) {
 	goMirrorOverride = strings.TrimSpace(url)
 }
@@ -306,11 +339,13 @@ func downloadURL(archive string) string {
 	return strings.TrimRight(mirrorBase("https://go.dev/dl"), "/") + "/" + archive
 }
 
-// checksumURL builds the URL of the sha256 file. go.dev/dl only serves the
-// archives (redirecting to dl.google.com); the .sha256 files live on
-// dl.google.com directly.
+// checksumURL builds the URL of the sha256 file. The checksum anchor is pinned
+// to the official dl.google.com source even when a mirror is configured:
+// otherwise the mirror could serve both the archive and a matching .sha256,
+// bypassing the supply-chain gate entirely. Downloads stay mirrorable; the
+// verification anchor never moves.
 func checksumURL(archive string) string {
-	return strings.TrimRight(mirrorBase("https://dl.google.com/go"), "/") + "/" + archive + ".sha256"
+	return "https://dl.google.com/go/" + archive + ".sha256"
 }
 
 // archiveName returns the official distribution archive file name for the

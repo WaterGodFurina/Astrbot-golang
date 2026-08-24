@@ -61,6 +61,9 @@ type Manager struct {
 	db      *db.Database
 	byCID   map[string]*Conversation // key = conversation_id
 	current map[string]string        // key = unified_msg_origin -> conversation_id
+	// tombstones records cids whose DB row was deleted. persist skips them so
+	// an in-flight lock-free persist cannot resurrect a deleted conversation.
+	tombstones map[string]struct{}
 	// dequeueContextLength caps how many history entries AppendHistory keeps
 	// per conversation. <= 0 keeps the full history (default).
 	dequeueContextLength int
@@ -70,9 +73,10 @@ type Manager struct {
 // keeps the manager purely in-memory (tests).
 func NewManager(database *db.Database) *Manager {
 	m := &Manager{
-		db:      database,
-		byCID:   make(map[string]*Conversation),
-		current: make(map[string]string),
+		db:         database,
+		byCID:      make(map[string]*Conversation),
+		current:    make(map[string]string),
+		tombstones: make(map[string]struct{}),
 	}
 	if database != nil {
 		m.loadFromDB()
@@ -191,15 +195,20 @@ func (m *Manager) NewConversation(unifiedMsgOrigin, platformID string) *Conversa
 	return conv
 }
 
-// GetConversation returns the current conversation for a session, loading it
-// from the database on a cache miss.
+// GetConversation returns a deep copy of the current conversation for a
+// session, loading it from the database on a cache miss. The copy is safe to
+// read outside the manager lock (same contract as GetConversationSnapshot).
 func (m *Manager) GetConversation(unifiedMsgOrigin string) *Conversation {
 	m.mu.RLock()
 	cid := m.current[unifiedMsgOrigin]
 	conv := m.byCID[cid]
+	var snap *Conversation
+	if conv != nil && !conv.IsDeleted {
+		snap = copyConversationLocked(conv)
+	}
 	m.mu.RUnlock()
-	if conv != nil || m.db == nil {
-		return conv
+	if snap != nil || m.db == nil {
+		return snap
 	}
 	row, found, err := m.db.GetConversationByUserID(unifiedMsgOrigin)
 	if err != nil || !found {
@@ -210,17 +219,17 @@ func (m *Manager) GetConversation(unifiedMsgOrigin string) *Conversation {
 	m.byCID[loaded.CID] = loaded
 	m.current[unifiedMsgOrigin] = loaded.CID
 	m.mu.Unlock()
-	return loaded
+	return copyConversationLocked(loaded)
 }
 
-// AllConversations returns all conversations.
+// AllConversations returns deep copies of all conversations.
 func (m *Manager) AllConversations() []*Conversation {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	result := make([]*Conversation, 0, len(m.byCID))
 	for _, conv := range m.byCID {
 		if !conv.IsDeleted {
-			result = append(result, conv)
+			result = append(result, copyConversationLocked(conv))
 		}
 	}
 	return result
@@ -403,30 +412,23 @@ func (m *Manager) GetCurrConversationID(unifiedMsgOrigin string) string {
 	return conv.CID
 }
 
-// UpdateConversation updates the conversation.
-func (m *Manager) UpdateConversation(conv *Conversation) {
-	m.mu.Lock()
-	conv.UpdatedAt = time.Now()
-	m.byCID[conv.CID] = conv
-	m.mu.Unlock()
-	m.persist(conv)
-}
-
 // SwitchConversation 把 unifiedMsgOrigin 的当前会话切换到 cid（对齐 Python
 // conversation_manager.switch_conversation）。cid 不存在（快照校验非 nil）
 // 时返回错误；切换会刷新 updated_at 并持久化，重启后 loadFromDB 仍能按
-// 更新时间恢复为当前会话。
+// 更新时间恢复为当前会话。更新在锁内对现有对象进行（指针保留式），不会
+// 替换 m.byCID 里的对象身份，避免此前持有活指针的调用方继续操作已脱离
+// 缓存的旧对象。
 func (m *Manager) SwitchConversation(unifiedMsgOrigin, cid string) error {
-	snap := m.GetConversationSnapshot(cid)
-	if snap == nil {
+	m.mu.Lock()
+	conv := m.byCID[cid]
+	if conv == nil || conv.IsDeleted {
+		m.mu.Unlock()
 		return fmt.Errorf("conversation %q not found", cid)
 	}
-	m.mu.Lock()
-	snap.UpdatedAt = time.Now()
-	m.byCID[snap.CID] = snap
-	m.current[unifiedMsgOrigin] = snap.CID
+	conv.UpdatedAt = time.Now()
+	m.current[unifiedMsgOrigin] = conv.CID
 	m.mu.Unlock()
-	m.persist(snap)
+	m.persist(conv)
 	return nil
 }
 
@@ -441,21 +443,26 @@ func (m *Manager) DeleteConversation(unifiedMsgOrigin string) {
 	}
 	delete(m.byCID, cid)
 	delete(m.current, unifiedMsgOrigin)
+	// 标记 tombstone：删除后任何锁外 persist（含在途的 AppendHistory 落库）
+	// 都不得把该会话写回数据库，否则重启后会复活。
+	m.tombstones[cid] = struct{}{}
 	m.mu.Unlock()
 	if m.db != nil {
 		_ = m.db.DeleteConversationByID(cid)
 	}
 }
 
-// FindByCID returns a conversation by its cid, or nil.
+// FindByCID returns a deep copy of a conversation by its cid, or nil.
+// The copy is safe to read outside the manager lock.
 func (m *Manager) FindByCID(cid string) *Conversation {
 	m.mu.RLock()
 	conv := m.byCID[cid]
-	m.mu.RUnlock()
+	var snap *Conversation
 	if conv != nil && !conv.IsDeleted {
-		return conv
+		snap = copyConversationLocked(conv)
 	}
-	return nil
+	m.mu.RUnlock()
+	return snap
 }
 
 // SetTitleByCID sets a conversation title by cid. Returns false if not found.
@@ -523,6 +530,9 @@ func (m *Manager) DeleteConversationByCID(cid string) bool {
 			delete(m.current, umo)
 		}
 	}
+	// 标记 tombstone：删除后任何锁外 persist（含在途的 AppendHistory 落库）
+	// 都不得把该会话写回数据库，否则重启后会复活。
+	m.tombstones[cid] = struct{}{}
 	m.mu.Unlock()
 	if m.db != nil {
 		_ = m.db.DeleteConversationByID(cid)
@@ -563,6 +573,24 @@ func (m *Manager) AppendHistory(unifiedMsgOrigin string, role, content string) {
 		conv.Title = deriveTitle(content)
 	}
 	m.mu.Unlock()
+	m.persistIfAlive(conv)
+}
+
+// persistIfAlive persists a conversation only while it is still referenced by
+// the manager cache. Between AppendHistory unlocking and the persist, another
+// goroutine may have deleted the conversation (map + DB row); writing it back
+// would resurrect it after the next restart. The alive check plus the
+// tombstone guard in persist close that window.
+func (m *Manager) persistIfAlive(conv *Conversation) {
+	if m.db == nil {
+		return
+	}
+	m.mu.RLock()
+	alive := m.byCID[conv.CID] == conv
+	m.mu.RUnlock()
+	if !alive {
+		return
+	}
 	m.persist(conv)
 }
 
@@ -634,6 +662,10 @@ func (m *Manager) persist(conv *Conversation) {
 		return
 	}
 	m.mu.RLock()
+	if _, dead := m.tombstones[conv.CID]; dead {
+		m.mu.RUnlock()
+		return
+	}
 	history := copyHistory(conv.History)
 	cid, uid, platformID := conv.CID, conv.UserID, conv.PlatformID
 	title, persona := conv.Title, conv.Persona

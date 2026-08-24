@@ -70,6 +70,9 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 	if model == "" {
 		model = "gemini-pro"
 	}
+	if !geminiModelPathSafe(model) {
+		return nil, fmt.Errorf("invalid gemini model name: %q", model)
+	}
 	url := fmt.Sprintf("%s/models/%s:generateContent", s.apiBase, model)
 	body := s.buildRequestBody(req, false)
 	jsonBody, err := json.Marshal(body)
@@ -84,17 +87,21 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return &provider.LLMResponse{
 			Role:           "err",
-			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, string(respBody)),
+			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024)),
 		}, nil
 	}
 	var result struct {
 		Candidates []struct {
 			Content struct {
 				Parts []struct {
-					Text string `json:"text"`
+					Text         string `json:"text"`
+					FunctionCall *struct {
+						Name string                 `json:"name"`
+						Args map[string]interface{} `json:"args"`
+					} `json:"functionCall"`
 				} `json:"parts"`
 			} `json:"content"`
 		} `json:"candidates"`
@@ -108,20 +115,44 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 	var text string
+	var toolCalls []struct {
+		name string
+		args map[string]interface{}
+	}
 	for _, cand := range result.Candidates {
 		for _, part := range cand.Content.Parts {
+			if part.FunctionCall != nil {
+				args := part.FunctionCall.Args
+				if args == nil {
+					args = map[string]interface{}{}
+				}
+				toolCalls = append(toolCalls, struct {
+					name string
+					args map[string]interface{}
+				}{name: part.FunctionCall.Name, args: args})
+				continue
+			}
 			text += part.Text
 		}
 	}
 	logger.Debug("LLM response: text_len=%d", len(text))
-	return &provider.LLMResponse{
+	llmResp := &provider.LLMResponse{
 		Role:           "assistant",
 		CompletionText: text,
 		Usage: &provider.TokenUsage{
 			InputOther: result.UsageMetadata.PromptTokenCount,
 			Output:     result.UsageMetadata.CandidatesTokenCount,
 		},
-	}, nil
+	}
+	for _, tc := range toolCalls {
+		llmResp.ToolsCallName = append(llmResp.ToolsCallName, tc.name)
+		llmResp.ToolsCallArgs = append(llmResp.ToolsCallArgs, tc.args)
+		llmResp.ToolsCallIDs = append(llmResp.ToolsCallIDs, tc.name) // Gemini 无 call id，用 name 占位
+	}
+	if len(llmResp.ToolsCallArgs) > 0 {
+		llmResp.Role = "tool"
+	}
+	return llmResp, nil
 }
 
 // TextChatStream sends a streaming chat request.
@@ -129,6 +160,9 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 	model := s.GetModel()
 	if model == "" {
 		model = "gemini-pro"
+	}
+	if !geminiModelPathSafe(model) {
+		return nil, fmt.Errorf("invalid gemini model name: %q", model)
 	}
 	url := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", s.apiBase, model)
 	body := s.buildRequestBody(req, true)
@@ -143,9 +177,9 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024))
 	}
 	ch := make(chan *provider.LLMResponse, 100)
 	go func() {
@@ -153,12 +187,20 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 		defer close(ch)
 		var usage *provider.TokenUsage
 		var content strings.Builder
+		var toolCalls []struct {
+			name string
+			args map[string]interface{}
+		}
 		reader := newSSEReader(ctx, resp, func(data string) (stop bool) {
 			var chunk struct {
 				Candidates []struct {
 					Content struct {
 						Parts []struct {
-							Text string `json:"text"`
+							Text         string `json:"text"`
+							FunctionCall *struct {
+								Name string                 `json:"name"`
+								Args map[string]interface{} `json:"args"`
+							} `json:"functionCall"`
 						} `json:"parts"`
 					} `json:"content"`
 				} `json:"candidates"`
@@ -178,6 +220,17 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 			}
 			for _, cand := range chunk.Candidates {
 				for _, part := range cand.Content.Parts {
+					if part.FunctionCall != nil {
+						args := part.FunctionCall.Args
+						if args == nil {
+							args = map[string]interface{}{}
+						}
+						toolCalls = append(toolCalls, struct {
+							name string
+							args map[string]interface{}
+						}{name: part.FunctionCall.Name, args: args})
+						continue
+					}
 					if part.Text != "" {
 						content.WriteString(part.Text)
 						ch <- &provider.LLMResponse{
@@ -196,12 +249,21 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 			return
 		}
 		// Emit a final consolidated chunk so token usage reaches the pipeline.
-		if usage != nil || content.Len() > 0 {
-			ch <- &provider.LLMResponse{
+		if usage != nil || content.Len() > 0 || len(toolCalls) > 0 {
+			final := &provider.LLMResponse{
 				Role:           "assistant",
 				CompletionText: content.String(),
 				Usage:          usage,
 			}
+			for _, tc := range toolCalls {
+				final.ToolsCallName = append(final.ToolsCallName, tc.name)
+				final.ToolsCallArgs = append(final.ToolsCallArgs, tc.args)
+				final.ToolsCallIDs = append(final.ToolsCallIDs, tc.name) // Gemini 无 call id，用 name 占位
+			}
+			if len(final.ToolsCallArgs) > 0 {
+				final.Role = "tool"
+			}
+			ch <- final
 		}
 		if usage != nil {
 			logger.Debug("LLM stream done, usage=%v", usage)
@@ -270,6 +332,33 @@ func (s *GeminiSource) buildRequestBody(req *provider.ProviderRequest, stream bo
 			"parts": []map[string]interface{}{
 				{"text": req.SystemPrompt},
 			},
+		}
+	}
+	// Convert OpenAI function schemas to Gemini functionDeclarations.
+	if len(req.Tools) > 0 {
+		funcDecls := []map[string]interface{}{}
+		for _, t := range req.Tools {
+			fn, _ := t["function"].(map[string]interface{})
+			if fn == nil {
+				continue
+			}
+			name, _ := fn["name"].(string)
+			if name == "" {
+				continue
+			}
+			decl := map[string]interface{}{"name": name}
+			if desc, ok := fn["description"].(string); ok && desc != "" {
+				decl["description"] = desc
+			}
+			if params, ok := fn["parameters"].(map[string]interface{}); ok {
+				decl["parameters"] = params
+			}
+			funcDecls = append(funcDecls, decl)
+		}
+		if len(funcDecls) > 0 {
+			body["tools"] = []map[string]interface{}{
+				{"functionDeclarations": funcDecls},
+			}
 		}
 	}
 	return body

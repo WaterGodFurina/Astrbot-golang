@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -269,21 +270,9 @@ func (c *MattermostClient) resolveMedia(ctx context.Context, path, file, base64D
 	return &mediaBytes{data: data, filename: filename, contentType: contentType}, nil
 }
 
-// downloadBytes 下载远程内容。
+// downloadBytes 下载远程内容（经 SSRF 校验，上限 64MiB）。
 func (c *MattermostClient) downloadBytes(ctx context.Context, rawURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("下载 %s 失败: %d", rawURL, resp.StatusCode)
-	}
-	return io.ReadAll(resp.Body)
+	return platform.SafeDownloadBytes(ctx, rawURL, 64<<20)
 }
 
 // detectMimeType 探测文件 MIME 类型（对应 mimetypes.guess_type + 内容探测）。

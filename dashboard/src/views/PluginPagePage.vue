@@ -28,6 +28,18 @@ const iframeRef = ref(null);
 const sseConnections = new Map();
 const BRIDGE_TARGET_ORIGIN = window.location.origin;
 let iframeMessageOrigin = null;
+// 一次性桥接握手 token：loadPluginPage 时生成，随 iframe URL 与每条出站
+// 消息下发；iframe 侧必须在 "ready" 消息中回显同一 token 才能启用桥接，
+// 防止 iframe 内容被导航到外部站点后继续借桥访问已认证 API。
+let pageBridgeToken = null;
+let bridgeActive = false;
+
+const generateBridgeToken = () => {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+};
 
 const pluginName = computed(() => String(route.params.pluginName || ""));
 const pageName = computed(() => String(route.params.pageName || ""));
@@ -66,7 +78,7 @@ const postToIframe = (payload) => {
       ? iframeMessageOrigin
       : "*";
   iframeWindow.postMessage(
-    { channel: BRIDGE_CHANNEL, ...payload },
+    { channel: BRIDGE_CHANNEL, bridgeToken: pageBridgeToken, ...payload },
     targetOrigin,
   );
 };
@@ -537,8 +549,18 @@ const handleWindowMessage = (event) => {
     return;
   }
 
+  // 一次性握手：ready 必须回显本次加载下发的 bridgeToken。
   if (message.kind === "ready") {
+    if (!pageBridgeToken || message.bridgeToken !== pageBridgeToken) {
+      return;
+    }
+    bridgeActive = true;
     sendIframeContext();
+    return;
+  }
+
+  // 未完成握手不处理任何请求。
+  if (!bridgeActive) {
     return;
   }
 
@@ -548,7 +570,9 @@ const handleWindowMessage = (event) => {
 };
 
 const handleIframeLoad = () => {
-  sendIframeContext();
+  // iframe 内容每次变化（含导航/重定向到外部站点）都视为新文档：
+  // 必须重新完成带 bridgeToken 的握手才能启用桥接。
+  bridgeActive = false;
 };
 
 const loadPluginPage = async () => {
@@ -558,6 +582,8 @@ const loadPluginPage = async () => {
   page.value = null;
   iframeSrc.value = "";
   iframeMessageOrigin = null;
+  bridgeActive = false;
+  pageBridgeToken = generateBridgeToken();
   cleanupSSEConnections();
 
   try {
@@ -600,6 +626,7 @@ const loadPluginPage = async () => {
     page.value = pageEntry;
     const contentUrl = new URL(pageEntry.content_path, window.location.origin);
     contentUrl.searchParams.set('theme', themeParam.value);
+    contentUrl.searchParams.set('bridge_token', pageBridgeToken);
     iframeSrc.value = contentUrl.pathname + contentUrl.search + contentUrl.hash;
   } catch (error) {
     errorMessage.value =
@@ -622,10 +649,14 @@ onBeforeUnmount(() => {
 
 watch([pluginName, pageName], loadPluginPage, { immediate: true });
 watch(locale, () => {
-  sendIframeContext();
+  if (bridgeActive) {
+    sendIframeContext();
+  }
 });
 watch(() => customizer.uiTheme, () => {
-  sendIframeContext();
+  if (bridgeActive) {
+    sendIframeContext();
+  }
 });
 </script>
 

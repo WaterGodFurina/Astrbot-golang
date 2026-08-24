@@ -31,7 +31,15 @@ func doomLoopKey(toolName string, args map[string]interface{}) string {
 	case "astrbot_execute_shell":
 		return toolName + "\x00" + argString(args, "command")
 	case "astrbot_shell_session":
-		return toolName + "\x00" + argString(args, "action") + "\x00" + argString(args, "command")
+		action := argString(args, "action")
+		// 只读动作（list/poll/get/status）是合法的重复轮询（长任务等待），
+		// 返回空键豁免死循环检测；会改变状态的 write/write_line/interrupt/
+		// terminate 按内容计键。
+		switch action {
+		case "list", "poll", "get", "status":
+			return ""
+		}
+		return toolName + "\x00" + action + "\x00" + argString(args, "command")
 	}
 	return toolName
 }
@@ -127,6 +135,10 @@ func (s *ProcessStage) resetDoomLoopCount(umo string) {
 // is paused (a doom loop was detected and the owner has been asked), in which
 // case the caller should stop executing tools.
 func (s *ProcessStage) checkDoomLoop(event *core.Event, toolName string) bool {
+	// 空键 = 豁免（见 doomLoopKey：shell 会话的只读轮询动作）。
+	if toolName == "" {
+		return true
+	}
 	// Whitelisted tools are exempt from repetition detection.
 	if doomWhitelist[toolName] {
 		return true

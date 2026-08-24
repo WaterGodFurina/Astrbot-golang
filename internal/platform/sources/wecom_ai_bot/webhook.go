@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -296,6 +297,7 @@ func (c *WecomAIBotWebhookClient) SendMessageChain(ctx context.Context, chain *m
 				logger.I18nWarn("文件消息缺少有效文件路径，已跳过: %v", err)
 				continue
 			}
+			defer removeWecomAITemp(filePath)
 			if err := c.SendFile(ctx, filePath); err != nil {
 				return err
 			}
@@ -308,6 +310,7 @@ func (c *WecomAIBotWebhookClient) SendMessageChain(ctx context.Context, chain *m
 				logger.I18nWarn("视频消息缺少有效文件路径，已跳过: %v", err)
 				continue
 			}
+			defer removeWecomAITemp(videoPath)
 			if err := c.SendFile(ctx, videoPath); err != nil {
 				return err
 			}
@@ -320,6 +323,7 @@ func (c *WecomAIBotWebhookClient) SendMessageChain(ctx context.Context, chain *m
 				logger.I18nWarn("语音消息缺少有效文件路径，已跳过: %v", err)
 				continue
 			}
+			defer removeWecomAITemp(sourcePath)
 			// Python 此处会将非 amr 音频转码为 amr；Go 端直接上传原文件
 			if err := c.SendVoice(ctx, sourcePath); err != nil {
 				return err
@@ -352,25 +356,22 @@ func componentImageBase64(img *message.Image) (string, error) {
 	if img.URL != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, img.URL, nil)
-		if err != nil {
-			return "", err
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("图片下载失败: HTTP %d", resp.StatusCode)
-		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+		data, err := platform.SafeDownloadBytes(ctx, img.URL, 32<<20)
 		if err != nil {
 			return "", err
 		}
 		return base64.StdEncoding.EncodeToString(data), nil
 	}
 	return "", fmt.Errorf("图片组件没有可用的路径或 URL")
+}
+
+// removeWecomAITemp 删除发送链路经 componentFilePath 下载到临时目录的媒体文件
+// （仅限本模块创建的 astrbot_wecomai_* 文件，避免误删调用方自备文件）。
+func removeWecomAITemp(p string) {
+	if p != "" && strings.HasPrefix(p, os.TempDir()+string(os.PathSeparator)) &&
+		strings.Contains(filepath.Base(p), "astrbot_wecomai_") {
+		_ = os.Remove(p)
+	}
 }
 
 // componentFilePath 将文件/语音/视频组件解析为本地路径（下载 URL 到临时文件）。
@@ -385,19 +386,7 @@ func componentFilePath(path, url string) (string, error) {
 		tmp := filepath.Join(os.TempDir(), fmt.Sprintf("astrbot_wecomai_%d", time.Now().UnixNano()))
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return "", err
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("文件下载失败: HTTP %d", resp.StatusCode)
-		}
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		data, err := platform.SafeDownloadBytes(ctx, url, 64<<20)
 		if err != nil {
 			return "", err
 		}

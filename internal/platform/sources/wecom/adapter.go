@@ -297,16 +297,18 @@ func (a *Adapter) handleKFMsgOrEvent(msg *WecomMessage) {
 			logger.I18nError("同步微信客服消息失败: %v", err)
 			return
 		}
+		cursorAdvanced := false
 		if nc, ok := ret["next_cursor"].(string); ok && nc != "" && nc != cursor {
 			cursor = nc
-		} else if hasMore {
-			logger.I18nWarn("kf/sync_msg has_more=1 但游标未推进，终止同步")
-			hasMore = false
+			cursorAdvanced = true
 		}
 		if hm, ok := ret["has_more"].(float64); ok {
-			hasMore = int(hm) != 0
+			hasMore = int(hm) != 0 && cursorAdvanced
 		} else {
 			hasMore = false
+		}
+		if hm, ok := ret["has_more"].(float64); ok && int(hm) == 1 && !cursorAdvanced {
+			logger.I18nWarn("kf/sync_msg has_more=1 但游标未推进，终止同步")
 		}
 		msgList, _ := ret["msg_list"].([]interface{})
 		for _, item := range msgList {
@@ -608,6 +610,8 @@ func (s *WecomServer) Start(ctx context.Context, host string, port int) error {
 		Addr:              fmt.Sprintf("%s:%d", host, port),
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	logger.I18nInfo("企业微信回调服务器开始监听 %s:%d", host, port)
 	go func() {

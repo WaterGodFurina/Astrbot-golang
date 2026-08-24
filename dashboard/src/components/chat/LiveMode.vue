@@ -283,9 +283,14 @@ function connectWebSocket(): Promise<void> {
             return;
         }
 
-        // 换取一次性票据后连接，票据失败时回退 ?token=（后端兼容）
+        // 换取一次性票据后连接；票据不可用（后端过旧/网络异常）时拒绝
+        // 连接，绝不把长效 token 放进 URL。
         getWSTicket().then((ticket) => {
-            const wsUrl = chatApi.liveWebSocketUrl(ticket, token);
+            if (!ticket) {
+                reject(new Error('后端不支持一次性 ws-ticket，请升级后端后重试'));
+                return;
+            }
+            const wsUrl = chatApi.liveWebSocketUrl(ticket);
 
             // nosemgrep: websocket
             ws = new WebSocket(wsUrl);
@@ -312,6 +317,9 @@ function connectWebSocket(): Promise<void> {
                     reject(new Error('WebSocket 连接超时'));
                 }
             }, 5000);
+        }).catch((error) => {
+            console.error('[Live Mode] 获取 ws-ticket 失败:', error);
+            reject(new Error('无法获取 WebSocket 连接票据，请升级后端后重试'));
         });
     });
 }

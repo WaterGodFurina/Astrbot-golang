@@ -322,7 +322,7 @@ func isLocalFile(path string) bool {
 // fileServer 是包级单例的本地媒体文件服务。
 var (
 	mediaFileServer *mediaServer
-	mediaServerOnce sync.Once
+	mediaServerMu   sync.Mutex
 )
 
 // mediaTokenTTL 是媒体文件 token 的有效期：LINE 在发送后立即回源拉取，
@@ -347,40 +347,32 @@ type mediaServer struct {
 }
 
 // startMediaServer 启动（或复用）本地媒体文件服务器，返回 baseURL。
+// 用互斥锁替代 sync.Once：只有启动成功才落单例，失败后下次调用可重试。
 func startMediaServer() (string, error) {
-	var err error
-	mediaServerOnce.Do(func() {
-		ms := &mediaServer{
-			mux:    http.NewServeMux(),
-			tokens: map[string]mediaTokenEntry{},
-		}
-		ms.mux.HandleFunc("/api/file/", ms.handleFile)
-		// 在 127.0.0.1 上寻找可用端口（从 6185 起尝试）
-		port := 6185
-		var ln net.Listener
-		for {
-			ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-			if err == nil {
-				break
-			}
-			port++
-			if port > 6200 {
-				return
-			}
-		}
-		ms.port = port
-		ms.srv = &http.Server{Handler: ms.mux}
-		go func() {
-			if serveErr := ms.srv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
-				lineLogger.I18nWarn("[LINE] 本地媒体文件服务器退出: %v", serveErr)
-			}
-		}()
-		mediaFileServer = ms
-	})
-	if err != nil || mediaFileServer == nil {
+	mediaServerMu.Lock()
+	defer mediaServerMu.Unlock()
+	if mediaFileServer != nil {
+		return fmt.Sprintf("http://127.0.0.1:%d", mediaFileServer.port), nil
+	}
+	ms := &mediaServer{
+		mux:    http.NewServeMux(),
+		tokens: map[string]mediaTokenEntry{},
+	}
+	ms.mux.HandleFunc("/api/file/", ms.handleFile)
+	// 让内核分配可用端口，避免端口占用导致启动失败
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
 		return "", fmt.Errorf("启动本地媒体文件服务器失败: %v", err)
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d", mediaFileServer.port), nil
+	ms.port = ln.Addr().(*net.TCPAddr).Port
+	ms.srv = &http.Server{Handler: ms.mux}
+	go func() {
+		if serveErr := ms.srv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
+			lineLogger.I18nWarn("[LINE] 本地媒体文件服务器退出: %v", serveErr)
+		}
+	}()
+	mediaFileServer = ms
+	return fmt.Sprintf("http://127.0.0.1:%d", ms.port), nil
 }
 
 // handleFile 提供 /api/file/{token} 的媒体文件下载。

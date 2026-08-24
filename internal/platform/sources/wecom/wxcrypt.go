@@ -12,6 +12,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha1" // #nosec G505 -- sha1 为企业微信 msg_signature 签名（协议要求），非密码学哈希用途
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -155,7 +156,7 @@ func (c *WXBizMsgCrypt) Decrypt(encrypted string) (string, error) {
 // CheckSignature 验证 URL 有效性：校验 msg_signature（对 echostr 计算签名）并解密 echostr。
 // 对应 Python WeChatCrypto.check_signature。
 func (c *WXBizMsgCrypt) CheckSignature(msgSignature, timestamp, nonce, echostr string) (string, error) {
-	if c.GetSignature(timestamp, nonce, echostr) != msgSignature {
+	if subtle.ConstantTimeCompare([]byte(c.GetSignature(timestamp, nonce, echostr)), []byte(msgSignature)) != 1 {
 		return "", ErrInvalidSignature
 	}
 	return c.Decrypt(echostr)
@@ -177,7 +178,7 @@ func (c *WXBizMsgCrypt) DecryptMessage(postData []byte, msgSignature, timestamp,
 	if encrypt == "" {
 		return "", errors.New("回调 XML 缺少 Encrypt 节点")
 	}
-	if c.GetSignature(timestamp, nonce, encrypt) != msgSignature {
+	if subtle.ConstantTimeCompare([]byte(c.GetSignature(timestamp, nonce, encrypt)), []byte(msgSignature)) != 1 {
 		return "", ErrInvalidSignature
 	}
 	return c.Decrypt(encrypt)

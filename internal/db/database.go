@@ -1007,6 +1007,7 @@ func (d *Database) GetPlatformMessageHistory(platformID, userID string, limit in
 	for rows.Next() {
 		var r PlatformMessageRow
 		if err := rows.Scan(&r.ID, &r.SenderID, &r.SenderName, &r.Content, &r.CreatedAt); err != nil {
+			logger.Warn("GetPlatformMessageHistory: 跳过坏行: %v", err)
 			continue
 		}
 		out = append(out, r)
@@ -1086,6 +1087,7 @@ func (d *Database) PlatformMessageRank(offsetSec int) []map[string]interface{} {
 		var name string
 		var count int
 		if err := rows.Scan(&name, &count); err != nil {
+			logger.Warn("PlatformMessageRank: 跳过坏行: %v", err)
 			continue
 		}
 		out = append(out, map[string]interface{}{
@@ -1099,6 +1101,14 @@ func (d *Database) PlatformMessageRank(offsetSec int) []map[string]interface{} {
 // MessageTimeSeries buckets message history into `bucketSec`-wide windows over
 // the last offsetSec seconds, returning [timestamp_seconds, count] pairs.
 func (d *Database) MessageTimeSeries(offsetSec, bucketSec int) [][]int {
+	// 防御非法入参：bucketSec<=0 会触发除零 panic（ts/bucketSec）或死循环
+	// （t += 0），offsetSec<=0 则退化为单桶；这里统一回退到 3600。
+	if bucketSec < 1 {
+		bucketSec = 3600
+	}
+	if offsetSec < 1 {
+		offsetSec = 3600
+	}
 	rows, err := d.db.Query(
 		`SELECT CAST(strftime('%s', created_at) AS INTEGER) FROM platform_message_history
 		 WHERE created_at >= datetime('now', '-' || ? || ' seconds')`,
@@ -1160,7 +1170,7 @@ func (d *Database) ProviderStatsSince(since time.Time) ([]ProviderStatRow, error
 		var r ProviderStatRow
 		var created string
 		if err := rows.Scan(&r.UMO, &r.ProviderID, &r.Model, &r.InputOther, &r.InputCached, &r.Output, &created); err != nil {
-			continue
+			return nil, fmt.Errorf("ProviderStatsSince: scan row: %w", err)
 		}
 		if t, err := time.Parse(time.RFC3339, created); err == nil {
 			r.CreatedAt = t
@@ -1190,34 +1200,42 @@ type KBRow struct {
 }
 
 // CreateKB persists a new knowledge base row.
+// KB 写点统一经 withRetry 处理 SQLITE_BUSY（与 SetPreference/RecordProviderCall
+// 等写点一致）：KB 批量导入最容易与其他高频写并发。
 func (d *Database) CreateKB(r KBRow) error {
-	_, err := d.db.Exec(
-		`INSERT INTO knowledge_bases (kb_id, kb_name, description, emoji, embedding_provider_id,
-			rerank_provider_id, chunk_size, chunk_overlap, top_k_dense, top_k_sparse, top_m_final)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.KBID, r.KBName, r.Description, r.Emoji, r.EmbeddingProviderID,
-		r.RerankProviderID, r.ChunkSize, r.ChunkOverlap, r.TopKDense, r.TopKSparse, r.TopMFinal,
-	)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO knowledge_bases (kb_id, kb_name, description, emoji, embedding_provider_id,
+				rerank_provider_id, chunk_size, chunk_overlap, top_k_dense, top_k_sparse, top_m_final)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.KBID, r.KBName, r.Description, r.Emoji, r.EmbeddingProviderID,
+			r.RerankProviderID, r.ChunkSize, r.ChunkOverlap, r.TopKDense, r.TopKSparse, r.TopMFinal,
+		)
+		return err
+	})
 }
 
 // UpdateKB updates an existing knowledge base row by kb_id.
 func (d *Database) UpdateKB(kbID string, r KBRow) error {
-	_, err := d.db.Exec(
-		`UPDATE knowledge_bases SET kb_name=?, description=?, emoji=?, embedding_provider_id=?,
-			rerank_provider_id=?, chunk_size=?, chunk_overlap=?, top_k_dense=?, top_k_sparse=?,
-			top_m_final=?, updated_at=CURRENT_TIMESTAMP WHERE kb_id=?`,
-		r.KBName, r.Description, r.Emoji, r.EmbeddingProviderID,
-		r.RerankProviderID, r.ChunkSize, r.ChunkOverlap, r.TopKDense, r.TopKSparse, r.TopMFinal,
-		kbID,
-	)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`UPDATE knowledge_bases SET kb_name=?, description=?, emoji=?, embedding_provider_id=?,
+				rerank_provider_id=?, chunk_size=?, chunk_overlap=?, top_k_dense=?, top_k_sparse=?,
+				top_m_final=?, updated_at=CURRENT_TIMESTAMP WHERE kb_id=?`,
+			r.KBName, r.Description, r.Emoji, r.EmbeddingProviderID,
+			r.RerankProviderID, r.ChunkSize, r.ChunkOverlap, r.TopKDense, r.TopKSparse, r.TopMFinal,
+			kbID,
+		)
+		return err
+	})
 }
 
 // DeleteKB removes a knowledge base row by kb_id.
 func (d *Database) DeleteKB(kbID string) error {
-	_, err := d.db.Exec(`DELETE FROM knowledge_bases WHERE kb_id=?`, kbID)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(`DELETE FROM knowledge_bases WHERE kb_id=?`, kbID)
+		return err
+	})
 }
 
 // GetKB returns a knowledge base row by kb_id.
@@ -1258,7 +1276,8 @@ func (d *Database) ListKBs() ([]KBRow, error) {
 	for rows.Next() {
 		r, err := scanKBRow(rows)
 		if err != nil {
-			continue
+			logger.Warn("ListKBs: 跳过坏行: %v", err)
+			return nil, fmt.Errorf("ListKBs: scan row: %w", err)
 		}
 		out = append(out, *r)
 	}
@@ -1296,12 +1315,14 @@ type KBChunk struct {
 
 // InsertKBChunk persists one chunk record.
 func (d *Database) InsertKBChunk(c KBChunk) error {
-	_, err := d.db.Exec(
-		`INSERT INTO knowledge_base_chunks (chunk_id, kb_id, doc_id, doc_name, content, chunk_index)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		c.ChunkID, c.KBID, c.DocID, c.DocName, c.Content, c.ChunkIdx,
-	)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO knowledge_base_chunks (chunk_id, kb_id, doc_id, doc_name, content, chunk_index)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			c.ChunkID, c.KBID, c.DocID, c.DocName, c.Content, c.ChunkIdx,
+		)
+		return err
+	})
 }
 
 // ListKBChunks returns chunk records for a KB, optionally filtered by doc_id.
@@ -1333,7 +1354,8 @@ func (d *Database) ListKBChunksPage(kbID, docID string, limit, offset int) ([]KB
 	for rows.Next() {
 		var c KBChunk
 		if err := rows.Scan(&c.ChunkID, &c.KBID, &c.DocID, &c.DocName, &c.Content, &c.ChunkIdx); err != nil {
-			continue
+			logger.Warn("ListKBChunksPage: 跳过坏行: %v", err)
+			return nil, fmt.Errorf("ListKBChunksPage: scan row: %w", err)
 		}
 		out = append(out, c)
 	}
@@ -1383,8 +1405,10 @@ func (d *Database) DeleteKBChunks(kbID, docID string) error {
 		query += ` AND doc_id=?`
 		args = append(args, docID)
 	}
-	_, err := d.db.Exec(query, args...)
-	return err
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(query, args...)
+		return err
+	})
 }
 
 // DeleteKBDoc removes a document's file records. Documents are stored on disk;

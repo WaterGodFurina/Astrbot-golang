@@ -50,7 +50,7 @@ func TestOrderedJSONRoundTrip(t *testing.T) {
 func TestSaveWritesPythonOrder(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "cmd_config.json")
-	cfg := NewConfig(path, DefaultConfig())
+	cfg := NewConfig(path)
 	// Simulate a config that would otherwise be alphabetized.
 	cfg.data = map[string]interface{}{
 		"provider":          []interface{}{},

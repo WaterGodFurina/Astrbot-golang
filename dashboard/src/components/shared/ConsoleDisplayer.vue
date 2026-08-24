@@ -200,21 +200,24 @@ export default {
 
       let hasUpdate = false;
 
+      // 用 Set 代替逐条 some() 全表比对，避免日志爆发时的 O(n²)
+      const seen = new Set(
+        this.localLogCache.map(
+          (l) => `${l.time}|${l.level}|${String(l.data || '').length}`
+        )
+      );
+
       newLogs.forEach(log => {
+        const key = `${log.time}|${log.level}|${String(log.data || '').length}`;
 
-        const exists = this.localLogCache.some(existing => 
-          existing.time === log.time && 
-          existing.data === log.data &&
-          existing.level === log.level
-        );
-        
-        if (!exists) {
-            this.localLogCache.push(log);
-            hasUpdate = true;
+        if (!seen.has(key)) {
+          seen.add(key);
+          this.localLogCache.push(log);
+          hasUpdate = true;
 
-            if (this.isLevelSelected(log.level) && !this.isHiddenByCategory(log)) {
-              this.printLog(log.data);
-            }
+          if (this.isLevelSelected(log.level) && !this.isHiddenByCategory(log)) {
+            this.printLog(log.data);
+          }
         }
       });
 

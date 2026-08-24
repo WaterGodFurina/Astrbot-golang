@@ -76,7 +76,7 @@ func TestLoadCorruptFileFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := NewConfig(cfgPath, DefaultConfig())
+	cfg := NewConfig(cfgPath)
 	if err := cfg.Load(); err == nil {
 		t.Fatal("Load of corrupt file should return an error")
 	}
@@ -88,8 +88,15 @@ func TestLoadCorruptFileFallback(t *testing.T) {
 		t.Errorf("log_level after ResetToDefaults = %q, want INFO", got)
 	}
 	if dm, ok := cfg.Get("dashboard").(map[string]interface{}); ok {
-		if p, ok := dm["port"].(int); !ok || p != 6185 {
-			t.Errorf("dashboard.port after ResetToDefaults = %v (ok=%v), want 6185", p, ok)
+		var port int
+		switch v := dm["port"].(type) {
+		case float64: // JSON 数字解析为 float64（完整默认来自 JSON）
+			port = int(v)
+		case int:
+			port = v
+		}
+		if port != 6185 {
+			t.Errorf("dashboard.port after ResetToDefaults = %v, want 6185", dm["port"])
 		}
 	} else {
 		t.Error("dashboard key missing after ResetToDefaults")
@@ -107,7 +114,7 @@ func TestLoadAtomicWriteBack(t *testing.T) {
 	if err := os.WriteFile(cfgPath, []byte(`{"wake_prefix": "/"}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := NewConfig(cfgPath, DefaultConfig())
+	cfg := NewConfig(cfgPath)
 	if err := cfg.Load(); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -177,16 +184,17 @@ func TestCheckConfigIntegrityListTypeMismatch(t *testing.T) {
 func TestNewConfigAutoLoadsExisting(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "config.json")
-	if err := os.WriteFile(cfgPath, []byte(`{"log_level": "WARN", "wake_prefix": "/x"}`), 0644); err != nil {
+	// wake_prefix 在完整默认中是列表，用户文件使用同类型以验证用户值保留。
+	if err := os.WriteFile(cfgPath, []byte(`{"log_level": "WARN", "wake_prefix": ["/x"]}`), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := NewConfig(cfgPath, DefaultConfig())
+	cfg := NewConfig(cfgPath)
 	if got := cfg.GetString("log_level"); got != "WARN" {
 		t.Errorf("NewConfig must auto-load existing file: log_level = %q, want WARN", got)
 	}
 	// 缺失的默认键仍被补全（integrity 生效）。
-	if got := cfg.GetString("wake_prefix"); got != "/x" {
-		t.Errorf("wake_prefix = %q, want /x", got)
+	if wp, ok := cfg.Get("wake_prefix").([]interface{}); !ok || len(wp) != 1 || wp[0] != "/x" {
+		t.Errorf("wake_prefix = %v, want [\"/x\"]", cfg.Get("wake_prefix"))
 	}
 	if _, ok := cfg.Get("dashboard").(map[string]interface{}); !ok {
 		t.Error("missing default keys must be filled in after auto-load")

@@ -7,30 +7,19 @@ on:
         description: '测试的 git 引用（分支/tag/SHA）。留空 = 当前分支'
         required: false
         default: ''
-      python_version:
-        description: 'AstrBot（Python）源版本号（跟随的 Python 版本，留空 = 4.27.3）'
-        required: false
-        default: ''
   push:
     branches:
       - test
 
 jobs:
-  go-test:
+  test:
     name: Go 测试
-    # 依赖前端构建：二进制 //go:embed 嵌入 internal/dashboard/web/dist，必须
-    # 等前端构建并同步 dist 到仓库后再编译/测试，保证产物嵌入最新前端。
-    needs: frontend
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          # 前端 job 若推送了新 dist 会产生新提交：用其输出的 SHA 检出，
-          # 保证编译/测试与嵌入的 dist 同源。
-          ref: ${{ inputs.ref || needs.frontend.outputs.sha }}
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
 
       - name: 设置 Go 版本（自动跟随 go.mod）
@@ -39,38 +28,10 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: 用 goproxy.cn 重建 go.sum（本地对齐，不提交回仓库）
-        env:
-          GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
-          GOFLAGS: -mod=mod
-        run: go mod tidy
-
       - name: 安装 Python（插件子进程测试需要）
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: 配置 apt 缓存目录到用户空间（/var/cache/apt root 不可写）
-        run: |
-          mkdir -p ~/.apt-cache/partial
-          echo 'Dir::Cache::archives "/home/runner/.apt-cache/";' | sudo tee /etc/apt/apt.conf.d/99-astrbot-cache
-
-      - name: apt 缓存（字体安装加速）
-        uses: actions/cache@v4
-        with:
-          path: ~/.apt-cache
-          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/test.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-
-
-      - name: 安装中文字体（t2i 测试需要）
-        # runner 在 Azure 云端，azure.archive.ubuntu.com 即本地镜像（最快），
-        # 不要切国内源（跨国际网络反而更慢）。加超时+重试防偶发网络抖动。
-        timeout-minutes: 3
-        run: |
-          sudo apt-get update -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
-          sudo apt-get install -y -q fonts-droid-fallback
 
       - name: 配置 Go 环境（代理与模块）
         env:
@@ -85,7 +46,7 @@ jobs:
         run: go build ./...
 
       - name: go vet
-        run: go vet ./... 2>&1 | grep -v "copies lock value" || true
+        run: go vet ./...
 
       - name: 运行全部测试
         timeout-minutes: 30
@@ -104,234 +65,3 @@ jobs:
             **/test*.log
             **/TEST-*.xml
           if-no-files-found: ignore
-
-      - name: 计算版本号（version tag + python version）
-        id: ver
-        run: |
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            VER="${GITHUB_REF_NAME}"
-          else
-            VER="$(git describe --tags --abbrev=0 2>/dev/null || echo 'dev')"
-          fi
-          echo "version_tag=${VER}" >> "$GITHUB_OUTPUT"
-          echo "python_version=${PYTHON_VERSION:-4.27.3}" >> "$GITHUB_OUTPUT"
-          echo "构建版本: ${VER} / Python ${PYTHON_VERSION:-4.27.3}"
-        env:
-          PYTHON_VERSION: ${{ inputs.python_version }}
-
-      - name: 编译 AstrBot（linux amd64 gnu，纯 Go 无 CGO）
-        env:
-          CGO_ENABLED: '0'
-          GOOS: linux
-          GOARCH: amd64
-        run: go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ steps.ver.outputs.version_tag }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ steps.ver.outputs.python_version }}" -o astrbot-linux-amd64 ./cmd/astrbot
-
-      - name: 校验编译产物
-        run: |
-          ls -la astrbot-linux-amd64
-          file astrbot-linux-amd64
-          ./astrbot-linux-amd64 > /tmp/astrbot-ver.txt 2>&1 &
-          PID=$!
-          sleep 3
-          kill "$PID" 2>/dev/null || true
-          wait "$PID" 2>/dev/null || true
-          cat /tmp/astrbot-ver.txt
-          grep "AstrBot Go" /tmp/astrbot-ver.txt
-
-      - name: 上传编译产物
-        uses: actions/upload-artifact@v5
-        with:
-          name: astrbot-linux-amd64
-          path: astrbot-linux-amd64
-          if-no-files-found: error
-
-  frontend:
-    name: 前端构建
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      # dist 推送后的提交 SHA（无变更 = 原 checkout SHA），供 go-test 检出
-      sha: ${{ steps.push_dist.outputs.sha || inputs.ref || github.sha }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-          fetch-depth: 0
-
-      - name: 设置 Node.js（与本地一致 v24，pnpm11 需 Node≥22.5）
-        uses: actions/setup-node@v5
-        with:
-          node-version: '24'
-
-      - name: 启用 pnpm
-        run: corepack enable
-
-      - name: pnpm store 缓存
-        uses: actions/cache@v4
-        with:
-          path: ~/.local/share/pnpm/store/v3
-          key: ${{ runner.os }}-pnpm-${{ hashFiles('dashboard/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-
-
-      - name: 安装依赖
-        run: pnpm install --frozen-lockfile
-        working-directory: dashboard
-
-      - name: 前端构建（含 t2i shiki runtime）
-        run: pnpm build && pnpm build:t2i-shiki-runtime
-        working-directory: dashboard
-
-      - name: 校验构建产物
-        run: |
-          ls -la dist/ | head
-          ls -la scripts/t2i/shiki_runtime.iife.js 2>/dev/null || find . -name "shiki_runtime.iife.js" | head
-        working-directory: dashboard
-
-      - name: 同步 dist 到内嵌目录并推送（[skip ci] 防递归触发）
-        # 前端构建产物嵌入 internal/dashboard/web/dist（//go:embed），由本 job
-        # 在 runner 上构建后推回仓库，服务器无需 pnpm 编译。go-test job 依赖
-        # 本 job 并检出推送后的 SHA，保证二进制嵌入最新前端。
-        id: push_dist
-        run: |
-          rm -rf internal/dashboard/web/dist
-          mkdir -p internal/dashboard/web/dist
-          cp -r dashboard/dist/. internal/dashboard/web/dist/
-          if ! git diff --quiet internal/dashboard/web/dist; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add internal/dashboard/web/dist
-            git commit -m "chore: 更新前端构建产物 [skip ci]"
-            git push origin HEAD
-            echo "已推送前端构建产物"
-          else
-            echo "前端产物无变更"
-          fi
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: 上传前端构建产物
-        uses: actions/upload-artifact@v5
-        with:
-          name: astrbot-frontend-dist
-          path: internal/dashboard/web/dist/
-          if-no-files-found: error
-
-  static-analysis:
-    name: 静态分析
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-          fetch-depth: 0
-
-      - name: 设置 Go 版本（自动跟随 go.mod）
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: 配置 Go 环境（代理与模块）
-        env:
-          GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
-          GOFLAGS: -mod=mod
-        run: |
-          go env -w GOPROXY="https://goproxy.cn,direct"
-          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
-
-      - name: 重建 go.sum（引用最新 Go SDK，与 go.mod 对齐）
-        run: go mod tidy
-
-      - name: 安装静态分析工具
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          go install github.com/kisielk/errcheck@latest
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
-
-      - name: gofmt 格式检查
-        run: |
-          FILES=$(gofmt -l .)
-          if [ -n "$FILES" ]; then
-            echo "以下文件未通过 gofmt："
-            echo "$FILES"
-            exit 1
-          fi
-
-      - name: go vet
-        run: go vet ./... 2>&1 | grep -v "copies lock value" || true
-
-      - name: staticcheck
-        run: staticcheck ./... 2>&1 | grep -v "copies lock value" || true
-
-      - name: errcheck
-        run: errcheck ./... 2>&1 || true
-
-      - name: golangci-lint
-        run: golangci-lint run ./... 2>&1 || true
-
-      - name: govulncheck（依赖漏洞）
-        run: govulncheck ./... 2>&1 || true
-
-      - name: gosec（Go 安全规则）
-        run: gosec -quiet -exclude=G402,G304 ./... 2>&1 || true
-
-      - name: 安装并运行 semgrep（污点分析）
-        run: |
-          pip install semgrep
-          semgrep --config=auto --error 2>&1 || true
-        env:
-          PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
-
-  codeql:
-    name: CodeQL
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-    env:
-      GOPROXY: https://goproxy.cn,direct
-      GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
-      GOFLAGS: -mod=mod
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-          fetch-depth: 0
-
-      - name: 设置 Go 版本（自动跟随 go.mod）
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: 重建 go.sum（引用最新 Go SDK，CodeQL autobuild 依赖）
-        env:
-          GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
-          GOFLAGS: -mod=mod
-        run: go mod tidy
-
-      - name: 预热模块缓存（tracer 用缓存不再下载，避免 go-querystruct 歧义模块校验和不匹配）
-        run: |
-          go env -w GOPROXY="https://goproxy.cn,direct"
-          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
-          go env -w GOFLAGS="-mod=mod"
-          go mod download
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: go
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3

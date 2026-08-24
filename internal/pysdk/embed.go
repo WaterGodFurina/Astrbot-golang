@@ -326,6 +326,43 @@ func minorAtLeast(v, min string) bool {
 	return vb >= mb
 }
 
+// pythonArchiveSHA256 固定 pin 每个 python-build-standalone 版本各平台归档的
+// sha256（键为 "version/target"），下载后校验，防止镜像/代理替换 tarball 获得
+// 宿主上的任意代码执行。未 pin 的版本（如自定义 ASTRBOT_PYTHON_VERSION）拒绝
+// 使用，除非显式设置 ASTRBOT_PYTHON_SKIP_VERIFY。
+var pythonArchiveSHA256 = map[string]string{
+	"20260814/x86_64-unknown-linux-gnu":  "3297691ae34f75fed81ac424e040145fccb0bafe8e581cd5cadbddfa1c0766c0",
+	"20260814/aarch64-unknown-linux-gnu": "4952b18bafda1880d4ab1f86e1c348dbdb31f0e6d049e76dc5f052f2f796f1c5",
+	"20260814/x86_64-apple-darwin":       "1a94c83264731e9603fbea78e57e7ca8f20e7d91eb866627ac2304621b0f6f1f",
+	"20260814/aarch64-apple-darwin":      "4572133a5542f306b9bdb155da5800f9e38950cd0a98d469b832ce256fe299ea",
+	"20260814/x86_64-pc-windows-msvc":    "7330282b47cd43a66b702d39078d2e5a88e580cee351d82f95045f21f5ee042a",
+}
+
+// verifyArchive 校验下载归档的 sha256 与固定 pin 一致；
+// ASTRBOT_PYTHON_SKIP_VERIFY 显式设置后跳过（默认校验，镜像路径不可信）。
+func verifyArchive(dest, version, target string) error {
+	if os.Getenv(EnvPythonSkipVerify) != "" {
+		return nil
+	}
+	want, ok := pythonArchiveSHA256[version+"/"+target]
+	if !ok {
+		return fmt.Errorf("no pinned sha256 for python %s (%s); set %s to skip verification", version, target, EnvPythonSkipVerify)
+	}
+	f, err := os.Open(dest) // #nosec G304 -- dest is the just-downloaded archive under the cache dir
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		return fmt.Errorf("python archive checksum mismatch: got %s want %s", got, want)
+	}
+	return nil
+}
+
 // EnsurePythonBin resolves an interpreter, downloading a bundled Python
 // (python-build-standalone) when the system has none. stage receives
 // human-readable phase text (may be nil). The downloaded tree is cached under
@@ -361,6 +398,10 @@ func downloadPython(stage func(string)) (string, error) {
 	logger.Info("Downloading Python %s from %s", version, url)
 	if err := downloadFile(url, dest, stage); err != nil {
 		return "", fmt.Errorf("download %s: %w", url, err)
+	}
+	if err := verifyArchive(dest, version, target); err != nil {
+		_ = os.Remove(dest)
+		return "", fmt.Errorf("verify %s: %w", archive, err)
 	}
 
 	if stage != nil {
@@ -420,6 +461,10 @@ func pyDownloadURL(archive string) string {
 // 仍会走宿主的全局代理。
 var dlClient = &http.Client{Timeout: 30 * time.Minute}
 
+// maxArchiveBytes 限制解释器/SDK 归档下载总量（1GB），防止镜像返回无限流
+// 灌满磁盘。
+const maxArchiveBytes = 1 << 30
+
 // downloadFile streams url to dest with 10%-step progress logs and the stage
 // callback (download phase text). The default http.Client transport honors
 // the host's global proxy configuration.
@@ -446,6 +491,9 @@ func downloadFile(url, dest string, stage func(string)) error {
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			if written+int64(n) > maxArchiveBytes {
+				return fmt.Errorf("archive exceeds size limit %d bytes", maxArchiveBytes)
+			}
 			if _, werr := out.Write(buf[:n]); werr != nil {
 				return werr
 			}
@@ -555,6 +603,26 @@ func extractTarGzKeepTop(src, dir string) error {
 			if err := os.Symlink(link, target); err != nil {
 				return err
 			}
+		case tar.TypeLink:
+			// GNU tar 硬链接条目的 Linkname 指向归档内的首个实体（内容为空），
+			// 跳过即丢失该路径；先尝试 os.Link，跨设备/不支持时退化为复制。
+			_ = os.Remove(target)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			src, err := safeJoin(dir, filepath.FromSlash(hdr.Linkname))
+			if err != nil {
+				return fmt.Errorf("hardlink %q -> %q escapes root: %w", name, hdr.Linkname, err)
+			}
+			if err := os.Link(src, target); err != nil {
+				data, rerr := os.ReadFile(src)
+				if rerr != nil {
+					return err
+				}
+				if werr := os.WriteFile(target, data, os.FileMode(uint32(hdr.Mode&0o777))); werr != nil {
+					return werr
+				}
+			}
 		}
 	}
 }
@@ -622,15 +690,37 @@ func Ensure(dataDir string) (string, error) {
 		return dir, nil
 	}
 
+	// 下载/解包段落包进与 venv 相同的跨进程锁：双实例共享同一 dataDir 时，
+	// RemoveAll + 解包与另一实例的解包/读取交错会产出损坏的 SDK 目录。
+	lockPath := filepath.Join(absData, ".python-sdk.lock")
+	release, err := acquireVenvLock(lockPath, venvLockTimeout)
+	if err != nil {
+		return "", fmt.Errorf("获取 Python SDK 锁失败: %w", err)
+	}
+	defer release()
+
 	marker := filepath.Join(root, "astrbot", "__init__.py")
 	versionFile := filepath.Join(root, "VERSION")
+	// 锁内重新检查 marker/versionFile（双重检查：等锁期间他人可能已装好），
+	// 再决定 needFetch 与 RemoveAll。versionFile 读取错误区分 not-exist 与
+	// 其他 IO 错误，后者直接报错而非误判版本不匹配触发全量重下。
 	needFetch := false
 	if _, err := os.Stat(marker); err != nil {
 		needFetch = true
-	} else if data, err := os.ReadFile(versionFile); err != nil || strings.TrimSpace(string(data)) != SDKVersion { // #nosec G304 -- versionFile is a host-controlled marker under root
-		logger.Info("Python SDK 版本变化（磁盘 %q vs 期望 %q），重新下载…",
-			strings.TrimSpace(string(data)), SDKVersion)
-		needFetch = true
+	} else {
+		data, rerr := os.ReadFile(versionFile)
+		switch {
+		case os.IsNotExist(rerr):
+			needFetch = true
+		case rerr == nil && strings.TrimSpace(string(data)) != SDKVersion:
+			logger.Info("Python SDK 版本变化（磁盘 %q vs 期望 %q），重新下载…",
+				strings.TrimSpace(string(data)), SDKVersion)
+			needFetch = true
+		case rerr != nil:
+			return "", fmt.Errorf("read VERSION: %w", rerr)
+		}
+	}
+	if needFetch {
 		_ = os.RemoveAll(root)
 	}
 	if !needFetch {
@@ -740,6 +830,28 @@ func extractTarGzStripTop(src, dir string) error {
 			}
 			if err := w.Close(); err != nil {
 				return err
+			}
+		case tar.TypeLink:
+			_ = os.Remove(target)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			link := hdr.Linkname
+			if top != "" && (link == top || strings.HasPrefix(link, top+"/")) {
+				link = strings.TrimPrefix(strings.TrimPrefix(link, top), "/")
+			}
+			src, err := safeJoin(dir, filepath.FromSlash(link))
+			if err != nil {
+				return fmt.Errorf("hardlink %q -> %q escapes root: %w", name, hdr.Linkname, err)
+			}
+			if err := os.Link(src, target); err != nil {
+				data, rerr := os.ReadFile(src)
+				if rerr != nil {
+					return err
+				}
+				if werr := os.WriteFile(target, data, os.FileMode(uint32(hdr.Mode&0o777))); werr != nil {
+					return werr
+				}
 			}
 		}
 	}

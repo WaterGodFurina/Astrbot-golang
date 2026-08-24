@@ -848,7 +848,7 @@ func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*Stag
 			if !ok {
 				continue
 			}
-			text, err := s.sttRecord(rec, event.UnifiedMsgOrigin())
+			text, err := s.sttRecord(event, rec)
 			if err != nil {
 				logger.I18nWarn("STT 转写失败: %v", err)
 				continue
@@ -881,13 +881,11 @@ func (s *PreProcessStage) sttEnabled(umo string) bool {
 
 // sttRecord transcribes a voice component using the session/global STT provider
 // (provider_perf_speech_to_text rule wins).
-func (s *PreProcessStage) sttRecord(rec *message.Record, umo string) (string, error) {
+func (s *PreProcessStage) sttRecord(event *core.Event, rec *message.Record) (string, error) {
 	var stt provider.STTProvider
 	providerID := ""
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
-			providerID, _ = rules[conversation.RuleProviderSpeechToText].(string)
-		}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		providerID, _ = rules[conversation.RuleProviderSpeechToText].(string)
 	}
 	if providerID != "" {
 		if p := s.providerMgr.Get(providerID); p != nil {
@@ -1122,12 +1120,15 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	// Session custom rules (session_plugin_config) can disable/enable plugins
 	// for this session.
 	activated = s.filterHandlersBySession(event, activated)
-	if permissionDenied {
-		// Ported from waking_check/stage.py: a permission filter failed. When
-		// no_permission_reply is enabled, send the reply directly — Continue=false
-		// short-circuits the pipeline before ResultDecorateStage/RespondStage, so
-		// an event.Result chain would never be delivered; either way the event is
-		// stopped before any handler or the LLM runs.
+	// Ported from waking_check/stage.py: a permission filter failure only skips
+	// that handler (raise_error=False path); the other matched handlers still
+	// run. Only when NO handler is left does the event stop before the LLM.
+	if permissionDenied && len(activated) == 0 {
+		// When no_permission_reply is enabled, send the reply directly —
+		// Continue=false short-circuits the pipeline before
+		// ResultDecorateStage/RespondStage, so an event.Result chain would
+		// never be delivered; either way the event is stopped before any
+		// handler or the LLM runs.
 		if s.noPermissionReply && !event.IsStopped() {
 			s.replyText(event, fmt.Sprintf("您(ID: %s)的权限不足以使用此指令。通过 /sid 获取 ID 并请管理员添加。", event.Source.SenderID))
 		}
@@ -1219,7 +1220,11 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 
 	logger.Debug("[dbg] findMatchingHandlers: %d 个 filter handler, msg=%q wake=%v", len(all), event.MessageStr, event.IsAtOrWakeCommand)
 	for _, handler := range all {
-		if !handler.Enabled {
+		// 经快照读取 filters/Enabled：dashboard 可能在运行期经写锁修改
+		// EventFilters/Enabled（SetHandlerPermission/Enable/Disable），
+		// 直接遍历共享切片会与写者并发构成数据竞争。
+		filters, enabled, ok := registry.SnapshotFilters(handler.HandlerFullName)
+		if !ok || !enabled {
 			continue
 		}
 		if s.disableBuiltinCommands && handler.HandlerModulePath == "astrbot.builtin_stars.builtin_commands.main" {
@@ -1237,7 +1242,7 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 		// filter marks the event as permission-denied.
 		passed := true
 		filterDenied := false
-		for _, filter := range handler.EventFilters {
+		for _, filter := range filters {
 			if _, isPerm := filter.(*star.PermissionFilter); isPerm {
 				if !filter.Match(fctx) {
 					filterDenied = true
@@ -1271,6 +1276,23 @@ func (s *ProcessStage) executeHandler(ctx context.Context, event *core.Event, ha
 	return handler.Handler(event)
 }
 
+// sessionRulesMemo returns the event-level memoized session rules.
+// GetSessionRules runs 2 SQL queries + JSON decode per call; the pipeline
+// queries it up to 6 times per event (plugin filter, provider override,
+// persona override, TTS ×2, STT). Rules cannot change mid-event, so caching
+// on the event is safe. Returns nil when the conversation manager is absent.
+func sessionRulesMemo(event *core.Event, convMgr *conversation.Manager) map[string]interface{} {
+	if convMgr == nil {
+		return nil
+	}
+	if r, ok := event.GetExtra("_session_rules").(map[string]interface{}); ok {
+		return r
+	}
+	r := convMgr.GetSessionRules(event.UnifiedMsgOrigin())
+	event.SetExtra("_session_rules", r)
+	return r
+}
+
 // filterHandlersBySession applies the session_plugin_config rule
 // (disabled_plugins / enabled_plugins) to the matched plugin handlers,
 // mirroring Python SessionPluginManager.filter_handlers_by_session.
@@ -1278,7 +1300,7 @@ func (s *ProcessStage) filterHandlersBySession(event *core.Event, handlers []*st
 	if s.convMgr == nil || len(handlers) == 0 {
 		return handlers
 	}
-	rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin())
+	rules := sessionRulesMemo(event, s.convMgr)
 	pc, ok := rules[conversation.RulePluginConfig].(map[string]interface{})
 	if !ok {
 		return handlers
@@ -1410,8 +1432,13 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		prompt = extractPlainText(event.Message)
 	}
 	logger.Debug("callLLMAgent: prompt=%q plaintext=%q messagestr=%q", prompt, event.PlainText, event.MessageStr)
+	// 纯媒体消息（图片/语音）没有可提取的文本，但同样需要调用 LLM（对齐
+	// Python：req.prompt 为空但 image_urls/audio_urls 非空时继续）。
 	if prompt == "" {
-		return nil, nil
+		imgs, auds := collectMediaURLs(event)
+		if len(imgs) == 0 && len(auds) == 0 {
+			return nil, nil
+		}
 	}
 
 	// Reset the doom-loop counters for this session at each request entry so
@@ -1443,12 +1470,10 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 	// Session-level provider override (custom rules / /provider command):
 	// when the session has a provider_perf_chat_completion rule, use that
 	// provider instead of the global default.
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin()); rules != nil {
-			if pid, _ := rules[conversation.RuleProviderChatCompletion].(string); pid != "" {
-				if pc := findProviderByID(s.config, pid); pc != nil {
-					providerCfg = pc
-				}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		if pid, _ := rules[conversation.RuleProviderChatCompletion].(string); pid != "" {
+			if pc := findProviderByID(s.config, pid); pc != nil {
+				providerCfg = pc
 			}
 		}
 	}
@@ -1481,13 +1506,11 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 
 	// Session custom-rule persona overrides everything (highest priority):
 	// session_service_config.persona_id from the WebUI rules editor.
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(event.UnifiedMsgOrigin()); rules != nil {
-			if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
-				if pid, ok := sc["persona_id"].(string); ok && pid != "" {
-					personaID = pid
-					providerSettings["persona"] = pid
-				}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
+			if pid, ok := sc["persona_id"].(string); ok && pid != "" {
+				personaID = pid
+				providerSettings["persona"] = pid
 			}
 		}
 	}
@@ -1505,7 +1528,12 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		systemPrompt = s.personaPrompt(event.UnifiedMsgOrigin(), personaID)
 	}
 	if systemPrompt == "" {
-		systemPrompt = personaPrompt(providerSettings)
+		// providerSettings["persona"] 在上方被写成 persona ID（非提示词文本），
+		// 不能再把它当系统提示词回退（persona 被删除/改名时会把 ID 直接发给
+		// 模型）。仅兼容历史遗留的"纯文本 persona"形态配置。
+		if p, ok := providerSettings["persona_prompt_text"].(string); ok && p != "" {
+			systemPrompt = p
+		}
 	}
 
 	// Inject active skills into the system prompt (mirrors Python's
@@ -1517,13 +1545,14 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 	systemPrompt = s.applyLLMSafetyMode(systemPrompt)
 
 	// Apply on_llm_request hooks from subprocess plugins: they may modify the
-	// system prompt (e.g. identity injection) or stop the LLM call entirely.
+	// system prompt and/or user prompt, or stop the LLM call entirely.
 	if s.subPlugins != nil {
-		sp, stop, err := s.applyLLMRequestHooks(event, systemPrompt, prompt)
+		sp, up, stop, err := s.applyLLMRequestHooks(event, systemPrompt, prompt)
 		if err != nil {
 			logger.I18nWarn("插件 on_llm_request 钩子执行失败: %v", err)
 		} else {
 			systemPrompt = sp
+			prompt = up
 			if stop {
 				logger.Debug("plugin on_llm_request hook stopped the LLM call")
 				event.Stop()
@@ -1570,12 +1599,13 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 	providerCfg, providerSettings := ar.providerCfg, ar.providerSettings
 	prompt, systemPrompt := ar.prompt, ar.systemPrompt
 
+	imageURLs, audioURLs := collectMediaURLs(event)
 	req := &provider.ProviderRequest{
 		Prompt:       prompt,
 		SessionID:    event.UnifiedMsgOrigin(),
 		SystemPrompt: systemPrompt,
-		ImageURLs:    []string{},
-		AudioURLs:    []string{},
+		ImageURLs:    imageURLs,
+		AudioURLs:    audioURLs,
 		Conversation: s.convMgr,
 		Contexts:     s.conversationHistory(event.UnifiedMsgOrigin()),
 	}
@@ -1698,6 +1728,37 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 
 	ar.req = req
 	return ar, nil
+}
+
+// collectMediaURLs gathers image/audio URLs from the event message chain for
+// the multimodal provider request (mirrors Python's astr_main_agent media
+// attachment collection). Image components prefer URL, then local path
+// (file://), then base64 data; Record components prefer URL, then path.
+func collectMediaURLs(event *core.Event) (imageURLs, audioURLs []string) {
+	if event.Message == nil {
+		return nil, nil
+	}
+	for _, comp := range event.Message.Chain {
+		switch c := comp.(type) {
+		case *message.Image:
+			switch {
+			case c.URL != "":
+				imageURLs = append(imageURLs, c.URL)
+			case c.Path != "":
+				imageURLs = append(imageURLs, "file://"+c.Path)
+			case c.Base64 != "":
+				imageURLs = append(imageURLs, "data:image/png;base64,"+c.Base64)
+			}
+		case *message.Record:
+			switch {
+			case c.URL != "":
+				audioURLs = append(audioURLs, c.URL)
+			case c.Path != "":
+				audioURLs = append(audioURLs, "file://"+c.Path)
+			}
+		}
+	}
+	return imageURLs, audioURLs
 }
 
 // runAgentToolLoop issues the initial chat round, executes the requested
@@ -1840,6 +1901,14 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 // group sessions (group LTM), flushes the stream and sets event.Result.
 func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMResponse, streamer *streamSender) {
 	event := ar.event
+
+	// The tool loop ends early when the model hit maxSteps or a tool was paused
+	// by doom-loop detection: the last response carries tool calls and usually
+	// no text. Record a visible notice instead of polluting history with an
+	// empty assistant turn (L-24).
+	if strings.TrimSpace(resp.CompletionText) == "" && len(resp.ToolsCallName) > 0 {
+		resp.CompletionText = "（已达最大工具调用步数/工具被暂停，未能生成最终回复。）"
+	}
 
 	// Append user + assistant reply to history (Python appends the pair
 	// post-completion; the user message is intentionally not in req.Contexts
@@ -2379,10 +2448,11 @@ func dispatchSubprocessHooksPayload(sub *plugin.SubprocessManager, event *core.E
 }
 
 // applyLLMRequestHooks runs every loaded subprocess plugin's on_llm_request
-// hooks, letting them modify the system prompt or stop the LLM call.
-func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, userPrompt string) (string, bool, error) {
+// hooks, letting them modify the system prompt, the user prompt, or stop the
+// LLM call.
+func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, userPrompt string) (string, string, bool, error) {
 	if s.subPlugins == nil {
-		return systemPrompt, false, nil
+		return systemPrompt, userPrompt, false, nil
 	}
 	sdkEvent := star.CoreEventToSDK(event)
 	for _, inst := range s.subPlugins.List() {
@@ -2395,7 +2465,7 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 			}
 			// on_llm_request 是被动广播，不计入活动时间。
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-			sp, stop, res, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
+			sp, up, stop, res, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
 			rpcCancel()
 			if err != nil {
 				logger.I18nWarn("插件 %s 的 on_llm_request 钩子 %s 执行失败: %v", inst.Name, h.Name, err)
@@ -2405,12 +2475,13 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 				event.HasSendOper = true
 			}
 			systemPrompt = sp
+			userPrompt = up
 			if stop {
-				return systemPrompt, true, nil
+				return systemPrompt, userPrompt, true, nil
 			}
 		}
 	}
-	return systemPrompt, false, nil
+	return systemPrompt, userPrompt, false, nil
 }
 
 // toolsRefreshTTL 是插件工具列表 ListTools RPC 的缓存时长：TTL 内跳过重复
@@ -2425,7 +2496,10 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 	}
 	// 先刷新运行中插件的实时工具列表（插件工具在实例化阶段注册，晚于
 	// Register 快照；RefreshTools 成功后回写管理器工具注册表）。TTL 内已
-	// 刷新过的插件跳过，避免每次 LLM 调用都同步发起 ListTools RPC。
+	// 刷新过的插件跳过，避免每次 LLM 调用都同步发起 ListTools RPC。TTL
+	// 过期时先用旧快照（AllPluginTools 兜底），后台异步刷新，下次请求生效
+	// ——同步刷新会阻塞 LLM 热路径最长 30s/插件（插件假死/被调试器暂停时
+	// 用户消息长时间无响应）。
 	for _, inst := range s.subPlugins.List() {
 		if inst.Meta == nil {
 			continue
@@ -2433,7 +2507,7 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 		if inst.ToolsFreshWithin(toolsRefreshTTL) {
 			continue
 		}
-		inst.RefreshTools(context.Background())
+		go inst.RefreshTools(context.Background())
 	}
 	// 注入全部已注册工具（含闲置休眠插件：其工具保留在注册表中，LLM 调用
 	// 时按名唤醒——避免休眠导致 LLM 工具集收缩）。
@@ -3582,14 +3656,6 @@ func (s *ProcessStage) applySelectedProviderModel(event *core.Event, providerCfg
 	return pc
 }
 
-// personaPrompt extracts the persona system prompt from settings.
-func personaPrompt(settings map[string]interface{}) string {
-	if p, ok := settings["persona"].(string); ok {
-		return p
-	}
-	return ""
-}
-
 // conversationHistory converts conversation history to LLM context messages.
 // The history slice is shallow-copied so a concurrent AppendHistory (from
 // another message racing the same session) can never mutate the slice the LLM
@@ -4173,15 +4239,12 @@ func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
 	if event.Result == nil || len(event.Result.Chain) == 0 {
 		return nil
 	}
-	umo := event.UnifiedMsgOrigin()
 
 	// Session tts_enabled rule (session_service_config), default true.
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
-			if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
-				if enabled, ok := sc["tts_enabled"].(bool); ok && !enabled {
-					return nil
-				}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
+			if enabled, ok := sc["tts_enabled"].(bool); ok && !enabled {
+				return nil
 			}
 		}
 	}
@@ -4194,10 +4257,8 @@ func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
 	// Resolve TTS provider: session rule provider_perf_text_to_speech wins.
 	var tts provider.TTSProvider
 	providerID := ""
-	if s.convMgr != nil {
-		if rules := s.convMgr.GetSessionRules(umo); rules != nil {
-			providerID, _ = rules[conversation.RuleProviderTextToSpeech].(string)
-		}
+	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
+		providerID, _ = rules[conversation.RuleProviderTextToSpeech].(string)
 	}
 	if providerID != "" {
 		if p := s.providerMgr.Get(providerID); p != nil {

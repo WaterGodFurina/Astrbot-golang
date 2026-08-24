@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"crypto/rand"
 	"fmt"
 	"sort"
 	"sync/atomic"
@@ -46,9 +47,14 @@ func (m *SubprocessManager) RegisterSessionWait(pluginName, umo string, timeoutS
 	if m == nil {
 		return ""
 	}
-	// waitID 格式 <插件名>-<序号>：日志/仪表盘可直读归属，序号保证唯一。
+	// waitID 格式 <插件名>-<序号>-<8 字节随机熵>：纯序号可枚举，恶意插件可
+	// 批量注销其他插件的等待（注册表无归属校验）；随机后缀使其不可枚举。
+	var entropy [8]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		entropy = [8]byte{} // crypto/rand 异常（极罕见）：退化为无熵格式
+	}
 	n := sessionWaitSeq.Add(1)
-	waitID := fmt.Sprintf("%s-%d", sanitizeID(pluginName), n)
+	waitID := fmt.Sprintf("%s-%d-%x", sanitizeID(pluginName), n, entropy)
 
 	m.sessionWaitMu.Lock()
 	if len(m.sessionWaitReg) >= maxSessionWaits {

@@ -91,6 +91,16 @@
     "providerTypes": {
         "title": "Тип провайдера"
     },
+    "agentRunnerDialog": {
+        "title": "Тестируйте Agent Runner на странице «Файлы конфигурации»",
+        "description": "Тестирование Agent Runner выполняется на странице «Файлы конфигурации».",
+        "step1": "Найдите и откройте нужный файл конфигурации.",
+        "step2": "Найдите раздел Agent Runner, измените исполнителя и нажмите «Сохранить».",
+        "step3": "Нажмите кнопку чата 💬 в правом нижнем углу, чтобы протестировать.",
+        "applyHint": "Чтобы бот применял этот Agent Runner, вам также нужно изменить его в конфигурации.",
+        "ok": "Хорошо",
+        "go": "Перейти"
+    },
     "providerSources": {
         "title": "Источник провайдера",
         "add": "Добавить",
@@ -140,6 +150,7 @@
         "testError": "Тест модели провален",
         "searchPlaceholder": "Поиск по имени или ID",
         "manualAddButton": "Добавить вручную",
+        "manualDialogAddButton": "Добавить",
         "manualDialogTitle": "Произвольная модель",
         "manualDialogModelLabel": "Код модели (напр. gpt-4o-mini)",
         "manualDialogPreviewLabel": "Отображаемый ID (авто)",

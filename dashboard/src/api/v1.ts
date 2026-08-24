@@ -800,8 +800,15 @@ export const backupApi = {
       openApiV1.renameBackup({ path: { filename }, body: payload }),
     );
   },
-  downloadUrl(filename: string, token: string) {
-    return `/api/v1/backups/${encodeURIComponent(filename)}?token=${encodeURIComponent(token)}`;
+  // 备份下载：一次性 ws-ticket 走 URL（30s、单次使用），长效 token 不进 URL。
+  downloadUrl(filename: string, ticket: string) {
+    return `/api/v1/backups/${encodeURIComponent(filename)}?ticket=${encodeURIComponent(ticket)}`;
+  },
+  // 备份下载（blob 方式）：经 Authorization 头鉴权，票据不可用时的兜底路径。
+  download(filename: string) {
+    return apiV1Client.get(`/backups/${encodeURIComponent(filename)}`, {
+      responseType: 'blob',
+    });
   },
 };
 
@@ -815,19 +822,15 @@ export const chatApi = {
   resumeRunStreamUrl(runId: string) {
     return `/api/v1/chat/runs/${encodeURIComponent(runId)}/stream`;
   },
-  liveWebSocketUrl(ticket: string, token: string, host = window.location.host) {
+  // 一次性 ws-ticket 置于后端约定的 ?token= 参数（兼容旧 ?token= 协议），
+  // 长效 JWT 不再进入 URL；调用方必须在拿到票据后才建立连接。
+  liveWebSocketUrl(ticket: string, host = window.location.host) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const credential = ticket
-      ? `ticket=${encodeURIComponent(ticket)}`
-      : `token=${encodeURIComponent(token)}`;
-    return `${protocol}//${host}/api/v1/live-chat/ws?${credential}`;
+    return `${protocol}//${host}/api/v1/live-chat/ws?token=${encodeURIComponent(ticket)}`;
   },
-  unifiedWebSocketUrl(ticket: string, token: string, host = window.location.host) {
+  unifiedWebSocketUrl(ticket: string, host = window.location.host) {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const credential = ticket
-      ? `ticket=${encodeURIComponent(ticket)}`
-      : `token=${encodeURIComponent(token)}`;
-    return `${protocol}//${host}/api/v1/unified-chat/ws?${credential}`;
+    return `${protocol}//${host}/api/v1/unified-chat/ws?token=${encodeURIComponent(ticket)}`;
   },
   listSessions(params?: ChatSessionListParams) {
     return typed<any>(

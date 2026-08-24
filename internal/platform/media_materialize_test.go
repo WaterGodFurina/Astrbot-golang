@@ -213,8 +213,8 @@ func TestMediaHostAllowed(t *testing.T) {
 		{"http://nonexistent.invalid/a", false}, // DNS 失败 → fail-closed
 	}
 	for _, c := range cases {
-		if got := mediaHostAllowed(c.url); got != c.want {
-			t.Errorf("mediaHostAllowed(%q) = %v, want %v", c.url, got, c.want)
+		if got := MediaHostAllowed(c.url); got != c.want {
+			t.Errorf("MediaHostAllowed(%q) = %v, want %v", c.url, got, c.want)
 		}
 	}
 }

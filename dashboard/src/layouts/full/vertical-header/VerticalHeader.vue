@@ -448,7 +448,7 @@ function accountEdit() {
       }, 2000);
     })
     .catch((err) => {
-      console.log(err);
+      console.error("Failed to update account:", err);
       accountEditStatus.value.error = true;
       accountEditStatus.value.message =
         typeof err === "string"
@@ -512,7 +512,7 @@ function getVersion() {
       }
     })
     .catch((err) => {
-      console.log(err);
+      console.error("Failed to fetch version info:", err);
     });
 }
 
@@ -550,16 +550,16 @@ function checkUpdate() {
     })
     .catch((err) => {
       if (isLegacyFallbackError(err)) {
-        console.log(err);
+        console.error("Update check fell back to legacy endpoint:", err);
         return;
       }
       if (err.response && err.response.status == 401) {
-        console.log("401");
+        console.error("401 during update check, logging out:", err);
         const authStore = useAuthStore();
         authStore.logout();
         return;
       }
-      console.log(err);
+      console.error("Failed to check updates:", err);
       updateStatus.value = err;
     });
 }
@@ -575,7 +575,7 @@ function getReleases() {
       });
     })
     .catch((err) => {
-      console.log(err);
+      console.error("Failed to fetch releases:", err);
     })
     .finally(() => {
       releasesLoading.value = false;
@@ -792,7 +792,7 @@ function startUpdateProgressPolling(progressId: string) {
         }
       })
       .catch((err) => {
-        console.log(err);
+        console.error("Failed to poll update progress:", err);
       });
   };
   poll();
@@ -851,7 +851,7 @@ async function switchVersion(targetVersion: string) {
       }
     })
     .catch((err) => {
-      console.log(err);
+      console.error("Failed to switch version:", err);
       stopUpdateProgressPolling();
       if (!err?.response && restartPollTimer) {
         waitForAstrBotRestart(restartStartTime.value);
@@ -923,12 +923,10 @@ onMounted(() => {
       const sessionId = parts[2];
       if (sessionId) {
         sessionStorage.setItem(LAST_CHAT_ROUTE_KEY, sessionId);
-        console.log("Initial save chat ID:", sessionId);
       }
     } else {
       // 保存 bot 路由（非 chat 頁面）
       sessionStorage.setItem(LAST_BOT_ROUTE_KEY, route.fullPath);
-      console.log("Initial save bot route:", route.fullPath);
     }
   }
 });
@@ -945,11 +943,6 @@ watch(
   () => route.fullPath,
   (newPath) => {
     if (typeof window === "undefined") return;
-    console.log("Route changed:", {
-      newPath,
-      isChat: isChatPath.value,
-      currentChatId: route.params.id,
-    });
     try {
       // 使用現有的 isChatPath 計算屬性來避免名稱衝突
       const isChat = isChatPath.value; // 這裡使用已經計算好的 isChatPath

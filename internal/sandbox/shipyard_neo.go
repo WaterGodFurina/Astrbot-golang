@@ -64,9 +64,6 @@ func NewShipyardNeoBooter(endpointURL, accessToken, profile string, ttl int) *Sh
 	if ttl <= 0 {
 		ttl = 3600
 	}
-	if profile == "" {
-		profile = ""
-	}
 	return &ShipyardNeoBooter{
 		endpointURL: strings.TrimSpace(endpointURL),
 		accessToken: strings.TrimSpace(accessToken),
@@ -91,14 +88,18 @@ func (b *ShipyardNeoBooter) IsRunning() bool {
 
 // Start boots a sandbox on Bay: resolves the profile, creates the sandbox and
 // waits until it is ready. Mirrors ShipyardNeoBooter.boot + _wait_until_ready.
+// 锁只在短临界区持有（读不可变配置 / 写回就绪状态）：最长 180 秒的就绪轮询
+// 在锁外进行，否则同实例的 Exec/ReadFile/WriteFile 会全部阻塞到就绪或超时。
 func (b *ShipyardNeoBooter) Start(ctx context.Context) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.running {
+		b.mu.Unlock()
 		return nil
 	}
-
 	ep := strings.TrimSpace(b.endpointURL)
+	token := b.accessToken
+	b.mu.Unlock()
+
 	if ep == "" || ep == "__auto__" {
 		// Python auto-starts a Bay Docker container here; we require the user
 		// to configure the endpoint explicitly.
@@ -106,11 +107,15 @@ func (b *ShipyardNeoBooter) Start(ctx context.Context) error {
 	}
 	ep = strings.TrimSuffix(ep, "/")
 
-	if b.accessToken == "" {
-		b.accessToken = discoverBayCredentials()
-	}
-	if b.accessToken == "" {
-		return fmt.Errorf("shipyard_neo_access_token is empty and no Bay credentials.json was found")
+	if token == "" {
+		token = discoverBayCredentials()
+		if token == "" {
+			return fmt.Errorf("shipyard_neo_access_token is empty and no Bay credentials.json was found")
+		}
+		// 尽早写回，使失败清理路径的 delete 请求带正确的鉴权。
+		b.mu.Lock()
+		b.accessToken = token
+		b.mu.Unlock()
 	}
 
 	// Resolve the profile: explicit > best from /v1/profiles > python-default.
@@ -131,10 +136,10 @@ func (b *ShipyardNeoBooter) Start(ctx context.Context) error {
 	if id == "" {
 		return fmt.Errorf("create sandbox: response missing id: %v", resp)
 	}
-	b.sandboxID = id
 
 	// Readiness gate (mirrors _wait_until_ready): poll until "ready".
 	deadline := time.Now().Add(neoReadinessTimeout)
+	var caps []string
 	for {
 		info, err := b.get(ctx, ep, "/v1/sandboxes/"+id, nil)
 		if err != nil {
@@ -143,15 +148,19 @@ func (b *ShipyardNeoBooter) Start(ctx context.Context) error {
 		}
 		status, _ := info["status"].(string)
 		if status == "ready" {
-			if caps, ok := info["capabilities"].([]interface{}); ok {
-				for _, c := range caps {
+			if raw, ok := info["capabilities"].([]interface{}); ok {
+				for _, c := range raw {
 					if s, ok := c.(string); ok {
-						b.caps = append(b.caps, s)
+						caps = append(caps, s)
 					}
 				}
 			}
+			b.mu.Lock()
+			b.sandboxID = id
+			b.caps = caps
 			b.running = true
-			neoLogger.Debug("Shipyard Neo sandbox ready: id=%s profile=%s capabilities=%v", id, profile, b.caps)
+			b.mu.Unlock()
+			neoLogger.Debug("Shipyard Neo sandbox ready: id=%s profile=%s capabilities=%v", id, profile, caps)
 			return nil
 		}
 		if status == "failed" || status == "expired" {

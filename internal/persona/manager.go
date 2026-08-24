@@ -39,7 +39,15 @@ func (m *PersonaManager) Register(p *Persona) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if p.ID == "" {
-		p.ID = fmt.Sprintf("persona_%d", len(m.byID)+1)
+		// 按顺序找第一个空位，避免删除后 len(byID)+1 与既有 ID 碰撞覆盖。
+		var n int
+		for {
+			n++
+			if _, exists := m.byID[fmt.Sprintf("persona_%d", n)]; !exists {
+				p.ID = fmt.Sprintf("persona_%d", n)
+				break
+			}
+		}
 	}
 	m.byID[p.ID] = p
 	m.byName[p.Name] = p

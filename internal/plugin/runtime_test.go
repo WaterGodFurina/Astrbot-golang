@@ -118,7 +118,7 @@ func TestNewSDKCapabilities(t *testing.T) {
 	}
 
 	// on_llm_request hook: modifies the system prompt.
-	sp, stop, _, err := inst.Client.HandleLLMRequest(ctx, "inject", &pluginsdk.Event{}, "base", "user")
+	sp, _, stop, _, err := inst.Client.HandleLLMRequest(ctx, "inject", &pluginsdk.Event{}, "base", "user")
 	if err != nil {
 		t.Fatalf("HandleLLMRequest: %v", err)
 	}

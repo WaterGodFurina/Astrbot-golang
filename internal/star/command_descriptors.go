@@ -16,11 +16,17 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 		if h.EventType != EventTypeFilter {
 			continue
 		}
+		// 经快照读取 filters/Enabled：dashboard 写入口（SetHandlerPermission
+		// 等）在写锁内修改 EventFilters/Enabled，快照拷贝使本遍历与写者互斥。
+		filters, enabled, ok := registry.SnapshotFilters(h.HandlerFullName)
+		if !ok {
+			continue
+		}
 		// Only handlers carrying a command filter are commands. Plugin message
 		// filters (e.g. "plugin_filter_<id>_<name>") match EventTypeFilter too
 		// but have no CommandFilter and must not appear in the command list.
 		hasCommandFilter := false
-		for _, f := range h.EventFilters {
+		for _, f := range filters {
 			if _, ok := f.(*CommandFilter); ok {
 				hasCommandFilter = true
 				break
@@ -29,22 +35,27 @@ func CollectCommandDescriptors(registry *StarHandlerRegistry) []*CommandDescript
 		if !hasCommandFilter {
 			continue
 		}
-		desc := BuildDescriptor(registry, h)
+		// 用快照副本构建描述符：BuildDescriptor/permissionFor/aliases 读取
+		// 的都是同一份拷贝，避免无锁访问共享 EventFilters。
+		clone := *h
+		clone.Enabled = enabled
+		clone.EventFilters = filters
+		desc := BuildDescriptor(registry, &clone)
 		if desc == nil {
 			continue
 		}
-		desc.HandlerName = h.HandlerName
-		desc.PluginName = pluginNameFor(h)
-		desc.Reserved = isReservedModule(h.HandlerModulePath)
+		desc.HandlerName = clone.HandlerName
+		desc.PluginName = pluginNameFor(&clone)
+		desc.Reserved = isReservedModule(clone.HandlerModulePath)
 		// aliases
-		for _, filter := range h.EventFilters {
+		for _, filter := range clone.EventFilters {
 			if cf, ok := filter.(*CommandFilter); ok {
 				desc.Aliases = cf.Aliases()
 				break
 			}
 		}
 		// permission
-		desc.Permission = permissionFor(h)
+		desc.Permission = permissionFor(&clone)
 		// 组命令 type 统一为 "group"（对齐 Python command_management 的
 		// command_type，WebUI 类型筛选按该值匹配）。
 		if desc.IsGroup {

@@ -1437,6 +1437,11 @@ async function sendCurrentMessage() {
     });
   } catch (error) {
     console.error("Failed to send message:", error);
+    toast.error(
+      isAxiosError(error)
+        ? error.response?.data?.message || error.message
+        : tm("errors.createSessionFailed"),
+    );
   } finally {
     sending.value = false;
     await focusChatInput();
@@ -1716,10 +1721,17 @@ function removeThreadFromMessages(threadId: string) {
   }
 }
 
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4GB，与后端上传限制保持一致
+
 async function handleFilesSelected(files: FileList | File[]) {
   const selectedFiles = Array.from(files || []);
+  const oversized = selectedFiles.filter((f) => f.size > MAX_UPLOAD_BYTES);
+  for (const file of oversized) {
+    toast.error(tm("input.fileTooLarge", { name: file.name }));
+  }
+  const okFiles = selectedFiles.filter((f) => f.size <= MAX_UPLOAD_BYTES);
   await Promise.all(
-    selectedFiles.map((file) =>
+    okFiles.map((file) =>
       file.type.startsWith("image/")
         ? processAndUploadImage(file)
         : processAndUploadFile(file),

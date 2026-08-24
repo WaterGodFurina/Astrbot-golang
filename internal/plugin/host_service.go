@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"time"
@@ -60,6 +61,33 @@ type CallActionAdapter interface {
 // RecallAdapter is implemented by platform adapters that can recall messages.
 type RecallAdapter interface {
 	RecallMessage(messageID string) error
+}
+
+// pluginAdminListFromConfig 从主配置读取插件管理管理员名单（config 键
+// plugin_admin_list，字符串数组）。缺省返回 nil（无管理插件）。
+func pluginAdminListFromConfig(cfgMgr *config.ConfigManager) []string {
+	if cfgMgr == nil {
+		return nil
+	}
+	cfg := cfgMgr.Get("default")
+	if cfg == nil {
+		return nil
+	}
+	v := cfg.GetNested("plugin_admin_list")
+	if v == nil {
+		return nil
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, e := range arr {
+		if s, ok := e.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // pluginConfigID 把 HostService 反调用携带的插件注册名解析为实例 id
@@ -134,10 +162,15 @@ type personaFileCache struct {
 
 var personaCache personaFileCache
 
+// personaDataPath 是人格数据文件路径。SetHostService 时按 subMgr.dataDir
+// 对齐 dashboard 的写入路径（filepath.Join(dataDir, "personas.json")），
+// 避免宿主 CWD 非项目根/配置 dataDir 非 "data" 时插件人格 RPC 静默读空。
+var personaDataPath = "data/personas.json"
+
 // loadPersonas 返回 data/personas.json 解析后的 persona 列表。
 // mtime 未变化时直接返回缓存内容，变化时才重读文件。
 func loadPersonas() []map[string]any {
-	info, err := os.Stat("data/personas.json")
+	info, err := os.Stat(personaDataPath)
 	if err != nil {
 		return nil
 	}
@@ -146,7 +179,7 @@ func loadPersonas() []map[string]any {
 	if personaCache.content != nil && personaCache.modTime.Equal(info.ModTime()) {
 		return parsePersonas(personaCache.content)
 	}
-	data, err := os.ReadFile("data/personas.json")
+	data, err := os.ReadFile(personaDataPath)
 	if err != nil {
 		return nil
 	}
@@ -309,6 +342,13 @@ type ChatLLMCmd struct {
 // Call once at startup, after all managers exist and before plugins begin
 // handling messages.
 func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(cmd ChatLLMCmd) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager) {
+	if subMgr != nil && subMgr.dataDir != "" {
+		personaDataPath = filepath.Join(subMgr.dataDir, "personas.json")
+	}
+	// 插件管理管理员名单：默认无管理插件（插件仅能启停自身）。
+	// config 的 plugin_admin_list 数组可授权指定插件（注册名，如
+	// astrbot_plugin_xxx_python）执行安装/卸载/操作其他插件。
+	pluginsdk.SetPluginAdminList(pluginAdminListFromConfig(cfgMgr))
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
 		CallAction: func(platformID, api string, params map[string]any) (map[string]any, error) {
 			adapter := pm.Get(platformID)
@@ -830,7 +870,10 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			if subMgr == nil {
 				return fmt.Errorf("plugin manager not available")
 			}
-			_, err := subMgr.InstallFromSource(context.Background(), "", repo, InstallOptions{})
+			// 安装可能下载/编译数分钟：带超时 context，避免无界后台拉取。
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			_, err := subMgr.InstallFromSource(ctx, "", repo, InstallOptions{})
 			return err
 		},
 		UninstallPlugin: func(pluginName string) error {

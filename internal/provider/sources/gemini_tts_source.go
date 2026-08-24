@@ -83,6 +83,9 @@ func (s *GeminiTTSSource) GetAudio(ctx context.Context, text string) (string, er
 		return "", err
 	}
 
+	if !geminiModelPathSafe(s.model) {
+		return "", fmt.Errorf("invalid gemini model name: %q", s.model)
+	}
 	url := fmt.Sprintf("%s/models/%s:generateContent", s.apiBase, s.model)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {

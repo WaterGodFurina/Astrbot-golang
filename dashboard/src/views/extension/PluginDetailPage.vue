@@ -7,7 +7,6 @@ import {
   ref,
   watch,
 } from "vue";
-import axios from "axios";
 import DOMPurify from "dompurify";
 import MarkdownIt from "markdown-it";
 import defaultPluginIcon from "/favicon.svg";
@@ -633,11 +632,25 @@ const getDocumentUrl = (fieldName) => {
 };
 
 const fetchRemoteMarkdown = async (url) => {
-  const res = await axios.get(url, {
-    responseType: "text",
-    transformResponse: [(data) => data],
+  // 第三方可控 URL：使用不带鉴权拦截器的裸 fetch（并仅放行 http/https），
+  // 杜绝 dashboard 凭证随 readme_url 外泄。
+  let parsed;
+  try {
+    parsed = new URL(url, window.location.origin);
+  } catch {
+    throw new Error("Invalid readme URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("Invalid readme URL protocol");
+  }
+  const res = await window.fetch(parsed.toString(), {
+    method: "GET",
+    headers: { Accept: "text/plain,text/markdown,*/*" },
   });
-  return typeof res.data === "string" ? res.data : String(res.data || "");
+  if (!res.ok) {
+    throw new Error(`Failed to fetch readme: ${res.status}`);
+  }
+  return await res.text();
 };
 
 const fetchReadme = async () => {

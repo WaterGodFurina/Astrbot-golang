@@ -129,7 +129,7 @@ func TestConfigSavePreservesTOTP(t *testing.T) {
 	defer s.Stop()
 
 	cm := config.NewConfigManager()
-	cfg := config.NewConfig(filepath.Join(dir, "config.json"), nil)
+	cfg := config.NewConfig(filepath.Join(dir, "config.json"))
 	cm.Register("default", cfg)
 	s.configMgr = cm
 
@@ -189,7 +189,7 @@ func TestAuthPersistViaConfigManager(t *testing.T) {
 	defer s.Stop()
 
 	cm := config.NewConfigManager()
-	cfg := config.NewConfig(filepath.Join(dir, "config.json"), nil)
+	cfg := config.NewConfig(filepath.Join(dir, "config.json"))
 	cm.Register("default", cfg)
 	s.configMgr = cm
 	s.auth.SetConfigManager(cm)

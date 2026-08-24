@@ -586,7 +586,6 @@ export default {
 
         // 检测是否为暗色模式
         isDark() {
-            console.log('isDark', this.customizerStore.uiTheme);
             return this.customizerStore.uiTheme === 'PurpleThemeDark';
         },
 
@@ -604,8 +603,6 @@ export default {
                 // tool / system 等非聊天角色不直接渲染为气泡，避免大文本走 markdown 路径卡死页面
                 .filter(msg => msg.role === 'user' || msg.role === 'assistant')
                 .map(msg => {
-                    console.log('处理消息:', msg.role, msg.content);
-
                     const messageParts = this.convertContentToMessageParts(msg.content)
                         // 丢弃 convertContentToMessageParts 兜底插入的空 plain，避免 assistant 仅有工具调用时渲染空气泡
                         .filter(part => part.type !== 'plain' || (part.text && part.text.trim()));
@@ -867,7 +864,6 @@ export default {
             this.isEditingHistory = false;
 
             try {
-                console.log(`正在请求对话详情，user_id=${item.user_id}, cid=${item.cid}`);
                 const response = await conversationApi.get(item.user_id, item.cid);
 
                 if (response.data.status === "ok") {

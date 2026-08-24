@@ -521,17 +521,20 @@ func (m *SubprocessManager) safeDataDirPath(sub string) (string, error) {
 }
 
 // instanceByName returns the running instance for a plugin identifier (id or
-// name), or nil.
+// name), or nil. 同名 Go/Python 多变体并存时（实例按 id = name_language 分键）
+// 取 id 字典序最小者，保证解析确定性（map 遍历顺序随机会导致 GetConfig/
+// SetConfig/会话等待喂入漂移到任意一个变体）。
 func (m *SubprocessManager) instanceByName(name string) *PluginInstance {
 	if inst := m.Get(name); inst != nil {
 		return inst
 	}
+	var hit *PluginInstance
 	for _, inst := range m.List() {
-		if inst.Name == name {
-			return inst
+		if inst.Name == name && (hit == nil || inst.ID < hit.ID) {
+			hit = inst
 		}
 	}
-	return nil
+	return hit
 }
 
 // ConfigSchema returns the plugin's config schema exported via Register().
@@ -1003,24 +1006,26 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 	}
 	m.docMu.Unlock()
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: safeRedirect}
 	const maxDocSize = 2 << 20
 	for _, rawURL := range rawURLs {
 		resp, err := client.Get(rawURL)
 		if err != nil {
 			continue
 		}
-		content, err := io.ReadAll(io.LimitReader(resp.Body, maxDocSize+1))
-		_ = resp.Body.Close()
-		if err != nil || int64(len(content)) > maxDocSize {
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
 			continue
 		}
-		if resp.StatusCode == http.StatusOK && len(content) > 0 {
-			m.docMu.Lock()
-			m.docFetchCache[cacheKey] = docCacheEntry{content: string(content), ts: time.Now()}
-			m.docMu.Unlock()
-			return string(content)
+		content, err := io.ReadAll(io.LimitReader(resp.Body, maxDocSize+1))
+		_ = resp.Body.Close()
+		if err != nil || int64(len(content)) > maxDocSize || len(content) == 0 {
+			continue
 		}
+		m.docMu.Lock()
+		m.docFetchCache[cacheKey] = docCacheEntry{content: string(content), ts: time.Now()}
+		m.docMu.Unlock()
+		return string(content)
 	}
 	// 负面缓存：本次未取到（网络不通/无 README）也记录（TTL 内不再重试），
 	// 前端立即得到"没有 README"而非长时间转圈。
@@ -1032,15 +1037,14 @@ func (m *SubprocessManager) fetchRepoDoc(name string, candidates []string) strin
 
 // repoURLFor returns the plugin's repository URL (manifest Repo, else Source).
 func (m *SubprocessManager) repoURLFor(name string) string {
-	if man, err := LoadManifest(m.manifestPath()); err == nil {
-		for i := range man.Plugins {
-			e := &man.Plugins[i]
-			if e.Name == name || e.ID == name {
-				if e.Repo != "" {
-					return e.Repo
-				}
-				return e.Source
+	man := m.cachedManifest()
+	for i := range man.Plugins {
+		e := &man.Plugins[i]
+		if e.Name == name || e.ID == name {
+			if e.Repo != "" {
+				return e.Repo
 			}
+			return e.Source
 		}
 	}
 	return ""

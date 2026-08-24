@@ -47,8 +47,12 @@ async function submitAccountStage() {
   loading.value = true;
   apiError.value = '';
   try {
+    // hash 路由下 query 位于 # 之后，window.location.search 恒为空，
+    // 需从 hash 中解析 redirect。
+    const hash = window.location.hash.replace(/^#/, "");
+    const redirect = new URLSearchParams(hash.split("?")[1] || "").get("redirect");
     // @ts-ignore
-    authStore.returnUrl = new URLSearchParams(window.location.search).get('redirect');
+    authStore.returnUrl = redirect;
     const res = await authStore.login(username.value, password.value);
     if (res === 'totp_required') {
       goToTotpStage();

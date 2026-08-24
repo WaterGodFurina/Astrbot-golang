@@ -293,6 +293,7 @@
         },
         "messages": {
             "loadFailed": "Не удалось загрузить ключи",
+            "nameRequired": "Укажите название ключа",
             "scopeRequired": "Выберите хотя бы одну область доступа",
             "createSuccess": "API Key создан",
             "createFailed": "Ошибка создания ключа",

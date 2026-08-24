@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -698,6 +699,9 @@ func executeLocalShell(umo, senderID, command string, background bool, timeout i
 	if timeout <= 0 {
 		timeout = 300
 	}
+	if timeout > 600 {
+		timeout = 600 // 与沙箱路径一致，防止被提示注入的模型让宿主机进程长期驻留
+	}
 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
@@ -850,8 +854,10 @@ func executeShellSession(umo, senderID, action, sessionID, data string) string {
 		return string(out)
 	case "poll", "get", "status":
 		return shellSessionPoll(sessionID, umo, senderID)
-	case "write", "write_line":
-		return shellSessionWrite(sessionID, data, umo, senderID)
+	case "write":
+		return shellSessionWrite(sessionID, data, umo, senderID, false)
+	case "write_line":
+		return shellSessionWrite(sessionID, data, umo, senderID, true)
 	case "interrupt":
 		return shellSessionSignal(sessionID, false, umo, senderID)
 	case "terminate", "kill":
@@ -883,7 +889,9 @@ func shellSessionPoll(sessionID, umo, senderID string) string {
 	return string(st) + "\nOutput:\n" + tail
 }
 
-func shellSessionWrite(sessionID, data, umo, senderID string) string {
+// shellSessionWrite writes raw data to a session's stdin. addNewline appends
+// a real line feed (the write_line action) so the session receives it.
+func shellSessionWrite(sessionID, data, umo, senderID string, addNewline bool) string {
 	shellSessionsMu.Lock()
 	s, ok := shellSessions[sessionID]
 	shellSessionsMu.Unlock()
@@ -896,7 +904,10 @@ func shellSessionWrite(sessionID, data, umo, senderID string) string {
 	if s.Stdin == nil {
 		return "Session " + sessionID + " does not accept input."
 	}
-	if _, err := io.WriteString(s.Stdin, data+"\n"); err != nil {
+	if addNewline {
+		data += "\n"
+	}
+	if _, err := io.WriteString(s.Stdin, data); err != nil {
 		return "Error writing to session: " + err.Error()
 	}
 	return "Written to session " + sessionID + "."
@@ -934,6 +945,9 @@ func executeLocalPython(umo, code string, timeout int) string {
 	}
 	if timeout <= 0 {
 		timeout = 30
+	}
+	if timeout > 600 {
+		timeout = 600 // 与沙箱路径一致
 	}
 	ws := workspaceRoot(umo)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
@@ -982,10 +996,27 @@ func executeFileRead(path, umo string, offset, limit int) string {
 		return fmt.Sprintf("Error: '%s' is a directory, not a file. "+
 			"Use a file path instead, or use 'astrbot_execute_shell' to list directory contents.", resolved)
 	}
-	// 先 stat 判断大小：超限文件拒绝整体读入内存，提示用 offset/limit 分段读取。
+	// 先 stat 判断大小：超限文件拒绝整体读入内存。带 offset/limit 时走
+	// 分页路径（按行流式读取，不整体载入内存），否则提示用 offset/limit。
 	if info.Size() > maxFileReadBytes {
-		return fmt.Sprintf("Error reading file: %s is %d bytes, exceeds the %d-byte read limit. "+
-			"Use offset/limit to read a portion of the file.", resolved, info.Size(), maxFileReadBytes)
+		if offset <= 0 && limit <= 0 {
+			return fmt.Sprintf("Error reading file: %s is %d bytes, exceeds the %d-byte read limit. "+
+				"Use offset/limit to read a portion of the file.", resolved, info.Size(), maxFileReadBytes)
+		}
+		f, err := os.Open(resolved)
+		if err != nil {
+			return "Error reading file: " + err.Error()
+		}
+		defer f.Close()
+		var lines []string
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for i := 0; sc.Scan() && (limit <= 0 || i < offset+limit); i++ {
+			if i >= offset {
+				lines = append(lines, sc.Text())
+			}
+		}
+		return fmt.Sprintf("Read %d lines from %s:\n%s", len(lines), resolved, strings.Join(lines, "\n"))
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil {

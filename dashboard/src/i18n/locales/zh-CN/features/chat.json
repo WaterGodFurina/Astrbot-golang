@@ -11,7 +11,8 @@
     "recordingPrompt": "录音中，请说话...",
     "chatPrompt": "聊天吧!",
     "dropToUpload": "松开鼠标上传文件",
-    "stopGenerating": "停止生成"
+    "stopGenerating": "停止生成",
+    "fileTooLarge": "文件 {name} 超过 4GB 上限，已跳过"
   },
   "message": {
     "user": "用户",

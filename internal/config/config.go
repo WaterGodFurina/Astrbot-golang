@@ -18,7 +18,6 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
-	"time"
 )
 
 var logger = log.GetDefault().WithComponent("Config")
@@ -139,64 +138,61 @@ func applyOrderTemplate(v interface{}, tmpl *OrderedJSON) interface{} {
 	}
 }
 
-// New creates a new AstrBotConfig. If the config file doesn't exist,
-// it's created from defaults. Integrity is checked and missing keys are added.
-func New(configPath string, defaults map[string]interface{}, schema map[string]interface{}) (*AstrBotConfig, error) {
-	cfg := &AstrBotConfig{
-		configPath: configPath,
-		data:       make(map[string]interface{}),
-		schema:     schema,
+// defaultConfigMap returns the generated full default config as a map — the
+// single source of truth for config completeness (checkConfigIntegrity fills
+// only missing keys, so existing user configs migrate idempotently).
+func defaultConfigMap() map[string]interface{} {
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(DefaultConfigJSON()), &m); err != nil {
+		return map[string]interface{}{}
 	}
-
-	if schema != nil {
-		defaults = schemaToDefaults(schema)
-	}
-	if defaults == nil {
-		defaults = make(map[string]interface{})
-	}
-	cfg.defaultConf = defaults
-
-	if !fileExists(configPath) {
-		cfg.data = copyMap(defaults)
-		if err := cfg.save(4); err != nil {
-			return nil, fmt.Errorf("create default config: %w", err)
-		}
-		logger.I18nInfo("未找到配置文件，已使用默认配置创建: %s", configPath)
-	}
-
-	raw, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
-	}
-	// Strip UTF-8 BOM
-	raw = stripBOM(raw)
-
-	var conf map[string]interface{}
-	if err := json.Unmarshal(raw, &conf); err != nil {
-		return nil, fmt.Errorf("parse config JSON: %w", err)
-	}
-
-	hasNew := checkConfigIntegrity(defaults, conf, "")
-	cfg.data = conf
-	if hasNew {
-		// Reuse save() for the integrity write-back so it is atomic
-		// (temp file + rename) instead of a plain non-atomic os.WriteFile.
-		if err := cfg.save(4); err != nil {
-			return nil, fmt.Errorf("write config: %w", err)
-		}
-	}
-	return cfg, nil
+	return m
 }
 
-// Get retrieves a value by key. Returns nil if not found. Nested maps are
-// deep-copied so callers can never mutate the live config data (and their
-// reads cannot race concurrent Set/Update writes).
+// Get retrieves a value by key. Returns nil if not found. Nested maps and
+// slices are deep-copied so callers can never mutate the live config data (and
+// their reads cannot race concurrent Set/Update writes).
 func (c *AstrBotConfig) Get(key string) interface{} {
 	c.mu.RLock()
 	v := c.data[key]
 	c.mu.RUnlock()
-	if m, ok := v.(map[string]interface{}); ok {
-		return copyMap(m)
+	switch t := v.(type) {
+	case map[string]interface{}:
+		return copyMap(t)
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = deepCopyValue(e)
+		}
+		return out
+	}
+	return v
+}
+
+// GetNested retrieves a value by path (e.g. GetNested("umo_alias", umo))
+// without deep-copying the whole config tree; containers are deep-copied like
+// Get so the returned value never aliases live data.
+func (c *AstrBotConfig) GetNested(keys ...string) interface{} {
+	c.mu.RLock()
+	var v interface{} = c.data
+	for _, k := range keys {
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			c.mu.RUnlock()
+			return nil
+		}
+		v = m[k]
+	}
+	c.mu.RUnlock()
+	switch t := v.(type) {
+	case map[string]interface{}:
+		return copyMap(t)
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = deepCopyValue(e)
+		}
+		return out
 	}
 	return v
 }
@@ -472,33 +468,6 @@ func checkConfigIntegrity(refer, conf map[string]interface{}, path string) bool 
 	return hasNew
 }
 
-// schemaToDefaults converts a schema to a default config map.
-func schemaToDefaults(schema map[string]interface{}) map[string]interface{} {
-	result := make(map[string]interface{})
-	for k, v := range schema {
-		item, ok := v.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		typeStr, _ := item["type"].(string)
-		st := SchemaType(typeStr)
-
-		if st == SchemaObject {
-			childSchema, _ := item["items"].(map[string]interface{})
-			result[k] = schemaToDefaults(childSchema)
-		} else {
-			if def, exists := item["default"]; exists {
-				result[k] = def
-			} else {
-				result[k] = defaultForType(st)
-			}
-		}
-	}
-	return result
-}
-
-// Helper functions
-
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
@@ -570,30 +539,20 @@ func repeatSpace(n int) string {
 	return string(b)
 }
 
-// SchemaNode describes a config field's type and default.
-// Used by defaults.go to build the default config tree.
-type SchemaNode struct {
-	Type         SchemaType
-	DefaultValue interface{}
-	Optional     bool
-	Description  string
-	Children     map[string]*SchemaNode // for object type
-	Items        *SchemaNode            // for list type
-}
-
-// NewConfig creates an AstrBotConfig from a path and schema. When the config
-// file already exists it is loaded (and integrity-checked) immediately, so a
-// fresh config is never left empty; when it is missing the defaults are saved.
-// A failed load is logged (the caller may still retry Load or reset).
-func NewConfig(path string, schema *SchemaNode) *AstrBotConfig {
-	defaults := schemaToDefaultsMap(schema)
+// NewConfig creates an AstrBotConfig at the given path, seeded with the full
+// generated default config (single source of truth; see DefaultConfigJSON).
+// When the config file already exists it is loaded (and integrity-checked)
+// immediately, so a fresh config is never left empty; when it is missing the
+// defaults are saved. A failed load is logged (the caller may still retry Load
+// or reset).
+func NewConfig(path string) *AstrBotConfig {
 	cfg := &AstrBotConfig{
 		configPath:  path,
 		data:        make(map[string]interface{}),
-		defaultConf: defaults,
+		defaultConf: defaultConfigMap(),
 	}
 	if !fileExists(path) {
-		cfg.data = copyMap(defaults)
+		cfg.data = copyMap(cfg.defaultConf)
 		if err := cfg.save(4); err != nil {
 			logger.Error("Failed to create default config: %v", err)
 		}
@@ -639,33 +598,6 @@ func (c *AstrBotConfig) ResetToDefaults() {
 	c.mu.Unlock()
 }
 
-// schemaToDefaultsMap converts a SchemaNode tree to a default value map.
-func schemaToDefaultsMap(node *SchemaNode) map[string]interface{} {
-	result := make(map[string]interface{})
-	if node == nil || node.Children == nil {
-		return result
-	}
-	for k, child := range node.Children {
-		switch child.Type {
-		case SchemaObject:
-			if len(child.Children) > 0 {
-				result[k] = schemaToDefaultsMap(child)
-			} else {
-				result[k] = make(map[string]interface{})
-			}
-		case SchemaList, SchemaTemplateList:
-			result[k] = []interface{}{}
-		default:
-			if child.DefaultValue != nil {
-				result[k] = child.DefaultValue
-			} else {
-				result[k] = defaultForType(child.Type)
-			}
-		}
-	}
-	return result
-}
-
 // ConfigManager manages multiple config files (global + per-platform).
 type ConfigManager struct {
 	confs  map[string]*AstrBotConfig
@@ -705,6 +637,3 @@ func (cm *ConfigManager) IDs() []string {
 	}
 	return ids
 }
-
-// Timestamp returns the current time (used for config metadata).
-func Timestamp() time.Time { return time.Now() }

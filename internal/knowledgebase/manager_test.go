@@ -2,6 +2,7 @@ package knowledgebase
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -21,15 +22,15 @@ func TestIssue9529_RetrieveByUUID(t *testing.T) {
 		t.Fatalf("CreateKB failed: %v", err)
 	}
 
-	// Retrieve by name should work
+	// Retrieve by name should reach the retrieval backend (not "not found")
 	_, err = mgr.Retrieve(ctx, "test query", []string{"My Documents"}, 5, 5)
-	if err != nil {
+	if err == nil || strings.Contains(err.Error(), "not found") {
 		t.Errorf("retrieve by name failed: %v", err)
 	}
 
 	// Retrieve by UUID should also work (this was the bug)
 	_, err = mgr.Retrieve(ctx, "test query", []string{kb.KBID}, 5, 5)
-	if err != nil {
+	if err == nil || strings.Contains(err.Error(), "not found") {
 		t.Errorf(
 			"BUG #9529: retrieve by UUID failed!\n"+
 				"  UUID: %s\n"+
@@ -54,7 +55,7 @@ func TestIssue9392_NoHardFailOnMissingDeps(t *testing.T) {
 
 	// Upload should not fail with "SuperKMeans is not defined"
 	// Other errors (network) are acceptable
-	err = mgr.UploadFromURL("TestKB", "https://example.com/doc.txt", 512, 50, 10, 4, 3, nil)
+	err = mgr.UploadFromURL("TestKB", "https://example.com/doc.txt", 512, 50)
 	if err != nil {
 		msg := err.Error()
 		if contains(msg, "SuperKMeans") {

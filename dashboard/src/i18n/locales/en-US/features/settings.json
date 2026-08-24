@@ -293,6 +293,7 @@
     },
     "messages": {
       "loadFailed": "Failed to load API keys",
+      "nameRequired": "Please enter a key name",
       "scopeRequired": "Please select at least one scope",
       "createSuccess": "API key created",
       "createFailed": "Failed to create API key",

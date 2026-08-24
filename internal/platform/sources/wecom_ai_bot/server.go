@@ -146,6 +146,8 @@ func (s *WecomAIBotServer) Start() error {
 		Addr:              fmt.Sprintf("%s:%d", s.host, s.port),
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	logger.I18nInfo("启动企业微信智能机器人服务器，监听 %s:%d", s.host, s.port)
 	go func() {

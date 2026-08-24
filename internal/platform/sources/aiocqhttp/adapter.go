@@ -622,7 +622,11 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if _, hasPost := msg["post_type"]; hasPost {
-			events <- msg
+			select {
+			case events <- msg:
+			default:
+				logger.I18nWarn("aiocqhttp: 事件处理队列已满，丢弃一条事件（echo 通道不受影响）")
+			}
 			continue
 		}
 		if echo, hasEcho := msg["echo"].(string); hasEcho {

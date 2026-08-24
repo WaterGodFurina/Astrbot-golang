@@ -621,7 +621,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         await checkUpdate();
       }
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     } finally {
       if (withLoading) {
         loading_.value = false;
@@ -1111,7 +1111,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         }
       }, 1000);
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     }
   };
 
@@ -1221,7 +1221,7 @@ export const useExtensionPage = (initialTab = "installed") => {
 
       await checkAndPromptConflicts();
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     } finally {
       extension.__toggle_pending = false;
     }
@@ -1240,7 +1240,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       toast(res.data.message, "success");
       await getExtensions();
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     } finally {
       extension.__toggle_pending = false;
     }
@@ -1261,7 +1261,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       extension_config.i18n = res.data.data.i18n || {};
       extension_config.log_level = res.data.data.log_level ?? null;
     } catch (err) {
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     }
   };
 
@@ -1296,7 +1296,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       if (curr_namespace.value === pluginName) {
         extension_config.log_level = previous;
       }
-      toast(err, "error");
+      toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
     } finally {
       pluginLogLevelSaving.value = false;
     }
@@ -2814,9 +2814,14 @@ export const useExtensionPage = (initialTab = "installed") => {
   // 监听语言切换事件
   window.addEventListener("astrbot-locale-changed", handleLocaleChange);
 
-  // 清理事件监听器
+  // 清理事件监听器与定时器
   onUnmounted(() => {
     window.removeEventListener("astrbot-locale-changed", handleLocaleChange);
+    stopInstallProgressPolling();
+    if (searchDebounceTimer) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = null;
+    }
   });
 
   // 搜索防抖处理

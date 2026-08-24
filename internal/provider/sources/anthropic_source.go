@@ -80,10 +80,10 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return &provider.LLMResponse{
 			Role:           "err",
-			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, string(respBody)),
+			CompletionText: fmt.Sprintf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024)),
 		}, nil
 	}
 	var result struct {
@@ -96,8 +96,10 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 		} `json:"content"`
 		Role  string `json:"role"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -109,8 +111,9 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 		ToolsCallName: []string{},
 		ToolsCallIDs:  []string{},
 		Usage: &provider.TokenUsage{
-			InputOther: result.Usage.InputTokens,
-			Output:     result.Usage.OutputTokens,
+			InputOther:  result.Usage.InputTokens,
+			InputCached: result.Usage.CacheReadInputTokens,
+			Output:      result.Usage.OutputTokens,
 		},
 	}
 	var text strings.Builder
@@ -143,9 +146,9 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		_ = resp.Body.Close()
-		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(respBody), 1024))
 	}
 
 	ch := make(chan *provider.LLMResponse, 100)
@@ -197,8 +200,10 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 				Message *struct {
 					ID    string `json:"id"`
 					Usage struct {
-						InputTokens  int `json:"input_tokens"`
-						OutputTokens int `json:"output_tokens"`
+						InputTokens              int `json:"input_tokens"`
+						OutputTokens             int `json:"output_tokens"`
+						CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+						CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 					} `json:"usage"`
 				} `json:"message"`
 				ContentBlock *struct {
@@ -212,8 +217,10 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 					PartialJSON string `json:"partial_json"`
 				} `json:"delta"`
 				Usage *struct {
-					InputTokens  int `json:"input_tokens"`
-					OutputTokens int `json:"output_tokens"`
+					InputTokens              int `json:"input_tokens"`
+					OutputTokens             int `json:"output_tokens"`
+					CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+					CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 				} `json:"usage"`
 				Error *struct {
 					Type    string `json:"type"`
@@ -228,6 +235,7 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 				if event.Message != nil {
 					responseID = event.Message.ID
 					usage.InputOther = event.Message.Usage.InputTokens
+					usage.InputCached = event.Message.Usage.CacheReadInputTokens
 					usage.Output = event.Message.Usage.OutputTokens
 				}
 			case "content_block_start":
@@ -264,6 +272,8 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 				}
 			case "message_delta":
 				if event.Usage != nil {
+					usage.InputOther = event.Usage.InputTokens
+					usage.InputCached = event.Usage.CacheReadInputTokens
 					usage.Output = event.Usage.OutputTokens
 				}
 			case "message_stop":

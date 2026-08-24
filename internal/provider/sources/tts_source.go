@@ -92,10 +92,17 @@ func (s *OpenAITTSSource) GetAudio(ctx context.Context, text string) (string, er
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	const maxTTSBytes = 100 << 20 // 100MB，足够任意长语音
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxTTSBytes+1))
+	if err != nil {
 		_ = f.Close()
 		_ = os.Remove(path)
 		return "", err
+	}
+	if n > maxTTSBytes {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("tts audio exceeds %d bytes", maxTTSBytes)
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(path)
