@@ -86,7 +86,10 @@ func (tc *Toolchain) GoBin() (string, error) {
 	}
 
 	if tc.BundledRoot() != "" {
-		if bin := filepath.Join(tc.BundledRoot(), "bin", exe("go")); tc.isExecutable(bin) {
+		// 归档解压产物保留顶层 go/ 目录（GOROOT = root/go），go 二进制在
+		// root/go/bin/go(.exe)——之前漏拼 go/ 子目录导致永远找不到已下载
+		// 的 bundled 工具链（每次重启报 no toolchain、每次插件安装重下）。
+		if bin := filepath.Join(tc.BundledRoot(), "go", "bin", exe("go")); tc.isExecutable(bin) {
 			logger.Info("Using bundled Go toolchain: %s", bin)
 			return bin, nil
 		}
