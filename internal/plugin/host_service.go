@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,9 +33,26 @@ func ComponentsFromSDK(chain []pluginsdk.Component) []message.Component {
 		case pluginsdk.CompAt:
 			out = append(out, &message.At{TargetID: c.TargetID, Name: c.Name})
 		case pluginsdk.CompImage:
-			out = append(out, &message.Image{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID})
+			img := &message.Image{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID}
+			// data:image/...;base64,xxx / base64://xxx 形式的图片内容归一化到
+			// Base64 字段（Python 插件 text_to_image/html_render 返回 data URI，
+			// 若不归一化会被当作本地文件路径发送 → OneBot stat ENAMETOOLONG）。
+			if img.Base64 == "" {
+				if b64, ok := mediaDataURIToBase64(c.File); ok {
+					img.Base64 = b64
+					img.File = ""
+				}
+			}
+			out = append(out, img)
 		case pluginsdk.CompRecord:
-			out = append(out, &message.Record{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID})
+			rec := &message.Record{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID}
+			if rec.Base64 == "" {
+				if b64, ok := mediaDataURIToBase64(c.File); ok {
+					rec.Base64 = b64
+					rec.File = ""
+				}
+			}
+			out = append(out, rec)
 		case pluginsdk.CompFile:
 			out = append(out, &message.File{URL: c.URL, Path: c.Path, FileID: c.FileID, Name: c.Name})
 		case pluginsdk.CompVideo:
@@ -50,6 +68,23 @@ func ComponentsFromSDK(chain []pluginsdk.Component) []message.Component {
 		}
 	}
 	return out
+}
+
+// mediaDataURIToBase64 提取 data:media;base64,xxx 或 base64://xxx 形式的
+// 媒体内容为裸 base64；非此类字符串返回 ok=false。
+func mediaDataURIToBase64(v string) (string, bool) {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return "", false
+	}
+	if rest, found := strings.CutPrefix(s, "base64://"); found {
+		return rest, true
+	}
+	lower := strings.ToLower(s)
+	if idx := strings.Index(lower, ";base64,"); idx >= 0 && strings.HasPrefix(lower, "data:") {
+		return s[idx+len(";base64,"):], true
+	}
+	return "", false
 }
 
 // CallActionAdapter is implemented by platform adapters that can serve generic
