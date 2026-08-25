@@ -814,7 +814,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		},
 
 		// ── 插件/Star 管理（对齐 Python star_manager）──
-ListStars: func() []map[string]any {
+		ListStars: func() []map[string]any {
 			// 用子进程插件的静态清单（含已安装但休眠/禁用的插件），对齐
 			// Python 原版 star_registry 语义（原版插件全常驻、注册表含全部
 			// 插件）：update_manager 等依赖 get_all_stars 枚举全部插件以

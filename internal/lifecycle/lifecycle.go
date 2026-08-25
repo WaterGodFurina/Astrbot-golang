@@ -329,17 +329,17 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			out := make([]map[string]any, 0, len(descs))
 			for _, d := range descs {
 				out = append(out, map[string]any{
-					"plugin_name":        d.PluginName,
-					"handler_full_name":  d.HandlerFullName,
-					"handler_name":       d.HandlerName,
-					"command":            d.EffectiveCommand,
-					"aliases":            d.Aliases,
-					"description":        d.Description,
-					"permission":         d.Permission,
-					"enabled":            d.Enabled,
-					"parent_group":       d.ParentSignature,
-					"is_sub_command":     d.IsSubCommand,
-					"command_type":       d.CommandType,
+					"plugin_name":       d.PluginName,
+					"handler_full_name": d.HandlerFullName,
+					"handler_name":      d.HandlerName,
+					"command":           d.EffectiveCommand,
+					"aliases":           d.Aliases,
+					"description":       d.Description,
+					"permission":        d.Permission,
+					"enabled":           d.Enabled,
+					"parent_group":      d.ParentSignature,
+					"is_sub_command":    d.IsSubCommand,
+					"command_type":      d.CommandType,
 				})
 			}
 			return out

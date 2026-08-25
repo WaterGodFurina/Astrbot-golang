@@ -1026,7 +1026,7 @@ const (
 var (
 	t2iEndpointsMu    sync.Mutex
 	t2iEndpointsCache []string
-	t2iEndpointsAt   time.Time
+	t2iEndpointsAt    time.Time
 )
 
 // t2iResolvedEndpoints 解析远程 t2i 端点列表：
