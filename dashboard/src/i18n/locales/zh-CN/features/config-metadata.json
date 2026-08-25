@@ -869,15 +869,6 @@
         }
       }
     },
-    "t2i": {
-      "description": "文本转图像",
-      "t2i": {
-        "description": "文本转图像输出"
-      },
-      "t2i_word_threshold": {
-        "description": "文本转图像字数阈值"
-      }
-    },
     "others": {
       "description": "其他配置",
       "platform_settings": {
@@ -1203,6 +1194,18 @@
         "description": "Go 构建额外参数",
         "hint": "附加到 go build 的参数，如 -tags xxx"
       }
+    }
+  },
+  "misc_config_group": {
+    "name": "其他设置",
+    "description": "其他杂项设置",
+    "t2i": {
+      "description": "文本转图像输出",
+      "hint": "开启后，回复文本超过字数阈值时将以图片形式发送"
+    },
+    "t2i_word_threshold": {
+      "description": "文本转图像字数阈值",
+      "hint": "回复文本达到该字数时转为图片发送（默认 150）"
     }
   },
   "provider_group": {
