@@ -972,6 +972,29 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			id := subMgr.pluginConfigID(pluginName)
 			return subMgr.Uninstall(id, false, false)
 		},
+		ListPlatforms: func() []map[string]any {
+			// 全部已加载平台实例元数据（id/type/name/display_name）：
+			// 子进程架构下插件无法访问宿主 Go 平台对象，经此发现平台并
+			// 构造跨进程 bot 代理（call_action 转发宿主），群分析类插件
+			// 初始化时调用（非消息路径，无运行期开销）。
+			if pm == nil {
+				return nil
+			}
+			var out []map[string]any
+			for _, a := range pm.All() {
+				if a == nil {
+					continue
+				}
+				t := a.Type()
+				out = append(out, map[string]any{
+					"id":           a.ID(),
+					"type":         t,
+					"name":         t,
+					"display_name": a.ID(),
+				})
+			}
+			return out
+		},
 
 		// ── 会话等待（SessionWaiter 跨进程喂入）──
 		RegisterSessionWait: func(pluginName, umo string, timeoutSeconds int32) string {
