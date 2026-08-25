@@ -823,6 +823,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				var out []map[string]any
 				for _, info := range subMgr.ListInfo() {
 					name, _ := info["name"].(string)
+					instID, _ := info["id"].(string)
 					displayName, _ := info["display_name"].(string)
 					if displayName == "" {
 						displayName = name
@@ -836,17 +837,18 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 					repo, _ := info["repo"].(string)
 					activated, _ := info["activated"].(bool)
 					reserved, _ := info["reserved"].(bool)
-					out = append(out, map[string]any{
-						"name":         name,
-						"display_name": displayName,
-						"author":       author,
-						"desc":         desc,
-						"version":      version,
-						"module_path":  "data.plugins." + name,
-						"activated":    activated,
-						"repo":         repo,
-						"reserved":     reserved,
-					})
+				out = append(out, map[string]any{
+					"name":         name,
+					"id":           instID,
+					"display_name": displayName,
+					"author":       author,
+					"desc":         desc,
+					"version":      version,
+					"module_path":  "data.plugins." + name,
+					"activated":    activated,
+					"repo":         repo,
+					"reserved":     reserved,
+				})
 				}
 				return out
 			}
