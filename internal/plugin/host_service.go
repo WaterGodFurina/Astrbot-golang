@@ -814,11 +814,30 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		},
 
 		// ── 插件/Star 管理（对齐 Python star_manager）──
-		ListStars: func() []map[string]any {
+ListStars: func() []map[string]any {
 			// 用子进程插件的静态清单（含已安装但休眠/禁用的插件），对齐
 			// Python 原版 star_registry 语义（原版插件全常驻、注册表含全部
 			// 插件）：update_manager 等依赖 get_all_stars 枚举全部插件以
 			// 填充黑/白名单选项的管理类插件，不能只看到运行中插件。
+			// 每插件附带 commands（宿主聚合的指令描述符）：helps 类插件经
+			// 现有 ListStars 通道跨进程枚举全部插件指令（SDK 注册完成后
+			// 一次性注入本进程注册表，0 运行期开销）。
+			commandsByPlugin := map[string][]map[string]any{}
+			if starMgr != nil {
+				for _, d := range starMgr.CommandDescriptors() {
+					pid, _ := d["plugin_name"].(string)
+					if pid == "" {
+						continue
+					}
+					commandsByPlugin[pid] = append(commandsByPlugin[pid], d)
+				}
+			}
+			withCommands := func(id string, base map[string]any) map[string]any {
+				if cmds := commandsByPlugin[id]; len(cmds) > 0 {
+					base["commands"] = cmds
+				}
+				return base
+			}
 			if subMgr != nil {
 				var out []map[string]any
 				for _, info := range subMgr.ListInfo() {
@@ -837,18 +856,18 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 					repo, _ := info["repo"].(string)
 					activated, _ := info["activated"].(bool)
 					reserved, _ := info["reserved"].(bool)
-				out = append(out, map[string]any{
-					"name":         name,
-					"id":           instID,
-					"display_name": displayName,
-					"author":       author,
-					"desc":         desc,
-					"version":      version,
-					"module_path":  "data.plugins." + name,
-					"activated":    activated,
-					"repo":         repo,
-					"reserved":     reserved,
-				})
+					out = append(out, withCommands(instID, map[string]any{
+						"name":         name,
+						"id":           instID,
+						"display_name": displayName,
+						"author":       author,
+						"desc":         desc,
+						"version":      version,
+						"module_path":  "data.plugins." + name,
+						"activated":    activated,
+						"repo":         repo,
+						"reserved":     reserved,
+					}))
 				}
 				return out
 			}
@@ -861,7 +880,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				if m == nil {
 					continue
 				}
-				out = append(out, map[string]any{
+				out = append(out, withCommands(m.PluginID, map[string]any{
 					"name":        m.Name,
 					"author":      m.Author,
 					"desc":        m.Desc,
@@ -869,7 +888,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 					"module_path": m.StarModulePath,
 					"activated":   m.Activated,
 					"repo":        m.Repo,
-				})
+				}))
 			}
 			return out
 		},
@@ -952,15 +971,6 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			id := subMgr.pluginConfigID(pluginName)
 			return subMgr.Uninstall(id, false, false)
-		},
-		ListCommandDescriptors: func() []map[string]any {
-			// 全局命令描述符（含内置指令 + 所有子进程插件的指令，经宿主
-			// star 注册表聚合）：子进程架构下插件自身进程的注册表只含自己
-			// 的 handler，helps 类插件需经此枚举全部插件的指令。
-			if starMgr == nil {
-				return nil
-			}
-			return starMgr.CommandDescriptors()
 		},
 
 		// ── 会话等待（SessionWaiter 跨进程喂入）──
