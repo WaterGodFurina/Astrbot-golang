@@ -307,17 +307,44 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// back into the host. 同时注入会话/人格/Provider/Star 管理器，供插件
 	// 反向调用会话管理、人格解析、Provider 选择与插件安装等管理能力。
 	// starMgr 以闭包（StarManagerLike）传入，规避 star→plugin 的导入环。
-	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins, l.conversationMgr, l.providerMgr, plugin.StarManagerLikeFunc(func() []any {
-		if l.starMgr == nil {
-			return nil
-		}
-		metas := l.starMgr.Registry().All()
-		out := make([]any, 0, len(metas))
-		for _, m := range metas {
-			out = append(out, m)
-		}
-		return out
-	}), l.configMgr)
+	// CommandDescriptors 用 star.CollectCommandDescriptors 聚合全局命令
+	//（内置 + 子进程插件），供插件桥跨进程枚举指令。
+	plugin.SetHostService(l.platformMgr, l.subPluginMgr, l.chatLLMForPlugins, l.conversationMgr, l.providerMgr, plugin.StarManagerLikeFunc{
+		Fn: func() []any {
+			if l.starMgr == nil {
+				return nil
+			}
+			metas := l.starMgr.Registry().All()
+			out := make([]any, 0, len(metas))
+			for _, m := range metas {
+				out = append(out, m)
+			}
+			return out
+		},
+		CmdFn: func() []map[string]any {
+			if l.starMgr == nil {
+				return nil
+			}
+			descs := star.CollectCommandDescriptors(l.starMgr.Handlers())
+			out := make([]map[string]any, 0, len(descs))
+			for _, d := range descs {
+				out = append(out, map[string]any{
+					"plugin_name":        d.PluginName,
+					"handler_full_name":  d.HandlerFullName,
+					"handler_name":       d.HandlerName,
+					"command":            d.EffectiveCommand,
+					"aliases":            d.Aliases,
+					"description":        d.Description,
+					"permission":         d.Permission,
+					"enabled":            d.Enabled,
+					"parent_group":       d.ParentSignature,
+					"is_sub_command":     d.IsSubCommand,
+					"command_type":       d.CommandType,
+				})
+			}
+			return out
+		},
+	}, l.configMgr)
 	// 能力接线：先注入固定能力集（平台尚未加载，All() 为空），插件进程
 	// 启动时即带 ASTRBOT_HOST_CAPABILITIES 环境变量；loadPlatforms 完成后
 	// 再同步一次（含平台 ID），供后续懒加载/重载的插件使用。

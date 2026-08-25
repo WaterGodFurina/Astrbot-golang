@@ -298,18 +298,34 @@ func defaultPersona() map[string]any {
 type StarManagerLike interface {
 	// StarMetadataList 返回全部插件元数据（*star.StarMetadata 的 any 包装）。
 	StarMetadataList() []any
+	// CommandDescriptors 返回全部插件的命令描述符（含子命令/组/别名/权限/
+	// 描述，map 序列化）。供插件桥查询全局指令列表（子进程架构下 helps 类
+	// 插件无法从自身进程的注册表枚举其他插件指令）。
+	CommandDescriptors() []map[string]any
 }
 
 // StarManagerLikeFunc 是 StarManagerLike 的函数式适配器，供调用方用闭包
-// 便捷构造（避免在 plugin 包内匿名 struct 样板）。
-type StarManagerLikeFunc func() []any
+// 便捷构造（避免在 plugin 包内匿名 struct 样板）。CmdFn 为 nil 时
+// CommandDescriptors 返回 nil。
+type StarManagerLikeFunc struct {
+	Fn    func() []any
+	CmdFn func() []map[string]any
+}
 
 // StarMetadataList implements StarManagerLike.
 func (f StarManagerLikeFunc) StarMetadataList() []any {
-	if f == nil {
+	if f.Fn == nil {
 		return nil
 	}
-	return f()
+	return f.Fn()
+}
+
+// CommandDescriptors implements StarManagerLike.
+func (f StarManagerLikeFunc) CommandDescriptors() []map[string]any {
+	if f.CmdFn == nil {
+		return nil
+	}
+	return f.CmdFn()
 }
 
 // StarMetadata 是插件元数据的只读视图（镜像 internal/star.StarMetadata 字段，
@@ -552,33 +568,20 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			return base64.StdEncoding.EncodeToString(data), nil
 		},
 		HtmlRender: func(template, data, options string) (string, error) {
-			// 优先远程 t2i：配置了 t2i_endpoint 时调用 RenderCustomTemplate
-			// （HTML 模板 + 数据 → 图片），失败回退本地 gg 渲染。
+			// 远程 t2i（HTML 模板 → 图片）：优先用户配置的 t2i_endpoint，
+			// 未配置时用官方默认端点（RenderCustomTemplate 内部解析，对齐
+			// 原版 ASTRBOT_T2I_DEFAULT_ENDPOINT + 官方端点列表容灾）。
+			// 远程失败直接返回错误，让插件降级到纯文本渲染（text_to_image）
+			// ——绝不能把 HTML 模板当纯文本渲染，否则帮助图显示 HTML 源码。
 			endpoint := ""
 			if cfgMgr != nil {
 				if cfg := cfgMgr.Get("default"); cfg != nil {
 					endpoint = cfg.GetString("t2i_endpoint")
 				}
 			}
-			if endpoint != "" {
-				img, err := t2i.RenderCustomTemplate(endpoint, template, data, options)
-				if err == nil {
-					return base64.StdEncoding.EncodeToString(img), nil
-				}
-				// 远程失败 → 回退本地渲染。
-				logger.Warn("html_render 远程 t2i 渲染失败（%v），回退本地渲染", err)
-			}
-			// 本地 gg 兜底：模板为空时用 data 作为渲染文本。
-			text := template
-			if text == "" {
-				text = data
-			}
-			if text == "" {
-				return "", fmt.Errorf("html_render: 模板与数据均为空，无法渲染")
-			}
-			img, err := t2i.RenderTextToPNG(text, t2i.ImageOptions{})
+			img, err := t2i.RenderCustomTemplate(endpoint, template, data, options)
 			if err != nil {
-				return "", fmt.Errorf("html_render 本地渲染失败: %w", err)
+				return "", fmt.Errorf("html_render 远程渲染失败: %w", err)
 			}
 			return base64.StdEncoding.EncodeToString(img), nil
 		},
@@ -947,6 +950,15 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			id := subMgr.pluginConfigID(pluginName)
 			return subMgr.Uninstall(id, false, false)
+		},
+		ListCommandDescriptors: func() []map[string]any {
+			// 全局命令描述符（含内置指令 + 所有子进程插件的指令，经宿主
+			// star 注册表聚合）：子进程架构下插件自身进程的注册表只含自己
+			// 的 handler，helps 类插件需经此枚举全部插件的指令。
+			if starMgr == nil {
+				return nil
+			}
+			return starMgr.CommandDescriptors()
 		},
 
 		// ── 会话等待（SessionWaiter 跨进程喂入）──

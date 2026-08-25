@@ -920,10 +920,27 @@ func RenderRemote(endpoint, text, templateName string) ([]byte, error) {
 // 的 endpoint 约定），取其父路径再拼 /text2img；已是 /text2img 结尾则原样使用；
 // 否则直接拼接 /text2img（对齐 Python 原版
 // ASTRBOT_T2I_DEFAULT_ENDPOINT="https://t2i.soulter.top/text2img"）。
+//
+// endpoint 为空时使用官方默认端点；官方端点列表（api.soulter.top/astrbot/
+// t2i-endpoints）拉取成功时按序逐个尝试（对齐原版 network_strategy 的多端点
+// 容灾），全部失败返回最后错误。
 func RenderCustomTemplate(endpoint, template, data, options string) ([]byte, error) {
-	if endpoint == "" {
+	endpoints := t2iResolvedEndpoints(endpoint)
+	if len(endpoints) == 0 {
 		return nil, fmt.Errorf("t2i: remote endpoint is empty")
 	}
+	var lastErr error
+	for _, ep := range endpoints {
+		img, err := renderCustomTemplateAt(ep, template, data, options)
+		if err == nil {
+			return img, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func renderCustomTemplateAt(endpoint, template, data, options string) ([]byte, error) {
 	url := strings.TrimRight(endpoint, "/")
 	if strings.HasSuffix(url, "/t2i") {
 		url = strings.TrimSuffix(url, "/t2i")
@@ -995,6 +1012,80 @@ func isImageData(b []byte) bool {
 		bytes.HasPrefix(b, []byte("\xFF\xD8")) ||
 		bytes.HasPrefix(b, []byte("GIF8")) ||
 		bytes.HasPrefix(b, []byte("RIFF"))
+}
+
+// 官方远程 t2i 默认端点与官方端点列表（对齐 Python 原版
+// ASTRBOT_T2I_DEFAULT_ENDPOINT / get_official_endpoints）。
+const (
+	T2IDefaultEndpoint       = "https://t2i.soulter.top/text2img"
+	t2iOfficialEndpointsURL  = "https://api.soulter.top/astrbot/t2i-endpoints"
+	t2iEndpointsCacheTTL     = 10 * time.Minute
+	t2iEndpointsRequestLimit = 16 << 10 // 16 KiB
+)
+
+var (
+	t2iEndpointsMu    sync.Mutex
+	t2iEndpointsCache []string
+	t2iEndpointsAt   time.Time
+)
+
+// t2iResolvedEndpoints 解析远程 t2i 端点列表：
+//   - endpoint 非空 → 仅该端点（显式配置优先）
+//   - 否则默认官方端点 + 官方端点列表（拉取失败回退默认端点）
+func t2iResolvedEndpoints(endpoint string) []string {
+	if ep := strings.TrimSpace(endpoint); ep != "" {
+		return []string{ep}
+	}
+	t2iEndpointsMu.Lock()
+	defer t2iEndpointsMu.Unlock()
+	if len(t2iEndpointsCache) > 0 && time.Since(t2iEndpointsAt) < t2iEndpointsCacheTTL {
+		return t2iEndpointsCache
+	}
+	eps := []string{T2IDefaultEndpoint}
+	if list := fetchOfficialT2IEndpoints(); len(list) > 0 {
+		eps = list
+	}
+	t2iEndpointsCache, t2iEndpointsAt = eps, time.Now()
+	return eps
+}
+
+// fetchOfficialT2IEndpoints 从官方接口拉取可用 t2i 端点（网络失败返回 nil，
+// 调用方回退默认端点）。
+func fetchOfficialT2IEndpoints() []string {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(t2iOfficialEndpointsURL)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, t2iEndpointsRequestLimit))
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		Data []struct {
+			URL    string `json:"url"`
+			Active bool   `json:"active"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return nil
+	}
+	var out []string
+	for _, ep := range payload.Data {
+		u := strings.TrimSpace(ep.URL)
+		if u == "" || !ep.Active {
+			continue
+		}
+		out = append(out, u)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func decodeBase64Image(s string) ([]byte, error) {
