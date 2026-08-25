@@ -43,6 +43,16 @@ func ComponentsFromSDK(chain []pluginsdk.Component) []message.Component {
 					img.File = ""
 				}
 			}
+			// SDK Image.fromFileSystem 对 data URI 误做 Path.resolve 时，伪装
+			// 成绝对路径的 data URI 会同时出现在 path 字段（file 为 file://
+			// URI）：path 一律清除（含 base64 已提取的场景），防止其他适配器
+			// 按路径读取失败。
+			if b64, ok := mediaDataURIToBase64(c.Path); ok {
+				if img.Base64 == "" {
+					img.Base64 = b64
+				}
+				img.Path = ""
+			}
 			out = append(out, img)
 		case pluginsdk.CompRecord:
 			rec := &message.Record{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID}
@@ -51,6 +61,12 @@ func ComponentsFromSDK(chain []pluginsdk.Component) []message.Component {
 					rec.Base64 = b64
 					rec.File = ""
 				}
+			}
+			if b64, ok := mediaDataURIToBase64(c.Path); ok {
+				if rec.Base64 == "" {
+					rec.Base64 = b64
+				}
+				rec.Path = ""
 			}
 			out = append(out, rec)
 		case pluginsdk.CompFile:
@@ -70,8 +86,15 @@ func ComponentsFromSDK(chain []pluginsdk.Component) []message.Component {
 	return out
 }
 
-// mediaDataURIToBase64 提取 data:media;base64,xxx 或 base64://xxx 形式的
-// 媒体内容为裸 base64；非此类字符串返回 ok=false。
+// mediaDataURIToBase64 提取 media 内容为裸 base64：
+//   - base64://xxx
+//   - data:image/png;base64,xxx（裸 data URI）
+//   - file://<插件CWD>/data:image/png;base64,xxx 或 <绝对路径>/data:image/...
+//     （Python SDK Image.fromFileSystem 对 data URI 误做 Path.resolve+as_uri
+//     后的形态——data URI 被当作相对路径拼到插件工作目录，宿主必须识别并
+//     归一化，否则会被当本地文件路径发送 → OneBot stat ENAMETOOLONG）
+//
+// 非此类字符串返回 ok=false。
 func mediaDataURIToBase64(v string) (string, bool) {
 	s := strings.TrimSpace(v)
 	if s == "" {
@@ -81,8 +104,15 @@ func mediaDataURIToBase64(v string) (string, bool) {
 		return rest, true
 	}
 	lower := strings.ToLower(s)
-	if idx := strings.Index(lower, ";base64,"); idx >= 0 && strings.HasPrefix(lower, "data:") {
-		return s[idx+len(";base64,"):], true
+	idx := strings.Index(lower, ";base64,")
+	if idx < 0 {
+		return "", false
+	}
+	// 要求 ";base64," 之前是 data:media 形态（允许 file:// 或绝对路径前缀）。
+	if dataIdx := strings.LastIndex(lower[:idx], "data:"); dataIdx >= 0 {
+		if strings.HasPrefix(lower[dataIdx:], "data:") {
+			return s[idx+len(";base64,"):], true
+		}
 	}
 	return "", false
 }
