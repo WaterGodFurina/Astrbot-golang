@@ -380,12 +380,25 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		m.manifestMu.Unlock()
 		return nil, fmt.Errorf("plugin %s not in install manifest", id)
 	}
-	source := entry.DownloadURL
+	// 更新时外部（dashboard，对齐 Python resolve_market_update_info）可能已从
+	// 插件原 registry 重新解析出该插件的最新下载源：显式传入的
+	// download_url/repo 优先于 manifest 快照，避免更新拉取固定旧版本 zip
+	//（manifest 的 download_url 指向具体版本，如 …/2.6.0/xxx-2.6.0-<sha>.zip，
+	// 直接用会永远装回旧版本）。
+	dlURL := entry.DownloadURL
+	if v := strings.TrimSpace(opts.DownloadURL); v != "" {
+		dlURL = v
+	}
+	repo := entry.Repo
+	if v := strings.TrimSpace(opts.Repo); v != "" {
+		repo = v
+	}
+	source := dlURL
 	if source == "" {
 		source = entry.Source
 	}
 	if source == "" {
-		source = entry.Repo
+		source = repo
 	}
 	if source == "" {
 		m.manifestMu.Unlock()
@@ -403,8 +416,8 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		RegistryURL:    entry.RegistryURL,
 		RegistryName:   entry.RegistryName,
 		MarketPluginID: entry.MarketPluginID,
-		Repo:           entry.Repo,
-		DownloadURL:    entry.DownloadURL,
+		Repo:           repo,
+		DownloadURL:    dlURL,
 	}
 	m.manifestMu.Unlock()
 
@@ -415,6 +428,17 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 	}
 
 	return m.InstallFromSource(ctx, id, source, carry)
+}
+
+// ManifestEntry returns the persisted install-manifest entry for id (nil when
+// absent), consumed by the dashboard to re-resolve the plugin's original
+// registry when refreshing update sources (对齐 Python resolve_market_update_info).
+func (m *SubprocessManager) ManifestEntry(id string) *ManifestEntry {
+	man := m.cachedManifest()
+	if man == nil {
+		return nil
+	}
+	return man.Get(id)
 }
 
 // Uninstall removes an installed plugin: unloads it, drops the manifest entry,

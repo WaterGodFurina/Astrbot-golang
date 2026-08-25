@@ -304,3 +304,133 @@ func decodeMarketBody(r io.Reader) (interface{}, error) {
 	}
 	return raw, nil
 }
+
+// repoIdentifierFromURL 从仓库 URL 提取 owner/name 标识（对齐 Python
+// repo_identifier_from_url：github.com/owner/name[.git] → owner/name）。
+func repoIdentifierFromURL(repoURL string) string {
+	text := strings.TrimSpace(strings.TrimRight(strings.TrimSuffix(repoURL, ".git"), "/"))
+	if text == "" {
+		return ""
+	}
+	u, err := url.Parse(text)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.ToLower(parts[len(parts)-2] + "/" + parts[len(parts)-1])
+}
+
+// marketEntryIdentifier 返回市场条目的标识：market_plugin_id 字段优先，
+// 否则 author/name 组合；对齐 Python get_market_plugin_id。
+func marketEntryIdentifier(entry map[string]interface{}, fallbackKey string) string {
+	if v, _ := entry["market_plugin_id"].(string); strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	author, _ := entry["author"].(string)
+	name, _ := entry["name"].(string)
+	author = strings.TrimSpace(author)
+	name = strings.TrimSpace(name)
+	fallbackKey = strings.TrimSpace(fallbackKey)
+	if name == "" && fallbackKey != "" && !strings.Contains(fallbackKey, "/") {
+		name = fallbackKey
+	}
+	if author != "" && name != "" {
+		return author + "/" + name
+	}
+	return ""
+}
+
+// resolveMarketPluginEntry 在市场数据（dict 或数组）中按标识匹配插件条目，
+// 匹配顺序对齐 Python resolve_market_plugin_entry：market 标识 → repo 标识
+// → repo URL → name/marketplace_name。
+func resolveMarketPluginEntry(marketData interface{}, recordID, recordRepo, recordName string) (map[string]interface{}, bool) {
+	recordID = strings.TrimSpace(recordID)
+	recordRepoIdent := repoIdentifierFromURL(recordRepo)
+	recordRepoNorm := strings.ToLower(strings.TrimRight(strings.TrimSpace(recordRepo), "/"))
+	recordNames := map[string]bool{}
+	for _, n := range []string{strings.TrimSpace(recordName), strings.ReplaceAll(strings.TrimSpace(recordName), "_", "-")} {
+		if n != "" {
+			recordNames[n] = true
+		}
+	}
+	matches := func(ident string, pluginEntry map[string]interface{}) bool {
+		ident = strings.TrimSpace(ident)
+		if recordID != "" && ident == recordID {
+			return true
+		}
+		if recordRepoIdent != "" && ident == recordRepoIdent {
+			return true
+		}
+		pluginRepo, _ := pluginEntry["repo"].(string)
+		pluginRepo = strings.TrimSpace(pluginRepo)
+		if recordRepoIdent != "" && repoIdentifierFromURL(pluginRepo) == recordRepoIdent {
+			return true
+		}
+		if recordRepoNorm != "" && strings.ToLower(strings.TrimRight(pluginRepo, "/")) == recordRepoNorm {
+			return true
+		}
+		if pluginName, _ := pluginEntry["name"].(string); strings.TrimSpace(pluginName) != "" {
+			return recordNames[strings.TrimSpace(pluginName)]
+		}
+		return false
+	}
+	switch data := marketData.(type) {
+	case map[string]interface{}:
+		for key, raw := range data {
+			if key == "$meta" {
+				continue
+			}
+			pluginEntry, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if matches(marketEntryIdentifier(pluginEntry, key), pluginEntry) {
+				return pluginEntry, true
+			}
+		}
+	case []interface{}:
+		for _, raw := range data {
+			pluginEntry, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if matches(marketEntryIdentifier(pluginEntry, ""), pluginEntry) {
+				return pluginEntry, true
+			}
+		}
+	}
+	return nil, false
+}
+
+// resolveLatestPluginSource 更新插件前从原 registry 重新解析该插件的最新
+// 下载源（对齐 Python resolve_market_update_info）：market 类型且 registry
+// 拉取/匹配成功时返回最新 download_url/repo；否则返回空（调用方回退
+// manifest 记录的旧源，不阻断更新）。
+func (s *Server) resolveLatestPluginSource(pid string) (dlURL, repo string) {
+	if s.subPluginMgr == nil {
+		return "", ""
+	}
+	entry := s.subPluginMgr.ManifestEntry(pid)
+	if entry == nil || !strings.EqualFold(strings.TrimSpace(entry.InstallMethod), "market") {
+		return "", ""
+	}
+	registryURL := strings.TrimSpace(entry.RegistryURL)
+	if registryURL == "" {
+		return "", ""
+	}
+	marketData, err := s.fetchPluginMarket(registryURL, false)
+	if err != nil {
+		log.GetDefault().Warn("更新插件 %s 前拉取市场数据失败，回退记录源: %v", pid, err)
+		return "", ""
+	}
+	pluginEntry, ok := resolveMarketPluginEntry(marketData, entry.MarketPluginID, entry.Repo, entry.Name)
+	if !ok {
+		return "", ""
+	}
+	dl, _ := pluginEntry["download_url"].(string)
+	r, _ := pluginEntry["repo"].(string)
+	return strings.TrimSpace(dl), strings.TrimSpace(r)
+}

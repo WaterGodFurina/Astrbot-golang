@@ -2569,6 +2569,10 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			results = append(results, result{Name: id, Status: "error", Message: "插件不存在或非子进程插件"})
 			continue
 		}
+		// 更新前从插件原 registry 重新解析最新下载源（对齐 Python
+		// resolve_market_update_info）：market 类型插件拉取最新
+		// download_url/repo，避免更新拉取 manifest 记录的固定旧版本 zip。
+		latestDL, latestRepo := s.resolveLatestPluginSource(pid)
 		inst, err := s.subPluginMgr.ReinstallSource(ctx, pid, plugin.InstallOptions{
 			Progress:     s.installProgressCallback(""),
 			CCChoice:     ccChoice,
@@ -2576,6 +2580,8 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			PythonChoice: pythonChoice,
 			GoMirror:     goMirror,
 			PythonMirror: pythonMirror,
+			DownloadURL:  latestDL,
+			Repo:         latestRepo,
 		})
 		if err != nil {
 			var riskErr *plugin.RiskError
