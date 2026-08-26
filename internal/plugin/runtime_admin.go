@@ -588,6 +588,21 @@ func (m *SubprocessManager) instanceByName(name string) *PluginInstance {
 // id 为插件实例 id（name_language）：同名 Go/Python 插件的 schema 完全隔离。
 func (m *SubprocessManager) ConfigSchema(id string) map[string]interface{} {
 	inst := m.instanceByName(id)
+	// 按需加载：插件运行中时优先实时调插件 GetConfigSchema RPC——插件可在
+	// 运行期更新 config.schema（如 update_manager 动态填充插件列表的
+	// options/labels），这些值不在 Register 静态快照里，必须实时取。
+	// RPC 失败/空响应（插件未实现或实例不可用）回退 Register 快照/磁盘缓存。
+	if inst != nil && inst.Client != nil {
+		rpcCtx, cancel := context.WithTimeout(context.Background(), pluginHookRPCTimeout)
+		data, err := inst.Client.GetConfigSchema(rpcCtx)
+		cancel()
+		if err == nil && len(data) > 0 {
+			var schema map[string]interface{}
+			if err := json.Unmarshal(data, &schema); err == nil {
+				return schema
+			}
+		}
+	}
 	if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
 		var schema map[string]interface{}
 		if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {

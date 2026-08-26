@@ -487,11 +487,17 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			// 动态填充 options/labels）。
 			if subMgr != nil {
 				id := subMgr.pluginConfigID(pluginName)
-				inst := subMgr.Get(id)
-				if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
-					var schema map[string]any
-					if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err == nil && schema != nil {
-						cfg["__schema__"] = schema
+				// __schema__ 注入**扁平**结构（对齐原版插件期望）：插件侧
+				// self.config.schema 是"配置项名 → 元数据"的 dict，插件
+				// 直接按顶层 key 访问（如 update_manager 的
+				// schema.get("white_plugin_list")）。Register 上报的
+				// ConfigSchemaJson 是 WebUI 用的 {"type","properties"}
+				// 包装（SDK _load_config_schema），需展开 properties。
+				if s := subMgr.ConfigSchema(id); len(s) > 0 {
+					if props, ok := s["properties"].(map[string]any); ok {
+						cfg["__schema__"] = props
+					} else {
+						cfg["__schema__"] = s
 					}
 				}
 			}
