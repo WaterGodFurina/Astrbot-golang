@@ -11,7 +11,6 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -844,82 +843,32 @@ func RenderTextToJPEG(text string, opts ImageOptions) ([]byte, error) {
 	return r.RenderJPEG()
 }
 
-// RenderRemote renders text via a remote t2i service (Python AstrBot t2i
-// server protocol): POST multipart form {text, template_name} to the endpoint
-// and read the returned image bytes. The response may be raw image data or a
-// JSON envelope {code, data: {url|base64}}; anything else is an error.
+// RenderRemote renders text via a remote t2i service（对齐 Python 原版
+// network_strategy.render：取本地模板内容后 POST JSON 到 /text2img/generate）。
 func RenderRemote(endpoint, text, templateName string) ([]byte, error) {
 	if endpoint == "" {
 		return nil, fmt.Errorf("t2i: remote endpoint is empty")
 	}
-	url := strings.TrimRight(endpoint, "/") + "/t2i/"
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-	if err := writer.WriteField("text", text); err != nil {
-		return nil, err
-	}
 	if templateName == "" {
 		templateName = "base"
 	}
-	if err := writer.WriteField("template_name", templateName); err != nil {
-		return nil, err
-	}
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-
-	client := &http.Client{Timeout: 120 * time.Second}
-	req, err := http.NewRequest(http.MethodPost, url, &buf)
+	tmpl, err := t2iTemplateContent(templateName)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("t2i remote request: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("t2i remote returned HTTP %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return nil, err
-	}
-	if isImageData(body) {
-		return body, nil
-	}
-	// JSON envelope fallback.
-	var env struct {
-		Data struct {
-			URL    string `json:"url"`
-			Base64 string `json:"base64"`
-		} `json:"data"`
-	}
-	if json.Unmarshal(body, &env) == nil {
-		if env.Data.Base64 != "" {
-			raw, err := decodeBase64Image(env.Data.Base64)
-			if err != nil {
-				return nil, err
-			}
-			return raw, nil
-		}
-		if env.Data.URL != "" {
-			return fetchRemoteImage(env.Data.URL)
-		}
-	}
-	return nil, fmt.Errorf("t2i remote: unrecognized response (%d bytes)", len(body))
+	data, _ := json.Marshal(map[string]interface{}{"text": text})
+	return RenderCustomTemplate(endpoint, tmpl, string(data), "")
 }
 
 // RenderCustomTemplate renders an HTML template + data via a remote t2i service
-// (Python AstrBot HtmlRenderer 协议)，POST multipart 表单 {template, data,
-// options} 到 endpoint 的 text2img 路径并读取返回的图片字节。响应可能是原始
-// 图片数据或 JSON envelope {code, data:{url|base64}}；其余视为错误。
+// (Python AstrBot 新版协议)：POST JSON {tmpl, tmpldata, options, json:false}
+// 到 endpoint 的 /text2img/generate 路径并读取返回的图片字节。响应可能是
+// 原始图片数据或 JSON envelope {code, data:{url|base64|id}}；其余视为错误。
 //
-// 路径约定：endpoint 为 t2i 服务根地址。若以 /t2i 或 /t2i/ 结尾（RenderRemote
-// 的 endpoint 约定），取其父路径再拼 /text2img；已是 /text2img 结尾则原样使用；
-// 否则直接拼接 /text2img（对齐 Python 原版
-// ASTRBOT_T2I_DEFAULT_ENDPOINT="https://t2i.soulter.top/text2img"）。
+// 路径约定：endpoint 为 t2i 服务根地址。若以 /t2i 或 /t2i/ 结尾（旧 RenderRemote
+// 的 endpoint 约定），取其父路径再拼 /text2img/generate；已是 /text2img 结尾则
+// 追加 /generate（对齐 Python 原版 ASTRBOT_T2I_DEFAULT_ENDPOINT +
+// _clean_url + f"{endpoint}/generate"）。
 //
 // endpoint 为空时使用官方默认端点；官方端点列表（api.soulter.top/astrbot/
 // t2i-endpoints）拉取成功时按序逐个尝试（对齐原版 network_strategy 的多端点
@@ -940,7 +889,9 @@ func RenderCustomTemplate(endpoint, template, data, options string) ([]byte, err
 	return nil, lastErr
 }
 
-func renderCustomTemplateAt(endpoint, template, data, options string) ([]byte, error) {
+// generateURL 规范化 t2i 服务根地址为 /text2img/generate 端点（对齐 Python
+// network_strategy._clean_url + f"{endpoint}/generate"）。
+func generateURL(endpoint string) string {
 	url := strings.TrimRight(endpoint, "/")
 	if strings.HasSuffix(url, "/t2i") {
 		url = strings.TrimSuffix(url, "/t2i")
@@ -948,27 +899,75 @@ func renderCustomTemplateAt(endpoint, template, data, options string) ([]byte, e
 	if !strings.HasSuffix(url, "/text2img") {
 		url += "/text2img"
 	}
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-	if err := writer.WriteField("template", template); err != nil {
-		return nil, err
+	return url + "/generate"
+}
+
+// T2ITemplateDir 是用户 t2i HTML 模板目录（<data>/t2i_templates），由宿主
+// （dashboard.NewServer）初始化时注入；RenderRemote 按模板名读取内容。
+var T2ITemplateDir string
+
+// T2IDefaultTemplate 是内置 "base" 模板内容（dashboard t2iDefaultTemplate），
+// 用户模板缺失时的回退，由宿主注入。
+var T2IDefaultTemplate string
+
+// t2iTemplateContent 返回模板 HTML 内容：优先用户模板目录
+// （T2ITemplateDir/<name>.html，防路径穿越），缺失回退内置 base 模板。
+func t2iTemplateContent(name string) (string, error) {
+	if name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\\`) && T2ITemplateDir != "" {
+		if data, err := os.ReadFile(filepath.Join(T2ITemplateDir, name+".html")); err == nil {
+			return string(data), nil
+		}
 	}
-	if err := writer.WriteField("data", data); err != nil {
-		return nil, err
+	if T2IDefaultTemplate != "" {
+		return T2IDefaultTemplate, nil
 	}
-	if err := writer.WriteField("options", options); err != nil {
-		return nil, err
+	return "", fmt.Errorf("t2i: template %q not found", name)
+}
+
+func renderCustomTemplateAt(endpoint, template, data, options string) ([]byte, error) {
+	// options 默认值对齐 Python render_custom_template：full_page+type=jpeg
+	// +quality=40，调用方传入的 options 覆盖默认。
+	defaultOptions := map[string]interface{}{
+		"full_page": true,
+		"type":      "jpeg",
+		"quality":   40,
 	}
-	if err := writer.Close(); err != nil {
+	if options != "" {
+		var overrides map[string]interface{}
+		if json.Unmarshal([]byte(options), &overrides) == nil {
+			for k, v := range overrides {
+				defaultOptions[k] = v
+			}
+		}
+	}
+	// tmpldata 对齐 Python：dict（Jinja 模板数据）。Go 端 data 为 JSON 字符串，
+	// 解析为对象；解析失败时原样作为字符串传递（服务端容错）。
+	var tmplData interface{} = map[string]interface{}{}
+	if data != "" {
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(data), &m) == nil {
+			tmplData = m
+		} else {
+			tmplData = data
+		}
+	}
+	post := map[string]interface{}{
+		"tmpl":     template,
+		"json":     false,
+		"tmpldata": tmplData,
+		"options":  defaultOptions,
+	}
+	body, err := json.Marshal(post)
+	if err != nil {
 		return nil, err
 	}
 
 	client := &http.Client{Timeout: 120 * time.Second}
-	req, err := http.NewRequest(http.MethodPost, url, &buf)
+	req, err := http.NewRequest(http.MethodPost, generateURL(endpoint), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("t2i remote html render request: %w", err)
@@ -977,33 +976,39 @@ func renderCustomTemplateAt(endpoint, template, data, options string) ([]byte, e
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("t2i remote html render returned HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
 		return nil, err
 	}
-	if isImageData(body) {
-		return body, nil
+	if isImageData(raw) {
+		return raw, nil
 	}
-	// JSON envelope 兜底（同 RenderRemote）。
+	// JSON envelope 兜底（对齐 Python return_url 模式：data.id → /text2img/data/<id>；
+	// 以及旧协议的 url/base64）。
 	var env struct {
 		Data struct {
 			URL    string `json:"url"`
 			Base64 string `json:"base64"`
+			ID     string `json:"id"`
 		} `json:"data"`
 	}
-	if json.Unmarshal(body, &env) == nil {
+	if json.Unmarshal(raw, &env) == nil {
 		if env.Data.Base64 != "" {
-			raw, err := decodeBase64Image(env.Data.Base64)
+			img, err := decodeBase64Image(env.Data.Base64)
 			if err != nil {
 				return nil, err
 			}
-			return raw, nil
+			return img, nil
 		}
 		if env.Data.URL != "" {
 			return fetchRemoteImage(env.Data.URL)
 		}
+		if env.Data.ID != "" {
+			base := strings.TrimSuffix(strings.TrimRight(endpoint, "/"), "/text2img")
+			return fetchRemoteImage(base + "/text2img/data/" + strings.TrimPrefix(env.Data.ID, "data/"))
+		}
 	}
-	return nil, fmt.Errorf("t2i remote html render: unrecognized response (%d bytes)", len(body))
+	return nil, fmt.Errorf("t2i remote html render: unrecognized response (%d bytes)", len(raw))
 }
 
 // isImageData reports whether b looks like PNG/JPEG/GIF/WEBP image bytes.

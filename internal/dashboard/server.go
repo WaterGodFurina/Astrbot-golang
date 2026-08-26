@@ -35,6 +35,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
@@ -315,6 +316,10 @@ func (s *Server) notifyConfigChanged() {
 
 // NewServer creates a dashboard server with password management.
 func NewServer(port int, configPath string) *Server {
+	// 注入 t2i 远程渲染的模板来源（<data>/t2i_templates + 内置 base 模板），
+	// 供 t2i.RenderRemote 对齐 Python 原版按模板名取内容后走 /text2img/generate。
+	t2i.T2ITemplateDir = filepath.Join(filepath.Dir(configPath), "t2i_templates")
+	t2i.T2IDefaultTemplate = t2iDefaultTemplate
 	s := &Server{
 		mux:       http.NewServeMux(),
 		handlers:  make(map[string]http.HandlerFunc),
