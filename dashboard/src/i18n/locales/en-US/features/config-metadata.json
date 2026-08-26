@@ -796,6 +796,14 @@
       "disable_builtin_commands": {
         "description": "Disable Built-in Commands",
         "hint": "Disable all built-in AstrBot commands such as help, sid, new, etc."
+      },
+      "t2i": {
+        "description": "",
+        "hint": ""
+      },
+      "t2i_word_threshold": {
+        "description": "",
+        "hint": ""
       }
     },
     "whitelist": {
@@ -916,14 +924,6 @@
             }
           }
         }
-      },
-      "t2i": {
-        "description": "Text-to-Image Output",
-        "hint": "When enabled, replies longer than the word threshold are sent as images"
-      },
-      "t2i_word_threshold": {
-        "description": "Text-to-Image Word Count Threshold",
-        "hint": "Replies longer than this many characters are rendered as an image (default 150)"
       }
     }
   },
