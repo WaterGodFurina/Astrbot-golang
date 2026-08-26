@@ -916,6 +916,14 @@
             }
           }
         }
+      },
+      "t2i": {
+        "description": "文本转图像输出",
+        "hint": "开启后，回复文本超过字数阈值时将以图片形式发送"
+      },
+      "t2i_word_threshold": {
+        "description": "文本转图像字数阈值",
+        "hint": "回复文本达到该字数时转为图片发送（默认 150）"
       }
     }
   },
@@ -1027,14 +1035,6 @@
     "name": "系统配置",
     "system": {
       "description": "系统配置",
-      "t2i": {
-        "description": "文本转图像输出",
-        "hint": "开启后，回复文本超过字数阈值时将以图片形式发送"
-      },
-      "t2i_word_threshold": {
-        "description": "文本转图像字数阈值",
-        "hint": "回复文本达到该字数时转为图片发送（默认 150）"
-      },
       "t2i_strategy": {
         "description": "文本转图像策略",
         "hint": "文本转图像策略。`remote` 为使用远程基于 HTML 的渲染服务,`local` 为使用 PIL 本地渲染。当使用 local 时,将 ttf 字体命名为 'font.ttf' 放在 data/ 目录下可自定义字体。"

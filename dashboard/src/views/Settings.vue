@@ -785,8 +785,6 @@ const systemConfigGroups = computed(() => {
             'temp_dir_max_size'
         ]),
         createGroup('t2iRendering', [
-            't2i',
-            't2i_word_threshold',
             't2i_strategy',
             't2i_endpoint',
             't2i_template',

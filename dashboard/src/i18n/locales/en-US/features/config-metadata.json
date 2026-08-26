@@ -916,6 +916,14 @@
             }
           }
         }
+      },
+      "t2i": {
+        "description": "Text-to-Image Output",
+        "hint": "When enabled, replies longer than the word threshold are sent as images"
+      },
+      "t2i_word_threshold": {
+        "description": "Text-to-Image Word Count Threshold",
+        "hint": "Replies longer than this many characters are rendered as an image (default 150)"
       }
     }
   },
@@ -1027,14 +1035,6 @@
     "name": "System",
     "system": {
       "description": "System Settings",
-      "t2i": {
-        "description": "Text-to-Image Output",
-        "hint": "When enabled, replies longer than the word threshold are sent as images"
-      },
-      "t2i_word_threshold": {
-        "description": "Text-to-Image Word Count Threshold",
-        "hint": "Replies longer than this many characters are rendered as an image (default 150)"
-      },
       "t2i_strategy": {
         "description": "Text-to-Image Strategy",
         "hint": "Text-to-image strategy. `remote` uses a remote HTML-based rendering service, `local` uses PIL for local rendering. When using local, place a TTF font named 'font.ttf' in the data/ directory to customize the font."
