@@ -44,8 +44,12 @@ func (s *Server) recordKBTask(t *kbUploadTask) {
 func (s *Server) kbDocImportURL(w http.ResponseWriter, r *http.Request, kbID string) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
-		return
+		// 导入不限方法（GET/POST 均命中）：GET 无请求体时按空 body 处理，
+		// 由后续 url 参数校验兜底；只有非空但非法的 JSON 才报错。
+		if !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 	}
 	url, _ := body["url"].(string)
 	if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
