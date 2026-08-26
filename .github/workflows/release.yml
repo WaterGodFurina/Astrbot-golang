@@ -38,7 +38,7 @@ jobs:
 
       - name: 用 goproxy.cn 校验 go.sum 可重建（只读验证，不写回仓库）
         env:
-          GOPROXY: https://goproxy.cn,direct
+          GOPROXY: https://goproxy.cn,https://proxy.golang.org,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
         run: |
           # goproxy.cn 与 GitHub runner 偶发 HTTP/2 抖动（DATA after END_STREAM），
@@ -176,7 +176,7 @@ jobs:
           CGO_CPPFLAGS: ''
           CGO_CXXFLAGS: ''
           CGO_LDFLAGS: ''
-          GOPROXY: https://goproxy.cn,direct
+          GOPROXY: https://goproxy.cn,https://proxy.golang.org,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
         run: |

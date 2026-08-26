@@ -65,8 +65,12 @@ func TestDiscoverBundledPython(t *testing.T) {
 // TestPyTarget verifies the GOOS/GOARCH → python-build-standalone target map
 // for the platforms we support.
 func TestPyTarget(t *testing.T) {
+	libc := "gnu"
+	if linuxLibc() == "musl" {
+		libc = "musl"
+	}
 	for goos, want := range map[string]string{
-		"linux":   "unknown-linux-gnu",
+		"linux":   "unknown-linux-" + libc,
 		"darwin":  "apple-darwin",
 		"windows": "pc-windows-msvc",
 	} {

@@ -242,6 +242,15 @@ func (a *Adapter) convertMsg(event *larkim.P2MessageReceiveV1) {
 		return
 	}
 	msg := event.Event.Message
+	msgStr := ""
+	if msg.Content != nil {
+		msgStr = *msg.Content
+	}
+	chatType := ""
+	if msg.ChatType != nil {
+		chatType = *msg.ChatType
+	}
+	logger.I18nInfo("飞书收到消息 (chat=%s): %s", chatType, msgStr)
 
 	abm := platform.NewAstrBotMessage()
 	if msg.CreateTime != nil {

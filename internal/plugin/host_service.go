@@ -487,11 +487,17 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			// 动态填充 options/labels）。
 			if subMgr != nil {
 				id := subMgr.pluginConfigID(pluginName)
-				inst := subMgr.Get(id)
-				if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
-					var schema map[string]any
-					if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err == nil && schema != nil {
-						cfg["__schema__"] = schema
+				// __schema__ 注入**扁平**结构（对齐原版插件期望）：插件侧
+				// self.config.schema 是"配置项名 → 元数据"的 dict，插件
+				// 直接按顶层 key 访问（如 update_manager 的
+				// schema.get("white_plugin_list")）。Register 上报的
+				// ConfigSchemaJson 是 WebUI 用的 {"type","properties"}
+				// 包装（SDK _load_config_schema），需展开 properties。
+				if s := subMgr.ConfigSchema(id); len(s) > 0 {
+					if props, ok := s["properties"].(map[string]any); ok {
+						cfg["__schema__"] = props
+					} else {
+						cfg["__schema__"] = s
 					}
 				}
 			}
@@ -820,16 +826,65 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			// 插件）：update_manager 等依赖 get_all_stars 枚举全部插件以
 			// 填充黑/白名单选项的管理类插件，不能只看到运行中插件。
 			// 每插件附带 commands（宿主聚合的指令描述符）：helps 类插件经
-			// 现有 GetPluginRegistry 通道跨进程枚举全部插件指令（SDK 注册
-			// 完成后一次性注入本进程注册表，0 运行期开销）。
+			// GetPluginRegistry 通道跨进程枚举全部插件指令。
+			//
+			// commands 数据源用 RegisteredPlugins() 的 inst.Meta.Commands
+			//（插件 Register RPC 完成后宿主持有，含休眠占位实例），不依赖
+			// starMgr 的运行时注册时序——首次加载期间插件注册完成即可拿到
+			// 全部指令，避免"插件注册时宿主 starMgr 尚未 Rebridge"导致
+			// helps 类插件只看到自己指令的竞态。
 			commandsByPlugin := map[string][]map[string]any{}
+			if subMgr != nil {
+				for _, inst := range subMgr.RegisteredPlugins() {
+					if inst == nil || inst.Meta == nil {
+						continue
+					}
+					var cmds []map[string]any
+					for _, c := range inst.Meta.Commands {
+						cmds = append(cmds, map[string]any{
+							"plugin_name":    inst.ID,
+							"command":        c.Name,
+							"handler_name":   c.Name,
+							"aliases":        c.Aliases,
+							"description":    c.Description,
+							"permission":     c.Permission,
+							"enabled":        true,
+							"command_type":   "command",
+							"parent_group":   c.ParentGroup,
+							"is_sub_command": c.IsSubCommand,
+						})
+					}
+					if len(cmds) > 0 {
+						commandsByPlugin[inst.ID] = cmds
+					}
+				}
+			}
+			// 内置指令（help/sid 等）来自 starMgr 的全局命令描述符：宿主
+			// 启动即注册内置指令，不受插件加载时序影响。
 			if starMgr != nil {
 				for _, d := range starMgr.CommandDescriptors() {
 					pid, _ := d["plugin_name"].(string)
-					if pid == "" {
+					if pid == "" || pid == "astrbot" {
+						if pid == "astrbot" {
+							commandsByPlugin["astrbot"] = append(commandsByPlugin["astrbot"], d)
+						}
 						continue
 					}
-					commandsByPlugin[pid] = append(commandsByPlugin[pid], d)
+					// 宿主侧启停/命令权限调整时，以 starMgr 的描述符为准
+					// 修正 Meta 快照的 enabled/permission（Meta 恒为全量）。
+					existing := commandsByPlugin[pid]
+					for i, e := range existing {
+						en, _ := e["command"].(string)
+						den, _ := d["command"].(string)
+						if en == den {
+							if v, ok := d["enabled"]; ok {
+								existing[i]["enabled"] = v
+							}
+							if v, ok := d["permission"]; ok && v != "" {
+								existing[i]["permission"] = v
+							}
+						}
+					}
 				}
 			}
 			withCommands := func(id string, base map[string]any) map[string]any {
@@ -846,6 +901,18 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				for _, info := range subMgr.ListInfo() {
 					instID, _ := info["id"].(string)
 					out = append(out, withCommands(instID, info))
+				}
+				// 内置指令以独立条目附带（id=astrbot，对齐 Python 内置
+				// star_registry 的保留插件）。
+				if cmds := commandsByPlugin["astrbot"]; len(cmds) > 0 {
+					out = append(out, map[string]any{
+						"name":         "astrbot",
+						"id":           "astrbot",
+						"display_name": "AstrBot",
+						"reserved":     true,
+						"activated":    true,
+						"commands":     cmds,
+					})
 				}
 				return out
 			}

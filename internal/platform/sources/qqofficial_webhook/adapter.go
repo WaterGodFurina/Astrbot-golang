@@ -179,13 +179,15 @@ func (a *Adapter) Start(ctx context.Context) error {
 	a.startedAt = time.Now()
 	a.mu.Unlock()
 
-	if a.unifiedWebhookMode {
-		if a.webhookUUID != "" {
-			logger.I18nInfo("%s(QQ 官方机器人 Webhook) 已启用统一 Webhook 模式, webhook_uuid=%s", a.ID(), a.webhookUUID)
-		} else {
-			logger.I18nWarn("QQ 官方 Webhook 已启用统一 Webhook 模式，但未配置 webhook_uuid")
-		}
+	if a.unifiedWebhookMode && a.webhookUUID != "" {
+		logger.I18nInfo("%s(QQ 官方机器人 Webhook) 已启用统一 Webhook 模式, webhook_uuid=%s", a.ID(), a.webhookUUID)
 		return nil
+	}
+	if a.unifiedWebhookMode {
+		// 对齐 Python 原版：统一 Webhook 模式但未配置 webhook_uuid 时回退
+		// 启动独立服务器（原版 start_polling 语义），保证消息收发不中断，
+		// 而不是只告警后完全静默（否则 QQ 消息收不到）。
+		logger.I18nWarn("QQ 官方 Webhook 已启用统一 Webhook 模式，但未配置 webhook_uuid，回退到独立服务器模式")
 	}
 
 	mux := http.NewServeMux()

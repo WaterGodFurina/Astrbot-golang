@@ -630,7 +630,14 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if echo, hasEcho := msg["echo"].(string); hasEcho {
-			logger.Debug("OneBot API response: %v", msg)
+			// 用 JSON 序列化打印而非 %v：%v 对 float64 用科学计数法
+			// （user_id 2408045264 显示成 2.408045264e+09），易被误认为
+			// 精度丢失；JSON 序列化输出整数原形。
+			if b, jerr := json.Marshal(msg); jerr == nil {
+				logger.Debug("OneBot API response: %s", b)
+			} else {
+				logger.Debug("OneBot API response: %v", msg)
+			}
 			a.pendingMu.Lock()
 			if ch, ok := a.pending[echo]; ok {
 				delete(a.pending, echo)
@@ -907,6 +914,16 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 		}
 	}
 	selfID := a.getSelfID()
+	// 优先用事件自带的 self_id（OneBot 群/私聊事件均携带机器人自身 QQ 号）：
+	// 启动早期 get_login_info 异步查询可能未完成，快照仍是 config.id 占位
+	// （如 "default"），导致插件 event.get_self_id() 拿到平台 ID 而非真实
+	// QQ 号（qqadmin 全禁/宵禁等 int(get_self_id()) 抛 ValueError）。
+	if evSelf, ok := raw["self_id"]; ok {
+		if s := toString(evSelf); s != "" {
+			selfID = s
+			a.setSelfID(s) // 顺带回填快照，后续事件直接命中
+		}
+	}
 
 	// Publish event
 	event := &core.Event{
@@ -968,6 +985,13 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 		}
 	}
 	selfID := a.getSelfID()
+	// 同消息路径：优先用事件自带 self_id 并回填快照（见上方注释）。
+	if evSelf, ok := raw["self_id"]; ok {
+		if s := toString(evSelf); s != "" {
+			selfID = s
+			a.setSelfID(s)
+		}
+	}
 
 	a.mu.Lock()
 	if convID != "" {

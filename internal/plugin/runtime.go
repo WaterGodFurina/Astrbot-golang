@@ -2337,9 +2337,24 @@ func (m *SubprocessManager) TriggerHook(ctx context.Context, event string) {
 // "on_platform_loaded") on all running plugins via RPC, attaching a JSON
 // payload for payload-carrying events (nil for event-only hooks). Each RPC runs
 // under a bounded timeout so one hung plugin cannot block the whole broadcast.
+//
+// 仅向"已实例化"的插件推送：推送前经 HealthCheck 探测（Python 侧返回
+// ok=实例化完成）。实例化失败/进行中的插件被跳过——否则 Python 侧
+// _wait_instanced 等待会让 RPC 卡到 30s 超时（DeadlineExceeded 噪音），
+// 且向未就绪插件推送生命周期钩子无意义。
 func (m *SubprocessManager) TriggerHookPayload(ctx context.Context, event string, payload any) {
 	for _, inst := range m.List() {
 		if inst.Client == nil || inst.Meta == nil {
+			continue
+		}
+		// 实例就绪探测：仅 RUNNING 实例接收生命周期钩子。探测失败
+		// （进程重启中/连接断开）与未就绪（ok=false）都跳过——这是
+		// 实例化失败/进行中的预期状态，不视为错误。
+		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		hresp, herr := inst.Client.HealthCheck(hctx)
+		hcancel()
+		if herr != nil || hresp == nil || !hresp.GetOk() {
+			logger.Debug("跳过生命周期钩子推送（%s）：插件 %s 未就绪（实例化失败或进行中）", event, inst.ID)
 			continue
 		}
 		for _, h := range inst.Meta.Hooks {

@@ -158,6 +158,18 @@ func pyTarget() (string, error) {
 	return pyTargetFor(runtime.GOOS, runtime.GOARCH)
 }
 
+// linuxLibc 探测当前 Linux 系统的 C 运行库：存在 musl 动态链接器
+// （/lib 或 /usr/lib 下的 ld-musl-*.so.1，Alpine 等最小容器镜像同样适用）
+// 即视为 musl，否则按 glibc 处理。不依赖 getconf/ldd 等外部工具。
+func linuxLibc() string {
+	for _, pat := range []string{"/lib/ld-musl-*.so.1", "/usr/lib/ld-musl-*.so.1"} {
+		if ms, _ := filepath.Glob(pat); len(ms) > 0 {
+			return "musl"
+		}
+	}
+	return "gnu"
+}
+
 // termuxPrebuiltPkgs 是 Android/Termux 上宿主基础依赖中含 C 扩展、pip 无
 // 预编译 wheel 的包对应的 Termux 预编译软件包（pkg install 即装好，免去
 // 本地编译对 clang 的要求）。
@@ -190,6 +202,9 @@ func pyTargetFor(goos, goarch string) (string, error) {
 	}
 	switch goos {
 	case "linux":
+		if linuxLibc() == "musl" {
+			return a + "-unknown-linux-musl", nil
+		}
 		return a + "-unknown-linux-gnu", nil
 	case "darwin":
 		return a + "-apple-darwin", nil
@@ -209,7 +224,7 @@ func bundledPythonBin() string {
 		rel = filepath.Join("python", "python.exe")
 	}
 	bin := filepath.Join(pythonBaseDir(), pyVersion(), rel)
-	if info, err := os.Stat(bin); err == nil && !info.IsDir() {
+	if info, err := os.Stat(bin); err == nil && !info.IsDir() && pythonUsable(bin) {
 		return bin
 	}
 	return ""
@@ -250,10 +265,12 @@ func DiscoverPythonBin() string {
 			logger.Warn("PATH 上的 %s 不可用（%s），跳过回退 bundled Python", name, p)
 		}
 	}
-	// 已下载的 bundled Python（幂等：重启后直接复用）
+	// 已下载的 bundled Python（幂等：重启后直接复用）。需通过可用性校验：
+	// 曾按错误 libc（如 Alpine 上误下 glibc 构建）缓存的解释器不可执行，
+	// 视为未发现，由 downloadPython 按当前平台重下。
 	for _, minor := range []string{pyVersion(), defaultPythonVersion} {
 		cand := filepath.Join(pythonBaseDir(), minor, "python", "bin", exe("python3"))
-		if info, err := os.Stat(cand); err == nil && !info.IsDir() {
+		if info, err := os.Stat(cand); err == nil && !info.IsDir() && pythonUsable(cand) {
 			return cand
 		}
 	}
@@ -348,6 +365,8 @@ func minorAtLeast(v, min string) bool {
 var pythonArchiveSHA256 = map[string]string{
 	"20260814/x86_64-unknown-linux-gnu":  "3297691ae34f75fed81ac424e040145fccb0bafe8e581cd5cadbddfa1c0766c0",
 	"20260814/aarch64-unknown-linux-gnu": "4952b18bafda1880d4ab1f86e1c348dbdb31f0e6d049e76dc5f052f2f796f1c5",
+	"20260814/x86_64-unknown-linux-musl":  "19cadd8f069264f6dcc56279cc046d39fe9933a9df9dbd5bf270c631a97dbd88",
+	"20260814/aarch64-unknown-linux-musl": "0d26cffd0b3c13ee62cbba370419bd5ead634d69c99b6e29567957bc856b9cfa",
 	"20260814/x86_64-apple-darwin":       "1a94c83264731e9603fbea78e57e7ca8f20e7d91eb866627ac2304621b0f6f1f",
 	"20260814/aarch64-apple-darwin":      "4572133a5542f306b9bdb155da5800f9e38950cd0a98d469b832ce256fe299ea",
 	"20260814/x86_64-pc-windows-msvc":    "7330282b47cd43a66b702d39078d2e5a88e580cee351d82f95045f21f5ee042a",
@@ -637,7 +656,17 @@ func extractTarGzKeepTop(src, dir string) error {
 			if filepath.IsAbs(link) {
 				return fmt.Errorf("symlink %q -> absolute target %q rejected", name, link)
 			}
-			if _, err := safeJoin(filepath.Dir(target), link); err != nil {
+			// symlink 的 Linkname 是相对 symlink 所在目录的。先解析成绝对
+			// 路径，再从整个解压根目录（dir）判断是否逃逸。用
+			// filepath.Dir(target) 作为 base 会误判合法 symlink——例如
+			// python-build-standalone 的
+			// python/share/terminfo/1/1178 -> ../a/adm1178（相对 terminfo/1/
+			// 解析为 terminfo/a/adm1178，仍在 python/ 内），filepath.Rel
+			// 从 terminfo/1 看 ../a/adm1178 以 .. 开头而误报 "escapes root"。
+			absTarget := filepath.Clean(filepath.Join(filepath.Dir(target), link))
+			if rel, rerr := filepath.Rel(dir, absTarget); rerr != nil {
+				return fmt.Errorf("symlink %q -> %q escapes root: %w", name, link, rerr)
+			} else if _, err := safeJoin(dir, rel); err != nil {
 				return fmt.Errorf("symlink %q -> %q escapes root: %w", name, link, err)
 			}
 			if err := os.Symlink(link, target); err != nil {
@@ -1046,6 +1075,7 @@ func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 // 插件 requirements.txt 自装。
 var hostBaseDeps = []string{
 	"grpcio", "protobuf",
+	"aiosqlite",
 	"quart", "werkzeug", "jinja2",
 	"aiohttp", "httpx", "requests", "mcp",
 	"pydantic", "pyyaml", "pillow",
@@ -1056,18 +1086,23 @@ var hostBaseDeps = []string{
 	"cryptography", "qrcode", "packaging", "pyjwt",
 	"jieba", "rank-bm25", "pydub", "openpyxl", "pypdf",
 	"click", "aiofiles",
+	// tzdata：Alpine musl 无系统时区数据库（/usr/share/zoneinfo 缺失），
+	// 插件用 zoneinfo.ZoneInfo("Asia/Shanghai")（qqadmin 宵禁等）时
+	// ZoneInfoNotFoundError；Python 包 tzdata 提供 IANA 时区数据。
+	"tzdata",
 }
 
 // hostDepProbes 是 hostBaseDeps 的关键模块探测表（import 名）：任一缺失即
 // 视为宿主依赖不完整，启动 Python 插件前自动补齐（EnsureVenv 检查用）。
 var hostDepProbes = []string{
-	"grpc", "google.protobuf",
+	"grpc", "google.protobuf", "aiosqlite",
 	"quart", "werkzeug", "jinja2",
 	"aiohttp", "httpx", "requests", "mcp", "apscheduler", "tenacity",
 	"openai", "anthropic", "dashscope",
 	"pydantic", "yaml", "PIL", "deprecated", "docstring_parser", "markdown", "psutil",
 	"websockets", "cryptography", "qrcode", "packaging", "jwt",
 	"jieba", "rank_bm25", "pydub", "openpyxl", "pypdf", "click", "aiofiles",
+	"tzdata",
 	// qq-botpy 的 import 包名是 botpy；python-telegram-bot 是 telegram。
 	"botpy",
 }
@@ -1075,7 +1110,7 @@ var hostDepProbes = []string{
 // baseDepsVersion 是宿主依赖清单（hostBaseDeps/hostDepProbes）的版本号：
 // 修改清单内容时手动 +1，触发既有 venv 的 environment.json 不匹配而重新
 // pip 安装（否则 venv 一旦 READY 就永久复用，清单变化不会生效）。
-const baseDepsVersion = 3
+const baseDepsVersion = 5
 
 const (
 	// envFileName 记录 venv 的供给来源（解释器 / SDK 版本 / 依赖清单版本）。
