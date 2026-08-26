@@ -45,26 +45,33 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		}
 		e := entryByID[inst.ID]
 		info := map[string]interface{}{
-			"name":                   inst.Name,
-			"display_name":           m.pluginDisplayName(inst, e),
-			"short_desc":             m.pluginShortDesc(inst, e),
-			"marketplace_name":       strings.ReplaceAll(inst.Name, "_", "-"),
-			"version":                inst.Version,
-			"description":            desc,
-			"path":                   inst.Binary,
-			"id":                     inst.ID,
-			"language":               inst.Language,
-			"logo":                   m.pluginLogoURL(inst.ID),
-			"loaded":                 true,
-			"enabled":                true,
-			"activated":              true,
-			"reserved":               false,
-			"author":                 "",
-			"repo":                   "",
-			"idle_unload_blocked":    e != nil && e.IdleUnloadBlocked,
-			"install_source":         nil,
-			"updates_enabled":        true,
-			"update_disabled_reason": "",
+			"name":                    inst.Name,
+			"display_name":            m.pluginDisplayName(inst, e),
+			"short_desc":              m.pluginShortDesc(inst, e),
+			"marketplace_name":        strings.ReplaceAll(inst.Name, "_", "-"),
+			"version":                 inst.Version,
+			"description":             desc,
+			"path":                    inst.Binary,
+			"id":                      inst.ID,
+			"language":                inst.Language,
+			"logo":                    m.pluginLogoURL(inst.ID),
+			"loaded":                  true,
+			"enabled":                 true,
+			"activated":               true,
+			"reserved":                false,
+			"author":                  "",
+			"repo":                    "",
+			"idle_unload_blocked":     e != nil && e.IdleUnloadBlocked,
+			"install_source":          nil,
+			"updates_enabled":         true,
+			"update_disabled_reason":  "",
+			"logo_path":               "",
+			"support_platforms":       []string{},
+			"astrbot_version":         "",
+			"i18n":                    nil,
+			"pages":                   []interface{}{},
+			"root_dir_name":           "",
+			"star_handler_full_names": []string{},
 		}
 		if e != nil {
 			info["repo"] = e.Repo
@@ -76,6 +83,15 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			if !updatesEnabled(e.InstallMethod) {
 				info["update_disabled_reason"] = "该插件缺少可用的安装源或仓库地址，无法更新或重新安装"
 			}
+			// 以下字段从持久化 manifest 条目读取（对齐 Python StarMetadata），
+			// entry 为 nil 时保持上方的空值。
+			info["author"] = e.Author
+			info["logo_path"] = e.LogoPath
+			info["support_platforms"] = e.SupportPlatforms
+			info["astrbot_version"] = e.AstrbotVersion
+			info["i18n"] = e.I18n
+			info["pages"] = e.Pages
+			info["root_dir_name"] = e.ID
 		}
 		result = append(result, info)
 	}
@@ -97,26 +113,33 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			enabled = true
 		}
 		result = append(result, map[string]interface{}{
-			"name":                   e.Name,
-			"display_name":           m.pluginDisplayName(nil, &e),
-			"short_desc":             m.pluginShortDesc(nil, &e),
-			"marketplace_name":       strings.ReplaceAll(e.Name, "_", "-"),
-			"version":                e.Version,
-			"description":            desc,
-			"path":                   e.Binary,
-			"id":                     e.ID,
-			"language":               e.Language,
-			"logo":                   m.pluginLogoURL(e.ID),
-			"loaded":                 false,
-			"enabled":                enabled,
-			"activated":              false,
-			"reserved":               false,
-			"author":                 "",
-			"repo":                   repo,
-			"idle_unload_blocked":    e.IdleUnloadBlocked,
-			"install_source":         e.installSourceMap(),
-			"updates_enabled":        updatesEnabled(e.InstallMethod),
-			"update_disabled_reason": "",
+			"name":                    e.Name,
+			"display_name":            m.pluginDisplayName(nil, &e),
+			"short_desc":              m.pluginShortDesc(nil, &e),
+			"marketplace_name":        strings.ReplaceAll(e.Name, "_", "-"),
+			"version":                 e.Version,
+			"description":             desc,
+			"path":                    e.Binary,
+			"id":                      e.ID,
+			"language":                e.Language,
+			"logo":                    m.pluginLogoURL(e.ID),
+			"loaded":                  false,
+			"enabled":                 enabled,
+			"activated":               false,
+			"reserved":                false,
+			"author":                  e.Author,
+			"repo":                    repo,
+			"idle_unload_blocked":     e.IdleUnloadBlocked,
+			"install_source":          e.installSourceMap(),
+			"updates_enabled":         updatesEnabled(e.InstallMethod),
+			"update_disabled_reason":  "",
+			"logo_path":               e.LogoPath,
+			"support_platforms":       e.SupportPlatforms,
+			"astrbot_version":         e.AstrbotVersion,
+			"i18n":                    e.I18n,
+			"pages":                   e.Pages,
+			"root_dir_name":           e.ID,
+			"star_handler_full_names": []string{},
 		})
 	}
 	return result

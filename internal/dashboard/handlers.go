@@ -1237,7 +1237,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 	case "", "list":
 		if r.Method == http.MethodPost {
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body == nil {
 				body = map[string]interface{}{}
 			}
@@ -1338,7 +1341,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 			var body struct {
 				ProviderID string `json:"provider_id"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			writeJSON(w, http.StatusOK, apiOK(s.testProvider(body.ProviderID)))
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -1361,7 +1367,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 				ProviderID string                 `json:"provider_id"`
 				Config     map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.ProviderID != "" {
 				providerID = body.ProviderID
 			}
@@ -1392,7 +1401,10 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 			ProviderID string `json:"provider_id"`
 			Enabled    bool   `json:"enabled"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(s.setProviderEnabled(body.ProviderID, body.Enabled)))
 	case "models":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -1422,7 +1434,10 @@ func (s *Server) handleEmbeddingDimension(w http.ResponseWriter, r *http.Request
 		ProviderID     string                 `json:"provider_id"`
 		ProviderConfig map[string]interface{} `json:"provider_config"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if providerID == "" {
 		providerID = body.ProviderID
 	}
@@ -1721,7 +1736,10 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 				BotID  string                 `json:"bot_id"`
 				Config map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.Config == nil {
 				body.Config = map[string]interface{}{}
 			}
@@ -1912,7 +1930,10 @@ func (s *Server) setBotEnabled(w http.ResponseWriter, r *http.Request) {
 		BotID   string `json:"bot_id"`
 		Enabled bool   `json:"enabled"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	found := false
 	err := s.mutateConfig(func(cfg map[string]interface{}) error {
 		platforms, _ := cfg["platform"].([]interface{})
@@ -2002,7 +2023,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 				DeleteConfig bool `json:"delete_config"`
 				DeleteData   bool `json:"delete_data"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			s.pluginUninstall(pluginID, body.DeleteConfig, body.DeleteData)
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
 		case http.MethodPost:
@@ -2016,7 +2040,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			PluginID string `json:"plugin_id"`
 			Enabled  bool   `json:"enabled"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		s.pluginSetEnabled(body.PluginID, body.Enabled)
 		writeJSON(w, http.StatusOK, apiOKMsg("插件状态已更新", map[string]interface{}{}))
 	case "idle-unload":
@@ -2026,7 +2053,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			PluginID   string `json:"plugin_id"`
 			AllowSleep bool   `json:"allow_sleep"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if s.subPluginMgr != nil {
 			if pid, _, ok := s.resolveSubprocessPlugin(body.PluginID); ok {
 				if err := s.subPluginMgr.SetIdleUnloadBlocked(pid, !body.AllowSleep); err != nil {
@@ -2052,7 +2082,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		var body struct {
 			Minutes int `json:"minutes"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body.Minutes < 0 {
 			body.Minutes = 0
 		}
@@ -2070,7 +2103,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		var body struct {
 			PluginID string `json:"plugin_id"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		s.pluginReload(body.PluginID)
 		writeJSON(w, http.StatusOK, apiOKMsg("插件已重载", map[string]interface{}{}))
 	case "config":
@@ -2086,7 +2122,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 					PluginID string                 `json:"plugin_id"`
 					Config   map[string]interface{} `json:"config"`
 				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				if pluginID == "" {
 					pluginID = body.PluginID
 				}
@@ -2148,7 +2187,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		var body struct {
 			Level string `json:"level"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		level := strings.ToUpper(strings.TrimSpace(body.Level))
 		switch level {
 		case "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL":
@@ -2180,7 +2222,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 				var body struct {
 					Level *string `json:"level"`
 				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				var level string
 				if body.Level != nil {
 					level = strings.ToUpper(strings.TrimSpace(*body.Level))
@@ -2226,7 +2271,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 					var body struct {
 						Config map[string]interface{} `json:"config"`
 					}
-					_ = json.NewDecoder(r.Body).Decode(&body)
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+						return
+					}
 					s.pluginSaveConfig(pluginID, body.Config)
 					writeJSON(w, http.StatusOK, apiOKMsg("插件配置已保存", map[string]interface{}{}))
 				} else {
@@ -2313,7 +2361,10 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			Repo           string `json:"repo"`
 			DownloadURL    string `json:"download_url"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		source = strings.TrimSpace(body.URL)
 		ignoreRisk = body.IgnoreRisk
 		ccChoice = strings.TrimSpace(body.CCChoice)
@@ -2535,7 +2586,10 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			GoMirror     string   `json:"go_mirror"`
 			PythonMirror string   `json:"python_mirror"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body.PluginID != "" {
 			ids = append(ids, body.PluginID)
 		} else {
@@ -2662,7 +2716,10 @@ func (s *Server) handlePluginBindSource(w http.ResponseWriter, r *http.Request, 
 		Repo           string `json:"repo"`
 		DownloadURL    string `json:"download_url"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 
 	pid, _, ok := s.resolveSubprocessPlugin(pluginID)
 	if !ok {
@@ -2955,7 +3012,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 		case "create":
 			if method == http.MethodPost {
 				var body map[string]interface{}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				kb, err := s.createKB(body)
 				if err != nil {
 					writeJSON(w, http.StatusOK, apiError("创建知识库失败: "+err.Error()))
@@ -2967,7 +3027,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 		case "update":
 			kbID := r.URL.Query().Get("kb_id")
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if kbID == "" {
 				if v, _ := body["kb_id"].(string); v != "" {
 					kbID = v
@@ -2987,7 +3050,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 		case "delete":
 			kbID := r.URL.Query().Get("kb_id")
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if kbID == "" {
 				if v, _ := body["kb_id"].(string); v != "" {
 					kbID = v
@@ -3093,7 +3159,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 				return
 			case "retrieve":
 				var body map[string]interface{}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				query, _ := body["query"].(string)
 				if strings.TrimSpace(query) == "" {
 					query = r.URL.Query().Get("query")
@@ -3141,7 +3210,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 		}
 		if method == http.MethodPut {
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			kb, err := s.updateKB(kbID, body)
 			if err != nil {
 				writeJSON(w, http.StatusOK, apiError("更新知识库失败: "+err.Error()))
@@ -3165,7 +3237,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 	// No sub-path: GET → list, POST → create.
 	if method == http.MethodPost {
 		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		kb, err := s.createKB(body)
 		if err != nil {
 			writeJSON(w, http.StatusOK, apiError("创建知识库失败: "+err.Error()))
@@ -3653,7 +3728,10 @@ func (s *Server) handleSessionGroups(w http.ResponseWriter, r *http.Request, par
 			Name string   `json:"name"`
 			Umos []string `json:"umos"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if strings.TrimSpace(body.Name) == "" {
 			writeJSON(w, http.StatusOK, apiError("分组名称不能为空"))
 			return
@@ -3682,7 +3760,10 @@ func (s *Server) handleSessionGroups(w http.ResponseWriter, r *http.Request, par
 			Name string   `json:"name"`
 			Umos []string `json:"umos"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		groups := s.getSessionGroups()
 		g, ok := groups[groupID]
 		if !ok {
@@ -3742,7 +3823,10 @@ func (s *Server) handleSessionRules(w http.ResponseWriter, r *http.Request, part
 			UMOs    []string `json:"umos"`
 			RuleKey string   `json:"rule_key"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		umos := body.UMOs
 		if body.UMO != "" {
 			umos = append(umos, body.UMO)
@@ -4193,7 +4277,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		switch r.Method {
 		case http.MethodPost:
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body == nil {
 				body = map[string]interface{}{}
 			}
@@ -4222,7 +4309,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 			}))
 		case http.MethodPut:
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body == nil {
 				body = map[string]interface{}{}
 			}
@@ -4253,7 +4343,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 			PersonaID string `json:"persona_id"`
 			FolderID  string `json:"folder_id"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if err := s.personas.movePersona(body.PersonaID, body.FolderID); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("移动失败: "+err.Error()))
 			return
@@ -4265,7 +4358,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		var body struct {
 			Items []map[string]interface{} `json:"items"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if err := s.personas.reorder(body.Items); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
 			return
@@ -4277,7 +4373,10 @@ func (s *Server) handlePersonas(w http.ResponseWriter, r *http.Request, parts []
 		writeJSON(w, http.StatusOK, apiOK(s.personas.tree()))
 	case "create":
 		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if err := s.personas.upsertPersona(body); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
 			return
@@ -4320,7 +4419,10 @@ func (s *Server) handlePersonaFolders(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body == nil {
 				body = map[string]interface{}{}
 			}
@@ -4349,7 +4451,10 @@ func (s *Server) handlePersonaFolders(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body == nil {
 			body = map[string]interface{}{}
 		}
@@ -4519,7 +4624,10 @@ func (s *Server) updateTool(w http.ResponseWriter, r *http.Request, toolID, acti
 		var body struct {
 			Enabled bool `json:"enabled"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		// Built-in tools are readonly; MCP tools map to their server active flag.
 		for _, name := range builtinToolNames() {
 			if name == toolID {
@@ -4538,7 +4646,10 @@ func (s *Server) updateTool(w http.ResponseWriter, r *http.Request, toolID, acti
 		var body struct {
 			Permission string `json:"permission"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body.Permission != "admin" && body.Permission != "member" {
 			writeJSON(w, http.StatusOK, apiError("权限类型必须为 admin 或 member"))
 			return
@@ -4585,7 +4696,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 				ServerName string `json:"server_name"`
 				Enabled    bool   `json:"enabled"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if err := s.mcp.setEnabled(body.ServerName, body.Enabled); err != nil {
 				writeJSON(w, http.StatusOK, apiError(err.Error()))
 				return
@@ -4596,7 +4710,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 			var body struct {
 				ServerName string `json:"server_name"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			s.testMCPServer(w, r, body.ServerName)
 			return
 		}
@@ -4608,7 +4725,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 					ServerName string `json:"server_name"`
 					Enabled    bool   `json:"enabled"`
 				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				if body.ServerName != "" {
 					serverName = body.ServerName
 				}
@@ -4630,7 +4750,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 				ServerName string                 `json:"server_name"`
 				Config     map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.ServerName != "" {
 				serverName = body.ServerName
 			}
@@ -4662,7 +4785,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		} else if r.Method == http.MethodPost {
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			name, _ := body["name"].(string)
 			if name == "" {
 				writeJSON(w, http.StatusOK, apiError("Server name cannot be empty"))
@@ -4681,7 +4807,10 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 			var body struct {
 				AccessToken string `json:"access_token"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			count, err := s.syncModelScopeMCPServers(body.AccessToken)
 			if err != nil {
 				writeJSON(w, http.StatusOK, apiError(err.Error()))
@@ -4706,7 +4835,10 @@ func (s *Server) mcpByID(w http.ResponseWriter, r *http.Request) {
 		ServerName string                 `json:"server_name"`
 		Config     map[string]interface{} `json:"config"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if body.ServerName != "" {
 		serverName = body.ServerName
 	}
@@ -5252,7 +5384,10 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 				Filename  string `json:"filename"`
 				TotalSize int64  `json:"total_size"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if !strings.HasSuffix(strings.ToLower(body.Filename), ".zip") {
 				writeJSON(w, http.StatusBadRequest, apiError("请上传 ZIP 格式的备份文件"))
 				return
@@ -5324,7 +5459,10 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 			var body struct {
 				UploadID string `json:"upload_id"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.UploadID == "" {
 				writeJSON(w, http.StatusBadRequest, apiError("缺少 upload_id 参数"))
 				return
@@ -5374,6 +5512,18 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 			if size != nil {
 				fileSize = size.Size()
 			}
+			// 合并完成后立即校验 ZIP 有效性：损坏的备份不应进入备份列表。
+			// 校验失败删除已保存文件、清理分片会话并返回错误。
+			if res := backup.CheckBackup(outputPath); res == nil || !res.Valid || res.Error != "" {
+				_ = os.Remove(outputPath)
+				s.cleanupUploadSession(body.UploadID)
+				msg := "上传的备份文件无效"
+				if res != nil && res.Error != "" {
+					msg += ": " + res.Error
+				}
+				writeJSON(w, http.StatusBadRequest, apiError(msg))
+				return
+			}
 			// 标记上传来源（对齐 mark_backup_as_uploaded：写入 manifest.json）。
 			s.markBackupAsUploaded(outputPath)
 			s.cleanupUploadSession(body.UploadID)
@@ -5384,7 +5534,10 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 			var body struct {
 				UploadID string `json:"upload_id"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.UploadID != "" {
 				s.cleanupUploadSession(body.UploadID)
 			}
@@ -5426,6 +5579,17 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 	if n >= maxMultipartBodySize {
 		_ = os.Remove(zipPath)
 		writeJSON(w, http.StatusBadRequest, apiError("备份文件过大"))
+		return
+	}
+	// 保存后立即校验 ZIP 有效性：损坏的备份不应进入备份列表（对齐
+	// Python 上传后 pre_check）。校验失败删除已保存文件并返回错误。
+	if res := backup.CheckBackup(zipPath); res == nil || !res.Valid || res.Error != "" {
+		_ = os.Remove(zipPath)
+		msg := "上传的备份文件无效"
+		if res != nil && res.Error != "" {
+			msg += ": " + res.Error
+		}
+		writeJSON(w, http.StatusBadRequest, apiError(msg))
 		return
 	}
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -5545,7 +5709,10 @@ func (s *Server) handleBackupsRename(w http.ResponseWriter, r *http.Request, fil
 	var body struct {
 		NewName string `json:"new_name"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if body.NewName == "" {
 		writeJSON(w, http.StatusBadRequest, apiError("缺少参数 new_name"))
 		return
@@ -5606,7 +5773,10 @@ func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request, fil
 	var body struct {
 		Confirmed bool `json:"confirmed"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if !body.Confirmed {
 		writeJSON(w, http.StatusBadRequest, apiError("请先确认导入。导入将会清空并覆盖现有数据，此操作不可撤销。"))
 		return
@@ -5716,7 +5886,10 @@ func (s *Server) handleCron(w http.ResponseWriter, r *http.Request, parts []stri
 				switch r.Method {
 				case http.MethodPatch:
 					var body map[string]interface{}
-					_ = json.NewDecoder(r.Body).Decode(&body)
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+						return
+					}
 					updated, errMsg := s.cronUpdateJob(jobID, body)
 					if errMsg != "" {
 						writeJSON(w, http.StatusNotFound, apiOK(map[string]interface{}{
@@ -5743,7 +5916,10 @@ func (s *Server) handleCron(w http.ResponseWriter, r *http.Request, parts []stri
 		} else {
 			if r.Method == http.MethodPost {
 				var body map[string]interface{}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				created, errMsg := s.cronCreateJob(body)
 				if errMsg != "" {
 					writeJSON(w, http.StatusBadRequest, apiOK(map[string]interface{}{
@@ -5979,7 +6155,10 @@ func (s *Server) handleChatRegenerate(w http.ResponseWriter, r *http.Request, se
 		SelectedModel    string                 `json:"selected_model"`
 		Flags            map[string]interface{} `json:"flags"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	s.runChatSSEStream(w, r, chatStreamRequest{
 		SessionID:        sessionID,
 		Parts:            parts,
@@ -6498,7 +6677,10 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 		var body struct {
 			SessionIDs []string `json:"session_ids"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		deleted := s.chat.deleteSessions(body.SessionIDs)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"deleted_count": deleted,
@@ -6586,7 +6768,10 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 			writeJSON(w, http.StatusOK, apiOK(detail))
 		case http.MethodPatch:
 			var body map[string]interface{}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			_ = s.chat.updateSession(sessionID, body)
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"message": "session updated",
@@ -6615,7 +6800,10 @@ func (s *Server) installGoPackage(w http.ResponseWriter, r *http.Request) {
 		Package string `json:"package"`
 		Mirror  string `json:"mirror"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if s.subPluginMgr == nil {
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"status":  "error",
@@ -6686,7 +6874,10 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request, parts []st
 			Proxy      string `json:"proxy"`
 			ProgressID string `json:"progress_id"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		s.doUpdateCore(w, body.ProgressID, body.Version, body.Proxy)
 	case "dashboard":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
@@ -7248,7 +7439,10 @@ func (s *Server) updateCommand(w http.ResponseWriter, r *http.Request, handlerFu
 		Aliases         []string `json:"aliases"`
 		PermissionGroup *string  `json:"permission_group"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 
 	sm, ok := s.starMgr.(*star.Manager)
 	if !ok || sm == nil {
@@ -7340,7 +7534,10 @@ func (s *Server) handleProviderSources(w http.ResponseWriter, r *http.Request, p
 			var body struct {
 				Config map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if err := s.upsertProviderSource(body.Config); err != nil {
 				writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
 				return
@@ -7365,7 +7562,10 @@ func (s *Server) handleProviderSources(w http.ResponseWriter, r *http.Request, p
 				SourceID string                 `json:"source_id"`
 				Config   map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.SourceID != "" {
 				sourceID = body.SourceID
 			}
@@ -7411,7 +7611,10 @@ func (s *Server) handleProviderSources(w http.ResponseWriter, r *http.Request, p
 				SourceID string                 `json:"source_id"`
 				Config   map[string]interface{} `json:"config"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.Config == nil {
 				body.Config = map[string]interface{}{}
 			}
@@ -7733,7 +7936,10 @@ func (s *Server) handleBotRegistration(w http.ResponseWriter, r *http.Request, b
 		TaskID           string                 `json:"task_id"`
 		BindKey          string                 `json:"bind_key"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if body.PlatformConfig == nil {
 		body.PlatformConfig = map[string]interface{}{}
 	}
@@ -8587,7 +8793,10 @@ func (s *Server) handleT2ITemplates(w http.ResponseWriter, r *http.Request, part
 				var body struct {
 					Name string `json:"name"`
 				}
-				_ = json.NewDecoder(r.Body).Decode(&body)
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
 				if strings.TrimSpace(body.Name) == "" {
 					writeJSON(w, http.StatusBadRequest, apiError("模板名称(name)不能为空"))
 					return
@@ -8734,7 +8943,10 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 				SkillName string `json:"skill_name"`
 				Enabled   *bool  `json:"enabled"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.SkillName != "" {
 				skillName = body.SkillName
 			}
@@ -8965,7 +9177,10 @@ func (s *Server) updateSkillFile(w http.ResponseWriter, r *http.Request) {
 		Path      string `json:"path"`
 		Content   string `json:"content"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if body.Path == "" {
 		body.Path = "SKILL.md"
 	}
@@ -9292,7 +9507,10 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 			ConversationIDs []string `json:"conversation_ids"`
 			UserID          string   `json:"user_id"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		deleted := 0
 		for _, id := range body.ConversationIDs {
 			if s.conversationDeleteByCID(id) {
@@ -9326,7 +9544,10 @@ func (s *Server) handleConversationByID(w http.ResponseWriter, r *http.Request, 
 			var body struct {
 				History []map[string]interface{} `json:"history"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			history := make([]interface{}, 0, len(body.History))
 			for _, h := range body.History {
 				history = append(history, h)
@@ -9357,7 +9578,10 @@ func (s *Server) handleConversationByID(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusOK, apiOK(detail))
 	case http.MethodPatch:
 		var body map[string]interface{}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if s.conversationUpdateByCID(convID, body) {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"message": "conversation " + convID + " updated",
@@ -9402,7 +9626,10 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request, parts []str
 			var body struct {
 				TraceEnable *bool `json:"trace_enable"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
 			if body.TraceEnable != nil {
 				if err := s.setConfigData("trace_enable", *body.TraceEnable); err != nil {
 					writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))

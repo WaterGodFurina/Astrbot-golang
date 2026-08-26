@@ -728,7 +728,10 @@ func (s *Server) handleTOTP(w http.ResponseWriter, r *http.Request, parts []stri
 			Secret string `json:"secret"`
 			Code   string `json:"code"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		if body.Code == "" {
 			if s.auth.TOTPEnabled() {
 				// 已启用时拒绝重新生成，避免 GenerateTOTP 覆盖现有密钥
@@ -853,7 +856,10 @@ func (s *Server) handleAccountEdit(w http.ResponseWriter, r *http.Request) {
 		Password    string `json:"new_password"`
 		OldPassword string `json:"password"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	if s.auth == nil {
 		writeJSON(w, http.StatusOK, apiOK(nil))
 		return
@@ -1015,7 +1021,10 @@ func (s *Server) cleanupStorage(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Target string `json:"target"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	target := strings.ToLower(strings.TrimSpace(body.Target))
 	if target == "" {
 		target = "all"
@@ -1142,7 +1151,10 @@ func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			ProxyURL string `json:"proxy_url"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
 		proxyURL = strings.TrimSpace(body.ProxyURL)
 	}
 	if proxyURL == "" {

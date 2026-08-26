@@ -814,14 +814,14 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		},
 
 		// ── 插件/Star 管理（对齐 Python star_manager）──
-		ListStars: func() []map[string]any {
+		GetPluginRegistry: func() []map[string]any {
 			// 用子进程插件的静态清单（含已安装但休眠/禁用的插件），对齐
 			// Python 原版 star_registry 语义（原版插件全常驻、注册表含全部
 			// 插件）：update_manager 等依赖 get_all_stars 枚举全部插件以
 			// 填充黑/白名单选项的管理类插件，不能只看到运行中插件。
 			// 每插件附带 commands（宿主聚合的指令描述符）：helps 类插件经
-			// 现有 ListStars 通道跨进程枚举全部插件指令（SDK 注册完成后
-			// 一次性注入本进程注册表，0 运行期开销）。
+			// 现有 GetPluginRegistry 通道跨进程枚举全部插件指令（SDK 注册
+			// 完成后一次性注入本进程注册表，0 运行期开销）。
 			commandsByPlugin := map[string][]map[string]any{}
 			if starMgr != nil {
 				for _, d := range starMgr.CommandDescriptors() {
@@ -839,35 +839,13 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				return base
 			}
 			if subMgr != nil {
+				// 直接透传 ListInfo 返回的整条 info map（含 author/
+				// support_platforms/astrbot_version/i18n/pages/logo_path 等
+				// 对齐字段），再附加 commands，避免手挑字段遗漏新增元数据。
 				var out []map[string]any
 				for _, info := range subMgr.ListInfo() {
-					name, _ := info["name"].(string)
 					instID, _ := info["id"].(string)
-					displayName, _ := info["display_name"].(string)
-					if displayName == "" {
-						displayName = name
-					}
-					desc, _ := info["description"].(string)
-					if desc == "" {
-						desc, _ = info["short_desc"].(string)
-					}
-					author, _ := info["author"].(string)
-					version, _ := info["version"].(string)
-					repo, _ := info["repo"].(string)
-					activated, _ := info["activated"].(bool)
-					reserved, _ := info["reserved"].(bool)
-					out = append(out, withCommands(instID, map[string]any{
-						"name":         name,
-						"id":           instID,
-						"display_name": displayName,
-						"author":       author,
-						"desc":         desc,
-						"version":      version,
-						"module_path":  "data.plugins." + name,
-						"activated":    activated,
-						"repo":         repo,
-						"reserved":     reserved,
-					}))
+					out = append(out, withCommands(instID, info))
 				}
 				return out
 			}
@@ -893,7 +871,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			return out
 		},
 		GetStar: func(name string) map[string]any {
-			// 与 ListStars 一致：从静态插件清单查找（含休眠/禁用插件）。
+			// 与 GetPluginRegistry 一致：从静态插件清单查找（含休眠/禁用插件）。
 			if subMgr != nil {
 				for _, info := range subMgr.ListInfo() {
 					instName, _ := info["name"].(string)

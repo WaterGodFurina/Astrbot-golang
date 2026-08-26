@@ -1,154 +1,209 @@
 # AstrBot-golang
 
-该项目由[AstrBot](https://github.com/AstrBotDevs/AstrBot)迁移而来，目前移植进度94%左右，已验证60%的功能(核心功能已得到全部验证)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-blue.svg)](https://golang.org/)
+[![License](https://img.shields.io/badge/License-AstrBot-orange.svg)](https://github.com/WaterGodFurina/Astrbot-golang/blob/main/LICENSE)
 
-## 原仓库
+> 由 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 迁移而来的 Go 语言实现，**核心功能已验证**，当前移植进度 **97%**。
 
-[https://github.com/AstrBotDevs/AstrBot](https://github.com/AstrBotDevs/AstrBot)
+---
 
-## 架构
+## 项目简介
 
-```
+AstrBot-golang 是一个**高性能、可扩展**的聊天机器人框架，原生支持 **18 个消息平台**、**14 类 LLM Provider**、**子进程插件系统**（兼容 Python/Go 插件）以及 **WebUI 管理面板**。项目采用纯 Go 编写，核心二进制不依赖 CGO，可轻松跨平台部署（Windows / macOS / Linux / Termux）。
+
+---
+
+## 架构概览
+
+```text
 astrbot-go/
-├── cmd/astrbot/               # 主入口
+├── cmd/astrbot/               # 主程序入口
 ├── internal/
-│   ├── plugin/                # 子进程插件运行时 (go-plugin + gRPC：加载/编译/静态扫描/崩溃重启)
-│   ├── toolchain/             # 自带 Go 工具链 (自动下载、解压、路径管理)
-│   ├── star/                  # 指令系统 (子进程插件命令/filter/hook 桥接进管线)
-│   ├── lifecycle/             # 生命周期管理，组装所有模块
-│   ├── pipeline/              # 消息处理管线 (9 阶段)
-│   ├── platform/              # 平台适配器 (18 个：QQ官方/Telegram/WebChat/Discord/Lark/微信系列/OneBot/Satori/Line/Slack/Mattermost/Misskey/Kook/DingTalk/WeCom 等)
-│   ├── provider/              # LLM Provider 管理
-│   ├── dashboard/             # WebUI API 服务器 + 路由 + 认证
+│   ├── plugin/                # 子进程插件运行时（go-plugin + gRPC）
+│   ├── toolchain/             # 自带 Go / Clang 工具链（自动下载与管理）
+│   ├── star/                  # 指令系统（命令/filter/hook 桥接）
+│   ├── lifecycle/             # 生命周期管理（模块组装）
+│   ├── pipeline/              # 消息处理管线（9 阶段）
+│   ├── platform/              # 18 个平台适配器
+│   ├── provider/              # LLM Provider 管理（Chat/TTS/STT/Embedding/Rerank）
+│   ├── dashboard/             # WebUI API 服务器 + 认证
 │   ├── core/                  # 事件总线 + Pipeline 调度器
-│   ├── sandbox/               # 沙箱 (Docker/本地/Shipyard)
+│   ├── sandbox/               # 沙箱（Docker/本地/Shipyard）
 │   ├── skills/                # 技能管理
 │   ├── conversation/          # 会话管理
 │   ├── config/                # 配置管理
-│   ├── db/                    # SQLite 数据库
-│   └── ...                    # 其余支持包
+│   ├── db/                    # SQLite 数据库（纯 Go 驱动）
+│   └── ...                    # 其他支持包
 ├── pkg/
 │   ├── message/               # 消息组件
-│   └── sdk/                   # 插件 SDK 文档入口 (SDK 本体在独立 module)
+│   └── sdk/                   # 插件 SDK 文档入口
 └── go.mod
 ```
 
-## Agent改进
+---
 
-本项目在基于AstrBot上，加入了一些opencode的Agent特性，使模型在执行Agent操作时不会重复执行
+## Agent 改进
 
-## 插件方案
+本项目在 AstrBot 的基础上引入了部分 opencode 的 Agent 特性，确保模型在执行 Agent 操作时不会重复执行，提升多轮交互的效率与稳定性。
 
-插件系统已全面采用子进程方案（go-plugin + gRPC），旧 `.so` 插件方案及其 `legacy_plugin_mode` 配置项已彻底移除，不再提供 `.so` 加载路径。
+---
 
-为了兼容原项目AstrBot的插件，本项目通过gRPC+Python SDK实现了对原项目AstrBot插件的兼容（已知问题：一个插件占用运存80MB，因为gRPC方案是让插件相互独立）
+## 插件系统
 
-### 插件闲置休眠
+插件系统采用 子进程方案（go-plugin + gRPC），保证隔离性和稳定性
 
-为回收闲置插件进程的内存，可配置 `plugin_idle_unload_minutes`（WebUI 行为页），超过阈值无 RPC 活动的插件进程会被**卸载休眠**（OS 归还内存）：
+### 核心特性
 
-- **休眠 ≠ 卸载**：休眠时插件进程被终止，但其命令/过滤器 handler 与 LLM 工具仍保留在管线/工具注册表中——下次被命令触发、过滤器命中或 LLM 工具调用时自动**懒加载唤醒**（EnsureLoaded 重启进程），无感恢复
-- 适用所有插件（Go 二进制 / Python 解释器，仅管理进程生命周期）
-- 带 filter/hook 的插件被被动消息排除（不 Touch），避免被无关消息频繁唤醒
+- 跨语言兼容：支持 Go 与 Python 插件，通过 main.go / main.py 自动识别类型。
+- 进程隔离：每个插件运行在独立子进程中，崩溃自动重启（带退避与次数上限）。
+- 热重载：零停机更新（先起新进程，再杀旧进程）。
+- 闲置休眠：可配置 plugin_idle_unload_minutes，超时无 RPC 活动的插件进程被终止（内存归还），但命令/过滤器/LLM 工具仍保留在注册表中；下次触发时自动懒加载唤醒，用户无感。
+- 兼容 AstrBot 生态：Python 插件通过独立 gRPC 桥接，支持直接从市场安装（zip/Git），requirements.txt 自动安装依赖，_conf_schema.json 渲染 WebUI 配置面板。
 
-### 自带 Go 工具链
+> 注意：Python 插件每个进程约占用 60-80MB 内存（因 gRPC 隔离）。
 
-首次编译插件时，程序自动下载官方 Go 免安装包到用户私有目录（`~/.local/share/astrbot-go/` 等），无需用户装 Go：
+---
 
-- `ASTRBOT_GO_BIN`：指定已有的 `go` 二进制（最高优先）
-- `ASTRBOT_GO_VERSION`：指定要下载的 Go 版本（默认 1.24.3）
-- `ASTRBOT_GO_MIRROR`：下载镜像
+### Go 插件 SDK
 
-cgo 插件的 C 编译器（zig/clang/GCC）也存放在同一私有目录下（`clang-download/` 缓存归档、`clang/` 解压产物）：
+golang 插件通过[独立 module](github.com/WaterGodFurina/astrbot-go-plugin-sdk)桥接进宿主。
 
-- `ASTRBOT_CLANG_BIN`：直接指向已装好的 clang 可执行文件
-- `ASTRBOT_CLANG_VERSION`：指定要下载的 zig 版本（默认 0.16.0）
-- `ASTRBOT_CLANG_MIRROR`：C 编译器下载镜像（如 gh-proxy 加速地址）
-- `ASTRBOT_CC`：系统 GCC 覆盖（检测优先级 `ASTRBOT_CC` > `CC` > PATH `gcc`）
+#### 自带 Go 工具链
 
-### 静态扫描 + 风险提示
+首次编译插件时，程序自动下载官方 Go 免安装包到用户目录，无需用户预先安装 Go。
 
-安装插件前会静态扫描源码，发现 `os/exec`、`syscall`、`unsafe` 等危险包时，**WebUI 弹出风险对话框并列出具体代码行**，由用户选择"无视风险，继续安装"或"取消安装"。
+- 环境变量控制（见下方表格）
+- 版本默认：Go 1.26
 
-### 已知局限与注意事项
+#### 静态扫描 + 风险提示
 
-1. **cgo 支持（声明式 + 自动选择 C 编译器）**：插件在 `metadata.json` 里显式声明 `"cgo": true` 才启用 cgo（缺省为 false，纯 Go 编译）。声明 cgo 后，宿主自动检测/选择 C 编译器：
-   - 系统已有 GCC（按 `ASTRBOT_CC` > `CC` 环境变量 > PATH 中的 `gcc` 检测）→ WebUI 询问"使用系统 GCC 还是 Clang"
-   - 系统已有 Clang → 直接使用
-   - 都没有 → WebUI 询问是否自动下载 Clang；确认后下载 **zig**（`zig cc` 内置 clang，约 50MB，解压数秒，远快于 ~1GB 的 LLVM 完整包），或以 `zig cc`/`zig c++` 作为 CC/CXX 编译
-   - 可手动取消，或设 `ASTRBOT_CC`/`ASTRBOT_CLANG_BIN` 指定编译器
-   - 依赖 cgo 的库（如 `github.com/mattn/go-sqlite3`）因此在 Windows / macOS / Linux（含 Termux）上都能编译
-2. **首次安装需下载 Go 工具链（约 150–200MB）**：WebUI 安装对话框会显示实时下载进度，日志每 10% 一报。可设置 `ASTRBOT_GO_BIN` 指向本机已有的 Go 以跳过下载。
-3. **静态扫描的检测范围与盲区**：
-   - 已检测：插件自身源码直接 `import` 的 `os/exec`、`syscall`、`unsafe`、`reflect`，以及 `//go:linkname`、`//go:generate` 指令（均有文件/行号/代码行，可人工判断）
-   - **固有盲区（无法可靠拦截）**：
-     - **间接导入**：插件 A 导入的外部包 B 内部使用 `os/exec`——由于 SDK 本身经 go-plugin 就依赖 `os/exec`，对依赖树做此扫描会把所有插件都标红，故不设阻断
-     - **误报**：`os/exec` 执行 `ls` 等无害命令也会被标记
-   - 结论：风险提示仅供人工判断，不构成安全保证。
-4. **编译需要网络**：`go mod download` 会拉取依赖，离线环境安装插件会失败。
-5. **Termux（Android）**：官方没有 Android 的 Go 包，需先 `pkg install golang` 再设 `ASTRBOT_GO_BIN` 指向它，或手动安装 Go；cgo 插件需 `pkg install clang`（Termux 无官方 zig 包）。
-6. **cgo 编译器下载中断安全**：下载缓存于 `~/.local/share/astrbot-go/clang-download/`，支持断点续传（HTTP Range）；解压前写 `.install-lock`，若上次安装被中断，下次会自动丢弃半成品并重新下载。
+安装插件前，自动扫描源码中的危险包（os/exec、syscall、unsafe 等），WebUI 弹出风险对话框并显示具体代码行，用户可选择“继续安装”或“取消”。
 
-### 安装与热重载
+局限：仅能检测插件自身源码的直接导入，间接依赖（如第三方包）无法可靠拦截，该提示仅供人工判断。
 
-- WebUI「安装插件」支持上传 `.zip` 归档或填 Git/归档 URL
-- 插件包根目录须含 `metadata.json`（身份/cgo 声明）与 `main.go`（入口），缺任一安装失败
-- 安装 = 下载源码 → 校验 metadata.json + main.go → 静态扫描 → （如需 cgo 则选择/下载 C 编译器）→ 编译 → 启动子进程 → 桥接进管线
-- 安装后把 metadata.json 内容写入 `data/plugins_config/<name>/config.json` 开头，供 WebUI 展示插件信息
-- 崩溃自动重启（带退避与次数上限）；重载零停机（先起新进程再杀旧进程）
+#### cgo 支持
 
-## 平台适配器
+插件需在 metadata.json 中显式声明 "cgo": true 才启用 cgo（默认 false）。宿主自动检测并选择 C 编译器：
 
-共 18 个平台适配器，对齐 Python AstrBot v4.27.3 全平台覆盖：
+- 系统已有 GCC（按 ASTRBOT_CC > CC 环境变量 > PATH 中的 gcc）→ WebUI 询问使用系统 GCC 还是 Clang
+- 系统已有 Clang → 直接使用
+- 都没有 → WebUI 询问是否自动下载 zig（zig cc 内置 clang，约 50MB），下载后解压即可用
+- 支持断点续传，安装中断后自动清理并重试
 
-| 适配器 | 说明 | 关键实现 |
+---
+
+### Python 插件 SDK
+
+为兼容 AstrBot 生态，Python 插件通过[独立 module](github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk) 桥接进宿主。
+
+- API 对齐：astrbot.api.* 与 astrbot.core.* 对齐 Python AstrBot v4.27.4
+- 能力桥接：Context.get_all_stars/get_all_providers 等经宿主 RPC 反向调用；session_waiter 跨进程喂入
+
+#### 自带 Python 解释器
+
+若系统无 python3/python，程序自动下载 python-build-standalone（Astral 维护的 CPython 独立发行版）到用户目录，跨重启复用。
+
+- 环境变量控制（见下方表格）
+- 版本默认：20260814（内置 CPython 3.12）
+- pip 默认走阿里云镜像（可配置 pypi_index_url 或环境变量 ASTRBOT_PYPI_INDEX/PIP_INDEX_URL 覆盖）
+
+---
+
+## 平台适配器（18 个）
+
+| 适配器 | 说明 | 关键特性 |
 |--------|------|----------|
-| aiocqhttp | OneBot v11 | HTTP 接收 + 反向 WebSocket 发送，CQ 码转换，群转发/撤回/引用解析，同 msgID 去重 |
+| aiocqhttp | OneBot v11 | HTTP 接收 + 反向 WebSocket，CQ 码转换，群转发/撤回/引用，去重 |
 | qq_official | QQ 开放平台 | botpy WS 网关，原生 C2C 流式（StreamFragmenter） |
 | qq_official_webhook | QQ 开放平台 Webhook | Ed25519 签名校验，webhook 回调，REST 发送 |
-| telegram | Telegram | 长轮询，完整多媒体（photo/voice/document/video），setMessageReaction，30s 超时 |
+| telegram | Telegram | 长轮询，完整多媒体（photo/voice/document/video），reaction，30s 超时 |
 | webchat | 内置 Web 聊天 | HTTP `/chat` `/poll`，SSE/WebSocket 双 transport，JWT 鉴权 |
-| lark | 飞书 | 官方 SDK，socket 长连接 / webhook 双模式，post 富文本，im/v1/message_reaction，AES-256-CBC webhook 解密 |
-| discord | Discord | gateway + Application Command（斜杠指令 1:1 star 桥接），content+files 发送，MessageReactionAdd |
-| weixin_oc | 个人微信 | iLink 协议（QR 登录 + 长轮询），一键注册，token/context 持久化 |
-| weixin_official_account | 微信公众号 | MpAccount SDK，ReadMessage 校验+解密，客服消息 custom/send |
+| lark | 飞书 | SDK，socket/Webhook 双模式，post 富文本，reaction，AES-256-CBC 解密 |
+| discord | Discord | Gateway + Application Command（斜杠指令），content+files，reaction |
+| weixin_oc | 个人微信（iLink） | QR 登录 + 长轮询，一键注册，token/context 持久化 |
+| weixin_official_account | 微信公众号 | MpAccount SDK，消息校验+解密，客服消息 |
 | wecom | 企业微信 | WXBizMsgCrypt（AES-256-CBC + SHA1），应用+客服双模式，素材上传 |
 | wecom_ai_bot | 企业微信 AI 机器人 | WXBizJsonMsgCrypt，webhook/长连接双模式，队列管理，流聚合 |
-| line | LINE | 官方 SDK，webhook X-Line-Signature 校验，GetMessageContent，事件去重 |
+| line | LINE | Webhook X-Line-Signature 校验，GetMessageContent，事件去重 |
 | slack | Slack | Socket Mode + Webhook 双模式，blocks 解析，react，附件上传 |
-| mattermost | Mattermost | WS 长连接 + REST（posts/files/users），multipart 上传，@提及解析 |
+| mattermost | Mattermost | WS + REST（posts/files/users），multipart 上传，@提及解析 |
 | misskey | Misskey | REST + WS streaming，note/renote/引用，文件上传，react，重连 |
-| kook | KOOK | gateway WS（心跳/信令）+ REST，kmarkdown/卡片解析，(met)/(rol) 选择器 |
+| kook | KOOK | Gateway WS（心跳/信令）+ REST，kmarkdown/卡片解析，(met)/(rol) 选择器 |
 | dingtalk | 钉钉 | Stream 协议（connections/open WS + 心跳），REST 机器人消息，AES，重连退避 |
 | satori | Satori 通用协议 | WS 信令（IDENTIFY/心跳/READY/EVENT），元素解析/发送，react |
 
-统一 Webhook 入口：所有适配器均支持 `PlatformWebhook` 接口，dashboard 统一注册/分发 webhook 回调。
+所有适配器统一支持 PlatformWebhook 接口，dashboard 统一注册/分发回调。
 
-## Provider 支持情况
+---
 
-| 能力 | 支持 |
-|------|------|
-| Chat / LLM (14) | OpenAI、OpenRouter、Anthropic、Gemini、Ollama、DashScope、Groq、xAI、智谱、LongCat、AIHubMix、小米（OpenAI 兼容薄封装）、Kimi-Code（Anthropic 协议）、OpenAI Responses API |
+## Provider 支持
+
+| 能力类别 | 支持的 Provider |
+|----------|-----------------|
+| Chat / LLM | OpenAI、OpenRouter、Anthropic、Gemini、Ollama、DashScope、Groq、xAI、智谱、LongCat、AIHubMix、小米（OpenAI 兼容）、Kimi-Code（Anthropic 协议）、OpenAI Responses API |
 | TTS (9) | OpenAI、Azure、ElevenLabs、FishAudio、Edge-TTS、MiniMax、火山引擎、Gemini、MiMo |
 | STT (2) | OpenAI Whisper、MiMo |
 | Embedding (5) | OpenAI、DashScope、Gemini、NVIDIA、Ollama |
 | Rerank (5) | TEI、百炼、NVIDIA、vLLM、Xinference |
 
+## 技术选型说明
+
+- **向量检索（知识库）**：使用纯 Go 的 `nanovec` 作为向量检索后端，替代原版 AstrBot 依赖的 FAISS（FAISS 依赖 C++ 编译链，与项目"纯 Go、无 CGO"的目标冲突）。知识库采用"nanovec 向量检索 + SQLite chunk 列表"双写：入库先写 SQLite、删除先删向量、启动自愈，保证两边一致。
+- **文本转图片（t2i）**：渲染策略**优先远程 t2i 服务**（HTML 模板 → 浏览器截图，效果最好），**本地回退用内置 gg 引擎**（`fogleman/gg` + 中英双字体回退 + Twemoji），无需 CGO。策略由 `t2i_strategy`（remote/local）控制：remote 优先用户配置的 `t2i_endpoint`，不可用或失败时自动回退本地渲染。
+
+---
+
+## 环境变量
+
+以下环境变量用于控制工具链下载、编译器选择等行为，配置于 WebUI 或启动脚本中。
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `ASTRBOT_GO_BIN` | 指定已有的 `go` 可执行文件路径（最高优先） | （自动检测） |
+| `ASTRBOT_GO_VERSION` | 要下载的 Go 版本 | `1.26` |
+| `ASTRBOT_GO_MIRROR` | Go 下载镜像前缀（如 `https://goproxy.cn/`） | （官方源） |
+| `ASTRBOT_CLANG_BIN` | 指定已有的 `clang` 可执行文件路径 | （自动检测） |
+| `ASTRBOT_CLANG_VERSION` | 要下载的 zig 版本（含 clang） | `0.16.0` |
+| `ASTRBOT_CLANG_MIRROR` | zig 下载镜像前缀 | （官方源） |
+| `ASTRBOT_CC` | 覆盖系统 C 编译器（优先级高于 `CC`） | （自动检测） |
+| `ASTRBOT_PYTHON_BIN` | 指定已有的 `python3`/`python` 可执行文件路径 | （自动检测） |
+| `ASTRBOT_PYTHON_VERSION` | python-build-standalone 版本 tag（内置 CPython 版本） | `20260814` |
+| `ASTRBOT_PYTHON_MIRROR` | Python 发行版下载镜像前缀 | （官方源） |
+| `ASTRBOT_PYTHON_SKIP_VERIFY` | 跳过下载后的完整性检查（不推荐） | `false` |
+| `ASTRBOT_PYTHON_CACHE_DIR` | 覆盖 Python 缓存目录（venv 与 bundled-Python 共用） | `~/.local/share/astrbot-go` |
+| `ASTRBOT_PYPI_INDEX` / `PIP_INDEX_URL` | pip 源索引 URL（阿里云镜像为 `https://mirrors.aliyun.com/pypi/simple/`） | 阿里云镜像 |
+| `ASTRBOT_SKIP_PYTHON_DOWNLOAD` | 禁止自动下载 Python（若系统无 Python 则安装失败） | `false` |
+
+---
+
+## Release发布的安卓二进制文件局限
+经检查，release的安卓二进制文件运行时无法使用插件功能（会提示无权限）
+目前没有尚可的懒人方案
+如果你想要在安卓上运行本项目，请把本项目的代码拉下来，进行go源码编译：
+
+```bash
+pkg update && pkg install golang git
+git clone https://github.com/WaterGodFurina/Astrbot-golang.git && cd Astrbot-golang
+go build -o astrbot ./cmd/astrbot/main.go
+```
+
+---
+
+## 下载
+前往[Release](https://github.com/WaterGodFurina/Astrbot-golang/releases)获取对应平台的二进制文件
+
 ## 构建
 
 ```bash
-# 主程序（纯 Go，无需 C 编译器，CGO_ENABLED=0 亦可构建）
+# 主程序（纯 Go，无需 CGO，CGO_ENABLED=0 亦可）
 go build -o bin/astrbot ./cmd/astrbot
 ```
 
-> **CGO 说明**：主程序数据库使用纯 Go 驱动 `modernc.org/sqlite`，**不依赖 CGO**，
-> 可用 `CGO_ENABLED=0 go build` 产出静态二进制，交叉编译 / 无 GCC 的 Docker
-> 镜像 / Windows / Termux 均无需 C 工具链。仅**插件**在 `metadata.json` 声明
-> `"cgo": true` 时才需要 C 编译器（宿主自动选择 zig/clang/GCC，见上文"cgo 支持"）。
->
-> **模块路径**：`module github.com/WaterGodFurina/Astrbot-golang`，与仓库 URL 一致；
-> 插件 SDK 作为普通依赖从 GitHub 拉取（`github.com/WaterGodFurina/Astrbot-go-plugin-sdk`），
-> 无本地 `replace`，clone 后直接 `go build` 即可（需联网拉依赖）。
+CGO 说明：主程序使用纯 Go SQLite 驱动（modernc.org/sqlite），不依赖 CGO，可交叉编译出静态二进制，适合 Windows / macOS / Linux（含 Termux）及无 GCC 的 Docker 环境。
+仅当插件在 metadata.json 中声明 "cgo": true 时才需要 C 编译器（宿主自动选择 zig/clang/GCC）。
+
+- 模块路径：github.com/WaterGodFurina/Astrbot-golang
+- 插件 SDK：作为普通依赖从 GitHub 拉取（github.com/WaterGodFurina/Astrbot-go-plugin-sdk），无需本地 replace，直接 go build 即可（需联网拉取依赖）。
 
 ## 测试
 
@@ -162,35 +217,27 @@ go test ./... -v
 ./bin/astrbot
 ```
 
-默认 API 端口 6185。
+默认 WebUI API 端口：6185
+访问 http://IP地址:6185 进入管理面板。
+
+---
 
 ## 代码规模
 
-- 341 个 Go 文件（非测试 216，测试 125，53 个包）
-- 约 107,154 行（核心代码 ~79,701 行 + 测试 ~27,453 行）
-- 18 个平台适配器 + 14 类 LLM Provider 能力（Chat 14 / TTS 9 / STT 2 / Embedding 5 / Rerank 5）
-- 对齐 Python AstrBot v4.27.3 全平台全核心架构
+- Go 文件：354 个（非测试 226，测试 128，58 个包）
+- 代码行数：约 118,715 行（核心 ~90,746 行 + 测试 ~27,969 行）
+- 平台适配器：18 个
+- Provider 能力：Chat 14 / TTS 9 / STT 2 / Embedding 5 / Rerank 5
+- 对齐版本：Python AstrBot v4.27.4
 
-## Python 插件 SDK
+---
 
-为兼容 AstrBot 生态，Python 插件经独立 module `github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk` 通过 gRPC 桥接进宿主（`data/plugins/<id>/` 存本体、`data/plugins-src/` 源码、`python-venv-*` 运行时环境）：
+## 许可证
 
-- **插件兼容**：直接安装 AstrBot 市场的 Python 插件（zip/Git 源），`requirements.txt` 自动装依赖，`_conf_schema.json` 配置 schema 渲染 WebUI 配置面板
-- **API 对齐**：`astrbot.api.*`（star/filter/event/message_components/sp）、`astrbot.core.*`（Context 管理器 / Provider / star_manager / session_waiter / version_comparator 等）对齐 Python AstrBot v4.27.3
-- **能力桥接**：`Context.get_all_stars/get_all_providers` 等经宿主 RPC 反向调用；`session_waiter` 跨进程喂入（宿主 `SessionWaitStage` → `FeedSessionWait` → `try_trigger`）
-- **统一事件**：事件重建为三段式 unified_msg_origin（`platform_id:message_type:session_id`），与宿主 PythonUMO 一致
-- **SDK 版本**：`v0.4.1`（经宿主 go.mod 解析，开发态本地 `replace`；宿主运行期按模块目录注入子进程）
+本项目采用与 AstrBot 相同的许可证 [AGPL-3.0](https://github.com/WaterGodFurina/Astrbot-golang/blob/main/LICENSE)
 
-### 自带 Python 解释器（CPython 自动下载）
+---
 
-系统无 `python3`/`python` 时，程序自动下载 **python-build-standalone**（Astral 维护的 CPython 独立发行版，与 uv 同源）到用户私有目录（`~/.local/share/astrbot-go/python/<version>`），跨重启复用，无需用户装 Python：
+提示：本 README 持续更新，更多细节请查阅 [原项目文档](https://docs.astrbot.app/what-is-astrbot.html)。
 
-- `ASTRBOT_PYTHON_BIN`：显式指定已有解释器（最高优先）
-- `ASTRBOT_PYTHON_VERSION`：python-build-standalone 版本 tag（默认 `20260814`，内置 CPython 3.12）
-- `ASTRBOT_PYTHON_MIRROR`：下载镜像前缀（如 `https://ghfast.top/`，会拼在官方 URL 之前）
-- `ASTRBOT_PYTHON_SKIP_VERIFY`：跳过下载后的完整性检查
-- `ASTRBOT_PYTHON_CACHE_DIR`：覆盖缓存目录（venv 与 bundled-Python 共用）
-
-解释器查找优先级：`ASTRBOT_PYTHON_BIN` → PATH `python3`/`python` → 已下载的 bundled Python。插件依赖 pip 默认走阿里云镜像（可用配置 `pypi_index_url` 或 `ASTRBOT_PYPI_INDEX`/`PIP_INDEX_URL` 覆盖）。
-
-Go 插件 SDK（`github.com/WaterGodFurina/Astrbot-go-plugin-sdk` v1.3.2）见其仓库 README。
+```

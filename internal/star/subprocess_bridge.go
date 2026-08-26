@@ -337,7 +337,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 	}
 
 	// 把插件元数据注册进 star 注册表，使其能被宿主插件管理 RPC（如
-	// HostService.ListStars / Context.get_all_stars）枚举到——否则
+	// HostService.GetPluginRegistry / Context.get_all_stars）枚举到——否则
 	// update_manager 等依赖 get_all_stars 的管理类插件拿到空列表。
 	// 幂等：reload 时按 module path 查找，已存在则跳过（避免重复条目）。
 	modulePath := "data.plugins." + inst.ID

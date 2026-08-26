@@ -828,7 +828,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if opts.Repo == "" && meta.Repo != "" {
 		opts.Repo = meta.Repo
 	}
-	if err := m.recordInstall(inst, source, artifact, opts); err != nil {
+	if err := m.recordInstall(inst, source, artifact, opts, meta); err != nil {
 		logger.I18nWarn("插件 %s 已安装但 manifest 持久化失败: %v", id, err)
 	}
 	m.cachePluginDocs(inst.ID, srcDest, meta)
@@ -912,7 +912,7 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	if opts.Repo == "" && meta.Repo != "" {
 		opts.Repo = meta.Repo
 	}
-	if err := m.recordInstall(inst, source, dest, opts); err != nil {
+	if err := m.recordInstall(inst, source, dest, opts, meta); err != nil {
 		logger.I18nWarn("插件 %s 已安装但 manifest 持久化失败: %v", id, err)
 	}
 	m.cachePluginDocs(inst.ID, srcDir, meta)
@@ -1030,7 +1030,10 @@ func (m *SubprocessManager) PluginLogoFile(id string) string {
 }
 
 // recordInstall upserts the plugin into the persisted install manifest.
-func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact string, opts InstallOptions) error {
+// meta 是安装时的打包元数据（metadata.json/yaml），其中的展示/对齐字段
+// （Author/SupportPlatforms/AstrbotVersion/I18n/Pages/LogoPath）一并持久化，
+// 供 ListInfo 直接读取而无需每次重新读盘解析。
+func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact string, opts InstallOptions, meta *PluginMetadata) error {
 	// 串行化 manifest 的读→改→写，防止并发 Install/SetEnabled 互相覆盖丢条目。
 	m.manifestMu.Lock()
 	defer m.manifestMu.Unlock()
@@ -1038,22 +1041,45 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 	if err != nil {
 		return err
 	}
+	// 打包元数据对齐字段（Author/SupportPlatforms/AstrbotVersion/I18n/Pages/
+	// LogoPath）安装时持久化，供 ListInfo 直接读取；meta 为空（异常路径）时
+	// 留空，条目仍可写入。
+	var metaAuthor string
+	var metaSupportPlatforms []string
+	var metaAstrbotVersion string
+	var metaI18n map[string]map[string]string
+	var metaPages []interface{}
+	var metaLogoPath string
+	if meta != nil {
+		metaAuthor = meta.Author
+		metaSupportPlatforms = meta.SupportPlatforms
+		metaAstrbotVersion = meta.AstrbotVersion
+		metaI18n = meta.I18n
+		metaPages = meta.Pages
+		metaLogoPath = meta.LogoPath
+	}
 	man.Upsert(ManifestEntry{
-		ID:             inst.ID,
-		Name:           inst.Name,
-		Version:        inst.Version,
-		Source:         source,
-		Binary:         artifact,
-		Enabled:        true,
-		Language:       inst.Language,
-		DisplayName:    inst.DisplayName,
-		ShortDesc:      inst.ShortDesc,
-		InstallMethod:  opts.InstallMethod,
-		RegistryURL:    opts.RegistryURL,
-		RegistryName:   opts.RegistryName,
-		MarketPluginID: opts.MarketPluginID,
-		Repo:           opts.Repo,
-		DownloadURL:    opts.DownloadURL,
+		ID:               inst.ID,
+		Name:             inst.Name,
+		Version:          inst.Version,
+		Source:           source,
+		Binary:           artifact,
+		Enabled:          true,
+		Language:         inst.Language,
+		DisplayName:      inst.DisplayName,
+		ShortDesc:        inst.ShortDesc,
+		InstallMethod:    opts.InstallMethod,
+		RegistryURL:      opts.RegistryURL,
+		RegistryName:     opts.RegistryName,
+		MarketPluginID:   opts.MarketPluginID,
+		Repo:             opts.Repo,
+		DownloadURL:      opts.DownloadURL,
+		Author:           metaAuthor,
+		SupportPlatforms: metaSupportPlatforms,
+		AstrbotVersion:   metaAstrbotVersion,
+		I18n:             metaI18n,
+		Pages:            metaPages,
+		LogoPath:         metaLogoPath,
 		// 记录插件在 data 下创建的目录，供卸载时精确清理。目录一律按插件
 		// 实例 id（name_language）分键：同名 Go/Python 插件的本体（plugins/）、
 		// 配置（plugins_config/）、数据（plugins_data/）完全隔离。

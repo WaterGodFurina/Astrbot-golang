@@ -52,6 +52,18 @@ type PluginMetadata struct {
 	// LogoPath is the plugin logo file path relative to the plugin root
 	// (metadata.yaml logo_path; conventionally logo.png at the root).
 	LogoPath string `json:"logo_path,omitempty" yaml:"logo_path,omitempty"`
+	// SupportPlatforms 是插件声明支持的平台适配器 ID 列表（对应 Python
+	// adapter_name_2_type 的 key；metadata.yaml support_platforms）。
+	SupportPlatforms []string `json:"support_platforms,omitempty" yaml:"support_platforms,omitempty"`
+	// AstrbotVersion 是插件要求的 AstrBot 版本范围（PEP 440 specifier，如
+	// >=4.13.0,<4.17.0；metadata.yaml astrbot_version）。
+	AstrbotVersion string `json:"astrbot_version,omitempty" yaml:"astrbot_version,omitempty"`
+	// I18n 是插件自带的国际化文案，按 locale 分组（Python 原版从
+	// .astrbot-plugin/i18n/<locale>.json 加载；metadata.json/yaml 可选带
+	// i18n 字段时也会被解析）。
+	I18n map[string]map[string]string `json:"i18n,omitempty" yaml:"i18n,omitempty"`
+	// Pages 是插件注册的 Pages 元数据列表（metadata.yaml pages）。
+	Pages []interface{} `json:"pages,omitempty" yaml:"pages,omitempty"`
 }
 
 // ResolveLanguage determines the plugin's implementation language purely from
@@ -177,27 +189,35 @@ func readMetadataYAML(path string) (*PluginMetadata, error) {
 		return nil, fmt.Errorf("读取 metadata.yaml: %w", err)
 	}
 	var raw struct {
-		Name        string `yaml:"name"`
-		DisplayName string `yaml:"display_name"`
-		ShortDesc   string `yaml:"short_desc"`
-		Desc        string `yaml:"desc"`
-		Version     string `yaml:"version"`
-		Author      string `yaml:"author"`
-		Repo        string `yaml:"repo"`
-		LogoPath    string `yaml:"logo_path"`
+		Name             string                       `yaml:"name"`
+		DisplayName      string                       `yaml:"display_name"`
+		ShortDesc        string                       `yaml:"short_desc"`
+		Desc             string                       `yaml:"desc"`
+		Version          string                       `yaml:"version"`
+		Author           string                       `yaml:"author"`
+		Repo             string                       `yaml:"repo"`
+		LogoPath         string                       `yaml:"logo_path"`
+		SupportPlatforms []string                     `yaml:"support_platforms"`
+		AstrbotVersion   string                       `yaml:"astrbot_version"`
+		I18n             map[string]map[string]string `yaml:"i18n"`
+		Pages            []interface{}                `yaml:"pages"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("解析 metadata.yaml 失败: %w", err)
 	}
 	return &PluginMetadata{
-		Name:        raw.Name,
-		DisplayName: raw.DisplayName,
-		ShortDesc:   raw.ShortDesc,
-		Description: raw.Desc,
-		Version:     raw.Version,
-		Author:      raw.Author,
-		Repo:        raw.Repo,
-		LogoPath:    raw.LogoPath,
+		Name:             raw.Name,
+		DisplayName:      raw.DisplayName,
+		ShortDesc:        raw.ShortDesc,
+		Description:      raw.Desc,
+		Version:          raw.Version,
+		Author:           raw.Author,
+		Repo:             raw.Repo,
+		LogoPath:         raw.LogoPath,
+		SupportPlatforms: raw.SupportPlatforms,
+		AstrbotVersion:   raw.AstrbotVersion,
+		I18n:             raw.I18n,
+		Pages:            raw.Pages,
 	}, nil
 }
 

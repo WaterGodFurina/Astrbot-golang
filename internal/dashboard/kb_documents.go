@@ -43,7 +43,10 @@ func (s *Server) recordKBTask(t *kbUploadTask) {
 // 旧版子路径形式由调用方经 query 参数解析后传入。
 func (s *Server) kbDocImportURL(w http.ResponseWriter, r *http.Request, kbID string) {
 	var body map[string]interface{}
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+		return
+	}
 	url, _ := body["url"].(string)
 	if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
 		writeJSON(w, http.StatusOK, apiError("缺少或无效的参数 url"))
