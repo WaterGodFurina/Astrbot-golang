@@ -320,6 +320,7 @@ func NewServer(port int, configPath string) *Server {
 	// 供 t2i.RenderRemote 对齐 Python 原版按模板名取内容后走 /text2img/generate。
 	t2i.T2ITemplateDir = filepath.Join(filepath.Dir(configPath), "t2i_templates")
 	t2i.T2IDefaultTemplate = t2iDefaultTemplate
+	t2i.T2IVersion = version.Version
 	s := &Server{
 		mux:       http.NewServeMux(),
 		handlers:  make(map[string]http.HandlerFunc),

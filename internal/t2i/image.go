@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -63,12 +64,111 @@ func glyphFont(path string) (*truetype.Font, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := truetype.Parse(data)
+	f, err := parseFontData(data)
 	if err != nil {
 		return nil, err
 	}
 	glyphFontCache.Store(path, f)
 	return f, nil
+}
+
+// parseFontData parses TTF/OTF font bytes into a *truetype.Font. TrueType
+// Collection (.ttc) files are handled by extracting the font at index 0 into a
+// standalone TTF first (freetype/truetype has no TTC support and TTC table
+// offsets are absolute to the file start).
+func parseFontData(data []byte) (*truetype.Font, error) {
+	if len(data) >= 4 && string(data[:4]) == "ttcf" {
+		standalone, err := extractTTFFromTTC(data, 0)
+		if err != nil {
+			return nil, err
+		}
+		if standalone == nil {
+			return nil, fmt.Errorf("truetype: unrecognized font collection")
+		}
+		return truetype.Parse(standalone)
+	}
+	return truetype.Parse(data)
+}
+
+// extractTTFFromTTC extracts the font at index from a TrueType Collection
+// (.ttc) into a standalone TTF byte stream. In a TTC each subfont's table
+// directory stores table offsets that are absolute to the TTC file start;
+// freetype/truetype expects offsets relative to the font stream start, so we
+// rebuild the sfnt header + table directory and copy each table's raw bytes
+// into a fresh, self-contained TTF. Returns (nil, nil) for non-TTC input.
+func extractTTFFromTTC(data []byte, index int) ([]byte, error) {
+	if len(data) < 4 || string(data[:4]) != "ttcf" {
+		return nil, nil
+	}
+	if len(data) < 12 {
+		return nil, fmt.Errorf("truetype: malformed ttc header")
+	}
+	numFonts := int(binary.BigEndian.Uint32(data[8:12]))
+	if index < 0 || index >= numFonts || len(data) < 12+numFonts*4 {
+		return nil, fmt.Errorf("truetype: ttc font index %d out of range", index)
+	}
+	base := int(binary.BigEndian.Uint32(data[12+index*4:]))
+	if base < 0 || base+12 > len(data) {
+		return nil, fmt.Errorf("truetype: ttc font offset out of range")
+	}
+	s := data[base:]
+	scaler := s[0:4]
+	numTables := int(binary.BigEndian.Uint16(s[4:6]))
+	if numTables == 0 || base+12+numTables*16 > len(data) {
+		return nil, fmt.Errorf("truetype: malformed ttc subfont directory")
+	}
+
+	type table struct {
+		tag      [4]byte
+		checksum [4]byte
+		length   int
+		body     []byte
+	}
+	tables := make([]table, 0, numTables)
+	for i := 0; i < numTables; i++ {
+		rec := s[12+i*16:]
+		var tag, checksum [4]byte
+		copy(tag[:], rec[0:4])
+		copy(checksum[:], rec[4:8])
+		tblOff := int(binary.BigEndian.Uint32(rec[8:12]))
+		tblLen := int(binary.BigEndian.Uint32(rec[12:16]))
+		if tblOff < 0 || tblLen < 0 || tblOff+tblLen > len(data) {
+			return nil, fmt.Errorf("truetype: ttc table %q out of range", string(tag[:]))
+		}
+		tables = append(tables, table{tag: tag, checksum: checksum, length: tblLen, body: data[tblOff : tblOff+tblLen]})
+	}
+
+	// Rebuild a standalone sfnt: header + table directory + table data.
+	headerSize := 12 + numTables*16
+	out := make([]byte, headerSize)
+	copy(out[0:4], scaler)
+	entrySelector := 0
+	for (1 << (entrySelector + 1)) <= numTables {
+		entrySelector++
+	}
+	searchRange := 1 << entrySelector
+	binary.BigEndian.PutUint16(out[4:6], uint16(numTables))
+	binary.BigEndian.PutUint16(out[6:8], uint16(searchRange*16))
+	binary.BigEndian.PutUint16(out[8:10], uint16(entrySelector))
+	binary.BigEndian.PutUint16(out[10:12], uint16(numTables*16-searchRange*16))
+
+	pos := headerSize
+	for i := range tables {
+		padded := tables[i].length
+		if r := padded % 4; r != 0 {
+			padded += 4 - r
+		}
+		start := len(out)
+		out = append(out, make([]byte, padded)...)
+		copy(out[start:start+tables[i].length], tables[i].body)
+		recStart := 12 + i*16
+		copy(out[recStart:recStart+4], tables[i].tag[:])
+		copy(out[recStart+4:recStart+8], tables[i].checksum[:])
+		binary.BigEndian.PutUint32(out[recStart+8:recStart+12], uint32(pos))
+		binary.BigEndian.PutUint32(out[recStart+12:recStart+16], uint32(tables[i].length))
+		pos += padded
+	}
+	return out, nil
 }
 
 // fontHasGlyph reports whether the font at path defines a glyph for r. A
@@ -165,24 +265,40 @@ func cachedFontFace(path string, size float64) (font.Face, error) {
 	return truetype.NewFace(f, &truetype.Options{Size: size}), nil
 }
 
+// fontFileUsable reports whether the file exists and can be parsed into a
+// *truetype.Font (TrueType-glyf based, or a .ttc whose first subfont is).
+// CFF/OpenType (.otf / OTTO ttcs, e.g. Noto Sans CJK) are NOT parseable by
+// freetype/truetype and therefore skipped so the resolver can try other fonts.
+func fontFileUsable(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	_, err = parseFontData(data)
+	return err == nil
+}
+
 // systemCJKFont returns a usable CJK-capable font file, preferring an explicit
-// path then scanning well-known system locations.
+// path then scanning well-known system locations. Only fonts that actually
+// parse as TrueType are returned (CFF-based candidates are skipped).
 func systemCJKFont(explicit string) string {
 	if explicit != "" {
 		return explicit
 	}
 	candidates := []string{
 		"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-		"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
 		"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
 		"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
 		"/System/Library/Fonts/PingFang.ttc",
 		"C:/Windows/Fonts/msyh.ttc",
 		"C:/Windows/Fonts/simhei.ttf",
+		"/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
 	}
 	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
+		if fontFileUsable(p) {
 			return p
 		}
 	}
@@ -202,7 +318,7 @@ func systemASCIIFont() string {
 		"C:/Windows/Fonts/arial.ttf",
 	}
 	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
+		if fontFileUsable(p) {
 			return p
 		}
 	}
@@ -846,18 +962,23 @@ func RenderTextToJPEG(text string, opts ImageOptions) ([]byte, error) {
 // RenderRemote renders text via a remote t2i service（对齐 Python 原版
 // network_strategy.render：取本地模板内容后 POST JSON 到 /text2img/generate）。
 func RenderRemote(endpoint, text, templateName string) ([]byte, error) {
-	if endpoint == "" {
-		return nil, fmt.Errorf("t2i: remote endpoint is empty")
-	}
 	if templateName == "" {
 		templateName = "base"
 	}
+	// tmpl 传完整 HTML 模板内容（对齐 Python 原版 network_strategy.render：
+	// get_template(name) 取模板后 POST {tmpl, json:false, tmpldata:{text, version}}）。
+	// 传模板名的"base" 字符串会被服务端当字面内容渲染（图片只显示 "base"）。
+	// endpoint 为空时交由 RenderCustomTemplate 解析官方默认端点列表。
 	tmpl, err := t2iTemplateContent(templateName)
 	if err != nil {
 		return nil, err
 	}
-	data, _ := json.Marshal(map[string]interface{}{"text": text})
-	return RenderCustomTemplate(endpoint, tmpl, string(data), "")
+	data := map[string]interface{}{"text": text}
+	if T2IVersion != "" {
+		data["version"] = T2IVersion
+	}
+	payload, _ := json.Marshal(data)
+	return RenderCustomTemplate(endpoint, tmpl, string(payload), "")
 }
 
 // RenderCustomTemplate renders an HTML template + data via a remote t2i service
@@ -906,6 +1027,10 @@ func generateURL(endpoint string) string {
 // （dashboard.NewServer）初始化时注入；RenderRemote 按模板名读取内容。
 var T2ITemplateDir string
 
+// T2IVersion 是宿主版本号（如 "1.2.1"），注入 t2i 模板的 {{ version }} 变量
+// （对齐 Python 原版 {version: f"v{VERSION}"}）。空串时模板标题省略版本。
+var T2IVersion string
+
 // T2IDefaultTemplate 是内置 "base" 模板内容（dashboard t2iDefaultTemplate），
 // 用户模板缺失时的回退，由宿主注入。
 var T2IDefaultTemplate string
@@ -940,8 +1065,9 @@ func renderCustomTemplateAt(endpoint, template, data, options string) ([]byte, e
 			}
 		}
 	}
-	// tmpldata 对齐 Python：dict（Jinja 模板数据）。Go 端 data 为 JSON 字符串，
-	// 解析为对象；解析失败时原样作为字符串传递（服务端容错）。
+	// tmpldata 对齐 Python：dict（Jinja 模板数据，含 text/version）。Go 端 data
+	// 为 JSON 字符串，解析为对象；解析失败时原样作为字符串传递（服务端容错）。
+	// 注意：没有顶层 text 字段——文本在 tmpldata 里，模板内容在 tmpl 里。
 	var tmplData interface{} = map[string]interface{}{}
 	if data != "" {
 		var m map[string]interface{}
@@ -962,7 +1088,15 @@ func renderCustomTemplateAt(endpoint, template, data, options string) ([]byte, e
 		return nil, err
 	}
 
-	client := &http.Client{Timeout: 120 * time.Second}
+	// 直连（显式禁用环境代理）：http.Client 默认 Transport 是
+	// http.DefaultTransport，它带 ProxyFromEnvironment。容器里 HTTP_PROXY 的
+	// NO_PROXY 若用 "192.168.*" 这类通配符（非 CIDR），Go 的代理匹配器不识别，
+	// 内网 t2i 端点（192.168.x.x）会被误发到代理 → 代理返回 503。这里用
+	// Proxy=nil 的 Transport 强制直连，确保用户配置的 t2i_endpoint 直达。
+	client := &http.Client{
+		Timeout:   120 * time.Second,
+		Transport: &http.Transport{Proxy: nil},
+	}
 	req, err := http.NewRequest(http.MethodPost, generateURL(endpoint), bytes.NewReader(body))
 	if err != nil {
 		return nil, err

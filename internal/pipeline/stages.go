@@ -4191,14 +4191,22 @@ func (s *ResultDecorateStage) applyT2I(event *core.Event) error {
 	case "local":
 		imgData, err = renderLocalT2I(trimmed, s.t2iTemplate)
 	case "remote", "":
-		if s.t2iEndpoint == "" {
-			// No remote t2i service configured: fall back to the built-in
-			// local renderer so the feature works out of the box.
-			logger.I18nWarn("t2i_strategy=remote 但未配置 t2i_endpoint，已回退到本地渲染")
-			imgData, err = renderLocalT2I(trimmed, s.t2iTemplate)
+		// 回退优先级：配置端点 → 官方默认远程端点 → 本地渲染（对齐用户
+		// 期望的"配置t2i > 回退默认远程t2i > 本地gg"）。
+		if s.t2iEndpoint != "" {
+			imgData, err = t2i.RenderRemote(s.t2iEndpoint, trimmed, s.t2iTemplate)
+			if err == nil {
+				break
+			}
+			logger.I18nWarn("t2i 配置端点失败(%v)，回退默认远程端点", err)
+		}
+		// 默认远程端点（官方列表 + 兜底端点）；未配置端点时也先尝试远程。
+		imgData, err = t2i.RenderRemote("", trimmed, s.t2iTemplate)
+		if err == nil {
 			break
 		}
-		imgData, err = t2i.RenderRemote(s.t2iEndpoint, trimmed, s.t2iTemplate)
+		logger.I18nWarn("t2i 远程渲染失败(%v)，回退本地渲染", err)
+		imgData, err = renderLocalT2I(trimmed, s.t2iTemplate)
 	default:
 		return nil
 	}

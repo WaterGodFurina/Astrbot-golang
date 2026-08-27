@@ -101,8 +101,15 @@ func isBlockedIP(ip net.IP) bool {
 // validateOutboundURL 外，重定向的每一跳都会在此处再次校验，防止恶意服务器把
 // 请求重定向到内网/云元数据端点绕过 SSRF 防护。
 func newOutboundClient(timeout time.Duration) *http.Client {
+	// 走环境代理（HTTP_PROXY/HTTPS_PROXY/NO_PROXY）：容器/系统设置了代理时，
+	// GitHub API 等出站请求不再直连（避免被限流/封禁返回 403）。SSRF 防护仍由
+	// validateOutboundURL 在初始 URL 与每一跳重定向上把关。
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+	}
 	return &http.Client{
-		Timeout: timeout,
+		Timeout:   timeout,
+		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if err := validateOutboundURL(req.URL.String()); err != nil {
 				return fmt.Errorf("重定向目标校验失败 %s: %v", req.URL.Redacted(), err)
