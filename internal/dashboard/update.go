@@ -159,10 +159,15 @@ func (s *Server) handleUpdateReleases(proxy string) ([]map[string]interface{}, e
 }
 
 // handleUpdateCheck 处理 GET /api/update/check：比较当前版本与最新发行版。
+//
+// 走 fetchCachedChangelogReleases：拉取 GitHub releases 并缓存到 data/
+// （10 分钟 TTL），403/限流/网络失败时回退旧缓存。避免每次前端"检查更新"都
+// 直打 GitHub API——未认证接口限流 60 次/小时，共享代理出口 IP 极易 403
+// （"API rate limit exceeded"）。有缓存时即便本次拉取失败也不报"检查更新失败"。
 func (s *Server) handleUpdateCheck(proxy string) map[string]interface{} {
-	releases, err := s.fetchGithubReleases(proxy)
-	if err != nil {
-		updateLogger.Warn("检查更新失败: %v", err)
+	releases := s.fetchCachedChangelogReleases()
+	if len(releases) == 0 {
+		// 拉取失败且无任何缓存：退化为当前版本（不报错，避免前端反复告警）。
 		return map[string]interface{}{
 			"version":        version.Version,
 			"latest_version": version.Version,
