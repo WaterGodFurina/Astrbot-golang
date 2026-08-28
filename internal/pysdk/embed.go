@@ -386,13 +386,13 @@ func minorAtLeast(v, min string) bool {
 // 宿主上的任意代码执行。未 pin 的版本（如自定义 ASTRBOT_PYTHON_VERSION）拒绝
 // 使用，除非显式设置 ASTRBOT_PYTHON_SKIP_VERIFY。
 var pythonArchiveSHA256 = map[string]string{
-	"20260814/x86_64-unknown-linux-gnu":  "3297691ae34f75fed81ac424e040145fccb0bafe8e581cd5cadbddfa1c0766c0",
-	"20260814/aarch64-unknown-linux-gnu": "4952b18bafda1880d4ab1f86e1c348dbdb31f0e6d049e76dc5f052f2f796f1c5",
+	"20260814/x86_64-unknown-linux-gnu":   "3297691ae34f75fed81ac424e040145fccb0bafe8e581cd5cadbddfa1c0766c0",
+	"20260814/aarch64-unknown-linux-gnu":  "4952b18bafda1880d4ab1f86e1c348dbdb31f0e6d049e76dc5f052f2f796f1c5",
 	"20260814/x86_64-unknown-linux-musl":  "19cadd8f069264f6dcc56279cc046d39fe9933a9df9dbd5bf270c631a97dbd88",
 	"20260814/aarch64-unknown-linux-musl": "0d26cffd0b3c13ee62cbba370419bd5ead634d69c99b6e29567957bc856b9cfa",
-	"20260814/x86_64-apple-darwin":       "1a94c83264731e9603fbea78e57e7ca8f20e7d91eb866627ac2304621b0f6f1f",
-	"20260814/aarch64-apple-darwin":      "4572133a5542f306b9bdb155da5800f9e38950cd0a98d469b832ce256fe299ea",
-	"20260814/x86_64-pc-windows-msvc":    "7330282b47cd43a66b702d39078d2e5a88e580cee351d82f95045f21f5ee042a",
+	"20260814/x86_64-apple-darwin":        "1a94c83264731e9603fbea78e57e7ca8f20e7d91eb866627ac2304621b0f6f1f",
+	"20260814/aarch64-apple-darwin":       "4572133a5542f306b9bdb155da5800f9e38950cd0a98d469b832ce256fe299ea",
+	"20260814/x86_64-pc-windows-msvc":     "7330282b47cd43a66b702d39078d2e5a88e580cee351d82f95045f21f5ee042a",
 }
 
 // verifyArchive 校验下载归档的 sha256 与固定 pin 一致；

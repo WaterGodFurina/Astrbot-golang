@@ -9001,7 +9001,6 @@ const t2iDefaultTemplate = `<!doctype html>
 </html>
 `
 
-
 // t2iTemplatePath 校验模板名并返回用户模板文件路径（防路径穿越，
 // 对齐 Python _get_user_template_path）。
 func (s *Server) t2iTemplatePath(name string) (string, error) {

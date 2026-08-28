@@ -187,7 +187,10 @@ func BenchmarkRpcPathTextToImageBase64(b *testing.B) {
 		data := makeBytes(size)
 		b.Run(fmt.Sprintf("t2i_%dKB", size>>10), func(b *testing.B) {
 			b.ReportAllocs()
-			var once struct{ dst []byte; raw []byte }
+			var once struct {
+				dst []byte
+				raw []byte
+			}
 			for i := 0; i < b.N; i++ {
 				enc := base64.StdEncoding.EncodeToString(data)
 				msg := &sdkv1.TextToImageResponse{ImageBase64: enc}
@@ -216,7 +219,10 @@ func BenchmarkRpcPathTextToImageBytes(b *testing.B) {
 		data := makeBytes(size)
 		b.Run(fmt.Sprintf("t2i_bytes_%dKB", size>>10), func(b *testing.B) {
 			b.ReportAllocs()
-			var once struct{ raw []byte; dst []byte }
+			var once struct {
+				raw []byte
+				dst []byte
+			}
 			for i := 0; i < b.N; i++ {
 				msg := &sdkv1.TextToImageResponse{ImageBytes: data}
 				wire, err := proto.Marshal(msg)
@@ -334,6 +340,7 @@ func BenchmarkRpcPathComponentConvert(b *testing.B) {
 		_ = once
 	})
 }
+
 // BenchmarkRpcPathEventJSON1MB：1MB Event 的 legacy 全量 JSON 往返（Before）。
 func BenchmarkRpcPathEventJSON1MB(b *testing.B) {
 	ev := makeEvent(b, 1<<20)

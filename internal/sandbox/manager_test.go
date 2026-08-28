@@ -78,9 +78,15 @@ type fakeBooter struct {
 	mu      sync.Mutex
 }
 
-func (f *fakeBooter) Type() BooterType                   { return BooterRemote }
-func (f *fakeBooter) IsRunning() bool                    { f.mu.Lock(); defer f.mu.Unlock(); return f.running }
-func (f *fakeBooter) Stop() error                        { f.mu.Lock(); defer f.mu.Unlock(); f.stopped = true; f.running = false; return nil }
+func (f *fakeBooter) Type() BooterType { return BooterRemote }
+func (f *fakeBooter) IsRunning() bool  { f.mu.Lock(); defer f.mu.Unlock(); return f.running }
+func (f *fakeBooter) Stop() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopped = true
+	f.running = false
+	return nil
+}
 func (f *fakeBooter) ListSkills(ctx context.Context) ([]skills.SandboxCacheEntry, error) {
 	return nil, nil
 }

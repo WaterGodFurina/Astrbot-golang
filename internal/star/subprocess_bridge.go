@@ -523,7 +523,6 @@ func eventMessageType(e *core.Event) string {
 	return sdkMessageType(mt, e.Source.IsGroup)
 }
 
-
 // RemovePluginCommands removes all subprocess-plugin command handlers from the
 // star registry (Source "subprocess_cmd"; legacy .so 插件命令 Source
 // "so_plugin"). Used when re-bridging after install, unload, reload or
