@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -65,18 +66,22 @@ func (s *Server) updateProgressGet(id string) *updateProgress {
 	return st
 }
 
-// fetchGithubReleases 从 GitHub Release API 拉取本项目的发行版列表。
-// 返回每个 release 的简化视图：tag_name/name/published_at/body/prerelease。
-func (s *Server) fetchGithubReleases(proxy string) ([]map[string]interface{}, error) {
+// githubReleasesURL 构造 GitHub Release API 地址（可选 github_proxy 加速前缀）。
+func (s *Server) githubReleasesURL(proxy string) string {
 	url := updateRepoAPI
 	if proxy != "" {
 		url = strings.TrimRight(proxy, "/") + "/" + url
 	}
+	return url
+}
+
+// fetchGithubReleasesWithClient 用指定 http.Client 从 GitHub Release API 拉取
+// 发行版列表（tag_name/name/published_at/body/prerelease）。
+func (s *Server) fetchGithubReleasesWithClient(url string, client *http.Client) ([]map[string]interface{}, error) {
 	// 出站 URL 校验防 SSRF（代理前缀为管理员输入）。
 	if err := validateOutboundURL(url); err != nil {
 		return nil, err
 	}
-	client := newOutboundClient(30 * time.Second)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -117,6 +122,45 @@ func (s *Server) fetchGithubReleases(proxy string) ([]map[string]interface{}, er
 		})
 	}
 	return out, nil
+}
+
+// fetchGithubReleases 走环境代理（ProxyFromEnvironment）拉取发行版列表。
+func (s *Server) fetchGithubReleases(proxy string) ([]map[string]interface{}, error) {
+	return s.fetchGithubReleasesWithClient(s.githubReleasesURL(proxy), newOutboundClient(30*time.Second))
+}
+
+// newDirectOutboundClient 构造本机 IP 直连（禁用环境代理）的出站 client。
+// 代理出口 IP 被 GitHub 未认证限流(403)时回退本机 IP 检测；超时约 5 分钟
+// （配合后台检测，期间缓存顶替）。SSRF 防护沿用 validateOutboundURL。
+func newDirectOutboundClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{Proxy: nil}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if err := validateOutboundURL(req.URL.String()); err != nil {
+				return fmt.Errorf("重定向目标校验失败 %s: %v", req.URL.Redacted(), err)
+			}
+			return nil
+		},
+	}
+}
+
+// fetchGithubReleasesDirect 走本机 IP 直连（不走环境代理）拉取发行版列表，
+// 超时约 5 分钟。
+func (s *Server) fetchGithubReleasesDirect(proxy string) ([]map[string]interface{}, error) {
+	return s.fetchGithubReleasesWithClient(s.githubReleasesURL(proxy), newDirectOutboundClient(5*time.Minute))
+}
+
+// fetchGithubReleasesRobust 优先走代理；失败（403 限流/超时等）回退本机 IP 直连。
+func (s *Server) fetchGithubReleasesRobust(proxy string) ([]map[string]interface{}, error) {
+	url := s.githubReleasesURL(proxy)
+	if releases, err := s.fetchGithubReleasesWithClient(url, newOutboundClient(30*time.Second)); err == nil {
+		return releases, nil
+	} else {
+		updateLogger.Warn("代理拉取 releases 失败(%v)，回退本机 IP 直连检测", err)
+	}
+	return s.fetchGithubReleasesWithClient(url, newDirectOutboundClient(5*time.Minute))
 }
 
 // resourceForPlatform 把 GOOS/GOARCH 映射到 release 资产的后缀（对齐
@@ -160,14 +204,19 @@ func (s *Server) handleUpdateReleases(proxy string) ([]map[string]interface{}, e
 
 // handleUpdateCheck 处理 GET /api/update/check：比较当前版本与最新发行版。
 //
-// 走 fetchCachedChangelogReleases：拉取 GitHub releases 并缓存到 data/
-// （10 分钟 TTL），403/限流/网络失败时回退旧缓存。避免每次前端"检查更新"都
-// 直打 GitHub API——未认证接口限流 60 次/小时，共享代理出口 IP 极易 403
-// （"API rate limit exceeded"）。有缓存时即便本次拉取失败也不报"检查更新失败"。
+// 非阻塞 + 缓存顶替：先读 data/changelogs.json 缓存，TTL 内直接返回；缓存缺失
+// 或过期时立即用缓存/当前版本顶替返回，同时后台单飞刷新（代理→本机 IP 回退）。
+// 避免每次前端"检查更新"都阻塞直打 GitHub API——未认证接口限流 60 次/小时，
+// 共享代理出口 IP 极易 403（"API rate limit exceeded"）；代理 403 时回退本机 IP
+// 直连检测（超时约 5 分钟），期间缓存顶替，绝不因限流报"检查更新失败"。
 func (s *Server) handleUpdateCheck(proxy string) map[string]interface{} {
-	releases := s.fetchCachedChangelogReleases()
-	if len(releases) == 0 {
-		// 拉取失败且无任何缓存：退化为当前版本（不报错，避免前端反复告警）。
+	releases, fetchedAt, ok := s.readReleasesCache()
+	if !ok || time.Since(fetchedAt) >= changelogCacheTTL {
+		// 缓存缺失/过期：顶住现有数据，后台刷新（不在请求路径上阻塞）。
+		s.refreshReleasesAsync()
+	}
+	if !ok || len(releases) == 0 {
+		// 无任何缓存可顶替：退化为当前版本（不报错，避免前端反复告警）。
 		return map[string]interface{}{
 			"version":        version.Version,
 			"latest_version": version.Version,
@@ -655,39 +704,78 @@ func fileExistsLocal(path string) bool {
 	return err == nil
 }
 
-// fetchCachedChangelogReleases 从 GitHub 拉取 releases 并缓存到 data/
-// （TTL 内直接读缓存，离线时回退缓存）。
-func (s *Server) fetchCachedChangelogReleases() []map[string]interface{} {
-	path := s.changelogCachePath()
-	if data, err := os.ReadFile(path); err == nil {
-		var cached struct {
-			FetchedAt time.Time                `json:"fetched_at"`
-			Releases  []map[string]interface{} `json:"releases"`
-		}
-		if json.Unmarshal(data, &cached) == nil && cached.Releases != nil {
-			if time.Since(cached.FetchedAt) < changelogCacheTTL || len(cached.Releases) == 0 {
-				return cached.Releases
-			}
-		}
-	}
-	releases, err := s.fetchGithubReleases("")
+// releasesCacheFile 是 releases 缓存的磁盘格式（data/changelogs.json）。
+type releasesCacheFile struct {
+	FetchedAt time.Time                `json:"fetched_at"`
+	Releases  []map[string]interface{} `json:"releases"`
+}
+
+// readReleasesCache 读取 releases 缓存文件，返回 (releases, fetched_at, 是否存在)。
+// 即使过期也原样返回（供"检测期间缓存顶替"）。
+func (s *Server) readReleasesCache() ([]map[string]interface{}, time.Time, bool) {
+	data, err := os.ReadFile(s.changelogCachePath())
 	if err != nil {
-		// 拉取失败时回退到已有缓存（若有）。
-		if data, rerr := os.ReadFile(path); rerr == nil {
-			var cached struct {
-				Releases []map[string]interface{} `json:"releases"`
-			}
-			if json.Unmarshal(data, &cached) == nil && cached.Releases != nil {
-				return cached.Releases
-			}
-		}
-		return nil
+		return nil, time.Time{}, false
 	}
-	if payload, err := json.MarshalIndent(map[string]interface{}{
-		"fetched_at": time.Now(),
-		"releases":   releases,
+	var c releasesCacheFile
+	if json.Unmarshal(data, &c) != nil || c.Releases == nil {
+		return nil, time.Time{}, false
+	}
+	return c.Releases, c.FetchedAt, true
+}
+
+// writeReleasesCache 原子写 releases 缓存到 data/changelogs.json。
+func (s *Server) writeReleasesCache(releases []map[string]interface{}) {
+	if payload, err := json.MarshalIndent(releasesCacheFile{
+		FetchedAt: time.Now(),
+		Releases:  releases,
 	}, "", "  "); err == nil {
-		_ = writeFileAtomic(path, payload, 0o644)
+		_ = writeFileAtomic(s.changelogCachePath(), payload, 0o644)
+	}
+}
+
+var (
+	releaseRefreshMu      sync.Mutex
+	releaseRefreshRunning bool
+	releaseRefreshAt      time.Time // 最近一次刷新尝试时间（冷却用）
+)
+
+// refreshReleasesAsync 在后台单飞刷新 releases 缓存（代理→本机 IP 回退）。
+// 调用方立即返回，检测期间用缓存顶替，不阻塞前端。带冷却：距上次刷新尝试未满
+// changelogCacheTTL 就跳过（连上才重置缓存 TTL，失败/超时后继续用旧缓存，避免
+// 每次点击"检查更新"都重试打 GitHub API）。
+func (s *Server) refreshReleasesAsync() {
+	releaseRefreshMu.Lock()
+	// 单飞 + 冷却：正在刷新，或距上次尝试未满 TTL → 本次跳过。
+	if releaseRefreshRunning || time.Since(releaseRefreshAt) < changelogCacheTTL {
+		releaseRefreshMu.Unlock()
+		return
+	}
+	releaseRefreshRunning = true
+	releaseRefreshAt = time.Now()
+	releaseRefreshMu.Unlock()
+	go func() {
+		defer func() {
+			releaseRefreshMu.Lock()
+			releaseRefreshRunning = false
+			releaseRefreshMu.Unlock()
+		}()
+		releases, err := s.fetchGithubReleasesRobust("")
+		if err != nil {
+			updateLogger.Warn("后台刷新 releases 失败: %v", err)
+			return
+		}
+		// 仅连上时写缓存（重置 TTL）；失败保持旧缓存顶替。
+		s.writeReleasesCache(releases)
+	}()
+}
+
+// fetchCachedChangelogReleases 非阻塞读 releases 缓存（供 changelog 页）：
+// TTL 内直接返回；过期/缺失时返回现有缓存并触发后台刷新（不阻塞等待）。
+func (s *Server) fetchCachedChangelogReleases() []map[string]interface{} {
+	releases, fetchedAt, ok := s.readReleasesCache()
+	if !ok || time.Since(fetchedAt) >= changelogCacheTTL {
+		s.refreshReleasesAsync()
 	}
 	return releases
 }
