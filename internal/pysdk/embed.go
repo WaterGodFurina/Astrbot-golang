@@ -6,6 +6,7 @@ package pysdk
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -96,6 +97,28 @@ const (
 // 环境变量与默认镜像（EnsureVenv 宿主基础依赖安装与插件 requirements 安装共用）。
 var pyPIIndexOverride string
 
+// pipProxyOverride 是宿主注入的 pip 代理（config http_proxy）。pip/venv 安装的
+// 代理规则：配置代理优先于系统代理；配置代理为空时才回退系统 https_proxy
+// （PipEnv 返回 nil → 继承宿主环境）。与通用请求（ConfigureGlobalProxy，
+// 配置为空即直连）不同。
+var pipProxyOverride string
+
+// SetPipProxy overrides the proxy used by pip/venv provisioning (called by the
+// host with config http_proxy; empty restores the system https_proxy fallback).
+func SetPipProxy(url string) {
+	pipProxyOverride = strings.TrimSpace(url)
+}
+
+// PipEnv returns the environment for a pip subprocess. 配置代理优先：非空时在
+// 宿主环境基础上显式覆写 HTTP_PROXY/HTTPS_PROXY；为空时返回 nil，pip 继承
+// 宿主环境（含系统 https_proxy）。
+func PipEnv() []string {
+	if strings.TrimSpace(pipProxyOverride) == "" {
+		return nil
+	}
+	return append(os.Environ(), "HTTP_PROXY="+pipProxyOverride, "HTTPS_PROXY="+pipProxyOverride)
+}
+
 // SetPyPIIndex overrides the pip index used for host-base-dependency
 // installation (called by the host with config pypi_index_url; empty restores
 // the env/default resolution).
@@ -158,6 +181,18 @@ func pyTarget() (string, error) {
 	return pyTargetFor(runtime.GOOS, runtime.GOARCH)
 }
 
+// linuxLibc 探测当前 Linux 系统的 C 运行库：存在 musl 动态链接器
+// （/lib 或 /usr/lib 下的 ld-musl-*.so.1，Alpine 等最小容器镜像同样适用）
+// 即视为 musl，否则按 glibc 处理。不依赖 getconf/ldd 等外部工具。
+func linuxLibc() string {
+	for _, pat := range []string{"/lib/ld-musl-*.so.1", "/usr/lib/ld-musl-*.so.1"} {
+		if ms, _ := filepath.Glob(pat); len(ms) > 0 {
+			return "musl"
+		}
+	}
+	return "gnu"
+}
+
 // termuxPrebuiltPkgs 是 Android/Termux 上宿主基础依赖中含 C 扩展、pip 无
 // 预编译 wheel 的包对应的 Termux 预编译软件包（pkg install 即装好，免去
 // 本地编译对 clang 的要求）。
@@ -190,6 +225,9 @@ func pyTargetFor(goos, goarch string) (string, error) {
 	}
 	switch goos {
 	case "linux":
+		if linuxLibc() == "musl" {
+			return a + "-unknown-linux-musl", nil
+		}
 		return a + "-unknown-linux-gnu", nil
 	case "darwin":
 		return a + "-apple-darwin", nil
@@ -209,7 +247,7 @@ func bundledPythonBin() string {
 		rel = filepath.Join("python", "python.exe")
 	}
 	bin := filepath.Join(pythonBaseDir(), pyVersion(), rel)
-	if info, err := os.Stat(bin); err == nil && !info.IsDir() {
+	if info, err := os.Stat(bin); err == nil && !info.IsDir() && pythonUsable(bin) {
 		return bin
 	}
 	return ""
@@ -250,10 +288,12 @@ func DiscoverPythonBin() string {
 			logger.Warn("PATH 上的 %s 不可用（%s），跳过回退 bundled Python", name, p)
 		}
 	}
-	// 已下载的 bundled Python（幂等：重启后直接复用）
+	// 已下载的 bundled Python（幂等：重启后直接复用）。需通过可用性校验：
+	// 曾按错误 libc（如 Alpine 上误下 glibc 构建）缓存的解释器不可执行，
+	// 视为未发现，由 downloadPython 按当前平台重下。
 	for _, minor := range []string{pyVersion(), defaultPythonVersion} {
 		cand := filepath.Join(pythonBaseDir(), minor, "python", "bin", exe("python3"))
-		if info, err := os.Stat(cand); err == nil && !info.IsDir() {
+		if info, err := os.Stat(cand); err == nil && !info.IsDir() && pythonUsable(cand) {
 			return cand
 		}
 	}
@@ -348,6 +388,8 @@ func minorAtLeast(v, min string) bool {
 var pythonArchiveSHA256 = map[string]string{
 	"20260814/x86_64-unknown-linux-gnu":  "3297691ae34f75fed81ac424e040145fccb0bafe8e581cd5cadbddfa1c0766c0",
 	"20260814/aarch64-unknown-linux-gnu": "4952b18bafda1880d4ab1f86e1c348dbdb31f0e6d049e76dc5f052f2f796f1c5",
+	"20260814/x86_64-unknown-linux-musl":  "19cadd8f069264f6dcc56279cc046d39fe9933a9df9dbd5bf270c631a97dbd88",
+	"20260814/aarch64-unknown-linux-musl": "0d26cffd0b3c13ee62cbba370419bd5ead634d69c99b6e29567957bc856b9cfa",
 	"20260814/x86_64-apple-darwin":       "1a94c83264731e9603fbea78e57e7ca8f20e7d91eb866627ac2304621b0f6f1f",
 	"20260814/aarch64-apple-darwin":      "4572133a5542f306b9bdb155da5800f9e38950cd0a98d469b832ce256fe299ea",
 	"20260814/x86_64-pc-windows-msvc":    "7330282b47cd43a66b702d39078d2e5a88e580cee351d82f95045f21f5ee042a",
@@ -637,7 +679,17 @@ func extractTarGzKeepTop(src, dir string) error {
 			if filepath.IsAbs(link) {
 				return fmt.Errorf("symlink %q -> absolute target %q rejected", name, link)
 			}
-			if _, err := safeJoin(filepath.Dir(target), link); err != nil {
+			// symlink 的 Linkname 是相对 symlink 所在目录的。先解析成绝对
+			// 路径，再从整个解压根目录（dir）判断是否逃逸。用
+			// filepath.Dir(target) 作为 base 会误判合法 symlink——例如
+			// python-build-standalone 的
+			// python/share/terminfo/1/1178 -> ../a/adm1178（相对 terminfo/1/
+			// 解析为 terminfo/a/adm1178，仍在 python/ 内），filepath.Rel
+			// 从 terminfo/1 看 ../a/adm1178 以 .. 开头而误报 "escapes root"。
+			absTarget := filepath.Clean(filepath.Join(filepath.Dir(target), link))
+			if rel, rerr := filepath.Rel(dir, absTarget); rerr != nil {
+				return fmt.Errorf("symlink %q -> %q escapes root: %w", name, link, rerr)
+			} else if _, err := safeJoin(dir, rel); err != nil {
 				return fmt.Errorf("symlink %q -> %q escapes root: %w", name, link, err)
 			}
 			if err := os.Symlink(link, target); err != nil {
@@ -1046,6 +1098,7 @@ func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 // 插件 requirements.txt 自装。
 var hostBaseDeps = []string{
 	"grpcio", "protobuf",
+	"aiosqlite",
 	"quart", "werkzeug", "jinja2",
 	"aiohttp", "httpx", "requests", "mcp",
 	"pydantic", "pyyaml", "pillow",
@@ -1056,18 +1109,23 @@ var hostBaseDeps = []string{
 	"cryptography", "qrcode", "packaging", "pyjwt",
 	"jieba", "rank-bm25", "pydub", "openpyxl", "pypdf",
 	"click", "aiofiles",
+	// tzdata：Alpine musl 无系统时区数据库（/usr/share/zoneinfo 缺失），
+	// 插件用 zoneinfo.ZoneInfo("Asia/Shanghai")（qqadmin 宵禁等）时
+	// ZoneInfoNotFoundError；Python 包 tzdata 提供 IANA 时区数据。
+	"tzdata",
 }
 
 // hostDepProbes 是 hostBaseDeps 的关键模块探测表（import 名）：任一缺失即
 // 视为宿主依赖不完整，启动 Python 插件前自动补齐（EnsureVenv 检查用）。
 var hostDepProbes = []string{
-	"grpc", "google.protobuf",
+	"grpc", "google.protobuf", "aiosqlite",
 	"quart", "werkzeug", "jinja2",
 	"aiohttp", "httpx", "requests", "mcp", "apscheduler", "tenacity",
 	"openai", "anthropic", "dashscope",
 	"pydantic", "yaml", "PIL", "deprecated", "docstring_parser", "markdown", "psutil",
 	"websockets", "cryptography", "qrcode", "packaging", "jwt",
 	"jieba", "rank_bm25", "pydub", "openpyxl", "pypdf", "click", "aiofiles",
+	"tzdata",
 	// qq-botpy 的 import 包名是 botpy；python-telegram-bot 是 telegram。
 	"botpy",
 }
@@ -1075,7 +1133,7 @@ var hostDepProbes = []string{
 // baseDepsVersion 是宿主依赖清单（hostBaseDeps/hostDepProbes）的版本号：
 // 修改清单内容时手动 +1，触发既有 venv 的 environment.json 不匹配而重新
 // pip 安装（否则 venv 一旦 READY 就永久复用，清单变化不会生效）。
-const baseDepsVersion = 3
+const baseDepsVersion = 5
 
 const (
 	// envFileName 记录 venv 的供给来源（解释器 / SDK 版本 / 依赖清单版本）。
@@ -1154,6 +1212,40 @@ func hasHostDeps(pythonBin string) bool {
 	return cmd.Run() == nil
 }
 
+var (
+	// errPipTimeout 标记 pip 安装因超时被 kill（区别于其他安装错误）。
+	errPipTimeout = errors.New("pip install 超时")
+	// pipInstallTimeout 单个 pip install 尝试的超时：某包（如 pypdf 的
+	// build-isolation 编译）长时间卡住时 kill 并重试。
+	pipInstallTimeout = 5 * time.Minute
+	// pipInstallRetries 是 pip 安装超时后的重试次数（kill 后自动重下/重装）。
+	pipInstallRetries = 2
+)
+
+// runPipInstall 运行 pip install，带 pipInstallTimeout 超时。超时 kill 整个
+// 进程组（含子编译进程）并返回 errPipTimeout，由调用方决定重试。
+func runPipInstall(pythonBin string, args []string) ([]byte, error) {
+	cmd := exec.Command(pythonBin, args...) // #nosec G204 -- pip 安装宿主基础依赖：args 由固定常量 hostBaseDeps + 固定 pip 参数组成; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	cmd.Env = PipEnv()
+	setupPipCmd(cmd)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return buf.Bytes(), err
+	case <-time.After(pipInstallTimeout):
+		killPipCmd(cmd)
+		<-done // 等进程真正退出，避免僵尸
+		return buf.Bytes(), errPipTimeout
+	}
+}
+
 func installHostDeps(pythonBin string, stage func(string)) error {
 	deps := hostBaseDeps
 	if runtime.GOOS == "android" {
@@ -1175,7 +1267,25 @@ func installHostDeps(pythonBin string, stage func(string)) error {
 	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, deps...)
 	args = append(args, "-i", PyPIIndex())
 	logger.Debug("pip install: %s %s", pythonBin, strings.Join(args, " "))
-	out, err := exec.Command(pythonBin, args...).CombinedOutput() // #nosec G204 -- pip 安装插件宿主基础依赖：args 由固定常量 hostBaseDeps + 固定 pip 参数组成，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+
+	// 带超时安装：单次 5 分钟，某包卡住（如 build isolation 编译）自动 kill 并
+	// 重试（重下/重装），避免无限挂起。
+	var out []byte
+	var err error
+	for attempt := 1; attempt <= pipInstallRetries+1; attempt++ {
+		if attempt > 1 {
+			logger.Warn("pip install 第 %d 次重试（%s）…", attempt, pipInstallTimeout)
+		}
+		out, err = runPipInstall(pythonBin, args)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errPipTimeout) {
+			// 非超时错误（index 404/校验失败等）重试无意义，直接返回。
+			break
+		}
+	}
+
 	// pip 过程输出统一走 DEBUG（正常安装时的下载/构建细节；失败时下面再报
 	// 错误信息）。
 	if len(strings.TrimSpace(string(out))) > 0 {

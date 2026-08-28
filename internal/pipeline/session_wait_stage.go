@@ -2,7 +2,6 @@ package pipeline
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
@@ -56,13 +55,8 @@ func (s *SessionWaitStage) Process(ctx context.Context, event *core.Event) (*Sta
 	if len(targets) == 0 {
 		return &StageResult{Continue: true}, nil
 	}
-	// 事件序列化复用 HandleCommand/HandleFilter 的 SDK Event JSON 格式
-	//（star.CoreEventToSDK），Python 侧 session_waiter.trigger 按该结构解析。
-	eventJSON, err := json.Marshal(star.CoreEventToSDK(event))
-	if err != nil {
-		logger.I18nWarn("会话等待事件序列化失败: %v", err)
-		return &StageResult{Continue: true}, nil
-	}
+	// 会话等待事件：走原生 SDKEvent（P1，0 JSON）。
+	sdkEv := star.CoreEventToSDKEvent(event)
 	for _, t := range targets {
 		inst := s.subPlugins.InstanceByName(t.PluginName)
 		if inst == nil || inst.Client == nil {
@@ -70,7 +64,7 @@ func (s *SessionWaitStage) Process(ctx context.Context, event *core.Event) (*Sta
 			continue
 		}
 		rpcCtx, rpcCancel := context.WithTimeout(ctx, pluginRPCTimeout)
-		handled, err := inst.Client.FeedSessionWait(rpcCtx, eventJSON)
+		handled, err := inst.Client.FeedSessionWait(rpcCtx, sdkEv)
 		rpcCancel()
 		if err != nil {
 			// UNIMPLEMENTED：旧版插件（编译时不带 FeedSessionWait RPC）

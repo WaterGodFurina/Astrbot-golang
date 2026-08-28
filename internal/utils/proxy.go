@@ -15,12 +15,13 @@ import (
 // ConfigureGlobalProxy 根据配置的 http_proxy 与 no_proxy 配置 http.DefaultTransport，
 // 使所有 `&http.Client{}`（Transport=nil 时使用 DefaultTransport）自动走代理。
 //
-// proxyURL 为空时使用直连（Proxy 为 nil）；no_proxy 中的条目遵循标准格式，
-// 例如 "localhost"、"127.0.0.1"、"192.168.*"、"*.example.com" 等。
+// proxyURL 为空时使用直连（Proxy 为 nil），不跟随系统 HTTP_PROXY/HTTPS_PROXY
+// 环境变量——"其它请求遵循前端配置的代理"，配置为空即直连（容器/宿主的环境
+// 代理可能是坏代理，如对部分目标返回 EOF）。pip/venv 安装另有独立的代理规则
+// （见 pysdk.PipEnv：配置代理为空时才回退系统 https_proxy）。
+// no_proxy 中的条目遵循标准格式，例如 "localhost"、"127.0.0.1"、"192.168.*"、
+// "*.example.com" 等。
 func ConfigureGlobalProxy(proxyURL string, noProxy []string) {
-	// 未配置时保持环境变量代理（http.ProxyFromEnvironment，对齐 Python 的
-	// aiohttp trust_env=True：市场拉取等出站请求跟随 HTTP_PROXY/HTTPS_PROXY
-	// 环境变量），不强制直连。
 	var proxyFunc func(req *http.Request) (*url.URL, error)
 	if strings.TrimSpace(proxyURL) != "" {
 		// 仅基于传入的配置构建，不调用 httpproxy.FromEnvironment，
@@ -35,9 +36,8 @@ func ConfigureGlobalProxy(proxyURL string, noProxy []string) {
 		proxyFunc = func(req *http.Request) (*url.URL, error) {
 			return cfg.ProxyFunc()(req.URL)
 		}
-	} else {
-		proxyFunc = http.ProxyFromEnvironment
 	}
+	// proxyFunc 为 nil 时 Transport.Proxy == nil → 直连。
 
 	// 保留与 http.DefaultTransport 相近的合理默认值（连接池、超时等）。
 	http.DefaultTransport = &http.Transport{

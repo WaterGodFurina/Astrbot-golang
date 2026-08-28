@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -630,7 +631,14 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if echo, hasEcho := msg["echo"].(string); hasEcho {
-			logger.Debug("OneBot API response: %v", msg)
+			// 用 JSON 序列化打印而非 %v：%v 对 float64 用科学计数法
+			// （user_id 2408045264 显示成 2.408045264e+09），易被误认为
+			// 精度丢失；JSON 序列化输出整数原形。
+			if b, jerr := json.Marshal(msg); jerr == nil {
+				logger.Debug("OneBot API response: %s", b)
+			} else {
+				logger.Debug("OneBot API response: %v", msg)
+			}
 			a.pendingMu.Lock()
 			if ch, ok := a.pending[echo]; ok {
 				delete(a.pending, echo)
@@ -898,7 +906,7 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 	msgChain := a.convertFromCQFormat(raw)
 	// Fetch quoted-reply content and combined-forward messages
 	// (quoted_message_parser; mirrors QuotedMessageExtractor).
-	a.enrichForwardAndQuoted(msgChain)
+	a.enrichForwardAndQuoted(msgChain, toString(raw["group_id"]), toString(raw["user_id"]))
 
 	msgID, _ := raw["message_id"].(string)
 	if msgID == "" {
@@ -907,6 +915,16 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 		}
 	}
 	selfID := a.getSelfID()
+	// 优先用事件自带的 self_id（OneBot 群/私聊事件均携带机器人自身 QQ 号）：
+	// 启动早期 get_login_info 异步查询可能未完成，快照仍是 config.id 占位
+	// （如 "default"），导致插件 event.get_self_id() 拿到平台 ID 而非真实
+	// QQ 号（qqadmin 全禁/宵禁等 int(get_self_id()) 抛 ValueError）。
+	if evSelf, ok := raw["self_id"]; ok {
+		if s := toString(evSelf); s != "" {
+			selfID = s
+			a.setSelfID(s) // 顺带回填快照，后续事件直接命中
+		}
+	}
 
 	// Publish event
 	event := &core.Event{
@@ -968,6 +986,13 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 		}
 	}
 	selfID := a.getSelfID()
+	// 同消息路径：优先用事件自带 self_id 并回填快照（见上方注释）。
+	if evSelf, ok := raw["self_id"]; ok {
+		if s := toString(evSelf); s != "" {
+			selfID = s
+			a.setSelfID(s)
+		}
+	}
 
 	a.mu.Lock()
 	if convID != "" {
@@ -1034,18 +1059,41 @@ func (a *Adapter) enrichFileURLs(chain *message.MessageChain, raw map[string]int
 	}
 	groupID := toString(raw["group_id"])
 	userID := toString(raw["user_id"])
-	if groupID == "" && userID == "" {
+	a.enrichFileURLsIn(chain.Chain, groupID, userID)
+}
+
+// enrichFileURLsIn walks a component slice and completes any File component
+// that carries a file id but no URL, using the group/user context (get_
+// group_file_url / get_private_file_url). Nested chains (quoted replies and
+// forward nodes) are walked recursively so a quoted file message also gets a
+// usable download URL for the agent context.
+func (a *Adapter) enrichFileURLsIn(comps []message.Component, groupID, userID string) {
+	if len(comps) == 0 || (groupID == "" && userID == "") {
 		return
 	}
-	for _, comp := range chain.Chain {
-		f, ok := comp.(*message.File)
-		if !ok || f.URL != "" || f.FileID == "" {
-			continue
-		}
-		if url := a.fetchFileURL(f.FileID, groupID, userID); url != "" {
-			f.URL = url
+	var walk func(cs []message.Component)
+	walk = func(cs []message.Component) {
+		for _, comp := range cs {
+			switch c := comp.(type) {
+			case *message.File:
+				if c.URL != "" || c.FileID == "" {
+					continue
+				}
+				if url := a.fetchFileURL(c.FileID, groupID, userID); url != "" {
+					c.URL = url
+				}
+			case *message.Reply:
+				walk(c.Chain)
+			case *message.Nodes:
+				for _, n := range c.Nodes {
+					if n != nil {
+						walk(n.Content)
+					}
+				}
+			}
 		}
 	}
+	walk(comps)
 }
 
 // fetchFileURL resolves a file segment's download URL via the OneBot
@@ -1072,17 +1120,31 @@ func (a *Adapter) fetchFileURL(fileID, groupID, userID string) string {
 		return ""
 	}
 	url, _ := ret["url"].(string)
-	if url == "" {
-		logger.Warn("aiocqhttp: %s 未返回 URL file_id=%s", action, fileID)
+	if url == "" || !validHTTPURL(url) {
+		logger.Warn("aiocqhttp: %s 未返回可用 URL file_id=%s (url=%q)", action, fileID, url)
+		return ""
 	}
 	return url
+}
+
+// validHTTPURL reports whether raw is a parseable http(s) URL with a non-empty
+// host. OneBot 的 get_group_file_url 可能返回形如 "https:///ftn_handler//?fname="
+// 的空 host 伪 URL，这类链接不可下载，必须在进入 agent 上下文前过滤掉。
+func validHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 // enrichForwardAndQuoted resolves remote content referenced by the chain:
 // reply ids are fetched with get_msg (building the quoted chain) and forward
 // ids with get_forward_msg (BFS, max_forward_fetch hops). Mirrors the
-// QuotedMessageExtractor flow for the aiocqhttp platform.
-func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain) {
+// QuotedMessageExtractor flow for the aiocqhttp platform. groupID/userID
+// provide the file-URL resolution context for File components inside the
+// quoted content.
+func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain, groupID, userID string) {
 	if chain == nil || len(chain.Chain) == 0 {
 		return
 	}
@@ -1095,7 +1157,7 @@ func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain) {
 
 	// Fetch quoted reply content (get_msg) — build Reply.Chain.
 	for _, rid := range replyIDs {
-		quotedChain, _ := a.fetchQuotedContent(rid)
+		quotedChain, _ := a.fetchQuotedContent(rid, groupID, userID)
 		for _, comp := range chain.Chain {
 			if reply, ok := comp.(*message.Reply); ok && reply.MessageID == rid {
 				reply.Chain = quotedChain

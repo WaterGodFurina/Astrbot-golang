@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,11 +68,11 @@ func sandboxResolvePath(path string) string {
 	return p
 }
 
-func sandboxShell(ctx context.Context, mgr *sandbox.Manager, command string) string {
+func sandboxShell(ctx context.Context, mgr *sandbox.Manager, sessionID, command string) string {
 	if strings.TrimSpace(command) == "" {
 		return "Error executing command: `command` must be a non-empty string."
 	}
-	stdout, stderr, code, err := mgr.Exec(ctx, "sh", []string{"-c", command}, sandboxWorkdir)
+	stdout, stderr, code, err := mgr.Exec(ctx, sessionID, "sh", []string{"-c", command}, sandboxWorkdir)
 	if err != nil && code < 0 {
 		return "Error executing command in sandbox: " + err.Error()
 	}
@@ -85,11 +86,11 @@ func sandboxShell(ctx context.Context, mgr *sandbox.Manager, command string) str
 	return fmt.Sprintf("Command completed with exit code 0.\nOutput:\n%s", out)
 }
 
-func sandboxPython(ctx context.Context, mgr *sandbox.Manager, code string) string {
+func sandboxPython(ctx context.Context, mgr *sandbox.Manager, sessionID, code string) string {
 	if strings.TrimSpace(code) == "" {
 		return "Error executing code: `code` must be a non-empty string."
 	}
-	stdout, stderr, exitCode, err := mgr.Exec(ctx, "python3", []string{"-c", code}, sandboxWorkdir)
+	stdout, stderr, exitCode, err := mgr.Exec(ctx, sessionID, "python3", []string{"-c", code}, sandboxWorkdir)
 	if err != nil && exitCode < 0 {
 		return "error: code execution failed in sandbox: " + err.Error()
 	}
@@ -99,35 +100,104 @@ func sandboxPython(ctx context.Context, mgr *sandbox.Manager, code string) strin
 	return stdout
 }
 
-func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, path string) string {
+func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path string) string {
 	path = sandboxResolvePath(path)
 	if path == "" {
 		return "Error reading file: `path` must be a non-empty string."
 	}
-	content, err := mgr.ReadFile(ctx, path)
+	content, err := mgr.ReadFile(ctx, sessionID, path)
 	if err != nil {
 		return "Error reading file: " + err.Error()
 	}
 	return fmt.Sprintf("Content of %s:\n%s", path, content)
 }
 
-func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, path, content string) string {
+func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, sessionID, path, content string) string {
 	path = sandboxResolvePath(path)
 	if path == "" {
 		return "Error writing file: `path` must be a non-empty string."
 	}
-	if err := mgr.WriteFile(ctx, path, content); err != nil {
+	if err := mgr.WriteFile(ctx, sessionID, path, content); err != nil {
 		return "Error writing file: " + err.Error()
 	}
 	return "File written successfully: " + path
 }
 
-func sandboxFileEdit(ctx context.Context, mgr *sandbox.Manager, path, old, new string, replaceAll bool) string {
+// sandboxUploadFile transfers a file FROM the host machine INTO the sandbox
+// workspace so sandbox tools (read/shell/python) can access it. Mirrors
+// astrbot-py's FileUploadTool (astrbot_upload_file): local_path is an absolute
+// host path, and the file is written into the sandbox working directory using
+// its basename.
+func sandboxUploadFile(ctx context.Context, mgr *sandbox.Manager, sessionID, localPath string) string {
+	if strings.TrimSpace(localPath) == "" {
+		return "Error uploading file: `local_path` must be a non-empty string."
+	}
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return "Error: File does not exist: " + localPath
+	}
+	if info.IsDir() {
+		return "Error: Path is not a file: " + localPath
+	}
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return "Error uploading file: " + err.Error()
+	}
+	name := filepath.Base(localPath)
+	dst := sandboxWorkdir + "/" + name
+	if err := mgr.WriteFile(ctx, sessionID, dst, string(data)); err != nil {
+		return "Error uploading file: " + err.Error()
+	}
+	return "File uploaded successfully to " + dst + " (size: " + fmt.Sprintf("%d", len(data)) + " bytes). " +
+		"Use astrbot_file_read_tool to read it."
+}
+
+// sandboxDownloadFile transfers a file FROM the sandbox OUT to the host,
+// writing it into the host temp directory and returning the local path.
+// Mirrors astrbot-py's FileDownloadTool (astrbot_download_file): remote_path
+// is the path inside the sandbox to copy out.
+func sandboxDownloadFile(ctx context.Context, mgr *sandbox.Manager, sessionID, remotePath string) string {
+	if strings.TrimSpace(remotePath) == "" {
+		return "Error downloading file: `remote_path` must be a non-empty string."
+	}
+	content, err := mgr.ReadFile(ctx, sessionID, remotePath)
+	if err != nil {
+		return "Error downloading file: " + err.Error()
+	}
+	name := filepath.Base(strings.TrimSuffix(sandboxResolvePath(remotePath), "/"))
+	if name == "" || name == "." || name == "/" {
+		name = "downloaded_file"
+	}
+	tmp, err := os.CreateTemp("", "astrbot-sandbox-*"+name)
+	if err != nil {
+		return "Error downloading file: " + err.Error()
+	}
+	tmpName := tmp.Name()
+	_ = tmp.Close()
+	if err := os.WriteFile(tmpName, []byte(content), 0o600); err != nil {
+		os.Remove(tmpName)
+		return "Error downloading file: " + err.Error()
+	}
+	return "File downloaded successfully to " + tmpName + " (size: " + fmt.Sprintf("%d", len(content)) + " bytes)."
+}
+
+// validHTTPURL reports whether raw is a parseable http(s) URL with a non-empty
+// host. OneBot 的 get_group_file_url 可能返回空 host 的伪 URL（如
+// "https:///ftn_handler//?fname="），这类链接不可下载，必须提前拦截。
+func validHTTPURL(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
+
+func sandboxFileEdit(ctx context.Context, mgr *sandbox.Manager, sessionID, path, old, new string, replaceAll bool) string {
 	path = sandboxResolvePath(path)
 	if path == "" || old == "" {
 		return "Error editing file: `path` and `old` must be non-empty."
 	}
-	content, err := mgr.ReadFile(ctx, path)
+	content, err := mgr.ReadFile(ctx, sessionID, path)
 	if err != nil {
 		return "Error editing file: " + err.Error()
 	}
@@ -143,7 +213,7 @@ func sandboxFileEdit(ctx context.Context, mgr *sandbox.Manager, path, old, new s
 		replacements = 1
 		content = content[:idx] + new + content[idx+len(old):]
 	}
-	if err := mgr.WriteFile(ctx, path, content); err != nil {
+	if err := mgr.WriteFile(ctx, sessionID, path, content); err != nil {
 		return "Error editing file: " + err.Error()
 	}
 	modeText := "first match"
@@ -153,14 +223,14 @@ func sandboxFileEdit(ctx context.Context, mgr *sandbox.Manager, path, old, new s
 	return fmt.Sprintf("Edited %s. Replaced %d occurrence(s) using %s mode.", path, replacements, modeText)
 }
 
-func sandboxGrep(ctx context.Context, mgr *sandbox.Manager, pattern, path string) string {
+func sandboxGrep(ctx context.Context, mgr *sandbox.Manager, sessionID, pattern, path string) string {
 	if strings.TrimSpace(pattern) == "" {
 		return "Error: `pattern` must be a non-empty string."
 	}
 	if path == "" {
 		path = "."
 	}
-	stdout, stderr, code, err := mgr.Exec(ctx, "sh", []string{"-c", "grep -rn " + "'" + strings.ReplaceAll(pattern, "'", "'\\''") + "' " + "'" + strings.ReplaceAll(path, "'", "'\\''") + "' 2>/dev/null"}, sandboxWorkdir)
+	stdout, stderr, code, err := mgr.Exec(ctx, sessionID, "sh", []string{"-c", "grep -rn " + "'" + strings.ReplaceAll(pattern, "'", "'\\''") + "' " + "'" + strings.ReplaceAll(path, "'", "'\\''") + "' 2>/dev/null"}, sandboxWorkdir)
 	if err != nil && code < 0 {
 		return "Error searching in sandbox: " + err.Error()
 	}
@@ -377,22 +447,44 @@ func sandboxModePrompt() string {
 		"`astrbot_execute_shell` and `astrbot_execute_python` use it as their working directory. " +
 		"`astrbot_file_read_tool`, `astrbot_file_write_tool`, `astrbot_file_edit_tool`, and " +
 		"`astrbot_grep_tool` resolve relative paths from it. " +
-		"Prefer relative paths within `/workspace`."
+		"Prefer relative paths within `/workspace`. " +
+		"The sandbox container has network access, so you can fetch remote files inside it " +
+		"with `curl`/`wget`. User-sent/quoted files are downloaded to the host and shown in " +
+		"context as `[File Attachment: name X, path Y]`; use `astrbot_upload_file` to copy " +
+		"the host file into the sandbox before reading it."
 }
 
 // collectSandboxTools builds the OpenAI tool schemas for the sandbox runtime.
 func collectSandboxTools() []map[string]interface{} {
-	return collectLocalTools()
+	return collectComputerTools(true)
 }
 
 // collectLocalTools builds the OpenAI tool schemas for the local runtime.
 func collectLocalTools() []map[string]interface{} {
+	return collectComputerTools(false)
+}
+
+// collectComputerTools builds the computer-use tool schemas. 沙盒与本地运行时
+// 使用同一组工具但语义不同：沙盒内 shell/python 在隔离容器 /workspace 执行、
+// 且容器有网络可 curl 下载；本地运行时的描述则强调直接操作宿主机需谨慎。
+func collectComputerTools(sandbox bool) []map[string]interface{} {
+	shellDesc := "The shell command to execute in the current runtime shell (for example, powershell.exe on Windows). Equivalent to `cd {working_dir} && {command}` where {working_dir} is the conversation workspace. Prefer relative paths. 注意：该命令直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。当用户发送或引用了文件消息（上下文里显示为 [File Attachment ...]）时，请先使用 astrbot_upload_file 把文件上传到工作区再处理，而不是自行猜测文件路径。"
+	pythonDesc := "Execute codes in a Python environment. Current OS: " + runtime.GOOS + ". Use system-compatible commands. 注意：该代码直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。"
+	uploadDesc := "Transfer a file FROM the host machine INTO the current runtime so that code can access it. Use this when the user sends/attaches a file and you need to process it. The local_path must point to an existing file on the host filesystem (e.g. a [File Attachment: ...] path shown in the context)."
+	downloadDesc := "Transfer a file OUT of the current runtime to the host machine. Use this only when the user asks to retrieve/export a file that was created or modified inside the runtime."
+	if sandbox {
+		shellDesc = "Execute a shell command inside the sandbox container. Working directory is `/workspace`; relative paths resolve there. The sandbox has network access, so you can download files directly with curl/wget, e.g. `curl -L -o bug.md '<url>'`. 当用户发送或引用了文件消息（上下文显示为 [File Attachment ...]）时，请先用 astrbot_upload_file 把宿主侧的文件路径上传到 /workspace 再读取分析，而不是自行猜测文件路径或到处 ls 找文件。"
+		pythonDesc = "Execute Python code inside the sandbox container. An IPython kernel is used and variables/state persist across calls within the same sandbox session. Working directory is `/workspace`."
+		uploadDesc = "Transfer a file FROM the host machine INTO the sandbox so that sandbox code can access it. Use this when the user sends/attaches a file (shown in context as [File Attachment: name X, path Y]) and you need to process it inside the sandbox. The local_path must be the host path from the [File Attachment ...] line."
+		downloadDesc = "Transfer a file FROM the sandbox OUT to the host. Use this ONLY when the user asks to retrieve/export a file that was created or modified inside the sandbox."
+	}
+
 	schemas := []map[string]interface{}{
 		{
 			"type": "function",
 			"function": map[string]interface{}{
 				"name":        "astrbot_execute_shell",
-				"description": "The shell command to execute in the current runtime shell (for example, powershell.exe on Windows). Equivalent to `cd {working_dir} && {command}` where {working_dir} is the conversation workspace. Prefer relative paths. 注意：该命令直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。",
+				"description": shellDesc,
 				"parameters": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -444,7 +536,7 @@ func collectLocalTools() []map[string]interface{} {
 			"type": "function",
 			"function": map[string]interface{}{
 				"name":        "astrbot_execute_python",
-				"description": "Execute codes in a Python environment. Current OS: " + runtime.GOOS + ". Use system-compatible commands. 注意：该代码直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。",
+				"description": pythonDesc,
 				"parameters": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -562,6 +654,40 @@ func collectLocalTools() []map[string]interface{} {
 						},
 					},
 					"required": []interface{}{"pattern"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "astrbot_upload_file",
+				"description": uploadDesc,
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"local_path": map[string]interface{}{
+							"type":        "string",
+							"description": "Absolute path to the file on the host filesystem that will be copied into the sandbox.",
+						},
+					},
+					"required": []interface{}{"local_path"},
+				},
+			},
+		},
+		{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        "astrbot_download_file",
+				"description": downloadDesc,
+				"parameters": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"remote_path": map[string]interface{}{
+							"type":        "string",
+							"description": "Path of the file inside the sandbox to copy out to the host.",
+						},
+					},
+					"required": []interface{}{"remote_path"},
 				},
 			},
 		},
@@ -1052,6 +1178,66 @@ func executeFileWrite(path, content, umo string) string {
 		return "Error writing file: " + err.Error()
 	}
 	return "File written successfully: " + resolved
+}
+
+// executeLocalUpload copies a host file into the conversation workspace on the
+// local runtime (the workspace IS the host filesystem). Mirrors Python's
+// ast rbot_upload_file for the local computer-use runtime.
+func executeLocalUpload(localPath, umo string) string {
+	if strings.TrimSpace(localPath) == "" {
+		return "Error uploading file: `local_path` must be a non-empty string."
+	}
+	info, err := os.Stat(localPath)
+	if err != nil || info.IsDir() {
+		return "Error: File does not exist or is not a file: " + localPath
+	}
+	name := filepath.Base(localPath)
+	dst := filepath.Join(workspaceRoot(umo), name)
+	if err := copyLocalFile(localPath, dst); err != nil {
+		return "Error uploading file: " + err.Error()
+	}
+	return "File uploaded successfully to " + dst
+}
+
+// executeLocalDownload copies a workspace file out to the host temp directory
+// on the local runtime (the workspace IS the host filesystem). Mirrors Python's
+// ast rbot_download_file for the local computer-use runtime.
+func executeLocalDownload(remotePath, umo string) string {
+	if strings.TrimSpace(remotePath) == "" {
+		return "Error downloading file: `remote_path` must be a non-empty string."
+	}
+	resolved, err := resolveLocalPath(remotePath, umo, false)
+	if err != nil {
+		return "Error downloading file: " + err.Error()
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return "Error downloading file: " + err.Error()
+	}
+	name := filepath.Base(resolved)
+	tmp, err := os.CreateTemp("", "astrbot-sandbox-*"+name)
+	if err != nil {
+		return "Error downloading file: " + err.Error()
+	}
+	tmpName := tmp.Name()
+	_ = tmp.Close()
+	if err := os.WriteFile(tmpName, data, 0o600); err != nil {
+		os.Remove(tmpName)
+		return "Error downloading file: " + err.Error()
+	}
+	return "File downloaded successfully to " + tmpName + " (size: " + fmt.Sprintf("%d", len(data)) + " bytes)."
+}
+
+// copyLocalFile copies src to dst, preserving the source file mode.
+func copyLocalFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o600)
 }
 
 func executeFileEdit(path, old, new string, replaceAll bool, umo string) string {

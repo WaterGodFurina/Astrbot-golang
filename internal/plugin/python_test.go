@@ -1,28 +1,55 @@
 package plugin
 
-import (
-	"context"
+import (	"context"
+	"fmt"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
+
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 )
 
 // sdkEvent builds a *pluginsdk.Event from a raw map (used to simulate host
 // events crossing the RPC boundary).
-func sdkEvent(t *testing.T, m map[string]any) *pluginsdk.Event {
+// sdkEvent 从测试用的 map 直接构造 proto SDKEvent（P1 native，不经过
+// SDK struct / JSON）。
+func sdkEvent(t *testing.T, m map[string]any) *sdkv1.SDKEvent {
 	t.Helper()
-	b, _ := json.Marshal(m)
-	var e pluginsdk.Event
-	if err := json.Unmarshal(b, &e); err != nil {
-		t.Fatalf("unmarshal event: %v", err)
+	se := &sdkv1.SDKEvent{}
+	if v, ok := m["type"]; ok { se.Type = fmt.Sprint(v) }
+	if v, ok := m["platform"]; ok { se.Platform = fmt.Sprint(v) }
+	if v, ok := m["platform_id"]; ok { se.PlatformId = fmt.Sprint(v) }
+	if v, ok := m["message_type"]; ok { se.MessageType = fmt.Sprint(v) }
+	if v, ok := m["self_id"]; ok { se.SelfId = fmt.Sprint(v) }
+	if v, ok := m["sender_id"]; ok { se.SenderId = fmt.Sprint(v) }
+	if v, ok := m["sender_name"]; ok { se.SenderName = fmt.Sprint(v) }
+	if v, ok := m["conv_id"]; ok { se.ConvId = fmt.Sprint(v) }
+	if v, ok := m["group_name"]; ok { se.GroupName = fmt.Sprint(v) }
+	if v, ok := m["message_str"]; ok { se.MessageStr = fmt.Sprint(v) }
+	if v, ok := m["plain_text"]; ok { se.PlainText = fmt.Sprint(v) }
+	if v, ok := m["raw_message"]; ok { se.RawMessage = fmt.Sprint(v) }
+	if v, ok := m["message_id"]; ok { se.MessageId = fmt.Sprint(v) }
+	if v, ok := m["is_group"]; ok { se.IsGroup = fmt.Sprint(v) == "true" }
+	if v, ok := m["is_at_bot"]; ok { se.IsAtBot = fmt.Sprint(v) == "true" }
+	if v, ok := m["is_admin"]; ok { se.IsAdmin = fmt.Sprint(v) == "true" }
+	if v, ok := m["timestamp"]; ok {
+		switch n := v.(type) {
+		case float64: se.Timestamp = int64(n)
+		case int: se.Timestamp = int64(n)
+		case int64: se.Timestamp = n
+		}
 	}
-	return &e
+	if md, ok := m["metadata"]; ok {
+		if b, err := json.Marshal(md); err == nil {
+			se.MetadataJson = b
+		}
+	}
+	return se
 }
 
 // TestPythonPluginEndToEnd loads a real Python plugin through the subprocess

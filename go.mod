@@ -5,8 +5,8 @@ go 1.26
 require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.4.3
-	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.6.2
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.5.0
+	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.8.0
 	github.com/blusewang/wx v1.3.3
 	github.com/bwmarrin/discordgo v0.25.1
 	github.com/dobest1024/go-weixin-ilink v0.2.0
@@ -89,3 +89,5 @@ require (
 // nanovec 上游未修复 Windows 编译（flat.go 直接用 unix.Mmap 且无 build tag）；
 // 使用 fork（含 Windows mmap 平台封装补丁，内容与上游 956786fcfa80 一致）。
 replace github.com/hungpdn/nanovec => github.com/WaterGodFurina/nanovec v1.0.1
+
+

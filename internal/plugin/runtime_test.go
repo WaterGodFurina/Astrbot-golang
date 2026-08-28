@@ -70,7 +70,7 @@ func pluginReply(t *testing.T, m *SubprocessManager, id string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	text, _, _, err := inst.Client.HandleCommand(ctx, "test", nil, &pluginsdk.Event{})
+	text, _, _, err := inst.Client.HandleCommand(ctx, "test", nil, &sdkv1.SDKEvent{})
 	if err != nil {
 		t.Fatalf("HandleCommand: %v", err)
 	}
@@ -109,7 +109,7 @@ func TestNewSDKCapabilities(t *testing.T) {
 	defer cancel()
 
 	// LLM tool execution.
-	text, isErr, _, err := inst.Client.HandleTool(ctx, "echo_tool", map[string]any{"text": "hi"}, &pluginsdk.Event{})
+	text, isErr, _, err := inst.Client.HandleTool(ctx, "echo_tool", map[string]any{"text": "hi"}, &sdkv1.SDKEvent{})
 	if err != nil || isErr {
 		t.Fatalf("HandleTool: err=%v isErr=%v", err, isErr)
 	}
@@ -118,7 +118,7 @@ func TestNewSDKCapabilities(t *testing.T) {
 	}
 
 	// on_llm_request hook: modifies the system prompt.
-	sp, _, stop, _, err := inst.Client.HandleLLMRequest(ctx, "inject", &pluginsdk.Event{}, "base", "user")
+	sp, _, stop, _, err := inst.Client.HandleLLMRequest(ctx, "inject", &sdkv1.SDKEvent{}, "base", "user")
 	if err != nil {
 		t.Fatalf("HandleLLMRequest: %v", err)
 	}
@@ -131,7 +131,7 @@ func TestNewSDKCapabilities(t *testing.T) {
 
 	// Result hook: decorates the outgoing chain.
 	chain := []pluginsdk.Component{pluginsdk.Text("hi")}
-	newChain, stop, _, err := inst.Client.HandleHook(ctx, "decorate", &pluginsdk.Event{}, chain)
+	newChain, stop, _, err := inst.Client.HandleHook(ctx, "decorate", &sdkv1.SDKEvent{}, chain)
 	if err != nil {
 		t.Fatalf("HandleHook(decorate): %v", err)
 	}
@@ -177,7 +177,7 @@ func TestHostServiceReverseCalls(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	inst := m.Get(id)
-	text, _, _, err := inst.Client.HandleCommand(ctx, "hosttest", nil, &pluginsdk.Event{})
+	text, _, _, err := inst.Client.HandleCommand(ctx, "hosttest", nil, &sdkv1.SDKEvent{})
 	if err != nil {
 		t.Fatalf("HandleCommand(hosttest): %v", err)
 	}

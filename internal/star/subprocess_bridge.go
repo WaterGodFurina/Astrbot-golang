@@ -6,11 +6,13 @@ package star
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"sync"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
@@ -190,7 +192,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				}
 				logger.Debug("plugin RPC HandleCommand: name=%s args=%v", cmd.Name, args)
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				text, chain, result, err := cur.Client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDK(e))
+				text, chain, result, err := cur.Client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDKEvent(e))
 				rpcCancel()
 				if err != nil {
 					text = "插件执行失败: " + err.Error()
@@ -262,7 +264,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 					return nil
 				}
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				allow, result, err := cur.Client.HandleFilter(rpcCtx, f.Name, CoreEventToSDK(e))
+				allow, result, err := cur.Client.HandleFilter(rpcCtx, f.Name, CoreEventToSDKEvent(e))
 				rpcCancel()
 				if err != nil {
 					return nil
@@ -316,7 +318,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 					return nil
 				}
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				_, _, result, err := cur.Client.HandleHook(rpcCtx, h.Name, CoreEventToSDK(e), nil)
+				_, _, result, err := cur.Client.HandleHook(rpcCtx, h.Name, CoreEventToSDKEvent(e), nil)
 				rpcCancel()
 				if result.GetSent() {
 					e.HasSendOper = true
@@ -356,21 +358,19 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 	}
 }
 
-// CoreEventToSDK converts a host core.Event into the SDK's serializable Event
-// view that crosses the gRPC boundary.
-func CoreEventToSDK(e *core.Event) *pluginsdk.Event {
-	if e == nil {
-		return &pluginsdk.Event{}
-	}
-	out := &pluginsdk.Event{
+// CoreEventToSDKEvent 把宿主 core.Event 直接构造为 proto SDKEvent（P1 native，
+// 0 Event JSON、无中间 SDK struct）。固定字段直填 protobuf，Components 走原生
+// repeated Component，仅动态 metadata 做一次 JSON。
+func CoreEventToSDKEvent(e *core.Event) *sdkv1.SDKEvent {
+	se := &sdkv1.SDKEvent{
 		Type:        coreEventTypeName(e.Type),
 		Platform:    e.Source.Platform,
-		PlatformID:  eventPlatformID(e),
+		PlatformId:  eventPlatformID(e),
 		MessageType: eventMessageType(e),
-		SelfID:      e.Source.SelfID,
-		SenderID:    e.Source.SenderID,
+		SelfId:      e.Source.SelfID,
+		SenderId:    e.Source.SenderID,
 		SenderName:  e.Source.SenderName,
-		ConvID:      e.Source.ConvID,
+		ConvId:      e.Source.ConvID,
 		GroupName:   e.Source.GroupName,
 		IsGroup:     e.Source.IsGroup,
 		IsAtBot:     e.Source.IsAtBot,
@@ -379,15 +379,68 @@ func CoreEventToSDK(e *core.Event) *pluginsdk.Event {
 		PlainText:   e.PlainText,
 		RawMessage:  e.RawMessage,
 		Timestamp:   e.Timestamp.Unix(),
-		Metadata:    sdkMetadata(e),
 	}
 	if e.MessageObj != nil {
-		out.MessageID = e.MessageObj.MessageID
+		se.MessageId = e.MessageObj.MessageID
 	}
-	if e.Message != nil {
-		for _, c := range e.Message.Chain {
-			out.Chain = append(out.Chain, componentToSDK(c))
+	if e.Message != nil && len(e.Message.Chain) > 0 {
+		se.Components = messageToProtoComponents(e.Message.Chain)
+	}
+	if md := sdkMetadata(e); len(md) > 0 {
+		if b, err := json.Marshal(md); err == nil {
+			se.MetadataJson = b
 		}
+	}
+	return se
+}
+
+// messageToProtoComponents 把宿主 message.Component 链直接转为 proto
+// Component（P1 native，跳过 SDK 中间 struct）。
+func messageToProtoComponents(chain []message.Component) []*sdkv1.Component {
+	out := make([]*sdkv1.Component, 0, len(chain))
+	for _, c := range chain {
+		if c == nil {
+			continue
+		}
+		pc := &sdkv1.Component{Type: string(c.Type())}
+		switch v := c.(type) {
+		case *message.Plain:
+			pc.Text = v.Text
+		case *message.At:
+			pc.TargetId = v.TargetID
+			pc.Name = v.Name
+		case *message.Image:
+			pc.Url, pc.Path, pc.File, pc.FileId = v.URL, v.Path, v.File, v.FileID
+			if v.Base64 != "" {
+				if b, err := base64.StdEncoding.DecodeString(v.Base64); err == nil {
+					pc.Base64Data = b
+				}
+			}
+		case *message.Record:
+			pc.Url, pc.Path, pc.File, pc.FileId = v.URL, v.Path, v.File, v.FileID
+			if v.Base64 != "" {
+				if b, err := base64.StdEncoding.DecodeString(v.Base64); err == nil {
+					pc.Base64Data = b
+				}
+			}
+		case *message.File:
+			pc.Url, pc.Path, pc.FileId, pc.Name = v.URL, v.Path, v.FileID, v.Name
+		case *message.Video:
+			pc.Url, pc.Path, pc.FileId = v.URL, v.Path, v.FileID
+		case *message.Face:
+			pc.Id = v.ID
+		case *message.Emoji:
+			pc.Id, pc.Url = v.ID, v.URL
+		case *message.Json:
+			if len(v.Data) > 0 {
+				if b, err := json.Marshal(v.Data); err == nil {
+					pc.DataJson = b
+				}
+			}
+		case *message.Reply:
+			pc.Id, pc.Text = v.MessageID, v.MessageStr
+		}
+		out = append(out, pc)
 	}
 	return out
 }
@@ -470,53 +523,6 @@ func eventMessageType(e *core.Event) string {
 	return sdkMessageType(mt, e.Source.IsGroup)
 }
 
-// componentToSDK flattens a host message component into the SDK's serializable
-// Component.
-func componentToSDK(c message.Component) pluginsdk.Component {
-	if c == nil {
-		return pluginsdk.Component{Type: pluginsdk.CompUnknown}
-	}
-	out := pluginsdk.Component{Type: pluginsdk.ComponentType(c.Type())}
-	switch v := c.(type) {
-	case *message.Plain:
-		out.Text = v.Text
-	case *message.At:
-		out.TargetID = v.TargetID
-		out.Name = v.Name
-	case *message.Image:
-		out.URL = v.URL
-		out.Path = v.Path
-		out.File = v.File
-		out.Base64 = v.Base64
-		out.FileID = v.FileID
-	case *message.Record:
-		out.URL = v.URL
-		out.Path = v.Path
-		out.File = v.File
-		out.Base64 = v.Base64
-		out.FileID = v.FileID
-	case *message.File:
-		out.URL = v.URL
-		out.Path = v.Path
-		out.FileID = v.FileID
-		out.Name = v.Name
-	case *message.Video:
-		out.URL = v.URL
-		out.Path = v.Path
-		out.FileID = v.FileID
-	case *message.Face:
-		out.ID = v.ID
-	case *message.Emoji:
-		out.ID = v.ID
-		out.URL = v.URL
-	case *message.Json:
-		out.Data = v.Data
-	case *message.Reply:
-		out.ID = v.MessageID
-		out.Text = v.MessageStr
-	}
-	return out
-}
 
 // RemovePluginCommands removes all subprocess-plugin command handlers from the
 // star registry (Source "subprocess_cmd"; legacy .so 插件命令 Source

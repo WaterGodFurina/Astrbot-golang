@@ -65,8 +65,12 @@ func TestDiscoverBundledPython(t *testing.T) {
 // TestPyTarget verifies the GOOS/GOARCH → python-build-standalone target map
 // for the platforms we support.
 func TestPyTarget(t *testing.T) {
+	libc := "gnu"
+	if linuxLibc() == "musl" {
+		libc = "musl"
+	}
 	for goos, want := range map[string]string{
-		"linux":   "unknown-linux-gnu",
+		"linux":   "unknown-linux-" + libc,
 		"darwin":  "apple-darwin",
 		"windows": "pc-windows-msvc",
 	} {
@@ -255,4 +259,31 @@ func TestCacheDirEnvOverride(t *testing.T) {
 	if got := EnsureVenv(t.TempDir()); got != want {
 		t.Fatalf("EnsureVenv = %q, want %q", got, want)
 	}
+}
+
+// TestPipEnvProxy: pip 代理规则 —— 配置代理（http_proxy）优先；配置为空时
+// 返回 nil（pip 继承系统环境，含 https_proxy）。
+func TestPipEnvProxy(t *testing.T) {
+	SetPipProxy("")
+	if env := PipEnv(); env != nil {
+		t.Errorf("empty config proxy must yield nil env (inherit system), got %v", env)
+	}
+	SetPipProxy("http://192.168.3.9:7900")
+	env := PipEnv()
+	if env == nil {
+		t.Fatal("config proxy must produce a non-nil env")
+	}
+	foundHTTP, foundHTTPS := false, false
+	for _, e := range env {
+		if strings.HasPrefix(e, "HTTP_PROXY=") {
+			foundHTTP = e == "HTTP_PROXY=http://192.168.3.9:7900"
+		}
+		if strings.HasPrefix(e, "HTTPS_PROXY=") {
+			foundHTTPS = e == "HTTPS_PROXY=http://192.168.3.9:7900"
+		}
+	}
+	if !foundHTTP || !foundHTTPS {
+		t.Errorf("HTTP_PROXY/HTTPS_PROXY must be set to the config proxy, got %v", env)
+	}
+	SetPipProxy("")
 }
