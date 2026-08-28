@@ -947,6 +947,7 @@ func (m *SubprocessManager) pipInstall(ctx context.Context, env *pysdk.RuntimeEn
 	defer cancel()
 	cmd := exec.CommandContext(ctx, env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = pluginDir
+	cmd.Env = pysdk.PipEnv()
 	logger.Debug("pip install: %s %s", env.PythonBin, strings.Join(args, " "))
 	out, err := cmd.CombinedOutput()
 	// pip 过程输出统一走 DEBUG（正常安装时的下载/构建细节；失败时错误信息
@@ -1628,6 +1629,12 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 	// 插件子进程工作目录设为统一数据根目录 data/plugins_data/<id>，插件写相对
 	// 路径的运行时数据（修仙存档、表情库等）自动落盘于此，便于管理/备份/卸载。
 	pluginDataRoot := m.pluginDataRoot(id)
+	// cmd.Dir 必须是绝对路径：Go fork 子进程先 chdir(cmd.Dir) 再 execve，相对
+	// 路径会相对宿主进程 cwd 解析（宿主 cwd 不稳即错位），且相对 PythonBin 会
+	// 按此 cwd 二次解析。与 pythonRuntime 返回的绝对 PythonBin 一起兜底。
+	if abs, err := filepath.Abs(pluginDataRoot); err == nil {
+		pluginDataRoot = abs
+	}
 	// #nosec G301 -- 插件数据目录（用户态）
 	if err := os.MkdirAll(pluginDataRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create plugin data dir: %w", err)
@@ -2366,7 +2373,7 @@ func (m *SubprocessManager) TriggerHookPayload(ctx context.Context, event string
 				hookCtx = context.Background()
 			}
 			rpcCtx, cancel := context.WithTimeout(hookCtx, pluginHookRPCTimeout)
-			_, _, _, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, &pluginsdk.Event{}, nil, payload)
+			_, _, _, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, &sdkv1.SDKEvent{}, nil, payload)
 			cancel()
 			if err != nil {
 				logger.I18nWarn("钩子 %s (%s) 在插件 %s 上执行失败: %v", h.Name, h.Event, inst.ID, err)

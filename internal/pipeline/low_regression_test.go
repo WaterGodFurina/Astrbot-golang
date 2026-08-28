@@ -27,7 +27,7 @@ func TestExecuteSandboxToolNilOnlyBlocksSandboxTools(t *testing.T) {
 	}
 	// Non-sandbox names must fall through unhandled.
 	for _, name := range []string{"web_search", "get_current_time", "future_task"} {
-		if result, handled := s.executeSandboxTool(context.Background(), name, map[string]interface{}{}); handled {
+		if result, handled := s.executeSandboxTool(context.Background(), "g:1", name, map[string]interface{}{}); handled {
 			t.Fatalf("%s must not be marked handled without a sandbox, got %q", name, result)
 		}
 	}
@@ -36,8 +36,9 @@ func TestExecuteSandboxToolNilOnlyBlocksSandboxTools(t *testing.T) {
 		"astrbot_execute_shell", "astrbot_execute_python",
 		"astrbot_file_read_tool", "astrbot_file_write_tool",
 		"astrbot_file_edit_tool", "astrbot_grep_tool",
+		"astrbot_upload_file", "astrbot_download_file",
 	} {
-		result, handled := s.executeSandboxTool(context.Background(), name, map[string]interface{}{})
+		result, handled := s.executeSandboxTool(context.Background(), "g:1", name, map[string]interface{}{})
 		if !handled || !strings.Contains(result, "not configured") {
 			t.Fatalf("%s must report not-configured, got handled=%v result=%q", name, handled, result)
 		}

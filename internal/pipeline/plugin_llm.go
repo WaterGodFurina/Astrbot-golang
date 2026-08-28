@@ -100,5 +100,5 @@ func resolveProviderFromConfig(config map[string]interface{}, explicitID string)
 			return pc, providerSettings, nil
 		}
 	}
-	return nil, nil, fmt.Errorf("未找到可用的模型提供商，请先配置")
+	return nil, nil, errNoAvailableProvider
 }

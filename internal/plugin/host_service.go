@@ -425,6 +425,14 @@ type ChatLLMCmd struct {
 func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(cmd ChatLLMCmd) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager) {
 	if subMgr != nil && subMgr.dataDir != "" {
 		personaDataPath = filepath.Join(subMgr.dataDir, "personas.json")
+		// 大文件 Blob 存储根目录 data/blobs（P0-2）。启动即初始化，TTL 10min。
+		bs, err := NewBlobStore(filepath.Join(subMgr.dataDir, "blobs"), 10*time.Minute, 1<<20)
+		if err != nil {
+			logger.I18nWarn("初始化 Blob 存储失败: %v", err)
+		} else {
+			setBlobStore(bs)
+			logger.Info("Blob 存储已就绪: %s", filepath.Join(subMgr.dataDir, "blobs"))
+		}
 	}
 	// 插件管理管理员名单：默认无管理插件（插件仅能启停自身）。
 	// config 的 plugin_admin_list 数组可授权指定插件（注册名，如
@@ -533,6 +541,44 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			subMgr.UnregisterBridgeHook(id, hookName)
 			return nil
+		},
+
+		// ── 大文件 Blob 存储（P0-2）──
+		CreateBlob: func(data []byte, mimeType, filename string, ttlSeconds int32) (*sdkv1.FileReference, error) {
+			bs := getBlobStore()
+			if bs == nil {
+				return nil, fmt.Errorf("blob store not initialized")
+			}
+			ref, err := bs.Create(data, mimeType, filename, ttlSeconds)
+			if err != nil {
+				return nil, err
+			}
+			return &ref, nil
+		},
+		ReadBlob: func(handleID string, offset int64, limit int32) ([]byte, bool, int64, error) {
+			bs := getBlobStore()
+			if bs == nil {
+				return nil, false, 0, fmt.Errorf("blob store not initialized")
+			}
+			return bs.Read(handleID, offset, limit)
+		},
+		GetBlobInfo: func(handleID string) (*sdkv1.FileReference, error) {
+			bs := getBlobStore()
+			if bs == nil {
+				return nil, fmt.Errorf("blob store not initialized")
+			}
+			ref, err := bs.Info(handleID)
+			if err != nil {
+				return nil, err
+			}
+			return &ref, nil
+		},
+		ReleaseBlob: func(handleID string) error {
+			bs := getBlobStore()
+			if bs == nil {
+				return fmt.Errorf("blob store not initialized")
+			}
+			return bs.Release(handleID)
 		},
 		ChatLLM: func(req *sdkv1.ChatLLMRequest) (string, error) {
 			if chatLLM == nil {

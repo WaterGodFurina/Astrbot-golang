@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -905,7 +906,7 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 	msgChain := a.convertFromCQFormat(raw)
 	// Fetch quoted-reply content and combined-forward messages
 	// (quoted_message_parser; mirrors QuotedMessageExtractor).
-	a.enrichForwardAndQuoted(msgChain)
+	a.enrichForwardAndQuoted(msgChain, toString(raw["group_id"]), toString(raw["user_id"]))
 
 	msgID, _ := raw["message_id"].(string)
 	if msgID == "" {
@@ -1058,18 +1059,41 @@ func (a *Adapter) enrichFileURLs(chain *message.MessageChain, raw map[string]int
 	}
 	groupID := toString(raw["group_id"])
 	userID := toString(raw["user_id"])
-	if groupID == "" && userID == "" {
+	a.enrichFileURLsIn(chain.Chain, groupID, userID)
+}
+
+// enrichFileURLsIn walks a component slice and completes any File component
+// that carries a file id but no URL, using the group/user context (get_
+// group_file_url / get_private_file_url). Nested chains (quoted replies and
+// forward nodes) are walked recursively so a quoted file message also gets a
+// usable download URL for the agent context.
+func (a *Adapter) enrichFileURLsIn(comps []message.Component, groupID, userID string) {
+	if len(comps) == 0 || (groupID == "" && userID == "") {
 		return
 	}
-	for _, comp := range chain.Chain {
-		f, ok := comp.(*message.File)
-		if !ok || f.URL != "" || f.FileID == "" {
-			continue
-		}
-		if url := a.fetchFileURL(f.FileID, groupID, userID); url != "" {
-			f.URL = url
+	var walk func(cs []message.Component)
+	walk = func(cs []message.Component) {
+		for _, comp := range cs {
+			switch c := comp.(type) {
+			case *message.File:
+				if c.URL != "" || c.FileID == "" {
+					continue
+				}
+				if url := a.fetchFileURL(c.FileID, groupID, userID); url != "" {
+					c.URL = url
+				}
+			case *message.Reply:
+				walk(c.Chain)
+			case *message.Nodes:
+				for _, n := range c.Nodes {
+					if n != nil {
+						walk(n.Content)
+					}
+				}
+			}
 		}
 	}
+	walk(comps)
 }
 
 // fetchFileURL resolves a file segment's download URL via the OneBot
@@ -1096,17 +1120,31 @@ func (a *Adapter) fetchFileURL(fileID, groupID, userID string) string {
 		return ""
 	}
 	url, _ := ret["url"].(string)
-	if url == "" {
-		logger.Warn("aiocqhttp: %s 未返回 URL file_id=%s", action, fileID)
+	if url == "" || !validHTTPURL(url) {
+		logger.Warn("aiocqhttp: %s 未返回可用 URL file_id=%s (url=%q)", action, fileID, url)
+		return ""
 	}
 	return url
+}
+
+// validHTTPURL reports whether raw is a parseable http(s) URL with a non-empty
+// host. OneBot 的 get_group_file_url 可能返回形如 "https:///ftn_handler//?fname="
+// 的空 host 伪 URL，这类链接不可下载，必须在进入 agent 上下文前过滤掉。
+func validHTTPURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 // enrichForwardAndQuoted resolves remote content referenced by the chain:
 // reply ids are fetched with get_msg (building the quoted chain) and forward
 // ids with get_forward_msg (BFS, max_forward_fetch hops). Mirrors the
-// QuotedMessageExtractor flow for the aiocqhttp platform.
-func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain) {
+// QuotedMessageExtractor flow for the aiocqhttp platform. groupID/userID
+// provide the file-URL resolution context for File components inside the
+// quoted content.
+func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain, groupID, userID string) {
 	if chain == nil || len(chain.Chain) == 0 {
 		return
 	}
@@ -1119,7 +1157,7 @@ func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain) {
 
 	// Fetch quoted reply content (get_msg) — build Reply.Chain.
 	for _, rid := range replyIDs {
-		quotedChain, _ := a.fetchQuotedContent(rid)
+		quotedChain, _ := a.fetchQuotedContent(rid, groupID, userID)
 		for _, comp := range chain.Chain {
 			if reply, ok := comp.(*message.Reply); ok && reply.MessageID == rid {
 				reply.Chain = quotedChain

@@ -94,4 +94,4 @@ func TestPluginToolRegistryClearedOnUnload(t *testing.T) {
 	}
 }
 
-var _ = star.CoreEventToSDK
+var _ = star.CoreEventToSDKEvent
