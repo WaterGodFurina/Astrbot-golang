@@ -2083,6 +2083,24 @@ func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 			lang = "go"
 		}
 		if _, err := m.LoadLang(ctx, e.ID, e.Binary, lang); err != nil {
+			// 启动兜底：旧 SDK 编译的二进制 Register 协议不匹配（Host P1=2 vs
+			// SDK=0）。Go 插件有本地源码则就地重编译自愈；失败/无源码则明确
+			// 告警并提示走 WebUI 重新安装。
+			if isProtocolMismatchErr(err) && lang == "go" {
+				var rerr error
+				if rerr = m.rebuildGoPluginFromSource(ctx, e.ID, e.Binary); rerr == nil {
+					var lerr error
+					if _, lerr = m.LoadLang(ctx, e.ID, e.Binary, lang); lerr == nil {
+						loaded++
+						logger.I18nInfo("插件 %s 已自动重编译并加载（对齐当前 SDK 协议）", e.ID)
+						continue
+					}
+					logger.I18nWarn("插件 %s 重编译成功但重新加载失败: %v", e.ID, lerr)
+					continue
+				}
+				logger.I18nWarn("插件 %s 协议不匹配且自动重编译失败（无本地源码或工具链不可用），请于 WebUI 重新安装: %v", e.ID, rerr)
+				continue
+			}
 			logger.I18nWarn("加载已安装插件 %s 失败: %v", e.ID, err)
 			continue
 		}
@@ -2094,6 +2112,41 @@ func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 	// 一次性迁移：旧版本会把打包元数据混入 config.json，启动时对全部已安装
 	// 插件执行剥离（元数据归位独立文件、config 只留真实配置项）。
 	m.migrateLegacyMetadataConfigs(man)
+}
+
+// isProtocolMismatchErr reports whether a plugin load error comes from the
+// SDK Register protocol-version negotiation (old compiled binary vs current
+// Host P1), which the startup loader can self-heal by recompiling from source.
+func isProtocolMismatchErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "protocol version mismatch")
+}
+
+// rebuildGoPluginFromSource 就地重编译已安装 Go 插件的本地源码到原产物路径，
+// 用于旧 SDK 编译二进制 Register 协议不匹配（Host P1=2 vs SDK=0）的启动自愈。
+// 只执行 Prepare/Vet/Build（跳过 StaticScan 风险门：安装时已扫描过）；源码
+// 缺失或工具链不可用时返回错误，由调用方告警并提示走 WebUI 重新安装。
+func (m *SubprocessManager) rebuildGoPluginFromSource(ctx context.Context, id, artifact string) error {
+	srcDest := filepath.Join(m.dataDir, "plugins", sanitizeID(id))
+	if err := ensureMainGo(srcDest); err != nil {
+		return fmt.Errorf("本地源码缺失（%s）: %w", srcDest, err)
+	}
+	if err := m.compiler.Prepare(srcDest, goModuleNameOf(srcDest, nil)); err != nil {
+		return fmt.Errorf("prepare module: %w", err)
+	}
+	if err := m.compiler.Vet(ctx, srcDest); err != nil {
+		return fmt.Errorf("go vet: %w", err)
+	}
+	absArtifact := artifact
+	if a, err := filepath.Abs(artifact); err == nil {
+		absArtifact = a
+	}
+	if err := os.MkdirAll(filepath.Dir(absArtifact), 0o755); err != nil {
+		return fmt.Errorf("创建产物目录: %w", err)
+	}
+	if err := m.compiler.Build(ctx, srcDest, absArtifact); err != nil {
+		return fmt.Errorf("build: %w", err)
+	}
+	return nil
 }
 
 // migrateLegacyMetadataConfigs strips packaged-metadata keys from every
