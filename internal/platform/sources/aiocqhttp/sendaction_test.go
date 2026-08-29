@@ -107,13 +107,9 @@ func TestSendActionConsumesResponse(t *testing.T) {
 	t.Errorf("响应到达后 pending 应被消费清理，剩余 %d 项", len(a.pending))
 }
 
-// TestSendActionPendingCleanedOnTimeout verifies a missing response cleans up
-// the pending registration after actionTimeout.
+// TestSendActionPendingCleanedOnTimeout verifies a missing connection cleans
+// up the pending registration on the failure path (no pending leak).
 func TestSendActionPendingCleanedOnTimeout(t *testing.T) {
-	old := actionTimeout
-	actionTimeout = 80 * time.Millisecond
-	defer func() { actionTimeout = old }()
-
 	a := New(map[string]interface{}{"id": "test"}, nil, nil)
 	// 无连接 → sendAction 应失败且不遗留 pending。
 	if err := a.sendAction("send_msg", map[string]interface{}{"message": "hi"}); err == nil {
