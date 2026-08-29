@@ -204,9 +204,6 @@ onMounted(async () => {
             </div>
           </div>
         </div>
-        <div class="sleep-warning mb-4">
-          {{ tm("sleep.warning") }}
-        </div>
 
         <v-table v-if="plugins.length" class="detail-info-table sleep-table">
           <thead>
@@ -224,7 +221,7 @@ onMounted(async () => {
                 <div class="d-flex align-center ga-2">
                   <span class="text-body-2">{{ item.displayName }}</span>
                   <span class="text-caption text-medium-emphasis">
-                    v{{ item.version }}
+                    {{ item.version }}
                   </span>
                 </div>
               </td>
