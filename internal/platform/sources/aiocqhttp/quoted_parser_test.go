@@ -335,11 +335,12 @@ func TestConvertFromCQFormatCQString(t *testing.T) {
 }
 
 // TestFileSegmentFileID: the file segment carries the NapCat file id used by
-// get_group_file_url / get_private_file_url.
+// get_group_file_url / get_private_file_url. When both `file` (filename) and
+// `file_id` are present, file_id wins (对齐 Python 用 data["file_id"]).
 func TestFileSegmentFileID(t *testing.T) {
 	a := testAdapter()
 	segments := []interface{}{
-		map[string]interface{}{"type": "file", "data": map[string]interface{}{"file": "file-abc", "name": "doc.pdf"}},
+		map[string]interface{}{"type": "file", "data": map[string]interface{}{"file": "bug.md", "file_id": "/d03b2bc3-c046-4aee-87f2-6852a6f9b1ed", "name": "bug.md"}},
 	}
 	chain, _ := a.parseOneBotSegments(segments, 0)
 	if len(chain) != 1 {
@@ -349,8 +350,11 @@ func TestFileSegmentFileID(t *testing.T) {
 	if !ok {
 		t.Fatalf("component = %T, want File", chain[0])
 	}
-	if f.FileID != "file-abc" || f.Name != "doc.pdf" {
-		t.Errorf("file mismatch: %#v", f)
+	if f.FileID != "/d03b2bc3-c046-4aee-87f2-6852a6f9b1ed" {
+		t.Errorf("file_id should take priority over file: %#v", f)
+	}
+	if f.Name != "bug.md" {
+		t.Errorf("file name mismatch: %#v", f)
 	}
 }
 
@@ -453,7 +457,7 @@ func TestResolveForwardPlaceholdersMultiple(t *testing.T) {
 		&message.Nodes{ForwardIDs: []string{"fwd2"}},
 		&message.Reply{MessageID: "r1"},
 	}}
-	a.enrichForwardAndQuoted(chain)
+	a.enrichForwardAndQuoted(chain, "", "")
 
 	if len(chain.Chain) != 4 {
 		t.Fatalf("chain length = %d", len(chain.Chain))
@@ -477,6 +481,104 @@ func TestResolveForwardPlaceholdersMultiple(t *testing.T) {
 	rn, ok := reply.Chain[0].(*message.Nodes)
 	if !ok || len(rn.Nodes) != 1 || rn.Nodes[0].UIN != "u1" {
 		t.Errorf("reply placeholder not resolved: %#v", reply.Chain[0])
+	}
+}
+
+// TestEnrichForwardAndQuotedFileURL: a File component inside a quoted reply is
+// completed with get_group_file_url using the event's group context, so the
+// agent context (describeChain) can show a usable download URL.
+func TestEnrichForwardAndQuotedFileURL(t *testing.T) {
+	a := startTestAdapter(t, func(action string, params map[string]interface{}, echo string) map[string]interface{} {
+		if action == "get_msg" {
+			return map[string]interface{}{
+				"status": "ok",
+				"data": map[string]interface{}{
+					"message": []interface{}{
+						map[string]interface{}{"type": "file", "data": map[string]interface{}{"file": "file-abc", "name": "bug.md"}},
+					},
+				},
+			}
+		}
+		if action != "get_group_file_url" {
+			return nil
+		}
+		if params["group_id"] != "12345" || params["file_id"] != "file-abc" {
+			t.Errorf("unexpected get_group_file_url params: %v", params)
+		}
+		return map[string]interface{}{
+			"status": "ok",
+			"data":   map[string]interface{}{"url": "https://example.com/bug.md"},
+		}
+	})
+
+	chain := &message.MessageChain{Chain: []message.Component{
+		&message.Reply{MessageID: "r1"},
+	}}
+	a.enrichForwardAndQuoted(chain, "12345", "")
+
+	reply, ok := chain.Chain[0].(*message.Reply)
+	if !ok {
+		t.Fatalf("component[0] = %T, want Reply", chain.Chain[0])
+	}
+	if len(reply.Chain) != 1 {
+		t.Fatalf("reply chain length = %d", len(reply.Chain))
+	}
+	f, ok := reply.Chain[0].(*message.File)
+	if !ok {
+		t.Fatalf("reply chain component = %T, want File", reply.Chain[0])
+	}
+	if f.URL != "https://example.com/bug.md" {
+		t.Errorf("quoted file URL not completed: %#v", f)
+	}
+}
+
+// TestFetchFileURLRejectsInvalidHost: get_group_file_url 返回空 host 的伪 URL
+// （如 https:///ftn_handler//?fname=）时必须被拒绝，不进入 File.URL。
+func TestFetchFileURLRejectsInvalidHost(t *testing.T) {
+	a := startTestAdapter(t, func(action string, params map[string]interface{}, echo string) map[string]interface{} {
+		if action == "get_msg" {
+			return map[string]interface{}{
+				"status": "ok",
+				"data": map[string]interface{}{
+					"message": []interface{}{
+						map[string]interface{}{"type": "file", "data": map[string]interface{}{"file": "file-abc", "name": "bug.md"}},
+					},
+				},
+			}
+		}
+		if action != "get_group_file_url" {
+			return nil
+		}
+		return map[string]interface{}{
+			"status": "ok",
+			"data":   map[string]interface{}{"url": "https:///ftn_handler//?fname="},
+		}
+	})
+
+	chain := &message.MessageChain{Chain: []message.Component{
+		&message.Reply{MessageID: "r1"},
+	}}
+	a.enrichForwardAndQuoted(chain, "12345", "")
+
+	reply, ok := chain.Chain[0].(*message.Reply)
+	if !ok {
+		t.Fatalf("component[0] = %T, want Reply", chain.Chain[0])
+	}
+	if len(reply.Chain) != 1 {
+		t.Fatalf("reply chain length = %d", len(reply.Chain))
+	}
+	f, ok := reply.Chain[0].(*message.File)
+	if !ok {
+		t.Fatalf("reply chain component = %T, want File", reply.Chain[0])
+	}
+	if f.URL != "" {
+		t.Errorf("invalid host URL must not be applied: %#v", f)
+	}
+	if !validHTTPURL("https://example.com/file") {
+		t.Error("validHTTPURL rejected a valid URL")
+	}
+	if validHTTPURL("https:///ftn_handler//?fname=") {
+		t.Error("validHTTPURL accepted an empty-host URL")
 	}
 }
 

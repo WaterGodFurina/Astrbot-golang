@@ -5,6 +5,7 @@ package sources
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -382,6 +383,61 @@ func sanitizeContexts(msgs []map[string]interface{}) []map[string]interface{} {
 	return out
 }
 
+// imageRefToDataURL resolves a user-supplied image reference into an inline
+// base64 data URL the remote API can decode. Mirrors astrbot-py's
+// openai_source._image_ref_to_data_url (safe mode): already-inline data URIs
+// pass through unchanged; local file path / file:// / http(s) references are
+// fetched via fetchMediaData. Returns "" when the reference cannot be
+// resolved — the caller drops the part (image ignored) instead of failing.
+func imageRefToDataURL(ref string) string {
+	trimmed := strings.TrimSpace(ref)
+	if strings.HasPrefix(trimmed, "data:") {
+		return trimmed
+	}
+	data, mediaType, err := fetchMediaData(trimmed)
+	if err != nil {
+		logger.Warn("OpenAI: 加载图片 %q 失败，忽略该图片: %v", trimmed, err)
+		return ""
+	}
+	if mediaType == "" {
+		mediaType = "image/png"
+	}
+	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+// resolveOpenAIImageParts converts every image_url reference in the assembled
+// messages into an inline base64 data URL (astrbot-py parity). A local
+// file:// / path reference would otherwise be sent verbatim to the remote
+// OpenAI-compatible API, which cannot read host-local files (GLM/Zhipu 看不了
+// 图片). Unresolvable parts are dropped so a stale path never breaks the chat
+// request.
+func resolveOpenAIImageParts(messages []map[string]interface{}) {
+	for _, msg := range messages {
+		content, ok := msg["content"].([]map[string]interface{})
+		if !ok {
+			continue
+		}
+		out := content[:0]
+		for _, part := range content {
+			if typ, _ := part["type"].(string); typ == "image_url" {
+				if img, ok := part["image_url"].(map[string]interface{}); ok {
+					if u, _ := img["url"].(string); u != "" {
+						if resolved := imageRefToDataURL(u); resolved != "" {
+							img["url"] = resolved
+							out = append(out, part)
+							continue
+						}
+					}
+				}
+				logger.Warn("OpenAI: 图片引用无效或无法解析，忽略该图片块")
+				continue
+			}
+			out = append(out, part)
+		}
+		msg["content"] = out
+	}
+}
+
 func (s *OpenAISource) buildRequestBody(req *provider.ProviderRequest, stream bool) map[string]interface{} {
 	body := map[string]interface{}{
 		"model":  s.GetModel(),
@@ -405,6 +461,9 @@ func (s *OpenAISource) buildRequestBody(req *provider.ProviderRequest, stream bo
 	messages = append(messages, sanitizeContexts(req.Contexts)...)
 	// Add current user message
 	messages = append(messages, req.ToUserMessage())
+	// 本地/相对 image_url 引用统一转 inline data URI（GLM/Zhipu 等远端 API
+	// 读不到宿主本地路径）
+	resolveOpenAIImageParts(messages)
 	body["messages"] = messages
 
 	// Add tools if present

@@ -3110,8 +3110,12 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 			case "chunks":
 				// List chunks from the SQLite index (list source of truth),
 				// with real pagination（对齐前端 page/page_size 参数，避免大 KB
-				// 全量返回）。
-				docID := r.URL.Query().Get("doc_id")
+				// 全量返回）。doc_id 过滤：前端发送 document_id 查询参数
+				//（DocumentDetail.vue），同时兼容 doc_id 旧参数。
+				docID := r.URL.Query().Get("document_id")
+				if docID == "" {
+					docID = r.URL.Query().Get("doc_id")
+				}
 				page := parseIntDefault(r.URL.Query().Get("page"), 1)
 				pageSize := parseIntDefault(r.URL.Query().Get("page_size"), 50)
 				if page < 1 {
@@ -8739,9 +8743,9 @@ const t2iDefaultTemplate = `<!doctype html>
 
       body {
           word-break: break-word;
-          line-height: 1.75;
+          line-height: 1.6;
           font-weight: 400;
-          font-size: 32px;
+          font-size: 21px;
           margin: 0;
           padding: 0;
           overflow-x: hidden;
@@ -8996,7 +9000,6 @@ const t2iDefaultTemplate = `<!doctype html>
 </body>
 </html>
 `
-
 
 // t2iTemplatePath 校验模板名并返回用户模板文件路径（防路径穿越，
 // 对齐 Python _get_user_template_path）。

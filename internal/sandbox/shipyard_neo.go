@@ -69,6 +69,9 @@ func NewShipyardNeoBooter(endpointURL, accessToken, profile string, ttl int) *Sh
 		accessToken: strings.TrimSpace(accessToken),
 		profile:     strings.TrimSpace(profile),
 		ttl:         ttl,
+		// 默认 Transport（ProxyFromEnvironment）：内网 Bay 端点（192.168.x.x）
+		// 靠 NO_PROXY（应为 CIDR，如 192.168.0.0/16 / 172.16.0.0/12）直连；
+		// 外网 Bay 端点走代理。不用 Proxy=nil 硬编码直连，否则外网端点无法走代理。
 		client: &http.Client{
 			Timeout: 60 * time.Second,
 		},
@@ -84,6 +87,25 @@ func (b *ShipyardNeoBooter) IsRunning() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.running
+}
+
+// markDeadIfNeeded 反应式检测死沙盒（对齐 astrbot 自动拉取新沙盒行为）：
+// 当 Bay 返回 "Sandbox not found"（TTL 到期/会话被删除）时，重置本地 running/
+// sandboxID，使下一次 EnsureSession 自动创建一个新沙盒，宿主不做主动健康检测。
+func (b *ShipyardNeoBooter) markDeadIfNeeded(err error) {
+	if err == nil {
+		return
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "sandbox not found") || strings.Contains(s, "\"not_found\"") || strings.Contains(s, "sandbox not_found") {
+		b.mu.Lock()
+		if b.running {
+			b.running = false
+			b.sandboxID = ""
+			neoLogger.Debug("Shipyard Neo sandbox 已失效（TTL 到期/被删除），重置以便自动拉取新沙盒")
+		}
+		b.mu.Unlock()
+	}
 }
 
 // Start boots a sandbox on Bay: resolves the profile, creates the sandbox and
@@ -262,6 +284,7 @@ func (b *ShipyardNeoBooter) Exec(ctx context.Context, cmd string, args []string,
 		payload := map[string]interface{}{"code": body, "timeout": 300}
 		resp, err := b.execPost(ctx, ep, "/v1/sandboxes/"+id+"/python/exec", payload)
 		if err != nil {
+			b.markDeadIfNeeded(err)
 			return "", "", -1, err
 		}
 		out, _ := resp["output"].(string)
@@ -279,6 +302,7 @@ func (b *ShipyardNeoBooter) Exec(ctx context.Context, cmd string, args []string,
 		}
 		resp, err := b.execPost(ctx, ep, "/v1/sandboxes/"+id+"/shell/exec", payload)
 		if err != nil {
+			b.markDeadIfNeeded(err)
 			return "", "", -1, err
 		}
 		out, _ := resp["output"].(string)
@@ -304,8 +328,9 @@ func (b *ShipyardNeoBooter) ReadFile(ctx context.Context, path string) (string, 
 		return "", fmt.Errorf("shipyard neo sandbox not running")
 	}
 	ep = strings.TrimSuffix(strings.TrimSpace(ep), "/")
-	resp, err := b.get(ctx, ep, "/v1/sandboxes/"+id+"/filesystem/files", map[string]string{"path": path})
+	resp, err := b.get(ctx, ep, "/v1/sandboxes/"+id+"/filesystem/files", map[string]string{"path": normalizeNeoPath(path)})
 	if err != nil {
+		b.markDeadIfNeeded(err)
 		return "", err
 	}
 	content, _ := resp["content"].(string)
@@ -323,9 +348,24 @@ func (b *ShipyardNeoBooter) WriteFile(ctx context.Context, path, content string)
 		return fmt.Errorf("shipyard neo sandbox not running")
 	}
 	ep = strings.TrimSuffix(strings.TrimSpace(ep), "/")
-	body := map[string]interface{}{"path": path, "content": content}
+	body := map[string]interface{}{"path": normalizeNeoPath(path), "content": content}
 	_, err := b.put(ctx, ep, "/v1/sandboxes/"+id+"/filesystem/files", body)
+	if err != nil {
+		b.markDeadIfNeeded(err)
+	}
 	return err
+}
+
+// normalizeNeoPath converts a sandbox filesystem path into the Bay-relative
+// form. The Bay filesystem API only accepts paths relative to /workspace
+// (an absolute path like /workspace/x returns "path must be a relative path").
+// 宿主侧工具（sandboxResolvePath）与 ListSkills 可能传入绝对路径，这里统一
+// 去掉 /workspace 前缀与开头的斜杠。
+func normalizeNeoPath(path string) string {
+	p := strings.TrimSpace(path)
+	p = strings.TrimPrefix(p, SandboxWorkdir)
+	p = strings.TrimPrefix(p, "/")
+	return p
 }
 
 // ListSkills discovers SKILL.md files under /workspace/skills via a shell find.

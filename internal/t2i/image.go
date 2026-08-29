@@ -191,7 +191,7 @@ type ImageOptions struct {
 	// is searched (Droid Sans Fallback etc.); an error is returned if none
 	// is found.
 	FontPath string
-	// FontSize is the body text size in points (0 defaults to 28).
+	// FontSize is the body text size in points (0 defaults to 17).
 	FontSize float64
 	// LineSpacing is the line spacing multiplier (0 defaults to 1.6).
 	LineSpacing float64
@@ -217,7 +217,7 @@ func (o ImageOptions) withDefaults() ImageOptions {
 		o.BgColor = color.RGBA{255, 255, 255, 255}
 	}
 	if o.FontSize <= 0 {
-		o.FontSize = 28
+		o.FontSize = 17
 	}
 	if o.LineSpacing <= 0 {
 		o.LineSpacing = 1.6
@@ -1088,15 +1088,10 @@ func renderCustomTemplateAt(endpoint, template, data, options string) ([]byte, e
 		return nil, err
 	}
 
-	// 直连（显式禁用环境代理）：http.Client 默认 Transport 是
-	// http.DefaultTransport，它带 ProxyFromEnvironment。容器里 HTTP_PROXY 的
-	// NO_PROXY 若用 "192.168.*" 这类通配符（非 CIDR），Go 的代理匹配器不识别，
-	// 内网 t2i 端点（192.168.x.x）会被误发到代理 → 代理返回 503。这里用
-	// Proxy=nil 的 Transport 强制直连，确保用户配置的 t2i_endpoint 直达。
-	client := &http.Client{
-		Timeout:   120 * time.Second,
-		Transport: &http.Transport{Proxy: nil},
-	}
+	// 用默认 Transport（ProxyFromEnvironment）：内网 t2i 端点靠 NO_PROXY
+	// （应为 CIDR，如 192.168.0.0/16 / 172.16.0.0/12）直连；外网 t2i 端点走代理。
+	// 不能用 Proxy=nil 硬编码直连，否则外网端点无法走代理。
+	client := &http.Client{Timeout: 120 * time.Second}
 	req, err := http.NewRequest(http.MethodPost, generateURL(endpoint), bytes.NewReader(body))
 	if err != nil {
 		return nil, err

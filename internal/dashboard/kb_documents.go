@@ -365,7 +365,9 @@ func (s *Server) kbDocUpload(w http.ResponseWriter, r *http.Request, kbID string
 }
 
 // kbDocList handles GET /knowledge-bases/{kb_id}/documents — list documents
-// stored under the KB data directory.
+// stored under the KB data directory, with real pagination honoring the
+// page/page_size query params (default page_size 10, aligned with the WebUI's
+// document table).
 func (s *Server) kbDocList(w http.ResponseWriter, r *http.Request, kbID string) {
 	dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
 	// 一次聚合查询取回全部 doc_id → chunk 数（GROUP BY），替代循环内逐文档
@@ -403,11 +405,33 @@ func (s *Server) kbDocList(w http.ResponseWriter, r *http.Request, kbID string) 
 			})
 		}
 	}
+	page := parseIntDefault(r.URL.Query().Get("page"), 1)
+	pageSize := parseIntDefault(r.URL.Query().Get("page_size"), 10)
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 10
+	}
+	total := len(items)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-		"items":     items,
-		"page":      1,
-		"page_size": len(items),
-		"total":     len(items),
+		"items":       items[start:end],
+		"page":        page,
+		"page_size":   pageSize,
+		"total":       total,
+		"total_pages": totalPages,
 	}))
 }
 

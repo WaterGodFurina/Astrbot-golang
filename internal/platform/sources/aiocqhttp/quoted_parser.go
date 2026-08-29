@@ -105,9 +105,11 @@ func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int) ([]mess
 		case "file":
 			url, _ := data["url"].(string)
 			name, _ := data["name"].(string)
-			fileID := toString(data["file"])
+			// NapCat 事件里 file 是文件名、file_id 才是真正的文件 ID
+			// （对齐 Python aiocqhttp_platform_adapter 用 data["file_id"]）。
+			fileID := toString(data["file_id"])
 			if fileID == "" {
-				fileID = toString(data["file_id"])
+				fileID = toString(data["file"])
 			}
 			if name == "" {
 				name = fileID
@@ -242,11 +244,13 @@ func (a *Adapter) fetchForwardMessage(forwardID string) []*message.Node {
 	return a.parseForwardNodes(messages, 0)
 }
 
-// fetchQuotedForwardIDs fetches the message referenced by a reply id
+// fetchQuotedContent fetches the message referenced by a reply id
 // (get_msg) and collects nested forward ids from its content (mirrors
 // QuotedMessageExtractor._fetch_quoted_content). Returns the parsed chain
-// and the collected forward ids.
-func (a *Adapter) fetchQuotedContent(messageID string) ([]message.Component, []string) {
+// and the collected forward ids. groupID/userID provide the file-URL
+// resolution context (get_group_file_url / get_private_file_url) for any File
+// component in the quoted message; empty values leave file URLs unset.
+func (a *Adapter) fetchQuotedContent(messageID, groupID, userID string) ([]message.Component, []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ret, err := a.CallActionCtx(ctx, "get_msg", map[string]interface{}{"message_id": messageID})
@@ -264,7 +268,11 @@ func (a *Adapter) fetchQuotedContent(messageID string) ([]message.Component, []s
 	if len(segments) == 0 {
 		return nil, nil
 	}
-	return a.parseOneBotSegments(segments, 0)
+	chain, forwardIDs := a.parseOneBotSegments(segments, 0)
+	if groupID != "" || userID != "" {
+		a.enrichFileURLsIn(chain, groupID, userID)
+	}
+	return chain, forwardIDs
 }
 
 // resolveNestedForwards performs a BFS over forward-message ids, fetching

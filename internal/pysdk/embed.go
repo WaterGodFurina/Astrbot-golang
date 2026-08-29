@@ -6,6 +6,7 @@ package pysdk
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -95,6 +96,28 @@ const (
 // pyPIIndexOverride 是宿主注入的 pip 镜像（config pypi_index_url），优先于
 // 环境变量与默认镜像（EnsureVenv 宿主基础依赖安装与插件 requirements 安装共用）。
 var pyPIIndexOverride string
+
+// pipProxyOverride 是宿主注入的 pip 代理（config http_proxy）。pip/venv 安装的
+// 代理规则：配置代理优先于系统代理；配置代理为空时才回退系统 https_proxy
+// （PipEnv 返回 nil → 继承宿主环境）。与通用请求（ConfigureGlobalProxy，
+// 配置为空即直连）不同。
+var pipProxyOverride string
+
+// SetPipProxy overrides the proxy used by pip/venv provisioning (called by the
+// host with config http_proxy; empty restores the system https_proxy fallback).
+func SetPipProxy(url string) {
+	pipProxyOverride = strings.TrimSpace(url)
+}
+
+// PipEnv returns the environment for a pip subprocess. 配置代理优先：非空时在
+// 宿主环境基础上显式覆写 HTTP_PROXY/HTTPS_PROXY；为空时返回 nil，pip 继承
+// 宿主环境（含系统 https_proxy）。
+func PipEnv() []string {
+	if strings.TrimSpace(pipProxyOverride) == "" {
+		return nil
+	}
+	return append(os.Environ(), "HTTP_PROXY="+pipProxyOverride, "HTTPS_PROXY="+pipProxyOverride)
+}
 
 // SetPyPIIndex overrides the pip index used for host-base-dependency
 // installation (called by the host with config pypi_index_url; empty restores
@@ -363,13 +386,13 @@ func minorAtLeast(v, min string) bool {
 // 宿主上的任意代码执行。未 pin 的版本（如自定义 ASTRBOT_PYTHON_VERSION）拒绝
 // 使用，除非显式设置 ASTRBOT_PYTHON_SKIP_VERIFY。
 var pythonArchiveSHA256 = map[string]string{
-	"20260814/x86_64-unknown-linux-gnu":  "3297691ae34f75fed81ac424e040145fccb0bafe8e581cd5cadbddfa1c0766c0",
-	"20260814/aarch64-unknown-linux-gnu": "4952b18bafda1880d4ab1f86e1c348dbdb31f0e6d049e76dc5f052f2f796f1c5",
+	"20260814/x86_64-unknown-linux-gnu":   "3297691ae34f75fed81ac424e040145fccb0bafe8e581cd5cadbddfa1c0766c0",
+	"20260814/aarch64-unknown-linux-gnu":  "4952b18bafda1880d4ab1f86e1c348dbdb31f0e6d049e76dc5f052f2f796f1c5",
 	"20260814/x86_64-unknown-linux-musl":  "19cadd8f069264f6dcc56279cc046d39fe9933a9df9dbd5bf270c631a97dbd88",
 	"20260814/aarch64-unknown-linux-musl": "0d26cffd0b3c13ee62cbba370419bd5ead634d69c99b6e29567957bc856b9cfa",
-	"20260814/x86_64-apple-darwin":       "1a94c83264731e9603fbea78e57e7ca8f20e7d91eb866627ac2304621b0f6f1f",
-	"20260814/aarch64-apple-darwin":      "4572133a5542f306b9bdb155da5800f9e38950cd0a98d469b832ce256fe299ea",
-	"20260814/x86_64-pc-windows-msvc":    "7330282b47cd43a66b702d39078d2e5a88e580cee351d82f95045f21f5ee042a",
+	"20260814/x86_64-apple-darwin":        "1a94c83264731e9603fbea78e57e7ca8f20e7d91eb866627ac2304621b0f6f1f",
+	"20260814/aarch64-apple-darwin":       "4572133a5542f306b9bdb155da5800f9e38950cd0a98d469b832ce256fe299ea",
+	"20260814/x86_64-pc-windows-msvc":     "7330282b47cd43a66b702d39078d2e5a88e580cee351d82f95045f21f5ee042a",
 }
 
 // verifyArchive 校验下载归档的 sha256 与固定 pin 一致；
@@ -1189,6 +1212,40 @@ func hasHostDeps(pythonBin string) bool {
 	return cmd.Run() == nil
 }
 
+var (
+	// errPipTimeout 标记 pip 安装因超时被 kill（区别于其他安装错误）。
+	errPipTimeout = errors.New("pip install 超时")
+	// pipInstallTimeout 单个 pip install 尝试的超时：某包（如 pypdf 的
+	// build-isolation 编译）长时间卡住时 kill 并重试。
+	pipInstallTimeout = 5 * time.Minute
+	// pipInstallRetries 是 pip 安装超时后的重试次数（kill 后自动重下/重装）。
+	pipInstallRetries = 2
+)
+
+// runPipInstall 运行 pip install，带 pipInstallTimeout 超时。超时 kill 整个
+// 进程组（含子编译进程）并返回 errPipTimeout，由调用方决定重试。
+func runPipInstall(pythonBin string, args []string) ([]byte, error) {
+	cmd := exec.Command(pythonBin, args...) // #nosec G204 -- pip 安装宿主基础依赖：args 由固定常量 hostBaseDeps + 固定 pip 参数组成; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	cmd.Env = PipEnv()
+	setupPipCmd(cmd)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return buf.Bytes(), err
+	case <-time.After(pipInstallTimeout):
+		killPipCmd(cmd)
+		<-done // 等进程真正退出，避免僵尸
+		return buf.Bytes(), errPipTimeout
+	}
+}
+
 func installHostDeps(pythonBin string, stage func(string)) error {
 	deps := hostBaseDeps
 	if runtime.GOOS == "android" {
@@ -1210,7 +1267,25 @@ func installHostDeps(pythonBin string, stage func(string)) error {
 	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check", "-q"}, deps...)
 	args = append(args, "-i", PyPIIndex())
 	logger.Debug("pip install: %s %s", pythonBin, strings.Join(args, " "))
-	out, err := exec.Command(pythonBin, args...).CombinedOutput() // #nosec G204 -- pip 安装插件宿主基础依赖：args 由固定常量 hostBaseDeps + 固定 pip 参数组成，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+
+	// 带超时安装：单次 5 分钟，某包卡住（如 build isolation 编译）自动 kill 并
+	// 重试（重下/重装），避免无限挂起。
+	var out []byte
+	var err error
+	for attempt := 1; attempt <= pipInstallRetries+1; attempt++ {
+		if attempt > 1 {
+			logger.Warn("pip install 第 %d 次重试（%s）…", attempt, pipInstallTimeout)
+		}
+		out, err = runPipInstall(pythonBin, args)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errPipTimeout) {
+			// 非超时错误（index 404/校验失败等）重试无意义，直接返回。
+			break
+		}
+	}
+
 	// pip 过程输出统一走 DEBUG（正常安装时的下载/构建细节；失败时下面再报
 	// 错误信息）。
 	if len(strings.TrimSpace(string(out))) > 0 {
@@ -1248,6 +1323,13 @@ func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, e
 	}
 	if py == "" {
 		return nil, ErrRuntimeUnavailable
+	}
+	// 子进程启动后 cwd 是插件数据目录（data/plugins_data/<id>），相对路径的
+	// PythonBin 会被内核按该 cwd 重新解析导致错位（cache 缺失或
+	// ASTRBOT_PYTHON_CACHE_DIR 相对时，EnsureVenv 可能产出相对 venv 路径）。
+	// 统一绝对化，与 Env() 注释"路径要绝对化否则静默失效"对齐。
+	if abs, err := filepath.Abs(py); err == nil {
+		py = abs
 	}
 	return &RuntimeEnv{
 		PythonBin: py,

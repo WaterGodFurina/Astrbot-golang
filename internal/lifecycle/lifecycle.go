@@ -116,6 +116,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}
 	l.configMgr.Register("default", cfg)
 	logger.I18nInfo("配置已加载（完整性校验通过）")
+	warnNoAvailableProvider(cfg)
 
 	// 加载内置 i18n locale 并应用 config 指定的语言（默认 zh_CN）。
 	// 之后所有 i18n.Get(...) 的日志/指令文案按当前语言输出。
@@ -300,6 +301,9 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.subPluginMgr.SetPipConfig(cfg.GetString("pypi_index_url"), cfg.GetString("pip_install_arg"))
 	// Python SDK（非嵌入，从 astrbot-python-sdk 仓库下载）的 GitHub 加速前缀。
 	pysdk.SetSDKGitHubProxy(cfg.GetString("github_proxy"))
+	// pip/venv 安装代理：config http_proxy 优先于系统代理，为空时 pip 才回退
+	// 系统 https_proxy（与通用请求"配置为空即直连"不同）。
+	pysdk.SetPipProxy(cfg.GetString("http_proxy"))
 	// 嵌入式/低内存设备：插件闲置自动卸载（进程内存回收），触发时懒加载唤醒。
 	l.syncIdleUnload()
 	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
@@ -486,7 +490,7 @@ func (l *Lifecycle) syncSandboxBooter() {
 
 	booterType, _ := sandboxCfg["booter"].(string)
 	if computerUseRuntime != "sandbox" {
-		l.sandboxMgr.SetBooter(nil)
+		l.sandboxMgr.SetBooterFactory(nil)
 		logger.I18nInfo("沙盒启动器已清除（computer_use_runtime=%q）", computerUseRuntime)
 		return
 	}
@@ -501,7 +505,11 @@ func (l *Lifecycle) syncSandboxBooter() {
 		if v := floatValue(sandboxCfg["shipyard_neo_ttl"]); v > 0 {
 			ttl = int(v)
 		}
-		l.sandboxMgr.SetBooter(sandbox.NewShipyardNeoBooter(ep, token, profile, ttl))
+		// 每个会话（群/私聊）独立创建沙盒实例（对齐 Python get_booter 的
+		// session_booter 模型），每会话最多一个沙盒；总数由 Bay 侧决定。
+		l.sandboxMgr.SetBooterFactory(func() sandbox.Booter {
+			return sandbox.NewShipyardNeoBooter(ep, token, profile, ttl)
+		})
 		logger.I18nInfo("沙盒启动器已设置（shipyard_neo endpoint=%q profile=%q ttl=%d）", ep, profile, ttl)
 	case "boxlite":
 		// Boxlite = Docker-backed containers.
@@ -525,11 +533,13 @@ func (l *Lifecycle) setDockerOrLocalBooter(sandboxCfg map[string]interface{}) {
 	// docker 不可用必须让沙箱启动失败并给出明确指引，绝不静默降级到无隔离
 	// 的本地执行（LocalBooter 仅限开发/测试场景）。
 	if !dockerAvailable() {
-		l.sandboxMgr.SetBooter(nil)
+		l.sandboxMgr.SetBooterFactory(nil)
 		logger.I18nError("boxlite 沙箱需要 Docker，但当前不可用；请安装 Docker 或改用 shipyard_neo 后端")
 		return
 	}
-	l.sandboxMgr.SetBooter(sandbox.NewDockerBooter(image))
+	l.sandboxMgr.SetBooterFactory(func() sandbox.Booter {
+		return sandbox.NewDockerBooter(image)
+	})
 	logger.I18nInfo("沙盒启动器已设置（docker, image=%s）", image)
 }
 
@@ -1134,4 +1144,21 @@ func isOrphanPluginCmdline(cmdline []byte, pluginBinPrefix string) bool {
 		return false
 	}
 	return strings.HasPrefix(args[0], pluginBinPrefix)
+}
+
+// warnNoAvailableProvider 检查配置中是否至少有一个启用的模型提供商。
+// 没有时在启动时打印 warn（对齐 Python 原版静默 + 日志提示）；聊天侧不再
+// 向平台发送"未找到可用的模型提供商"提示。
+func warnNoAvailableProvider(cfg *config.AstrBotConfig) {
+	providers, _ := cfg.Get("provider").([]interface{})
+	for _, p := range providers {
+		pc, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if enable, _ := pc["enable"].(bool); enable {
+			return
+		}
+	}
+	logger.I18nWarn("未找到可用的模型提供商，请先配置")
 }

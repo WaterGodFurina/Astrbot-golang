@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -28,6 +29,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -56,6 +58,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -64,6 +67,10 @@ var logger = log.GetDefault().WithComponent("Pipeline")
 // pluginRPCTimeout bounds every gRPC call into a subprocess plugin so a hung
 // plugin handler (infinite loop, deadlock) cannot freeze the pipeline forever.
 const pluginRPCTimeout = 30 * time.Second
+
+// errNoAvailableProvider 表示配置中没有可用的模型提供商。平台侧静默处理
+// （不回复用户），宿主启动时会打印一条 warn 提示（见 lifecycle）。
+var errNoAvailableProvider = errors.New("未找到可用的模型提供商，请先配置")
 
 var (
 	// tagBlockRe matches <script>...</script> and <style>...</style> blocks.
@@ -1190,9 +1197,16 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	// Call LLM agent
 	if s.shouldCallLLM(event) {
 		if err := s.callLLMAgent(ctx, event); err != nil {
-			logger.Error("LLM agent call failed: %v", err)
-			event.Result = &message.MessageEventResult{}
-			event.Result.Chain = []message.Component{&message.Plain{Text: "LLM 调用失败: " + err.Error()}}
+			if errors.Is(err, errNoAvailableProvider) {
+				// 未配置可用模型提供商：平台侧静默（不回复用户），
+				// 仅在启动时打印 warn（见 lifecycle）。
+				logger.Debug("skip LLM call: %v", err)
+				event.Result = nil
+			} else {
+				logger.Error("LLM agent call failed: %v", err)
+				event.Result = &message.MessageEventResult{}
+				event.Result.Chain = []message.Component{&message.Plain{Text: "LLM 调用失败: " + err.Error()}}
+			}
 		}
 	}
 
@@ -1393,6 +1407,18 @@ type agentRequest struct {
 // assembles the request, runAgentToolLoop drives the chat + tool-call rounds,
 // and finalizeAgentReply persists the reply and flushes the stream.
 func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) error {
+	// Pre-boot the sandbox BEFORE the first LLM request when Computer Use runs
+	// in sandbox mode. 沙盒此前在首次工具调用时才惰性启动，导致首轮系统提示词
+	// 构建（applySkills）时沙盒技能缓存仍为空，python-sandbox 等沙盒内置技能
+	// 从未注入 agent 上下文（agent 因此不了解沙盒环境与文件处理流程）。此处
+	// 提前启动并同步技能，使首轮请求即可带上沙盒技能。ensureSandboxStarted 幂等，
+	// 已运行则直接返回，仅首个请求付出 ~10s 启动成本。
+	if s.providerConf != nil && s.providerConf.ComputerUseRuntime == "sandbox" && s.sandboxMgr != nil {
+		if err := s.ensureSandboxStarted(ctx, event.UnifiedMsgOrigin()); err != nil {
+			logger.I18nWarn("沙盒预启动失败（继续处理）: %v", err)
+		}
+	}
+
 	ar, err := s.prepareAgentRequest(event)
 	if err != nil || ar == nil {
 		// A failure reply was already written to event.Result, a plugin hook
@@ -1462,8 +1488,8 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 
 	providerCfg, providerSettings, err := s.resolveProvider()
 	if err != nil {
+		// 无可用模型提供商：平台侧静默（不回复），宿主启动时已打印 warn。
 		event.Result = &message.MessageEventResult{}
-		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 " + err.Error()}}
 		return nil, err
 	}
 
@@ -1608,6 +1634,16 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 		AudioURLs:    audioURLs,
 		Conversation: s.convMgr,
 		Contexts:     s.conversationHistory(event.UnifiedMsgOrigin()),
+	}
+
+	// File attachments (当前消息与引用回复中的 File 组件) 注入 LLM 上下文，
+	// 使 agent 能看到下载 URL 并 astrbot_download_file（对齐 Python
+	// astr_main_agent 的 [File Attachment ...]）。
+	for _, part := range collectFileAttachments(event) {
+		req.ExtraUserContentParts = append(req.ExtraUserContentParts, map[string]interface{}{
+			"type": "text",
+			"text": part,
+		})
 	}
 
 	// Sanitize context by the provider's supported modalities
@@ -1759,6 +1795,90 @@ func collectMediaURLs(event *core.Event) (imageURLs, audioURLs []string) {
 		}
 	}
 	return imageURLs, audioURLs
+}
+
+// collectFileAttachments gathers File components from the event's message chain
+// and any quoted-reply / forward-node chains. For each file with a resolvable
+// download URL it downloads the file to a host temp path (mirroring Python's
+// astr_main_agent File.get_file()) and returns "[File Attachment ...]" text
+// parts for the LLM context, so the agent can astrbot_upload_file the host
+// path into the sandbox.
+func collectFileAttachments(event *core.Event) []string {
+	if event.Message == nil {
+		return nil
+	}
+	var parts []string
+	var walk func(comps []message.Component, quoted bool)
+	walk = func(comps []message.Component, quoted bool) {
+		for _, comp := range comps {
+			switch c := comp.(type) {
+			case *message.File:
+				name := c.Name
+				if name == "" {
+					name = c.FileID
+				}
+				if name == "" {
+					name = "unknown"
+				}
+				prefix := "[File Attachment: "
+				if quoted {
+					prefix = "[File Attachment in quoted message: "
+				}
+				if path := downloadFileAttachment(c); path != "" {
+					c.Path = path
+					parts = append(parts, fmt.Sprintf("%sname %s, path %s]", prefix, name, path))
+				} else if validHTTPURL(c.URL) {
+					parts = append(parts, fmt.Sprintf("%sname %s, url %s (download failed)]", prefix, name, c.URL))
+				} else {
+					parts = append(parts, fmt.Sprintf("%sname %s (no download URL resolved)]", prefix, name))
+				}
+			case *message.Reply:
+				walk(c.Chain, true)
+			case *message.Nodes:
+				for _, n := range c.Nodes {
+					if n != nil {
+						walk(n.Content, quoted)
+					}
+				}
+			}
+		}
+	}
+	walk(event.Message.Chain, false)
+	return parts
+}
+
+// downloadFileAttachment downloads a File component's URL to a host temp
+// directory (data/temp) and returns the local path, or "" when there is no
+// usable URL or the download fails. Mirrors Python's File.get_file()/
+// _download_file which caches the remote file locally before the LLM round.
+func downloadFileAttachment(c *message.File) string {
+	if c == nil || !validHTTPURL(c.URL) {
+		return ""
+	}
+	dir := filepath.Join("data", "temp")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return ""
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	name := strings.TrimSpace(c.Name)
+	if name == "" {
+		name = c.FileID
+	}
+	safe := filepath.Base(strings.ReplaceAll(name, " ", "_"))
+	if safe == "" || safe == "." || safe == "/" {
+		safe = "attachment"
+	}
+	dst := filepath.Join(dir, fmt.Sprintf("fileseg_%s_%d", safe, time.Now().UnixNano()))
+	dlCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := utils.DownloadFile(dlCtx, c.URL, dst); err != nil {
+		logger.I18nWarn("文件附件下载失败 (%s): %v", c.URL, err)
+		os.Remove(dst)
+		return ""
+	}
+	return dst
 }
 
 // runAgentToolLoop issues the initial chat round, executes the requested
@@ -2398,7 +2518,7 @@ func dispatchBridgeHooks(sub *plugin.SubprocessManager, event *core.Event) {
 	if len(hooks) == 0 {
 		return
 	}
-	sdkEvent := star.CoreEventToSDK(event)
+	sdkEvent := star.CoreEventToSDKEvent(event)
 	for instID, names := range hooks {
 		inst := sub.Get(instID)
 		if inst == nil || inst.Client == nil || inst.Meta == nil {
@@ -2423,7 +2543,7 @@ func dispatchSubprocessHooksPayload(sub *plugin.SubprocessManager, event *core.E
 	if sub == nil {
 		return
 	}
-	sdkEvent := star.CoreEventToSDK(event)
+	sdkEvent := star.CoreEventToSDKEvent(event)
 	for _, inst := range sub.List() {
 		if inst.Client == nil || inst.Meta == nil {
 			continue
@@ -2454,7 +2574,7 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 	if s.subPlugins == nil {
 		return systemPrompt, userPrompt, false, nil
 	}
-	sdkEvent := star.CoreEventToSDK(event)
+	sdkEvent := star.CoreEventToSDKEvent(event)
 	for _, inst := range s.subPlugins.List() {
 		if inst.Client == nil || inst.Meta == nil {
 			continue
@@ -2545,7 +2665,7 @@ func (s *ProcessStage) executePluginTool(event *core.Event, name string, args ma
 	if s.subPlugins == nil {
 		return "", false
 	}
-	sdkEvent := star.CoreEventToSDK(event)
+	sdkEvent := star.CoreEventToSDKEvent(event)
 	// 1) 运行中实例直接命中。
 	for _, inst := range s.subPlugins.List() {
 		if inst.Client == nil || inst.Meta == nil {
@@ -2583,7 +2703,7 @@ func (s *ProcessStage) executePluginTool(event *core.Event, name string, args ma
 }
 
 // dispatchPluginTool invokes one plugin tool RPC and formats the result.
-func (s *ProcessStage) dispatchPluginTool(inst *plugin.PluginInstance, t *sdkv1.ToolDesc, event *core.Event, name string, args map[string]interface{}, sdkEvent *pluginsdk.Event) (string, bool) {
+func (s *ProcessStage) dispatchPluginTool(inst *plugin.PluginInstance, t *sdkv1.ToolDesc, event *core.Event, name string, args map[string]interface{}, sdkEvent *sdkv1.SDKEvent) (string, bool) {
 	inst.Touch() // 活动标记：参与闲置卸载判定
 	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 	text, isErr, res, err := inst.Client.HandleTool(rpcCtx, t.Name, args, sdkEvent)
@@ -3288,6 +3408,8 @@ var coreBuiltinToolSet = map[string]bool{
 	"astrbot_file_write_tool":    true,
 	"astrbot_file_edit_tool":     true,
 	"astrbot_grep_tool":          true,
+	"astrbot_upload_file":        true,
+	"astrbot_download_file":      true,
 	"web_search_tavily":          true,
 	"web_search_bocha":           true,
 	"web_search_brave":           true,
@@ -3401,7 +3523,7 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		}
 	}
 	if !handled && runtime == "sandbox" {
-		if r, h := s.executeSandboxTool(ctx, name, args); h {
+		if r, h := s.executeSandboxTool(ctx, event.UnifiedMsgOrigin(), name, args); h {
 			result, handled = r, true
 		}
 	}
@@ -3430,7 +3552,7 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		switch name {
 		case "astrbot_execute_shell", "astrbot_shell_session", "astrbot_execute_python",
 			"astrbot_file_read_tool", "astrbot_file_write_tool", "astrbot_file_edit_tool",
-			"astrbot_grep_tool":
+			"astrbot_grep_tool", "astrbot_upload_file", "astrbot_download_file":
 			if runtime != "local" {
 				result = fmt.Sprintf("工具 %s 未启用（Computer Use 运行时为 %s，需要 local）", name, runtime)
 			} else if !computerUseAllowed(s.config, event) {
@@ -3458,6 +3580,10 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 					result = snapshotFileMutation(ws, before, name, r)
 				case "astrbot_grep_tool":
 					result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
+				case "astrbot_upload_file":
+					result = executeLocalUpload(argString(args, "local_path"), umo)
+				case "astrbot_download_file":
+					result = executeLocalDownload(argString(args, "remote_path"), umo)
 				}
 			}
 		case "future_task":
@@ -3507,8 +3633,10 @@ func addCronTools(config map[string]interface{}) bool {
 	return *ps.Proactive.AddCronTools
 }
 
-// executeSandboxTool routes computer-use tools into the sandbox runtime.
-func (s *ProcessStage) executeSandboxTool(ctx context.Context, name string, args map[string]interface{}) (string, bool) {
+// executeSandboxTool routes computer-use tools into the per-session sandbox
+// runtime. sessionID 是事件的 unified_msg_origin（群/私聊），每个会话独立
+// 沙盒（对齐 Python session_booter 模型），同一会话的沙盒任务天然串行。
+func (s *ProcessStage) executeSandboxTool(ctx context.Context, sessionID, name string, args map[string]interface{}) (string, bool) {
 	if s.sandboxMgr == nil {
 		// Only sandbox-only tools are reported as unavailable here; any other
 		// name must fall through to the remaining executors so it is not
@@ -3516,7 +3644,8 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, name string, args
 		switch name {
 		case "astrbot_execute_shell", "astrbot_execute_python",
 			"astrbot_file_read_tool", "astrbot_file_write_tool",
-			"astrbot_file_edit_tool", "astrbot_grep_tool":
+			"astrbot_file_edit_tool", "astrbot_grep_tool",
+			"astrbot_upload_file", "astrbot_download_file":
 			return "Sandbox manager not configured.", true
 		}
 		return "", false
@@ -3534,51 +3663,81 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, name string, args
 	defer cancel()
 	switch name {
 	case "astrbot_execute_shell":
-		if err := s.ensureSandboxStarted(tctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxShell(tctx, s.sandboxMgr, argString(args, "command")), true
+		return sandboxShell(tctx, s.sandboxMgr, sessionID, argString(args, "command")), true
 	case "astrbot_execute_python":
-		if err := s.ensureSandboxStarted(tctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxPython(tctx, s.sandboxMgr, argString(args, "code")), true
+		return sandboxPython(tctx, s.sandboxMgr, sessionID, argString(args, "code")), true
 	case "astrbot_file_read_tool":
-		if err := s.ensureSandboxStarted(tctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxFileRead(tctx, s.sandboxMgr, argString(args, "path")), true
+		return sandboxFileRead(tctx, s.sandboxMgr, sessionID, argString(args, "path")), true
 	case "astrbot_file_write_tool":
-		if err := s.ensureSandboxStarted(tctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxFileWrite(tctx, s.sandboxMgr, argString(args, "path"), argString(args, "content")), true
+		return sandboxFileWrite(tctx, s.sandboxMgr, sessionID, argString(args, "path"), argString(args, "content")), true
 	case "astrbot_file_edit_tool":
-		if err := s.ensureSandboxStarted(tctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxFileEdit(tctx, s.sandboxMgr, argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all")), true
+		return sandboxFileEdit(tctx, s.sandboxMgr, sessionID, argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all")), true
 	case "astrbot_grep_tool":
-		if err := s.ensureSandboxStarted(tctx); err != nil {
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxGrep(tctx, s.sandboxMgr, argString(args, "pattern"), argString(args, "path")), true
+		return sandboxGrep(tctx, s.sandboxMgr, sessionID, argString(args, "pattern"), argString(args, "path")), true
+	case "astrbot_upload_file":
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return sandboxUploadFile(tctx, s.sandboxMgr, sessionID, argString(args, "local_path")), true
+	case "astrbot_download_file":
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return sandboxDownloadFile(tctx, s.sandboxMgr, sessionID, argString(args, "remote_path")), true
 	}
 	return "", false
 }
 
-// ensureSandboxStarted lazily starts the sandbox booter on first use.
-func (s *ProcessStage) ensureSandboxStarted(ctx context.Context) error {
-	if s.sandboxMgr.IsRunning() {
-		return nil
-	}
-	if err := s.sandboxMgr.Start(ctx); err != nil {
+// ensureSandboxStarted lazily ensures the session's sandbox is booted on first
+// use (per-session, mirroring Python get_booter). 内部会做健康检查：会话沙盒
+// 已失效（404/TTL 到期）时自动重建。
+func (s *ProcessStage) ensureSandboxStarted(ctx context.Context, sessionID string) error {
+	if _, err := s.sandboxMgr.EnsureSession(ctx, sessionID); err != nil {
 		return err
 	}
 	if s.skillMgr != nil {
-		_ = s.sandboxMgr.SyncSkills(ctx)
+		s.syncSandboxSkills(ctx, sessionID)
 	}
 	return nil
+}
+
+// syncSandboxSkills syncs sandbox skill metadata with a short retry window.
+// /workspace/skills 由 cargo volume 挂载，容器刚就绪时可能尚未挂载完成，首次
+// 扫描返回 0 个技能（观察为 "Synced 0 skills from sandbox"），导致 python-
+// sandbox 内置技能丢失。重试直到扫到技能或窗口耗尽。
+func (s *ProcessStage) syncSandboxSkills(ctx context.Context, sessionID string) {
+	for attempt := 0; attempt < 5; attempt++ {
+		if err := s.sandboxMgr.SyncSkills(ctx, sessionID); err == nil {
+			if st := s.skillMgr.GetSandboxSkillsCacheStatus(); st != nil {
+				if ready, _ := st["ready"].(bool); ready {
+					return
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // resolveProvider picks the provider config to use for this chat.
@@ -3621,7 +3780,7 @@ func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]int
 			return pc, providerSettings, nil
 		}
 	}
-	return nil, nil, fmt.Errorf("未找到可用的模型提供商，请先配置")
+	return nil, nil, errNoAvailableProvider
 }
 
 // applySelectedProviderModel applies the dashboard-selected provider/model
@@ -4316,7 +4475,7 @@ func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
 // applyResultHooks runs every loaded subprocess plugin's on_decorating_result
 // hooks against the outgoing chain.
 func (s *ResultDecorateStage) applyResultHooks(event *core.Event, chain *[]pluginsdk.Component) (bool, error) {
-	sdkEvent := star.CoreEventToSDK(event)
+	sdkEvent := star.CoreEventToSDKEvent(event)
 	cur := *chain
 	for _, inst := range s.subPlugins.List() {
 		if inst.Client == nil || inst.Meta == nil {

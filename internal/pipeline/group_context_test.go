@@ -102,3 +102,28 @@ func TestGroupContextRemoveSession(t *testing.T) {
 		t.Errorf("records must be empty after RemoveSession, got %d", len(req.ExtraUserContentParts))
 	}
 }
+
+// TestCollectFileAttachments: File components in the current message and inside
+// a quoted reply (Reply.Chain) are surfaced as [File Attachment ...] parts.
+// Files without a resolvable download URL are marked accordingly (no network
+// is touched in this test).
+func TestCollectFileAttachments(t *testing.T) {
+	ev := &core.Event{
+		Message: &message.MessageChain{Chain: []message.Component{
+			&message.Reply{MessageID: "r1", Chain: []message.Component{
+				&message.File{Name: "bug.md", FileID: "/abc"}, // no URL
+			}},
+			&message.File{Name: "top.txt", URL: "https:///ftn_handler//?fname="}, // invalid host URL
+		}},
+	}
+	parts := collectFileAttachments(ev)
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 attachment parts, got %d: %v", len(parts), parts)
+	}
+	if parts[0] != "[File Attachment in quoted message: name bug.md (no download URL resolved)]" {
+		t.Errorf("quoted attachment mismatch: %q", parts[0])
+	}
+	if parts[1] != "[File Attachment: name top.txt (no download URL resolved)]" {
+		t.Errorf("top-level attachment mismatch: %q", parts[1])
+	}
+}

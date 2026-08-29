@@ -374,12 +374,75 @@ func (g *GroupChatContext) formatMessage(event *core.Event, c groupContextCfg) s
 		case *message.Video:
 			b.WriteString(" [Video]")
 		case *message.File:
-			fmt.Fprintf(&b, " [File: %s]", v.Name)
+			// 携带下载 URL（若有且合法），使 LLM 能通过 astrbot_download_file 获取文件。
+			if validHTTPURL(v.URL) {
+				fmt.Fprintf(&b, " [File: %s (%s)]", v.Name, v.URL)
+			} else {
+				fmt.Fprintf(&b, " [File: %s]", v.Name)
+			}
+		case *message.Reply:
+			// 对齐 Python 的 _format_message：引用回复在上下文里以 [Quote(...)] 展示。
+			if v.MessageStr != "" {
+				fmt.Fprintf(&b, " [Quote(%s: %s)]", v.SenderNick, truncateReplyText(v.MessageStr))
+			} else if len(v.Chain) > 0 {
+				fmt.Fprintf(&b, " [Quote(%s: %s)]", v.SenderNick, describeChain(v.Chain))
+			} else {
+				b.WriteString(" [Quote]")
+			}
 		case *message.Json:
 			b.WriteString(renderJsonCard(v))
 		}
 	}
 	return b.String()
+}
+
+// describeChain 将消息链摘要为纯文本，供引用回复在 agent 上下文中展示
+// （对齐 Python _describe_chain）。文件组件携带下载 URL。
+func describeChain(chain []message.Component) string {
+	desc := make([]string, 0, len(chain))
+	for _, c := range chain {
+		switch v := c.(type) {
+		case *message.Plain:
+			if text := strings.TrimSpace(v.Text); text != "" {
+				desc = append(desc, text)
+			}
+		case *message.Image:
+			desc = append(desc, "[Image]")
+		case *message.At:
+			name := v.Name
+			if name == "" {
+				name = v.TargetID
+			}
+			desc = append(desc, "[At: "+name+"]")
+		case *message.Record:
+			desc = append(desc, "[Voice]")
+		case *message.Video:
+			desc = append(desc, "[Video]")
+		case *message.File:
+			if validHTTPURL(v.URL) {
+				desc = append(desc, "[File: "+v.Name+" ("+v.URL+")]")
+			} else {
+				desc = append(desc, "[File: "+v.Name+"]")
+			}
+		case *message.Forward:
+			desc = append(desc, "[Forward]")
+		case *message.Nodes:
+			desc = append(desc, "[Forward]")
+		case *message.AtAll:
+			desc = append(desc, "[At: All]")
+		case *message.Face:
+			desc = append(desc, "[Sticker: "+v.ID+"]")
+		case *message.Reply:
+			desc = append(desc, "[Quote]")
+		default:
+			desc = append(desc, "["+string(c.Type())+"]")
+		}
+	}
+	s := strings.Join(desc, "")
+	if s == "" {
+		return "[Unknown]"
+	}
+	return s
 }
 
 // maxReplyTextLength mirrors _MAX_REPLY_TEXT_LENGTH: 过长的引用回复与卡片文本

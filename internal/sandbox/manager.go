@@ -689,108 +689,234 @@ func dockerRun(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 	return -1, err
 }
 
-// Manager manages the sandbox lifecycle and skill synchronization.
+// sessionBooter is one session's (群/私聊 unified_msg_origin) sandbox backend.
+// The per-session mutex serializes concurrent tool ops within the same session
+// (a session runs at most one agent task at a time anyway).
+type sessionBooter struct {
+	mu     sync.Mutex
+	booter Booter
+}
+
+// Manager manages per-session sandbox booters, mirroring astrbot-py's
+// computer_client.session_booter map: each session (group / private chat) gets
+// its own sandbox (at most one), reused across that session's tool calls. A
+// stale (unhealthy) sandbox is torn down and rebuilt on the next use — the
+// "auto re-enable a new sandbox on 404" behavior. 单机沙盒总数由沙盒侧（Bay）
+// 的配置决定，宿主不另设硬上限（与 Python 一致）。
 type Manager struct {
 	mu       sync.RWMutex
-	booter   Booter
+	factory  func() Booter
+	sessions map[string]*sessionBooter
 	skillMgr *skills.SkillManager
 }
 
 // NewManager creates a sandbox manager.
 func NewManager(skillMgr *skills.SkillManager) *Manager {
-	return &Manager{skillMgr: skillMgr}
+	return &Manager{
+		skillMgr: skillMgr,
+		sessions: make(map[string]*sessionBooter),
+	}
 }
 
-// SetBooter switches the sandbox backend.
-func (m *Manager) SetBooter(b Booter) {
+// SetBooterFactory sets the booter factory (from lifecycle's sandbox config).
+// Existing per-session booters are stopped and discarded; the next use of a
+// session lazily creates a fresh one.
+func (m *Manager) SetBooterFactory(fn func() Booter) {
 	m.mu.Lock()
-	old := m.booter
-	m.booter = b
+	m.factory = fn
+	old := m.sessions
+	m.sessions = make(map[string]*sessionBooter)
 	m.mu.Unlock()
-	// 旧 booter 的 Stop 可能阻塞较久（docker rm 最长 30s），必须在锁外执行，
-	// 否则期间所有 Exec/读写操作都会被写锁卡住。
-	if old != nil {
-		if err := old.Stop(); err != nil {
-			logger.Error("停止旧 sandbox booter 失败: %v", err)
+	for _, sb := range old {
+		if sb != nil && sb.booter != nil {
+			if err := sb.booter.Stop(); err != nil {
+				logger.Error("停止旧 sandbox booter 失败: %v", err)
+			}
 		}
 	}
 }
 
-// Start launches the sandbox.
-func (m *Manager) Start(ctx context.Context) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.booter == nil {
-		return fmt.Errorf("no booter configured")
+// EnsureSession returns the session's sandbox booter, creating + booting a new
+// one on first use (mirrors Python get_booter). 宿主不做主动健康检测——沙盒总部
+// （Bay）自行管理沙盒生命周期；若上一次操作已把该会话沙盒标记失效
+// （markDeadIfNeeded 命中 "Sandbox not found"），这里直接拉取一个全新沙盒。
+func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*sessionBooter, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, fmt.Errorf("sandbox session id is empty")
 	}
-	return m.booter.Start(ctx)
+	m.mu.RLock()
+	sb := m.sessions[sessionID]
+	m.mu.RUnlock()
+	if sb != nil {
+		return sb, nil
+	}
+	m.mu.RLock()
+	factory := m.factory
+	m.mu.RUnlock()
+	if factory == nil {
+		return nil, fmt.Errorf("no booter configured")
+	}
+	b := factory()
+	if err := b.Start(ctx); err != nil {
+		return nil, err
+	}
+	sb = &sessionBooter{booter: b}
+	m.mu.Lock()
+	// 并发下可能已被其他 goroutine 创建，保留已存在者并停掉本次多余的。
+	if existing := m.sessions[sessionID]; existing != nil {
+		m.mu.Unlock()
+		_ = b.Stop()
+		return existing, nil
+	}
+	m.sessions[sessionID] = sb
+	m.mu.Unlock()
+	if m.skillMgr != nil {
+		if entries, err := b.ListSkills(ctx); err == nil {
+			m.skillMgr.SetSandboxSkillsCache(entries)
+		}
+	}
+	return sb, nil
 }
 
-// Stop shuts down the sandbox.
+// Start boots the sandbox for a session (lazily creates it if absent).
+func (m *Manager) Start(ctx context.Context, sessionID string) error {
+	_, err := m.EnsureSession(ctx, sessionID)
+	return err
+}
+
+// Stop shuts down every session's sandbox.
 func (m *Manager) Stop() error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.booter == nil {
+	m.mu.Lock()
+	old := m.sessions
+	m.sessions = make(map[string]*sessionBooter)
+	m.mu.Unlock()
+	var firstErr error
+	for _, sb := range old {
+		if sb != nil && sb.booter != nil {
+			if err := sb.booter.Stop(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
+}
+
+// StopSession tears down one session's sandbox (e.g. on session end).
+func (m *Manager) StopSession(sessionID string) error {
+	m.mu.Lock()
+	sb := m.sessions[sessionID]
+	delete(m.sessions, sessionID)
+	m.mu.Unlock()
+	if sb == nil || sb.booter == nil {
 		return nil
 	}
-	return m.booter.Stop()
+	return sb.booter.Stop()
 }
 
-// SyncSkills discovers skills from the sandbox and updates the local cache.
-func (m *Manager) SyncSkills(ctx context.Context) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.booter == nil || !m.booter.IsRunning() {
+// SyncSkills refreshes the sandbox skill cache from a session's sandbox.
+func (m *Manager) SyncSkills(ctx context.Context, sessionID string) error {
+	sb, err := m.EnsureSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if sb.booter == nil || !sb.booter.IsRunning() {
 		return fmt.Errorf("sandbox not running")
 	}
-	entries, err := m.booter.ListSkills(ctx)
+	entries, err := sb.booter.ListSkills(ctx)
 	if err != nil {
 		return fmt.Errorf("list sandbox skills: %w", err)
 	}
 	if m.skillMgr != nil {
 		m.skillMgr.SetSandboxSkillsCache(entries)
 	}
-	logger.Debug("Synced %d skills from sandbox", len(entries))
+	logger.Debug("Synced %d skills from sandbox session %s", len(entries), sessionID)
 	return nil
 }
 
-// Exec runs a command in the sandbox.
-func (m *Manager) Exec(ctx context.Context, cmd string, args []string, workdir string) (string, string, int, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.booter == nil || !m.booter.IsRunning() {
-		return "", "", -1, fmt.Errorf("sandbox not running")
+// Exec runs a command in the session's sandbox.
+func (m *Manager) Exec(ctx context.Context, sessionID, cmd string, args []string, workdir string) (string, string, int, error) {
+	sb, err := m.EnsureSession(ctx, sessionID)
+	if err != nil {
+		return "", "", -1, err
+	}
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if !sb.booter.IsRunning() {
+		// 该会话沙盒已失效（Bay 侧被回收），丢弃会话，下一次调用自动拉取新沙盒。
+		m.dropSession(sessionID, sb)
+		return "", "", -1, fmt.Errorf("sandbox not running (will auto-recreate)")
 	}
 	startTime := time.Now()
-	stdout, stderr, code, err := m.booter.Exec(ctx, cmd, args, workdir)
+	stdout, stderr, code, err := sb.booter.Exec(ctx, cmd, args, workdir)
 	elapsed := time.Since(startTime)
-	logger.Debug("Exec %s %v (exit=%d, %v)", cmd, args, code, elapsed)
+	logger.Debug("Exec[%s] %s %v (exit=%d, %v)", sessionID, cmd, args, code, elapsed)
+	// 操作命中死沙盒（Bay "Sandbox not found"，booter 已自我重置）时丢弃该会话，
+	// 下一次 EnsureSession 自动拉取新沙盒（对齐 astrbot 行为）。
+	if !sb.booter.IsRunning() {
+		m.dropSession(sessionID, sb)
+	}
 	return stdout, stderr, code, err
 }
 
-// ReadFile reads a file from the sandbox workspace.
-func (m *Manager) ReadFile(ctx context.Context, path string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.booter == nil || !m.booter.IsRunning() {
-		return "", fmt.Errorf("sandbox not running")
+// ReadFile reads a file from the session's sandbox workspace.
+func (m *Manager) ReadFile(ctx context.Context, sessionID, path string) (string, error) {
+	sb, err := m.EnsureSession(ctx, sessionID)
+	if err != nil {
+		return "", err
 	}
-	return m.booter.ReadFile(ctx, path)
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if !sb.booter.IsRunning() {
+		m.dropSession(sessionID, sb)
+		return "", fmt.Errorf("sandbox not running (will auto-recreate)")
+	}
+	content, err := sb.booter.ReadFile(ctx, path)
+	if !sb.booter.IsRunning() {
+		m.dropSession(sessionID, sb)
+	}
+	return content, err
 }
 
-// WriteFile writes content to a file in the sandbox workspace.
-func (m *Manager) WriteFile(ctx context.Context, path, content string) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.booter == nil || !m.booter.IsRunning() {
-		return fmt.Errorf("sandbox not running")
+// WriteFile writes content to a file in the session's sandbox workspace.
+func (m *Manager) WriteFile(ctx context.Context, sessionID, path, content string) error {
+	sb, err := m.EnsureSession(ctx, sessionID)
+	if err != nil {
+		return err
 	}
-	return m.booter.WriteFile(ctx, path, content)
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if !sb.booter.IsRunning() {
+		m.dropSession(sessionID, sb)
+		return fmt.Errorf("sandbox not running (will auto-recreate)")
+	}
+	err = sb.booter.WriteFile(ctx, path, content)
+	if !sb.booter.IsRunning() {
+		m.dropSession(sessionID, sb)
+	}
+	return err
 }
 
-// IsRunning returns whether the sandbox is active.
-func (m *Manager) IsRunning() bool {
+// dropSession removes a session's booter from the map only if it is still the
+// current entry (a concurrent rebuild may have replaced it meanwhile).
+func (m *Manager) dropSession(sessionID string, sb *sessionBooter) {
+	m.mu.Lock()
+	if m.sessions[sessionID] == sb {
+		delete(m.sessions, sessionID)
+	}
+	m.mu.Unlock()
+}
+
+// IsRunning returns whether the session's sandbox is active.
+func (m *Manager) IsRunning(sessionID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.booter != nil && m.booter.IsRunning()
+	sb := m.sessions[sessionID]
+	return sb != nil && sb.booter != nil && sb.booter.IsRunning()
+}
+
+// SessionCount returns the number of active per-session sandboxes.
+func (m *Manager) SessionCount() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.sessions)
 }
