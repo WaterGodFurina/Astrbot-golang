@@ -35,7 +35,10 @@ func NewOpenAIEmbeddingSource(config, settings map[string]interface{}) *OpenAIEm
 	}
 	s.apiBase = configString(config, "embedding_api_base", configString(config, "api_base", "https://api.openai.com/v1"))
 	s.apiBase = strings.TrimSuffix(s.apiBase, "/")
-	s.apiKey = configString(config, "embedding_api_key", configString(config, "key", ""))
+	s.apiKey = configKey(config, "embedding_api_key")
+	if s.apiKey == "" {
+		s.apiKey = configKey(config, "key")
+	}
 	s.dim = configInt(config, "embedding_dimensions", 0)
 	if m := configString(config, "embedding_model", configString(config, "model", "")); m != "" {
 		s.SetModel(m)

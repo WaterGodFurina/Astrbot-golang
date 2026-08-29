@@ -117,6 +117,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.configMgr.Register("default", cfg)
 	logger.I18nInfo("配置已加载（完整性校验通过）")
 	warnNoAvailableProvider(cfg)
+	loadProvidersToManager(cfg, l.providerMgr)
 
 	// 加载内置 i18n locale 并应用 config 指定的语言（默认 zh_CN）。
 	// 之后所有 i18n.Get(...) 的日志/指令文案按当前语言输出。
@@ -1161,4 +1162,51 @@ func warnNoAvailableProvider(cfg *config.AstrBotConfig) {
 		}
 	}
 	logger.I18nWarn("未找到可用的模型提供商，请先配置")
+}
+
+// loadProvidersToManager 将配置中启用的 provider 实例化并填充 ProviderManager。
+//
+// 宿主 pipeline 在请求时经 CreateProvider 现场实例化 provider（瞬态实例），
+// 而插件桥（host_service 的 ListProviders/GetUsingProvider）读取的是
+// ProviderManager——若启动时不填充，插件侧（如 livingmemory）永远看到空
+// provider 列表。此处按 cmd_config.json 的 provider 数组逐条注册，并按
+// provider_settings 设置默认 chat/embedding provider ID。
+func loadProvidersToManager(cfg *config.AstrBotConfig, pm *provider.ProviderManager) {
+	if pm == nil {
+		return
+	}
+	providers, _ := cfg.Get("provider").([]interface{})
+	loaded := 0
+	for _, p := range providers {
+		pc, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if enable, _ := pc["enable"].(bool); !enable {
+			continue
+		}
+		id, _ := pc["id"].(string)
+		typeName, _ := pc["type"].(string)
+		if id == "" || typeName == "" {
+			continue
+		}
+		inst, err := provider.CreateProvider(typeName, pc, map[string]interface{}{})
+		if err != nil {
+			logger.I18nWarn("Provider %s (%s) 实例化失败，已跳过: %v", id, typeName, err)
+			continue
+		}
+		pm.Register(id, inst)
+		loaded++
+	}
+	if settings, ok := cfg.Get("provider_settings").(map[string]interface{}); ok {
+		if v, _ := settings["default_provider_id"].(string); v != "" {
+			pm.SetDefaultChatProvider(v)
+		}
+		if v, _ := settings["default_embedding_provider_id"].(string); v != "" {
+			pm.SetDefaultEmbeddingProvider(v)
+		}
+	}
+	if loaded > 0 {
+		logger.I18nInfo("ProviderManager 已加载 %d 个 provider（插件桥数据源就绪）", loaded)
+	}
 }
