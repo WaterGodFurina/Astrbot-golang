@@ -55,6 +55,26 @@
         },
         "image_caption_prompt": {
           "description": "Image Caption Prompt"
+        },
+        "request_retry_429_enabled": {
+          "description": "Enable 429 Rate-Limit Retry",
+          "hint": "Whether to retry when the model API returns 429 Too Many Requests. Enabled by default; disable to skip 429 retries."
+        },
+        "request_retry_429_max": {
+          "description": "429 Max Retry Count",
+          "hint": "Maximum retries when receiving 429. Defaults to 5 and cannot be 0 (the backend coerces 0 to 1)."
+        },
+        "request_retry_429_strategy": {
+          "description": "429 Retry Strategy",
+          "hint": "How long to wait between 429 retries: exponential backoff or a fixed per-retry delay.",
+          "labels": [
+            "Exponential backoff",
+            "Fixed delay"
+          ]
+        },
+        "request_retry_429_fixed_seconds": {
+          "description": "Fixed Retry Delay (seconds)",
+          "hint": "Seconds to wait before each retry when “Fixed retry” is selected. Defaults to 10."
         }
       },
       "provider_stt_settings": {
@@ -175,6 +195,10 @@
         "computer_use_require_admin": {
           "description": "Require AstrBot Admin Permission",
           "hint": "When enabled, AstrBot admin permission is required to use computer capabilities. Admins can be added in Platform Config. Use the /sid command to view admin IDs."
+        },
+        "computer_use_max_same_tool_calls": {
+          "description": "Max same tool calls per agent run",
+          "hint": "To prevent the bot from looping on a single tool call, set the maximum number of consecutive identical tool calls. 0 disables this check."
         },
         "sandbox": {
           "booter": {

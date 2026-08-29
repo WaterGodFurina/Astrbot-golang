@@ -85,6 +85,18 @@ func (m *PluginMetadata) RequiresCgo() bool {
 	return m != nil && m.Cgo != nil && *m.Cgo
 }
 
+// normalizePluginVersion strips a leading "v" from a plugin version string so
+// the host's internal convention (log template "(v%s)", manifest persistence,
+// WebUI display) always sees a plain version like "1.0.0" — the SDK/`metadata`
+// may hand back "v1.0.0" and un-stripped would render "vv1.0.0". Empty input
+// stays empty.
+func normalizePluginVersion(v string) string {
+	if v == "" {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimSpace(v), "v")
+}
+
 // PluginIDFromMeta derives a stable, predictable plugin id from the packaged
 // metadata: <sanitized name>_<language>（如 astrbot_plugin_xxx_python）。
 // 与来源推导 id（astrbot-plugin-xxx-4.11.2-<commit>，随版本/commit 变化）
@@ -233,6 +245,10 @@ func validateMetadata(meta *PluginMetadata) (*PluginMetadata, error) {
 	if err := validatePluginName(meta.Name); err != nil {
 		return nil, err
 	}
+	// 版本号统一剥离前导 v（metadata 里可能是 v1.0.0 或 1.0.0）：宿主内部
+	// 约定 version 不带 v（日志模板 (v%s)、manifest 持久化、WebUI 展示都
+	// 期望纯数字版本号，避免显示 vv1.0.0）。
+	meta.Version = normalizePluginVersion(meta.Version)
 	if meta.Cgo == nil {
 		// 显式补齐：避免嵌套表示二义。为空则默认否。
 		no := false

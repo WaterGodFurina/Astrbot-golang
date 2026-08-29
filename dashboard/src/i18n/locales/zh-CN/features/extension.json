@@ -140,10 +140,6 @@
       "authorWebsite": "作者网站",
       "repository": "仓库",
       "pluginLanguage": "插件语言"
-    },
-    "sleep": {
-      "globalLabel": "全局闲置自动休眠",
-      "pluginLabel": "允许本插件闲置自动休眠"
     }
   },
   "market": {

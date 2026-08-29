@@ -323,3 +323,100 @@ func (s *Server) RetrieveKBContext(umo, query string) (string, error) {
 	}
 	return sb.String(), nil
 }
+
+// RetrieveKBByNames runs a vector retrieval across the given knowledge bases
+// (names or IDs; empty = all KBs, aligned with Python kb_mgr.retrieve 的
+// "kb_names 空 = 全部启用 KB" 语义) and returns the concatenated context text
+// plus per-hit result maps (字段对齐 Python 本体 results dict：chunk_id/
+// doc_id/kb_id/kb_name/doc_name/chunk_index/content/score/char_count)。
+// topMFinal <=0 用默认 5；topKFusion 保留入参（当前向量后端为单路召回，
+// 融合条数与最终条数一致）。Exported for the plugin HostService KBRetrieve
+// hook（经 lifecycle 闭包注入 plugin.HostServiceExtras.KBRetriever）。
+func (s *Server) RetrieveKBByNames(query string, kbNames []string, topKFusion, topMFinal int) (string, []map[string]any, error) {
+	if s.database == nil {
+		return "", nil, fmt.Errorf("数据库不可用")
+	}
+	rows, err := s.database.ListKBs()
+	if err != nil {
+		return "", nil, err
+	}
+	lookup := map[string]db.KBRow{}
+	for _, row := range rows {
+		lookup[row.KBID] = row
+		if row.KBName != "" {
+			lookup[row.KBName] = row
+		}
+	}
+	var resolved []string
+	if len(kbNames) == 0 {
+		for _, row := range rows {
+			resolved = append(resolved, row.KBID)
+		}
+	} else {
+		for _, ref := range kbNames {
+			if row, ok := lookup[ref]; ok {
+				resolved = append(resolved, row.KBID)
+			} else {
+				logger.I18nWarn("知识库 %q 不存在，已跳过", ref)
+			}
+		}
+	}
+	if len(resolved) == 0 {
+		return "", []map[string]any{}, nil
+	}
+	topK := topMFinal
+	if topK <= 0 {
+		topK = 5
+	}
+
+	var sb strings.Builder
+	results := []map[string]any{}
+	idx := 0
+	for _, kbID := range resolved {
+		hits, err := s.kbRetrieve(kbID, query, topK)
+		if err != nil {
+			logger.I18nWarn("知识库 %s 检索失败: %v", kbID, err)
+			continue
+		}
+		if len(hits) == 0 {
+			continue
+		}
+		kbName := lookup[kbID].KBName
+		// 按 docID 聚合后一次性查 SQLite 分块表，回填 chunk_index
+		//（向量索引元数据未随 SearchResult 返回，SQLite 是 chunk 元数据
+		// source of truth）。
+		byDoc := map[string][]knowledgebase.SearchResult{}
+		var docOrder []string
+		for _, hit := range hits {
+			if _, seen := byDoc[hit.DocID]; !seen {
+				docOrder = append(docOrder, hit.DocID)
+			}
+			byDoc[hit.DocID] = append(byDoc[hit.DocID], hit)
+		}
+		chunkIdx := map[string]int{}
+		for _, docID := range docOrder {
+			if chunks, err := s.database.ListKBChunks(kbID, docID); err == nil {
+				for _, c := range chunks {
+					chunkIdx[c.ChunkID] = c.ChunkIdx
+				}
+			}
+		}
+		for _, hit := range hits {
+			idx++
+			sb.WriteString(fmt.Sprintf("【知识 %d】\n%s\n", idx, hit.Content))
+			content := hit.Content
+			results = append(results, map[string]any{
+				"chunk_id":    hit.ChunkID,
+				"doc_id":      hit.DocID,
+				"kb_id":       kbID,
+				"kb_name":     kbName,
+				"doc_name":    hit.DocName,
+				"chunk_index": chunkIdx[hit.ChunkID],
+				"content":     content,
+				"score":       float64(hit.Score),
+				"char_count":  len([]rune(content)),
+			})
+		}
+	}
+	return sb.String(), results, nil
+}

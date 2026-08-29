@@ -1025,6 +1025,65 @@ func (d *Database) TotalMessageCount() int {
 	return n
 }
 
+// UpdatePlatformMessageHistory updates a platform message history record's
+// content and/or llm_checkpoint_id by ID (returns whether a row was updated).
+func (d *Database) UpdatePlatformMessageHistory(id int64, content *string, llmCheckpointID *string) (bool, error) {
+	updated := false
+	err := d.withRetry(func() error {
+		if content != nil {
+			if llmCheckpointID != nil {
+				res, e := d.db.Exec(
+					`UPDATE platform_message_history SET content=?, llm_checkpoint_id=? WHERE id=?`,
+					*content, *llmCheckpointID, id,
+				)
+				updated = e == nil && changedRowCount(res)
+				return e
+			}
+			res, e := d.db.Exec(
+				`UPDATE platform_message_history SET content=? WHERE id=?`,
+				*content, id,
+			)
+			updated = e == nil && changedRowCount(res)
+			return e
+		}
+		if llmCheckpointID != nil {
+			res, e := d.db.Exec(
+				`UPDATE platform_message_history SET llm_checkpoint_id=? WHERE id=?`,
+				*llmCheckpointID, id,
+			)
+			updated = e == nil && changedRowCount(res)
+			return e
+		}
+		return nil
+	})
+	return updated, err
+}
+
+// DeletePlatformMessageHistoryByID deletes one platform message history record
+// by ID (returns whether a row was deleted).
+func (d *Database) DeletePlatformMessageHistoryByID(id int64) (bool, error) {
+	deleted := false
+	err := d.withRetry(func() error {
+		res, e := d.db.Exec(`DELETE FROM platform_message_history WHERE id=?`, id)
+		deleted = e == nil && changedRowCount(res)
+		return e
+	})
+	return deleted, err
+}
+
+// changedRowCount reports whether a sql.Result affected at least one row.
+func changedRowCount(res any) bool {
+	type rowsAffected interface {
+		RowsAffected() (int64, error)
+	}
+	if ra, ok := res.(rowsAffected); ok {
+		if n, err := ra.RowsAffected(); err == nil {
+			return n > 0
+		}
+	}
+	return true
+}
+
 // RecordProviderCall inserts a provider call record for statistics.
 // 高频写点：经 withRetry 处理 SQLITE_BUSY。
 func (d *Database) RecordProviderCall(umo, providerID, model string, inputOther, inputCached, output int, start, end float64) error {

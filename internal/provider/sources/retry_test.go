@@ -192,7 +192,7 @@ func TestDoWithRetryRetries429(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := RetryConfig{MaxAttempts: 5, MinDelay: 10 * time.Millisecond, MaxDelay: 50 * time.Millisecond, Retry429: true}
+	cfg := RetryConfig{MaxAttempts: 5, MinDelay: 10 * time.Millisecond, MaxDelay: 50 * time.Millisecond, Retry429: true, Retry429Max: 3}
 	start := time.Now()
 	resp, err := DoWithRetry(context.Background(), server.Client(), func() (*http.Request, error) {
 		return http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
@@ -350,7 +350,7 @@ func TestDoWithRetryRetryAfterHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	cfg := RetryConfig{MaxAttempts: 3, MinDelay: 10 * time.Millisecond, MaxDelay: 50 * time.Millisecond}
+	cfg := RetryConfig{MaxAttempts: 3, MinDelay: 10 * time.Millisecond, MaxDelay: 50 * time.Millisecond, Retry429Max: 1}
 	start := time.Now()
 	resp, err := DoWithRetry(context.Background(), server.Client(), func() (*http.Request, error) {
 		return http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)

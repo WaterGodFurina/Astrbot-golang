@@ -843,7 +843,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		inst.Name = meta.Name
 	}
 	if meta.Version != "" {
-		inst.Version = meta.Version
+		inst.Version = normalizePluginVersion(meta.Version)
 	}
 	inst.DisplayName = meta.DisplayName
 	inst.ShortDesc = meta.ShortDesc
@@ -927,7 +927,7 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 		inst.Name = meta.Name
 	}
 	if meta.Version != "" {
-		inst.Version = meta.Version
+		inst.Version = normalizePluginVersion(meta.Version)
 	}
 	inst.DisplayName = meta.DisplayName
 	inst.ShortDesc = meta.ShortDesc
@@ -1942,7 +1942,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 	inst := &PluginInstance{
 		ID:            id,
 		Name:          meta.Name,
-		Version:       meta.Version,
+		Version:       normalizePluginVersion(meta.Version),
 		Binary:        abs,
 		Language:      language,
 		Client:        pc,

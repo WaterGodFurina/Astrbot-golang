@@ -16,6 +16,8 @@ type ProviderSettings struct {
 	DefaultPersonality           string  `mapstructure:"default_personality"`
 	Persona                      string  `mapstructure:"persona"`
 	ComputerUseRuntime           string  `mapstructure:"computer_use_runtime"`
+	ComputerUseRequireAdmin      *bool   `mapstructure:"computer_use_require_admin"`
+	ComputerUseMaxSameToolCalls  *int    `mapstructure:"computer_use_max_same_tool_calls"`
 	StreamingResponse            bool    `mapstructure:"streaming_response"`
 	WakePrefix                   string  `mapstructure:"wake_prefix"`
 	Identifier                   bool    `mapstructure:"identifier"`

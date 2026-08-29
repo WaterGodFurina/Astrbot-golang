@@ -80,10 +80,13 @@ type Server struct {
 	backupTaskMu sync.Mutex
 	backupTasks  map[string]*backupTaskState
 	// uploadMu/uploadSessions 跟踪备份分片上传会话。
-	uploadMu           sync.Mutex
-	uploadSessions     map[string]*uploadSession
-	starMgr            interface{} // *star.Manager
-	database           *db.Database
+	uploadMu       sync.Mutex
+	uploadSessions map[string]*uploadSession
+	starMgr        interface{} // *star.Manager
+	database       *db.Database
+	// fileTokens 是宿主文件令牌注册表（plugin.RegisterFileToken 反调用写入，
+	// GET /api/file/{token} 公开路由消费），由 lifecycle 经 managers 注入。
+	fileTokens         *plugin.FileTokenRegistry
 	startTime          time.Time
 	onPlatformsChanged func()
 	onPluginsChanged   func()
@@ -436,6 +439,11 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		if v, ok := managers["database"]; ok {
 			if dbm, ok := v.(*db.Database); ok {
 				s.database = dbm
+			}
+		}
+		if v, ok := managers["file_tokens"]; ok {
+			if reg, ok := v.(*plugin.FileTokenRegistry); ok {
+				s.fileTokens = reg
 			}
 		}
 	}

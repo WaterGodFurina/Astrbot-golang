@@ -140,10 +140,6 @@
       "authorWebsite": "Author Website",
       "repository": "Repository",
       "pluginLanguage": "Plugin Language"
-    },
-    "sleep": {
-      "globalLabel": "Global idle auto-sleep",
-      "pluginLabel": "Allow this plugin to idle-sleep"
     }
   },
   "market": {

@@ -55,6 +55,26 @@
         },
         "image_caption_prompt": {
           "description": "图片转述提示词"
+        },
+        "request_retry_429_enabled": {
+          "description": "限流429重试总开关",
+          "hint": "是否开启 429（Too Many Requests）限流重试。默认开启；关闭后遇到 429 不再重试。"
+        },
+        "request_retry_429_max": {
+          "description": "限流429的模型调用重试次数",
+          "hint": "遇 429 时最多重试次数。默认为 5，不可为 0（后端检测到 0 会自动改为 1）。"
+        },
+        "request_retry_429_strategy": {
+          "description": "429限流的重试方式",
+          "hint": "选择 429 重试的等待方式：指数重试按指数退避等待；单次时间重试每次固定等待相同秒数。",
+          "labels": [
+            "指数重试",
+            "单次时间重试"
+          ]
+        },
+        "request_retry_429_fixed_seconds": {
+          "description": "单次时间重试的秒数",
+          "hint": "选择“单次时间重试”时，每次重试前固定等待的秒数。默认 10 秒。"
         }
       },
       "provider_stt_settings": {
@@ -175,6 +195,10 @@
         "computer_use_require_admin": {
           "description": "需要 AstrBot 管理员权限",
           "hint": "开启后，需要 AstrBot 管理员权限才能调用使用电脑能力。在平台配置->管理员中可添加管理员。使用 /sid 指令查看管理员 ID。"
+        },
+        "computer_use_max_same_tool_calls": {
+          "description": "单次Agent能重复处理的工具次数",
+          "hint": "为防止Bot出现单个工具指令调用的循环问题，可以在这里设置相同工具调用最大调用次数，为0则表示禁用。"
         },
         "sandbox": {
           "booter": {

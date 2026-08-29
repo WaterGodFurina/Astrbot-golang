@@ -3259,10 +3259,12 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 }
 
 // writeKBList writes the paginated KB list in the WebUI's expected shape
-// {items, page, page_size, total}.
+// {items, page, page_size, total}. Supports ?search= to filter by KB name
+// (case-insensitive substring).
 func (s *Server) writeKBList(w http.ResponseWriter, r *http.Request) {
 	page := 1
 	pageSize := 20
+	search := strings.TrimSpace(r.URL.Query().Get("search"))
 	if v := r.URL.Query().Get("page"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			page = n
@@ -3282,6 +3284,24 @@ func (s *Server) writeKBList(w http.ResponseWriter, r *http.Request) {
 				all = append(all, s.kbRowToMap(&rows[i]))
 			}
 		}
+	}
+	// search 过滤：按 kb_name / description 做不区分大小写的子串匹配。
+	if search != "" {
+		sl := strings.ToLower(search)
+		filtered := all[:0]
+		for _, item := range all {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["kb_name"].(string)
+			desc, _ := m["description"].(string)
+			if strings.Contains(strings.ToLower(name), sl) ||
+				strings.Contains(strings.ToLower(desc), sl) {
+				filtered = append(filtered, item)
+			}
+		}
+		all = filtered
 	}
 	total := len(all)
 	start := (page - 1) * pageSize

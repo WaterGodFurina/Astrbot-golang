@@ -140,10 +140,6 @@
       "authorWebsite": "Сайт автора",
       "repository": "Репозиторий",
       "pluginLanguage": "Язык плагина"
-    },
-    "sleep": {
-      "globalLabel": "Глобальный авто-сон при простое",
-      "pluginLabel": "Разрешить этому плагину засыпать при простое"
     }
   },
   "market": {

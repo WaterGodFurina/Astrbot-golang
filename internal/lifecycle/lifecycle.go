@@ -290,6 +290,11 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.backupExporter = backup.NewExporter("data")
 	logger.I18nInfo("备份导出器已初始化")
 
+	// 9.6b. 文件令牌注册表：RegisterFileToken 反调用登记宿主侧文件，同一
+	// 实例注入 HostService 与 dashboard（GET /api/file/{token} 公开路由），
+	// 保证发放与消费共享同一张令牌表。默认 TTL（30min）在注册表内定义。
+	fileTokens := plugin.NewFileTokenRegistry(0)
+
 	// 9.6. Subprocess plugin runtime (go-plugin child processes). Loads
 	// installed plugins from the manifest, bridges their handlers into the
 	// star pipeline, and re-bridges after a crash-restart swaps an instance.
@@ -349,7 +354,32 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			}
 			return out
 		},
-	}, l.configMgr)
+	}, l.configMgr, plugin.HostServiceExtras{
+		SkillMgr: l.skillMgr,
+		Database: l.database,
+		// 知识库：KBMgr 支持 KBUploadFromURL/KBListKBs；KBRetriever 闭包
+		// 延迟解析 dashboard（12 步才创建）的真实向量检索后端，供
+		// KBRetrieve 反调用（与管线 KBRetriever 同款接线模式）。
+		KBMgr: l.kbMgr,
+		KBRetriever: func(query string, kbNames []string, topKFusion, topMFinal int) (string, []map[string]any, error) {
+			if l.dashboard == nil {
+				return "", nil, fmt.Errorf("dashboard KB backend not ready")
+			}
+			return l.dashboard.RetrieveKBByNames(query, kbNames, topKFusion, topMFinal)
+		},
+		// 定时任务 / MCP 桥 / 文件令牌：分别支持 Cron* / Mcp* /
+		// RegisterFileToken 反调用（fileTokens 同一实例经 managers map 注入
+		// dashboard 的公开文件路由 GET /api/file/{token}）。
+		CronMgr:    l.cronMgr,
+		McpBridge:  plugin.NewMCPClientPool("data"),
+		FileTokens: fileTokens,
+	})
+	// 插件 basic 定时任务（job_type="cron"）到点触发 handler：按 payload
+	// 的 _plugin_id 定位插件子进程实例，经 PluginService.FeedCronJob RPC
+	// 回推触发（宿主→插件方向；对齐 session_wait 的推送模式）。须在
+	// SetHostService 之后调用（身份注入发生在 CronCreate hook），且与
+	// active_agent handler（RegisterHandler 按 job_type 隔离）互不影响。
+	plugin.RegisterCronFeedHandler(l.cronMgr, l.subPluginMgr)
 	// 能力接线：先注入固定能力集（平台尚未加载，All() 为空），插件进程
 	// 启动时即带 ASTRBOT_HOST_CAPABILITIES 环境变量；loadPlatforms 完成后
 	// 再同步一次（含平台 ID），供后续懒加载/重载的插件使用。
@@ -379,6 +409,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		"knowledgebase":     l.kbMgr,
 		"skills":            l.skillMgr,
 		"database":          l.database,
+		"file_tokens":       fileTokens,
 	}
 	dashboardPort := 6185
 	if dm, ok := cfg.Get("dashboard").(map[string]interface{}); ok {

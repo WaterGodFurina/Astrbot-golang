@@ -16,10 +16,16 @@ import (
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // ComponentsFromSDK converts SDK components (received from a plugin over RPC)
@@ -415,6 +421,37 @@ type ChatLLMCmd struct {
 	ProviderID   string
 }
 
+// HostServiceExtras carries optional host-side managers layered onto the
+// plugin HostService hooks after the base set (platform/plugin/conversation/
+// provider/persona). They back the skills + platform-message-history RPCs the
+// SDK now exposes (ListSkills / SetSkillActive / DeleteSkill /
+// GetPlatformMessageHistory / Insert/Update/DeletePlatformMessageHistory),
+// plus the knowledge-base / cron / MCP-bridge / file-token capabilities
+// (KBRetrieve/KBUploadFromURL/KBListKBs / Cron* / Mcp* / RegisterFileToken /
+// ListSkillsV2).
+type HostServiceExtras struct {
+	// SkillMgr backs ListSkills/ListSkillsV2/SetSkillActive/DeleteSkill when non-nil.
+	SkillMgr *skills.SkillManager
+	// Database backs the platform-message-history RPCs when non-nil.
+	Database *db.Database
+	// KBMgr backs KBUploadFromURL/KBListKBs（以及 KBRetrieve 无后端时的名称
+	// 解析回退）when non-nil.
+	KBMgr *knowledgebase.Manager
+	// KBRetriever backs KBRetrieve with the real vector retrieval backend
+	//（dashboard kbRetrieve 接线；由 lifecycle 以闭包注入）。nil 时回退
+	// KBMgr.Retrieve（未接线时返回明确错误）。
+	KBRetriever func(query string, kbNames []string, topKFusion, topMFinal int) (contextText string, results []map[string]any, err error)
+	// CronMgr backs the Cron* RPCs when non-nil.
+	CronMgr *cron.CronJobManager
+	// McpBridge backs McpListTools/McpCallTool when non-nil.
+	McpBridge MCPBridge
+	// FileTokens backs RegisterFileToken when non-nil.
+	FileTokens *FileTokenRegistry
+}
+
+// hostExtras is the active set of optional extras passed to SetHostService.
+var hostExtras HostServiceExtras
+
 // SetHostService installs the HostService hooks (reverse plugin -> host RPCs)
 // backed by the platform manager, the subprocess plugin manager (for config
 // reads/writes), a ChatLLM callback (for plugins calling the LLM directly),
@@ -422,7 +459,10 @@ type ChatLLMCmd struct {
 // over star.Registry().All() via StarManagerLike，规避 star→plugin 导入环).
 // Call once at startup, after all managers exist and before plugins begin
 // handling messages.
-func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(cmd ChatLLMCmd) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager) {
+func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(cmd ChatLLMCmd) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager, extra ...HostServiceExtras) {
+	if len(extra) > 0 {
+		hostExtras = extra[0]
+	}
 	if subMgr != nil && subMgr.dataDir != "" {
 		personaDataPath = filepath.Join(subMgr.dataDir, "personas.json")
 		// 大文件 Blob 存储根目录 data/blobs（P0-2）。启动即初始化，TTL 10min。
@@ -1132,6 +1172,383 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			subMgr.UnregisterSessionWait(waitID)
 		},
+
+		// ── 技能（Skills）──
+		ListSkills: func() []map[string]any {
+			if hostExtras.SkillMgr == nil {
+				return nil
+			}
+			return hostExtras.SkillMgr.ListSkillsInfo()
+		},
+		SetSkillActive: func(name string, active bool) error {
+			if hostExtras.SkillMgr == nil {
+				return nil
+			}
+			return hostExtras.SkillMgr.SetSkillActive(name, active)
+		},
+		DeleteSkill: func(name string) error {
+			if hostExtras.SkillMgr == nil {
+				return nil
+			}
+			return hostExtras.SkillMgr.DeleteSkill(name)
+		},
+		ListSkillsV2: func(activeOnly bool, runtime string, showSandboxPath bool) []map[string]any {
+			if hostExtras.SkillMgr == nil {
+				return nil
+			}
+			// showSandboxPath=true 时 path 返回 sandbox 路径：runtime 为空
+			// 视图不具备混合路径语义，映射为 sandbox 视图（含本地+沙盒缓存
+			// 技能，path 一律为 sandbox 路径）；显式 runtime 优先。
+			if showSandboxPath && runtime == "" {
+				runtime = "sandbox"
+			}
+			items := hostExtras.SkillMgr.ListSkills(activeOnly, runtime)
+			out := make([]map[string]any, 0, len(items))
+			for _, s := range items {
+				out = append(out, map[string]any{
+					"name":           s.Name,
+					"description":    s.Description,
+					"path":           s.Path,
+					"active":         s.Active,
+					"source_type":    s.SourceType,
+					"source_label":   s.SourceLabel,
+					"local_exists":   s.LocalExists,
+					"sandbox_exists": s.SandboxExists,
+					"plugin_name":    s.PluginName,
+					"readonly":       s.Readonly,
+					"preset":         s.Preset,
+				})
+			}
+			return out
+		},
+
+		// ── 知识库（KnowledgeBase）──
+		KBRetrieve: func(query string, kbNames []string, topKFusion, topMFinal int) (string, string, error) {
+			// 真实检索后端（dashboard kbRetrieve：嵌入查询 + nanovec 向量
+			// 检索）由 lifecycle 经 KBRetriever 闭包注入；未接线时回退
+			// KBMgr.Retrieve（当前为显式报错的占位实现，不会静默返回空）。
+			if fn := hostExtras.KBRetriever; fn != nil {
+				contextText, results, err := fn(query, kbNames, topKFusion, topMFinal)
+				if err != nil {
+					return "", "", err
+				}
+				if results == nil {
+					results = []map[string]any{}
+				}
+				out, err := json.Marshal(results)
+				if err != nil {
+					return "", "", fmt.Errorf("KBRetrieve results 序列化失败: %w", err)
+				}
+				return contextText, string(out), nil
+			}
+			if hostExtras.KBMgr == nil {
+				return "", "", fmt.Errorf("knowledge base manager not available")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			res, err := hostExtras.KBMgr.Retrieve(ctx, query, kbNames, topKFusion, topMFinal)
+			if err != nil {
+				return "", "", err
+			}
+			if res == nil {
+				return "", "[]", nil
+			}
+			out, err := json.Marshal([]map[string]any{knowledgebaseResultToMap(res, res.KBID, res.KBName)})
+			if err != nil {
+				return "", "", fmt.Errorf("KBRetrieve results 序列化失败: %w", err)
+			}
+			return res.Content, string(out), nil
+		},
+		KBUploadFromURL: func(kbNameOrID, url string, chunkSize, chunkOverlap int) error {
+			if hostExtras.KBMgr == nil {
+				return fmt.Errorf("knowledge base manager not available")
+			}
+			return hostExtras.KBMgr.UploadFromURL(kbNameOrID, url, chunkSize, chunkOverlap)
+		},
+		KBListKBs: func() []map[string]any {
+			if hostExtras.KBMgr == nil {
+				return nil
+			}
+			kbs := hostExtras.KBMgr.ListKBs()
+			out := make([]map[string]any, 0, len(kbs))
+			for _, kb := range kbs {
+				out = append(out, serializeKnowledgeBase(kb))
+			}
+			return out
+		},
+
+		// ── 文件令牌（file_token 公开文件服务）──
+		RegisterFileToken: func(path string, timeoutSec int32) (string, error) {
+			reg := hostExtras.FileTokens
+			if reg == nil {
+				return "", fmt.Errorf("file token registry not available")
+			}
+			ttl := time.Duration(timeoutSec) * time.Second
+			return reg.Register(path, ttl)
+		},
+
+		// ── 插件定时任务（internal/cron）──
+		CronCreate: func(spec *pluginsdk.CronCreateSpec) (map[string]any, error) {
+			m := hostExtras.CronMgr
+			if m == nil {
+				return nil, fmt.Errorf("cron manager not available")
+			}
+			if spec == nil {
+				return nil, fmt.Errorf("cron job spec is empty")
+			}
+			var runAt time.Time
+			if spec.RunAt != "" {
+				t, err := time.Parse(time.RFC3339, spec.RunAt)
+				if err != nil {
+					// 宽容解析（ISO datetime/自然语言由 ParseRunAt 承担，
+					// 对齐 cron.Load 恢复 run_at 的语义）。
+					t, err = cron.ParseRunAt(spec.RunAt)
+				}
+				if err != nil {
+					return nil, fmt.Errorf("run_at 解析失败: %w", err)
+				}
+				runAt = t
+			}
+			if spec.JobType == "active_agent" {
+				// active_agent 专用构造：校验 cron 表达式/run_at 并生成 ID。
+				job, err := m.AddActiveJob(spec.Name, spec.CronExpression, spec.Payload, spec.Description, spec.Timezone, spec.RunOnce, runAt)
+				if err != nil {
+					return nil, err
+				}
+				if !spec.Enabled {
+					m.SetEnabled(job.ID, false)
+				}
+				return cron.SerializeJob(m.Get(job.ID)), nil
+			}
+			// basic 任务：构造 Job + Add（持久化由 Add→persist 自动完成；
+			// run_once 的 run_at 由 persist 写入 payload["run_at"]，重启可恢复）。
+			payload := spec.Payload
+			if payload == nil {
+				payload = map[string]any{}
+			}
+			// 注入插件路由键：宿主 cron 到点触发时按 _plugin_id 定位插件
+			// 子进程实例，经 PluginService.FeedCronJob 回推触发。身份取
+			// SDK 侧注入的连接身份（注册名，对齐 RegisterSessionWait 的
+			// pluginName 注入模式），仅 basic 分支需要路由。
+			if spec.PluginName != "" {
+				payload["_plugin_id"] = spec.PluginName
+			}
+			// 幂等去重：同 (job_type, name, _plugin_id) 已存在时复用原任务
+			//（UpdateJob 原地更新），避免插件子进程每次重启/唤醒都重复注册
+			//（Add 恒生成新 ID，旧任务残留会造成重复触发）。
+			dedupID := ""
+			if spec.Name != "" {
+				for _, j := range m.List() {
+					if j.JobType != spec.JobType || j.Name != spec.Name {
+						continue
+					}
+					if oldPID, _ := j.Payload["_plugin_id"].(string); oldPID == spec.PluginName {
+						dedupID = j.ID
+						break
+					}
+				}
+			}
+			if dedupID != "" {
+				ok := m.UpdateJob(dedupID, func(j *cron.Job) {
+					j.Description = spec.Description
+					j.CronExpression = spec.CronExpression
+					j.Timezone = spec.Timezone
+					j.RunOnce = spec.RunOnce
+					j.RunAt = runAt
+					j.Payload = payload
+				})
+				if ok {
+					if spec.Enabled {
+						m.SetEnabled(dedupID, true)
+					} else {
+						m.SetEnabled(dedupID, false)
+					}
+					return cron.SerializeJob(m.Get(dedupID)), nil
+				}
+				// 极端竞态（列表后任务被删）：落到下方正常新建路径。
+			}
+			job := &cron.Job{
+				ID:             fmt.Sprintf("job_%d", time.Now().UnixNano()),
+				Name:           spec.Name,
+				Description:    spec.Description,
+				JobType:        spec.JobType,
+				CronExpression: spec.CronExpression,
+				Timezone:       spec.Timezone,
+				RunOnce:        spec.RunOnce,
+				RunAt:          runAt,
+				Payload:        payload,
+			}
+			m.Add(job)
+			// Add 固定置 Enabled=true，显式禁用需补一次 SetEnabled。
+			if !spec.Enabled {
+				m.SetEnabled(job.ID, false)
+			}
+			return cron.SerializeJob(m.Get(job.ID)), nil
+		},
+		CronUpdate: func(jobID string, fields map[string]any) (map[string]any, error) {
+			m := hostExtras.CronMgr
+			if m == nil {
+				return nil, fmt.Errorf("cron manager not available")
+			}
+			// UpdateJob 的 mutate 在管理器锁内执行（含重算 NextRun 与持久化）；
+			// fields 仅出现的键才会更新（部分更新语义，对齐 fields_json 约定）。
+			ok := m.UpdateJob(jobID, func(j *cron.Job) {
+				if v, ok := fields["name"].(string); ok {
+					j.Name = v
+				}
+				if v, ok := fields["cron_expression"].(string); ok {
+					j.CronExpression = v
+				}
+				if v, ok := fields["timezone"].(string); ok {
+					j.Timezone = v
+				}
+				if v, ok := fields["description"].(string); ok {
+					j.Description = v
+				}
+			if v, ok := fields["payload"].(map[string]any); ok {
+				// _plugin_id 是宿主簿记的路由键（CronCreate 注入）：插件更新
+				// payload 未携带时继承旧值，否则后续 FeedCronJob 无法路由。
+				if _, has := v["_plugin_id"]; !has {
+					if old, hasOld := j.Payload["_plugin_id"]; hasOld {
+						v["_plugin_id"] = old
+					}
+				}
+				j.Payload = v
+			}
+				if v, ok := fields["enabled"].(bool); ok {
+					j.Enabled = v
+				}
+			})
+			if !ok {
+				return nil, fmt.Errorf("job not found: %s", jobID)
+			}
+			return cron.SerializeJob(m.Get(jobID)), nil
+		},
+		CronDelete: func(jobID string) error {
+			m := hostExtras.CronMgr
+			if m == nil {
+				return fmt.Errorf("cron manager not available")
+			}
+			m.Remove(jobID)
+			return nil
+		},
+		CronList: func(jobType string) []map[string]any {
+			m := hostExtras.CronMgr
+			if m == nil {
+				return nil
+			}
+			var out []map[string]any
+			for _, info := range m.ListInfo() {
+				if jobType != "" {
+					if t, _ := info["job_type"].(string); t != jobType {
+						continue
+					}
+				}
+				out = append(out, info)
+			}
+			return out
+		},
+		CronRunNow: func(jobID string) error {
+			m := hostExtras.CronMgr
+			if m == nil {
+				return fmt.Errorf("cron manager not available")
+			}
+			return m.RunNow(jobID)
+		},
+
+		// ── 宿主 MCP 读写桥接 ──
+		McpListTools: func() []map[string]any {
+			if hostExtras.McpBridge == nil {
+				return nil
+			}
+			return hostExtras.McpBridge.ListTools()
+		},
+		McpCallTool: func(server, toolName string, args map[string]any) (map[string]any, string, bool, error) {
+			if hostExtras.McpBridge == nil {
+				return nil, "", false, fmt.Errorf("MCP bridge not available")
+			}
+			return hostExtras.McpBridge.CallTool(context.Background(), server, toolName, args)
+		},
+
+		// ── 平台消息历史 ──
+		GetPlatformMessageHistory: func(platformID, userID string, limit int32) []map[string]any {
+			if hostExtras.Database == nil {
+				return nil
+			}
+			if limit <= 0 {
+				limit = 200
+			}
+			rows, err := hostExtras.Database.GetPlatformMessageHistory(platformID, userID, int(limit))
+			if err != nil {
+				return nil
+			}
+			out := make([]map[string]any, 0, len(rows))
+			for _, r := range rows {
+				out = append(out, map[string]any{
+					"id":          r.ID,
+					"platform_id": platformID,
+					"user_id":     userID,
+					"sender_id":   r.SenderID,
+					"content":     decodePMHistoryContent(r.Content),
+					"created_at":  r.CreatedAt,
+				})
+			}
+			return out
+		},
+		InsertPlatformMessageHistory: func(platformID, userID, senderID string, content any, llmCheckpointID string, maxMessages int32) map[string]any {
+			if hostExtras.Database == nil {
+				return map[string]any{}
+			}
+			contentJSON := encodePMHistoryContent(content)
+			if err := hostExtras.Database.RecordPlatformMessage(platformID, userID, senderID, contentJSON); err != nil {
+				return map[string]any{}
+			}
+			if maxMessages > 0 {
+				_ = hostExtras.Database.TrimPlatformMessageHistory(platformID, userID, int(maxMessages))
+			}
+			if rows, err := hostExtras.Database.GetPlatformMessageHistory(platformID, userID, 1); err == nil && len(rows) > 0 {
+				return map[string]any{
+					"id":                rows[0].ID,
+					"platform_id":       platformID,
+					"user_id":           userID,
+					"sender_id":         rows[0].SenderID,
+					"content":           decodePMHistoryContent(rows[0].Content),
+					"llm_checkpoint_id": llmCheckpointID,
+					"created_at":        rows[0].CreatedAt,
+				}
+			}
+			return map[string]any{
+				"platform_id":       platformID,
+				"user_id":           userID,
+				"sender_id":         senderID,
+				"content":           content,
+				"llm_checkpoint_id": llmCheckpointID,
+			}
+		},
+		UpdatePlatformMessageHistory: func(id int64, content any, llmCheckpointID string) error {
+			if hostExtras.Database == nil {
+				return nil
+			}
+			var contentPtr *string
+			if content != nil {
+				encoded := encodePMHistoryContent(content)
+				contentPtr = &encoded
+			}
+			var ckPtr *string
+			if llmCheckpointID != "" {
+				ck := llmCheckpointID
+				ckPtr = &ck
+			}
+			_, err := hostExtras.Database.UpdatePlatformMessageHistory(id, contentPtr, ckPtr)
+			return err
+		},
+		DeletePlatformMessageHistory: func(id int64) error {
+			if hostExtras.Database == nil {
+				return nil
+			}
+			_, err := hostExtras.Database.DeletePlatformMessageHistoryByID(id)
+			return err
+		},
 	})
 }
 
@@ -1166,4 +1583,132 @@ func applyProviderCredentials(entry map[string]any, p provider.AbstractProvider)
 	if ek, ok := cfg["embedding_api_key"].(string); ok && ek != "" {
 		entry["key"] = ek
 	}
+}
+
+// decodePMHistoryContent 把 db 存储的 content 串转回任意值：优先 JSON，
+// 失败时原样字符串（历史留档可能是非 JSON 的纯文本）。
+func decodePMHistoryContent(s string) any {
+	var out any
+	if s != "" && json.Unmarshal([]byte(s), &out) == nil {
+		return out
+	}
+	return s
+}
+
+// encodePMHistoryContent 把 content 编码为 db 存储串：可 JSON 化值转 JSON，
+// 字符串原样保留（与 RecordPlatformMessage 的 content 语义一致）。
+func encodePMHistoryContent(content any) string {
+	if content == nil {
+		return ""
+	}
+	if s, ok := content.(string); ok {
+		return s
+	}
+	b, err := json.Marshal(content)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// serializeKnowledgeBase 把 knowledgebase.KnowledgeBase 序列化为 Python
+// 本体 KnowledgeBase 的 snake_case JSON map（供 KBListKBs 通道）。
+func serializeKnowledgeBase(kb *knowledgebase.KnowledgeBase) map[string]any {
+	if kb == nil {
+		return nil
+	}
+	return map[string]any{
+		"kb_id":                 kb.KBID,
+		"kb_name":               kb.KBName,
+		"description":           kb.Description,
+		"emoji":                 kb.Emoji,
+		"embedding_provider_id": kb.EmbeddingProviderID,
+		"rerank_provider_id":    kb.RerankProviderID,
+		"chunk_size":            kb.ChunkSize,
+		"chunk_overlap":         kb.ChunkOverlap,
+		"top_k_dense":           kb.TopKDense,
+		"top_k_sparse":          kb.TopKSparse,
+		"top_m_final":           kb.TopMFinal,
+		"created_at":            kb.CreatedAt.Format(time.RFC3339),
+		"updated_at":            kb.UpdatedAt.Format(time.RFC3339),
+	}
+}
+
+// knowledgebaseResultToMap 把 Manager.Retrieve 的单条命中序列化为 Python
+// 本体 kb_mgr.retrieve 的 results dict 字段（chunk_id/doc_id/kb_id/kb_name/
+// doc_name/chunk_index/content/score/char_count）。kbName 未知时以 kbID 兜底。
+func knowledgebaseResultToMap(res *knowledgebase.RetrievalResult, kbID, kbName string) map[string]any {
+	if res == nil {
+		return nil
+	}
+	if kbName == "" {
+		kbName = kbID
+	}
+	chunkIdx := 0
+	if res.Metadata != nil {
+		if v, ok := res.Metadata["chunk_index"].(int); ok {
+			chunkIdx = v
+		}
+	}
+	return map[string]any{
+		"chunk_id":    res.ChunkID,
+		"doc_id":      res.DocID,
+		"kb_id":       res.KBID,
+		"kb_name":     kbName,
+		"doc_name":    res.DocName,
+		"chunk_index": chunkIdx,
+		"content":     res.Content,
+		"score":       res.Score,
+		"char_count":  len([]rune(res.Content)),
+	}
+}
+
+// pluginCronFeedTimeout bounds the FeedCronJob push so a hung plugin cannot
+// stall the cron tick goroutine indefinitely.
+const pluginCronFeedTimeout = 60 * time.Second
+
+// RegisterCronFeedHandler 注册 job_type="cron" 的宿主 cron 到点触发 handler：
+// 插件 basic 任务（经 HostService.CronCreate 注册、payload 带 _plugin_id）
+// 到点时按 _plugin_id 定位插件子进程实例，经 PluginService.FeedCronJob RPC
+// 推送触发（宿主→插件方向，对齐 session_wait 的 FeedSessionWait 推送模式）。
+// 旧 SDK 插件无该 RPC（UNIMPLEMENTED）静默容忍；RegisterHandler 按 job_type
+// 隔离，active_agent 既有 handler 不受影响。
+func RegisterCronFeedHandler(m *cron.CronJobManager, subMgr *SubprocessManager) {
+	if m == nil {
+		return
+	}
+	m.RegisterHandler("cron", func(ctx context.Context, job *cron.Job) error {
+		pluginID, _ := job.Payload["_plugin_id"].(string)
+		if pluginID == "" {
+			return fmt.Errorf("cron job %s 缺少 _plugin_id，无法路由到插件", job.ID)
+		}
+		if subMgr == nil {
+			return fmt.Errorf("subprocess plugin manager not available")
+		}
+		inst := subMgr.InstanceByName(pluginID)
+		if inst == nil || inst.Client == nil {
+			// 插件未加载（卸载/休眠窗口）：本次触发无法投递。
+			return fmt.Errorf("插件 %s 实例未就绪（cron job %s）", pluginID, job.ID)
+		}
+		payloadJSON, err := json.Marshal(job.Payload)
+		if err != nil {
+			return fmt.Errorf("cron job %s payload 序列化失败: %w", job.ID, err)
+		}
+		rpcCtx, cancel := context.WithTimeout(ctx, pluginCronFeedTimeout)
+		defer cancel()
+		if _, err := inst.Client.FeedCronJob(rpcCtx, &sdkv1.FeedCronJobRequest{
+			JobId:       job.ID,
+			JobName:     job.Name,
+			PayloadJson: payloadJSON,
+			RunAt:       time.Now().Format(time.RFC3339),
+		}); err != nil {
+			// UNIMPLEMENTED：旧 SDK 插件（编译时不带 FeedCronJob RPC），
+			// 静默容忍（对齐 session_wait_stage 的处理）。
+			if status.Code(err) == codes.Unimplemented {
+				return nil
+			}
+			return fmt.Errorf("cron job %s FeedCronJob 失败: %w", job.ID, err)
+		}
+		return nil
+	})
 }
