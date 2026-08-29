@@ -2583,7 +2583,9 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 			if h.Event != "on_llm_request" {
 				continue
 			}
-			// on_llm_request 是被动广播，不计入活动时间。
+			// on_llm_request 是被动广播，不计入活动时间（但计入进行中 RPC，
+			// 防止执行中被闲置清扫回收）。
+			defer inst.RPCGuardPassive()()
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 			sp, up, stop, res, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
 			rpcCancel()
@@ -2704,7 +2706,8 @@ func (s *ProcessStage) executePluginTool(event *core.Event, name string, args ma
 
 // dispatchPluginTool invokes one plugin tool RPC and formats the result.
 func (s *ProcessStage) dispatchPluginTool(inst *plugin.PluginInstance, t *sdkv1.ToolDesc, event *core.Event, name string, args map[string]interface{}, sdkEvent *sdkv1.SDKEvent) (string, bool) {
-	inst.Touch() // 活动标记：参与闲置卸载判定
+	inst.Touch()            // 活动标记：参与闲置卸载判定
+	defer inst.RPCGuard()() // 进行中 RPC 计数：防止执行中的工具被闲置清扫回收
 	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 	text, isErr, res, err := inst.Client.HandleTool(rpcCtx, t.Name, args, sdkEvent)
 	rpcCancel()

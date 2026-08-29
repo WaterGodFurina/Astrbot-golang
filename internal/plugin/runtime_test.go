@@ -903,6 +903,9 @@ func TestIdleUnloadAndLazyReload(t *testing.T) {
 
 	// 启用闲置卸载（阈值极短）并手动触发清扫（不依赖 ticker 定时）。
 	m.SetIdleUnload(10 * time.Millisecond)
+	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
+		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
 	inst.lastActiveNano.Store(time.Now().Add(-time.Minute).UnixNano()) // 模拟闲置
 	m.sweepIdlePlugins()
 	if m.Get(inst.ID) != nil {
@@ -947,9 +950,10 @@ func TestSweepSkipsActivePlugins(t *testing.T) {
 	}
 }
 
-// TestIdleUnloadBlockedKeepsPluginResident: 行为页配置"不允许休眠"的插件
-// 即使闲置也不会被清扫卸载；设置持久化到 manifest，重启后仍生效。
-func TestIdleUnloadBlockedKeepsPluginResident(t *testing.T) {
+// TestIdleUnloadKeepsResidentByDefault: 新装插件默认不允许闲置自动休眠
+// （常驻），即便闲置也不会被清扫卸载；显式允许休眠后才会被清扫。设置持久化
+// 到 manifest，重启后仍生效。
+func TestIdleUnloadKeepsResidentByDefault(t *testing.T) {
 	requirePlugin(t)
 	m := newTestManager(t)
 	m.SetIdleUnload(10 * time.Millisecond)
@@ -958,30 +962,27 @@ func TestIdleUnloadBlockedKeepsPluginResident(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
-	if m.IdleUnloadBlocked(inst.ID) {
-		t.Fatal("fresh install must default to allow-sleep")
-	}
-
-	if err := m.SetIdleUnloadBlocked(inst.ID, true); err != nil {
-		t.Fatalf("SetIdleUnloadBlocked: %v", err)
-	}
-	if !m.IdleUnloadBlocked(inst.ID) {
-		t.Fatal("blocked flag must be readable")
+	if m.PluginIdleUnload(inst.ID) {
+		t.Fatal("fresh install must default to resident (idle-unload off)")
 	}
 
 	inst.lastActiveNano.Store(time.Now().Add(-time.Hour).UnixNano()) // 闲置一小时
 	m.sweepIdlePlugins()
 	if m.Get(inst.ID) == nil {
-		t.Fatal("blocked plugin must survive the idle sweep")
+		t.Fatal("default-resident plugin must survive the idle sweep")
 	}
 
-	// 重新打开允许休眠后，闲置会被清扫。
-	if err := m.SetIdleUnloadBlocked(inst.ID, false); err != nil {
-		t.Fatal(err)
+	// 显式允许休眠后，闲置会被清扫。
+	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
+		t.Fatalf("SetPluginIdleUnload: %v", err)
 	}
+	if !m.PluginIdleUnload(inst.ID) {
+		t.Fatal("allow-sleep flag must be readable")
+	}
+	inst.lastActiveNano.Store(time.Now().Add(-time.Hour).UnixNano())
 	m.sweepIdlePlugins()
 	if m.Get(inst.ID) != nil {
-		t.Fatal("unblocked idle plugin must be swept")
+		t.Fatal("allow-sleep idle plugin must be swept")
 	}
 }
 

@@ -27,6 +27,9 @@ func TestPluginToolWakesIdlePlugin(t *testing.T) {
 		t.Fatalf("InstallFromSource: %v", err)
 	}
 	m.SetIdleUnload(10 * time.Millisecond)
+	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
+		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
 	t.Cleanup(m.Shutdown)
 
 	// Register 元数据工具先入注册表（echo_tool → toolwake）。

@@ -512,12 +512,13 @@ func (l *Lifecycle) syncSandboxBooter() {
 			return sandbox.NewShipyardNeoBooter(ep, token, profile, ttl)
 		})
 		logger.I18nInfo("沙盒启动器已设置（shipyard_neo endpoint=%q profile=%q ttl=%d）", ep, profile, ttl)
-	case "boxlite":
-		// Boxlite = Docker-backed containers.
+	case "boxlite", "cua":
+		// boxlite = Docker-backed 容器；cua = computer-use 容器（镜像取自
+		// sandbox.cua_image.model，等价 astrbot-py CuaBooter 的容器化语义：
+		// 经 docker exec 提供 shell/文件能力）。共用同一 docker/local 后端。
 		l.setDockerOrLocalBooter(sandboxCfg)
 	default:
-		// shipyard (legacy), cua, and unknown types are not implemented in Go;
-		// fall back to a docker/local backend.
+		// shipyard (legacy) 与未知类型未在 Go 实现；回退 docker/local。
 		logger.I18nWarn("沙盒启动器类型 %q 未在 Go 实现；回退到 docker/local", booterType)
 		l.setDockerOrLocalBooter(sandboxCfg)
 	}

@@ -4,6 +4,7 @@ package dashboard
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -2047,11 +2048,14 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		s.pluginSetEnabled(body.PluginID, body.Enabled)
 		writeJSON(w, http.StatusOK, apiOKMsg("插件状态已更新", map[string]interface{}{}))
 	case "idle-unload":
-		// 单插件休眠开关：POST {plugin_id, allow_sleep: bool}。allow_sleep=true
-		// 表示该插件允许闲置自动休眠；false = 常驻（不参与清扫）。
+		// 单插件休眠策略：POST {plugin_id, allow_sleep: bool,
+		// idle_unload_minutes?: int}。allow_sleep=true 表示该插件允许闲置自动
+		// 休眠；false = 常驻（不参与清扫）。idle_unload_minutes 为该插件独立
+		// 闲置阈值（分钟），缺省/0 = 回退全局默认。
 		var body struct {
-			PluginID   string `json:"plugin_id"`
-			AllowSleep bool   `json:"allow_sleep"`
+			PluginID          string `json:"plugin_id"`
+			AllowSleep        bool   `json:"allow_sleep"`
+			IdleUnloadMinutes *int   `json:"idle_unload_minutes"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
@@ -2059,7 +2063,17 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		}
 		if s.subPluginMgr != nil {
 			if pid, _, ok := s.resolveSubprocessPlugin(body.PluginID); ok {
-				if err := s.subPluginMgr.SetIdleUnloadBlocked(pid, !body.AllowSleep); err != nil {
+				if body.IdleUnloadMinutes != nil {
+					minutes := *body.IdleUnloadMinutes
+					if minutes < 0 {
+						minutes = 0
+					}
+					if err := s.subPluginMgr.SetPluginIdleUnloadMinutes(pid, minutes); err != nil {
+						writeJSON(w, http.StatusOK, apiError(err.Error()))
+						return
+					}
+				}
+				if err := s.subPluginMgr.SetPluginIdleUnload(pid, body.AllowSleep); err != nil {
 					writeJSON(w, http.StatusOK, apiError(err.Error()))
 					return
 				}
@@ -3086,18 +3100,6 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 			kbID := r.URL.Query().Get("kb_id")
 			s.handleKBDocuments(w, r, kbID, parts[1:])
 			return
-		case "chunks":
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"chunks": []interface{}{},
-			}))
-			return
-		case "retrieve":
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"results": []interface{}{},
-				"total":   0,
-				"query":   "",
-			}))
-			return
 		}
 		// Fall through: parts[0] is a kb_id in the RESTful path form.
 		kbID := parts[0]
@@ -3302,7 +3304,6 @@ func (s *Server) writeKBList(w http.ResponseWriter, r *http.Request) {
 	}))
 }
 
-// handleKBDocuments is a stub for document endpoints (uploads / listing).
 // kbUploadTask tracks a knowledge-base document upload task so the WebUI can
 // poll its progress. The Go runtime saves uploaded files directly (it does not
 // yet perform chunking/embedding), so a task is marked completed immediately
@@ -4497,9 +4498,33 @@ func (s *Server) handleTools(w http.ResponseWriter, r *http.Request, parts []str
 	case "by-name":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "archive":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "tool archive download not implemented",
-		}))
+		toolName := r.URL.Query().Get("name")
+		if toolName == "" {
+			toolName = r.URL.Query().Get("tool_name")
+		}
+		if toolName == "" {
+			writeJSON(w, http.StatusBadRequest, apiError("缺少工具名"))
+			return
+		}
+		var def map[string]interface{}
+		for _, row := range s.listTools() {
+			if m, ok := row.(map[string]interface{}); ok {
+				if n, _ := m["name"].(string); n == toolName {
+					def = m
+					break
+				}
+			}
+		}
+		if def == nil {
+			writeJSON(w, http.StatusNotFound, apiError("工具不存在: "+toolName))
+			return
+		}
+		data, err := json.MarshalIndent(def, "", "  ")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, apiError("工具定义序列化失败"))
+			return
+		}
+		writeAttachment(w, toolName+".json", "application/json", data)
 	case "batch":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "file":
@@ -9242,9 +9267,11 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 			s.getSkillFile(w, r)
 		}
 	case "archive":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"message": "skill archive download not implemented",
-		}))
+		skillName := r.URL.Query().Get("skill_name")
+		if skillName == "" {
+			skillName = r.URL.Query().Get("name")
+		}
+		s.serveSkillArchive(w, skillName)
 	case "neo":
 		if len(parts) > 1 {
 			switch parts[1] {
@@ -9295,6 +9322,11 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		}
 	default:
+		// 路径形态：/skills/{skill_name}/archive
+		if len(parts) > 1 && parts[1] == "archive" {
+			s.serveSkillArchive(w, parts[0])
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
 }
@@ -9338,6 +9370,79 @@ func skillFilePath(dataDir, skillName, relPath string) (string, error) {
 		return "", fmt.Errorf("非法路径")
 	}
 	return abs, nil
+}
+
+// serveSkillArchive serves <skillsRoot>/<name> as a zip download (the SKILL.md
+// bundle, re-importable via the skills upload which only accepts .zip). An
+// invalid or missing skill writes a JSON api error instead.
+func (s *Server) serveSkillArchive(w http.ResponseWriter, skillName string) {
+	dir, err := skillFilePath(s.kbDataDir(), skillName, ".")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, apiError(err.Error()))
+		return
+	}
+	if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err != nil {
+		writeJSON(w, http.StatusNotFound, apiError("技能不存在: "+skillName))
+		return
+	}
+	data, err := zipDirToBytes(dir)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("技能打包失败: "+err.Error()))
+		return
+	}
+	writeAttachment(w, skillName+".zip", "application/zip", data)
+}
+
+// zipDirToBytes zips every file under root into an in-memory archive whose
+// entries are relative to root (no wrapping top-level folder).
+func zipDirToBytes(root string) ([]byte, error) {
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(path) // #nosec G304 -- path 来自本机技能目录遍历
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(rel)
+		mw, err := zw.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(mw, f)
+		return err
+	})
+	if err != nil {
+		_ = zw.Close()
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// writeAttachment streams data to the client as an attachment download.
+func writeAttachment(w http.ResponseWriter, filename, contentType string, data []byte) {
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 // listSkillFiles implements GET /api/v1/skills/files.

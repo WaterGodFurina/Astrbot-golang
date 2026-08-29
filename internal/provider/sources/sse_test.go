@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -112,9 +113,21 @@ func TestSSEReaderBlockedOnReadHonorsCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var events []string
+	// events 由 scan goroutine 的 onData 回调追加，测试主 goroutine 在轮询与
+	// 最终断言中读取，需互斥锁同步（race detector 曾在此报 DATA RACE）。
+	var (
+		events []string
+		mu     sync.Mutex
+	)
+	eventsSnapshot := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), events...)
+	}
 	reader := newSSEReader(ctx, &http.Response{Body: pr}, func(data string) bool {
+		mu.Lock()
 		events = append(events, data)
+		mu.Unlock()
 		return false
 	})
 
@@ -127,7 +140,7 @@ func TestSSEReaderBlockedOnReadHonorsCancel(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
-	for len(events) < 1 {
+	for len(eventsSnapshot()) < 1 {
 		if time.Now().After(deadline) {
 			t.Fatal("first event was not dispatched")
 		}
@@ -148,8 +161,9 @@ func TestSSEReaderBlockedOnReadHonorsCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("scan did not stop after context cancellation at token boundary")
 	}
-	if len(events) != 1 || events[0] != "one" {
-		t.Fatalf("expected only the pre-cancel event, got %v", events)
+	got := eventsSnapshot()
+	if len(got) != 1 || got[0] != "one" {
+		t.Fatalf("expected only the pre-cancel event, got %v", got)
 	}
 }
 

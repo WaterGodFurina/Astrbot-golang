@@ -112,3 +112,9 @@ func (s *XinferenceRerankSource) Rerank(ctx context.Context, query string, docum
 	}
 	return results, nil
 }
+
+// Test verifies the provider by issuing a minimal rerank request.
+func (s *XinferenceRerankSource) Test(ctx context.Context) error {
+	_, err := s.Rerank(ctx, "test", []string{"测试文档"}, 1)
+	return err
+}

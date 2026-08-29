@@ -1279,10 +1279,16 @@ export const pluginApi = {
       }),
     );
   },
-  setIdleSleep(pluginId: string, allowSleep: boolean) {
+  setIdleSleep(pluginId: string, allowSleep: boolean, idleUnloadMinutes?: number) {
     return typed<OpenConfig>(
       openApiV1.setPluginIdleSleepById({
-        body: { plugin_id: pluginId, allow_sleep: allowSleep },
+        body: {
+          plugin_id: pluginId,
+          allow_sleep: allowSleep,
+          ...(idleUnloadMinutes !== undefined
+            ? { idle_unload_minutes: idleUnloadMinutes }
+            : {}),
+        } as any,
       }),
     );
   },

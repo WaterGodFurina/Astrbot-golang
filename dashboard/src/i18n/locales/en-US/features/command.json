@@ -93,15 +93,19 @@
     "showSystemPlugins": "Show system plugins commands",
     "systemPluginConflictHint": "System plugin conflicts detected. Resolve conflicts to hide."
   },
-  "sleep": {
-    "globalLabel": "Global idle auto-sleep",
-    "globalDesc": "When enabled, plugin processes idle for over 10 minutes are unloaded (memory reclaimed) and lazily reloaded on next use",
-    "columnPlugin": "Plugin",
-    "columnLanguage": "Plugin Language",
-    "columnAllow": "Allow sleep",
-    "noPlugins": "No enabled plugins",
-    "globalSaved": "Global sleep policy updated",
-    "pluginSaved": "Plugin sleep policy updated",
-    "warning": "A sleeping plugin can no longer receive messages proactively. Be cautious when sleeping plugins that use filters/hooks."
-  }
+   "sleep": {
+     "globalMinutesLabel": "Default idle minutes for new plugins",
+     "globalMinutesDesc": "New plugin default idle time",
+     "globalMinutesHint": "Used only as the default idle threshold for newly installed plugins; 0 = resident by default, does not override individually configured plugins.",
+     "columnPlugin": "Plugin",
+     "columnLanguage": "Plugin Language",
+     "columnAllow": "Allow sleep",
+     "columnMinutes": "Idle time (min)",
+     "columnRisk": "Risk",
+     "residentLabel": "Resident",
+     "noPlugins": "No enabled plugins",
+     "globalSaved": "New-plugin default idle time saved",
+     "pluginSaved": "Plugin sleep policy updated",
+     "listenerRisk": "This plugin has filters/hooks (active event listeners). Once hibernated its process is terminated and it can no longer receive messages/events."
+   }
 }
