@@ -61,7 +61,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"reserved":                false,
 			"author":                  "",
 			"repo":                    "",
-			"idle_unload_blocked":     e != nil && e.IdleUnloadBlocked,
+			"idle_unload":             e != nil && e.IdleUnload,
 			"install_source":          nil,
 			"updates_enabled":         true,
 			"update_disabled_reason":  "",
@@ -129,7 +129,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"reserved":                false,
 			"author":                  e.Author,
 			"repo":                    repo,
-			"idle_unload_blocked":     e.IdleUnloadBlocked,
+			"idle_unload":             e.IdleUnload,
 			"install_source":          e.installSourceMap(),
 			"updates_enabled":         updatesEnabled(e.InstallMethod),
 			"update_disabled_reason":  "",
@@ -686,7 +686,7 @@ func (m *SubprocessManager) Components(id string) map[string]interface{} {
 		"type":           "休眠策略",
 		"global_enabled": m.IdleUnloadEnabled(),
 		"global_minutes": m.IdleUnloadMinutes(),
-		"blocked":        m.IdleUnloadBlocked(inst.ID),
+		"idle_unload":    m.PluginIdleUnload(inst.ID),
 	}}
 	if len(out) == 0 {
 		return nil

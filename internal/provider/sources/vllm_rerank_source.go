@@ -115,3 +115,9 @@ func (s *VLLMRerankSource) Rerank(ctx context.Context, query string, documents [
 	}
 	return results, nil
 }
+
+// Test verifies the provider by issuing a minimal rerank request.
+func (s *VLLMRerankSource) Test(ctx context.Context) error {
+	_, err := s.Rerank(ctx, "test", []string{"测试文档"}, 1)
+	return err
+}

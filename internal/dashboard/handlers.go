@@ -2060,7 +2060,7 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		}
 		if s.subPluginMgr != nil {
 			if pid, _, ok := s.resolveSubprocessPlugin(body.PluginID); ok {
-				if err := s.subPluginMgr.SetIdleUnloadBlocked(pid, !body.AllowSleep); err != nil {
+				if err := s.subPluginMgr.SetPluginIdleUnload(pid, body.AllowSleep); err != nil {
 					writeJSON(w, http.StatusOK, apiError(err.Error()))
 					return
 				}

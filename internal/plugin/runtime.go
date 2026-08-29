@@ -137,7 +137,7 @@ type SubprocessManager struct {
 	// 分离：m.mu 保护内存 map，manifestMu 保护磁盘文件的一致性。
 	manifestMu sync.Mutex
 	// manifestCacheMu 保护 manifest 只读缓存（mtime 失效）：repoURLFor /
-	// IdleUnloadBlocked 等逐插件读 manifest 的高频路径复用同一份解析结果，
+	// IdleUnload 等逐插件读 manifest 的高频路径复用同一份解析结果，
 	// 避免 WebUI 详情/行为页的 N+1 全量读盘。写路径 Save 后 mtime 变化自动
 	// 失效，无需显式同步。
 	manifestCacheMu sync.Mutex
@@ -1309,10 +1309,10 @@ func (m *SubprocessManager) IdleUnloadMinutes() int {
 	return int(m.idleUnload / time.Minute)
 }
 
-// SetIdleUnloadBlocked marks a plugin as exempt from the idle sweep (blocked =
-// true keeps it resident; false re-allows idle sleep). Persisted in the
+// SetPluginIdleUnload marks whether a plugin may be idle-unloaded (allow =
+// true re-allows idle sleep; false keeps it resident). Persisted in the
 // manifest so the setting survives restarts.
-func (m *SubprocessManager) SetIdleUnloadBlocked(id string, blocked bool) error {
+func (m *SubprocessManager) SetPluginIdleUnload(id string, allow bool) error {
 	m.manifestMu.Lock()
 	defer m.manifestMu.Unlock()
 	man, err := LoadManifest(m.manifestPath())
@@ -1323,22 +1323,22 @@ func (m *SubprocessManager) SetIdleUnloadBlocked(id string, blocked bool) error 
 	if e == nil {
 		return fmt.Errorf("插件 %s 未安装", id)
 	}
-	e.IdleUnloadBlocked = blocked
+	e.IdleUnload = allow
 	if err := man.Save(m.manifestPath()); err != nil {
 		return err
 	}
-	if blocked {
-		logger.I18nInfo("插件 %s 已设置为常驻（不参与闲置自动休眠）", id)
-	} else {
+	if allow {
 		logger.I18nInfo("插件 %s 已允许闲置自动休眠", id)
+	} else {
+		logger.I18nInfo("插件 %s 已设置为常驻（不参与闲置自动休眠）", id)
 	}
 	return nil
 }
 
-// IdleUnloadBlocked reports whether the plugin is exempt from the idle sweep.
-func (m *SubprocessManager) IdleUnloadBlocked(id string) bool {
+// PluginIdleUnload reports whether the plugin is allowed to idle-unload.
+func (m *SubprocessManager) PluginIdleUnload(id string) bool {
 	if e := m.cachedManifest().Get(id); e != nil {
-		return e.IdleUnloadBlocked
+		return e.IdleUnload
 	}
 	return false
 }
@@ -1385,7 +1385,7 @@ func (m *SubprocessManager) sweepIdlePlugins() {
 	blocked := map[string]bool{}
 	if man, err := LoadManifest(m.manifestPath()); err == nil {
 		for i := range man.Plugins {
-			if man.Plugins[i].IdleUnloadBlocked {
+			if !man.Plugins[i].IdleUnload {
 				blocked[man.Plugins[i].ID] = true
 			}
 		}

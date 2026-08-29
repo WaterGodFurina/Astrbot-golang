@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -474,8 +476,14 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 					abm.Message = append(abm.Message, &message.Image{Base64: b64})
 				}
 			} else {
-				// TODO: 下载鉴权（与 Python 一致，仅透传私有 URL）
-				abm.Message = append(abm.Message, &message.File{Name: fileName, URL: fileURL})
+				// 私有 URL 仅 Slack 侧可鉴权读取，透传给下游（LLM/文件服务）
+				// 会因无权限取不到附件，因此带鉴权下载到本地临时文件。
+				if path := a.downloadSlackFile(ctx, fileURL, fileName); path != "" {
+					abm.Message = append(abm.Message, &message.File{Name: fileName, Path: path, URL: path})
+				} else {
+					logger.I18nError("Slack 附件下载失败，回退透传私有 URL: %s", fileURL)
+					abm.Message = append(abm.Message, &message.File{Name: fileName, URL: fileURL})
+				}
 			}
 		}
 	}
@@ -556,6 +564,39 @@ func (a *Adapter) getFileBase64(ctx context.Context, url string) (string, error)
 		return "", fmt.Errorf("下载文件失败: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+// downloadSlackFile 用鉴权客户端（slack.Client.GetFileContext 自带 Bearer
+// token）把附件下载到本地临时文件，供下游（LLM / file service）无鉴权读取。
+// 私有 url_private 透传会被下游视为无权限，必须真正落地。返回落盘路径，
+// 失败时返回空串。
+func (a *Adapter) downloadSlackFile(ctx context.Context, url, name string) string {
+	if url == "" {
+		return ""
+	}
+	f, err := os.CreateTemp("", "astrbot-slack-*")
+	if err != nil {
+		logger.I18nError("创建 Slack 附件临时文件失败: %v", err)
+		return ""
+	}
+	path := f.Name()
+	if err := a.client.GetFileContext(ctx, url, &limitedWriter{w: f, remaining: maxFileDownloadSize}); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		logger.I18nError("下载 Slack 附件失败: %v", err)
+		return ""
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return ""
+	}
+	// 补扩展名便于下游按 MIME 识别（临时文件名无扩展名）。
+	if ext := filepath.Ext(name); ext != "" {
+		if renamed := path + ext; os.Rename(path, renamed) == nil {
+			path = renamed
+		}
+	}
+	return path
 }
 
 // parseBlocks 解析 Slack blocks 格式的消息内容。

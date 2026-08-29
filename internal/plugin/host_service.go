@@ -872,7 +872,25 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			return nil
 		},
 		GetProviderModels: func(providerID string) []string {
-			// 模型列表需要 provider 具体实现，宿主暂不实现，返回 nil。
+			// 复用 provider 源现有的 GetModels(ctx)（openai 家族：Zhipu/GLM、
+			// DashScope、Groq、XAI、Xiaomi、Kimi、OpenAI Responses 等），供
+			// 插件查询模型列表（如群总结插件挑选总结用的模型）。未实现
+			// GetModels 的源（Gemini/Anthropic/Ollama 等）返回空。
+			if providerMgr == nil {
+				return nil
+			}
+			p := providerMgr.Get(providerID)
+			if gm, ok := p.(interface {
+				GetModels(context.Context) ([]string, error)
+			}); ok {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				if models, err := gm.GetModels(ctx); err == nil {
+					return models
+				} else {
+					logger.Warn("GetProviderModels(%s) 拉取模型列表失败: %v", providerID, err)
+				}
+			}
 			return nil
 		},
 
