@@ -801,12 +801,14 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				if capability != "" && string(meta.ProviderType) != capability {
 					continue
 				}
-				out = append(out, map[string]any{
+				entry := map[string]any{
 					"id":            meta.ID,
 					"model":         meta.Model,
 					"type":          meta.Type,
 					"provider_type": string(meta.ProviderType),
-				})
+				}
+				applyProviderCredentials(entry, p)
+				out = append(out, entry)
 			}
 			return out
 		},
@@ -838,6 +840,15 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				if p != nil {
 					meta := p.Meta()
 					return map[string]any{"id": meta.ID, "model": meta.Model, "type": meta.Type, "provider_type": string(meta.ProviderType)}
+				}
+			}
+			if capability == "embedding" {
+				p := providerMgr.GetEmbeddingProvider()
+				if p != nil {
+					meta := p.Meta()
+					entry := map[string]any{"id": meta.ID, "model": meta.Model, "type": meta.Type, "provider_type": string(meta.ProviderType)}
+					applyProviderCredentials(entry, p)
+					return entry
 				}
 			}
 			return nil
@@ -1104,4 +1115,37 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			subMgr.UnregisterSessionWait(waitID)
 		},
 	})
+}
+
+// applyProviderCredentials copies provider credentials (key/api_base) from the
+// provider's own config into the payload returned to Python plugins, so that
+// SDK-side providers (e.g. EmbeddingProvider) can call OpenAI-compatible
+// endpoints directly. Keys stay on the local unix-socket gRPC channel and are
+// never exposed beyond plugin subprocesses on the same machine.
+func applyProviderCredentials(entry map[string]any, p provider.AbstractProvider) {
+	ch, ok := p.(interface{ Config() map[string]interface{} })
+	if !ok {
+		return
+	}
+	cfg := ch.Config()
+	if cfg == nil {
+		return
+	}
+	// key may be a list (rotation pool) or a plain string.
+	if keys, ok := cfg["key"].([]interface{}); ok && len(keys) > 0 {
+		if k, ok := keys[0].(string); ok {
+			entry["key"] = k
+		}
+	} else if k, ok := cfg["key"].(string); ok {
+		entry["key"] = k
+	}
+	// Embedding sources prefer embedding-specific endpoint overrides.
+	if ab, ok := cfg["embedding_api_base"].(string); ok && ab != "" {
+		entry["api_base"] = ab
+	} else if ab, ok := cfg["api_base"].(string); ok && ab != "" {
+		entry["api_base"] = ab
+	}
+	if ek, ok := cfg["embedding_api_key"].(string); ok && ek != "" {
+		entry["key"] = ek
+	}
 }

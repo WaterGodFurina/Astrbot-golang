@@ -5,6 +5,12 @@ import (
 )
 
 func init() {
+	// Register OpenAI-compatible Embedding (also works for Zhipu/Moonshot/
+	// vLLM and any /v1/embeddings-compatible endpoint).
+	provider.RegisterProvider("openai_embedding", func(config, settings map[string]interface{}) (provider.AbstractProvider, error) {
+		return NewOpenAIEmbeddingSource(config, settings), nil
+	})
+
 	// Register Gemini Embedding
 	provider.RegisterProvider("gemini_embedding", func(config, settings map[string]interface{}) (provider.AbstractProvider, error) {
 		return NewGeminiEmbeddingSource(config, settings), nil
