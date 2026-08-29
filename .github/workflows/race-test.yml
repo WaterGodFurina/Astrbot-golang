@@ -1,0 +1,100 @@
+name: Go Race 检测
+
+# 与 test.yml / codeql.yml 并行：单独 workflow 在 push 到 test 分支时并发运行
+# `go test --race`。自带前端构建（dist 仅在本 job 工作区使用，不回推仓库），
+# 因此独立于其它 workflow 的前端推送时序，避免 //go:embed 缺 dist 失败。
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '测试的 git 引用（分支/tag/SHA）。留空 = 当前分支'
+        required: false
+        default: ''
+  push:
+    branches:
+      - test
+
+jobs:
+  race-test:
+    name: Go Race 测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: 设置 Node.js（前端构建，与 test.yml 一致 v24）
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: 启用 pnpm 并安装依赖
+        run: corepack enable
+
+      - name: 前端构建（嵌入 dist，供 //go:embed）
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build && pnpm build:t2i-shiki-runtime
+        working-directory: dashboard
+
+      - name: 同步 dist 到内嵌目录（仅本工作区，不推送）
+        run: |
+          rm -rf internal/dashboard/web/dist
+          mkdir -p internal/dashboard/web/dist
+          cp -r dashboard/dist/. internal/dashboard/web/dist/
+
+      - name: 设置 Go 版本（1.26.5，race detector 需 CGO）
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.5'
+          cache-dependency-path: go.sum
+
+      - name: 用 goproxy.cn 重建 go.sum（本地对齐，不提交回仓库）
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GOFLAGS: -mod=mod
+        run: go mod tidy
+
+      - name: 安装 Python（插件子进程测试需要）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 配置 Go 环境（代理与模块）
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GOFLAGS: -mod=mod
+        run: |
+          go env -w GOPROXY="https://goproxy.cn,direct"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
+
+      - name: 安装中文字体（t2i 测试需要）
+        timeout-minutes: 3
+        run: |
+          sudo apt-get update -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
+          sudo apt-get install -y -q fonts-droid-fallback
+
+      - name: 编译检查
+        run: go build ./...
+
+      - name: 运行全部测试（race detector，CGO 开启）
+        timeout-minutes: 45
+        env:
+          CGO_ENABLED: '1'
+          PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+          ASTRBOT_PYPI_INDEX: https://mirrors.aliyun.com/pypi/simple/
+        run: go test --race ./... -count=1 -timeout 40m
+
+      - name: 上传失败测试日志
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: race-test-output
+          path: |
+            **/test*.log
+            **/TEST-*.xml
+          if-no-files-found: ignore
