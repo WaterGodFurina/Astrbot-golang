@@ -48,6 +48,24 @@ func configString(config map[string]interface{}, key, fallback string) string {
 	return fallback
 }
 
+// configKey returns the API key for key, accepting both the plain-string form
+// ("key": "sk-...") and the keyring-array form ("key": ["sk-...", ...]) used
+// by cmd_config.json（取首个）。Fallback sources（anthropic/gemini 等）各自
+// 内联了数组处理；此处统一抽出供 embedding 等新代码复用。
+func configKey(config map[string]interface{}, key string) string {
+	if v, ok := config[key].(string); ok && v != "" {
+		return v
+	}
+	if keys, ok := config[key].([]interface{}); ok {
+		for _, k := range keys {
+			if s, ok := k.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // cloneMap returns a shallow copy of a string-keyed map so callers can apply
 // defaults without mutating a shared config map.
 func cloneMap(m map[string]interface{}) map[string]interface{} {
