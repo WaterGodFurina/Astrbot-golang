@@ -100,6 +100,10 @@ type PluginInstance struct {
 	// UnixNano 时间戳，供闲置自动卸载（idle unload）判定使用。
 	lastActiveNano atomic.Int64
 
+	// activeRPC 是正在进行的宿主→插件 RPC 数量（RPCGuard 增减）。闲置清扫
+	// 遇到 activeRPC>0 的插件不会卸载，避免把执行中命令/工具的进程回收。
+	activeRPC atomic.Int64
+
 	// owner 是插件所属的 SubprocessManager（RefreshTools 成功后回写工具
 	// 注册表用；由 startInstance 赋值）。
 	owner *SubprocessManager
@@ -235,6 +239,23 @@ type SubprocessManager struct {
 // plugin). 供闲置卸载判定使用。
 func (inst *PluginInstance) Touch() {
 	inst.lastActiveNano.Store(time.Now().UnixNano())
+}
+
+// RPCGuard marks the start of a host→plugin RPC (Touch + in-flight counter)
+// and returns the end-of-RPC function. 用法：defer inst.RPCGuard()()。闲置清扫
+// 会跳过 activeRPC>0 的插件，确保长时间运行的命令/工具不被误判为空闲。
+func (inst *PluginInstance) RPCGuard() func() {
+	inst.Touch()
+	inst.activeRPC.Add(1)
+	return func() { inst.activeRPC.Add(-1) }
+}
+
+// RPCGuardPassive 与 RPCGuard 相同，但不刷新活动时间（lastActiveNano）。
+// 用于过滤器/钩子等被动广播：既要防止"执行中被回收"，又不能令被动流量
+// 阻止带 filter/hook 的插件闲置休眠。
+func (inst *PluginInstance) RPCGuardPassive() func() {
+	inst.activeRPC.Add(1)
+	return func() { inst.activeRPC.Add(-1) }
 }
 
 // LastActive returns the last activity time (zero if never touched).
@@ -466,7 +487,7 @@ type docCacheEntry struct {
 // NewSubprocessManager creates the subprocess plugin manager.
 func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessManager {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &SubprocessManager{
+	m := &SubprocessManager{
 		instances:        make(map[string]*PluginInstance),
 		failures:         make(map[string]error),
 		docFetchCache:    make(map[string]docCacheEntry),
@@ -485,6 +506,10 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 		RestartBaseDelay: time.Second,
 		PollInterval:     500 * time.Millisecond,
 	}
+	// 闲置清扫循环常驻运行（每插件独立判定，见 sweepIdlePlugins）：
+	// 全局默认阈值可关闭，但带独立分钟配置的插件仍需被周期性扫描。
+	go m.idleSweepLoop()
+	return m
 }
 
 // lockOp acquires the per-plugin lifecycle lock for id and returns a release
@@ -1343,6 +1368,35 @@ func (m *SubprocessManager) PluginIdleUnload(id string) bool {
 	return false
 }
 
+// PluginIdleUnloadMinutes returns the plugin's own idle timeout in minutes
+// (0 = unset, falls back to the global default).
+func (m *SubprocessManager) PluginIdleUnloadMinutes(id string) int {
+	if e := m.cachedManifest().Get(id); e != nil {
+		return e.IdleUnloadMinutes
+	}
+	return 0
+}
+
+// SetPluginIdleUnloadMinutes sets the plugin's own idle timeout in minutes
+// (0 = unset → fall back to the global default). Persisted in the manifest.
+func (m *SubprocessManager) SetPluginIdleUnloadMinutes(id string, minutes int) error {
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return err
+	}
+	e := man.Get(id)
+	if e == nil {
+		return fmt.Errorf("插件 %s 未安装", id)
+	}
+	e.IdleUnloadMinutes = minutes
+	if err := man.Save(m.manifestPath()); err != nil {
+		return err
+	}
+	return nil
+}
+
 // idleSweepLoop periodically unloads idle plugin processes.
 func (m *SubprocessManager) idleSweepLoop() {
 	interval := m.scanInterval
@@ -1372,35 +1426,57 @@ func (m *SubprocessManager) SweepIdle() {
 // restart) and triggers OnInstancesChanged so the host re-bridges handlers.
 func (m *SubprocessManager) sweepIdlePlugins() {
 	m.mu.RLock()
-	idle := m.idleUnload
+	global := m.idleUnload
 	insts := make([]*PluginInstance, 0, len(m.instances))
 	for _, inst := range m.instances {
 		insts = append(insts, inst)
 	}
 	m.mu.RUnlock()
-	if idle <= 0 {
-		return
+
+	// 一次构建插件休眠规则表（manifest 只读一遍），避免逐插件重读磁盘。
+	type rule struct {
+		allow   bool
+		minutes int
 	}
-	// 一次构建常驻插件表（manifest 只读一遍），避免逐插件重读 manifest 磁盘。
-	blocked := map[string]bool{}
+	byID := map[string]rule{}
 	if man, err := LoadManifest(m.manifestPath()); err == nil {
 		for i := range man.Plugins {
-			if !man.Plugins[i].IdleUnload {
-				blocked[man.Plugins[i].ID] = true
-			}
+			byID[man.Plugins[i].ID] = rule{man.Plugins[i].IdleUnload, man.Plugins[i].IdleUnloadMinutes}
 		}
 	}
 	now := time.Now()
 	for _, inst := range insts {
-		if blocked[inst.ID] {
-			continue // 常驻插件（WebUI 行为页勾选"不允许休眠"）不参与清扫
+		// 进行中的 RPC 不判闲：避免正在执行命令/工具的插件被回收。
+		if inst.activeRPC.Load() > 0 {
+			continue
 		}
-		if inst.IsIdle(now, idle) {
-			logger.I18nInfo("插件 %s 已闲置 %v，自动休眠（内存已回收，下次触发时自动唤醒）",
-				inst.ID, now.Sub(inst.LastActive()).Round(time.Second))
-			if err := m.UnloadIdle(inst.ID); err != nil && err.Error() != fmt.Sprintf("plugin %s not loaded", inst.ID) {
-				logger.I18nWarn("闲置休眠插件 %s 失败: %v", inst.ID, err)
-			}
+		r, ok := byID[inst.ID]
+		if !ok || !r.allow {
+			continue // 常驻插件（IdleUnload=false）不参与清扫
+		}
+		timeout := global // 插件未设独立分钟 → 回退全局默认
+		if r.minutes > 0 {
+			timeout = time.Duration(r.minutes) * time.Minute
+		}
+		if timeout <= 0 {
+			continue // 无有效超时：不回收（避免立即反复休眠/唤醒）
+		}
+		if !inst.IsIdle(now, timeout) {
+			continue
+		}
+		// 防"旧 timer 误杀新实例"：确认注册表里仍是同一个实例且仍闲置，
+		// 避免刚被 Lazy Load 唤醒的实例被上一轮清扫捕获的旧指针连带卸载。
+		m.mu.RLock()
+		cur, ok := m.instances[inst.ID]
+		idle := ok && cur == inst && cur.activeRPC.Load() == 0 && cur.IsIdle(now, timeout)
+		m.mu.RUnlock()
+		if !idle {
+			continue
+		}
+		logger.I18nInfo("插件 %s 已闲置 %v，自动休眠（内存已回收，下次触发时自动唤醒）",
+			inst.ID, now.Sub(inst.LastActive()).Round(time.Second))
+		if err := m.UnloadIdle(inst.ID); err != nil && err.Error() != fmt.Sprintf("plugin %s not loaded", inst.ID) {
+			logger.I18nWarn("闲置休眠插件 %s 失败: %v", inst.ID, err)
 		}
 	}
 }

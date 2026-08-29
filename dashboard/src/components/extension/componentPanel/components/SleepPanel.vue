@@ -1,10 +1,13 @@
 <script setup lang="ts">
 /**
  * 休眠策略面板 - 组件管理页第三个视图（与"指令/函数工具"按钮同列）。
- * 每个插件的"允许休眠"开关（关闭 = 常驻）。
+ * 每插件的"允许休眠"开关 + 独立闲置分钟数（0 = 回退全局默认）+ 过滤器/钩子
+ * 风险提示。顶部"新装插件默认休眠时间"仅作为新装插件的默认阈值，不覆盖已
+ * 单独配置的插件（也不控制所有插件的开关）。
  */
 import { onMounted, ref } from "vue";
 import { pluginApi } from "@/api/v1";
+import { fetchWithAuth } from "@/api/http";
 import { useModuleI18n } from "@/i18n/composables";
 
 defineOptions({ name: "SleepPanel" });
@@ -21,6 +24,10 @@ interface SleepPluginItem {
   language: string;
   enabled: boolean;
   allowSleep: boolean;
+  idleUnloadMinutes: number;
+  hasFilter: boolean;
+  hasHook: boolean;
+  activeEventListener: boolean;
   version: string;
 }
 
@@ -37,6 +44,7 @@ const languageOf = (p: Record<string, unknown>) => {
 
 const loading = ref(false);
 const saving = ref(false);
+const globalMinutes = ref(0);
 const plugins = ref<SleepPluginItem[]>([]);
 const snackbar = ref<{ show: boolean; message: string; color: string }>({
   show: false,
@@ -50,9 +58,47 @@ const toast = (message: string, color = "success") => {
   snackbar.value.show = true;
 };
 
+const fetchGlobalMinutes = async () => {
+  // 全局默认阈值（分钟）：openapi 客户端只有 POST 变体，GET 走原始请求。
+  try {
+    const res = await fetchWithAuth("/api/v1/plugins/idle-unload-global", {
+      method: "GET",
+    });
+    const j = await res.json().catch(() => null);
+    if (j?.status === "ok") {
+      globalMinutes.value = Number(j.data?.minutes || 0);
+    }
+  } catch {
+    // 忽略：全局默认仅用于展示，拉不到不阻塞插件列表。
+  }
+};
+
+const saveGlobalMinutes = async (raw: number | string | null) => {
+  const minutes = Math.max(0, Number(raw) || 0);
+  if (saving.value) return;
+  saving.value = true;
+  try {
+    const res = await pluginApi.setGlobalIdleSleep(minutes);
+    if (res.data.status === "ok") {
+      globalMinutes.value = minutes;
+      toast(tm("sleep.globalSaved") || "已保存新装插件默认休眠时间");
+    } else {
+      toast(
+        (res.data as any)?.message || tm("messages.operationFailed"),
+        "error",
+      );
+    }
+  } catch (err) {
+    toast((err as any)?.message || String(err), "error");
+  } finally {
+    saving.value = false;
+  }
+};
+
 const fetchData = async () => {
   loading.value = true;
   try {
+    await fetchGlobalMinutes();
     const listRes = await pluginApi.list();
     if (listRes.data.status === "ok") {
       const items = (listRes.data.data || []) as Array<Record<string, unknown>>;
@@ -64,6 +110,10 @@ const fetchData = async () => {
           language: languageOf(p),
           enabled: Boolean(p.enabled),
           allowSleep: Boolean(p.idle_unload),
+          idleUnloadMinutes: Number(p.idle_unload_minutes || 0),
+          hasFilter: Boolean(p.has_filter),
+          hasHook: Boolean(p.has_hook),
+          activeEventListener: Boolean(p.active_event_listener),
           version: String(p.version || ""),
         }));
     }
@@ -78,12 +128,44 @@ const togglePlugin = async (item: SleepPluginItem, allowSleep: boolean) => {
   if (saving.value || !item.id) return;
   saving.value = true;
   try {
-    const res = await pluginApi.setIdleSleep(item.id, allowSleep);
+    const res = await pluginApi.setIdleSleep(
+      item.id,
+      allowSleep,
+      item.idleUnloadMinutes || undefined,
+    );
     if (res.data.status === "ok") {
       item.allowSleep = allowSleep;
       toast(tm("sleep.pluginSaved"));
     } else {
-      toast((res.data as any)?.message || tm("messages.operationFailed"), "error");
+      toast(
+        (res.data as any)?.message || tm("messages.operationFailed"),
+        "error",
+      );
+    }
+  } catch (err) {
+    toast((err as any)?.message || String(err), "error");
+  } finally {
+    saving.value = false;
+  }
+};
+
+const savePluginMinutes = async (
+  item: SleepPluginItem,
+  raw: number | string | null,
+) => {
+  const minutes = Math.max(0, Number(raw) || 0);
+  if (saving.value || !item.id) return;
+  saving.value = true;
+  try {
+    const res = await pluginApi.setIdleSleep(item.id, item.allowSleep, minutes);
+    if (res.data.status === "ok") {
+      item.idleUnloadMinutes = minutes;
+      toast(tm("sleep.pluginSaved"));
+    } else {
+      toast(
+        (res.data as any)?.message || tm("messages.operationFailed"),
+        "error",
+      );
     }
   } catch (err) {
     toast((err as any)?.message || String(err), "error");
@@ -101,6 +183,27 @@ onMounted(async () => {
   <div>
     <v-card variant="flat" class="sleep-panel">
       <v-card-text>
+        <div class="d-flex align-center ga-3 mb-2 flex-wrap">
+          <v-text-field
+            type="number"
+            min="0"
+            :model-value="globalMinutes"
+            density="compact"
+            hide-details
+            style="max-width: 150px"
+            :disabled="saving"
+            :label="tm('sleep.globalMinutesLabel')"
+            @change="(v: any) => saveGlobalMinutes(v?.target?.value ?? 0)"
+          />
+          <div>
+            <div class="text-body-1 font-weight-medium">
+              {{ tm("sleep.globalMinutesDesc") }}
+            </div>
+            <div class="text-caption text-medium-emphasis">
+              {{ tm("sleep.globalMinutesHint") }}
+            </div>
+          </div>
+        </div>
         <div class="sleep-warning mb-4">
           {{ tm("sleep.warning") }}
         </div>
@@ -111,6 +214,8 @@ onMounted(async () => {
               <th>{{ tm("sleep.columnPlugin") }}</th>
               <th>{{ tm("sleep.columnLanguage") }}</th>
               <th>{{ tm("sleep.columnAllow") }}</th>
+              <th>{{ tm("sleep.columnMinutes") }}</th>
+              <th>{{ tm("sleep.columnRisk") }}</th>
             </tr>
           </thead>
           <tbody>
@@ -135,6 +240,30 @@ onMounted(async () => {
                   :disabled="saving"
                   @update:model-value="(v: boolean | null) => togglePlugin(item, !!v)"
                 />
+              </td>
+              <td>
+                <v-text-field
+                  v-if="item.allowSleep"
+                  type="number"
+                  min="0"
+                  :model-value="item.idleUnloadMinutes"
+                  density="compact"
+                  hide-details
+                  style="max-width: 110px"
+                  :disabled="saving"
+                  @change="(v: any) => savePluginMinutes(item, v?.target?.value ?? 0)"
+                />
+                <span v-else class="text-caption text-medium-emphasis">
+                  {{ tm("sleep.residentLabel") }}
+                </span>
+              </td>
+              <td>
+                <span
+                  v-if="item.activeEventListener"
+                  class="sleep-warning"
+                >
+                  ⚠️ {{ tm("sleep.listenerRisk") }}
+                </span>
               </td>
             </tr>
           </tbody>
@@ -164,10 +293,10 @@ onMounted(async () => {
 }
 
 .sleep-table__name {
-  width: 40%;
+  width: 36%;
 }
 
 .sleep-table__toggle {
-  width: 120px;
+  width: 96px;
 }
 </style>

@@ -23,6 +23,29 @@ import (
 // ListInfo returns dashboard-compatible plugin info: running subprocess
 // instances plus installed-but-disabled plugins from the persisted manifest,
 // so the WebUI keeps showing plugins that were switched off.
+// pluginHasMetaFilters/Hooks/PassiveEvents 报告插件是否声明了需要主动接收
+// 宿主事件的过滤器/钩子（闲置休眠后进程已终止，无法再被动监听，供 WebUI
+// 风险提示）。
+func pluginHasMetaFilters(meta *sdkv1.RegisterResponse) bool {
+	return meta != nil && len(meta.Filters) > 0
+}
+
+func pluginHasMetaHooks(meta *sdkv1.RegisterResponse) bool {
+	return meta != nil && len(meta.Hooks) > 0
+}
+
+func pluginHasPassiveEvents(meta *sdkv1.RegisterResponse) bool {
+	return pluginHasMetaFilters(meta) || pluginHasMetaHooks(meta)
+}
+
+// idleMinutesOf returns the plugin's own idle timeout minutes (0 = unset).
+func idleMinutesOf(e *ManifestEntry) int {
+	if e == nil {
+		return 0
+	}
+	return e.IdleUnloadMinutes
+}
+
 func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
@@ -62,6 +85,10 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"author":                  "",
 			"repo":                    "",
 			"idle_unload":             e != nil && e.IdleUnload,
+			"idle_unload_minutes":     idleMinutesOf(e),
+			"has_filter":              pluginHasMetaFilters(inst.Meta),
+			"has_hook":                pluginHasMetaHooks(inst.Meta),
+			"active_event_listener":   pluginHasPassiveEvents(inst.Meta),
 			"install_source":          nil,
 			"updates_enabled":         true,
 			"update_disabled_reason":  "",
@@ -130,6 +157,10 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"author":                  e.Author,
 			"repo":                    repo,
 			"idle_unload":             e.IdleUnload,
+			"idle_unload_minutes":     e.IdleUnloadMinutes,
+			"has_filter":              pluginHasMetaFilters(m.handlerMeta[e.ID]),
+			"has_hook":                pluginHasMetaHooks(m.handlerMeta[e.ID]),
+			"active_event_listener":   pluginHasPassiveEvents(m.handlerMeta[e.ID]),
 			"install_source":          e.installSourceMap(),
 			"updates_enabled":         updatesEnabled(e.InstallMethod),
 			"update_disabled_reason":  "",
@@ -680,13 +711,14 @@ func (m *SubprocessManager) Components(id string) map[string]interface{} {
 	// 休眠策略：与指令/函数工具同列的行为配置项。global_* 反映全局闲置
 	// 自动休眠开关；blocked 表示本插件是否被排除在休眠之外（常驻）。
 	out["sleep"] = []interface{}{map[string]interface{}{
-		"name":           "idle_sleep",
-		"handler_name":   "idle_sleep",
-		"desc":           "插件闲置自动休眠（回收空闲插件进程内存，触发时自动唤醒）",
-		"type":           "休眠策略",
-		"global_enabled": m.IdleUnloadEnabled(),
-		"global_minutes": m.IdleUnloadMinutes(),
-		"idle_unload":    m.PluginIdleUnload(inst.ID),
+		"name":                "idle_sleep",
+		"handler_name":        "idle_sleep",
+		"desc":                "插件闲置自动休眠（回收空闲插件进程内存，触发时自动唤醒）",
+		"type":                "休眠策略",
+		"global_enabled":      m.IdleUnloadEnabled(),
+		"global_minutes":      m.IdleUnloadMinutes(),
+		"idle_unload":         m.PluginIdleUnload(inst.ID),
+		"idle_unload_minutes": m.PluginIdleUnloadMinutes(inst.ID),
 	}}
 	if len(out) == 0 {
 		return nil

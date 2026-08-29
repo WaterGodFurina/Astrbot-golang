@@ -903,6 +903,9 @@ func TestIdleUnloadAndLazyReload(t *testing.T) {
 
 	// 启用闲置卸载（阈值极短）并手动触发清扫（不依赖 ticker 定时）。
 	m.SetIdleUnload(10 * time.Millisecond)
+	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
+		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
 	inst.lastActiveNano.Store(time.Now().Add(-time.Minute).UnixNano()) // 模拟闲置
 	m.sweepIdlePlugins()
 	if m.Get(inst.ID) != nil {

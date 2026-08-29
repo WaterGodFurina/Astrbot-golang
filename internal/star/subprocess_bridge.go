@@ -185,6 +185,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 					e.Result.Chain = []message.Component{&message.Plain{Text: "插件未就绪，请稍后重试"}}
 					return nil
 				}
+				defer cur.RPCGuard()()
 				parts := strings.Fields(e.MessageStr)
 				var args []string
 				if len(parts) > 1 {
@@ -263,6 +264,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				if cur == nil || cur.Client == nil {
 					return nil
 				}
+				defer cur.RPCGuardPassive()()
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 				allow, result, err := cur.Client.HandleFilter(rpcCtx, f.Name, CoreEventToSDKEvent(e))
 				rpcCancel()
@@ -317,6 +319,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				if cur == nil || cur.Client == nil {
 					return nil
 				}
+				defer cur.RPCGuardPassive()()
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 				_, _, result, err := cur.Client.HandleHook(rpcCtx, h.Name, CoreEventToSDKEvent(e), nil)
 				rpcCancel()
