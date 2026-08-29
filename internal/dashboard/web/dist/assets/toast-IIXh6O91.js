@@ -1,0 +1,1 @@
+import{bY as e}from"./index-B19q5kKo.js";function c(){const t=e(),o=(r,s="info",n={})=>t.add({message:r,color:s,...n});return{toast:o,success:(r,s)=>o(r,"success",s),error:(r,s)=>o(r,"error",s),info:(r,s)=>o(r,"primary",s),warning:(r,s)=>o(r,"warning",s)}}export{c as u};
