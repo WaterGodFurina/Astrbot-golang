@@ -50,6 +50,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'internal/pysdk/embed.go'
 
       - name: 配置 apt 缓存目录到用户空间（/var/cache/apt root 不可写）
         run: |
@@ -91,8 +93,11 @@ jobs:
         timeout-minutes: 30
         env:
           CGO_ENABLED: '0'
-          PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
-          ASTRBOT_PYPI_INDEX: https://mirrors.aliyun.com/pypi/simple/
+          # GitHub runner 在海外（Azure），直连官方 PyPI 比走阿里云镜像更快且
+          # 稳定（aliyun 对海外 IP 反而慢/限流）。setup-python 的 pip cache
+          # 已缓存 wheel，插件子进程首次装宿主依赖也能命中。
+          PIP_INDEX_URL: https://pypi.org/simple
+          ASTRBOT_PYPI_INDEX: https://pypi.org/simple
         run: go test ./... -count=1 -timeout 25m
 
       - name: 上传失败测试日志
@@ -308,7 +313,8 @@ jobs:
           pip install semgrep
           semgrep --config=auto --error 2>&1 || true
         env:
-          PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
+          # GitHub runner 海外直连官方 PyPI（海外访问 aliyun 反而慢/限流）。
+          PIP_INDEX_URL: https://pypi.org/simple
 
   codeql:
     name: CodeQL

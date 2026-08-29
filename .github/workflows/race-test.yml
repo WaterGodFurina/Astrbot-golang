@@ -62,6 +62,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'internal/pysdk/embed.go'
 
       - name: 配置 Go 环境（代理与模块）
         env:
@@ -85,8 +87,9 @@ jobs:
         timeout-minutes: 45
         env:
           CGO_ENABLED: '1'
-          PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
-          ASTRBOT_PYPI_INDEX: https://mirrors.aliyun.com/pypi/simple/
+          # GitHub runner 海外直连官方 PyPI（见 test.yml 注释）。
+          PIP_INDEX_URL: https://pypi.org/simple
+          ASTRBOT_PYPI_INDEX: https://pypi.org/simple
         run: go test --race ./... -count=1 -timeout 40m
 
       - name: 上传失败测试日志
