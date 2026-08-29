@@ -1629,6 +1629,12 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 	// 插件子进程工作目录设为统一数据根目录 data/plugins_data/<id>，插件写相对
 	// 路径的运行时数据（修仙存档、表情库等）自动落盘于此，便于管理/备份/卸载。
 	pluginDataRoot := m.pluginDataRoot(id)
+	// cmd.Dir 必须是绝对路径：Go fork 子进程先 chdir(cmd.Dir) 再 execve，相对
+	// 路径会相对宿主进程 cwd 解析（宿主 cwd 不稳即错位），且相对 PythonBin 会
+	// 按此 cwd 二次解析。与 pythonRuntime 返回的绝对 PythonBin 一起兜底。
+	if abs, err := filepath.Abs(pluginDataRoot); err == nil {
+		pluginDataRoot = abs
+	}
 	// #nosec G301 -- 插件数据目录（用户态）
 	if err := os.MkdirAll(pluginDataRoot, 0o755); err != nil {
 		return nil, fmt.Errorf("create plugin data dir: %w", err)

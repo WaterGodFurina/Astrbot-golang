@@ -1324,6 +1324,13 @@ func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, e
 	if py == "" {
 		return nil, ErrRuntimeUnavailable
 	}
+	// 子进程启动后 cwd 是插件数据目录（data/plugins_data/<id>），相对路径的
+	// PythonBin 会被内核按该 cwd 重新解析导致错位（cache 缺失或
+	// ASTRBOT_PYTHON_CACHE_DIR 相对时，EnsureVenv 可能产出相对 venv 路径）。
+	// 统一绝对化，与 Env() 注释"路径要绝对化否则静默失效"对齐。
+	if abs, err := filepath.Abs(py); err == nil {
+		py = abs
+	}
 	return &RuntimeEnv{
 		PythonBin: py,
 		SDKDir:    sdkDir,
