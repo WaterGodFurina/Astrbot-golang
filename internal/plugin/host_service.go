@@ -16,8 +16,10 @@ import (
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
@@ -415,6 +417,21 @@ type ChatLLMCmd struct {
 	ProviderID   string
 }
 
+// HostServiceExtras carries optional host-side managers layered onto the
+// plugin HostService hooks after the base set (platform/plugin/conversation/
+// provider/persona). They back the skills + platform-message-history RPCs the
+// SDK now exposes (ListSkills / SetSkillActive / DeleteSkill /
+// GetPlatformMessageHistory / Insert/Update/DeletePlatformMessageHistory).
+type HostServiceExtras struct {
+	// SkillMgr backs ListSkills/SetSkillActive/DeleteSkill when non-nil.
+	SkillMgr *skills.SkillManager
+	// Database backs the platform-message-history RPCs when non-nil.
+	Database *db.Database
+}
+
+// hostExtras is the active set of optional extras passed to SetHostService.
+var hostExtras HostServiceExtras
+
 // SetHostService installs the HostService hooks (reverse plugin -> host RPCs)
 // backed by the platform manager, the subprocess plugin manager (for config
 // reads/writes), a ChatLLM callback (for plugins calling the LLM directly),
@@ -422,7 +439,10 @@ type ChatLLMCmd struct {
 // over star.Registry().All() via StarManagerLike，规避 star→plugin 导入环).
 // Call once at startup, after all managers exist and before plugins begin
 // handling messages.
-func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(cmd ChatLLMCmd) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager) {
+func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, chatLLM func(cmd ChatLLMCmd) (string, error), convMgr *conversation.Manager, providerMgr *provider.ProviderManager, starMgr StarManagerLike, cfgMgr *config.ConfigManager, extra ...HostServiceExtras) {
+	if len(extra) > 0 {
+		hostExtras = extra[0]
+	}
 	if subMgr != nil && subMgr.dataDir != "" {
 		personaDataPath = filepath.Join(subMgr.dataDir, "personas.json")
 		// 大文件 Blob 存储根目录 data/blobs（P0-2）。启动即初始化，TTL 10min。
@@ -1132,6 +1152,106 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			subMgr.UnregisterSessionWait(waitID)
 		},
+
+		// ── 技能（Skills）──
+		ListSkills: func() []map[string]any {
+			if hostExtras.SkillMgr == nil {
+				return nil
+			}
+			return hostExtras.SkillMgr.ListSkillsInfo()
+		},
+		SetSkillActive: func(name string, active bool) error {
+			if hostExtras.SkillMgr == nil {
+				return nil
+			}
+			return hostExtras.SkillMgr.SetSkillActive(name, active)
+		},
+		DeleteSkill: func(name string) error {
+			if hostExtras.SkillMgr == nil {
+				return nil
+			}
+			return hostExtras.SkillMgr.DeleteSkill(name)
+		},
+
+		// ── 平台消息历史 ──
+		GetPlatformMessageHistory: func(platformID, userID string, limit int32) []map[string]any {
+			if hostExtras.Database == nil {
+				return nil
+			}
+			if limit <= 0 {
+				limit = 200
+			}
+			rows, err := hostExtras.Database.GetPlatformMessageHistory(platformID, userID, int(limit))
+			if err != nil {
+				return nil
+			}
+			out := make([]map[string]any, 0, len(rows))
+			for _, r := range rows {
+				out = append(out, map[string]any{
+					"id":          r.ID,
+					"platform_id": platformID,
+					"user_id":     userID,
+					"sender_id":   r.SenderID,
+					"content":     decodePMHistoryContent(r.Content),
+					"created_at":  r.CreatedAt,
+				})
+			}
+			return out
+		},
+		InsertPlatformMessageHistory: func(platformID, userID, senderID string, content any, llmCheckpointID string, maxMessages int32) map[string]any {
+			if hostExtras.Database == nil {
+				return map[string]any{}
+			}
+			contentJSON := encodePMHistoryContent(content)
+			if err := hostExtras.Database.RecordPlatformMessage(platformID, userID, senderID, contentJSON); err != nil {
+				return map[string]any{}
+			}
+			if maxMessages > 0 {
+				_ = hostExtras.Database.TrimPlatformMessageHistory(platformID, userID, int(maxMessages))
+			}
+			if rows, err := hostExtras.Database.GetPlatformMessageHistory(platformID, userID, 1); err == nil && len(rows) > 0 {
+				return map[string]any{
+					"id":                rows[0].ID,
+					"platform_id":       platformID,
+					"user_id":           userID,
+					"sender_id":         rows[0].SenderID,
+					"content":           decodePMHistoryContent(rows[0].Content),
+					"llm_checkpoint_id": llmCheckpointID,
+					"created_at":        rows[0].CreatedAt,
+				}
+			}
+			return map[string]any{
+				"platform_id":       platformID,
+				"user_id":           userID,
+				"sender_id":         senderID,
+				"content":           content,
+				"llm_checkpoint_id": llmCheckpointID,
+			}
+		},
+		UpdatePlatformMessageHistory: func(id int64, content any, llmCheckpointID string) error {
+			if hostExtras.Database == nil {
+				return nil
+			}
+			var contentPtr *string
+			if content != nil {
+				encoded := encodePMHistoryContent(content)
+				contentPtr = &encoded
+			}
+			var ckPtr *string
+			if llmCheckpointID != "" {
+				ck := llmCheckpointID
+				ckPtr = &ck
+			}
+			_, err := hostExtras.Database.UpdatePlatformMessageHistory(id, contentPtr, ckPtr)
+			return err
+		},
+		DeletePlatformMessageHistory: func(id int64) error {
+			if hostExtras.Database == nil {
+				return nil
+			}
+			_, err := hostExtras.Database.DeletePlatformMessageHistoryByID(id)
+			return err
+		},
 	})
 }
 
@@ -1166,4 +1286,30 @@ func applyProviderCredentials(entry map[string]any, p provider.AbstractProvider)
 	if ek, ok := cfg["embedding_api_key"].(string); ok && ek != "" {
 		entry["key"] = ek
 	}
+}
+
+// decodePMHistoryContent 把 db 存储的 content 串转回任意值：优先 JSON，
+// 失败时原样字符串（历史留档可能是非 JSON 的纯文本）。
+func decodePMHistoryContent(s string) any {
+	var out any
+	if s != "" && json.Unmarshal([]byte(s), &out) == nil {
+		return out
+	}
+	return s
+}
+
+// encodePMHistoryContent 把 content 编码为 db 存储串：可 JSON 化值转 JSON，
+// 字符串原样保留（与 RecordPlatformMessage 的 content 语义一致）。
+func encodePMHistoryContent(content any) string {
+	if content == nil {
+		return ""
+	}
+	if s, ok := content.(string); ok {
+		return s
+	}
+	b, err := json.Marshal(content)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }

@@ -349,7 +349,10 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			}
 			return out
 		},
-	}, l.configMgr)
+	}, l.configMgr, plugin.HostServiceExtras{
+		SkillMgr: l.skillMgr,
+		Database: l.database,
+	})
 	// 能力接线：先注入固定能力集（平台尚未加载，All() 为空），插件进程
 	// 启动时即带 ASTRBOT_HOST_CAPABILITIES 环境变量；loadPlatforms 完成后
 	// 再同步一次（含平台 ID），供后续懒加载/重载的插件使用。
