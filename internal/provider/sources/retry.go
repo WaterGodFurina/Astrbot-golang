@@ -51,9 +51,9 @@ type RetryConfig struct {
 	//   Retry429Max:     遇 429 时最多重试次数（默认 5，<=0 视为 1）
 	//   Retry429Fixed:   是否按固定秒数等待（默认 false → 指数退避）
 	//   Retry429FixedSeconds: 固定等待秒数（默认 10）
-	Retry429Enabled     bool
-	Retry429Max         int
-	Retry429Fixed       bool
+	Retry429Enabled      bool
+	Retry429Max          int
+	Retry429Fixed        bool
 	Retry429FixedSeconds int
 }
 
