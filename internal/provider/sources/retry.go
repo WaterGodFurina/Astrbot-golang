@@ -51,7 +51,7 @@ type RetryConfig struct {
 	//   Retry429Max:     遇 429 时最多重试次数（默认 5，<=0 视为 1）
 	//   Retry429Fixed:   是否按固定秒数等待（默认 false → 指数退避）
 	//   Retry429FixedSeconds: 固定等待秒数（默认 10）
-	Retry429Enabled      bool
+	Retry429Enabled      *bool
 	Retry429Max          int
 	Retry429Fixed        bool
 	Retry429FixedSeconds int
@@ -65,7 +65,7 @@ func DefaultRetryConfig() RetryConfig {
 		MaxDelay:    30 * time.Second,
 		Retry429:    true,
 
-		Retry429Enabled:      true,
+		// Retry429Enabled 保持 nil：表示未显式设置（默认开启 429 重试）。
 		Retry429Max:          5,
 		Retry429Fixed:        false,
 		Retry429FixedSeconds: 10,
@@ -100,8 +100,11 @@ func RetryConfigFromSettings(settings map[string]interface{}) RetryConfig {
 		cfg.Retry429 = false
 	}
 	// 429 专用配置。
+	// 429 专用配置。request_retry_429_enabled 缺省（nil）视为开启；
+	// 显式 true/false 才记录，false 时关闭 429 重试。
 	if v, ok := settings["request_retry_429_enabled"].(bool); ok {
-		cfg.Retry429Enabled = v
+		b := v
+		cfg.Retry429Enabled = &b
 	}
 	if v := configInt(settings, "request_retry_429_max", 0); v > 0 {
 		cfg.Retry429Max = v
@@ -241,10 +244,11 @@ func DoWithRetry(
 		} else {
 			status := resp.StatusCode
 			if status == http.StatusTooManyRequests {
-				if !cfg.Retry429Enabled || !cfg.Retry429 {
+				// 429 独立重试：仅当未显式禁用（request_retry_429_enabled=false）
+				// 时进入专用分支（固定或指数，最多 Retry429Max 次）。
+				if cfg.Retry429Enabled != nil && !*cfg.Retry429Enabled {
 					return resp, nil
 				}
-				// 429 独立重试：固定或指数，最多 Retry429Max 次
 				resp, err = retry429(ctx, client, factory, resp, cfg, providerLabel)
 				if err != nil {
 					return nil, err
