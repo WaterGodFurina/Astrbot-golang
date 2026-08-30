@@ -2274,15 +2274,16 @@ export const useExtensionPage = (initialTab = "installed") => {
   };
 
   const annotateMarketVersionSupport = async () => {
-    // 宿主对比版本随插件来源切换：Python 市场用宿主对齐的 Python 版本号
-    //（4.x，插件 astrbot_version 如 >=4.26,<5），Go 市场用 Go 发布版本号
-    //（1.x）。不能用 Go 版去比对 Python 插件的 astrbot_version，否则误报不兼容。
+    // 市场插件的 astrbot_version 约束是对齐的 Python 版本号（如 >=4.16），
+    // 必须用宿主对齐的 Python 版本（pythonVersion，默认 4.27.4）比对，
+    // 而不是 Go 版发布版本号（astrbotVersion，如 1.1.3）。
+    if (!commonStore.pythonVersion) {
+      await commonStore
+        .fetchAstrBotVersion()
+        .catch(() => "");
+    }
+    const currentVersion = commonStore.pythonVersion || "";
     const sourceType = getSourceTypeForUrl(selectedSource.value);
-    await commonStore.fetchAstrBotVersion().catch(() => "");
-    const currentVersion =
-      sourceType === "python"
-        ? commonStore.pythonVersion
-        : commonStore.astrbotVersion;
     pluginMarketData.value.forEach((plugin) => {
       const result = checkAstrBotVersionSupport(
         plugin?.astrbot_version,
@@ -2713,14 +2714,15 @@ export const useExtensionPage = (initialTab = "installed") => {
       return;
     }
 
-    await commonStore.fetchAstrBotVersion().catch(() => "");
-    const runtime = String(plugin?.runtime || "").toLowerCase();
-    // Python 插件按宿主对齐的 Python 版本（4.x）比对 astrbot_version，Go 插件
-    // 按 Go 发布版本（1.x）比对，避免 Go 版误拒绝 >=4.26,<5 这类 Python 约束。
-    const currentVersion =
-      runtime === "python"
-        ? commonStore.pythonVersion
-        : commonStore.astrbotVersion;
+    // 插件的 astrbot_version 约束对齐 Python 版本号（如 >=4.16,<5），必须用
+    // 宿主对齐的 Python 版本（pythonVersion，如 4.27.4）比对，而非 Go 发布
+    // 版本号（astrbotVersion，如 1.2.2）。
+    if (!commonStore.pythonVersion) {
+      await commonStore
+        .fetchAstrBotVersion()
+        .catch(() => "");
+    }
+    const currentVersion = commonStore.pythonVersion || "";
     const result = checkAstrBotVersionSupport(
       plugin.astrbot_version,
       currentVersion,

@@ -187,6 +187,7 @@
     "updateToolPermissionSuccess": "Доступ к {name} обновлён",
     "updateToolPermissionFailed": "Не удалось обновить доступ к инструменту",
     "updateToolPermissionBuiltin": "Встроенные инструменты не поддерживают настройку доступа.",
-    "testError": "Ошибка теста связи: {error}"
+    "testError": "Ошибка теста связи: {error}",
+    "testSuccess": "Тест MCP-сервера пройден ({count} инструментов)"
   }
 }

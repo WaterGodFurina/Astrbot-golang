@@ -4757,13 +4757,14 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 			return
 		case "test":
 			var body struct {
-				ServerName string `json:"server_name"`
+				ServerName string                 `json:"server_name"`
+				Config     map[string]interface{} `json:"mcp_server_config"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
 				return
 			}
-			s.testMCPServer(w, r, body.ServerName)
+			s.testMCPServer(w, r, body.ServerName, body.Config)
 			return
 		}
 		serverName := parts[1]
@@ -4787,7 +4788,18 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 				}
 				writeJSON(w, http.StatusOK, apiOKMsg("MCP server 状态已更新", map[string]interface{}{}))
 			case "test":
-				s.testMCPServer(w, r, serverName)
+				var body struct {
+					ServerName string                 `json:"server_name"`
+					Config     map[string]interface{} `json:"mcp_server_config"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
+				if body.ServerName != "" {
+					serverName = body.ServerName
+				}
+				s.testMCPServer(w, r, serverName, body.Config)
 			default:
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 			}
@@ -4980,16 +4992,25 @@ func (s *Server) syncModelScopeMCPServers(accessToken string) (int, error) {
 }
 
 // (stdio: check command exists; sse/http: try a HEAD/GET request).
-func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request, serverName string) {
-	cfg := s.mcp.get(serverName)
+func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request, serverName string, draftCfg map[string]interface{}) {
+	cfg := draftCfg
 	if len(cfg) == 0 {
-		writeJSON(w, http.StatusOK, apiError("Server does not exist"))
-		return
+		cfg = s.mcp.get(serverName)
+		if len(cfg) == 0 {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"name":    serverName,
+				"success": false,
+				"error":   "Server does not exist",
+				"tools":   []interface{}{},
+			}))
+			return
+		}
 	}
 	result := map[string]interface{}{
 		"name":    serverName,
 		"success": true,
 		"error":   nil,
+		"tools":   []interface{}{},
 	}
 	transport, _ := cfg["transport"].(string)
 	if transport == "" {

@@ -191,7 +191,10 @@ export const useCommonStore = defineStore("common", {
       return this.githubProxyConfig;
     },
     async fetchAstrBotVersion(force = false) {
-      if (!force && this.astrbotVersion) {
+      // pythonVersion 为空说明尚未拉到 /stats/version（含 python_version 字
+      // 段），此时即使 astrbotVersion 有缓存也要强制拉取，否则 Python 插件
+      // 的 astrbot_version 校验永远拿不到 4.x 宿主版本。
+      if (!force && this.astrbotVersion && this.pythonVersion) {
         return this.astrbotVersion;
       }
       const res = await statsApi.version();
