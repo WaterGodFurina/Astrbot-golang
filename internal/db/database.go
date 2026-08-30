@@ -1390,14 +1390,25 @@ func (d *Database) ListKBChunks(kbID, docID string) ([]KBChunk, error) {
 }
 
 // ListKBChunksPage returns one page of chunk records for a KB (limit<=0 =
-// no limit), optionally filtered by doc_id.
+// no limit), optionally filtered by doc_id and a content search keyword.
 func (d *Database) ListKBChunksPage(kbID, docID string, limit, offset int) ([]KBChunk, error) {
+	return d.ListKBChunksPageSearch(kbID, docID, "", limit, offset)
+}
+
+// ListKBChunksPageSearch is ListKBChunksPage plus a case-insensitive content
+// LIKE filter (search != ""). The keyword is escaped so no LIKE wildcards leak
+// in from user input (plain substring match).
+func (d *Database) ListKBChunksPageSearch(kbID, docID, search string, limit, offset int) ([]KBChunk, error) {
 	query := `SELECT chunk_id, kb_id, doc_id, COALESCE(doc_name,''), content, chunk_index
 		FROM knowledge_base_chunks WHERE kb_id=?`
 	args := []any{kbID}
 	if docID != "" {
 		query += ` AND doc_id=?`
 		args = append(args, docID)
+	}
+	if search != "" {
+		query += ` AND content LIKE ? ESCAPE '\' COLLATE NOCASE`
+		args = append(args, "%"+escapeLike(search)+"%")
 	}
 	query += ` ORDER BY chunk_index ASC`
 	if limit > 0 {
@@ -1421,13 +1432,32 @@ func (d *Database) ListKBChunksPage(kbID, docID string, limit, offset int) ([]KB
 	return out, rows.Err()
 }
 
+// escapeLike escapes SQL LIKE wildcards (% _ \) in user input so only literal
+// matches happen. Backslash is escaped first so our ESCAPE '\' works.
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
 // CountKBChunks returns the number of chunks for a KB (optionally per doc).
 func (d *Database) CountKBChunks(kbID, docID string) (int, error) {
+	return d.CountKBChunksSearch(kbID, docID, "")
+}
+
+// CountKBChunksSearch counts chunks with the same filters as
+// ListKBChunksPageSearch (content LIKE keyword included).
+func (d *Database) CountKBChunksSearch(kbID, docID, search string) (int, error) {
 	query := `SELECT COUNT(*) FROM knowledge_base_chunks WHERE kb_id=?`
 	args := []any{kbID}
 	if docID != "" {
 		query += ` AND doc_id=?`
 		args = append(args, docID)
+	}
+	if search != "" {
+		query += ` AND content LIKE ? ESCAPE '\' COLLATE NOCASE`
+		args = append(args, "%"+escapeLike(search)+"%")
 	}
 	var n int
 	err := d.db.QueryRow(query, args...).Scan(&n)

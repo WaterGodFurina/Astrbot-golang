@@ -2886,6 +2886,7 @@ export type ListKnowledgeChunksData = {
         document_id?: string;
         page?: number;
         page_size?: number;
+        search?: string;
     };
 };
 

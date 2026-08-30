@@ -45,6 +45,16 @@ type RetryConfig struct {
 	MinDelay    time.Duration
 	MaxDelay    time.Duration
 	Retry429    bool // whether 429 rate-limit counts as retryable
+
+	// 429 专用重试（provider_settings.request_retry_429_*）：
+	//   Retry429Enabled: 总开关，false 时遇 429 不重试（默认 true）
+	//   Retry429Max:     遇 429 时最多重试次数（默认 5，<=0 视为 1）
+	//   Retry429Fixed:   是否按固定秒数等待（默认 false → 指数退避）
+	//   Retry429FixedSeconds: 固定等待秒数（默认 10）
+	Retry429Enabled     bool
+	Retry429Max         int
+	Retry429Fixed       bool
+	Retry429FixedSeconds int
 }
 
 // DefaultRetryConfig returns the default retry configuration.
@@ -54,6 +64,11 @@ func DefaultRetryConfig() RetryConfig {
 		MinDelay:    200 * time.Millisecond,
 		MaxDelay:    30 * time.Second,
 		Retry429:    true,
+
+		Retry429Enabled:      true,
+		Retry429Max:          5,
+		Retry429Fixed:        false,
+		Retry429FixedSeconds: 10,
 	}
 }
 
@@ -63,6 +78,10 @@ func DefaultRetryConfig() RetryConfig {
 //   - request_retry_min_delay_ms (default 200)
 //   - request_retry_max_delay_ms (default 30000)
 //   - request_retry_rate_limits (default true; set false to skip 429)
+//   - request_retry_429_enabled (default true; set false to skip 429 retry)
+//   - request_retry_429_max (default 5; <=0 coerced to 1)
+//   - request_retry_429_strategy ("exponential" | "fixed", default exponential)
+//   - request_retry_429_fixed_seconds (default 10)
 func RetryConfigFromSettings(settings map[string]interface{}) RetryConfig {
 	cfg := DefaultRetryConfig()
 	if settings == nil {
@@ -79,6 +98,22 @@ func RetryConfigFromSettings(settings map[string]interface{}) RetryConfig {
 	}
 	if v, ok := settings["request_retry_rate_limits"].(bool); ok && !v {
 		cfg.Retry429 = false
+	}
+	// 429 专用配置。
+	if v, ok := settings["request_retry_429_enabled"].(bool); ok {
+		cfg.Retry429Enabled = v
+	}
+	if v := configInt(settings, "request_retry_429_max", 0); v > 0 {
+		cfg.Retry429Max = v
+	}
+	if cfg.Retry429Max <= 0 {
+		cfg.Retry429Max = 1
+	}
+	if v, ok := settings["request_retry_429_strategy"].(string); ok {
+		cfg.Retry429Fixed = v != "exponential"
+	}
+	if v := configInt(settings, "request_retry_429_fixed_seconds", 0); v > 0 {
+		cfg.Retry429FixedSeconds = v
 	}
 	return cfg
 }
@@ -205,7 +240,18 @@ func DoWithRetry(
 			}
 		} else {
 			status := resp.StatusCode
-			retryable := (status == http.StatusTooManyRequests && cfg.Retry429) || IsRetryableStatus(status)
+			if status == http.StatusTooManyRequests {
+				if !cfg.Retry429Enabled || !cfg.Retry429 {
+					return resp, nil
+				}
+				// 429 独立重试：固定或指数，最多 Retry429Max 次
+				resp, err = retry429(ctx, client, factory, resp, cfg, providerLabel)
+				if err != nil {
+					return nil, err
+				}
+				return resp, nil
+			}
+			retryable := IsRetryableStatus(status)
 			if status == http.StatusOK || status == http.StatusCreated || !retryable {
 				return resp, nil
 			}
@@ -217,19 +263,6 @@ func DoWithRetry(
 			retryLogger.Warn("[%s] Retryable status %d (attempt %d/%d): %s",
 				providerLabel, status, attempt, cfg.MaxAttempts,
 				truncate(lastErr.Error(), 200))
-			// Respect Retry-After for 429, capped at MaxDelay so a huge or
-			// mis-united header value (e.g. 60000 ms read as seconds) cannot
-			// stall the caller for hours.
-			if status == http.StatusTooManyRequests {
-				if d := ParseRetryAfter(resp.Header.Get("Retry-After")); d > 0 {
-					if d > cfg.MaxDelay {
-						d = cfg.MaxDelay
-					}
-					retryLogger.Debug("[%s] Retry-After: waiting %v before next attempt", providerLabel, d)
-					sleepWithContext(ctx, d)
-					continue
-				}
-			}
 		}
 
 		if attempt < cfg.MaxAttempts {
@@ -247,4 +280,66 @@ func DoWithRetry(
 		lastErr = fmt.Errorf("last status %d", lastResp.StatusCode)
 	}
 	return nil, fmt.Errorf("[%s] max retries (%d) exceeded: %w", providerLabel, cfg.MaxAttempts, lastErr)
+}
+
+// retry429 performs a dedicated 429 rate-limit retry loop. It consumes and
+// closes each 429 response, then re-issues the request up to
+// cfg.Retry429Max times. The wait between attempts honors the Retry-After
+// header when present; otherwise it is fixed
+// (cfg.Retry429FixedSeconds) when cfg.Retry429Fixed, or exponential backoff
+// otherwise. Returns the first non-429 response (body intact) or an error
+// after the budget is exhausted.
+func retry429(
+	ctx context.Context,
+	client *http.Client,
+	factory RequestFactory,
+	initial *http.Response,
+	cfg RetryConfig,
+	providerLabel string,
+) (*http.Response, error) {
+	resp := initial
+	for attempt := 0; ; attempt++ {
+		status := resp.StatusCode
+		// 成功或非 429（例如临时改判 502→结果继续走通用重试）直接原样返回，
+		// body 保持未消费，调用方负责读取/关闭。
+		if status == http.StatusOK || status == http.StatusCreated || status != http.StatusTooManyRequests {
+			return resp, nil
+		}
+		// 429：消费并关闭当前响应体，准备重试。
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if attempt >= cfg.Retry429Max {
+			return nil, fmt.Errorf("[%s] HTTP 429 rate-limit max retries (%d) exceeded", providerLabel, cfg.Retry429Max)
+		}
+		var delay time.Duration
+		if cfg.Retry429Fixed {
+			delay = time.Duration(cfg.Retry429FixedSeconds) * time.Second
+			if ra := ParseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
+				delay = ra
+			}
+		} else if ra := ParseRetryAfter(resp.Header.Get("Retry-After")); ra > 0 {
+			delay = ra
+		} else {
+			delay = backoffDelay(attempt+1, cfg)
+		}
+		if delay > cfg.MaxDelay {
+			delay = cfg.MaxDelay
+		}
+		retryLogger.Warn("[%s] HTTP 429 rate-limit (attempt %d/%d), retrying in %v",
+			providerLabel, attempt+1, cfg.Retry429Max, delay)
+		sleepWithContext(ctx, delay)
+		req, err := factory()
+		if err != nil {
+			return nil, fmt.Errorf("[%s] create request for 429 retry: %w", providerLabel, err)
+		}
+		resp, err = client.Do(req)
+		if err != nil {
+			if isRetryableError(err) {
+				retryLogger.Debug("[%s] 429-retry HTTP error (attempt %d/%d): %v",
+					providerLabel, attempt+1, cfg.Retry429Max, err)
+				continue
+			}
+			return nil, fmt.Errorf("[%s] %w", providerLabel, err)
+		}
+	}
 }

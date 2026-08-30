@@ -1568,7 +1568,7 @@ export const knowledgeApi = {
   },
   chunks(
     kbId: string,
-    params?: { document_id?: string; page?: number; page_size?: number },
+    params?: { document_id?: string; page?: number; page_size?: number; search?: string },
   ) {
     return typed<any>(
       openApiV1.listKnowledgeChunks({

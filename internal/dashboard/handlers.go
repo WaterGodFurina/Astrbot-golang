@@ -3114,10 +3114,12 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 				// with real pagination（对齐前端 page/page_size 参数，避免大 KB
 				// 全量返回）。doc_id 过滤：前端发送 document_id 查询参数
 				//（DocumentDetail.vue），同时兼容 doc_id 旧参数。
+				// search 过滤：按 chunk content 做不区分大小写的子串匹配。
 				docID := r.URL.Query().Get("document_id")
 				if docID == "" {
 					docID = r.URL.Query().Get("doc_id")
 				}
+				search := strings.TrimSpace(r.URL.Query().Get("search"))
 				page := parseIntDefault(r.URL.Query().Get("page"), 1)
 				pageSize := parseIntDefault(r.URL.Query().Get("page_size"), 50)
 				if page < 1 {
@@ -3127,10 +3129,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 					pageSize = 50
 				}
 				total := 0
-				if n, err := s.database.CountKBChunks(kbID, docID); err == nil {
+				if n, err := s.database.CountKBChunksSearch(kbID, docID, search); err == nil {
 					total = n
 				}
-				chunks, err := s.database.ListKBChunksPage(kbID, docID, pageSize, (page-1)*pageSize)
+				chunks, err := s.database.ListKBChunksPageSearch(kbID, docID, search, pageSize, (page-1)*pageSize)
 				items := []interface{}{}
 				if err == nil {
 					for _, c := range chunks {
@@ -3259,10 +3261,12 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 }
 
 // writeKBList writes the paginated KB list in the WebUI's expected shape
-// {items, page, page_size, total}.
+// {items, page, page_size, total}. Supports ?search= to filter by KB name
+// (case-insensitive substring).
 func (s *Server) writeKBList(w http.ResponseWriter, r *http.Request) {
 	page := 1
 	pageSize := 20
+	search := strings.TrimSpace(r.URL.Query().Get("search"))
 	if v := r.URL.Query().Get("page"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			page = n
@@ -3282,6 +3286,24 @@ func (s *Server) writeKBList(w http.ResponseWriter, r *http.Request) {
 				all = append(all, s.kbRowToMap(&rows[i]))
 			}
 		}
+	}
+	// search 过滤：按 kb_name / description 做不区分大小写的子串匹配。
+	if search != "" {
+		sl := strings.ToLower(search)
+		filtered := all[:0]
+		for _, item := range all {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["kb_name"].(string)
+			desc, _ := m["description"].(string)
+			if strings.Contains(strings.ToLower(name), sl) ||
+				strings.Contains(strings.ToLower(desc), sl) {
+				filtered = append(filtered, item)
+			}
+		}
+		all = filtered
 	}
 	total := len(all)
 	start := (page - 1) * pageSize

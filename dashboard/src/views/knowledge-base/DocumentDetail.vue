@@ -92,7 +92,7 @@
             {{ totalChunks }} {{ t('chunks.title') }}
           </v-chip>
           <v-spacer />
-          <!-- <v-text-field
+          <v-text-field
             v-model="searchQuery"
             prepend-inner-icon="mdi-magnify"
             :placeholder="t('chunks.searchPlaceholder')"
@@ -101,7 +101,8 @@
             hide-details
             clearable
             style="max-width: 300px"
-          /> -->
+            @update:model-value="handleSearch"
+          />
         </v-card-title>
 
         <v-card-text class="pa-0">
@@ -300,14 +301,18 @@ const headers = [
   { title: t('chunks.actions'), key: 'actions', sortable: false, width: 150 }
 ]
 
-// 过滤分块
+// 过滤分块：搜索词传给后端做子串过滤（search 参数），前端不再本地切片
+//（避免只过滤当前页）；空搜索直接返回后端全量列表。
 const filteredChunks = computed(() => {
-  if (!searchQuery.value) return chunks.value
-  const query = searchQuery.value.toLowerCase()
-  return chunks.value.filter(chunk =>
-    chunk.content.toLowerCase().includes(query)
-  )
+  return chunks.value
 })
+
+// 搜索输入变化（含清空 → model 可为 null）：重置到第 1 页并重新请求，
+// 交给后端过滤。
+const handleSearch = () => {
+  page.value = 1
+  loadChunks()
+}
 
 // 加载文档详情
 const loadDocument = async () => {
@@ -336,10 +341,12 @@ const loadChunks = async () => {
   loadingChunks.value = true
   chunksLoadError.value = false
   try {
+    const kw = (searchQuery.value || '').trim()
     const response = await knowledgeApi.chunks(kbId.value, {
-        document_id: docId.value, 
+        document_id: docId.value,
         page: page.value,
-        page_size: pageSize.value
+        page_size: pageSize.value,
+        ...(kw ? { search: kw } : {})
     })
     if (response.data.status === 'ok') {
       chunks.value = response.data.data.items || []

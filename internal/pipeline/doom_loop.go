@@ -8,9 +8,25 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
-// doomLoopThreshold is the number of consecutive same-tool calls before we
-// pause the tool and ask the session owner for confirmation.
+// doomLoopThreshold is the default number of consecutive same-tool calls
+// before we pause the tool and ask the session owner for confirmation. It is
+// overridden per-session by provider_settings.computer_use_max_same_tool_calls
+// (0 disables the detector entirely).
 const doomLoopThreshold = 5
+
+// doomLoopThresholdValue returns the effective same-tool repetition threshold
+// for the current process: provider_settings.computer_use_max_same_tool_calls.
+// nil/negative falls back to doomLoopThreshold (5); 0 disables detection.
+func (s *ProcessStage) doomLoopThresholdValue() int {
+	if s.providerConf == nil || s.providerConf.ComputerUseMaxSameToolCalls == nil {
+		return doomLoopThreshold
+	}
+	v := *s.providerConf.ComputerUseMaxSameToolCalls
+	if v <= 0 {
+		return 0 // 禁用重复检测
+	}
+	return v
+}
 
 // doomTrackerTTL is how long an idle session's doom tracker is kept before it
 // is pruned. Paused sessions (waiting for owner confirmation) are never
@@ -143,6 +159,11 @@ func (s *ProcessStage) checkDoomLoop(event *core.Event, toolName string) bool {
 	if doomWhitelist[toolName] {
 		return true
 	}
+	// 阈值 <= 0 = 禁用重复检测（provider_settings.computer_use_max_same_tool_calls）。
+	threshold := s.doomLoopThresholdValue()
+	if threshold <= 0 {
+		return true
+	}
 	umo := event.UnifiedMsgOrigin()
 	s.doomMu.Lock()
 	// Lazy TTL sweep: drop trackers of sessions idle beyond the TTL before
@@ -165,14 +186,14 @@ func (s *ProcessStage) checkDoomLoop(event *core.Event, toolName string) bool {
 		tr.lastTool = toolName
 		tr.count = 1
 	}
-	if tr.count >= doomLoopThreshold {
+	if tr.count >= threshold {
 		tr.pausedTool = toolName
 		tr.askSender = event.Source.SenderID
 		tr.resumePrompt = event.PlainText
 		// 先释放锁再询问会话所有者：askDoomConfirm 的发送是网络 IO，不能
 		// 持全局锁进行；此后不再访问 doomMu 保护的共享状态。
 		s.doomMu.Unlock()
-		s.askDoomConfirm(event, toolName)
+		s.askDoomConfirm(event, toolName, threshold)
 		return false
 	}
 	s.doomMu.Unlock()
@@ -193,8 +214,8 @@ func (s *ProcessStage) pruneDoomTrackers() {
 }
 
 // askDoomConfirm sends a confirmation request to the session owner.
-func (s *ProcessStage) askDoomConfirm(event *core.Event, toolName string) {
-	text := "检测到工具 " + toolName + " 已连续调用 " + itoa(doomLoopThreshold) +
+func (s *ProcessStage) askDoomConfirm(event *core.Event, toolName string, threshold int) {
+	text := "检测到工具 " + toolName + " 已连续调用 " + itoa(threshold) +
 		" 次，可能是重复/死循环。已暂停该工具的执行。\n" +
 		"如需继续执行，请由本次请求的发起者回复“继续”；回复其他内容将保持停止。"
 	s.replyText(event, text)
