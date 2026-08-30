@@ -67,10 +67,10 @@
         "request_retry_429_strategy": {
           "description": "429限流的重试方式",
           "hint": "选择 429 重试的等待方式：指数重试按指数退避等待；单次时间重试每次固定等待相同秒数。",
-          "labels": {
-            "exponential": "指数重试",
-            "fixed": "单次时间重试"
-          }
+          "labels": [
+            "指数重试",
+            "单次时间重试"
+          ]
         },
         "request_retry_429_fixed_seconds": {
           "description": "单次时间重试的秒数",

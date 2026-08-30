@@ -3114,12 +3114,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 				// with real pagination（对齐前端 page/page_size 参数，避免大 KB
 				// 全量返回）。doc_id 过滤：前端发送 document_id 查询参数
 				//（DocumentDetail.vue），同时兼容 doc_id 旧参数。
-				// search 过滤：按 chunk content 做不区分大小写的子串匹配。
 				docID := r.URL.Query().Get("document_id")
 				if docID == "" {
 					docID = r.URL.Query().Get("doc_id")
 				}
-				search := strings.TrimSpace(r.URL.Query().Get("search"))
 				page := parseIntDefault(r.URL.Query().Get("page"), 1)
 				pageSize := parseIntDefault(r.URL.Query().Get("page_size"), 50)
 				if page < 1 {
@@ -3129,10 +3127,10 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 					pageSize = 50
 				}
 				total := 0
-				if n, err := s.database.CountKBChunksSearch(kbID, docID, search); err == nil {
+				if n, err := s.database.CountKBChunks(kbID, docID); err == nil {
 					total = n
 				}
-				chunks, err := s.database.ListKBChunksPageSearch(kbID, docID, search, pageSize, (page-1)*pageSize)
+				chunks, err := s.database.ListKBChunksPage(kbID, docID, pageSize, (page-1)*pageSize)
 				items := []interface{}{}
 				if err == nil {
 					for _, c := range chunks {

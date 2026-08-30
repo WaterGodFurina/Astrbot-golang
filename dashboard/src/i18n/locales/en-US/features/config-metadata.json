@@ -67,10 +67,10 @@
         "request_retry_429_strategy": {
           "description": "429 Retry Strategy",
           "hint": "How long to wait between 429 retries: exponential backoff or a fixed per-retry delay.",
-          "labels": {
-            "exponential": "Exponential backoff",
-            "fixed": "Fixed delay"
-          }
+          "labels": [
+            "Exponential backoff",
+            "Fixed delay"
+          ]
         },
         "request_retry_429_fixed_seconds": {
           "description": "Fixed Retry Delay (seconds)",

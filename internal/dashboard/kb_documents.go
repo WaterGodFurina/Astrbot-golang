@@ -379,9 +379,15 @@ func (s *Server) kbDocList(w http.ResponseWriter, r *http.Request, kbID string) 
 		}
 	}
 	items := []interface{}{}
+	search := strings.TrimSpace(r.URL.Query().Get("search"))
 	if entries, err := os.ReadDir(dir); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			// search 过滤：按文档文件名做不区分大小写的子串匹配（doc_name）。
+			if search != "" && !strings.Contains(strings.ToLower(name), strings.ToLower(search)) {
 				continue
 			}
 			info, _ := e.Info()
@@ -397,8 +403,8 @@ func (s *Server) kbDocList(w http.ResponseWriter, r *http.Request, kbID string) 
 			chunkCount := chunkCounts[docID]
 			items = append(items, map[string]interface{}{
 				"doc_id":      docID,
-				"doc_name":    e.Name(),
-				"file_type":   strings.TrimPrefix(filepath.Ext(e.Name()), "."),
+				"doc_name":    name,
+				"file_type":   strings.TrimPrefix(filepath.Ext(name), "."),
 				"file_size":   size,
 				"created_at":  modTime.Format(time.RFC3339),
 				"chunk_count": chunkCount,
