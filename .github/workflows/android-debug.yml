@@ -1,0 +1,58 @@
+name: Android Debug Build (Termux Docker)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    container:
+      image: termux/termux-docker:aarch64
+
+    steps:
+      - name: setup
+        run: |
+          /entrypoint.sh pkg update -y
+          /entrypoint.sh pkg install -y git golang clang make
+
+      - name: check environment
+        run: |
+          /entrypoint.sh bash -c '
+            uname -a
+            echo "PREFIX=$PREFIX"
+            go version
+            clang --version
+          '
+
+      - name: clone
+        run: |
+          /entrypoint.sh git clone --depth 1 \
+            https://github.com/${{ github.repository }}.git "$HOME/repo"
+
+      - name: build (go build -x 全量输出)
+        run: |
+          /entrypoint.sh bash -c '
+            cd ~/repo
+            export CGO_ENABLED=1
+            export GOOS=android
+            export GOARCH=arm64
+            export GOARM64=v8.0
+            export CC=$PREFIX/bin/clang
+            export CXX=$PREFIX/bin/clang++
+            echo "=== CC=$CC ==="
+            $CC --version || true
+            go build -x -o astrbot-debug ./cmd/astrbot 2>&1 | tee go-build.log
+            RC=$?
+            echo "=== exit code: $RC ==="
+            ls -la astrbot-debug || true
+            file astrbot-debug || true
+          '
+
+      - name: output log to stdout
+        run: |
+          /entrypoint.sh bash -c '
+            echo "========== GO BUILD LOG =========="
+            cat ~/repo/go-build.log
+            echo "========== END =========="
+          '

@@ -145,6 +145,17 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	case "files":
 		s.handleFiles(w, r, rest)
 
+	// ── File tokens（公开静态文件服务）────────────────────
+	case "file":
+		// GET /api/file/{token}：对齐 Python 本体的公开静态文件服务——
+		// token 本身即凭据（随机 uuid4 不可枚举 + TTL），按 token 查注册表
+		// 后流式发送宿主侧文件（过期=410，未登记=404）。
+		if len(rest) > 0 && rest[0] != "" {
+			s.handleFileToken(w, r, rest[0])
+		} else {
+			writeJSON(w, http.StatusNotFound, apiError("missing file token"))
+		}
+
 	// ── T2I (text-to-image) ──────────────────────────────
 	case "t2i":
 		s.handleT2I(w, r, rest)
@@ -244,6 +255,14 @@ func (s *Server) apiAuthAllowed(r *http.Request) bool {
 		// 内部另有签名校验，因此放行带具体 uuid 的路径；仅 webhooks 段的
 		// uuid 列表枚举（GET /api/v1/webhooks）仍要求认证。
 		if len(parts) >= 3 && parts[1] == "platforms" && parts[2] != "" {
+			return true
+		}
+	case "file":
+		// GET /api/file/{token}：公开文件令牌服务（对齐 Python 本体
+		// /api/file/{token}）。token 为随机 uuid4（不可枚举）且带 TTL，
+		// token 本身即凭据；注册表 lookup 失败按 404/410 拒绝。
+		// 无 token 段的裸 /api/file 仍要求认证。
+		if len(parts) >= 2 && parts[1] != "" {
 			return true
 		}
 	}

@@ -1,0 +1,223 @@
+name: AstrBot-golang 多平台发布构建
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '构建的 git 引用（分支/tag/SHA）。留空 = 自动使用 GitHub 最新 release'
+        required: false
+        default: ''
+      go_version:
+        description: '覆盖 Go 版本（留空 = 自动读取 go.mod，保持同步）'
+        required: false
+        default: ''
+      python_version:
+        description: 'AstrBot（Python）源版本号（跟随的 Python 版本，留空 = 4.27.4）'
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*.*'
+
+jobs:
+  update-go-sum:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+
+      - name: 用 goproxy.cn 校验 go.sum 可重建（只读验证，不写回仓库）
+        env:
+          GOPROXY: https://goproxy.cn,https://proxy.golang.org,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+        run: |
+          # goproxy.cn 与 GitHub runner 偶发 HTTP/2 抖动（DATA after END_STREAM），
+          # 重试 5 次避免一次网络抖动废掉整个发布。
+          # 仅做本地重建校验（go mod tidy 会更新本地 go.sum，但不提交回仓库——
+          # workflow 禁止向 main 写入文件）。
+          for i in 1 2 3 4 5; do
+            if go mod tidy; then
+              echo "go.sum 重建成功"
+              exit 0
+            fi
+            echo "go mod tidy 失败（第 $i/5 次，goproxy.cn 网络抖动），8s 后重试" >&2
+            sleep 8
+          done
+          echo "go mod tidy 重试 5 次仍失败" >&2
+          exit 1
+
+  # ── 版本/元信息：自动探测最新 release 版本 + 读取 go.mod 的 Go 版本 ──
+  release-meta:
+    runs-on: ubuntu-latest
+    outputs:
+      kind: ${{ steps.meta.outputs.kind }}
+      ref: ${{ steps.meta.outputs.ref }}
+      version: ${{ steps.meta.outputs.version }}
+      go_version: ${{ steps.gomod.outputs.go_version }}
+      python_version: ${{ steps.pymeta.outputs.python_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: 读取 go.mod 的 Go 版本
+        id: gomod
+        run: |
+          ver=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' go.mod | head -1)
+          echo "go_version=${ver}" >> "$GITHUB_OUTPUT"
+          echo "go.mod Go 版本: ${ver}"
+
+      - name: 读取 AstrBot（Python）源版本
+        id: pymeta
+        run: |
+          ver="${PYTHON_VERSION:-4.27.4}"
+          echo "python_version=${ver}" >> "$GITHUB_OUTPUT"
+          echo "AstrBot Python 源版本: ${ver}"
+        env:
+          PYTHON_VERSION: ${{ inputs.python_version }}
+
+      - name: 探测最新 release 版本（GitHub API，不绑定特定版本号）
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          KIND="release"
+          REF="$INPUT_REF"
+          VERSION=""
+          if [ -z "$REF" ]; then
+            # 自动取 GitHub 最新 release 的 tag（非特定版本号）
+            if TAG=$(gh api "repos/$GITHUB_REPO/releases/latest" --jq .tag_name 2>/dev/null); then
+              REF="$TAG"
+              VERSION="$TAG"
+              echo "已自动定位到最新 release: ${TAG}"
+            else
+              # 无 release 时回退到最近 tag，再退到当前 commit
+              KIND="tag"
+              REF="$(git describe --tags --abbrev=0 2>/dev/null || echo "${GITHUB_SHA}")"
+              VERSION="$REF"
+              echo "无 GitHub release，回退到最近 tag: ${REF}"
+            fi
+          else
+            VERSION="$REF"
+            echo "使用手动指定 ref: ${REF}"
+          fi
+          echo "kind=${KIND}" >> "$GITHUB_OUTPUT"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "go_version=${{ steps.gomod.outputs.go_version }}" >> "$GITHUB_OUTPUT"
+
+  # ── 多平台原生构建矩阵（镜像 cosmic-native）──
+  astrbot-native:
+    name: AstrBot ${{ matrix.resource }}
+    needs: [release-meta, update-go-sum]
+    permissions:
+      contents: write
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc,   resource: windows-x86_64,     goos: windows, goarch: amd64,   ext: .exe, libc: msvc }
+          - { runner: windows-latest, target: aarch64-pc-windows-msvc,  resource: windows-aarch64,    goos: windows, goarch: arm64,   ext: .exe, libc: msvc }
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-gnu,   resource: linux-x86_64-gnu,     goos: linux, goarch: amd64,   ext: '',   libc: gnu }
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-musl,  resource: linux-x86_64-musl,    goos: linux, goarch: amd64,   ext: '',   libc: musl }
+          - { runner: ubuntu-latest,  target: aarch64-unknown-linux-gnu,  resource: linux-aarch64-gnu,    goos: linux, goarch: arm64,   ext: '',   libc: gnu }
+          - { runner: ubuntu-latest,  target: aarch64-unknown-linux-musl, resource: linux-aarch64-musl,   goos: linux, goarch: arm64,   ext: '',   libc: musl }
+          - { runner: ubuntu-latest,  target: loongarch64-unknown-linux-gnu,  resource: linux-loongarch64-gnu,  goos: linux, goarch: loong64, ext: '', libc: gnu }
+          - { runner: ubuntu-latest,  target: loongarch64-unknown-linux-musl, resource: linux-loongarch64-musl, goos: linux, goarch: loong64, ext: '', libc: musl }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin,   resource: macos-x86_64,   goos: darwin, goarch: amd64,  ext: '', libc: '' }
+          - { runner: macos-14,       target: aarch64-apple-darwin,  resource: macos-aarch64,  goos: darwin, goarch: arm64,  ext: '', libc: '' }
+          - { runner: ubuntu-24.04-arm, target: aarch64-linux-android, resource: android-aarch64, goos: android, goarch: arm64, ext: '',   libc: bionic }
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.release-meta.outputs.ref }}
+
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: 安装 Android NDK（Lzhiyong/termux-ndk r29）
+        if: matrix.goos == 'android'
+        run: |
+          mkdir -p $HOME/ndk
+          curl -sL "https://github.com/Lzhiyong/termux-ndk/releases/download/android-ndk/android-ndk-r29-aarch64.tar.xz" -o $HOME/ndk/ndk.tar.xz
+          tar -xJf $HOME/ndk/ndk.tar.xz -C $HOME/ndk
+          echo "NDK_PATH=$HOME/ndk" >> "$GITHUB_ENV"
+
+      - name: 交叉编译 AstrBot（CGO_ENABLED=0，纯 Go，modernc.org/sqlite）
+        shell: bash
+        env:
+          CGO_ENABLED: ${{ matrix.libc == 'bionic' && '1' || '0' }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM64: v8.0
+          CC: ${{ matrix.libc == 'bionic' && format('{0}/android-ndk-r29/toolchains/llvm/prebuilt/linux-aarch64/bin/aarch64-linux-android30-clang', env.NDK_PATH) || '' }}
+          CXX: ${{ matrix.libc == 'bionic' && format('{0}/android-ndk-r29/toolchains/llvm/prebuilt/linux-aarch64/bin/aarch64-linux-android30-clang++', env.NDK_PATH) || '' }}
+          CGO_CFLAGS: ''
+          CGO_CPPFLAGS: ''
+          CGO_CXXFLAGS: ''
+          CGO_LDFLAGS: ''
+          GOPROXY: https://goproxy.cn,https://proxy.golang.org,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GOFLAGS: -mod=mod
+        run: |
+          BUILDARGS="-trimpath"
+          if [ "${{ matrix.libc }}" = "bionic" ]; then
+            # android + CGO_ENABLED=1：默认产出 PIE 动态链接（对齐 Termux go build）
+            go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ needs.release-meta.outputs.version }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ needs.release-meta.outputs.python_version }}" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
+          else
+            go build -buildmode=exe -compiler=gc -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ needs.release-meta.outputs.version }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ needs.release-meta.outputs.python_version }}" -o "astrbot${{ matrix.ext }}" ./cmd/astrbot
+          fi
+
+      - name: 打包 zip（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "astrbot${{ matrix.ext }}" -DestinationPath "astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip"
+
+      - name: 打包 zip（Linux/macOS）
+        if: runner.os != 'Windows'
+        run: zip "astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip" "astrbot${{ matrix.ext }}"
+
+      - name: 上传到最新 Release（不存在则跳过）
+        id: release_upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release-meta.outputs.version }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "astrbot-golang-$VERSION-${{ matrix.resource }}.zip" --clobber
+            echo "uploaded=true" >> "$GITHUB_OUTPUT"
+            echo "已上传到 Release $VERSION (${{ matrix.resource }})"
+          else
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Release $VERSION 不存在，不创建 release，改用 Artifact"
+          fi
+
+      - name: 上传 Artifact（Release 不存在时兜底）
+        if: steps.release_upload.outputs.uploaded != 'true'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: astrbot-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}
+          path: |
+            astrbot-golang-${{ needs.release-meta.outputs.version }}-${{ matrix.resource }}.zip
+          if-no-files-found: error
