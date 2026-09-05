@@ -53,6 +53,10 @@ type Adapter struct {
 	// msgCh 待处理的消息队列（WS 读循环仅入队，由 msgLoop 串行处理，
 	// 避免附件下载等耗时操作阻塞读循环导致连接超时）。
 	msgCh chan *pendingWsMessage
+
+	// lastSenders 记录各频道最近一次消息的发送者，供 GetGroup 填充 members
+	// （对齐本体 MattermostMessageEvent.get_group 的 members=[sender]）。
+	lastSenders map[string]platform.MessageMember
 }
 
 // pendingWsMessage 待处理的消息载荷（post 数据 + 原始 data）。
@@ -94,6 +98,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		seenPostIDs:    make(map[string]float64),
 		dedupTTL:       300.0,
 		msgCh:          make(chan *pendingWsMessage, 64),
+		lastSenders:    make(map[string]platform.MessageMember),
 	}
 }
 
@@ -314,11 +319,12 @@ func (a *Adapter) handleWsEvent(payload map[string]interface{}) {
 		return
 	}
 
-	// 事件仅入队，由 msgLoop 串行处理（附件下载在独立 goroutine 中完成）
+	// 事件投递：对齐本体 mattermost_adapter.py（消息直接 await convert+handle，
+	// 不丢弃）。队列满时阻塞等待最多 5s 并告警，超时才丢弃。
 	select {
 	case a.msgCh <- &pendingWsMessage{post: post, data: data}:
-	default:
-		logger.I18nWarn("Mattermost 消息处理队列已满, 丢弃一条消息")
+	case <-time.After(5 * time.Second):
+		logger.I18nWarn("Mattermost 消息处理队列已满，等待 5s 超时后丢弃一条消息")
 	}
 }
 
@@ -425,8 +431,44 @@ func (a *Adapter) convertMessage(ctx context.Context, post, data map[string]inte
 	abm.MessageStr = buildMessageStr(abm.Message, messageText, a.botSelfID)
 	a.mu.Lock()
 	a.lastTempPaths = tempPaths
+	// 记录频道最近发送者（供 GetGroup 使用）。
+	if abm.Sender.UserID != "" {
+		a.lastSenders[channelID] = abm.Sender
+	}
 	a.mu.Unlock()
 	return abm
+}
+
+// GetGroup 获取频道信息（对齐本体 MattermostMessageEvent.get_group，
+// mattermost_event.py:72-88）：group_name 取 display_name，回退 name/channel_id；
+// members 为该频道最近一次消息的发送者（本体为当前事件发送者）。
+func (a *Adapter) GetGroup(groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	channel, err := a.client.GetChannel(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+	group := &platform.Group{
+		GroupID:     groupID,
+		GroupName:   groupID,
+		GroupOwner:  "",
+		GroupAdmins: []string{},
+	}
+	if name := stringVal(channel["display_name"]); name != "" {
+		group.GroupName = name
+	} else if name := stringVal(channel["name"]); name != "" {
+		group.GroupName = name
+	}
+	a.mu.Lock()
+	if sender, ok := a.lastSenders[groupID]; ok {
+		group.Members = []platform.MessageMember{sender}
+	}
+	a.mu.Unlock()
+	return group, nil
 }
 
 // parseTextComponents 将消息文本解析为组件列表（对应 _parse_text_components）。

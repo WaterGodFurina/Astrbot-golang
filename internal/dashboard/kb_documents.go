@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
 	"io"
 	"net/http"
 	"os"
@@ -98,13 +100,26 @@ func (s *Server) kbDocImportURL(w http.ResponseWriter, r *http.Request, kbID str
 		return
 	}
 
+	// 对齐本体 parsers：HTML 网页剥标签抽正文，二进制格式尽力提取/报错，
+	// 文本多编码兜底——避免 HTML 标签原文分块污染向量库。
+	extracted, extractErr := knowledgebase.ExtractKBText(content, url, resp.Header.Get("Content-Type"))
+	if extractErr != nil {
+		writeJSON(w, http.StatusOK, apiError("解析文档内容失败: "+extractErr.Error()))
+		return
+	}
+	content = []byte(extracted)
+
 	// Save under the KB documents directory like the multipart upload path.
 	dir := filepath.Join(s.kbDataDir(), "knowledge_bases", sanitizePath(kbID), "documents")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeJSON(w, http.StatusOK, apiError("创建知识库数据目录失败: "+err.Error()))
 		return
 	}
-	name := filepath.Base(strings.TrimRight(url, "/"))
+	name := strings.TrimRight(url, "/")
+	if i := strings.IndexAny(name, "?#"); i >= 0 {
+		name = name[:i]
+	}
+	name = filepath.Base(name)
 	if name == "" || name == "." || name == "/" {
 		name = "imported"
 	}
@@ -316,12 +331,26 @@ func (s *Server) kbDocUpload(w http.ResponseWriter, r *http.Request, kbID string
 				SuccessCount: success,
 				FailedCount:  failed,
 			})
-			content, err := os.ReadFile(d.Path)
+			raw, err := os.ReadFile(d.Path)
 			if err != nil {
 				failed++
 				continue
 			}
-			if _, err := s.indexKBFile(kbID, d.DocID, d.Name, content, chunkSize, chunkOverlap); err != nil {
+			// 对齐本体 parsers：按格式提取纯文本（多编码兜底/HTML 抽取/
+			// PDF/DOCX/EPUB 尽力提取），避免二进制乱码直接分块污染向量库。
+			content, err := knowledgebase.ExtractKBText(raw, d.Name, "")
+			if err != nil {
+				failed++
+				s.recordKBTask(&kbUploadTask{
+					TaskID: taskID, KBID: kbID, Status: "processing",
+					Stage: "extract_failed", FileIndex: i,
+					Current: (i + 1) * 100, Total: total * 100,
+					SuccessCount: success, FailedCount: failed + 1,
+					Error: fmt.Sprintf("解析 %s 失败: %v", d.Name, err),
+				})
+				continue
+			}
+			if _, err := s.indexKBFile(kbID, d.DocID, d.Name, []byte(content), chunkSize, chunkOverlap); err != nil {
 				// The file is saved; SQLite records may exist. Report failure
 				// for the vector index but keep the doc listed.
 				failed++

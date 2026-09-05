@@ -252,6 +252,20 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 		}
 	}
 
+	// 剥离 Role Mention（bot 拥有的任一角色被提及，<@&role_id>）。
+	// 对齐本体 discord_platform_adapter.py:208-224：只剥离第一个匹配的角色 mention。
+	if s.State != nil && s.State.User != nil && msg.GuildID != "" {
+		if member, err := s.State.Member(msg.GuildID, s.State.User.ID); err == nil && member != nil {
+			for _, roleID := range member.Roles {
+				roleMention := fmt.Sprintf("<@&%s>", roleID)
+				if strings.HasPrefix(content, roleMention) {
+					content = strings.TrimLeft(content[len(roleMention):], " ")
+					break
+				}
+			}
+		}
+	}
+
 	isGroup := msg.GuildID != ""
 	abm := platform.NewAstrBotMessage()
 	if isGroup {
@@ -369,6 +383,8 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 
 	contentParts := []string{}
 	files := []*discordgo.File{}
+	embeds := []*discordgo.MessageEmbed{}
+	var components []discordgo.MessageComponent
 	var reference *discordgo.MessageReference
 
 	for _, comp := range chain.Chain {
@@ -385,10 +401,15 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 				files = append(files, f)
 			}
 		case *message.Record:
-			f := a.fileFromMedia(c.URL, c.Path, "audio")
-			if f != nil {
-				files = append(files, f)
+			// 对齐本体：Record 经 MediaResolver(target_format="wav") 转码后以
+			// audio.wav 上传；ffmpeg 不可用/转换失败时降级原样上传。
+			audio := a.recordAudioData(c.URL, pickFirst(c.Path, c.File), c.Base64)
+			if audio == nil {
+				logger.I18nWarn("Discord Record 组件没有可用的 file/url 属性，已跳过")
+				continue
 			}
+			audio = convertAudioToWav(audio)
+			files = append(files, &discordgo.File{Name: "audio.wav", Reader: bytes.NewReader(audio)})
 		case *message.File:
 			name := c.Name
 			if name == "" {
@@ -402,6 +423,19 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 			f := a.fileFromMedia(c.URL, c.Path, "video")
 			if f != nil {
 				files = append(files, f)
+			}
+		case *message.Json:
+			// Json 组件通道：discord_embed / discord_view（本体 components.py）。
+			embed, view, ok := parseDiscordJsonComponent(c.Data)
+			if !ok {
+				logger.Debug("Discord 忽略了不支持的 Json 组件类型: %v", c.Data["type"])
+				continue
+			}
+			if embed != nil {
+				embeds = append(embeds, embed)
+			}
+			if view != nil {
+				components = view
 			}
 		}
 	}
@@ -420,7 +454,7 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		logger.I18nWarn("Discord 消息内容超过 2000 字符，将被截断")
 		content = string([]rune(content)[:2000])
 	}
-	if content == "" && len(files) == 0 {
+	if content == "" && len(files) == 0 && len(embeds) == 0 && len(components) == 0 {
 		logger.Debug("Discord 尝试发送空消息，已忽略")
 		return nil
 	}
@@ -434,14 +468,21 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	delete(a.followups, channelID)
 	a.followupsMu.Unlock()
 	if ok && time.Since(entry.registeredAt) < followupMaxAge {
-		params := &discordgo.WebhookParams{Content: content, Files: files}
+		params := &discordgo.WebhookParams{
+			Content:    content,
+			Files:      files,
+			Embeds:     embeds,
+			Components: components,
+		}
 		_, err := a.session.FollowupMessageCreate(entry.interaction, false, params)
 		return err
 	}
 
 	data := &discordgo.MessageSend{
-		Content: content,
-		Files:   files,
+		Content:    content,
+		Files:      files,
+		Embeds:     embeds,
+		Components: components,
 	}
 	if reference != nil && reference.MessageID != "" {
 		data.Reference = reference

@@ -311,6 +311,38 @@ func (m *SubprocessManager) ListFailedPlugins() map[string]interface{} {
 	return result
 }
 
+// RemoveFailedPlugin removes a repeatedly-crashed plugin from the failure
+// table and cleans up its install artifacts (manifest entry + plugins-bin
+// artifact + data/plugins source dir when present). Used by the WebUI
+// "卸载失败插件" button: a crashed plugin has no live instance, so this is
+// a pure disk/manifest cleanup — Uninstall requires a loaded instance path.
+func (m *SubprocessManager) RemoveFailedPlugin(id string, deleteConfig, deleteData bool) error {
+	// 对齐本体 uninstall_failed_plugin（star_manager.py:1813-1856）：
+	// 失败记录不存在 → 明确报错；失败插件无可停实例（纯磁盘清理）。
+	m.mu.RLock()
+	_, inFailed := m.failures[id]
+	m.mu.RUnlock()
+	if !inFailed {
+		return fmt.Errorf("插件 %s 不在失败列表中", id)
+	}
+
+	unlock := m.lockOp(id)
+	defer unlock()
+
+	// 清失败记录（failures 表持有 mu）。
+	m.mu.Lock()
+	delete(m.failures, id)
+	m.mu.Unlock()
+
+	// 删 manifest 条目与残留目录（复用 Uninstall 的清理逻辑，忽略"实例
+	// 未加载"类错误——失败插件本来就没在运行；残留目录缺失时继续清理
+	// 记录，对齐本体 partial uninstall 语义）。
+	if err := m.Uninstall(id, deleteConfig, deleteData); err != nil && !strings.Contains(err.Error(), "not loaded") && !strings.Contains(err.Error(), "未安装") {
+		return err
+	}
+	return nil
+}
+
 // SetEnabled enables/disables an installed plugin: enable loads the cached
 // binary from the manifest (idempotent when already running), disable unloads
 // it; the manifest Enabled flag is persisted either way. manifestMu is released
@@ -519,7 +551,7 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 	}
 	if m.Get(id) != nil {
 		m.manifestMu.Unlock()
-		if err := m.unloadLocked(id, true); err != nil {
+		if err := m.unloadCoreLocked(id, true); err != nil {
 			return err
 		}
 		m.manifestMu.Lock()

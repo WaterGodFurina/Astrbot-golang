@@ -446,6 +446,12 @@ func moduleNameFromID(id string) string {
 }
 
 // sanitizeID makes an id safe for use in file names.
+// SanitizeIDLocal 导出 sanitizeID 供 dashboard 配置文件路径构造使用
+// （插件数据目录名 = stable id 的同一净化规则）。
+func SanitizeIDLocal(id string) string {
+	return sanitizeID(id)
+}
+
 func sanitizeID(id string) string {
 	var b strings.Builder
 	for _, r := range id {

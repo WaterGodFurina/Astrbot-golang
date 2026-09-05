@@ -9,7 +9,9 @@ package aiocqhttp
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,20 @@ import (
 )
 
 var logger = log.GetDefault().WithComponent("aiocqhttp")
+
+// qqHousekeeperID 是 QQ 官方助手（"QQ 管家"）的账号，其推送的消息非真实
+// 用户消息，直接过滤（对齐 Python adapter.py:133-135）。
+const qqHousekeeperID = "2854196310"
+
+// randomHex 生成 n 字节随机数的十六进制串（用作 request 等无原生 message_id
+// 事件的本地唯一 ID，对齐 Python 的 uuid4().hex）。
+func randomHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
 
 // Adapter implements the OneBot v11 reverse WebSocket protocol.
 type Adapter struct {
@@ -282,20 +298,87 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	}
 	a.mu.Unlock()
 
-	// Forward nodes cannot be mixed with normal segments: send each node via
-	// send_group_forward_msg / send_private_forward_msg (OneBot v11).
+	// 链中含合并转发节点（Node/Nodes）时不能整链一次 send_msg：转发段必须走
+	// send_group_forward_msg / send_private_forward_msg，转发节点之外的普通段
+	// 仍按普通消息继续逐个发送（对齐 Python aiocqhttp_message_event.send_message
+	// 的逐段遍历发送逻辑）。
 	if hasForwardNode(chain) {
-		return a.sendForward(sessionID, chain, isGroup)
+		return a.sendChainMixed(sessionID, chain, isGroup)
 	}
+	return a.sendAction("send_msg", a.dispatchParams(isGroup, sessionID, a.convertToCQFormat(chain)))
+}
 
-	segments := a.convertToCQFormat(chain)
+// dispatchParams 构造一次普通消息发送（send_msg）的 OneBot 参数：
+// 消息段数组 + 会话目标（群号 / QQ 号）。
+func (a *Adapter) dispatchParams(isGroup bool, sessionID string, segments []map[string]interface{}) map[string]interface{} {
 	params := map[string]interface{}{"message": segments}
 	if isGroup {
 		params["group_id"] = sessionID
 	} else {
 		params["user_id"] = sessionID
 	}
-	return a.sendAction("send_msg", params)
+	return params
+}
+
+// sendChainMixed 发送含合并转发节点（Node/Nodes）的混排消息链：遍历链，
+// 遇 Node/Nodes 发送合并转发消息（单个 Node 包装成只有一个节点的转发），
+// 遇其他段（含 File）继续按普通消息逐段发送（对齐 Python
+// AiocqhttpMessageEvent.send_message：转发节点不再导致链中其余段被丢弃）。
+func (a *Adapter) sendChainMixed(sessionID string, chain *message.MessageChain, isGroup bool) error {
+	sentAny := false
+	for _, comp := range chain.Chain {
+		switch c := comp.(type) {
+		case *message.Node:
+			// 单个 Node 包装成只有一个节点的 Nodes 发送。
+			if err := a.sendNodes(sessionID, &message.Nodes{Nodes: []*message.Node{c}}, isGroup); err != nil {
+				return err
+			}
+		case *message.Nodes:
+			if err := a.sendNodes(sessionID, c, isGroup); err != nil {
+				return err
+			}
+		default:
+			// 普通段/文件段：转成 OneBot 段后单段发送。
+			segments := a.convertToCQFormat(&message.MessageChain{Chain: []message.Component{comp}})
+			if len(segments) == 0 {
+				continue
+			}
+			// 段间限速（对齐 Python 逐段发送时的 asyncio.sleep(0.5)）。
+			if sentAny {
+				time.Sleep(500 * time.Millisecond)
+			}
+			if err := a.sendAction("send_msg", a.dispatchParams(isGroup, sessionID, segments)); err != nil {
+				return err
+			}
+			sentAny = true
+		}
+	}
+	return nil
+}
+
+// sendNodes 通过 send_group_forward_msg / send_private_forward_msg 发送一个
+// 合并转发消息。节点列表为空时跳过（不向 OneBot 侧发送空转发）。
+func (a *Adapter) sendNodes(sessionID string, nodes *message.Nodes, isGroup bool) error {
+	msgs := []map[string]interface{}{}
+	for _, n := range nodes.Nodes {
+		if n == nil {
+			continue
+		}
+		msgs = append(msgs, a.nodeToCQ(n))
+	}
+	if len(msgs) == 0 {
+		logger.Warn("aiocqhttp: 合并转发消息无可用节点，已跳过发送")
+		return nil
+	}
+	action := "send_group_forward_msg"
+	params := map[string]interface{}{"messages": msgs}
+	if isGroup {
+		params["group_id"] = sessionID
+	} else {
+		action = "send_private_forward_msg"
+		params["user_id"] = sessionID
+	}
+	return a.sendAction(action, params)
 }
 
 // hasForwardNode reports whether the chain contains Node/Nodes components.
@@ -310,35 +393,6 @@ func hasForwardNode(chain *message.MessageChain) bool {
 		}
 	}
 	return false
-}
-
-// sendForward sends Node components as combined-forward messages. A single
-// Node becomes one node in the forward message; a Nodes component supplies
-// the whole node list.
-func (a *Adapter) sendForward(sessionID string, chain *message.MessageChain, isGroup bool) error {
-	nodes := []map[string]interface{}{}
-	for _, comp := range chain.Chain {
-		switch c := comp.(type) {
-		case *message.Node:
-			nodes = append(nodes, a.nodeToCQ(c))
-		case *message.Nodes:
-			for _, n := range c.Nodes {
-				nodes = append(nodes, a.nodeToCQ(n))
-			}
-		}
-	}
-	if len(nodes) == 0 {
-		return nil
-	}
-	action := "send_group_forward_msg"
-	params := map[string]interface{}{"messages": nodes}
-	if isGroup {
-		params["group_id"] = sessionID
-	} else {
-		action = "send_private_forward_msg"
-		params["user_id"] = sessionID
-	}
-	return a.sendAction(action, params)
 }
 
 // nodeToCQ converts a Node component to the OneBot v11 "node" segment.
@@ -587,11 +641,43 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// 限制单连接消息体大小，防止异常对端放大内存占用。
 	conn.SetReadLimit(1 << 20)
 
-	// Heartbeat: respond to ping, and respect the peer's close/ping timeouts.
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	// Heartbeat：反向 WS 每收到一帧（事件/echo/心跳 JSON）都刷新读超时。
+	// 对齐 Python 本体：aiocqhttp 库靠 Quart 长连接 + 对端应用层心跳保活，
+	// 本体没有 5min 读超时——OneBot 实现（NapCat 等）的心跳是应用层 JSON
+	// （meta_event.heartbeat）而非 WS ping，PongHandler 收不到；固定
+	// ReadDeadline 到期即断（表现为连接精确每 5 分钟断开重连）。
+	// 另每 60s 主动发 WS ping，双保险（对端实现 Pong 处理则更稳）。
+	refreshReadDeadline := func() {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+	}
+	refreshReadDeadline()
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 	})
+	stopPing := make(chan struct{})
+	defer close(stopPing)
+	go func(c *websocket.Conn) {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPing:
+				return
+			case <-ticker.C:
+				mu := a.connWriteLock(c)
+				if mu == nil {
+					return
+				}
+				mu.Lock()
+				_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				err := c.WriteMessage(websocket.PingMessage, nil)
+				mu.Unlock()
+				if err != nil {
+					return
+				}
+			}
+		}
+	}(conn)
 
 	// Events are handled on a single per-connection goroutine so a slow
 	// handleEvent (quoted-message fetching via CallAction) never blocks this
@@ -612,6 +698,8 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		// 任何到达的帧（含应用层心跳 JSON）都证明连接存活，刷新读超时。
+		refreshReadDeadline()
 		if len(data) == 0 {
 			continue
 		}
@@ -849,10 +937,102 @@ func (a *Adapter) handleEvent(raw map[string]interface{}) {
 		a.handleMessage(raw)
 	case "notice":
 		a.handleNotice(raw)
+	case "request":
+		a.handleRequest(raw)
 	default:
-		// "request" and meta events are not published to plugins yet.
+		// meta 事件（heartbeat/lifecycle）不进入事件管线。
 		logger.Debug("aiocqhttp: ignoring event post_type=%q", postType)
 	}
+}
+
+// handleRequest processes a OneBot v11 request event (好友申请 / 加群申请 /
+// 群邀请，notice_type 为 friend / group)。对齐 Python
+// _convert_handle_request_event：构造一个含描述文本的事件发布进管线，
+// 原始事件 JSON 放入 RawMessage 供插件自行处理（同意/拒绝等）。
+func (a *Adapter) handleRequest(raw map[string]interface{}) {
+	requestType, _ := raw["request_type"].(string)
+	// 请求类型描述（对齐 OneBot v11：friend=好友申请、group=加群申请/邀请）。
+	segText := "请求"
+	switch requestType {
+	case "friend":
+		segText = "好友申请"
+	case "group":
+		segText = "加群申请"
+	}
+	// 有 comment 时附带申请留言。
+	if comment, _ := raw["comment"].(string); strings.TrimSpace(comment) != "" {
+		segText += "：" + comment
+	}
+
+	userID := toString(raw["user_id"])
+	senderName := userID
+	senderID := userID
+
+	// 对齐 Python _convert_handle_request_event：有 group_id 视为群请求
+	// （GROUP_MESSAGE），否则视为好友请求（FRIEND_MESSAGE）。
+	convID := senderID
+	isGroup := false
+	messageType := "FriendMessage"
+	if gid, ok := raw["group_id"]; ok {
+		if g := toString(gid); g != "" {
+			isGroup = true
+			convID = g
+			messageType = "GroupMessage"
+			segText += fmt.Sprintf("（群 %s）", g)
+		}
+	}
+
+	selfID := a.getSelfID()
+	// 同消息路径：优先用事件自带 self_id 并回填快照（见 handleMessage 注释）。
+	if evSelf, ok := raw["self_id"]; ok {
+		if s := toString(evSelf); s != "" {
+			selfID = s
+			a.setSelfID(s)
+		}
+	}
+
+	a.mu.Lock()
+	a.groupConvs[convID] = isGroup
+	a.mu.Unlock()
+
+	// message_str 组装为 "[好友申请] xxx" 类描述文本，原始事件数据入 raw_message
+	// （对齐 Python：abm.message_str 由事件类型组装、raw_message 存原始事件）。
+	messageStr := "[" + segText + "] " + userID
+	flag, _ := raw["flag"].(string)
+
+	event := &core.Event{
+		Type: core.EventRequest,
+		Source: core.EventSource{
+			Platform:   "aiocqhttp",
+			PlatformID: a.ID(),
+			SelfID:     selfID,
+			SenderID:   senderID,
+			SenderName: senderName,
+			ConvID:     convID,
+			IsGroup:    isGroup,
+		},
+		MessageStr: messageStr,
+		RawMessage: rawJSON(raw),
+		Timestamp:  time.Now(),
+		Metadata: map[string]interface{}{
+			// 插件处理请求所需的关键字段（同意/拒绝需 flag）。
+			"request_type": requestType,
+			"flag":         flag,
+			"comment":      raw["comment"],
+		},
+		MessageObj: &core.MessageObj{
+			MessageID:   randomHex(16),
+			SelfID:      selfID,
+			SessionID:   convID,
+			MessageType: messageType,
+			Platform:    "aiocqhttp",
+			MessageStr:  messageStr,
+			RawMessage:  raw,
+			Timestamp:   time.Now(),
+		},
+	}
+
+	a.publishEvent(event)
 }
 
 // publishEvent sends a core.Event to the bus (nil-safe).
@@ -879,6 +1059,19 @@ func rawJSON(raw map[string]interface{}) string {
 func (a *Adapter) handleMessage(raw map[string]interface{}) {
 	messageType, _ := raw["message_type"].(string)
 	isGroup := messageType == "group"
+
+	// 屏蔽 QQ 管家（官方助手账号 2854196310）的消息（对齐 Python
+	// adapter.py:133-135：该账号的推送非真实用户消息，进入管线会造成干扰）。
+	if sender, ok := raw["sender"].(map[string]interface{}); ok {
+		if uid := toString(sender["user_id"]); uid == qqHousekeeperID {
+			logger.Debug("aiocqhttp: 忽略 QQ 管家消息 (user_id=%s)", uid)
+			return
+		}
+	}
+	if uid := toString(raw["user_id"]); uid == qqHousekeeperID {
+		logger.Debug("aiocqhttp: 忽略 QQ 管家消息 (user_id=%s)", uid)
+		return
+	}
 
 	var senderID, senderName, convID string
 	if sender, ok := raw["sender"].(map[string]interface{}); ok {
@@ -958,8 +1151,8 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 	a.publishEvent(event)
 }
 
-// handleNotice processes a OneBot v11 notice event (recall, ban, etc.) and
-// publishes it as a notice event so plugins (e.g. recall-cancel) can react.
+// handleNotice processes a OneBot v11 notice event (recall, ban, poke, etc.)
+// and publishes it as a notice event so plugins (e.g. recall-cancel) can react.
 func (a *Adapter) handleNotice(raw map[string]interface{}) {
 	noticeType, _ := raw["notice_type"].(string)
 	if noticeType == "" {
@@ -1027,6 +1220,16 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 	if noticeType == "group_recall" || noticeType == "friend_recall" {
 		event.MessageStr = "[撤回通知]"
 	}
+	// 戳一戳通知（对齐 Python adapter.py:192-194：notice 事件 sub_type=poke
+	// 且携带 target_id 时，构造含 Poke(target_id) 组件的消息事件，插件可据此
+	// 响应戳一戳）。
+	if subType, _ := raw["sub_type"].(string); subType == "poke" {
+		if targetID := toString(raw["target_id"]); targetID != "" {
+			event.Message = &message.MessageChain{
+				Chain: []message.Component{&message.Poke{Target: targetID}},
+			}
+		}
+	}
 	a.publishEvent(event)
 }
 
@@ -1044,7 +1247,8 @@ func (a *Adapter) convertFromCQFormat(raw map[string]interface{}) *message.Messa
 		return chain
 	}
 
-	parsed, _ := a.parseOneBotSegments(segments, 0)
+	// groupID 供 @ 段解析群昵称（get_group_member_info，见 parseOneBotSegments）。
+	parsed, _ := a.parseOneBotSegments(segments, 0, toString(raw["group_id"]))
 	chain.Chain = parsed
 	a.enrichFileURLs(chain, raw)
 	return chain
@@ -1223,6 +1427,12 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 			segments = append(segments, map[string]interface{}{
 				"type": "at",
 				"data": map[string]interface{}{"qq": c.TargetID, "name": c.Name},
+			})
+			// At 组件后补一个空格段，避免 @ 与后续文本粘连
+			//（对齐 Python _parse_onebot_json：At 后 append {"type":"text","data":{"text":" "}}）。
+			segments = append(segments, map[string]interface{}{
+				"type": "text",
+				"data": map[string]interface{}{"text": " "},
 			})
 		case *message.AtAll:
 			segments = append(segments, map[string]interface{}{

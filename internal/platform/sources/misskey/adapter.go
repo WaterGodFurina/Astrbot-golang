@@ -84,9 +84,20 @@ type Adapter struct {
 	botUsername string
 	userCache   map[string]map[string]interface{}
 
+	// sessionEvents 记录每个会话最近一次发布到事件总线的 core.Event 指针。
+	// core.Event 在 pipeline 处理过程中会被阶段/插件原地修改（如写入
+	// Metadata["extra_data"]，对应 Python session.extra_data 的 SDK 事件
+	// metadata 通道），发送帖子时据此读取 cw/poll/renote_id/channel_id。
+	sessionEventsMu sync.Mutex
+	sessionEvents   map[string]*core.Event
+	sessionEventsQ  []string // FIFO 驱逐队列, 防止会话缓存无限增长
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 }
+
+// sessionEventsMax 会话事件缓存上限。
+const sessionEventsMax = 128
 
 // New 创建 Misskey 适配器。
 // config 为平台实例配置（misskey_instance_url / misskey_token 等，字段名与 Python 一致）。
@@ -141,6 +152,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		maxDownloadBytes:       maxDownloadBytes,
 		instanceID:             instanceID,
 		userCache:              make(map[string]map[string]interface{}),
+		sessionEvents:          make(map[string]*core.Event),
 		stopCh:                 make(chan struct{}),
 	}
 }
@@ -567,7 +579,7 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	visibility, visibleUserIDs := resolveMessageVisibility(userIDForCache, a.userCache, a.botSelfID, nil, a.defaultVisibility)
 	logger.Debug("Misskey 解析可见性: visibility=%s, visible_user_ids=%v, session_id=%s, user_id_for_cache=%s", visibility, visibleUserIDs, sessionID, userIDForCache)
 
-	fields := a.extractAdditionalFields(chain)
+	fields := a.extractAdditionalFields(sessionID, chain)
 	if len(fallbackURLs) > 0 {
 		text = text + "\n" + strings.Join(fallbackURLs, "\n")
 	}
@@ -608,8 +620,33 @@ func (a *Adapter) sendTextOnlyMessage(ctx context.Context, sessionID, text strin
 	return nil
 }
 
+// rememberSessionEvent 记录会话最近一次发布的事件指针（带容量上限, FIFO 驱逐）。
+func (a *Adapter) rememberSessionEvent(sessionID string, event *core.Event) {
+	if sessionID == "" || event == nil {
+		return
+	}
+	a.sessionEventsMu.Lock()
+	defer a.sessionEventsMu.Unlock()
+	if _, exists := a.sessionEvents[sessionID]; !exists && len(a.sessionEventsQ) >= sessionEventsMax {
+		// 驱逐最旧会话, 保证缓存不无限增长
+		oldest := a.sessionEventsQ[0]
+		a.sessionEventsQ = a.sessionEventsQ[1:]
+		delete(a.sessionEvents, oldest)
+	}
+	if _, exists := a.sessionEvents[sessionID]; !exists {
+		a.sessionEventsQ = append(a.sessionEventsQ, sessionID)
+	}
+	a.sessionEvents[sessionID] = event
+}
+
+// sessionEvent 读取会话最近一次发布的事件指针。
+func (a *Adapter) sessionEvent(sessionID string) *core.Event {
+	a.sessionEventsMu.Lock()
+	defer a.sessionEventsMu.Unlock()
+	return a.sessionEvents[sessionID]
+}
+
 // additionalFields 从会话/消息链中提取的额外字段（对应 _extract_additional_fields）。
-// Go 消息链组件没有 cw/poll 等属性，全部返回零值（保留结构以对应 Python 逻辑）。
 type additionalFields struct {
 	cw        string
 	poll      map[string]interface{}
@@ -617,11 +654,45 @@ type additionalFields struct {
 	channelID string
 }
 
-// extractAdditionalFields 从消息链中提取额外字段（对应 _extract_additional_fields）。
-// Python 的 MessageChain 组件可能带 cw 属性、session 可能带 extra_data（poll/renote_id/channel_id）；
-// Go 的消息链与 Send 接口不携带这些数据，此处保留返回结构并全部置零。
-func (a *Adapter) extractAdditionalFields(chain *message.MessageChain) additionalFields {
-	return additionalFields{}
+// extractAdditionalFields 从会话事件与消息链中提取额外字段（对应 _extract_additional_fields）。
+//   - cw：对应 Python 遍历消息链取 comp.cw。Go 组件为具体结构体、无动态属性，
+//     唯一可携带任意键的是 Json 组件，故约定通过 Json.Data["cw"] 传递。
+//   - poll / renote_id / channel_id：对应 Python session.extra_data；Go 侧等价物为
+//     core.Event 的 Metadata["extra_data"]（SDK 事件 metadata 通道），键不存在时
+//     兼容 Metadata 顶层的等价键。
+func (a *Adapter) extractAdditionalFields(sessionID string, chain *message.MessageChain) additionalFields {
+	fields := additionalFields{}
+
+	if chain != nil {
+		for _, comp := range chain.Chain {
+			if j, ok := comp.(*message.Json); ok {
+				if cw, ok := j.Data["cw"].(string); ok && cw != "" {
+					fields.cw = cw
+					break
+				}
+			}
+		}
+	}
+
+	event := a.sessionEvent(sessionID)
+	if event == nil || event.Metadata == nil {
+		return fields
+	}
+	extra, ok := event.Metadata["extra_data"].(map[string]interface{})
+	if !ok {
+		// extra_data 键不存在时兼容顶层等价键写法
+		extra = event.Metadata
+	}
+	if poll, ok := extra["poll"].(map[string]interface{}); ok {
+		fields.poll = poll
+	}
+	if v, ok := extra["renote_id"].(string); ok {
+		fields.renoteID = v
+	}
+	if v, ok := extra["channel_id"].(string); ok {
+		fields.channelID = v
+	}
+	return fields
 }
 
 // convertMessage 将 Misskey 贴文数据转换为 AstrBotMessage（对应 convert_message）。
@@ -761,4 +832,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.Error("Misskey 发布事件失败: %v", err)
 	}
+	// pipeline 会原地修改事件 (插件可写入 Metadata["extra_data"]),
+	// 保留事件指针供发送帖子时读取附加字段
+	a.rememberSessionEvent(abm.SessionID, event)
 }

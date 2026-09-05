@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,12 +26,40 @@ import (
 // the host Go toolchain against the SDK module (resolved from go.mod).
 var testPluginBin string
 
+// sharedPythonCacheDir 是整个测试二进制共享的 Python venv/缓存根目录，在
+// TestMain 里一次性创建并写入 ASTRBOT_PYTHON_CACHE_DIR。此前每个 Python
+// 测试各自 t.Setenv + t.TempDir()，各建一个全新 venv 并全量 pip 安装
+// （每个 2~2.5 分钟），全量跑时累计超过默认 10 分钟 timeout而集体超时。
+// 共享是安全的：pysdk.EnsureVenv 按「解释器指纹」键控 venv 目录，并用
+// environment.json 的 interpreter/SDKVersion/baseDepsVersion 三元组做就绪
+// 校验，依赖清单变化会自动重装；本包测试不并行，TestPythonRuntimeCacheSelfHeals
+// 删 venv 后会立刻在锁内自愈重建，后续测试复用重建结果。
+// 结束时统一 RemoveAll；个别需要特殊语义的测试（relpath_test 的相对 cache
+// 路径）仍可用 t.Setenv 覆盖本值。
+var sharedPythonCacheDir string
+
 func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "astrbot-plugin-test-pycache-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "TestMain: 创建共享 Python 缓存目录失败: %v\n", err)
+		os.Exit(2)
+	}
+	sharedPythonCacheDir = dir
+	// 包级 os.Setenv（非 t.Setenv）：全测试周期生效、不逐测试恢复，
+	// 各 Python 测试因此可共享同一 venv（避免重复 venv+pip 安装）。
+	_ = os.Setenv(pysdk.EnvPythonCacheDir, dir)
+	// pip 下载缓存同样共享：relpath_test 的相对 cache 路径测试会新建独立
+	// venv，warm 的 wheel 缓存能让其安装从分钟级降到秒级（不设则每次全量
+	// 联网下载）。
+	_ = os.Setenv("PIP_CACHE_DIR", filepath.Join(dir, "pip"))
+
 	testPluginBin = BuildTestPlugin()
 	code := m.Run()
 	// Give managed child processes a moment to be reaped by go-plugin.
 	time.Sleep(300 * time.Millisecond)
 	CleanupTestPlugin()
+	_ = os.RemoveAll(sharedPythonCacheDir)
+	sharedPythonCacheDir = ""
 	os.Exit(code)
 }
 

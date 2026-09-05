@@ -56,7 +56,7 @@ func TestParseWSMessageFrame(t *testing.T) {
 			"author_id": "user_1",
 			"content": "hello (met)123(met)",
 			"msg_id": "msg_1",
-			"msg_timestamp": 1700000000,
+			"msg_timestamp": 1700000000000,
 			"nonce": "",
 			"from_type": 1,
 			"extra": {

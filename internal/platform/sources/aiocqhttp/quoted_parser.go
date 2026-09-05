@@ -60,7 +60,9 @@ func resolveQuotedParserSettings(settings map[string]interface{}) quotedParserSe
 // collecting forward-message ids for later fetching. Inline forward node
 // content is parsed recursively (mirrors _parse_onebot_segments).
 // The depth limit guards nested forward nodes (max_forward_node_depth).
-func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int) ([]message.Component, []string) {
+// groupID 为消息所属群号（群消息事件携带，私聊/无上下文传空串），供 @ 段
+// 的群昵称解析使用（get_group_member_info，对齐 Python adapter 的同步调用）。
+func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int, groupID string) ([]message.Component, []string) {
 	chain := []message.Component{}
 	forwardIDs := []string{}
 
@@ -76,12 +78,26 @@ func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int) ([]mess
 		case "text", "plain":
 			text, _ := data["text"].(string)
 			chain = append(chain, &message.Plain{Text: text})
+		case "markdown":
+			// markdown 消息段按纯文本接收（对齐 Python adapter.py:400-404：
+			// 优先 data.markdown，回退 data.content，转成 Plain 并保留原文）。
+			text, _ := data["markdown"].(string)
+			if text == "" {
+				text, _ = data["content"].(string)
+			}
+			chain = append(chain, &message.Plain{Text: text})
 		case "at":
 			qq := toString(data["qq"])
 			name, _ := data["name"].(string)
 			if qq == "all" {
 				chain = append(chain, &message.AtAll{})
 			} else {
+				// 事件段通常不带昵称，经 get_group_member_info 拉取
+				// card/nickname（对齐 Python adapter.py:344-397；同步调用，
+				// 失败或拿不到时降级用段内原始 name 值）。
+				if name == "" {
+					name = a.fetchGroupMemberNickname(groupID, qq)
+				}
 				chain = append(chain, &message.At{TargetID: qq, Name: name})
 			}
 		case "image":
@@ -141,7 +157,7 @@ func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int) ([]mess
 			}
 			// Inline node content.
 			if content, ok := data["content"].([]interface{}); ok {
-				nodes := a.parseForwardNodes(content, depth+1)
+				nodes := a.parseForwardNodes(content, depth+1, groupID)
 				if len(nodes) > 0 {
 					chain = append(chain, &message.Nodes{Nodes: nodes})
 				}
@@ -154,7 +170,7 @@ func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int) ([]mess
 				chain = append(chain, &message.Nodes{ForwardIDs: []string{fid}})
 				continue
 			}
-			if nodes := a.parseForwardNodes([]interface{}{segMap}, depth+1); len(nodes) > 0 {
+			if nodes := a.parseForwardNodes([]interface{}{segMap}, depth+1, groupID); len(nodes) > 0 {
 				chain = append(chain, &message.Nodes{Nodes: nodes})
 			}
 		}
@@ -162,11 +178,38 @@ func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int) ([]mess
 	return chain, forwardIDs
 }
 
+// fetchGroupMemberNickname 通过 get_group_member_info 拉取群成员的群昵称
+// （card），card 为空时回退 nickname；查询失败或无群上下文时返回空串，
+// 调用方降级用事件段内原始 name（对齐 Python adapter.py:355-374 的同步
+// get_group_member_info 调用，无缓存参数对齐 no_cache=False 默认行为）。
+func (a *Adapter) fetchGroupMemberNickname(groupID, userID string) string {
+	if groupID == "" || userID == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ret, err := a.CallActionCtx(ctx, "get_group_member_info", map[string]interface{}{
+		"group_id": groupID,
+		"user_id":  userID,
+	})
+	if err != nil {
+		logger.Debug("aiocqhttp: 获取 @ 用户信息失败 qq=%s: %v", userID, err)
+		return ""
+	}
+	if card, _ := ret["card"].(string); card != "" {
+		return card
+	}
+	if nick, _ := ret["nickname"].(string); nick != "" {
+		return nick
+	}
+	return ""
+}
+
 // parseForwardNodes converts a get_forward_msg node list into Node components
 // (mirrors _extract_text_forward_ids_and_images_from_forward_nodes, but
 // preserves the component structure). Nested forwards are capped at
-// max_forward_node_depth.
-func (a *Adapter) parseForwardNodes(nodes []interface{}, depth int) []*message.Node {
+// max_forward_node_depth. groupID 透传给 parseOneBotSegments（@ 昵称解析）。
+func (a *Adapter) parseForwardNodes(nodes []interface{}, depth int, groupID string) []*message.Node {
 	if depth > a.quotedParser.maxForwardNodeDepth {
 		return nil
 	}
@@ -201,12 +244,12 @@ func (a *Adapter) parseForwardNodes(nodes []interface{}, depth int) []*message.N
 				}
 				segType, _ := segMap["type"].(string)
 				if segType == "node" || segType == "nodes" {
-					if subNodes := a.parseForwardNodes([]interface{}{segMap}, depth+1); len(subNodes) > 0 {
+					if subNodes := a.parseForwardNodes([]interface{}{segMap}, depth+1, groupID); len(subNodes) > 0 {
 						content = append(content, &message.Nodes{Nodes: subNodes})
 					}
 					continue
 				}
-				parsed, _ := a.parseOneBotSegments([]interface{}{segMap}, depth)
+				parsed, _ := a.parseOneBotSegments([]interface{}{segMap}, depth, groupID)
 				content = append(content, parsed...)
 			}
 		case string:
@@ -241,7 +284,8 @@ func (a *Adapter) fetchForwardMessage(forwardID string) []*message.Node {
 	if len(messages) == 0 {
 		return nil
 	}
-	return a.parseForwardNodes(messages, 0)
+	// 转发消息节点内容不解析 @ 群昵称（缺群上下文，与原始行为一致）。
+	return a.parseForwardNodes(messages, 0, "")
 }
 
 // fetchQuotedContent fetches the message referenced by a reply id
@@ -268,7 +312,7 @@ func (a *Adapter) fetchQuotedContent(messageID, groupID, userID string) ([]messa
 	if len(segments) == 0 {
 		return nil, nil
 	}
-	chain, forwardIDs := a.parseOneBotSegments(segments, 0)
+	chain, forwardIDs := a.parseOneBotSegments(segments, 0, groupID)
 	if groupID != "" || userID != "" {
 		a.enrichFileURLsIn(chain, groupID, userID)
 	}

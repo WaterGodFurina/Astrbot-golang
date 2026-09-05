@@ -376,8 +376,11 @@ func TestHandleTextMessageDoesNotBlockReadLoop(t *testing.T) {
 	close(blocker)
 }
 
-// TestStreamPollImageInNonFinish 非 finish 轮询也携带图片增量，finish 轮询不重复发送（回归 M-47）。
-func TestStreamPollImageInNonFinish(t *testing.T) {
+// TestStreamPollImageCacheUntilFinish 图片仅随 finish 帧返回（对齐本体
+// wecomai_adapter.py:310-321）：非 finish 轮询先缓存图片不下发，finish
+// 轮询一次性携带且不重复（原回归 M-47 的"非 finish 携带图片"行为已按
+// 本体对齐反转）。
+func TestStreamPollImageCacheUntilFinish(t *testing.T) {
 	a := newTestAIBotAdapter(t, &fakeEventBus{}, nil)
 	crypt := a.apiClient.wxcpt
 
@@ -388,7 +391,7 @@ func TestStreamPollImageInNonFinish(t *testing.T) {
 
 	nonce := "nonce_poll"
 	timestamp := "1700000100"
-	// 先图后文：图片已入队，文本与结束尚未入队 → 非 finish 轮询必须返回图片增量
+	// 图片已入队，文本与结束尚未入队 → 非 finish 轮询不返回图片，先缓存
 	resp, err := a.processMessage(map[string]interface{}{
 		"msgtype": "stream",
 		"stream":  map[string]interface{}{"id": "sid_stream"},
@@ -396,30 +399,17 @@ func TestStreamPollImageInNonFinish(t *testing.T) {
 	if err != nil {
 		t.Fatalf("非 finish 轮询失败: %v", err)
 	}
-	if resp == "" {
-		t.Fatal("非 finish 轮询应返回图片增量")
+	if resp != "" {
+		t.Fatalf("非 finish 轮询不应下发图片，应返回空响应: %s", resp)
 	}
-	_, sig := crypt.GetSHA1(timestamp, nonce, extractEncryptField(t, resp))
-	_, decrypted := crypt.DecryptMsg([]byte(resp), sig, timestamp, nonce)
-	var out map[string]interface{}
-	if err := json.Unmarshal([]byte(decrypted), &out); err != nil {
-		t.Fatalf("解密响应解析失败: %v", err)
-	}
-	stream, _ := out["stream"].(map[string]interface{})
-	if stream["finish"] != false {
-		t.Errorf("非 finish 轮询 finish 应为 false: %v", stream["finish"])
-	}
-	items, _ := stream["msg_item"].([]interface{})
-	if len(items) != 1 {
-		t.Fatalf("msg_item 应包含 1 个图片，got %d: %v", len(items), stream)
-	}
-	item, _ := items[0].(map[string]interface{})
-	img, _ := item["image"].(map[string]interface{})
-	if item["msgtype"] != MSGTypeImage || img["base64"] != imgB64 {
-		t.Errorf("图片增量异常: %v", item)
+	a.streamCacheMu.Lock()
+	cached := a.streamImageCache["sid_stream"]
+	a.streamCacheMu.Unlock()
+	if len(cached) != 1 || cached[0] != imgB64 {
+		t.Fatalf("图片应缓存至 finish，got %v", cached)
 	}
 
-	// 文本 + 结束入队，finish 轮询：返回文本且不重复发送图片
+	// 文本 + 结束入队，finish 轮询：返回文本并一次性携带缓存图片
 	bq <- &QueueItem{Type: "plain", Data: "你好", Streaming: true}
 	bq <- &QueueItem{Type: "end", Data: "", Streaming: false}
 	resp2, err := a.processMessage(map[string]interface{}{
@@ -446,16 +436,30 @@ func TestStreamPollImageInNonFinish(t *testing.T) {
 		t.Errorf("finish 轮询 content: %v", stream2["content"])
 	}
 	items2, _ := stream2["msg_item"].([]interface{})
-	if len(items2) != 0 {
-		t.Errorf("finish 轮询不应重复发送图片: %v", items2)
+	if len(items2) != 1 {
+		t.Fatalf("finish 轮询应一次性携带缓存的 1 个图片，got %d: %v", len(items2), items2)
+	}
+	item, _ := items2[0].(map[string]interface{})
+	img, _ := item["image"].(map[string]interface{})
+	if item["msgtype"] != MSGTypeImage || img["base64"] != imgB64 {
+		t.Errorf("finish 轮询图片异常: %v", item)
+	}
+	a.streamCacheMu.Lock()
+	leftover := a.streamImageCache["sid_stream"]
+	a.streamCacheMu.Unlock()
+	if len(leftover) != 0 {
+		t.Errorf("finish 后图片缓存应清空: %v", leftover)
 	}
 }
 
-// TestSendToBackQueue Send 逻辑：文本进入输出队列。
+// TestSendToBackQueue Send 逻辑：正常回复（存在待响应上下文）文本进入输出队列。
 func TestSendToBackQueue(t *testing.T) {
 	bus := &fakeEventBus{}
 	a := newTestAIBotAdapter(t, bus, nil)
-	a.sessionStreamMap.Store("wecom_ai_bot_wecomai_user_1", "wecom_ai_bot_wecomai_user_1_abcdefghij")
+	streamID := "wecom_ai_bot_wecomai_user_1_abcdefghij"
+	a.sessionStreamMap.Store("wecom_ai_bot_wecomai_user_1", streamID)
+	// 注入待响应上下文，模拟用户消息刚到、尚未收尾的正常回复场景。
+	a.queueMgr.SetPendingResponse(streamID, map[string]string{"req_id": "req_1"})
 
 	chain := &message.MessageChain{Chain: []message.Component{
 		&message.Plain{Text: "回复内容"},
@@ -463,7 +467,6 @@ func TestSendToBackQueue(t *testing.T) {
 	if err := a.Send("wecom_ai_bot_wecomai_user_1", chain); err != nil {
 		t.Fatalf("发送失败: %v", err)
 	}
-	streamID := "wecom_ai_bot_wecomai_user_1_abcdefghij"
 	bq := a.queueMgr.GetOrCreateBackQueue(streamID)
 	select {
 	case item := <-bq:
@@ -472,6 +475,23 @@ func TestSendToBackQueue(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("输出队列超时")
+	}
+}
+
+// TestSendProactiveWithoutWebhookErrors 主动消息（无待响应上下文）且未配置
+// 消息推送 webhook 时应报错返回（对齐本体 wecomai_adapter.py:564-583 RuntimeError），
+// 不再静默降级。
+func TestSendProactiveWithoutWebhookErrors(t *testing.T) {
+	a := newTestAIBotAdapter(t, &fakeEventBus{}, nil)
+	chain := &message.MessageChain{Chain: []message.Component{
+		&message.Plain{Text: "主动消息"},
+	}}
+	err := a.Send("wecom_ai_bot_wecomai_no_ctx", chain)
+	if err == nil {
+		t.Fatal("未配置 webhook 的主动消息发送应返回错误")
+	}
+	if !strings.Contains(err.Error(), "未配置企业微信消息推送 Webhook URL") {
+		t.Fatalf("错误信息不符: %v", err)
 	}
 }
 

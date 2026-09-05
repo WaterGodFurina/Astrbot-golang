@@ -5,8 +5,8 @@ go 1.26
 require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.0
-	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.3
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.1
+	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.5
 	github.com/blusewang/wx v1.3.3
 	github.com/bwmarrin/discordgo v0.25.1
 	github.com/dobest1024/go-weixin-ilink v0.2.0
@@ -18,6 +18,7 @@ require (
 	github.com/hashicorp/go-plugin v1.6.2
 	github.com/hungpdn/nanovec v0.0.0-20260205215424-956786fcfa80
 	github.com/larksuite/oapi-sdk-go/v3 v3.9.10
+	github.com/ledongthuc/pdf v0.0.0-20260902151811-0378b83ae5e4
 	github.com/line/line-bot-sdk-go/v8 v8.22.0
 	github.com/mark3labs/mcp-go v0.57.0
 	github.com/mholt/archives v0.1.5
@@ -25,12 +26,14 @@ require (
 	github.com/pquerna/otp v1.5.0
 	github.com/rivo/uniseg v0.4.7
 	github.com/slack-go/slack v0.27.0
+	github.com/xuri/excelize/v2 v2.11.0
 	github.com/yitsushi/go-misskey v1.1.6
 	golang.org/x/crypto v0.55.0
-	golang.org/x/image v0.0.0-20190802002840-cff245a6509b
+	golang.org/x/image v0.38.0
 	golang.org/x/mod v0.38.0
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0
+	golang.org/x/text v0.41.0
 	google.golang.org/grpc v1.83.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
@@ -66,6 +69,8 @@ require (
 	github.com/oklog/run v1.0.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/richardlehane/mscfb v1.0.7 // indirect
+	github.com/richardlehane/msoleps v1.0.6 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/sorairolake/lzip-go v0.3.8 // indirect
@@ -74,12 +79,14 @@ require (
 	github.com/tidwall/gjson v1.17.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
+	github.com/tiendc/go-deepcopy v1.7.2 // indirect
 	github.com/ulikunitz/xz v0.5.16 // indirect
+	github.com/xuri/efp v0.0.1 // indirect
+	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/youkale/go-querystruct v1.0.0 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
 	go4.org v0.0.0-20230225012048-214862532bf5 // indirect
-	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

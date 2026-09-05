@@ -77,10 +77,18 @@ type Adapter struct {
 	sessionScene   map[string]string    // convID -> "group"/"friend"/"channel"
 	recentMsg      map[string]time.Time // msgID -> received at (dedupe)
 	sessionLastMsg map[string]string    // convID -> last message id
-	memberGroup    map[string]string    // member_openid/senderID -> group_openid
-	stopCh         chan struct{}
-	stopped        bool
-	httpClient     *http.Client
+	// sessionLastMsgAt 记录各会话 msg_id 的接收时间：QQ 官方 msg_id 的被动回复
+	// 时效约 5 分钟，超时后发送应转为主动消息语义（不带 msg_id）。
+	sessionLastMsgAt map[string]time.Time // convID -> msg id received at
+	memberGroup      map[string]string    // member_openid/senderID -> group_openid
+	stopCh           chan struct{}
+	stopped          bool
+	httpClient       *http.Client
+
+	// AllowGroupProactiveSend 群主动消息发送开关（默认开启，
+	// 对齐 Python _allow_group_proactive_send=True）：开启时群主动发送
+	// 不携带 msg_id 直接发送；关闭且无可用 msg_id 时跳过群发送。
+	AllowGroupProactiveSend bool
 
 	// writeMu 串行化同一 WebSocket 连接上的所有写操作
 	// （gorilla/websocket 要求同一时刻仅一个写者）。
@@ -92,12 +100,14 @@ type Adapter struct {
 // New creates a QQ official adapter from config.
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		BaseAdapter:    *platform.NewBaseAdapter(configID(config), "qq_official"),
-		sessionScene:   make(map[string]string),
-		sessionLastMsg: make(map[string]string),
-		memberGroup:    make(map[string]string),
-		stopCh:         make(chan struct{}),
-		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		BaseAdapter:             *platform.NewBaseAdapter(configID(config), "qq_official"),
+		sessionScene:            make(map[string]string),
+		sessionLastMsg:          make(map[string]string),
+		sessionLastMsgAt:        make(map[string]time.Time),
+		memberGroup:             make(map[string]string),
+		stopCh:                  make(chan struct{}),
+		httpClient:              &http.Client{Timeout: 30 * time.Second},
+		AllowGroupProactiveSend: true, // 对齐 Python _allow_group_proactive_send = True
 	}
 	a.AppID, _ = config["appid"].(string)
 	a.Secret, _ = config["secret"].(string)
@@ -756,6 +766,7 @@ func (a *Adapter) remember(scene, convID, msgID string) {
 	a.sessionScene[convID] = scene
 	if msgID != "" {
 		a.sessionLastMsg[convID] = msgID
+		a.sessionLastMsgAt[convID] = time.Now()
 	}
 	a.mu.Unlock()
 }
@@ -810,6 +821,10 @@ func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msg
 // ---------------------------------------------------------------------------
 
 // Send sends a message chain to a session (convID).
+// 主动消息语义对齐 Python _send_by_session_common（:363-380, 448）：
+//   - 私聊（friend）主动发送：不带 msg_id（QQ 私聊主动推送无限制）
+//   - 群主动发送：受 AllowGroupProactiveSend 开关控制
+//   - 频道（channel）：被动回复注入缓存的 msg_id（清单 5）
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	if chain == nil || len(chain.Chain) == 0 {
 		return nil
@@ -817,28 +832,54 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	a.mu.Lock()
 	scene := a.sessionScene[sessionID]
 	lastMsgID := a.sessionLastMsg[sessionID]
+	lastMsgAt := a.sessionLastMsgAt[sessionID]
 	// scene 为空时回退查找 群成员 openid → 群 openid 映射：unique_session
 	// 把会话 ConvID 改成了发送者成员 id，消息仍应发回原群。
 	if scene == "" {
 		if groupOpenID, ok := a.memberGroup[sessionID]; ok && groupOpenID != "" {
 			scene = "group"
 			lastMsgID = a.sessionLastMsg[groupOpenID]
+			lastMsgAt = a.sessionLastMsgAt[groupOpenID]
 			sessionID = groupOpenID
 		}
 	}
+	allowGroupProactive := a.AllowGroupProactiveSend
 	a.mu.Unlock()
+
+	// 被动回复窗口判定：msg_id 超过时效后视为主动消息（不带 msg_id 发送）。
+	msgInfo := MsgIDInfo{ID: lastMsgID, At: lastMsgAt}
+	proactive := msgInfo.Proactive()
+	if proactive {
+		msgInfo.ID = ""
+	}
+
 	plainText, imageRef, fileRef, fileName, fileType := extractSendParts(chain)
+	// markdown 发送模式（清单 1）：对齐 Python use_markdown_ 默认语义——
+	// 显式 False 走 content 纯文本，其余（nil/true）走 markdown（msg_type=2）。
+	useMarkdown := chain.UseMarkdown == nil || *chain.UseMarkdown
 
 	switch scene {
 	case "friend":
-		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
+		// 私聊主动发送 pop msg_id（Python :448）：主动消息时不再带 msg_id。
+		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, fileType, msgInfo.ID, useMarkdown)
 	case "group":
-		return a.sendGroup(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
+		// 群主动发送受开关控制（Python :363-384）：开关开启时群发送强制按
+		// 主动消息语义（不带 msg_id）；关闭时按被动回复带 msg_id，无可用
+		// msg_id 则跳过发送。
+		groupProactive := allowGroupProactive
+		groupMsgID := msgInfo.ID
+		if groupProactive {
+			groupMsgID = ""
+		} else if proactive {
+			logger.I18nWarn("[QQOfficial] 会话 %s 无可用被动回复 msg_id 且未开启群主动发送，跳过发送", sessionID)
+			return nil
+		}
+		return a.sendGroup(sessionID, plainText, imageRef, fileRef, fileName, fileType, groupMsgID, useMarkdown)
 	case "channel":
-		return a.sendChannel(sessionID, plainText, imageRef)
+		return a.sendChannel(sessionID, plainText, imageRef, msgInfo.ID, useMarkdown)
 	default:
 		// fallback: treat as friend (C2C)
-		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, fileType, lastMsgID)
+		return a.sendC2C(sessionID, plainText, imageRef, fileRef, fileName, fileType, msgInfo.ID, useMarkdown)
 	}
 }
 
@@ -903,7 +944,15 @@ func readFileBase64(path string) string {
 }
 
 // apiRequest performs an authenticated QQ Open Platform API request.
+// 清单 6：瞬时错误（HTTP 500/504/超时）重试 5 次指数退避（对齐 Python _qqofficial_retry）。
 func (a *Adapter) apiRequest(method, path string, payload map[string]interface{}) (map[string]interface{}, error) {
+	return RetryTransient(MaxSendAttempts, func() (map[string]interface{}, error) {
+		return a.doAPIRequest(method, path, payload)
+	})
+}
+
+// doAPIRequest 执行单次 API 请求（不含重试）。
+func (a *Adapter) doAPIRequest(method, path string, payload map[string]interface{}) (map[string]interface{}, error) {
 	token, err := a.getAccessToken()
 	if err != nil {
 		return nil, err
@@ -934,118 +983,99 @@ func (a *Adapter) apiRequest(method, path string, payload map[string]interface{}
 		if msg == "" {
 			msg = string(dataBytes)
 		}
-		return nil, fmt.Errorf("QQ 接口错误 (%d): %s", resp.StatusCode, msg)
+		return nil, &APIError{
+			Status:  resp.StatusCode,
+			Code:    ExtractBizCode(data),
+			Message: msg,
+		}
+	}
+	// HTTP 200 但业务 code 非 0 同样视为失败（对齐 Python：code not in (None, 0)）。
+	if code := ExtractBizCode(data); code != 0 {
+		msg, _ := data["message"].(string)
+		return nil, &APIError{Status: resp.StatusCode, Code: code, Message: msg}
 	}
 	return data, nil
 }
 
-// uploadFile uploads a media file for a C2C or group target.
-func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType int, fileName string) (map[string]interface{}, error) {
-	var path string
-	payload := map[string]interface{}{
-		"file_type":    fileType,
-		"srv_send_msg": false,
-	}
-	if fileName != "" {
-		payload["file_name"] = fileName
-	}
-	if strings.HasPrefix(fileData, "data:") {
-		parts := strings.SplitN(fileData, ",", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("无效的 data: URI 文件数据")
-		}
-		fileData = parts[1]
-	}
-	if kind == "friend" {
-		payload["openid"] = targetID
-		path = "/v2/users/" + targetID + "/files"
-	} else {
-		payload["group_openid"] = targetID
-		path = "/v2/groups/" + targetID + "/files"
-	}
-	// If the file ref looks like a URL, pass it directly; a local path is read
-	// and base64-encoded (对齐 Python 的 os.path.exists + base64 分支)
-	if strings.HasPrefix(fileData, "http://") || strings.HasPrefix(fileData, "https://") {
-		payload["url"] = fileData
-	} else if data, err := os.ReadFile(fileData); err == nil {
-		payload["file_data"] = base64.StdEncoding.EncodeToString(data)
-	} else {
-		payload["file_data"] = fileData // 兼容调用方直接传 base64 的旧路径
-	}
+// PostJSON 实现 APIPoster：带鉴权的 POST 请求（含瞬时错误重试）。
+func (a *Adapter) PostJSON(path string, payload map[string]interface{}) (map[string]interface{}, error) {
 	return a.apiRequest(http.MethodPost, path, payload)
 }
 
+// HTTPClient 实现 APIPoster（分片上传直连 COS 预签名 URL 用）。
+func (a *Adapter) HTTPClient() *http.Client { return a.httpClient }
+
+// uploadFile uploads a media file for a C2C or group target.
+// 清单 7：本地文件 >10MB 自动切换分片上传（复用包内 UploadMedia）。
+func (a *Adapter) uploadFile(kind, targetID string, fileData string, fileType int, fileName string) (map[string]interface{}, error) {
+	return UploadMedia(a, kind, targetID, fileData, fileType, fileName)
+}
+
 // sendC2C sends a message to a C2C user.
-func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string) error {
-	payload := map[string]interface{}{"content": plainText}
-	payload["msg_seq"] = rand.Intn(10000) + 1 // #nosec G404 -- QQ 官方 API msg_seq 消息序号（对齐 Python random.randint(1,10000)），非安全随机
-	if msgID != "" {
-		payload["msg_id"] = msgID
-	}
+// 走 markdown 模式（msg_type=2，清单 1）+ markdown 被拒回退（清单 2）+
+// 被动回复失败转主动重发（清单 3）；主动消息（msgID 为空）不带 msg_id（清单 4）。
+func (a *Adapter) sendC2C(openID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string, useMarkdown bool) error {
+	var media map[string]interface{}
+	var err error
 	if imageRef != "" {
-		media, err := a.uploadFile("friend", openID, imageRef, fileTypeImage, "")
-		if err != nil {
-			return err
-		}
-		payload["media"] = media
-		payload["msg_type"] = 7
+		media, err = a.uploadFile("friend", openID, imageRef, fileTypeImage, "")
 	} else if fileRef != "" {
-		media, err := a.uploadFile("friend", openID, fileRef, fileType, fileName)
-		if err != nil {
-			return err
-		}
-		payload["media"] = media
-		payload["msg_type"] = 7
+		media, err = a.uploadFile("friend", openID, fileRef, fileType, fileName)
 	}
-	return a.postMessage("/v2/users/"+openID+"/messages", payload)
-}
-
-// sendGroup sends a message to a group.
-func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string) error {
-	payload := map[string]interface{}{"content": plainText}
-	if msgID != "" {
-		payload["msg_id"] = msgID
-	}
-	payload["msg_seq"] = rand.Intn(10000) + 1 // #nosec G404 -- QQ 官方 API msg_seq 消息序号（对齐 Python random.randint(1,10000)），非安全随机
-	if imageRef != "" {
-		media, err := a.uploadFile("group", groupOpenID, imageRef, fileTypeImage, "")
-		if err != nil {
-			return err
-		}
-		payload["media"] = media
-		payload["msg_type"] = 7
-	} else if fileRef != "" {
-		media, err := a.uploadFile("group", groupOpenID, fileRef, fileType, fileName)
-		if err != nil {
-			return err
-		}
-		payload["media"] = media
-		payload["msg_type"] = 7
-	}
-	return a.postMessage("/v2/groups/"+groupOpenID+"/messages", payload)
-}
-
-// sendChannel sends a message to a guild channel.
-func (a *Adapter) sendChannel(channelID, plainText, imageRef string) error {
-	payload := map[string]interface{}{"content": plainText}
-	if imageRef != "" {
-		payload["file_image"] = imageRef
-	}
-	return a.postMessage("/channels/"+channelID+"/messages", payload)
-}
-
-func (a *Adapter) postMessage(path string, payload map[string]interface{}) error {
-	data, err := a.apiRequest(http.MethodPost, path, payload)
 	if err != nil {
 		return err
 	}
-	if data != nil {
-		if id, ok := data["id"].(string); ok {
-			// refresh cached msg id happens on next remember
-			_ = id
-		}
+	if plainText == "" && media == nil {
+		// 对齐 Python：无文本且无媒体时跳过发送。
+		return nil
 	}
-	return nil
+	payload := BuildSendPayload(SceneFriend, plainText, useMarkdown, msgID, media)
+	_, err = SendWithMarkdownFallback(a.PostJSON, "/v2/users/"+openID+"/messages", payload, plainText, nil)
+	return err
+}
+
+// sendGroup sends a message to a group.
+// 走 markdown 模式 + markdown 被拒回退 + 被动回复失败转主动重发；
+// 主动消息（msgID 为空）不带 msg_id（清单 4，开关校验在 Send 层）。
+func (a *Adapter) sendGroup(groupOpenID, plainText, imageRef, fileRef, fileName string, fileType int, msgID string, useMarkdown bool) error {
+	var media map[string]interface{}
+	var err error
+	if imageRef != "" {
+		media, err = a.uploadFile("group", groupOpenID, imageRef, fileTypeImage, "")
+	} else if fileRef != "" {
+		media, err = a.uploadFile("group", groupOpenID, fileRef, fileType, fileName)
+	}
+	if err != nil {
+		return err
+	}
+	if plainText == "" && media == nil {
+		return nil
+	}
+	payload := BuildSendPayload(SceneGroup, plainText, useMarkdown, msgID, media)
+	_, err = SendWithMarkdownFallback(a.PostJSON, "/v2/groups/"+groupOpenID+"/messages", payload, plainText, nil)
+	return err
+}
+
+// sendChannel sends a message to a guild channel.
+// 清单 5：频道被动回复注入 msg_id（对齐 Python :331）；频道 API 不使用 v2
+// msg_type/msg_seq，markdown 直接随载荷携带（被拒时回退 content）。
+func (a *Adapter) sendChannel(channelID, plainText, imageRef string, msgID string, useMarkdown bool) error {
+	payload := map[string]interface{}{"content": plainText}
+	if msgID != "" {
+		payload["msg_id"] = msgID
+	}
+	if imageRef != "" {
+		payload["file_image"] = imageRef
+	}
+	if useMarkdown && plainText != "" {
+		delete(payload, "content")
+		payload["markdown"] = map[string]string{"content": plainText}
+	}
+	if plainText == "" && imageRef == "" {
+		return nil
+	}
+	_, err := SendWithMarkdownFallback(a.PostJSON, "/channels/"+channelID+"/messages", payload, plainText, nil)
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,25 +1086,46 @@ func (a *Adapter) postMessage(path string, payload map[string]interface{}) error
 // ---------------------------------------------------------------------------
 
 // streamFragment sends one C2C streaming fragment and returns the message id.
+// 请求体对齐 Python post_c2c_message 的 stream 包装结构（:742-793）：
+// {"msg_type":2, "markdown":{"content":...}, "msg_id":..., "msg_seq":n,
+//
+//	"stream":{"state":1|10, "index":n, "reset":false, "id":...?}}，
+//
+// 不再把 state/index/reset 平铺在顶层（msg_type=1 平铺为旧协议，QQ 已弃用）。
 func (a *Adapter) streamFragment(openID string, state int, id string, index int, text string) (string, error) {
+	// 清单 8：结束分片（state=10）内容必须以 \n 结尾（QQ API 流式校验，
+	// 对齐 Python :314-323 的发送前修正）。
+	if state == 10 && text != "" && !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
 	payload := map[string]interface{}{
-		"content":  text,
-		"msg_type": 1,
+		"msg_type": 2,
+		"markdown": map[string]string{"content": text},
 		"msg_seq":  rand.Intn(10000) + 1, // #nosec G404 -- QQ 官方 API msg_seq 消息序号（对齐 Python random.randint(1,10000)），非安全随机
-		"state":    state,
-		"index":    index,
-		"reset":    false,
 	}
+	// 被动回复：注入仍在时效内的 msg_id（对齐 Python C2C payload["msg_id"]=message_id）
+	a.mu.Lock()
+	cachedID := a.sessionLastMsg[openID]
+	cachedAt := a.sessionLastMsgAt[openID]
+	a.mu.Unlock()
+	if cachedID != "" && (MsgIDInfo{ID: cachedID, At: cachedAt}).Fresh() {
+		payload["msg_id"] = cachedID
+	}
+	stream := map[string]interface{}{"state": state, "index": index, "reset": false}
 	if id != "" {
-		payload["id"] = id
+		// QQ 不接受 stream.id=null：尚未分配消息 id 时移除该键（对齐 Python :762-767）
+		stream["id"] = id
 	}
-	data, err := a.apiRequest(http.MethodPost, "/v2/users/"+openID+"/messages", payload)
+	payload["stream"] = stream
+
+	// 发送并走回退链：msg_id 失败转主动 → 流式 \n 修正重试 → markdown 被拒回退 content
+	ret, err := SendWithMarkdownFallback(a.PostJSON, "/v2/users/"+openID+"/messages", payload, text, stream)
 	if err != nil {
 		return "", err
 	}
 	msgID := ""
-	if data != nil {
-		if v, ok := data["id"].(string); ok {
+	if ret != nil {
+		if v, ok := ret["id"].(string); ok {
 			msgID = v
 		}
 	}

@@ -44,7 +44,7 @@ func TestParseForwardInline(t *testing.T) {
 			},
 		},
 	}
-	chain, fids := a.parseOneBotSegments(segments, 0)
+	chain, fids := a.parseOneBotSegments(segments, 0, "")
 	if len(chain) != 2 {
 		t.Fatalf("expected 2 components, got %d", len(chain))
 	}
@@ -69,7 +69,7 @@ func TestParseForwardRemoteId(t *testing.T) {
 			"data": map[string]interface{}{"id": "fwd123"},
 		},
 	}
-	chain, fids := a.parseOneBotSegments(segments, 0)
+	chain, fids := a.parseOneBotSegments(segments, 0, "")
 	if len(fids) != 1 || fids[0] != "fwd123" {
 		t.Errorf("forward ids: %v", fids)
 	}
@@ -103,7 +103,7 @@ func TestForwardDepthLimit(t *testing.T) {
 	segments := []interface{}{
 		map[string]interface{}{"type": "forward", "data": map[string]interface{}{"content": level1}},
 	}
-	chain, _ := a.parseOneBotSegments(segments, 0)
+	chain, _ := a.parseOneBotSegments(segments, 0, "")
 	if len(chain) != 1 {
 		t.Fatalf("expected 1 component for depth-2 nesting, got %d", len(chain))
 	}
@@ -133,7 +133,7 @@ func TestForwardDepthLimit(t *testing.T) {
 	segments4 := []interface{}{
 		map[string]interface{}{"type": "forward", "data": map[string]interface{}{"content": level4}},
 	}
-	chain4, _ := a.parseOneBotSegments(segments4, 0)
+	chain4, _ := a.parseOneBotSegments(segments4, 0, "")
 	if len(chain4) != 0 {
 		t.Errorf("over-deep nested forwards must be dropped entirely, got %d components", len(chain4))
 	}
@@ -157,7 +157,7 @@ func TestForwardDepthLimit(t *testing.T) {
 	segments5 := []interface{}{
 		map[string]interface{}{"type": "forward", "data": map[string]interface{}{"content": selfTextLevel}},
 	}
-	chain5, _ := a.parseOneBotSegments(segments5, 0)
+	chain5, _ := a.parseOneBotSegments(segments5, 0, "")
 	if len(chain5) != 1 {
 		t.Fatalf("expected 1 component, got %d", len(chain5))
 	}
@@ -181,7 +181,7 @@ func TestParseReplySegment(t *testing.T) {
 		map[string]interface{}{"type": "text", "data": map[string]interface{}{"text": "hi"}},
 		map[string]interface{}{"type": "reply", "data": map[string]interface{}{"id": "r123"}},
 	}
-	chain, fids := a.parseOneBotSegments(segments, 0)
+	chain, fids := a.parseOneBotSegments(segments, 0, "")
 	if len(chain) != 2 {
 		t.Fatalf("expected 2 components, got %d", len(chain))
 	}
@@ -342,7 +342,7 @@ func TestFileSegmentFileID(t *testing.T) {
 	segments := []interface{}{
 		map[string]interface{}{"type": "file", "data": map[string]interface{}{"file": "bug.md", "file_id": "/d03b2bc3-c046-4aee-87f2-6852a6f9b1ed", "name": "bug.md"}},
 	}
-	chain, _ := a.parseOneBotSegments(segments, 0)
+	chain, _ := a.parseOneBotSegments(segments, 0, "")
 	if len(chain) != 1 {
 		t.Fatalf("expected 1 component, got %d", len(chain))
 	}
