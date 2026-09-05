@@ -99,10 +99,9 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	if pysdk.DiscoverPythonBin() == "" {
 		t.Skip("python3 不可用")
 	}
-	// 独立 venv/缓存目录：不共享 ~/.cache/astrbot-go 下的 venv，避免测试
-	// 环境污染与跨进程 pip 并发（t.Setenv 不可在并行测试中调用——本测试
-	// 不 t.Parallel()）。
-	t.Setenv("ASTRBOT_PYTHON_CACHE_DIR", t.TempDir())
+	// venv/缓存目录由 TestMain 统一设置（包级共享 ASTRBOT_PYTHON_CACHE_DIR），
+	// 各 Python 测试复用同一 venv，避免逐测试重复创建 + pip 安装拖垮全量
+	// timeout（共享安全性见 runtime_test.go TestMain 注释）。
 	pluginDir := filepath.Join("testdata", "python_plugin")
 	if _, err := os.Stat(pluginDir); err != nil {
 		t.Skipf("缺少 testdata/python_plugin: %v", err)
@@ -286,11 +285,8 @@ func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
 	if pysdk.DiscoverPythonBin() == "" {
 		t.Skip("python3 不可用")
 	}
-	// 独立 venv/缓存目录：不共享 ~/.cache/astrbot-go 下的 venv，避免污染
-	// 真实宿主缓存与跨进程 pip 并发；pip 缓存也隔离到临时目录（沙箱内
-	// ~/.cache/pip 可能不可写导致 wheel 构建失败）。
-	t.Setenv("ASTRBOT_PYTHON_CACHE_DIR", t.TempDir())
-	t.Setenv("PIP_CACHE_DIR", t.TempDir())
+	// venv/缓存目录由 TestMain 统一共享（见 runtime_test.go TestMain 注释）；
+	// PIP_CACHE_DIR 也在 TestMain 设为共享目录下的 pip/，wheel 缓存加速重建。
 	m := newTestManager(t)
 	defer m.Shutdown()
 
@@ -344,9 +340,7 @@ func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
 // HandleCommand 必须返回 sent=true（对齐 Python _has_send_oper）——宿主管线
 // 据此不再走 LLM。
 func TestPythonPluginSendMarksSent(t *testing.T) {
-	// 独立 venv/缓存目录（同 EndToEnd，避免与真实宿主/其他测试共享
-	// ~/.cache/astrbot-go 下的 venv 与 pip 并发）。
-	t.Setenv("ASTRBOT_PYTHON_CACHE_DIR", t.TempDir())
+	// venv/缓存目录由 TestMain 统一共享（见 runtime_test.go TestMain 注释）。
 	m := newTestManager(t)
 	// 独立端口区间：与真实宿主默认范围（10000-25000）及其他测试隔离。
 	m.MinPort = 50900

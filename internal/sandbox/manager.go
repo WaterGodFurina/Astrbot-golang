@@ -15,6 +15,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
@@ -22,12 +23,147 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 var logger = log.GetDefault().WithComponent("Sandbox")
+
+// managedSkillsFile 对齐 Python computer_client._MANAGED_SKILLS_FILE：沙盒
+// /workspace/skills 下的宿主托管技能清单，推送前据此清理上一轮托管的技能
+// 目录（沙盒内置技能不受影响）。
+const managedSkillsFile = ".astrbot_managed_skills.json"
+
+// skillsRootName 对齐 Python SANDBOX_SKILLS_ROOT（"skills"，位于 /workspace 下）。
+const skillsRootName = "skills"
+
+// hostSkillsProvider 返回宿主本地技能目录中需要推送进沙盒的技能
+// （name → 宿主目录路径），等价 Python computer_client._collect_sync_skill_dirs
+// 的宿主侧部分。返回 nil 表示未接线（跳过推送）。
+var hostSkillsProvider func(activeOnly bool) map[string]string
+
+// SetHostSkillsProvider wires the host skill-dir snapshot used by
+// pushHostSkills. Called by sandbox.NewManager when a SkillManager is set.
+// 收集语义对齐 _collect_sync_skill_dirs：只推 active 本地/插件技能
+// （sandbox_only 无宿主目录、未激活插件技能与文件缺失条目天然缺席），
+// 不含 workspace 技能（会话工作区，对齐本体不推 workspace）。
+func SetHostSkillsProvider(fn func(activeOnly bool) map[string]string) {
+	if fn == nil {
+		return
+	}
+	hostSkillsProvider = fn
+}
+
+// PushHostSkills pushes the host's active local skills into the sandbox's
+// /workspace/skills (mirrors Python _sync_skills_to_sandbox apply phase):
+// previous managed skills are removed first, then each host skill dir is
+// copied file-by-file via WriteFile, and the managed list is persisted inside
+// the sandbox. Non-skill files under existing sandbox skills stay untouched;
+// sandbox builtin skills are never removed.
+func (m *Manager) PushHostSkills(ctx context.Context, sessionID string) error {
+	if hostSkillsProvider == nil {
+		return nil
+	}
+	sb, err := m.EnsureSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if sb.booter == nil || !sb.booter.IsRunning() {
+		return fmt.Errorf("sandbox not running")
+	}
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	return pushHostSkillsLocked(ctx, sb.booter, hostSkillsProvider(true))
+}
+
+func pushHostSkillsLocked(ctx context.Context, b Booter, hostSkills map[string]string) error {
+	// 1. Load the previous managed-skills list (empty when absent).
+	prev := loadManagedList(ctx, b)
+	// 2. Remove previously managed skill dirs (aligned with the apply phase).
+	for _, name := range prev {
+		_ = removeSandboxTree(ctx, b, skillsRootName+"/"+name)
+	}
+	// 3. Copy host skill dirs into /workspace/skills.
+	managed := make([]string, 0, len(hostSkills))
+	names := make([]string, 0, len(hostSkills))
+	for name := range hostSkills {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		dir := hostSkills[name]
+		if err := copyHostSkillDir(ctx, b, dir, skillsRootName+"/"+name); err != nil {
+			logger.Warn("推送技能 %s 到沙盒失败: %v", name, err)
+			continue
+		}
+		managed = append(managed, name)
+	}
+	// 4. Persist the managed list inside the sandbox.
+	payload, _ := json.Marshal(map[string]interface{}{"managed_skills": managed})
+	if err := b.WriteFile(ctx, skillsRootName+"/"+managedSkillsFile, string(payload)); err != nil {
+		logger.Warn("写沙盒托管技能清单失败: %v", err)
+	}
+	logger.Debug("已推送 %d 个宿主技能到沙盒 %s", len(managed), sessionIDOf(b))
+	return nil
+}
+
+// loadManagedList reads the managed-skills list from the sandbox.
+func loadManagedList(ctx context.Context, b Booter) []string {
+	data, err := b.ReadFile(ctx, skillsRootName+"/"+managedSkillsFile)
+	if err != nil {
+		return nil
+	}
+	var payload struct {
+		ManagedSkills []string `json:"managed_skills"`
+	}
+	if json.Unmarshal([]byte(data), &payload) != nil {
+		return nil
+	}
+	out := make([]string, 0, len(payload.ManagedSkills))
+	for _, name := range payload.ManagedSkills {
+		name = strings.TrimSpace(name)
+		if name != "" && !strings.Contains(name, "/") && name != "." && name != ".." {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// removeSandboxTree deletes a directory (or file) inside the sandbox workspace
+// via a shell rm -rf guarded by a fixed root prefix.
+func removeSandboxTree(ctx context.Context, b Booter, rel string) error {
+	// rel 由受控常量与技能名拼出（技能名经 skillNameRe 校验），无路径注入。
+	_, _, _, err := b.Exec(ctx, "sh", []string{"-c", "rm -rf '" + rel + "'"}, SandboxWorkdir)
+	return err
+}
+
+// copyHostSkillDir copies a host skill directory into the sandbox file by
+// file (nested dirs flattened into posix paths under relDir).
+func copyHostSkillDir(ctx context.Context, b Booter, hostDir, relDir string) error {
+	return filepath.WalkDir(hostDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(hostDir, p)
+		if err != nil {
+			return err
+		}
+		// #nosec G304 -- p is derived from filepath.WalkDir over the host
+		// skills root (managed local directory).
+		content, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return b.WriteFile(ctx, relDir+"/"+filepath.ToSlash(rel), string(content))
+	})
+}
+
+func sessionIDOf(b Booter) string { return string(b.Type()) }
 
 // BooterType identifies the sandbox backend.
 type BooterType string
@@ -712,10 +848,33 @@ type Manager struct {
 
 // NewManager creates a sandbox manager.
 func NewManager(skillMgr *skills.SkillManager) *Manager {
-	return &Manager{
+	m := &Manager{
 		skillMgr: skillMgr,
 		sessions: make(map[string]*sessionBooter),
 	}
+	// 接线宿主技能目录快照（等价 Python computer_client._collect_sync_skill_dirs
+	// 的宿主侧）：推送进沙盒的 = active 本地/插件技能（sandbox_only 无宿主目录
+	// 天然缺席；文件缺失目录跳过）。⚠️ 本体推送侧还会按插件激活状态过滤——
+	// Go 宿主由注入侧 filterSkillsForCurrentConfig 统一承担（sandbox 包不
+	// 依赖 pipeline 的激活快照），未激活插件的技能目录可能多推一份，但
+	// 不会进入 LLM 技能清单。
+	if skillMgr != nil {
+		SetHostSkillsProvider(func(activeOnly bool) map[string]string {
+			out := map[string]string{}
+			for _, sk := range skillMgr.ListSkillsView(activeOnly, "local", false) {
+				if sk.SourceType == skills.SourceSandboxOnly {
+					continue
+				}
+				local := filepath.FromSlash(sk.Path)
+				if info, err := os.Stat(local); err != nil || !info.IsDir() {
+					continue
+				}
+				out[sk.Name] = local
+			}
+			return out
+		})
+	}
+	return m
 }
 
 // SetBooterFactory sets the booter factory (from lifecycle's sandbox config).

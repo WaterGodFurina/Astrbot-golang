@@ -14,11 +14,15 @@ package dashboard
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +30,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -43,6 +48,26 @@ type chatStreamAdapter struct {
 	mu          sync.Mutex
 	seq         uint64
 	subscribers map[string]map[uint64]chan *message.MessageChain // sessionID -> seq -> ch
+
+	// persistMu 保护下方惰性绑定的落库依赖（bindPersistence 由每次 chat
+	// run 注入，Send 在无订阅者兜底时读取）。
+	persistMu sync.Mutex
+	// chat/threads/registerAttachment 用于"无订阅者兜底落库"（对齐本体
+	// webchat_adapter.send_by_session：无活跃流时直接持久化主动消息）。
+	// chatStore/threadStore 不导出且 server.go 不可改动，因此由 chat run
+	// 入口（runChatSSEStream / handleWSMessageSend）幂等绑定。
+	chat               *chatStore
+	threads            *threadStore
+	registerAttachment func(srcPath, attachType, displayName string) (string, string, error)
+}
+
+// bindPersistence 幂等绑定落库依赖（重复绑定同值无害）。
+func (a *chatStreamAdapter) bindPersistence(chat *chatStore, threads *threadStore, registerAttachment func(srcPath, attachType, displayName string) (string, string, error)) {
+	a.persistMu.Lock()
+	defer a.persistMu.Unlock()
+	a.chat = chat
+	a.threads = threads
+	a.registerAttachment = registerAttachment
 }
 
 func newChatStreamAdapter() *chatStreamAdapter {
@@ -71,6 +96,9 @@ func (a *chatStreamAdapter) Send(sessionID string, chain *message.MessageChain) 
 	}
 	a.mu.Unlock()
 	if target == nil {
+		// 无活跃订阅者：对齐本体 webchat_adapter.send_by_session 兜底——
+		// 主动消息不再直接丢弃，而是落库到会话历史，保证重新打开会话可见。
+		a.persistProactiveMessage(sessionID, chain)
 		return nil
 	}
 	select {
@@ -79,6 +107,32 @@ func (a *chatStreamAdapter) Send(sessionID string, chain *message.MessageChain) 
 		// Subscriber not draining; drop rather than block the pipeline.
 	}
 	return nil
+}
+
+// persistProactiveMessage 把无订阅者收到的回复链按全组件持久化进会话历史
+// （对齐本体 webchat_adapter._save_proactive_message：媒体组件登记为附件
+// part，bot 身份落库）。会话不存在时 appendMessage 返回 false，静默放弃。
+func (a *chatStreamAdapter) persistProactiveMessage(sessionID string, chain *message.MessageChain) {
+	a.persistMu.Lock()
+	chat, register := a.chat, a.registerAttachment
+	a.persistMu.Unlock()
+	if chat == nil || chain == nil || len(chain.Chain) == 0 {
+		return
+	}
+	parts := chainToStorageParts(register, chain)
+	if len(parts) == 0 {
+		return
+	}
+	chat.appendMessage(sessionID, map[string]interface{}{
+		"id":          fmt.Sprintf("b_%d", time.Now().UnixNano()),
+		"session_id":  sessionID,
+		"sender_id":   "bot",
+		"sender_name": "bot",
+		"role":        "assistant",
+		"type":        "bot",
+		"content":     map[string]interface{}{"type": "bot", "message": parts},
+		"created_at":  time.Now().Format(time.RFC3339Nano),
+	})
 }
 
 func (a *chatStreamAdapter) subscribe(sessionID string) (chan *message.MessageChain, uint64) {
@@ -120,6 +174,64 @@ type chatStreamRequest struct {
 	// ThreadID 非空时消息写入线程历史而非会话历史（对齐 Python
 	// platform_history_id="webchat_thread"）。
 	ThreadID string
+	// Extras 携带 action_type / llm_checkpoint_id / thread_selected_text，
+	// 对齐本体 webchat_adapter.create_event 注入 event.extra 的字段
+	// （pipeline 通过 event.GetExtra 消费）。
+	Extras map[string]interface{}
+	// LegacyFlags 是请求体遗留顶层 flag 字段（flags.* 未传时的回退源），
+	// 与 Flags 一起交给 resolveWebchatRequestFlags。
+	LegacyFlags map[string]interface{}
+	// LLMCheckpointID 为本次 run 的 checkpoint id（落库/前端 message_saved 共用）。
+	LLMCheckpointID string
+}
+
+// resolveWebchatRequestFlags 对齐本体 request_flags.resolve_webchat_request_flags：
+// flags[key]（bool）优先，其次 payload 顶层同名字段（bool），否则默认 true。
+// 三个 flag 未传时默认开启（Go decode 后缺字段是零值，需显式 resolve）。
+func resolveWebchatRequestFlags(flags map[string]interface{}, payload map[string]interface{}) map[string]interface{} {
+	resolved := make(map[string]interface{}, 3)
+	for _, key := range webchatRequestFlagKeys {
+		value := boolFlagValue(flags[key])
+		if value == nil {
+			value = boolFlagValue(payload[key])
+		}
+		if value == nil {
+			value = true
+		}
+		resolved[key] = value
+	}
+	return resolved
+}
+
+// webchatRequestFlagKeys 对齐本体 WEBCHAT_REQUEST_FLAG_DEFAULTS（三者默认 true）。
+var webchatRequestFlagKeys = []string{
+	"enable_inline_genui",
+	"enable_default_system_prompt",
+	"enable_streaming",
+}
+
+// boolFlagValue 仅接受显式 bool，其余（含缺省/类型不符）返回 nil 触发回退。
+func boolFlagValue(v interface{}) interface{} {
+	if b, ok := v.(bool); ok {
+		return b
+	}
+	return nil
+}
+
+// legacyFlagPayload 把请求体中的遗留顶层 flag 字段收集成 map（对齐本体
+// payload 顶层 enable_* 回退字段），nil 字段不放入（表示未传）。
+func legacyFlagPayload(inlineGenui, defaultPrompt, streaming *bool) map[string]interface{} {
+	payload := make(map[string]interface{}, 3)
+	if inlineGenui != nil {
+		payload["enable_inline_genui"] = *inlineGenui
+	}
+	if defaultPrompt != nil {
+		payload["enable_default_system_prompt"] = *defaultPrompt
+	}
+	if streaming != nil {
+		payload["enable_streaming"] = *streaming
+	}
+	return payload
 }
 
 // handleChatSend streams a chat reply over SSE.
@@ -134,6 +246,14 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		SelectedModel    string                   `json:"selected_model"`
 		Flags            map[string]interface{}   `json:"flags"`
 		SkipUserHistory  bool                     `json:"_skip_user_history"`
+		// 遗留顶层 flag 字段：flags.* 未传时回退（本体 payload 顶层字段语义）。
+		EnableInlineGenui         *bool `json:"enable_inline_genui"`
+		EnableDefaultSystemPrompt *bool `json:"enable_default_system_prompt"`
+		EnableStreaming           *bool `json:"enable_streaming"`
+		// 对齐本体 webchat_adapter.create_event 注入 extra 的三个字段。
+		ActionType         string `json:"action_type"`
+		LLMCheckpointID    string `json:"_llm_checkpoint_id"`
+		ThreadSelectedText string `json:"_thread_selected_text"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiError("Invalid JSON body"))
@@ -158,6 +278,12 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, apiError("Message content is empty"))
 		return
 	}
+	// llm_checkpoint_id：请求显式携带时沿用（regenerate 续接 checkpoint），
+	// 否则新生成（对齐本体 chat_service.build_chat_stream）。
+	llmCheckpointID := body.LLMCheckpointID
+	if llmCheckpointID == "" {
+		llmCheckpointID = fmt.Sprintf("c_%d", time.Now().UnixNano())
+	}
 	s.runChatSSEStream(w, r, chatStreamRequest{
 		SessionID:        sessionID,
 		Parts:            parts,
@@ -168,6 +294,14 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		// 编辑后"继续对话"（continueEditedMessage）会带 _skip_user_history：
 		// user 消息已存在于历史中，不再重复落盘（对齐 Python _skip_user_history）。
 		PersistUser: !body.SkipUserHistory,
+		Extras: map[string]interface{}{
+			"action_type":          body.ActionType,
+			"llm_checkpoint_id":    llmCheckpointID,
+			"thread_selected_text": body.ThreadSelectedText,
+		},
+		// 遗留顶层 flag 字段与显式 flags 一并交给 resolveWebchatRequestFlags。
+		LegacyFlags:     legacyFlagPayload(body.EnableInlineGenui, body.EnableDefaultSystemPrompt, body.EnableStreaming),
+		LLMCheckpointID: llmCheckpointID,
 	})
 }
 
@@ -191,6 +325,10 @@ func partsHaveContent(parts []map[string]interface{}, files []interface{}) bool 
 func (s *Server) runChatSSEStream(w http.ResponseWriter, r *http.Request, req chatStreamRequest) {
 	sessionID := req.SessionID
 
+	// 惰性绑定落库依赖：无订阅者兜底（persistProactiveMessage）需要
+	// chat store 与附件登记函数（server.go 构造处不可改动，在此幂等注入）。
+	s.chatAdapter.bindPersistence(s.chat, s.threads, s.registerReplyAttachment)
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeJSON(w, http.StatusInternalServerError, apiError("streaming not supported"))
@@ -200,7 +338,10 @@ func (s *Server) runChatSSEStream(w http.ResponseWriter, r *http.Request, req ch
 	// Persist the user message (skipped for regenerate: the message already
 	// exists in history).
 	savedUserID := fmt.Sprintf("u_%d", time.Now().UnixNano())
-	llmCheckpointID := fmt.Sprintf("c_%d", time.Now().UnixNano())
+	llmCheckpointID := req.LLMCheckpointID
+	if llmCheckpointID == "" {
+		llmCheckpointID = fmt.Sprintf("c_%d", time.Now().UnixNano())
+	}
 	if req.PersistUser {
 		userRecord := map[string]interface{}{
 			"id":          savedUserID,
@@ -251,14 +392,15 @@ func (s *Server) runChatSSEStream(w http.ResponseWriter, r *http.Request, req ch
 	s.registerChatRun(sessionID, runID, runCancel)
 	defer s.unregisterChatRun(sessionID, runID)
 
-	// Subscribe to the pipeline reply for this session. runID 标识本次 run，
-	// 即使同一 session 并发发送也不会把别的请求的回复累积进来。
+	// 订阅管线回复；同时用 sink 累积全组件 parts，run 结束时把完整
+	// 组件列表（媒体+文本）持久化进会话历史（对齐本体全组件落库）。
 	ch, subSeq := s.chatAdapter.subscribe(sessionID)
 	defer s.chatAdapter.unsubscribe(sessionID, subSeq, ch)
+	botSink := newChainPartsSink()
 
 	// Run the user message through the pipeline; done is closed when the
 	// event finishes processing.
-	done := s.processChatEvent(runCtx, sessionID, runID, plainTextFromParts(req.Parts), req.SelectedProvider, req.SelectedModel, req.Flags, req.Files)
+	done := s.processChatEvent(runCtx, sessionID, runID, plainTextFromParts(req.Parts), req)
 	if done == nil {
 		sendSSE(w, flusher, map[string]interface{}{"type": "error", "data": "对话管道不可用"})
 		sendSSE(w, flusher, map[string]interface{}{"type": "end", "data": nil})
@@ -282,14 +424,16 @@ func (s *Server) runChatSSEStream(w http.ResponseWriter, r *http.Request, req ch
 			for {
 				select {
 				case chain := <-ch:
-					emitChainSSE(w, flusher, &full, chain)
+					s.emitChainSSE(w, flusher, &full, chain, botSink)
 				default:
 					goto done
 				}
 			}
 		done:
-			if full.Len() > 0 {
-				// Persist the bot reply into the chat session/thread store.
+			// Persist the bot reply into the chat session/thread store: 全组件
+			// （plain/image/record/file/video）一并落库，对齐本体
+			// message_parts_helper 全组件持久化语义（此前仅存纯文本）。
+			if parts := botSink.storageParts(); len(parts) > 0 {
 				botID := fmt.Sprintf("b_%d", time.Now().UnixNano())
 				botRecord := map[string]interface{}{
 					"id":          botID,
@@ -300,7 +444,7 @@ func (s *Server) runChatSSEStream(w http.ResponseWriter, r *http.Request, req ch
 					"type":        "bot",
 					"content": map[string]interface{}{
 						"type":    "bot",
-						"message": []map[string]interface{}{{"type": "plain", "text": full.String()}},
+						"message": parts,
 					},
 					"created_at": time.Now().Format(time.RFC3339Nano),
 				}
@@ -313,26 +457,418 @@ func (s *Server) runChatSSEStream(w http.ResponseWriter, r *http.Request, req ch
 					"type": "message_saved",
 					"data": map[string]interface{}{"id": botID, "created_at": time.Now().Format(time.RFC3339Nano)},
 				})
-				sendSSE(w, flusher, map[string]interface{}{"type": "complete", "data": full.String()})
 			}
+			// complete 帧只做完成信号（文本兜底由前端处理），帧格式不变。
+			sendSSE(w, flusher, map[string]interface{}{"type": "complete", "data": full.String()})
 			sendSSE(w, flusher, map[string]interface{}{"type": "end", "data": nil})
 			return
 		case chain := <-ch:
-			emitChainSSE(w, flusher, &full, chain)
+			s.emitChainSSE(w, flusher, &full, chain, botSink)
 		}
 	}
 }
 
-// emitChainSSE sends SSE frames for a reply chain: media components first
-// (images as data URLs), then the plain text.
-func emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full *strings.Builder, chain *message.MessageChain) {
-	for _, data := range chainImageDataURLs(chain) {
-		sendSSE(w, flusher, map[string]interface{}{"type": "image", "data": data})
+// emitChainSSE sends SSE frames for a reply chain. 对齐本体 webchat_event._send
+// 分帧语义：逐组件独立发帧——plain 文本帧；Json 组件序列化为 plain 帧；
+// image/record/video/file 媒体帧（文件登记进 webui_files 后发
+// "[TYPE]存储名[|显示名]"，前端按 stored filename 走文件服务拉取）。
+// image 的 base64/URL 保持旧帧格式（data URL / URL 直传）——帧格式不变，
+// 只补此前完全丢失的 record/file/video/json 帧。所有组件同步累积进 sink，
+// 供 run 结束时全组件持久化。
+func (s *Server) emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full *strings.Builder, chain *message.MessageChain, sink *chainPartsSink) {
+	if chain == nil {
+		return
 	}
-	if t := chainPlainText(chain); t != "" {
-		full.WriteString(t)
-		sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": t, "chain_type": "text"})
+	for _, comp := range chain.Chain {
+		switch c := comp.(type) {
+		case *message.Plain:
+			if c.Text == "" {
+				continue
+			}
+			full.WriteString(c.Text)
+			sink.absorbPlain(c.Text)
+			sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": c.Text, "chain_type": "text"})
+		case *message.Json:
+			// 对齐本体：Json 组件序列化为 plain 帧输出。
+			if b, err := json.Marshal(c.Data); err == nil && len(b) > 0 {
+				full.WriteString(string(b))
+				sink.absorbPlain(string(b))
+				sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": string(b), "chain_type": "text"})
+			}
+		case *message.Image:
+			if data := chainImageDataURL(c); data != "" {
+				sendSSE(w, flusher, map[string]interface{}{"type": "image", "data": data})
+				s.persistImageForSink(sink, c)
+				continue
+			}
+			s.emitMediaSSE(w, flusher, sink, c.Path, c.File, "image", "")
+		case *message.Record:
+			s.emitMediaSSE(w, flusher, sink, c.Path, c.File, "record", "")
+		case *message.Video:
+			s.emitMediaSSE(w, flusher, sink, c.Path, c.URL, "video", "")
+		case *message.File:
+			s.emitMediaSSE(w, flusher, sink, c.Path, c.URL, "file", c.Name)
+		}
 	}
+}
+
+// emitMediaSSE 登记媒体组件为附件、发出对齐本体 webchat_event._send 的媒体帧
+// （data="[TYPE]存储名[|显示名]"）并累积进 sink。登记失败时：URL 源回退
+// 直传帧（组件不丢），本地源静默跳过。
+func (s *Server) emitMediaSSE(w http.ResponseWriter, flusher http.Flusher, sink *chainPartsSink, primary, secondary, attachType, displayName string) {
+	frame := s.mediaReplyFrame(sink, primary, secondary, attachType, displayName)
+	if frame == nil {
+		return
+	}
+	sendSSE(w, flusher, frame)
+}
+
+// persistImageForSink 把 base64/URL 形态的图片也登记成附件 part（仅用于
+// 持久化回放；帧本身保持旧格式直传）。登记失败静默忽略。
+func (s *Server) persistImageForSink(sink *chainPartsSink, img *message.Image) {
+	if sink == nil || img == nil {
+		return
+	}
+	var id, stored string
+	var err error
+	if img.Base64 != "" {
+		id, stored, err = registerBase64Image(s.registerReplyAttachment, img.Base64)
+	} else {
+		id, stored, err = s.registerReplyAttachment(img.URL, "image", "")
+	}
+	if err != nil || id == "" {
+		return
+	}
+	sink.absorbAttachment("image", id, stored, "")
+}
+
+// chainImageDataURL returns the inline display source for an image: base64
+// payloads become data URLs (no file service needed), https URLs pass through.
+// Local files return "" so callers fall back to the attachment channel.
+func chainImageDataURL(img *message.Image) string {
+	if img == nil {
+		return ""
+	}
+	switch {
+	case img.Base64 != "":
+		return "data:image/png;base64," + img.Base64
+	case strings.HasPrefix(img.URL, "http://"), strings.HasPrefix(img.URL, "https://"):
+		return img.URL
+	}
+	return ""
+}
+
+// mediaReplyFrame 把媒体组件登记进 webui_files（复用现有附件通道）并生成
+// 对齐本体的媒体帧。登记成功时同步把附件 part 累积进 sink（bot 持久化）。
+func (s *Server) mediaReplyFrame(sink *chainPartsSink, primary, secondary, attachType, displayName string) map[string]interface{} {
+	src := firstMediaPath(primary, secondary)
+	if src == "" {
+		return nil
+	}
+	prefix := "[IMAGE]"
+	switch attachType {
+	case "record":
+		prefix = "[RECORD]"
+	case "video":
+		prefix = "[VIDEO]"
+	case "file":
+		prefix = "[FILE]"
+	}
+	id, stored, display := registerMediaIntoSink(s.registerReplyAttachment, sink, primary, secondary, attachType, displayName)
+	if id == "" {
+		if !strings.HasPrefix(src, "http://") && !strings.HasPrefix(src, "https://") {
+			return nil
+		}
+		// 登记失败回退：URL 直传帧，前端尽力解析；不入持久化 parts。
+		return map[string]interface{}{"type": attachType, "data": prefix + src}
+	}
+	data := prefix + stored
+	if attachType == "file" && display != "" && stored != display {
+		data = prefix + stored + "|" + display
+	}
+	return map[string]interface{}{"type": attachType, "data": data}
+}
+
+// firstMediaPath 返回第一个可用的媒体源（本地路径或 URL），跳过空值。
+func firstMediaPath(paths ...string) string {
+	for _, p := range paths {
+		if p = strings.TrimSpace(p); p != "" {
+			return p
+		}
+	}
+	return ""
+}
+
+// registerMediaIntoSink 把媒体组件（本地文件或远端 URL）登记进 webui_files
+// 并把附件 part 累积进 sink（bot 持久化），返回 attachment_id / 存储名 /
+// 显示名；登记失败返回空 id。发帧与纯落库两条路径共用。
+func registerMediaIntoSink(register func(srcPath, attachType, displayName string) (string, string, error), sink *chainPartsSink, primary, secondary, attachType, displayName string) (string, string, string) {
+	src := firstMediaPath(primary, secondary)
+	if src == "" || register == nil {
+		return "", "", ""
+	}
+	id, stored, err := register(src, attachType, displayName)
+	if err != nil || id == "" {
+		return "", "", ""
+	}
+	display := strings.TrimSpace(displayName)
+	if display == "" {
+		display = stored
+	}
+	sink.absorbAttachment(attachType, id, display, stored)
+	return id, stored, display
+}
+
+// chainToStorageParts 把整条回复链转换为全组件存储 parts（对齐本体
+// message_chain_to_storage_message_parts：plain/json → plain part，
+// 媒体组件登记为附件 part）。供主动消息兜底落库使用。
+func chainToStorageParts(register func(srcPath, attachType, displayName string) (string, string, error), chain *message.MessageChain) []map[string]interface{} {
+	sink := newChainPartsSink()
+	if chain != nil {
+		for _, comp := range chain.Chain {
+			switch c := comp.(type) {
+			case *message.Plain:
+				sink.absorbPlain(c.Text)
+			case *message.Json:
+				if b, err := json.Marshal(c.Data); err == nil && len(b) > 0 {
+					sink.absorbPlain(string(b))
+				}
+			case *message.Image:
+				if chainImageDataURL(c) == "" {
+					registerMediaIntoSink(register, sink, c.Path, c.File, "image", "")
+				} else if c.Base64 != "" {
+					if id, stored, err := registerBase64Image(register, c.Base64); err == nil {
+						sink.absorbAttachment("image", id, stored, "")
+					}
+				}
+			case *message.Record:
+				registerMediaIntoSink(register, sink, c.Path, c.File, "record", "")
+			case *message.Video:
+				registerMediaIntoSink(register, sink, c.Path, c.URL, "video", "")
+			case *message.File:
+				registerMediaIntoSink(register, sink, c.Path, c.URL, "file", c.Name)
+			}
+		}
+	}
+	return sink.storageParts()
+}
+
+// registerBase64Image 把 base64 图片（裸 base64 或 data URL）解码写入
+// webui_files 并登记，用于 bot 回复图片的持久化。
+func registerBase64Image(register func(srcPath, attachType, displayName string) (string, string, error), b64 string) (string, string, error) {
+	payload := strings.TrimSpace(b64)
+	if payload == "" {
+		return "", "", fmt.Errorf("empty base64 payload")
+	}
+	ext := ".png"
+	if strings.HasPrefix(payload, "data:") {
+		if i := strings.Index(payload, ","); i >= 0 {
+			header := strings.ToLower(payload[:i])
+			switch {
+			case strings.Contains(header, "jpeg"), strings.Contains(header, "jpg"):
+				ext = ".jpg"
+			case strings.Contains(header, "gif"):
+				ext = ".gif"
+			case strings.Contains(header, "webp"):
+				ext = ".webp"
+			}
+			payload = payload[i+1:]
+		}
+	}
+	data, decErr := base64.StdEncoding.DecodeString(payload)
+	if decErr != nil || len(data) == 0 || int64(len(data)) > maxWebUIFileSize {
+		return "", "", fmt.Errorf("invalid base64 image")
+	}
+	tmp, err := os.CreateTemp("", "b64img_*"+ext)
+	if err != nil {
+		return "", "", err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return "", "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", "", err
+	}
+	return register(tmpName, "image", "")
+}
+
+// registerReplyAttachment 把媒体源登记进 data/webui_files（复制文件并写
+// 元数据；元数据 filename 使用存储名，保证前端 by-name 检索命中），
+// 返回 attachment_id 与存储名。远端 URL 会先下载到临时文件（对齐本体
+// _send 把媒体落盘的行为）。失败返回错误。
+func (s *Server) registerReplyAttachment(srcPath, attachType, displayName string) (attachmentID, storedName string, err error) {
+	src := strings.TrimSpace(srcPath)
+	if src == "" {
+		return "", "", fmt.Errorf("empty media source")
+	}
+	dir := s.webuiFilesDir()
+	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+		return "", "", mkErr
+	}
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		tmp, cErr := os.CreateTemp(dir, "dl_*")
+		if cErr != nil {
+			return "", "", cErr
+		}
+		tmpName := tmp.Name()
+		defer func() { _ = os.Remove(tmpName) }()
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, gErr := client.Get(src)
+		if gErr != nil {
+			return "", "", gErr
+		}
+		_, cErr = io.Copy(tmp, io.LimitReader(resp.Body, maxWebUIFileSize+1))
+		_ = resp.Body.Close()
+		if cErr == nil {
+			cErr = tmp.Close()
+		} else {
+			_ = tmp.Close()
+		}
+		if cErr != nil {
+			return "", "", cErr
+		}
+		src = tmpName
+	} else if abs, aErr := filepath.Abs(src); aErr == nil {
+		src = abs
+	}
+	info, statErr := os.Stat(src)
+	if statErr != nil {
+		return "", "", statErr
+	}
+	if info.IsDir() || info.Size() == 0 || info.Size() > maxWebUIFileSize {
+		return "", "", fmt.Errorf("media source unusable: %s", src)
+	}
+
+	// 存储名对齐本体 generate_timestamp_id 语义：唯一 id + 扩展名；
+	// 显示名（displayName / 源文件名）仅用于扩展名推断与前端展示。
+	display := strings.TrimSpace(displayName)
+	if display == "" {
+		display = filepath.Base(src)
+	}
+	ext := strings.ToLower(filepath.Ext(display))
+	if ext == "" {
+		ext = strings.ToLower(filepath.Ext(src))
+	}
+	attachmentID = uuid.NewString()
+	storedName = attachmentID + ext
+	dst := filepath.Join(dir, storedName)
+	if cErr := copyFileLimited(src, dst, maxWebUIFileSize); cErr != nil {
+		return "", "", cErr
+	}
+	meta := webuiFileMeta{
+		AttachmentID: attachmentID,
+		Filename:     storedName,
+		Type:         attachType,
+		Size:         info.Size(),
+		CreatedAt:    time.Now().Format(time.RFC3339Nano),
+		FileToken:    uuid.NewString(),
+	}
+	data, _ := json.Marshal(meta)
+	if wErr := writeFileAtomic(filepath.Join(dir, attachmentID+".json"), data, 0o644); wErr != nil {
+		_ = os.Remove(dst)
+		return "", "", wErr
+	}
+	return attachmentID, storedName, nil
+}
+
+// copyFileLimited 复制源文件到目标路径，超过 limit 报错（防异常大文件）。
+func copyFileLimited(src, dst string, limit int64) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(out, io.LimitReader(in, limit+1))
+	if err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	if n > limit {
+		_ = os.Remove(dst)
+		return fmt.Errorf("file exceeds size limit")
+	}
+	return nil
+}
+
+// chainPartsSink 按到达顺序累积一次 run 的回复组件，run 结束时把完整
+// parts 列表（plain/image/record/file/video）持久化进会话历史——对齐本体
+// message_parts_helper.message_chain_to_storage_message_parts 的全组件
+// 持久化语义（此前 Go 仅持久化纯文本）。媒体 part 登记产物携带
+// attachment_id / filename（strip path 字段，对齐本体 storage parts 结构，
+// 兼容现有 chat_store 读取与前端渲染）。
+type chainPartsSink struct {
+	mu    sync.Mutex
+	parts []map[string]interface{}
+	// lastPlainIndex 指向最后一个 plain part（无则 -1），把分帧到达的
+	// 流式文本合并进同一 part（对齐本体 flush 语义）。
+	lastPlainIndex int
+}
+
+func newChainPartsSink() *chainPartsSink {
+	return &chainPartsSink{lastPlainIndex: -1}
+}
+
+// absorbPlain 追加一段文本（与最后一个 plain part 合并）。
+func (sink *chainPartsSink) absorbPlain(text string) {
+	if text == "" {
+		return
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if sink.lastPlainIndex >= 0 && sink.lastPlainIndex < len(sink.parts) {
+		if last, ok := sink.parts[sink.lastPlainIndex]["text"].(string); ok {
+			sink.parts[sink.lastPlainIndex]["text"] = last + text
+			return
+		}
+	}
+	sink.parts = append(sink.parts, map[string]interface{}{"type": "plain", "text": text})
+	sink.lastPlainIndex = len(sink.parts) - 1
+}
+
+// absorbAttachment 追加一个媒体附件 part（type/attachment_id/filename/
+// stored_filename，对齐本体 create_attachment_part_from_existing_file 结构）。
+func (sink *chainPartsSink) absorbAttachment(attachType, attachmentID, filename, storedFilename string) {
+	if attachmentID == "" {
+		return
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	part := map[string]interface{}{
+		"type":          attachType,
+		"attachment_id": attachmentID,
+		"filename":      filename,
+	}
+	if storedFilename != "" && storedFilename != filename {
+		part["stored_filename"] = storedFilename
+	}
+	sink.parts = append(sink.parts, part)
+	sink.lastPlainIndex = -1
+}
+
+// storageParts 返回待持久化的全组件 parts 快照（无组件时返回 nil）。
+func (sink *chainPartsSink) storageParts() []map[string]interface{} {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.parts) == 0 {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(sink.parts))
+	for _, p := range sink.parts {
+		out = append(out, p)
+	}
+	return out
 }
 
 // processChatEvent runs the message through the "default" pipeline scheduler
@@ -345,15 +881,23 @@ func emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full *strings.Bui
 // core.PipelineDone signal that the bus closes once the event is dispatched.
 // Fallback: when the bus is unavailable (queue full / no scheduler), run the
 // event through the scheduler directly in a goroutine.
-func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, providerID, model string, flags map[string]interface{}, files []interface{}) <-chan struct{} {
+//
+// flags 按本体 request_flags 语义解析（未传默认 true）注入 Metadata；
+// action_type / llm_checkpoint_id / thread_selected_text 等请求 extras 一并
+// 注入（对齐本体 webchat_adapter.create_event 注入 event.extra）；
+// reply part 解析为 Reply 组件追加进链（引用内容进 LLM 上下文）。
+func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text string, req chatStreamRequest) <-chan struct{} {
 	bus, ok := s.eventBus.(*core.EventBus)
 	if !ok || bus == nil {
 		return nil
 	}
 	chain := message.NewMessageChain(&message.Plain{Text: text})
+	// reply 组件解析：引用消息 id → 历史内容进上下文（selected_text 优先，
+	// 否则查会话/线程历史 plain 文本，只查 1 层，对齐本体 reply 语义）。
+	chain.Chain = append(chain.Chain, s.replyComponents(req)...)
 	// 上传的文件转成真实组件追加到链上，让管线能消费本地文件
 	// （LLM 视觉上下文、平台转发等），而不是只留占位文本。
-	if comps := s.filesToChainComponents(files); len(comps) > 0 {
+	if comps := s.filesToChainComponents(req.Files); len(comps) > 0 {
 		chain.Chain = append(chain.Chain, comps...)
 	}
 	event := &core.Event{
@@ -383,14 +927,24 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text, p
 	if runID != "" {
 		event.Metadata["run_id"] = runID
 	}
-	if providerID != "" {
-		event.Metadata["selected_provider"] = providerID
+	if req.SelectedProvider != "" {
+		event.Metadata["selected_provider"] = req.SelectedProvider
 	}
-	if model != "" {
-		event.Metadata["selected_model"] = model
+	if req.SelectedModel != "" {
+		event.Metadata["selected_model"] = req.SelectedModel
 	}
-	if len(flags) > 0 {
-		event.Metadata["flags"] = flags
+	// flags 解析对齐本体 request_flags.resolve_webchat_request_flags：
+	// flags.* > 遗留顶层 enable_* > 默认 true，总是注入完整 flag 集。
+	event.Metadata["flags"] = resolveWebchatRequestFlags(req.Flags, req.LegacyFlags)
+	// 对齐本体 webchat_adapter.create_event：action_type / llm_checkpoint_id /
+	// thread_selected_text 注入事件 extra（Go 侧为 Metadata）。
+	for _, key := range []string{"action_type", "llm_checkpoint_id", "thread_selected_text"} {
+		if req.Extras == nil {
+			break
+		}
+		if v, ok := req.Extras[key]; ok && v != nil {
+			event.Metadata[key] = v
+		}
 	}
 
 	done := core.NewPipelineDone()
@@ -437,28 +991,6 @@ func chainPlainText(chain *message.MessageChain) string {
 	return b.String()
 }
 
-// chainImageDataURLs returns the displayable image sources in a chain: base64
-// payloads become data URLs (no file service needed), https URLs pass through.
-func chainImageDataURLs(chain *message.MessageChain) []string {
-	if chain == nil {
-		return nil
-	}
-	var out []string
-	for _, comp := range chain.Chain {
-		img, ok := comp.(*message.Image)
-		if !ok {
-			continue
-		}
-		switch {
-		case img.Base64 != "":
-			out = append(out, "data:image/png;base64,"+img.Base64)
-		case img.URL != "":
-			out = append(out, img.URL)
-		}
-	}
-	return out
-}
-
 // plainTextFromParts joins the plain text of message parts.
 func plainTextFromParts(parts []map[string]interface{}) string {
 	var b strings.Builder
@@ -470,6 +1002,64 @@ func plainTextFromParts(parts []map[string]interface{}) string {
 		}
 	}
 	return b.String()
+}
+
+// replyComponents 解析请求 parts 中的 reply 组件（对齐本体
+// message_parts_helper.parse_webchat_message_parts 的 reply 分支与独立
+// 适配器 _parse_message_parts 的历史递归）：selected_text 优先，否则按
+// message_id 查会话/线程历史 plain 文本（仅 1 层，历史内容中的 reply 不再
+// 递归）。生成 Reply 组件追加进事件链，引用内容随链进入 LLM 上下文
+// （pipeline collectFileAttachments 会展开 Reply.Chain）。
+func (s *Server) replyComponents(req chatStreamRequest) []message.Component {
+	var out []message.Component
+	for _, p := range req.Parts {
+		if t, _ := p["type"].(string); t != "reply" {
+			continue
+		}
+		messageID := partIDString(p["message_id"])
+		if messageID == "" {
+			continue
+		}
+		selectedText, _ := p["selected_text"].(string)
+		if selectedText == "" {
+			selectedText = s.replyHistoryText(messageID)
+		}
+		out = append(out, &message.Reply{
+			MessageID:  messageID,
+			MessageStr: selectedText,
+			Chain:      []message.Component{&message.Plain{Text: selectedText}},
+		})
+	}
+	return out
+}
+
+// replyHistoryText 按 id 查历史消息（会话历史优先，线程历史兜底），提取
+// 其 plain 文本。对齐本体 get_reply_parts（递归深度 1 层）。
+func (s *Server) replyHistoryText(messageID string) string {
+	if msg := s.chat.messageByID(messageID); msg != nil {
+		if text := messageContentText(msg); text != "" {
+			return text
+		}
+	}
+	if msg := s.threads.messageByID(messageID); msg != nil {
+		return messageContentText(msg)
+	}
+	return ""
+}
+
+// partIDString 把 part 中的 message_id 归一为字符串（JSON 数字为 float64，
+// 对齐本体 cast_reply_id_to_str）。
+func partIDString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatInt(int64(t), 10)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprint(t)
+	}
 }
 
 // partsHaveMediaContent reports whether parts carry real content (plain text
@@ -691,15 +1281,18 @@ func (s *Server) handleUnifiedChatWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var msg struct {
-			CT               string                   `json:"ct"`
-			T                string                   `json:"t"`
-			SessionID        string                   `json:"session_id"`
-			MessageID        string                   `json:"message_id"`
-			Message          []map[string]interface{} `json:"message"`
-			Files            []interface{}            `json:"files"`
-			Flags            map[string]interface{}   `json:"flags"`
-			SelectedProvider string                   `json:"selected_provider"`
-			SelectedModel    string                   `json:"selected_model"`
+			CT                 string                   `json:"ct"`
+			T                  string                   `json:"t"`
+			SessionID          string                   `json:"session_id"`
+			MessageID          string                   `json:"message_id"`
+			Message            []map[string]interface{} `json:"message"`
+			Files              []interface{}            `json:"files"`
+			Flags              map[string]interface{}   `json:"flags"`
+			SelectedProvider   string                   `json:"selected_provider"`
+			SelectedModel      string                   `json:"selected_model"`
+			ActionType         string                   `json:"action_type"`
+			LLMCheckpointID    string                   `json:"llm_checkpoint_id"`
+			ThreadSelectedText string                   `json:"thread_selected_text"`
 		}
 		if err := json.Unmarshal(raw, &msg); err != nil {
 			continue
@@ -780,16 +1373,22 @@ func (s *Server) wsSend(c *wsClient, payload map[string]interface{}) {
 // handleWSMessageSend runs a chat message through the pipeline and streams the
 // reply events back over the websocket (per message_id).
 func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
-	CT               string                   `json:"ct"`
-	T                string                   `json:"t"`
-	SessionID        string                   `json:"session_id"`
-	MessageID        string                   `json:"message_id"`
-	Message          []map[string]interface{} `json:"message"`
-	Files            []interface{}            `json:"files"`
-	Flags            map[string]interface{}   `json:"flags"`
-	SelectedProvider string                   `json:"selected_provider"`
-	SelectedModel    string                   `json:"selected_model"`
+	CT                 string                   `json:"ct"`
+	T                  string                   `json:"t"`
+	SessionID          string                   `json:"session_id"`
+	MessageID          string                   `json:"message_id"`
+	Message            []map[string]interface{} `json:"message"`
+	Files              []interface{}            `json:"files"`
+	Flags              map[string]interface{}   `json:"flags"`
+	SelectedProvider   string                   `json:"selected_provider"`
+	SelectedModel      string                   `json:"selected_model"`
+	ActionType         string                   `json:"action_type"`
+	LLMCheckpointID    string                   `json:"llm_checkpoint_id"`
+	ThreadSelectedText string                   `json:"thread_selected_text"`
 }) {
+	// 落库依赖绑定（无订阅者兜底与媒体登记共用，幂等）。
+	s.chatAdapter.bindPersistence(s.chat, s.threads, s.registerReplyAttachment)
+
 	sessionID := msg.SessionID
 	text := plainTextFromParts(msg.Message)
 	messageID := msg.MessageID
@@ -810,7 +1409,10 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 	}
 	s.chat.appendMessage(sessionID, userRecord)
 
-	llmCheckpointID := fmt.Sprintf("c_%d", time.Now().UnixNano())
+	llmCheckpointID := msg.LLMCheckpointID
+	if llmCheckpointID == "" {
+		llmCheckpointID = fmt.Sprintf("c_%d", time.Now().UnixNano())
+	}
 	s.wsSend(c, map[string]interface{}{
 		"ct": "chat", "type": "user_message_saved",
 		"data":       map[string]interface{}{"id": userRecord["id"], "created_at": userRecord["created_at"], "llm_checkpoint_id": llmCheckpointID},
@@ -842,13 +1444,29 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 		runCancel()
 	}()
 
-	done := s.processChatEvent(runCtx, sessionID, messageID, text, msg.SelectedProvider, msg.SelectedModel, msg.Flags, msg.Files)
+	req := chatStreamRequest{
+		SessionID:        sessionID,
+		Parts:            msg.Message,
+		Files:            msg.Files,
+		SelectedProvider: msg.SelectedProvider,
+		SelectedModel:    msg.SelectedModel,
+		Flags:            msg.Flags,
+		PersistUser:      true,
+		LLMCheckpointID:  llmCheckpointID,
+		Extras: map[string]interface{}{
+			"action_type":          msg.ActionType,
+			"llm_checkpoint_id":    llmCheckpointID,
+			"thread_selected_text": msg.ThreadSelectedText,
+		},
+	}
+	done := s.processChatEvent(runCtx, sessionID, messageID, text, req)
 	if done == nil {
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "error", "data": "对话管道不可用", "message_id": messageID})
 		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
 		return
 	}
 
+	botSink := newChainPartsSink()
 	var full strings.Builder
 	deadline := time.After(300 * time.Second)
 	for {
@@ -863,13 +1481,14 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 			for {
 				select {
 				case chain := <-ch:
-					s.emitChainWS(c, &full, chain, messageID)
+					s.emitChainWS(c, &full, chain, messageID, botSink)
 				default:
 					goto done
 				}
 			}
 		done:
-			if full.Len() > 0 {
+			// 全组件持久化（对齐 SSE 路径与本体语义）。
+			if parts := botSink.storageParts(); len(parts) > 0 {
 				botRecord := map[string]interface{}{
 					"id":          fmt.Sprintf("b_%d", time.Now().UnixNano()),
 					"session_id":  sessionID,
@@ -879,30 +1498,72 @@ func (s *Server) handleWSMessageSend(c *wsClient, msg struct {
 					"type":        "bot",
 					"content": map[string]interface{}{
 						"type":    "bot",
-						"message": []map[string]interface{}{{"type": "plain", "text": full.String()}},
+						"message": parts,
 					},
 					"created_at": time.Now().Format(time.RFC3339Nano),
 				}
 				s.chat.appendMessage(sessionID, botRecord)
 				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "message_saved", "data": map[string]interface{}{"id": botRecord["id"], "created_at": botRecord["created_at"]}, "message_id": messageID})
-				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "complete", "data": full.String(), "message_id": messageID})
 			}
+			s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "complete", "data": full.String(), "message_id": messageID})
 			s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "end", "data": nil, "message_id": messageID})
 			return
 		case chain := <-ch:
-			s.emitChainWS(c, &full, chain, messageID)
+			s.emitChainWS(c, &full, chain, messageID, botSink)
 		}
 	}
 }
 
-// emitChainWS sends WebSocket frames for a reply chain: media components first
-// (images as data URLs), then the plain text.
-func (s *Server) emitChainWS(c *wsClient, full *strings.Builder, chain *message.MessageChain, messageID string) {
-	for _, data := range chainImageDataURLs(chain) {
-		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "image", "data": data, "message_id": messageID})
+// emitChainWS sends WebSocket frames for a reply chain. 与 emitChainSSE 相同
+// 的分帧语义（全组件帧 + 附件登记 + sink 累积），仅输出通道与帧封装不同。
+func (s *Server) emitChainWS(c *wsClient, full *strings.Builder, chain *message.MessageChain, messageID string, sink *chainPartsSink) {
+	if chain == nil {
+		return
 	}
-	if t := chainPlainText(chain); t != "" {
-		full.WriteString(t)
-		s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": t, "message_id": messageID})
+	for _, comp := range chain.Chain {
+		switch cc := comp.(type) {
+		case *message.Plain:
+			if cc.Text == "" {
+				continue
+			}
+			full.WriteString(cc.Text)
+			sink.absorbPlain(cc.Text)
+			s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": cc.Text, "message_id": messageID})
+		case *message.Json:
+			if b, err := json.Marshal(cc.Data); err == nil && len(b) > 0 {
+				full.WriteString(string(b))
+				sink.absorbPlain(string(b))
+				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": string(b), "message_id": messageID})
+			}
+		case *message.Image:
+			if data := chainImageDataURL(cc); data != "" {
+				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "image", "data": data, "message_id": messageID})
+				s.persistImageForSink(sink, cc)
+				continue
+			}
+			if frame := s.mediaReplyFrame(sink, cc.Path, cc.File, "image", ""); frame != nil {
+				frame["ct"] = "chat"
+				frame["message_id"] = messageID
+				s.wsSend(c, frame)
+			}
+		case *message.Record:
+			if frame := s.mediaReplyFrame(sink, cc.Path, cc.File, "record", ""); frame != nil {
+				frame["ct"] = "chat"
+				frame["message_id"] = messageID
+				s.wsSend(c, frame)
+			}
+		case *message.Video:
+			if frame := s.mediaReplyFrame(sink, cc.Path, cc.URL, "video", ""); frame != nil {
+				frame["ct"] = "chat"
+				frame["message_id"] = messageID
+				s.wsSend(c, frame)
+			}
+		case *message.File:
+			if frame := s.mediaReplyFrame(sink, cc.Path, cc.URL, "file", cc.Name); frame != nil {
+				frame["ct"] = "chat"
+				frame["message_id"] = messageID
+				s.wsSend(c, frame)
+			}
+		}
 	}
 }

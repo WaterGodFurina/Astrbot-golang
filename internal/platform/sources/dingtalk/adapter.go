@@ -25,8 +25,8 @@ import (
 
 var logger = log.GetDefault().WithComponent("DingTalk")
 
-// 钉钉会话 id 前缀 (对应 Python 的 _id_to_sid)。
-const dingtalkIDPrefix = "$:LWCP_v1$:"
+// 钉钉会话 id 前缀 (对应 Python dingtalk_adapter.py 的 _id_to_sid: prefix = "$:LWCP_v1:$")。
+const dingtalkIDPrefix = "$:LWCP_v1:$"
 
 // accessTokenCache 缓存钉钉 access_token (对应 Python 中 SDK 的 token 缓存)。
 type accessTokenCache struct {
@@ -43,9 +43,8 @@ type Adapter struct {
 
 	EventBus *core.EventBus
 
-	clientID       string
-	clientSecret   string
-	cardTemplateID string
+	clientID     string
+	clientSecret string
 
 	httpClient *http.Client
 	tokenCache accessTokenCache
@@ -92,7 +91,6 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	}
 	a.clientID, _ = config["client_id"].(string)
 	a.clientSecret, _ = config["client_secret"].(string)
-	a.cardTemplateID, _ = config["card_template_id"].(string)
 	a.dataDir, _ = config["dingtalk_data_dir"].(string)
 	if a.dataDir == "" {
 		wd, _ := os.Getwd()

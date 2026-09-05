@@ -76,6 +76,9 @@ type Server struct {
 	projects        *projectStore
 	apiKeys         *apiKeyStore
 	mcp             *mcpStore
+	// neo 是 Neo 技能生命周期存储（data/neo_skills/，对齐 shipyard-neo SDK
+	// 数据模型；dashboard Neo API 的宿主侧等价实现，见 skills_neo 路由）。
+	neo *skills.NeoStore
 	// backupTaskMu/backupTasks 跟踪后台备份任务（导出/导入）进度。
 	backupTaskMu sync.Mutex
 	backupTasks  map[string]*backupTaskState
@@ -339,6 +342,7 @@ func NewServer(port int, configPath string) *Server {
 	s.apiKeys = newAPIKeyStore(filepath.Dir(configPath))
 	s.chatAdapter = newChatStreamAdapter()
 	s.mcp = newMCPStore(filepath.Dir(configPath))
+	s.neo = skills.NewNeoStore(filepath.Dir(configPath))
 	s.updateProgress = make(map[string]*updateProgress)
 	s.installProgress = make(map[string]*installStatus)
 	s.marketCache = make(map[string]*marketCacheEntry)
@@ -420,7 +424,18 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 					if kbID == "" {
 						return fmt.Errorf("knowledge base id is empty")
 					}
-					name := filepath.Base(strings.TrimRight(url, "/"))
+					// 对齐本体 parsers：提取纯文本后再分块（HTML 抽正文/
+					// 多编码兜底/二进制格式尽力提取），避免标签与乱码入库。
+					extracted, xerr := knowledgebase.ExtractKBText(content, url, "")
+					if xerr != nil {
+						return fmt.Errorf("解析文档内容失败: %w", xerr)
+					}
+					content = []byte(extracted)
+					name := strings.TrimRight(url, "/")
+					if i := strings.IndexAny(name, "?#"); i >= 0 {
+						name = name[:i]
+					}
+					name = filepath.Base(name)
 					if name == "" || name == "." || name == "/" {
 						name = "url_import"
 					}
@@ -432,6 +447,11 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		}
 		if v, ok := managers["skills"]; ok {
 			s.skillMgr = v
+			// Neo 技能生命周期 sync 需要把同步出的本地 SKILL.md 标记为
+			// 激活（对齐本体 SkillManager().set_skill_active）。
+			if sm, ok := v.(*skills.SkillManager); ok {
+				s.neo.SetSkillManager(sm)
+			}
 		}
 		if v, ok := managers["persona"]; ok {
 			s.personaMgr = v
@@ -2489,13 +2509,17 @@ func (s *Server) pluginReload(id string) {
 	}
 }
 
-func (s *Server) pluginUninstall(id string, deleteConfig, deleteData bool) {
-	if pid, _, ok := s.resolveSubprocessPlugin(id); ok {
-		if err := s.subPluginMgr.Uninstall(pid, deleteConfig, deleteData); err != nil {
-			logger.I18nWarn("卸载插件 %s 失败: %v", id, err)
-		}
-		s.notifyPluginsChanged()
+func (s *Server) pluginUninstall(id string, deleteConfig, deleteData bool) error {
+	pid, _, ok := s.resolveSubprocessPlugin(id)
+	if !ok {
+		return fmt.Errorf("插件 %s 不存在", id)
 	}
+	if err := s.subPluginMgr.Uninstall(pid, deleteConfig, deleteData); err != nil {
+		logger.I18nWarn("卸载插件 %s 失败: %v", id, err)
+		return err
+	}
+	s.notifyPluginsChanged()
+	return nil
 }
 
 func (s *Server) pluginConfigSchema(id string) map[string]interface{} {

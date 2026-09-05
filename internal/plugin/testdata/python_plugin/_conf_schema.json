@@ -1,7 +1,7 @@
 {
     "greeting": {
         "description": "问候语",
-        "type": "str",
+        "type": "string",
         "default": "你好"
     },
     "max_count": {

@@ -54,6 +54,14 @@ type Adapter struct {
 	mu       sync.Mutex
 	evIDTime map[string]time.Time
 
+	// replyIDs 记录每个会话最近一次收到消息的 message_id：
+	// 对齐本体 lark_event.py:551-558 的 send 始终 reply 原消息语义
+	// （reply_message_id=self.message_obj.message_id）。
+	replyIDs map[string]string
+
+	// streamCards 记录进行中的 CardKit 流式卡片（sessionID → card + sequence）。
+	streamCards map[string]*streamCard
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
 }
@@ -61,12 +69,14 @@ type Adapter struct {
 // New creates a Lark adapter.
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		config:   config,
-		settings: settings,
-		EventBus: eventBus,
-		botName:  "astrbot",
-		evIDTime: make(map[string]time.Time),
-		stopCh:   make(chan struct{}),
+		config:      config,
+		settings:    settings,
+		EventBus:    eventBus,
+		botName:     "astrbot",
+		evIDTime:    make(map[string]time.Time),
+		replyIDs:    make(map[string]string),
+		streamCards: make(map[string]*streamCard),
+		stopCh:      make(chan struct{}),
 	}
 	a.appID, _ = config["app_id"].(string)
 	a.appSecret, _ = config["app_secret"].(string)
@@ -366,7 +376,40 @@ func (a *Adapter) convertMsg(event *larkim.P2MessageReceiveV1) {
 	}
 	abm.SessionID = sessionID
 
+	// 记录回复目标（send 始终 reply 原消息，对齐本体 send 语义）。
+	a.rememberReplyID(sessionID, msgID)
+
 	a.handleMsg(abm)
+}
+
+// rememberReplyID 记录会话最近一次收到消息的 message_id。unique_session 开启时
+// pipeline 会把群聊 ConvID 改写为 "senderID%chatID"，因此同时记录两种键。
+func (a *Adapter) rememberReplyID(sessionID, msgID string) {
+	if sessionID == "" || msgID == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.replyIDs[sessionID] = msgID
+	if idx := strings.Index(sessionID, "%"); idx >= 0 {
+		a.replyIDs[sessionID[idx+1:]] = msgID
+	}
+}
+
+// lookupReplyID 查询会话的回复目标 message_id。
+func (a *Adapter) lookupReplyID(sessionID string) string {
+	if sessionID == "" {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if id, ok := a.replyIDs[sessionID]; ok {
+		return id
+	}
+	if idx := strings.Index(sessionID, "%"); idx >= 0 {
+		return a.replyIDs[sessionID[idx+1:]]
+	}
+	return ""
 }
 
 // handleMsg publishes the message event into the pipeline.
@@ -405,7 +448,10 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 }
 
 // Send sends a message chain to a Lark session. Group sessions use chat_id,
-// private sessions use open_id (mirrors send_by_session).
+// private sessions use open_id (mirrors send_by_session). 对齐本体
+// lark_event.py:551-558：send 始终 reply 原消息——优先取链中显式 Reply 组件的
+// message_id（reply_with_quote 开启时由 pipeline 注入），否则回填最近一次
+// 收到消息的 message_id。
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	if a.client == nil {
 		return fmt.Errorf("lark: client not ready")
@@ -418,7 +464,16 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 			receiveID = receiveID[strings.Index(receiveID, "%")+1:]
 		}
 	}
-	return sendMessageChain(context.Background(), a.client, chain, "", receiveID, receiveIDType)
+	replyMessageID := a.lookupReplyID(sessionID)
+	if chain != nil {
+		for _, comp := range chain.Chain {
+			if reply, ok := comp.(*message.Reply); ok && reply.MessageID != "" {
+				replyMessageID = reply.MessageID
+				break
+			}
+		}
+	}
+	return sendMessageChain(context.Background(), a.client, chain, replyMessageID, receiveID, receiveIDType)
 }
 
 // React adds an emoji reaction to a message (CreateMessageReaction API).

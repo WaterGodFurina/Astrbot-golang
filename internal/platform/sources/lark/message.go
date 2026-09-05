@@ -345,20 +345,85 @@ func sendMessageChain(ctx context.Context, client *lark.Client, chain *message.M
 	return errors.Join(errs...)
 }
 
-// sendRichText converts non-file components into a Lark post message
-// (mirrors _convert_to_lark + post sending).
-func sendRichText(ctx context.Context, client *lark.Client, comps []message.Component, replyMessageID, receiveID, receiveIDType string) error {
-	postContent := convertToLark(ctx, client, comps)
-	if len(postContent) == 0 {
-		return nil
+// hasReasoningMarker 检查组件中是否存在折叠面板标记
+// （对齐本体 send_message_chain 的 has_reasoning_marker）。
+func hasReasoningMarker(comps []message.Component) bool {
+	for _, comp := range comps {
+		if js, ok := comp.(*message.Json); ok && js.Data != nil && jsonStrSafe(js.Data, "type") == reasoningPanelType {
+			return true
+		}
 	}
-	wrapped, _ := json.Marshal(map[string]interface{}{
-		"zh_cn": map[string]interface{}{
-			"title":   "",
-			"content": postContent,
-		},
-	})
-	return sendImMessage(ctx, client, string(wrapped), "post", replyMessageID, receiveID, receiveIDType)
+	return false
+}
+
+// sendRichText converts non-file components into a Lark post message
+// (mirrors _convert_to_lark + post sending). 遇到
+// Json(type=lark_collapsible_panel_reasoning) 标记时：
+//   - 链中无附件组件（sendRichText 收到的 comps 已排除文件/音频/视频）且全部
+//     组件可入卡时，合成单张 reasoning 卡片发送（对齐本体 :451-471）；
+//   - 否则逐个标记先 flush 普通内容再发送折叠面板卡片（对齐本体 :507-533）；
+//     卡片发送失败时回退为 "🤔 title: content" 的 Plain 文本继续参与后续 post。
+func sendRichText(ctx context.Context, client *lark.Client, comps []message.Component, replyMessageID, receiveID, receiveIDType string) error {
+	// 单卡片路径（对齐本体 _build_reasoning_card + _send_interactive_card）。
+	if hasReasoningMarker(comps) {
+		if cardJSON := buildReasoningCard(comps); cardJSON != nil {
+			if err := sendInteractiveCard(ctx, client, cardJSON, replyMessageID, receiveID, receiveIDType); err == nil {
+				return nil
+			} else {
+				logger.I18nWarn("发送飞书 reasoning 卡片失败，回退到逐段发送: %v", err)
+			}
+		}
+	}
+
+	buffered := []message.Component{}
+	flush := func() error {
+		if len(buffered) == 0 {
+			return nil
+		}
+		postContent := convertToLark(ctx, client, buffered)
+		buffered = []message.Component{}
+		if len(postContent) == 0 {
+			return nil
+		}
+		wrapped, _ := json.Marshal(map[string]interface{}{
+			"zh_cn": map[string]interface{}{
+				"title":   "",
+				"content": postContent,
+			},
+		})
+		return sendImMessage(ctx, client, string(wrapped), "post", replyMessageID, receiveID, receiveIDType)
+	}
+
+	var errs []error
+	for _, comp := range comps {
+		if js, ok := comp.(*message.Json); ok && js.Data != nil && jsonStrSafe(js.Data, "type") == reasoningPanelType {
+			// 折叠面板标记：先发送已缓冲的普通内容。
+			if err := flush(); err != nil {
+				logger.I18nWarn("发送飞书富文本消息失败: %v", err)
+				errs = append(errs, err)
+			}
+			reasonText := strings.TrimSpace(jsonStrSafe(js.Data, "content"))
+			if reasonText == "" {
+				continue
+			}
+			panelTitle := jsonStrSafe(js.Data, "title")
+			if panelTitle == "" {
+				panelTitle = "💭 Thinking"
+			}
+			if err := sendCollapsibleReasoningPanel(ctx, client, reasonText, panelTitle, replyMessageID, receiveID, receiveIDType); err != nil {
+				logger.I18nWarn("发送飞书折叠面板卡片失败: %v", err)
+				// 回退为纯文本（对齐本体 :524-529）。
+				buffered = append(buffered, &message.Plain{Text: "🤔 " + panelTitle + ": " + reasonText})
+			}
+			continue
+		}
+		buffered = append(buffered, comp)
+	}
+	if err := flush(); err != nil {
+		logger.I18nWarn("发送飞书富文本消息失败: %v", err)
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // convertToLark converts components into Lark post content (mirrors
@@ -463,19 +528,22 @@ func sendImMessage(ctx context.Context, client *lark.Client, content, msgType, r
 }
 
 // uploadFile uploads a file (stream type) and returns the file_key
-// (mirrors _upload_lark_file).
-func uploadFile(ctx context.Context, client *lark.Client, path, fileType string) (string, error) {
+// (mirrors _upload_lark_file). durationMs > 0 时附带媒体时长（毫秒）。
+func uploadFile(ctx context.Context, client *lark.Client, path, fileType string, durationMs ...int) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	body := larkim.NewCreateFileReqBodyBuilder().
+		FileType(fileType).
+		FileName(filepath.Base(path)).
+		File(f)
+	if len(durationMs) > 0 && durationMs[0] > 0 {
+		body.Duration(durationMs[0])
+	}
 	req := larkim.NewCreateFileReqBuilder().
-		Body(larkim.NewCreateFileReqBodyBuilder().
-			FileType(fileType).
-			FileName(filepath.Base(path)).
-			File(f).
-			Build()).
+		Body(body.Build()).
 		Build()
 	resp, err := client.Im.File.Create(ctx, req)
 	if err != nil {
@@ -530,8 +598,9 @@ func sendFileMessage(ctx context.Context, client *lark.Client, comp *message.Fil
 	return sendImMessage(ctx, client, string(content), "file", replyMessageID, receiveID, receiveIDType)
 }
 
-// sendAudioMessage sends a Record component (mirrors _send_audio_message;
-// Go 不转码 opus，直接按 stream 上传原文件发送 file 消息回退).
+// sendAudioMessage sends a Record component (mirrors _send_audio_message):
+// ffmpeg 转 opus（libopus/单声道/16kHz）→ ffprobe 时长 → file_type=opus 上传
+// → audio 消息发送；转码失败降级按 stream 原样上传 file 消息。
 func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Record, replyMessageID, receiveID, receiveIDType string) error {
 	path := comp.Path
 	if path == "" {
@@ -551,6 +620,22 @@ func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Re
 	if path == "" {
 		return fmt.Errorf("lark: 音频路径为空")
 	}
+
+	// 转换为 opus 格式（对齐本体：失败继续直接上传原文件）。
+	audioPath, converted := convertAudioToOpus(ctx, path)
+	if converted {
+		defer safeRemove(audioPath)
+		fileType := "opus"
+		duration := getMediaDuration(audioPath)
+		key, err := uploadFile(ctx, client, audioPath, fileType, duration)
+		if err != nil {
+			return err
+		}
+		content, _ := json.Marshal(map[string]string{"file_key": key})
+		return sendImMessage(ctx, client, string(content), "audio", replyMessageID, receiveID, receiveIDType)
+	}
+
+	// 降级：opus 转码不可用时按 stream 上传原文件发送 file 消息（原有回退路径）。
 	key, err := uploadFile(ctx, client, path, "stream")
 	if err != nil {
 		return err
@@ -559,7 +644,8 @@ func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Re
 	return sendImMessage(ctx, client, string(content), "file", replyMessageID, receiveID, receiveIDType)
 }
 
-// sendMediaMessage sends a Video component (mirrors _send_media_message).
+// sendMediaMessage sends a Video component (mirrors _send_media_message):
+// ffmpeg 转 mp4（libx264/aac）→ ffprobe 时长 → file_type=mp4 上传 → media 消息发送。
 func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Video, replyMessageID, receiveID, receiveIDType string) error {
 	path, tempPath, err := resolveMediaPath(ctx, comp.Path, comp.URL)
 	if err != nil {
@@ -571,6 +657,22 @@ func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Vi
 	if path == "" {
 		return fmt.Errorf("lark: 视频路径为空")
 	}
+
+	// 转换为 mp4 格式（对齐本体：失败继续直接上传原文件）。
+	videoPath, converted := convertVideoToMp4(ctx, path)
+	if converted {
+		defer safeRemove(videoPath)
+		duration := getMediaDuration(videoPath)
+		key, err := uploadFile(ctx, client, videoPath, "mp4", duration)
+		if err != nil {
+			return err
+		}
+		content, _ := json.Marshal(map[string]string{"file_key": key})
+		return sendImMessage(ctx, client, string(content), "media", replyMessageID, receiveID, receiveIDType)
+	}
+
+	// 降级：mp4 转码不可用时按 stream 上传原文件（保留 media 消息类型，与
+	// 原有回退一致地依赖飞书服务端识别格式）。
 	key, err := uploadFile(ctx, client, path, "stream")
 	if err != nil {
 		return err

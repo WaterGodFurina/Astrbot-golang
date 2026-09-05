@@ -2277,9 +2277,12 @@ export const useExtensionPage = (initialTab = "installed") => {
     // 市场插件的 astrbot_version 约束是对齐的 Python 版本号（如 >=4.16），
     // 必须用宿主对齐的 Python 版本（pythonVersion，默认 4.27.4）比对，
     // 而不是 Go 版发布版本号（astrbotVersion，如 1.1.3）。
-    const currentVersion =
-      commonStore.pythonVersion ||
-      (await commonStore.fetchAstrBotVersion().catch(() => ""));
+    if (!commonStore.pythonVersion) {
+      await commonStore
+        .fetchAstrBotVersion()
+        .catch(() => "");
+    }
+    const currentVersion = commonStore.pythonVersion || "";
     const sourceType = getSourceTypeForUrl(selectedSource.value);
     pluginMarketData.value.forEach((plugin) => {
       const result = checkAstrBotVersionSupport(
@@ -2711,9 +2714,15 @@ export const useExtensionPage = (initialTab = "installed") => {
       return;
     }
 
-    const currentVersion =
-      commonStore.astrbotVersion ||
-      (await commonStore.fetchAstrBotVersion().catch(() => ""));
+    // 插件的 astrbot_version 约束对齐 Python 版本号（如 >=4.16,<5），必须用
+    // 宿主对齐的 Python 版本（pythonVersion，如 4.27.4）比对，而非 Go 发布
+    // 版本号（astrbotVersion，如 1.2.2）。
+    if (!commonStore.pythonVersion) {
+      await commonStore
+        .fetchAstrBotVersion()
+        .catch(() => "");
+    }
+    const currentVersion = commonStore.pythonVersion || "";
     const result = checkAstrBotVersionSupport(
       plugin.astrbot_version,
       currentVersion,

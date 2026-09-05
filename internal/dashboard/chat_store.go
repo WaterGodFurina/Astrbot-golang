@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -251,6 +252,63 @@ func (cs *chatStore) findMessage(sessionID, messageID string) int {
 	return -1
 }
 
+// messageByID 按 id 查找会话消息（任意会话），返回消息副本或 nil。
+// 供 reply 组件解析引用历史内容使用（对齐本体 get_reply_parts）。
+func (cs *chatStore) messageByID(messageID string) map[string]interface{} {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for _, s := range cs.data.Sessions {
+		for _, m := range s.Messages {
+			if mid, _ := m["id"].(string); mid == messageID {
+				cp := make(map[string]interface{}, len(m))
+				for k, v := range m {
+					cp[k] = v
+				}
+				return cp
+			}
+		}
+	}
+	return nil
+}
+
+// messageContentText 提取消息记录的 plain 文本（content.message 内所有
+// plain part 的 text 拼接；兼容历史 content 直接为字符串的记录）。
+func messageContentText(msg map[string]interface{}) string {
+	content, ok := msg["content"].(map[string]interface{})
+	if !ok {
+		if text, ok := msg["content"].(string); ok {
+			return text
+		}
+		return ""
+	}
+	parts, ok := content["message"].([]interface{})
+	if !ok {
+		if list, ok := content["message"].([]map[string]interface{}); ok {
+			var b strings.Builder
+			for _, p := range list {
+				if t, _ := p["type"].(string); t == "plain" {
+					text, _ := p["text"].(string)
+					b.WriteString(text)
+				}
+			}
+			return b.String()
+		}
+		return ""
+	}
+	var b strings.Builder
+	for _, raw := range parts {
+		p, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, _ := p["type"].(string); t == "plain" {
+			text, _ := p["text"].(string)
+			b.WriteString(text)
+		}
+	}
+	return b.String()
+}
+
 // truncateMessagesAfter removes every message after index keepIndex (keeps
 // [0, keepIndex]) and persists. Returns false when the session is unknown.
 func (cs *chatStore) truncateMessagesAfter(sessionID string, keepIndex int) bool {
@@ -439,6 +497,29 @@ func (ts *threadStore) deleteThread(id string) bool {
 	return false
 }
 
+// deleteThreadsBySession 删除某个父会话下的全部线程并返回删除数。对齐
+// 本体 delete_session_internal（chat_service.py:1226）级联调用
+// db.delete_webchat_threads_by_parent_session 的语义——会话删除时其衍生的
+// 线程一并清理，避免孤儿线程残留。
+func (ts *threadStore) deleteThreadsBySession(sessionID string) int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	next := make([]*chatThread, 0, len(ts.data.Threads))
+	deleted := 0
+	for _, t := range ts.data.Threads {
+		if t.ParentSessionID == sessionID {
+			deleted++
+			continue
+		}
+		next = append(next, t)
+	}
+	if deleted > 0 {
+		ts.data.Threads = next
+		_ = ts.save()
+	}
+	return deleted
+}
+
 // appendThreadMessage appends a message to a thread's history.
 func (ts *threadStore) appendThreadMessage(id string, msg map[string]interface{}) bool {
 	ts.mu.Lock()
@@ -452,6 +533,24 @@ func (ts *threadStore) appendThreadMessage(id string, msg map[string]interface{}
 		}
 	}
 	return false
+}
+
+// messageByID 按 id 查找线程消息（任意线程），返回消息副本或 nil。
+func (ts *threadStore) messageByID(messageID string) map[string]interface{} {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for _, t := range ts.data.Threads {
+		for _, m := range t.Messages {
+			if mid, _ := m["id"].(string); mid == messageID {
+				cp := make(map[string]interface{}, len(m))
+				for k, v := range m {
+					cp[k] = v
+				}
+				return cp
+			}
+		}
+	}
+	return nil
 }
 
 // threadDetail mirrors Python chat_service.get_thread: thread + history +

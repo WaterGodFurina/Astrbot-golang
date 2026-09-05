@@ -1206,8 +1206,15 @@ func venvMarkersMatch(venvRoot, interpreter, sdkVersion string, depsVersion int)
 // the given interpreter. Missing ones trigger a venv re-provisioning
 // (installHostDeps) so Python plugins that rely on Python-AstrBot's resident
 // deps (e.g. aiocqhttp) start without a module-not-found crash.
+//
+// 探测脚本必须 "import importlib.util"（而非裸 "import importlib"）：CPython
+// 的 importlib.util 是 importlib 的子模块，裸 import 不会自动加载它。裸写
+// 恰好能在 Ubuntu 宿主上工作的唯一原因是 dist-packages 里 zope 的
+// nspkg.pth 在 site 处理期 import 了 importlib.util——纯巧合；新建 venv
+// 没有该 .pth，探测必然 AttributeError: module 'importlib' has no attribute
+// 'util'，venv 被误判"依赖不完整"而反复重装（READY 永远写不出来）。
 func hasHostDeps(pythonBin string) bool {
-	script := "import importlib; mods=" + strconv.Quote(strings.Join(hostDepProbes, " ")) + "; missing=[m for m in mods.split() if importlib.util.find_spec(m) is None]; import sys; sys.exit(1 if missing else 0)"
+	script := "import importlib.util; mods=" + strconv.Quote(strings.Join(hostDepProbes, " ")) + "; missing=[m for m in mods.split() if importlib.util.find_spec(m) is None]; import sys; sys.exit(1 if missing else 0)"
 	cmd := exec.Command(pythonBin, "-c", script) // #nosec G204 -- 宿主依赖探测脚本：script 由固定常量 hostDepProbes 拼装并经 strconv.Quote 转义，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	return cmd.Run() == nil
 }

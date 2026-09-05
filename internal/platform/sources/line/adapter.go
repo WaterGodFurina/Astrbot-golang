@@ -507,7 +507,11 @@ func (a *Adapter) buildAudioComponent(messageID string, msg map[string]interface
 	}
 	suffix := guessSuffix(content.ContentType, ".m4a")
 	filePath := storeTempContent("audio", messageID, content.Content, suffix, "")
-	return &message.Record{File: filePath, Path: filePath}
+	// 对齐 Python：语音内容经 ffmpeg 转为 wav（MediaResolver
+	// target_format="wav"），供下游语音识别；ffmpeg 不可用或转换失败时
+	// 降级保留原文件。
+	wavPath := convertAudioToWavFile(filePath)
+	return &message.Record{File: wavPath, Path: wavPath}
 }
 
 // buildFileComponent 构建文件组件。

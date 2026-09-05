@@ -5,6 +5,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -498,11 +500,27 @@ func TestClangExtractFailureKeepsLockAndClearsCache(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("ASTRBOT_CLANG_BIN", t.TempDir())
 	// Serve a non-archive body so download succeeds but extraction fails.
+	mockBody := []byte("this is definitely not a zip or tar archive")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("this is definitely not a zip or tar archive"))
+		_, _ = w.Write(mockBody)
 	}))
 	defer srv.Close()
 	t.Setenv("ASTRBOT_CLANG_MIRROR", srv.URL)
+
+	// zigArchiveSHA256 引入后，默认版本归档会先做 sha256 校验：mock 的非归档
+	// 内容与官方 pin 值不符会被判"校验失败"而走不到 extract 路径。测试同包
+	// 临时把 info.archive 的 pin 覆盖为 mock 内容的真实 sha256（defer 恢复
+	// 原值），让下载通过校验、真正进入 extract 失败路径。
+	bodySum := sha256.Sum256(mockBody)
+	oldSum, hadSum := zigArchiveSHA256[info.archive]
+	zigArchiveSHA256[info.archive] = hex.EncodeToString(bodySum[:])
+	t.Cleanup(func() {
+		if hadSum {
+			zigArchiveSHA256[info.archive] = oldSum
+		} else {
+			delete(zigArchiveSHA256, info.archive)
+		}
+	})
 
 	_, _, err = downloadAndSetupClang(context.Background(), InstallOptions{GoChoice: "download"})
 	if err == nil {

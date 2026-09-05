@@ -98,9 +98,17 @@ type Adapter struct {
 	cancel  context.CancelFunc
 	stopCh  chan struct{}
 
-	// 记录接收到的频道消息的 target_id (频道 id), 用于发送时区分频道消息/私聊消息
+	// 记录最近收到消息的会话 (target_id 或私聊 author_id) 及其 channel_type,
+	// 用于发送时选择频道消息/私聊消息接口。对应 Python kook_client.send_text
+	// 按 astrbot_message_type 判定, 而 astrbot_message_type 由事件的
+	// channel_type 决定 (kook_adapter.convert_message)。
 	knownChannelsMu sync.Mutex
-	knownChannels   map[string]bool
+	knownChannels   map[string]knownChannelInfo
+}
+
+// knownChannelInfo 记录会话最近一次收到消息的 channel_type。
+type knownChannelInfo struct {
+	channelType KookChannelType
 }
 
 // New 创建 KOOK 适配器 (对应 Python __init__)。
@@ -110,7 +118,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		settings:      settings,
 		EventBus:      eventBus,
 		stopCh:        make(chan struct{}),
-		knownChannels: make(map[string]bool),
+		knownChannels: make(map[string]knownChannelInfo),
 	}
 	kc := &KookConfig{}
 	kc.fromConfig(config)
@@ -269,13 +277,15 @@ func (a *Adapter) convertMessage(data *kookMessageEventData) *platform.AstrBotMe
 		abm.Type = platform.GroupMessage
 		abm.Group = &platform.Group{GroupID: sessionID}
 		abm.SessionID = sessionID
-		a.rememberChannel(sessionID)
+		a.rememberChannel(sessionID, channelType)
 	case KookChannelPerson:
 		abm.Type = platform.FriendMessage
 		abm.SessionID = data.AuthorID
 		if abm.SessionID == "" {
 			abm.SessionID = "unknown"
 		}
+		// 私聊会话以 author_id 为 key 记录, 发送时据此走 direct-message/create
+		a.rememberChannel(abm.SessionID, channelType)
 	case KookChannelBroadcast:
 		sessionID := data.TargetID
 		if sessionID == "" {
@@ -284,7 +294,7 @@ func (a *Adapter) convertMessage(data *kookMessageEventData) *platform.AstrBotMe
 		abm.Type = platform.OtherMessage
 		abm.Group = &platform.Group{GroupID: sessionID}
 		abm.SessionID = sessionID
-		a.rememberChannel(sessionID)
+		a.rememberChannel(sessionID, channelType)
 	default:
 		logger.I18nError("[KOOK] 不支持的频道类型: %q", string(channelType))
 		return nil
@@ -302,7 +312,9 @@ func (a *Adapter) convertMessage(data *kookMessageEventData) *platform.AstrBotMe
 	if abm.MessageID == "" {
 		abm.MessageID = "unknown"
 	}
-	abm.Timestamp = data.MsgTimestamp
+	// KOOK 的 msg_timestamp 为毫秒级时间戳, 除以 1000 转为秒
+	// (client.go 按秒 time.Unix(Timestamp, 0) 解释)
+	abm.Timestamp = data.MsgTimestamp / 1000
 
 	switch data.Type {
 	case KookMsgKMarkdown:
@@ -328,21 +340,26 @@ func (a *Adapter) convertMessage(data *kookMessageEventData) *platform.AstrBotMe
 	return abm
 }
 
-// rememberChannel 记录频道消息的 target_id, 用于发送时区分频道/私聊。
-func (a *Adapter) rememberChannel(targetID string) {
-	if targetID == "" {
+// rememberChannel 记录会话最近一次收到消息的 channel_type,
+// 用于发送时按事件层类型选择频道/私聊接口 (对应 Python 事件的 message_obj.type)。
+func (a *Adapter) rememberChannel(sessionID string, channelType KookChannelType) {
+	if sessionID == "" {
 		return
 	}
 	a.knownChannelsMu.Lock()
-	a.knownChannels[targetID] = true
+	a.knownChannels[sessionID] = knownChannelInfo{channelType: channelType}
 	a.knownChannelsMu.Unlock()
 }
 
-// isKnownChannel 判断 target_id 是否为已接收过消息的频道 id。
-func (a *Adapter) isKnownChannel(targetID string) bool {
+// knownChannelType 返回会话最近一次收到消息的 channel_type; 未知会话返回空串。
+func (a *Adapter) knownChannelType(sessionID string) KookChannelType {
 	a.knownChannelsMu.Lock()
 	defer a.knownChannelsMu.Unlock()
-	return a.knownChannels[targetID]
+	info, ok := a.knownChannels[sessionID]
+	if !ok {
+		return ""
+	}
+	return info.channelType
 }
 
 // parseKMarkdownMessage 解析 kmarkdown 消息 (对应 Python _parse_kmarkdown_message)。
@@ -591,13 +608,14 @@ func (a *Adapter) parseCardMessage(data *kookMessageEventData) ([]message.Compon
 		case ModuleVideo:
 			msgComps = append(msgComps, &message.Video{URL: f.src})
 		case ModuleAudio:
-			// Python 使用 MediaResolver 将音频转为 wav; Go 侧 EnsureWAV 为占位实现
-			// (保持原文件), 这里直接把音频下载到临时目录
-			path := utils.TempFilePath(".wav")
+			// 对应 Python kook_adapter.py: MediaResolver(...).to_path(target_format="wav"),
+			// 卡片音频下载后用 ffmpeg 转为 wav, 转换失败时保留原格式
+			path := utils.TempFilePath("." + audioExtFromURL(f.src))
 			if err := utils.DownloadFile(a.kookCtx(), f.src, path); err != nil {
 				logger.I18nWarn("[KOOK] 下载音频文件失败: %v", err)
 				continue
 			}
+			path = convertAudioToWav(path)
 			msgComps = append(msgComps, &message.Record{File: path, URL: path})
 		default:
 			logger.I18nWarn("[KOOK] 跳过未知文件类型: %s", string(f.moduleType))
@@ -727,11 +745,15 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		}
 	}
 
-	// 根据是否接收过该频道的消息判断是频道消息还是私聊消息
-	// (对应 Python 中按会话的消息类型选择发送接口)
-	msgType := platform.FriendMessage
-	if a.isKnownChannel(sessionID) {
-		msgType = platform.GroupMessage
+	// 按会话最近一次收到消息的 channel_type 选择发送接口 (对应 Python
+	// kook_client.send_text 中 FRIEND_MESSAGE 走 direct-message/create)。
+	// 未知会话回退频道消息接口 (message/create) 并告警。
+	msgType := platform.GroupMessage
+	channelType := a.knownChannelType(sessionID)
+	if channelType == KookChannelPerson {
+		msgType = platform.FriendMessage
+	} else if channelType == "" {
+		logger.I18nWarn("[KOOK] 未记录会话 %q 的 channel_type, 回退使用频道消息接口 (message/create) 发送", sessionID)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -748,6 +770,11 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 			continue
 		}
 		if err := a.client.SendText(ctx, sessionID, item.text, msgType, item.msgType, replyID); err != nil {
+			// 对应 Python kook_event.py: 发送失败时把错误内容以 TEXT 回发到频道,
+			// 让用户感知到有消息发送失败
+			if reErr := a.client.SendText(ctx, sessionID, err.Error(), msgType, KookMsgText, replyID); reErr != nil {
+				logger.I18nError("[KOOK] 回发发送错误信息失败: %v", reErr)
+			}
 			errors = append(errors, err)
 		}
 	}
@@ -819,7 +846,10 @@ func (a *Adapter) buildOrderMessage(index int, comp message.Component) (orderMes
 	case *message.Reply:
 		return orderMessage{index: index, text: "", replyID: c.MessageID, msgType: KookMsgKMarkdown}, nil
 	case *message.Json:
-		// kook卡片json外层得是一个列表
+		// kook 卡片 json 外层得是一个列表。对应 Python kook_event.py:
+		// 仅 dict 才包裹, list 原样透传。Go 的 message.Json.Data 类型固定为
+		// map[string]interface{} (pkg/message 的类型限制, 无法表达列表),
+		// 等价于 Python 的 dict 分支, 因此这里始终包裹一层列表。
 		jsonData := []interface{}{c.Data}
 		data, err := json.Marshal(jsonData)
 		if err != nil {

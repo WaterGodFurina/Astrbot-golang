@@ -174,8 +174,13 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		SessionID string `json:"session_id"`
-		Message   string `json:"message"`
-		SenderID  string `json:"sender_id"`
+		// Message 对齐本体 payload["message"]：可以是字符串，也可以是
+		// message parts 数组（[{type:"plain",text:...},...]，对齐 dashboard
+		// 链路模式），解码后按形态分流。
+		Message json.RawMessage `json:"message"`
+		// SenderID / Flags 同本体队列 payload 字段。
+		SenderID string                 `json:"sender_id"`
+		Flags    map[string]interface{} `json:"flags"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
@@ -189,9 +194,22 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		req.SenderID = req.SessionID
 	}
 
-	// Create message chain
-	chain := &message.MessageChain{
-		Chain: []message.Component{&message.Plain{Text: req.Message}},
+	// Create message chain: message 为 parts 数组时按组件解析（对齐本体
+	// convert_message → parse_webchat_message_parts），否则按字符串处理。
+	chain := &message.MessageChain{}
+	var messageText string
+	textOnly := true
+	if len(req.Message) > 0 && !isJSONString(req.Message) {
+		var parts []map[string]interface{}
+		if err := json.Unmarshal(req.Message, &parts); err == nil && len(parts) > 0 {
+			textOnly = false
+			chain.Chain = parseMessageParts(parts)
+			messageText = chainPlainTextConcat(chain)
+		}
+	}
+	if textOnly {
+		_ = json.Unmarshal(req.Message, &messageText)
+		chain.Chain = []message.Component{&message.Plain{Text: messageText}}
 	}
 
 	// 每个 /chat 请求使用独立的回复通道（先注册再发布事件，避免回复在
@@ -221,10 +239,18 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 			IsGroup:    false,
 		},
 		Message:    chain,
-		MessageStr: req.Message,
+		MessageStr: messageText,
 		Timestamp:  time.Now(),
 		Metadata:   make(map[string]interface{}),
 	}
+	// flags 未传默认 true（对齐本体 request_flags.resolve_webchat_request_flags）。
+	event.Metadata["flags"] = resolveRequestFlags(req.Flags)
+	// 对齐本体 webchat_adapter.create_event 注入 extra 的字段。
+	event.Metadata["action_type"] = "chat"
+
+	// typing 信号（对齐本体 send_typing）：发布事件前向等待中的 /poll
+	// 投递哨兵，客户端感知"开始处理"。
+	a.sendTyping(req.SessionID)
 
 	if a.EventBus == nil {
 		logger.Error("webchat event bus not configured; cannot publish")
@@ -244,13 +270,165 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"session_id": req.SessionID,
 			"reply":      extractPlainText(resp),
+			// 对齐本体 send_typing 信号：携带 run 起始标记（响应即运行开始）。
+			"run_started": true,
+			"parts":       chainToReplyParts(resp),
 		})
 	case <-time.After(60 * time.Second):
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"session_id": req.SessionID,
-			"reply":      "Timeout waiting for response",
+			"session_id":  req.SessionID,
+			"reply":       "Timeout waiting for response",
+			"run_started": false,
 		})
+	}
+}
+
+// isJSONString 判断原始 JSON 值是否为字符串字面量（以引号开头）。
+func isJSONString(raw json.RawMessage) bool {
+	for _, b := range raw {
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '"':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// resolveRequestFlags 对齐本体 request_flags.resolve_webchat_request_flags：
+// flags[key] 显式 bool 优先，未传默认 true。
+func resolveRequestFlags(flags map[string]interface{}) map[string]interface{} {
+	resolved := make(map[string]interface{}, 3)
+	for _, key := range []string{"enable_inline_genui", "enable_default_system_prompt", "enable_streaming"} {
+		value := true
+		if b, ok := flags[key].(bool); ok {
+			value = b
+		}
+		resolved[key] = value
+	}
+	return resolved
+}
+
+// parseMessageParts 把 message parts 数组解析为组件链（对齐本体
+// parse_webchat_message_parts 的非严格模式：未知类型跳过）。
+func parseMessageParts(parts []map[string]interface{}) []message.Component {
+	var out []message.Component
+	for _, p := range parts {
+		if p == nil {
+			continue
+		}
+		partType, _ := p["type"].(string)
+		switch partType {
+		case "plain", "":
+			text, _ := p["text"].(string)
+			if text != "" {
+				out = append(out, &message.Plain{Text: text})
+			}
+		case "image":
+			out = append(out, mediaComponentFromPart(p, "image"))
+		case "record":
+			out = append(out, mediaComponentFromPart(p, "record"))
+		case "video":
+			out = append(out, mediaComponentFromPart(p, "video"))
+		case "file":
+			out = append(out, mediaComponentFromPart(p, "file"))
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, &message.Plain{})
+	}
+	return out
+}
+
+// mediaComponentFromPart 把媒体 part 转为对应组件（本地 path/file、url、
+// base64 均接受；对齐本体 media part 的 path/url 字段语义）。
+func mediaComponentFromPart(p map[string]interface{}, kind string) message.Component {
+	path, _ := p["path"].(string)
+	if path == "" {
+		if f, ok := p["file"].(string); ok {
+			path = f
+		}
+	}
+	url, _ := p["url"].(string)
+	b64, _ := p["base64"].(string)
+	name, _ := p["filename"].(string)
+	switch kind {
+	case "image":
+		return &message.Image{Path: path, File: path, URL: url, Base64: b64}
+	case "record":
+		return &message.Record{Path: path, File: path, URL: url, Base64: b64}
+	case "video":
+		return &message.Video{Path: path, URL: url}
+	default:
+		return &message.File{Path: path, URL: url, Name: name}
+	}
+}
+
+// chainPlainTextConcat 提取链内全部 plain 文本（无分隔拼接）。
+func chainPlainTextConcat(mc *message.MessageChain) string {
+	if mc == nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, comp := range mc.Chain {
+		if plain, ok := comp.(*message.Plain); ok {
+			b.WriteString(plain.Text)
+		}
+	}
+	return b.String()
+}
+
+// chainToReplyParts 把回复链转为 message parts 数组（plain 文本 + 媒体
+// 占位），让 /chat 调用方能拿到全组件回复（对齐本体分帧语义的同步版本）。
+func chainToReplyParts(mc *message.MessageChain) []map[string]interface{} {
+	parts := make([]map[string]interface{}, 0)
+	if mc == nil {
+		return parts
+	}
+	for _, comp := range mc.Chain {
+		switch c := comp.(type) {
+		case *message.Plain:
+			if c.Text != "" {
+				parts = append(parts, map[string]interface{}{"type": "plain", "text": c.Text})
+			}
+		case *message.Json:
+			if b, err := json.Marshal(c.Data); err == nil {
+				parts = append(parts, map[string]interface{}{"type": "plain", "text": string(b)})
+			}
+		case *message.Image:
+			parts = append(parts, map[string]interface{}{"type": "image", "url": c.URL, "path": c.Path, "base64": c.Base64})
+		case *message.Record:
+			parts = append(parts, map[string]interface{}{"type": "record", "url": c.URL, "path": c.Path})
+		case *message.Video:
+			parts = append(parts, map[string]interface{}{"type": "video", "url": c.URL, "path": c.Path})
+		case *message.File:
+			parts = append(parts, map[string]interface{}{"type": "file", "url": c.URL, "path": c.Path, "filename": c.Name})
+		}
+	}
+	return parts
+}
+
+// webchatTypingSentinel 是 typing 信号哨兵链（对齐本体 webchat_event.send_typing
+// 在 LLM 请求前向 back_queue 发 run_started 帧的语义）。用指针相等判断，
+// 不会与真实回复混淆。
+var webchatTypingSentinel = &message.MessageChain{Type: "typing"}
+
+// sendTyping 向会话的 /poll 长轮询通道投递 typing 信号。非阻塞投递，
+// 无等待中的 /poll 时信号直接丢弃（等价于无订阅者的 run_started）。
+func (a *Adapter) sendTyping(sessionID string) {
+	a.mu.Lock()
+	pch := a.pollClients[sessionID]
+	a.mu.Unlock()
+	if pch == nil {
+		return
+	}
+	select {
+	case pch <- webchatTypingSentinel:
+	default:
 	}
 }
 
@@ -289,9 +467,20 @@ func (a *Adapter) handlePoll(w http.ResponseWriter, r *http.Request) {
 
 	select {
 	case resp := <-ch:
+		if resp == webchatTypingSentinel {
+			// typing 信号（对齐本体 run_started 帧）：立即返回，客户端
+			// 感知"开始处理"并继续轮询，真实回复由下一次 /poll 取走。
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"reply":  nil,
+				"typing": true,
+			})
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"reply": extractPlainText(resp),
+			"parts": chainToReplyParts(resp),
 		})
 	case <-r.Context().Done():
 		// 客户端断开连接：直接返回，由 defer 清理轮询通道。
