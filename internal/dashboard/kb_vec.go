@@ -95,7 +95,9 @@ func (s *Server) indexKBFile(kbID, docID, docName string, content []byte, chunkS
 		return 0, fmt.Errorf("清理旧分块记录失败: %w", err)
 	}
 
-	chunks := knowledgebase.ChunkText(string(content), chunkSize, chunkOverlap)
+	// 对齐本体 kb_helper：按文档类型选分块器（docx/xlsx/pptx/epub/md 等走
+	// 标题感知 MarkdownChunk，其余固定窗口）。
+	chunks := knowledgebase.ChunkDocument(string(content), docName, chunkSize, chunkOverlap)
 	if len(chunks) == 0 {
 		return 0, fmt.Errorf("文档内容为空")
 	}
@@ -231,6 +233,45 @@ func (s *Server) kbDeleteDoc(kbID, docID string) error {
 		}
 	}
 	return s.database.DeleteKBDoc(kbID, docID)
+}
+
+// kbDeleteChunk deletes a single chunk: nanovec vector + SQLite row.
+// Used by the DocumentDetail "删除分块" button (DELETE .../chunks/{id}).
+func (s *Server) kbDeleteChunk(kbID, chunkID string) error {
+	if s.database == nil {
+		return fmt.Errorf("数据库不可用")
+	}
+	// 向量删除（与 kbDeleteDoc 同模式：嵌入模型可用才打开向量库；不可用时
+	// 仅删 SQLite 行并告警残留——与整文档删除的降级语义一致）。
+	if _, dim, derr := s.kbEmbeddingProvider(kbID); derr != nil {
+		logger.I18nWarn("删除分块 %s 的向量失败（嵌入模型不可用: %v），向量库可能残留孤儿向量", chunkID, derr)
+	} else {
+		lock := kbVecLock(kbID)
+		lock.Lock()
+		vdb, oerr := knowledgebase.OpenVecDB(s.kbVecDir(kbID), kbID, dim)
+		if oerr != nil {
+			lock.Unlock()
+			return fmt.Errorf("删除向量索引失败: %w", oerr)
+		}
+		if err := vdb.Delete(chunkID); err != nil {
+			logger.I18nWarn("删除向量 %s 失败: %v", chunkID, err)
+		}
+		if err := vdb.Vacuum(); err != nil {
+			logger.I18nWarn("向量库压缩失败: %v", err)
+		}
+		if err := vdb.Close(); err != nil {
+			logger.I18nWarn("关闭向量库失败: %v", err)
+		}
+		lock.Unlock()
+	}
+	affected, err := s.database.DeleteKBChunkByID(kbID, chunkID)
+	if err != nil {
+		return fmt.Errorf("删除分块记录失败: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("分块不存在: %s", chunkID)
+	}
+	return nil
 }
 
 // kbNamesForSession resolves the knowledge bases for a session: the session

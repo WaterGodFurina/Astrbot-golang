@@ -1470,6 +1470,25 @@ func (d *Database) DeleteKBChunks(kbID, docID string) error {
 	})
 }
 
+// DeleteKBChunkByID removes a single chunk row (chunk_id is the primary
+// lookup key within the KB). Returns rows affected for not-found detection.
+func (d *Database) DeleteKBChunkByID(kbID, chunkID string) (int64, error) {
+	var affected int64
+	err := d.withRetry(func() error {
+		res, err := d.db.Exec(`DELETE FROM knowledge_base_chunks WHERE kb_id=? AND chunk_id=?`, kbID, chunkID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		affected = n
+		return nil
+	})
+	return affected, err
+}
+
 // DeleteKBDoc removes a document's file records. Documents are stored on disk;
 // this clears their chunk records.
 func (d *Database) DeleteKBDoc(kbID, docID string) error {

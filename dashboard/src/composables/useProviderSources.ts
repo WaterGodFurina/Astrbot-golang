@@ -400,8 +400,49 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       return source
     }
 
+    // 补齐通用基础字段（对于缺少 timeout / proxy / custom_headers 的老配置数据）
+    if (source.timeout === undefined) {
+      source.timeout = 120
+    }
+    if (source.proxy === undefined) {
+      source.proxy = ''
+    }
+    if (source.custom_headers === undefined) {
+      source.custom_headers = {}
+    }
+
     if (source.provider === 'ollama' && source.ollama_disable_thinking === undefined) {
       source.ollama_disable_thinking = false
+    }
+
+    if (source.provider === 'xai' || source.type === 'xai_chat_completion') {
+      if (source.xai_native_search === undefined) {
+        source.xai_native_search = false
+      }
+    }
+
+    if (source.provider === 'google' || source.type === 'googlegenai_chat_completion') {
+      if (source.gm_resp_image_modal === undefined) source.gm_resp_image_modal = false
+      if (source.gm_native_search === undefined) source.gm_native_search = false
+      if (source.gm_native_coderunner === undefined) source.gm_native_coderunner = false
+      if (source.gm_url_context === undefined) source.gm_url_context = false
+      if (source.gm_safety_settings === undefined) {
+        source.gm_safety_settings = {
+          harassment: 'BLOCK_MEDIUM_AND_ABOVE',
+          hate_speech: 'BLOCK_MEDIUM_AND_ABOVE',
+          sexually_explicit: 'BLOCK_MEDIUM_AND_ABOVE',
+          dangerous_content: 'BLOCK_MEDIUM_AND_ABOVE'
+        }
+      }
+      if (source.gm_thinking_config === undefined) {
+        source.gm_thinking_config = { budget: 0, level: 'HIGH' }
+      }
+    }
+
+    if (source.provider === 'anthropic' || source.type === 'anthropic_chat_completion' || source.provider === 'kimi-code') {
+      if (source.anth_thinking_config === undefined) {
+        source.anth_thinking_config = { type: '', budget: 0, effort: '' }
+      }
     }
 
     return source

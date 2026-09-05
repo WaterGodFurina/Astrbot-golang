@@ -20,6 +20,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -61,6 +63,13 @@ type Adapter struct {
 	// tokenMu 串行化 access_token 的检查与刷新，避免并发回复多个用户时
 	// 重复请求 gettoken（微信对 gettoken 有频率限制，且重复获取会互相作废 token）。
 	tokenMu sync.Mutex
+
+	// 被动回复 5 秒窗口状态（对齐本体 user_buffer + wexin_event_workers）：
+	// userBuffer: from_user → 被动回复缓冲状态；workers: msg_id → 排重 worker。
+	userMu     sync.Mutex
+	userBuffer map[string]*userState
+	workersMu  sync.Mutex
+	workers    map[string]*msgWorker
 }
 
 // New creates the adapter.
@@ -71,6 +80,8 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		EventBus:   eventBus,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		stopCh:     make(chan struct{}),
+		userBuffer: make(map[string]*userState),
+		workers:    make(map[string]*msgWorker),
 	}
 	a.appid, _ = config["appid"].(string)
 	a.secret, _ = config["secret"].(string)
@@ -251,6 +262,12 @@ func (a *Adapter) verify(w http.ResponseWriter, r *http.Request) {
 // freshness, ciphertext structure checks and appId verification are done here
 // (the SDK only validates sha1(token,timestamp,nonce) and never uses
 // msg_signature, and its decryption can panic on malformed input).
+//
+// 被动回复全链路（对齐本体 handle_callback:128-298）：
+//  1. 同 msg_id 排重（微信失败重推 3 次），180s 内等待同一 worker 结果；
+//  2. user_buffer 命中：弹出缓存回复或返回【正在思考…】占位符；
+//  3. 新消息：创建缓冲状态、发布事件进入管线，4.0s 窗口内等待回复 XML
+//     （有 EncodingAESKey 时以安全模式加密回包），超时回占位符。
 func (a *Adapter) callbackCommand(w http.ResponseWriter, r *http.Request) {
 	msg, err := a.readCallbackMessage(r)
 	if err != nil {
@@ -266,13 +283,141 @@ func (a *Adapter) callbackCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	abm := a.convertMessage(&msg)
-	if abm == nil {
+	if a.activeSend {
+		// 主动发送模式：旁路被动回复逻辑，直接进入管线异步处理（本体 active_send_mode 分支）。
+		abm := a.convertMessage(&msg)
+		if abm == nil {
+			_, _ = io.WriteString(w, "success")
+			return
+		}
+		a.publishEvent(abm, nil)
 		_, _ = io.WriteString(w, "success")
 		return
 	}
-	a.processEvent(abm)
-	_, _ = io.WriteString(w, "success")
+
+	a.handlePassiveReply(&msg, w, r)
+}
+
+// handlePassiveReply 实现被动回复 5 秒窗口的全链路等待与缓冲（本体 :164-298）。
+func (a *Adapter) handlePassiveReply(msg *wxmp.MessageData, w http.ResponseWriter, r *http.Request) {
+	nonce := r.URL.Query().Get("nonce")
+	timestamp := r.URL.Query().Get("timestamp")
+	msgID := messageKey(msg)
+
+	// 1) 消息排重：同 msg_id（微信重试）在 180s 内等待同一 future（本体 :355-386）。
+	a.workersMu.Lock()
+	wk := a.workers[msgID]
+	a.workersMu.Unlock()
+	if wk != nil {
+		logger.Debug("duplicate message id checked: %s", msgID)
+		select {
+		case <-wk.done:
+		case <-time.After(workerWaitTTL):
+		}
+		if xml, ok, empty := wk.st.takeReply(); ok {
+			if empty {
+				a.deleteUserState(wk.st)
+			}
+			a.writeReply(w, xml, nonce, timestamp)
+			return
+		}
+		a.writeReply(w, a.maybeEncrypt(textReplyXML(msg.ToUserName, msg.FromUserName, workerTimeoutReply), nonce, timestamp), nonce, timestamp)
+		return
+	}
+
+	// 2) 用户缓冲命中：思考中/残留缓存（本体 :174-244）。
+	a.userMu.Lock()
+	st := a.userBuffer[msg.FromUserName]
+	a.userMu.Unlock()
+	if st != nil {
+		a.replyFromState(st, msg, w, nonce, timestamp, msgID)
+		return
+	}
+
+	// 3) 新消息：创建缓冲状态并发布事件（本体 :246-298）。
+	preview := msgPreview(msg)
+	logger.Info("wx start task: user=%s msg_id=%s preview=%s", msg.FromUserName, msgID, preview)
+	st = newUserState(msg, msgID, preview)
+
+	a.userMu.Lock()
+	if exist, ok := a.userBuffer[msg.FromUserName]; ok {
+		// 并发同用户：并入既有状态的处理分支。
+		a.userMu.Unlock()
+		st = exist
+		a.replyFromState(st, msg, w, nonce, timestamp, msgID)
+		return
+	}
+	a.userBuffer[msg.FromUserName] = st
+	a.userMu.Unlock()
+
+	abm := a.convertMessage(msg)
+	if abm == nil || a.EventBus == nil {
+		// 无事件总线（无法进入管线）或未支持的消息类型：清理状态后确认。
+		if a.EventBus == nil {
+			logger.Warn("EventBus 未注入，跳过被动回复等待")
+		}
+		st.finish()
+		a.deleteUserState(st)
+		_, _ = io.WriteString(w, "success")
+		return
+	}
+
+	done := core.NewPipelineDone()
+	a.publishEvent(abm, done)
+	a.launchWorker(msgID, st, done)
+
+	// 4.0s 窗口内等待管线结果。
+	st.waitDone(wxMsgTimeOut)
+	if xml, ok, empty := st.takeReply(); ok {
+		if empty {
+			a.deleteUserState(st)
+		}
+		logger.Info("wx finished in window: user=%s msg_id=%s", msg.FromUserName, msgID)
+		a.writeReply(w, xml, nonce, timestamp)
+		return
+	}
+	logger.Info("wx first window timeout: user=%s msg_id=%s", msg.FromUserName, msgID)
+	a.writePlaceholder(w, st, msg, nonce, timestamp)
+}
+
+// replyFromState 处理既有缓冲状态的回复弹出/重试等待/占位符（本体 :174-244）。
+func (a *Adapter) replyFromState(st *userState, msg *wxmp.MessageData, w http.ResponseWriter, nonce, timestamp, msgID string) {
+	// 缓存弹出优先：每次触发弹出一条（本体 cached_xml 分支）。
+	if xml, ok, empty := st.takeReply(); ok {
+		logger.Info("wx buffer hit on trigger: user=%s", st.fromUser)
+		if empty {
+			a.deleteUserState(st)
+		}
+		a.writeReply(w, xml, nonce, timestamp)
+		return
+	}
+
+	// 同 msg_id => 微信重试：在窗口内继续等待；新 msg_id => 用户触发：直接占位符。
+	if st.msgID == msgID && st.isActive() {
+		st.waitDone(wxMsgTimeOut)
+		if xml, ok, empty := st.takeReply(); ok {
+			if empty {
+				a.deleteUserState(st)
+			}
+			a.writeReply(w, xml, nonce, timestamp)
+			return
+		}
+	}
+	logger.Debug("wx trigger while thinking: user=%s", st.fromUser)
+	a.writePlaceholder(w, st, msg, nonce, timestamp)
+}
+
+// writePlaceholder 输出【正在思考…】占位符回复（本体 placeholder 文案）。
+func (a *Adapter) writePlaceholder(w http.ResponseWriter, st *userState, msg *wxmp.MessageData, nonce, timestamp string) {
+	elapsed := int(time.Since(st.startedAt).Seconds())
+	placeholder := fmt.Sprintf("【正在思考'%s'中，已思考%ds，回复任意文字尝试获取回复】", st.preview, elapsed)
+	a.writeReply(w, a.maybeEncrypt(textReplyXML(msg.ToUserName, msg.FromUserName, placeholder), nonce, timestamp), nonce, timestamp)
+}
+
+// writeReply 以 text/xml 输出被动回复（内容已就绪，含加密与否）。
+func (a *Adapter) writeReply(w http.ResponseWriter, replyXML, nonce, timestamp string) {
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	_, _ = io.WriteString(w, replyXML)
 }
 
 // readCallbackMessage 读取并校验回调消息：
@@ -407,8 +552,14 @@ func (a *Adapter) convertMessage(msg *wxmp.MessageData) *platform.AstrBotMessage
 		abm.MessageStr = "[图片]"
 		abm.Message = []message.Component{&message.Image{URL: msg.PicUrl, File: msg.MediaId}}
 	case "voice":
+		// 语音接收：下载临时素材并用宿主 ffmpeg 转 wav（本体 :460-484）。
+		// 转换失败时跳过该消息（本体转换失败直接 return，不进入管线）。
+		path, ok := a.fetchVoiceMessage(msg)
+		if !ok {
+			return nil
+		}
 		abm.MessageStr = ""
-		abm.Message = []message.Component{&message.Record{File: msg.MediaId, URL: msg.MediaId}}
+		abm.Message = []message.Component{&message.Record{File: path, URL: path}}
 	case "video", "shortvideo":
 		abm.MessageStr = "[视频]"
 		abm.Message = []message.Component{&message.Video{FileID: msg.MediaId, Path: msg.ThumbMediaId}}
@@ -427,8 +578,34 @@ func (a *Adapter) convertMessage(msg *wxmp.MessageData) *platform.AstrBotMessage
 	return abm
 }
 
+// fetchVoiceMessage 下载语音临时素材并转为 wav，返回文件路径。
+// 对应本体 convert_message 的 voice 分支（media.download + ffmpeg 转 wav）。
+func (a *Adapter) fetchVoiceMessage(msg *wxmp.MessageData) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	data, err := a.downloadMediaByID(ctx, msg.MediaId)
+	if err != nil {
+		logger.Error("下载公众号语音素材失败: %v", err)
+		return "", false
+	}
+	ext := mediaExtByFormat(msg.Format)
+	if sniffed := sniffAudioExt(data, ""); sniffed != "" {
+		ext = sniffed
+	}
+	path := filepath.Join(os.TempDir(), fmt.Sprintf("weixin_offacc_%s%s", msg.MediaId, ext))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		logger.Error("保存公众号语音素材失败: %v", err)
+		return "", false
+	}
+	// ffmpeg 转 wav（amr 等 → wav），失败时保留原文件（宿主 wecom 先例：降级不丢消息）。
+	path = convertAudioToWavPath(path)
+	return path, true
+}
+
 // processEvent publishes the event into the pipeline.
-func (a *Adapter) processEvent(abm *platform.AstrBotMessage) {
+// done 非空时（被动回复模式）在 Metadata 上挂管线完成信号，
+// 供被动回复窗口等待管线结束（对应本体 future/task 完成语义）。
+func (a *Adapter) publishEvent(abm *platform.AstrBotMessage, done *core.PipelineDone) {
 	if a.EventBus == nil {
 		return
 	}
@@ -449,28 +626,211 @@ func (a *Adapter) processEvent(abm *platform.AstrBotMessage) {
 		MessageObj: &core.MessageObj{MessageID: abm.MessageID, SelfID: abm.SelfID},
 		Metadata:   map[string]interface{}{},
 	}
+	if done != nil {
+		event.Metadata[core.MetadataPipelineDone] = done
+	}
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.Error("发布事件失败: %v", err)
 	}
 }
 
-// Send sends a message chain via the custom message API. The Official
-// Account does not support proactive messages; this path is used in
-// active_send_mode replies (mirrors Python's send_by_session which raises).
+// Send 发送消息链。
+//   - active_send_mode：通过客服消息接口发送（send_text/send_image/send_voice，
+//     对齐本体 weixin_offacc_event.py 的 active_send_mode 分支）；
+//   - 被动模式：写入用户缓冲——文本按 1024 分段进 cached（本体 send() 的
+//     message_out["cached_xml"]），图片/语音上传素材后生成被动回复 XML
+//     等待被动窗口返回（本体 future.set_result）。
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
-	if !a.activeSend {
-		return fmt.Errorf("微信公众号不支持发送主动消息（请使用被动回复模式）")
+	if a.activeSend {
+		return a.sendActive(sessionID, chain)
 	}
-	text := ""
+	return a.bufferPassive(sessionID, chain)
+}
+
+// bufferPassive 被动模式发送：写入用户缓冲状态。
+func (a *Adapter) bufferPassive(sessionID string, chain *message.MessageChain) error {
+	st := a.getUserState(sessionID)
+	if st == nil {
+		return fmt.Errorf("微信公众号不支持发送主动消息（被动模式且无回复缓冲）")
+	}
 	for _, comp := range chain.Chain {
-		if plain, ok := comp.(*message.Plain); ok {
-			text += plain.Text
+		switch c := comp.(type) {
+		case *message.Plain:
+			// 长文本 1024 分段（本体 split_plain），暂存待管线结束后统一入缓存。
+			st.appendPending(c.Text)
+		case *message.Image:
+			mediaID, err := a.uploadImageComponent(c)
+			if err != nil {
+				logger.Error("微信公众平台上传图片失败: %v", err)
+				st.appendPending(fmt.Sprintf("微信公众平台上传图片失败: %v", err))
+				continue
+			}
+			// 被动 ImageReply XML（本体 ImageReply(media_id).render() + future.set_result）。
+			st.setFutureXML(imageReplyXML(st.toUser, st.fromUser, mediaID))
+		case *message.Record:
+			mediaID, err := a.uploadVoiceComponent(c)
+			if err != nil {
+				logger.Error("微信公众平台上传语音失败: %v", err)
+				st.appendPending(fmt.Sprintf("微信公众平台上传语音失败: %v", err))
+				continue
+			}
+			// 被动 VoiceReply XML（本体 VoiceReply(media_id).render() + future.set_result）。
+			st.setFutureXML(voiceReplyXML(st.toUser, st.fromUser, mediaID))
+		default:
+			logger.Warn("还没实现这个消息类型的发送逻辑: %T。", comp)
 		}
 	}
-	if text == "" {
-		return nil
+	return nil
+}
+
+// sendActive 主动发送模式：客服消息接口发送文本/图片/语音。
+func (a *Adapter) sendActive(sessionID string, chain *message.MessageChain) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, comp := range chain.Chain {
+		switch c := comp.(type) {
+		case *message.Plain:
+			// 长文本 1024 分段逐条发送（本体 active 分支逐 chunk send_text）。
+			for _, chunk := range splitPlain(c.Text, plainMaxLength) {
+				if err := a.sendCustomText(sessionID, chunk); err != nil {
+					return err
+				}
+			}
+		case *message.Image:
+			mediaID, err := a.uploadImageComponent(c)
+			if err != nil {
+				logger.Error("微信公众平台上传图片失败: %v", err)
+				if err := a.sendCustomText(sessionID, fmt.Sprintf("微信公众平台上传图片失败: %v", err)); err != nil {
+					return err
+				}
+				continue
+			}
+			data := wxmp.MessageCustomSendData{
+				ToUser:  sessionID,
+				MsgType: wxmp.MessageCustomSendTypeImage,
+				Image:   wxmp.MessageCustomSendMsgImage{MediaId: mediaID},
+			}
+			if err := a.sendCustom(ctx, &data); err != nil {
+				return fmt.Errorf("weixin: custom send image failed: %w", err)
+			}
+		case *message.Record:
+			mediaID, err := a.uploadVoiceComponent(c)
+			if err != nil {
+				logger.Error("微信公众平台上传语音失败: %v", err)
+				if err := a.sendCustomText(sessionID, fmt.Sprintf("微信公众平台上传语音失败: %v", err)); err != nil {
+					return err
+				}
+				continue
+			}
+			data := wxmp.MessageCustomSendData{
+				ToUser:  sessionID,
+				MsgType: "voice",
+				Voice:   wxmp.MessageCustomSendMsgVoice{MediaId: mediaID},
+			}
+			if err := a.sendCustom(ctx, &data); err != nil {
+				return fmt.Errorf("weixin: custom send voice failed: %w", err)
+			}
+		default:
+			logger.Warn("还没实现这个消息类型的发送逻辑: %T。", comp)
+		}
 	}
-	return a.sendCustomText(sessionID, text)
+	return nil
+}
+
+// sendCustom 通过客服消息接口发送（message/custom/send）。
+func (a *Adapter) sendCustom(ctx context.Context, data *wxmp.MessageCustomSendData) error {
+	ctx2, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := a.account.NewMpReq(wxmp.MessageCustomSend).SendData(data).Do(ctx2); err != nil {
+		return fmt.Errorf("weixin: custom send failed: %w", err)
+	}
+	return nil
+}
+
+// uploadImageComponent 解析图片组件内容并上传为临时素材，返回 media_id。
+func (a *Adapter) uploadImageComponent(img *message.Image) (string, error) {
+	data, err := a.resolveComponentMedia(img.Path, img.File, img.Base64, img.URL)
+	if err != nil {
+		return "", err
+	}
+	ext := ".jpg"
+	if p := pickFirst(img.Path, img.File); p != "" {
+		if e := strings.ToLower(filepath.Ext(p)); e != "" {
+			ext = e
+		}
+	}
+	if len(data) >= 4 && string(data[:4]) == "\x89PNG" {
+		ext = ".png"
+	} else if len(data) >= 3 && string(data[:3]) == "GIF" {
+		ext = ".gif"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return a.uploadMedia(ctx, "image", data, ext)
+}
+
+// uploadVoiceComponent 解析语音组件内容并转为 amr 后上传，返回 media_id。
+// 对齐本体 send() 的 Record 分支（convert_audio_to_amr → media.upload("voice")）。
+func (a *Adapter) uploadVoiceComponent(rec *message.Record) (string, error) {
+	data, err := a.resolveComponentMedia(rec.Path, rec.File, rec.Base64, rec.URL)
+	if err != nil {
+		return "", err
+	}
+	// 先落盘再转码（ffmpeg 需要文件输入）。
+	ext := rec.Format
+	if ext == "" {
+		ext = strings.TrimPrefix(sniffAudioExt(data, ".amr"), ".")
+	}
+	inPath := filepath.Join(os.TempDir(), fmt.Sprintf("weixin_offacc_send_%d.%s", time.Now().UnixNano(), ext))
+	if err := os.WriteFile(inPath, data, 0o600); err != nil {
+		return "", err
+	}
+	defer os.Remove(inPath)
+
+	amrPath := convertAudioToAmrPath(inPath)
+	if amrPath == "" {
+		// 转码失败：已是 amr 时可直接上传，否则报错（对齐本体转换失败抛错的语义）。
+		if strings.HasSuffix(inPath, ".amr") {
+			amrPath = inPath
+		} else {
+			return "", fmt.Errorf("语音转 amr 失败：请确认宿主已安装 ffmpeg")
+		}
+	}
+	amrData, err := os.ReadFile(amrPath)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return a.uploadMedia(ctx, "voice", amrData, ".amr")
+}
+
+// resolveComponentMedia 解析消息组件的二进制内容：优先本地文件，其次 base64，
+// 最后经 SSRF 校验下载 URL（宿主 SafeDownloadBytes 先例）。
+func (a *Adapter) resolveComponentMedia(path, file, b64, url string) ([]byte, error) {
+	if path == "" {
+		path = file
+	}
+	if path != "" {
+		return os.ReadFile(path)
+	}
+	if b64 != "" {
+		return base64.StdEncoding.DecodeString(b64)
+	}
+	if url != "" {
+		return platform.SafeDownloadBytes(context.Background(), url, 20<<20)
+	}
+	return nil, fmt.Errorf("媒体组件缺少可用的内容（path/file/base64/url 均为空）")
+}
+
+// pickFirst 返回第一个非空字符串。
+func pickFirst(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // sendCustomText sends a text message via message/custom/send.

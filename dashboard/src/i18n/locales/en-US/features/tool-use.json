@@ -187,6 +187,7 @@
     "updateToolPermissionSuccess": "Permission for {name} updated",
     "updateToolPermissionFailed": "Failed to update tool permission",
     "updateToolPermissionBuiltin": "Builtin tools do not support per-tool permission configuration.",
-    "testError": "Test connection failed: {error}"
+    "testError": "Test connection failed: {error}",
+    "testSuccess": "MCP server test passed ({count} tools)"
   }
 }

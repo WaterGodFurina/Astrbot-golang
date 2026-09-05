@@ -1014,6 +1014,22 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.cronMgr = ctx.CronManager
 	s.database = ctx.Database
 	s.subPlugins = ctx.SubPlugins
+	// Wire the plugin-activation snapshot for filterSkillsForCurrentConfig
+	// (subprocess plugin ids are the data/plugins root dir names, matching
+	// the plugin skill source_label).
+	if ctx.SubPlugins != nil {
+		sub := ctx.SubPlugins
+		SetActivePluginIDsProvider(func() map[string]bool {
+			out := map[string]bool{}
+			for _, inst := range sub.RegisteredPlugins() {
+				if inst == nil || inst.ID == "" {
+					continue
+				}
+				out[inst.ID] = true
+			}
+			return out
+		})
+	}
 	s.providerConf = bindProviderSettings(ctx.AstrbotConfig)
 	// Wire dequeue_context_length into the conversation manager so AppendHistory
 	// truncates stored history instead of growing it without bound (M-33).
@@ -1564,7 +1580,7 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 
 	// Inject active skills into the system prompt (mirrors Python's
 	// astr_main_agent._ensure_persona_and_skills).
-	systemPrompt = s.applySkills(systemPrompt, providerSettings, personaID)
+	systemPrompt = s.applySkills(systemPrompt, providerSettings, personaID, event.UnifiedMsgOrigin())
 
 	// LLM safety mode: prefix the safety prompt when enabled (mirrors
 	// astr_main_agent._apply_llm_safety_mode).
@@ -2422,10 +2438,16 @@ func (s *ProcessStage) recordProviderCall(providerCfg map[string]interface{}, um
 }
 
 // applySkills appends the active-skills section to the system prompt.
-// It mirrors Python's astr_main_agent._ensure_persona_and_skills: only active
-// skills are listed, persona skill allow-lists are honored, and a runtime of
-// "none" warns that Computer Use is disabled.
-func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[string]interface{}, personaID string) string {
+// It mirrors Python's astr_main_agent._ensure_persona_and_skills:
+//   - list active skills for the configured computer_use_runtime;
+//   - drop plugin skills whose plugin is deactivated or excluded by the
+//     plugin_set allow-list (mirrors _filter_skills_for_current_config);
+//   - for the "local" runtime, merge request-scoped workspace skills
+//     (workspace overrides same-name skills, sorted by name);
+//   - honor the persona skill allow-list (nil = unrestricted, empty =
+//     disabled; workspace skills are skipped only when disabled);
+//   - a runtime of "none" warns that Computer Use is disabled.
+func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[string]interface{}, personaID string, umo string) string {
 	if s.skillMgr == nil {
 		return systemPrompt
 	}
@@ -2434,28 +2456,54 @@ func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[str
 		runtime = s.providerConf.ComputerUseRuntime
 	}
 	active := s.skillMgr.ListSkills(true, runtime)
-	if len(active) == 0 {
-		return systemPrompt
+	active = filterSkillsForCurrentConfig(active, s.config)
+	var workspaceSkills []*skills.SkillInfo
+	if runtime == "local" {
+		workspaceSkills = s.skillMgr.ListWorkspaceSkills(workspaceRoot(umo))
 	}
 
-	// Honor the persona's skill allow-list (nil = unrestricted).
-	if s.personaSkills != nil && personaID != "" {
-		allowed := s.personaSkills(personaID)
-		if allowed != nil {
-			if len(allowed) == 0 {
-				active = nil
-			} else {
-				allowSet := make(map[string]bool, len(allowed))
-				for _, name := range allowed {
-					allowSet[name] = true
-				}
-				filtered := active[:0:0]
-				for _, sk := range active {
-					if allowSet[sk.Name] {
-						filtered = append(filtered, sk)
+	if len(active) > 0 || len(workspaceSkills) > 0 {
+		// Honor the persona's skill allow-list (nil = unrestricted).
+		if s.personaSkills != nil && personaID != "" {
+			allowed := s.personaSkills(personaID)
+			if allowed != nil {
+				if len(allowed) == 0 {
+					active = nil
+				} else {
+					allowSet := make(map[string]bool, len(allowed))
+					for _, name := range allowed {
+						allowSet[name] = true
 					}
+					filtered := active[:0:0]
+					for _, sk := range active {
+						if allowSet[sk.Name] {
+							filtered = append(filtered, sk)
+						}
+					}
+					active = filtered
 				}
-				active = filtered
+			}
+		}
+		// Workspace skills merge AFTER persona filtering: a disabled persona
+		// (persona.skills == []) excludes workspace skills too; otherwise
+		// workspace skills override same-name entries and the merged map is
+		// sorted by name (mirrors astr_main_agent.py:586-590).
+		if len(workspaceSkills) > 0 && personaWorkspaceUnrestricted(s.personaSkills, personaID) {
+			byName := make(map[string]*skills.SkillInfo, len(active)+len(workspaceSkills))
+			for _, sk := range active {
+				byName[sk.Name] = sk
+			}
+			for _, sk := range workspaceSkills {
+				byName[sk.Name] = sk
+			}
+			names := make([]string, 0, len(byName))
+			for name := range byName {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			active = make([]*skills.SkillInfo, 0, len(byName))
+			for _, name := range names {
+				active = append(active, byName[name])
 			}
 		}
 	}
@@ -2471,6 +2519,81 @@ func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[str
 			"If you need to use these capabilities, ask the user to enable Computer Use in the AstrBot WebUI -> Config.\n"
 	}
 	return systemPrompt
+}
+
+// personaWorkspaceUnrestricted reports whether workspace skills may merge:
+// Python gates the merge on `not persona or persona.get("skills") != []`,
+// i.e. only a persona explicitly configured with an empty skills list blocks
+// workspace skills.
+func personaWorkspaceUnrestricted(personaSkills func(personaID string) []string, personaID string) bool {
+	if personaSkills == nil || personaID == "" {
+		return true
+	}
+	return personaSkills(personaID) == nil
+}
+
+// filterSkillsForCurrentConfig mirrors Python's
+// astr_main_agent._filter_skills_for_current_config: plugin-sourced skills
+// require their plugin to be registered+activated and (unless no allow-list
+// is configured) be included in the plugin_set config. Non-plugin skills
+// pass through. In this Go host every subprocess plugin registered in the
+// star registry is activated (subprocess_bridge registers Activated: true),
+// so activation == registry presence.
+func filterSkillsForCurrentConfig(list []*skills.SkillInfo, config map[string]interface{}) []*skills.SkillInfo {
+	if len(list) == 0 {
+		return list
+	}
+	var allowedPlugins map[string]bool
+	if raw, ok := config["plugin_set"].([]interface{}); ok {
+		star := false
+		names := map[string]bool{}
+		for _, v := range raw {
+			if name, ok := v.(string); ok {
+				if name == "*" {
+					star = true
+				}
+				names[name] = true
+			}
+		}
+		if !star {
+			allowedPlugins = names
+		}
+	}
+	registered := activePluginIDs()
+	filtered := make([]*skills.SkillInfo, 0, len(list))
+	for _, sk := range list {
+		if sk.SourceType != skills.SourcePlugin {
+			filtered = append(filtered, sk)
+			continue
+		}
+		if !registered[sk.PluginName] {
+			continue
+		}
+		if allowedPlugins == nil || allowedPlugins[sk.PluginName] {
+			filtered = append(filtered, sk)
+		}
+	}
+	return filtered
+}
+
+// activePluginIDs snapshots the activated plugin ids (subprocess plugin
+// registry; mirrors iterating star_registry for plugin.activated). The
+// package-level indirection keeps filterSkillsForCurrentConfig testable
+// without a full ProcessStage.
+var activePluginIDs = func() map[string]bool {
+	// Default no-op: without a wired snapshot no plugin id is known, so
+	// plugin-sourced skills would be dropped. Pipeline initialization always
+	// wires this (see SetActivePluginIDsProvider).
+	return nil
+}
+
+// SetActivePluginIDsProvider wires the plugin-activation snapshot used by
+// filterSkillsForCurrentConfig. Called by ProcessStage.Initialize.
+func SetActivePluginIDsProvider(fn func() map[string]bool) {
+	if fn == nil {
+		return
+	}
+	activePluginIDs = fn
 }
 
 // buildToolCallsMessage converts LLMResponse tool calls into the OpenAI
@@ -3717,6 +3840,12 @@ func (s *ProcessStage) ensureSandboxStarted(ctx context.Context, sessionID strin
 		return err
 	}
 	if s.skillMgr != nil {
+		// 先推送宿主 active 技能进 /workspace/skills（对齐 Python
+		// computer_client._sync_skills_to_sandbox），再回扫沙盒技能刷新
+		// 缓存（含沙盒内置技能——推送后 SyncSkills 才能看到全部条目）。
+		if err := s.sandboxMgr.PushHostSkills(ctx, sessionID); err != nil {
+			logger.Warn("推送宿主技能到沙盒失败: %v", err)
+		}
 		s.syncSandboxSkills(ctx, sessionID)
 	}
 	return nil

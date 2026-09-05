@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -1021,6 +1022,50 @@ func (s *Server) getProviderItems() *config.OrderedJSON {
 			"hint", "模型支持的模态及能力。"),
 		"custom_headers", om("description", "自定义请求头", "type", "dict", "items", om(), "hint", "此处添加的键值对将被合并到 HTTP 请求头中。"),
 		"custom_extra_body", om("description", "自定义请求体参数", "type", "dict", "items", om(), "hint", "用于在请求时添加额外的参数，如 temperature, top_p, max_tokens, reasoning_effort 等。"),
+		"ollama_disable_thinking", om("description", "关闭思考模式", "type", "bool", "hint", "关闭 Ollama 思考模式。"),
+		"xai_native_search", om("description", "启用原生搜索功能", "type", "bool",
+			"hint", "启用后，将通过 xAI 的 Chat Completions 原生 Live Search 进行联网检索（按需计费）。仅对 xAI 提供商生效。",
+			"condition", om("provider", "xai", "type", "xai_chat_completion")),
+		"gm_resp_image_modal", om("description", "启用图片模态", "type", "bool",
+			"hint", "启用后，将支持返回图片内容。需要模型支持，否则会报错。具体支持模型请查看 Google Gemini 官方网站。"),
+		"gm_native_search", om("description", "启用原生搜索功能", "type", "bool",
+			"hint", "启用后所有函数工具将全部失效，免费次数限制请查阅官方文档"),
+		"gm_native_coderunner", om("description", "启用原生代码执行器", "type", "bool",
+			"hint", "启用后所有函数工具将全部失效"),
+		"gm_url_context", om("description", "启用URL上下文功能", "type", "bool",
+			"hint", "启用后所有函数工具将全部失效"),
+		"gm_safety_settings", om("description", "安全过滤器", "type", "object",
+			"hint", "设置模型输入的内容安全过滤级别。",
+			"items", om(
+				"harassment", om("description", "骚扰内容", "type", "string",
+					"options", []string{"BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"}),
+				"hate_speech", om("description", "仇恨言论", "type", "string",
+					"options", []string{"BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"}),
+				"sexually_explicit", om("description", "露骨色情内容", "type", "string",
+					"options", []string{"BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"}),
+				"dangerous_content", om("description", "危险内容", "type", "string",
+					"options", []string{"BLOCK_NONE", "BLOCK_ONLY_HIGH", "BLOCK_MEDIUM_AND_ABOVE", "BLOCK_LOW_AND_ABOVE"}),
+			)),
+		"gm_thinking_config", om("description", "Thinking Config", "type", "object",
+			"items", om(
+				"budget", om("description", "Thinking Budget", "type", "int",
+					"hint", "Guides the model on the specific number of thinking tokens to use for reasoning."),
+				"level", om("description", "Thinking Level", "type", "string",
+					"hint", "Recommended for Gemini 3 models and onwards, lets you control reasoning behavior.",
+					"options", []string{"MINIMAL", "LOW", "MEDIUM", "HIGH"}),
+			)),
+		"anth_thinking_config", om("description", "思考配置", "type", "object",
+			"items", om(
+				"type", om("description", "思考类型", "type", "string",
+					"options", []string{"", "adaptive"},
+					"hint", "Opus 4.6+ / Sonnet 4.6+ 推荐设为 'adaptive'。留空则使用手动 budget 模式。"),
+				"budget", om("description", "思考预算", "type", "int",
+					"hint", "手动 budget_tokens，需 >= 1024。仅在 type 为空时生效。"),
+				"effort", om("description", "思考深度", "type", "string",
+					"options", []string{"", "low", "medium", "high", "max"},
+					"hint", "type 为 'adaptive' 时控制思考深度。默认 'high'。"),
+			)),
+		"dashscope_tts_voice", om("description", "音色", "type", "string"),
 	)
 }
 
@@ -1028,29 +1073,54 @@ func (s *Server) getProviderItems() *config.OrderedJSON {
 func (s *Server) getProviderTemplates() *config.OrderedJSON {
 	template := func(name, provider, providerType, apiBase string) *config.OrderedJSON {
 		return om("id", name, "type", name, "provider", provider,
-			"provider_type", providerType, "enable", false, "api_base", apiBase, "key", "")
+			"provider_type", providerType, "enable", false, "api_base", apiBase, "key", []string{},
+			"timeout", 120, "proxy", "", "custom_headers", om())
 	}
 	return om(
 		"openai", template("openai", "openai_chat_completion", "chat_completion", "https://api.openai.com/v1"),
 		"openrouter", template("openrouter", "openrouter_chat_completion", "chat_completion", "https://openrouter.ai/api/v1"),
-		"anthropic", template("anthropic", "anthropic_chat_completion", "chat_completion", "https://api.anthropic.com"),
-		"gemini", template("gemini", "googlegenai_chat_completion", "chat_completion", "https://generativelanguage.googleapis.com/v1beta"),
-		"ollama", template("ollama", "ollama_chat_completion", "chat_completion", "http://127.0.0.1:11434"),
+		"anthropic", om("id", "anthropic", "type", "anthropic_chat_completion", "provider", "anthropic",
+			"provider_type", "chat_completion", "enable", false,
+			"api_base", "https://api.anthropic.com/v1", "key", []string{},
+			"timeout", 120, "proxy", "", "custom_headers", om(),
+			"anth_thinking_config", om("type", "", "budget", 0, "effort", "")),
+		"gemini", om("id", "gemini", "type", "googlegenai_chat_completion", "provider", "google",
+			"provider_type", "chat_completion", "enable", false,
+			"api_base", "https://generativelanguage.googleapis.com/", "key", []string{},
+			"timeout", 120, "proxy", "",
+			"gm_resp_image_modal", false, "gm_native_search", false, "gm_native_coderunner", false, "gm_url_context", false,
+			"gm_safety_settings", om(
+				"harassment", "BLOCK_MEDIUM_AND_ABOVE",
+				"hate_speech", "BLOCK_MEDIUM_AND_ABOVE",
+				"sexually_explicit", "BLOCK_MEDIUM_AND_ABOVE",
+				"dangerous_content", "BLOCK_MEDIUM_AND_ABOVE",
+			),
+			"gm_thinking_config", om("budget", 0, "level", "HIGH")),
+		"ollama", om("id", "ollama", "type", "ollama_chat_completion", "provider", "ollama",
+			"provider_type", "chat_completion", "enable", false,
+			"api_base", "http://127.0.0.1:11434", "key", []string{"ollama"},
+			"timeout", 120, "proxy", "", "custom_headers", om(),
+			"ollama_disable_thinking", false),
 		"dashscope", template("dashscope", "dashscope_chat_completion", "chat_completion", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
 		"groq", template("groq", "groq_chat_completion", "chat_completion", "https://api.groq.com/openai/v1"),
 		"xai", om("id", "xai", "type", "xai_chat_completion", "provider", "xai_chat_completion",
 			"provider_type", "chat_completion", "enable", false,
-			"api_base", "https://api.x.ai/v1", "key", "", "xai_native_search", false),
+			"api_base", "https://api.x.ai/v1", "key", []string{},
+			"timeout", 120, "proxy", "", "custom_headers", om(),
+			"xai_native_search", false),
 		"zhipu", template("zhipu", "zhipu_chat_completion", "chat_completion", "https://open.bigmodel.cn/api/paas/v4"),
 		"longcat", template("longcat", "longcat_chat_completion", "chat_completion", "https://api.longcat.chat/openai/v1"),
 		"aihubmix", template("aihubmix", "aihubmix_chat_completion", "chat_completion", "https://aihubmix.com/v1"),
 		"xiaomi", template("xiaomi", "xiaomi_chat_completion", "chat_completion", "https://api.xiaomimimo.com/v1"),
 		"openai_responses", om("id", "openai_responses", "type", "openai_responses", "provider", "openai",
 			"provider_type", "chat_completion", "enable", false,
-			"api_base", "https://api.openai.com/v1", "key", "", "model", ""),
+			"api_base", "https://api.openai.com/v1", "key", []string{}, "model", "",
+			"timeout", 120, "proxy", "", "custom_headers", om()),
 		"kimi_code", om("id", "kimi_code", "type", "kimi_code_chat_completion", "provider", "kimi-code",
 			"provider_type", "chat_completion", "enable", false,
-			"api_base", "https://api.kimi.com/coding", "key", "", "model", "kimi-for-coding"),
+			"api_base", "https://api.kimi.com/coding", "key", []string{}, "model", "kimi-for-coding",
+			"timeout", 120, "proxy", "", "custom_headers", om("User-Agent", "claude-code/0.1.0"),
+			"anth_thinking_config", om("type", "", "budget", 0, "effort", "")),
 		// Non-chat capabilities (STT / TTS / Embedding / Rerank). The type field
 		// must match the provider registered in internal/provider/sources/init.go.
 		"openai_whisper", om("id", "whisper", "type", "openai_whisper", "provider", "openai",
@@ -1805,12 +1875,14 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 			if id == "" {
 				id = ptype
 			}
+			// 按平台真实声明取值（对照本体 platform_metadata），不再硬编码。
+			streaming, proactive := platformSupport(ptype)
 			meta := map[string]interface{}{
 				"id":                        id,
 				"name":                      ptype,
 				"display_name":              platformDisplayName(ptype),
-				"support_streaming_message": true,
-				"support_proactive_message": true,
+				"support_streaming_message": streaming,
+				"support_proactive_message": proactive,
 			}
 			statsList = append(statsList, map[string]interface{}{
 				"id":              id,
@@ -2028,10 +2100,16 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
 				return
 			}
-			s.pluginUninstall(pluginID, body.DeleteConfig, body.DeleteData)
+			if err := s.pluginUninstall(pluginID, body.DeleteConfig, body.DeleteData); err != nil {
+				writeJSON(w, http.StatusOK, apiError("卸载插件失败: "+err.Error()))
+				return
+			}
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
 		case http.MethodPost:
-			s.pluginUninstall(pluginID, true, true)
+			if err := s.pluginUninstall(pluginID, true, true); err != nil {
+				writeJSON(w, http.StatusOK, apiError("卸载插件失败: "+err.Error()))
+				return
+			}
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
 		default:
 			writeJSON(w, http.StatusOK, apiOK(s.pluginByID(pluginID)))
@@ -2112,6 +2190,27 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		}
 		writeJSON(w, http.StatusOK, apiOKMsg("全局休眠策略已更新", map[string]interface{}{"minutes": body.Minutes}))
 	case "failed":
+		// DELETE /plugins/failed/{plugin_id}：卸载失败插件——清除崩溃失败
+		// 记录并清理残留安装目录（对齐前端"卸载失败插件"按钮语义）。
+		if r.Method == http.MethodDelete && len(parts) > 1 {
+			// 对齐本体 uninstall_failed_plugin（star_manager.py:1813）：
+			// delete_config/delete_data 默认 false，从请求体取（可选 body）。
+			pluginID := parts[1]
+			var body struct {
+				DeleteConfig bool `json:"delete_config"`
+				DeleteData   bool `json:"delete_data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
+			if err := s.subPluginMgr.RemoveFailedPlugin(pluginID, body.DeleteConfig, body.DeleteData); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("卸载成功", map[string]interface{}{"plugin_id": pluginID}))
+			return
+		}
 		writeJSON(w, http.StatusOK, apiOK(s.pluginFailed()))
 	case "reload":
 		var body struct {
@@ -2176,9 +2275,119 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 	case "logo":
 		s.handlePluginLogo(w, r)
 	case "config-files":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"files": []interface{}{},
-		}))
+		// 插件配置文件三件套（FileConfigItem.vue：type=file 配置项的
+		// 上传/列出/删除）。对齐本体 dashboard ConfigFileService：
+		//   目录 = 插件数据根 + "files/" + configKey 按 "." 分段净化成子目录；
+		//   列表返回相对插件根的 posix rel_path（仅 files/ 前缀）；
+		//   上传文件名净化（basename、拒 ./..、分隔符替 _）+ 响应
+		//   {uploaded, errors}；删除 body.path 必须以 files/ 开头且不逃逸。
+		// 此前为空壳 stub，前端按钮假成功。
+		pluginID := r.URL.Query().Get("plugin_id")
+		configKey := r.URL.Query().Get("config_key")
+		if pluginID == "" {
+			writeJSON(w, http.StatusOK, apiError("缺少 plugin_id"))
+			return
+		}
+		if s.subPluginMgr == nil {
+			writeJSON(w, http.StatusOK, apiError("插件管理器不可用"))
+			return
+		}
+		// 插件数据根（= 插件子进程工作目录，插件以相对路径读文件）。
+		pluginRoot := filepath.Join("data", "plugins_data", plugin.SanitizeIDLocal(pluginID))
+		folder := configKeyToFolder(configKey)
+		targetDir := filepath.Join(pluginRoot, "files", folder)
+
+		switch r.Method {
+		case http.MethodGet:
+			files := []interface{}{}
+			entries, err := os.ReadDir(targetDir)
+			if err == nil {
+				for _, e := range entries {
+					if !e.IsDir() {
+						files = append(files, path.Join("files", folder, e.Name()))
+					}
+				}
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"files": files}))
+		case http.MethodPost:
+			r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
+			if err := r.ParseMultipartForm(64 << 20); err != nil {
+				writeJSON(w, http.StatusOK, apiError("解析上传文件失败: "+err.Error()))
+				return
+			}
+			if err := os.MkdirAll(targetDir, 0o755); err != nil {
+				writeJSON(w, http.StatusOK, apiError("创建目录失败: "+err.Error()))
+				return
+			}
+			uploaded := []interface{}{}
+			errList := []interface{}{}
+			for _, fh := range r.MultipartForm.File["files"] {
+				name := sanitizeFilenameConfig(fh.Filename)
+				if name == "" {
+					errList = append(errList, "Invalid filename")
+					continue
+				}
+				dst := filepath.Join(targetDir, name)
+				if !strings.HasPrefix(filepath.Clean(dst), filepath.Clean(targetDir)+string(os.PathSeparator)) {
+					errList = append(errList, "Invalid path: "+name)
+					continue
+				}
+				src, err := fh.Open()
+				if err != nil {
+					errList = append(errList, name+": "+err.Error())
+					continue
+				}
+				out, err := os.Create(dst)
+				if err != nil {
+					_ = src.Close()
+					errList = append(errList, name+": "+err.Error())
+					continue
+				}
+				_, cerr := io.Copy(out, io.LimitReader(src, maxMultipartBodySize+1))
+				_ = out.Close()
+				_ = src.Close()
+				if cerr != nil {
+					errList = append(errList, name+": "+cerr.Error())
+					continue
+				}
+				uploaded = append(uploaded, path.Join("files", folder, name))
+			}
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"uploaded": uploaded,
+				"errors":   errList,
+			}))
+		case http.MethodDelete:
+			var body struct {
+				Path string `json:"path"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
+			rel := path.Clean(strings.TrimSpace(body.Path))
+			// 对齐本体 _normalize_rel_path/_safe_plugin_path：仅允许 files/
+			// 前缀，拒绝目录穿越与相对路径逃逸。
+			if rel == "" || rel == "." || strings.HasPrefix(rel, "..") || !strings.HasPrefix(rel, "files/") {
+				writeJSON(w, http.StatusBadRequest, apiError("Invalid path parameter"))
+				return
+			}
+			target := filepath.Join(pluginRoot, filepath.FromSlash(rel))
+			if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(pluginRoot)+string(os.PathSeparator)) {
+				writeJSON(w, http.StatusBadRequest, apiError("Invalid path parameter"))
+				return
+			}
+			if info, err := os.Stat(target); err != nil || info.IsDir() {
+				writeJSON(w, http.StatusOK, apiError("文件不存在"))
+				return
+			}
+			if err := os.Remove(target); err != nil {
+				writeJSON(w, http.StatusOK, apiError("删除失败: "+err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("Deleted", map[string]interface{}{}))
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, apiError("不支持的方法"))
+		}
 	case "changelog":
 		s.handlePluginDocs(w, r, s.subPluginMgr.Changelog)
 	case "update":
@@ -2311,13 +2520,31 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			case "changelog":
 				s.handlePluginDocs(w, r, s.subPluginMgr.Changelog)
 				return
+			default:
+				// 未知插件子资源：显式 404，防止 DELETE 掉进下方"动态段
+				// DELETE = 卸载插件"分支造成误卸载（如 config-files 子路径）。
+				writeJSON(w, http.StatusNotFound, apiError("未知插件子资源: "+parts[1]))
+				return
 			}
 		}
 		switch r.Method {
 		case http.MethodGet:
 			writeJSON(w, http.StatusOK, apiOK(s.pluginByID(pluginID)))
 		case http.MethodDelete, http.MethodPost:
-			s.pluginUninstall(pluginID, false, false)
+			// 卸载选项从请求体读取（DELETE 有 body；POST 兼容空 body），
+			// 对齐 by-id / failed 分支的 {delete_config, delete_data} 语义。
+			var body struct {
+				DeleteConfig bool `json:"delete_config"`
+				DeleteData   bool `json:"delete_data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+				return
+			}
+			if err := s.pluginUninstall(pluginID, body.DeleteConfig, body.DeleteData); err != nil {
+				writeJSON(w, http.StatusOK, apiError("卸载插件失败: "+err.Error()))
+				return
+			}
 			writeJSON(w, http.StatusOK, apiOKMsg("插件已卸载", map[string]interface{}{}))
 		default:
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -3110,6 +3337,28 @@ func (s *Server) handleKB(w http.ResponseWriter, r *http.Request, parts []string
 				s.handleKBDocuments(w, r, kbID, parts[2:])
 				return
 			case "chunks":
+				// DELETE /knowledge-bases/{kb_id}/chunks/{chunk_id}：删除单个
+				// 分块（nanovec 向量 + SQLite 行）——DocumentDetail.vue 的
+				// "删除分块" 按钮；此前 DELETE 落入列表分支返回假成功。
+				if r.Method == http.MethodDelete {
+					chunkID := ""
+					if len(parts) > 2 {
+						chunkID = parts[2]
+					}
+					if chunkID == "" {
+						chunkID = r.URL.Query().Get("chunk_id")
+					}
+					if chunkID == "" {
+						writeJSON(w, http.StatusBadRequest, apiError("缺少 chunk_id"))
+						return
+					}
+					if err := s.kbDeleteChunk(kbID, chunkID); err != nil {
+						writeJSON(w, http.StatusOK, apiError(err.Error()))
+						return
+					}
+					writeJSON(w, http.StatusOK, apiOKMsg("分块已删除", map[string]interface{}{"chunk_id": chunkID}))
+					return
+				}
 				// List chunks from the SQLite index (list source of truth),
 				// with real pagination（对齐前端 page/page_size 参数，避免大 KB
 				// 全量返回）。doc_id 过滤：前端发送 document_id 查询参数
@@ -3551,6 +3800,50 @@ func (s *Server) kbDataDir() string {
 }
 
 // sanitizePath makes a path segment safe for use in file names.
+// configKeyToFolder 对齐本体 _config_key_to_folder：configKey 按 "." 分段，
+// 每段经 sanitizePathSegment 净化（非 [a-zA-Z0-9_-] → "_"，首尾 "_" 去除），
+// 段间以 "/" 连接（嵌套 key → 子目录层级）。
+func configKeyToFolder(keyPath string) string {
+	parts := strings.Split(keyPath, ".")
+	cleaned := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		cleaned = append(cleaned, sanitizePathSegment(part))
+	}
+	if len(cleaned) == 0 {
+		return "_"
+	}
+	return strings.Join(cleaned, "/")
+}
+
+// sanitizePathSegment 对齐本体 sanitize_path_segment。
+func sanitizePathSegment(segment string) string {
+	var b strings.Builder
+	for _, ch := range segment {
+		switch {
+		case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9', ch == '-', ch == '_':
+			b.WriteRune(ch)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+// sanitizeFilenameConfig 对齐本体 _sanitize_filename：basename、拒 ./..、
+// 路径分隔符替换 "_"。
+func sanitizeFilenameConfig(name string) string {
+	cleaned := strings.TrimSpace(filepath.Base(name))
+	if cleaned == "" || cleaned == "." || cleaned == ".." {
+		return ""
+	}
+	cleaned = strings.ReplaceAll(cleaned, "/", "_")
+	cleaned = strings.ReplaceAll(cleaned, string(os.PathSeparator), "_")
+	return cleaned
+}
+
 func sanitizePath(p string) string {
 	p = filepath.Base(strings.ReplaceAll(p, "\\", "/"))
 	if strings.Trim(p, ".") == "" {
@@ -4757,13 +5050,14 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 			return
 		case "test":
 			var body struct {
-				ServerName string `json:"server_name"`
+				ServerName string                 `json:"server_name"`
+				Config     map[string]interface{} `json:"mcp_server_config"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
 				return
 			}
-			s.testMCPServer(w, r, body.ServerName)
+			s.testMCPServer(w, r, body.ServerName, body.Config)
 			return
 		}
 		serverName := parts[1]
@@ -4787,7 +5081,18 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request, parts []strin
 				}
 				writeJSON(w, http.StatusOK, apiOKMsg("MCP server 状态已更新", map[string]interface{}{}))
 			case "test":
-				s.testMCPServer(w, r, serverName)
+				var body struct {
+					ServerName string                 `json:"server_name"`
+					Config     map[string]interface{} `json:"mcp_server_config"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
+				if body.ServerName != "" {
+					serverName = body.ServerName
+				}
+				s.testMCPServer(w, r, serverName, body.Config)
 			default:
 				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 			}
@@ -4884,7 +5189,9 @@ func (s *Server) mcpByID(w http.ResponseWriter, r *http.Request) {
 		ServerName string                 `json:"server_name"`
 		Config     map[string]interface{} `json:"config"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	// DELETE 请求无 body：EOF 容忍（server_name 从 query 取），其余解码
+	// 错误照常报 400。
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
 		return
 	}
@@ -4980,16 +5287,25 @@ func (s *Server) syncModelScopeMCPServers(accessToken string) (int, error) {
 }
 
 // (stdio: check command exists; sse/http: try a HEAD/GET request).
-func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request, serverName string) {
-	cfg := s.mcp.get(serverName)
+func (s *Server) testMCPServer(w http.ResponseWriter, r *http.Request, serverName string, draftCfg map[string]interface{}) {
+	cfg := draftCfg
 	if len(cfg) == 0 {
-		writeJSON(w, http.StatusOK, apiError("Server does not exist"))
-		return
+		cfg = s.mcp.get(serverName)
+		if len(cfg) == 0 {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"name":    serverName,
+				"success": false,
+				"error":   "Server does not exist",
+				"tools":   []interface{}{},
+			}))
+			return
+		}
 	}
 	result := map[string]interface{}{
 		"name":    serverName,
 		"success": true,
 		"error":   nil,
+		"tools":   []interface{}{},
 	}
 	transport, _ := cfg["transport"].(string)
 	if transport == "" {
@@ -6731,6 +7047,12 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 			return
 		}
 		deleted := s.chat.deleteSessions(body.SessionIDs)
+		// 级联清理：会话删除时同时移除其衍生线程与 project 成员记录
+		// （对齐本体 delete_session_internal 的线程级联语义）。
+		for _, sid := range body.SessionIDs {
+			s.threads.deleteThreadsBySession(sid)
+			s.projects.removeSessionFromProject(sid)
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"deleted_count": deleted,
 			"failed_count":  0,
@@ -6827,9 +7149,12 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 			}))
 		case http.MethodDelete:
 			// 删除会话时同时取消进行中的 run（对齐 Python delete_session_internal
-			// 的 request_agent_stop_all）。
+			// 的 request_agent_stop_all），并级联清理该会话的 threads 与
+			// project 成员记录（对齐 delete_webchat_threads_by_parent_session）。
 			s.cancelChatRuns(sessionID)
 			s.chat.deleteSessions([]string{sessionID})
+			s.threads.deleteThreadsBySession(sessionID)
+			s.projects.removeSessionFromProject(sessionID)
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"message": "session deleted",
 			}))
@@ -7833,7 +8158,7 @@ func (s *Server) listBotTypes() []interface{} {
 			"id":                        "weixin_oc",
 			"description":               "微信开放平台（智能对话机器人）适配器",
 			"display_name":              "微信开放平台",
-			"support_streaming_message": true,
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "default", "type": "weixin_oc", "enable": true,
@@ -7842,11 +8167,15 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "weixin_official_account",
-			"id":                        "weixin_official_account",
-			"description":               "微信公众号适配器",
-			"display_name":              "微信公众号",
-			"support_streaming_message": true,
+			"type":         "weixin_official_account",
+			"id":           "weixin_official_account",
+			"description":  "微信公众号适配器",
+			"display_name": "微信公众号",
+			// 对照本体 weixin_offacc_adapter.py:314-315,401-408：meta 声明
+			// streaming=False、proactive=True（声明支持主动消息，但
+			// send_by_session 会 raise"不支持发送主动消息"——运行时拒绝，
+			// 声明仍按本体 meta 保持 true）。
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "default", "type": "weixin_official_account", "enable": true,
@@ -7856,11 +8185,13 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "discord",
-			"id":                        "discord",
-			"description":               "Discord 适配器",
-			"display_name":              "Discord",
-			"support_streaming_message": true,
+			"type":         "discord",
+			"id":           "discord",
+			"description":  "Discord 适配器",
+			"display_name": "Discord",
+			// 对照本体 discord_platform_adapter.py:38-39,110-117：
+			// support_streaming_message=False。
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "discord", "type": "discord", "enable": true,
@@ -7880,11 +8211,12 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "satori",
-			"id":                        "satori",
-			"description":               "Satori 协议适配器",
-			"display_name":              "Satori",
-			"support_streaming_message": true,
+			"type":         "satori",
+			"id":           "satori",
+			"description":  "Satori 协议适配器",
+			"display_name": "Satori",
+			// 对照本体 satori_adapter.py:37,66：support_streaming_message=False。
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "default", "type": "satori", "enable": true,
@@ -7894,11 +8226,12 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "line",
-			"id":                        "line",
-			"description":               "LINE 适配器",
-			"display_name":              "Line",
-			"support_streaming_message": true,
+			"type":         "line",
+			"id":           "line",
+			"description":  "LINE 适配器",
+			"display_name": "Line",
+			// 对照本体 line_adapter.py:65-71,109-116：support_streaming_message=False。
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "default", "type": "line", "enable": true,
@@ -7907,11 +8240,12 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "slack",
-			"id":                        "slack",
-			"description":               "Slack 适配器",
-			"display_name":              "Slack",
-			"support_streaming_message": true,
+			"type":         "slack",
+			"id":           "slack",
+			"description":  "Slack 适配器",
+			"display_name": "Slack",
+			// 对照本体 slack_adapter.py:33,70：support_streaming_message=False。
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "default", "type": "slack", "enable": true,
@@ -7920,11 +8254,12 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "misskey",
-			"id":                        "misskey",
-			"description":               "Misskey 适配器",
-			"display_name":              "Misskey",
-			"support_streaming_message": true,
+			"type":         "misskey",
+			"id":           "misskey",
+			"description":  "Misskey 适配器",
+			"display_name": "Misskey",
+			// 对照本体 misskey_adapter.py:48,121：support_streaming_message=False。
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "default", "type": "misskey", "enable": true,
@@ -7932,11 +8267,12 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "mattermost",
-			"id":                        "mattermost",
-			"description":               "Mattermost 适配器",
-			"display_name":              "Mattermost",
-			"support_streaming_message": true,
+			"type":         "mattermost",
+			"id":           "mattermost",
+			"description":  "Mattermost 适配器",
+			"display_name": "Mattermost",
+			// 对照本体 mattermost_adapter.py:30,57：support_streaming_message=False。
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "default", "type": "mattermost", "enable": true,
@@ -7944,11 +8280,12 @@ func (s *Server) listBotTypes() []interface{} {
 			},
 		},
 		map[string]interface{}{
-			"type":                      "wecom",
-			"id":                        "wecom",
-			"description":               "企业微信应用 & 微信客服适配器",
-			"display_name":              "企业微信",
-			"support_streaming_message": true,
+			"type":         "wecom",
+			"id":           "wecom",
+			"description":  "企业微信应用 & 微信客服适配器",
+			"display_name": "企业微信",
+			// 对照本体 wecom_adapter.py:170,303：support_streaming_message=False。
+			"support_streaming_message": false,
 			"support_proactive_message": true,
 			"default_config": map[string]interface{}{
 				"id": "default", "type": "wecom", "enable": true,
@@ -7972,7 +8309,54 @@ func (s *Server) listBotTypes() []interface{} {
 				"wecomaibot_ws_secret":         "",
 			},
 		},
+		// webchat 条目（本体 webchat_adapter.py:61-82 默认注册：
+		// support_proactive_message=True、streaming 走默认 True、
+		// default_config_tmpl=None → Go 侧 nil）。
+		map[string]interface{}{
+			"type":                      "webchat",
+			"id":                        "webchat",
+			"description":               "webchat",
+			"display_name":              "webchat",
+			"support_streaming_message": true,
+			"support_proactive_message": true,
+			"default_config":            nil,
+		},
 	}
+}
+
+// platformSupportMeta 是每个平台类型的 (support_streaming_message,
+// support_proactive_message) 真实声明值，供 bots/stats 的 meta 使用。
+// 逐平台对照本体 astrbot/core/platform/sources/*/ 的 platform_metadata：
+// 未显式声明的平台沿用本体 PlatformMetadata 的默认值 (true, true)。
+// 与上方 listBotTypes 的字面值保持一致（修改时两处同步）。
+var platformSupportMeta = map[string][2]bool{
+	"qq_official":             {true, true},  // qqofficial_platform_adapter.py 默认
+	"qq_official_webhook":     {true, true},  // qo_webhook_adapter.py 默认
+	"aiocqhttp":               {false, true}, // aiocqhttp_platform_adapter.py:30-33
+	"telegram":                {true, true},  // tg_adapter.py 默认
+	"lark":                    {true, true},  // lark_adapter.py 默认
+	"dingtalk":                {true, true},  // dingtalk_adapter.py:161 显式 proactive
+	"weixin_oc":               {false, true}, // weixin_oc_adapter.py:98-102
+	"weixin_official_account": {false, true}, // weixin_offacc_adapter.py:314-315,401-408
+	"discord":                 {false, true}, // discord_platform_adapter.py:38-39
+	"kook":                    {true, true},  // kook_adapter.py 默认
+	"satori":                  {false, true}, // satori_adapter.py:37
+	"line":                    {false, true}, // line_adapter.py:65-71
+	"slack":                   {false, true}, // slack_adapter.py:33
+	"misskey":                 {false, true}, // misskey_adapter.py:48
+	"mattermost":              {false, true}, // mattermost_adapter.py:30
+	"wecom":                   {false, true}, // wecom_adapter.py:170
+	"wecom_ai_bot":            {true, true},  // wecomai_adapter.py:124 显式 proactive
+	"webchat":                 {true, true},  // webchat_adapter.py:77-82 显式 proactive
+}
+
+// platformSupport 返回平台类型的流式/主动消息支持声明；未知平台按本体
+// PlatformMetadata 默认值返回 (true, true)。
+func platformSupport(ptype string) (streaming, proactive bool) {
+	if v, ok := platformSupportMeta[ptype]; ok {
+		return v[0], v[1]
+	}
+	return true, true
 }
 
 // handleBotRegistration handles POST /api/v1/bot-types/{bot_type}/registration.
@@ -9293,54 +9677,7 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 		}
 		s.serveSkillArchive(w, skillName)
 	case "neo":
-		if len(parts) > 1 {
-			switch parts[1] {
-			case "candidates":
-				if len(parts) > 2 && parts[2] == "delete" {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "candidate deleted",
-					}))
-				} else {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"candidates": []interface{}{},
-					}))
-				}
-			case "evaluate":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "skill evaluated",
-				}))
-			case "promote":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "skill promoted",
-				}))
-			case "releases":
-				if len(parts) > 2 && parts[2] == "delete" {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"message": "release deleted",
-					}))
-				} else {
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-						"releases": []interface{}{},
-					}))
-				}
-			case "rollback":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "skill rolled back",
-				}))
-			case "sync":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"message": "skills synced",
-				}))
-			case "payload":
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-					"payload": "",
-				}))
-			default:
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-			}
-		} else {
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
-		}
+		s.handleSkillsNeo(w, r, parts[min(1, len(parts)):])
 	default:
 		// 路径形态：/skills/{skill_name}/archive
 		if len(parts) > 1 && parts[1] == "archive" {
@@ -9349,6 +9686,246 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// handleSkillsNeo 处理 /api/v1/skills/neo/* 的技能生命周期操作（parts 是
+// "neo" 之后的子路径段）。路由与操作语义对齐本体
+// astrbot/dashboard/api/skills.py 的 neo 端点：
+//
+//	GET  /skills/neo/candidates        → 列表（query: status/skill_key/limit/offset）
+//	GET  /skills/neo/releases          → 列表（query: skill_key/stage/active_only/limit/offset）
+//	GET  /skills/neo/payload           → 读取 payload（query: payload_ref）
+//	POST /skills/neo/evaluate          → 评估候选（body: candidate_id/passed/score/benchmark_id/report）
+//	POST /skills/neo/promote           → 提升候选（body: candidate_id/stage/sync_to_local）
+//	POST /skills/neo/rollback          → 回滚发布（body: release_id）
+//	POST /skills/neo/sync              → 同步本地（body: release_id/skill_key/require_stable）
+//	POST /skills/neo/candidates/delete → 删除候选（body: candidate_id/reason）
+//	POST /skills/neo/releases/delete   → 删除发布（body: release_id/reason）
+//
+// 本体实现经 BayClient 转发到沙盒 Neo 服务；宿主侧由 skills.NeoStore 做
+// 等价本地存储（数据结构对齐 shipyard-neo SDK 模型）。
+func (s *Server) handleSkillsNeo(w http.ResponseWriter, r *http.Request, parts []string) {
+	if s.neo == nil {
+		writeJSON(w, http.StatusOK, apiError("Neo 技能生命周期存储未初始化"))
+		return
+	}
+	// 子路径形态：{candidates|releases}/{delete|...}。
+	if len(parts) > 0 {
+		switch parts[0] {
+		case "candidates":
+			if len(parts) > 1 && parts[1] == "delete" {
+				if r.Method != http.MethodPost {
+					writeJSON(w, http.StatusOK, apiError("method not allowed"))
+					return
+				}
+				var body struct {
+					CandidateID string `json:"candidate_id"`
+					Reason      string `json:"reason"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusOK, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
+				if body.CandidateID == "" {
+					writeJSON(w, http.StatusOK, apiError("Missing candidate_id"))
+					return
+				}
+				if err := s.neo.DeleteCandidate(body.CandidateID, body.Reason); err != nil {
+					writeJSON(w, http.StatusOK, apiError(err.Error()))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"candidate_id": body.CandidateID,
+					"deleted":      true,
+				}))
+				return
+			}
+			// GET /skills/neo/candidates
+			q := r.URL.Query()
+			writeJSON(w, http.StatusOK, apiOK(s.neo.ListCandidates(
+				q.Get("status"), q.Get("skill_key"),
+				atoiDefault(q.Get("limit"), 100), atoiDefault(q.Get("offset"), 0),
+			)))
+			return
+		case "releases":
+			if len(parts) > 1 && parts[1] == "delete" {
+				if r.Method != http.MethodPost {
+					writeJSON(w, http.StatusOK, apiError("method not allowed"))
+					return
+				}
+				var body struct {
+					ReleaseID string `json:"release_id"`
+					Reason    string `json:"reason"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					writeJSON(w, http.StatusOK, apiError("无效的 JSON: "+err.Error()))
+					return
+				}
+				if body.ReleaseID == "" {
+					writeJSON(w, http.StatusOK, apiError("Missing release_id"))
+					return
+				}
+				if err := s.neo.DeleteRelease(body.ReleaseID, body.Reason); err != nil {
+					writeJSON(w, http.StatusOK, apiError(err.Error()))
+					return
+				}
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"release_id": body.ReleaseID,
+					"deleted":    true,
+				}))
+				return
+			}
+			// GET /skills/neo/releases
+			q := r.URL.Query()
+			writeJSON(w, http.StatusOK, apiOK(s.neo.ListReleases(
+				q.Get("skill_key"), q.Get("stage"),
+				q.Get("active_only") == "true",
+				atoiDefault(q.Get("limit"), 100), atoiDefault(q.Get("offset"), 0),
+			)))
+			return
+		}
+	}
+
+	// 其余为动作端点（本体均为 POST）：payload/evaluate/promote/rollback/sync。
+	sub := ""
+	if len(parts) > 0 {
+		sub = parts[0]
+	}
+	switch sub {
+	case "payload":
+		// GET /skills/neo/payload?payload_ref=...
+		payloadRef := r.URL.Query().Get("payload_ref")
+		if payloadRef == "" {
+			writeJSON(w, http.StatusOK, apiError("Missing payload_ref"))
+			return
+		}
+		payload, err := s.neo.GetPayload(payloadRef)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(payload))
+	case "evaluate":
+		var body struct {
+			CandidateID string   `json:"candidate_id"`
+			Passed      *bool    `json:"passed"`
+			Score       *float64 `json:"score"`
+			BenchmarkID string   `json:"benchmark_id"`
+			Report      string   `json:"report"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusOK, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
+		if body.CandidateID == "" || body.Passed == nil {
+			writeJSON(w, http.StatusOK, apiError("Missing candidate_id or passed"))
+			return
+		}
+		result, err := s.neo.EvaluateCandidate(body.CandidateID, *body.Passed, body.Score, body.BenchmarkID, body.Report)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(result))
+	case "promote":
+		var body struct {
+			CandidateID string `json:"candidate_id"`
+			Stage       string `json:"stage"`
+			SyncToLocal *bool  `json:"sync_to_local"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusOK, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
+		if body.CandidateID == "" {
+			writeJSON(w, http.StatusOK, apiError("Missing candidate_id"))
+			return
+		}
+		if body.Stage == "" {
+			body.Stage = "canary"
+		}
+		if body.Stage != "canary" && body.Stage != "stable" {
+			writeJSON(w, http.StatusOK, apiError("Invalid stage, must be canary/stable"))
+			return
+		}
+		// sync_to_local 默认 true（对齐本体 _to_bool(payload.get("sync_to_local"), True)）。
+		syncToLocal := true
+		if body.SyncToLocal != nil {
+			syncToLocal = *body.SyncToLocal
+		}
+		result, err := s.neo.PromoteCandidate(body.CandidateID, body.Stage, syncToLocal)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		// 本体在同步失败时返回 ok=False + release/rollback 数据。
+		if se, ok := result["sync_error"].(string); ok && se != "" {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":  "error",
+				"message": "Stable promote synced failed and has been rolled back. sync_error=" + se,
+				"data":    result,
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(result))
+	case "rollback":
+		var body struct {
+			ReleaseID string `json:"release_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusOK, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
+		if body.ReleaseID == "" {
+			writeJSON(w, http.StatusOK, apiError("Missing release_id"))
+			return
+		}
+		release, err := s.neo.RollbackRelease(body.ReleaseID)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(release))
+	case "sync":
+		var body struct {
+			ReleaseID     string `json:"release_id"`
+			SkillKey      string `json:"skill_key"`
+			RequireStable *bool  `json:"require_stable"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusOK, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
+		if body.ReleaseID == "" && body.SkillKey == "" {
+			writeJSON(w, http.StatusOK, apiError("Missing release_id or skill_key"))
+			return
+		}
+		// require_stable 默认 true（对齐本体 _to_bool(payload.get("require_stable"), True)）。
+		requireStable := true
+		if body.RequireStable != nil {
+			requireStable = *body.RequireStable
+		}
+		result, err := s.neo.SyncRelease(body.ReleaseID, body.SkillKey, requireStable)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError(err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(result))
+	default:
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+	}
+}
+
+// atoiDefault 解析 query 里的整数，失败或缺省返回 def。
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // skillFileEditable reports whether a skill file may be edited in the WebUI.
@@ -9893,7 +10470,14 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 		}
 	case "batch-delete":
+		// 双契约兼容：OpenAPI 形态 {conversations:[{user_id,cid}]}（前端
+		// ConversationPage 批量删除在用），旧形态 {conversation_ids, user_id}
+		// 兜底；响应 deleted_count/failed_count（前端读取字段）+ deleted 兼容。
 		var body struct {
+			Conversations []struct {
+				UserID string `json:"user_id"`
+				CID    string `json:"cid"`
+			} `json:"conversations"`
 			ConversationIDs []string `json:"conversation_ids"`
 			UserID          string   `json:"user_id"`
 		}
@@ -9901,14 +10485,45 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
 			return
 		}
-		deleted := 0
-		for _, id := range body.ConversationIDs {
-			if s.conversationDeleteByCID(id) {
+		deleted, failed := 0, 0
+		failedItems := []interface{}{}
+		deleteOne := func(userID, cid string) bool {
+			if cid == "" {
+				return false
+			}
+			return s.conversationDeleteByCID(cid)
+		}
+		for _, conv := range body.Conversations {
+			// 对齐本体 _delete_conversations：user_id/cid 缺失计入失败明细。
+			if conv.UserID == "" || conv.CID == "" {
+				failedItems = append(failedItems, fmt.Sprintf("user_id:%s, cid:%s - 缺少必要参数", conv.UserID, conv.CID))
+				failed++
+				continue
+			}
+			if deleteOne(conv.UserID, conv.CID) {
 				deleted++
+			} else {
+				failedItems = append(failedItems, fmt.Sprintf("user_id:%s, cid:%s - 会话不存在", conv.UserID, conv.CID))
+				failed++
 			}
 		}
+		for _, id := range body.ConversationIDs {
+			if deleteOne("", id) {
+				deleted++
+			} else {
+				failed++
+			}
+		}
+		message := fmt.Sprintf("成功删除 %d 个对话", deleted)
+		if len(failedItems) > 0 {
+			message += fmt.Sprintf("，失败 %d 个", len(failedItems))
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"deleted": deleted,
+			"deleted":       deleted,
+			"deleted_count": deleted,
+			"failed_count":  failed,
+			"failed_items":  failedItems,
+			"message":       message,
 		}))
 	case "export":
 		// 对齐 Python ConversationService.export_conversations：导出 JSONL。

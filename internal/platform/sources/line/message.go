@@ -503,6 +503,55 @@ func extractVideoFrame(videoPath string) (string, bool) {
 	return thumbPath, true
 }
 
+// convertAudioToWavFile 将本地音频文件（LINE 语音为 m4a）转为 wav 并返回新路径。
+// 对齐 Python _build_audio_component 的 MediaResolver(target_format="wav")
+// （内部走 ensure_wav → ffmpeg -y -i in out.wav，无额外编码参数）。
+// 输入已是 wav（RIFF 魔数）时原路径返回；ffmpeg 不可用或转换失败时返回原路径
+// 降级（保留 m4a），并记录告警日志。
+func convertAudioToWavFile(path string) string {
+	if path == "" {
+		return path
+	}
+	// RIFF/WAVE 魔数：无需转码（对应 _get_audio_magic_type == "wav" 短路）。
+	if utils.DetectAudioFormat(path) == "wav" {
+		return path
+	}
+	wavPath := utils.TempFilePath("line_audio_" + randomHex(6) + ".wav")
+	// 若是 silk 格式，优先纯 Go 转码
+	if utils.DetectAudioFormat(path) == "silk" {
+		if _, err := utils.TencentSilkToWAV(context.Background(), path, wavPath); err == nil {
+			return wavPath
+		}
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		lineLogger.I18nWarn("[LINE] 未检测到 ffmpeg，语音跳过 wav 转码，保留原文件: %s。如果没有安装 ffmpeg 请先安装。", path)
+		return path
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// #nosec G204 -- 输入/输出均为受控临时文件路径，无外部命令注入面。
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", path, wavPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		lineLogger.I18nWarn("[LINE] ffmpeg wav 转码失败: %v: %s", err, truncateFFmpegOutput(out))
+		_ = os.Remove(wavPath)
+		return path
+	}
+	if _, err := os.Stat(wavPath); err != nil {
+		lineLogger.I18nWarn("[LINE] wav 转码结果不存在: %v", err)
+		return path
+	}
+	return wavPath
+}
+
+// truncateFFmpegOutput 压缩 ffmpeg 报错输出便于日志查看。
+func truncateFFmpegOutput(out []byte) string {
+	s := strings.TrimSpace(string(out))
+	if len(s) > 300 {
+		return s[:300]
+	}
+	return s
+}
+
 // randomHex 生成指定字节长度的随机十六进制字符串。
 func randomHex(n int) string {
 	buf := make([]byte, n)

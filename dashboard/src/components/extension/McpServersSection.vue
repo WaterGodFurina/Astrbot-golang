@@ -594,7 +594,15 @@ export default {
       mcpApi.test(this.currentServer.name || 'draft', configObj)
         .then(response => {
           this.loading = false;
-          this.addServerDialogMessage = `${response.data.message} (tools: ${response.data.data})`;
+          const data = response.data?.data || {};
+          if (response.data?.status === 'ok' && data.success !== false) {
+            const toolCount = Array.isArray(data.tools) ? data.tools.length : 0;
+            this.addServerDialogMessage = `${response.data.message || ''} (tools: ${toolCount})`;
+            this.showSuccess(this.tm('messages.testSuccess', { count: toolCount }));
+          } else {
+            this.addServerDialogMessage = '';
+            this.showError(data.error || response.data?.message || this.tm('messages.testError'));
+          }
         })
         .catch(error => {
           this.loading = false;

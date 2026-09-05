@@ -324,8 +324,13 @@ func (c *WecomAIBotWebhookClient) SendMessageChain(ctx context.Context, chain *m
 				continue
 			}
 			defer removeWecomAITemp(sourcePath)
-			// Python 此处会将非 amr 音频转码为 amr；Go 端直接上传原文件
-			if err := c.SendVoice(ctx, sourcePath); err != nil {
+			// 对齐本体（wecomai_webhook.py:199-218）：语音上传要求 amr 格式，
+			// 非 amr 音频先经 ffmpeg 转码；转码产物发送后清理。
+			voicePath := convertAudioToAMR(sourcePath)
+			if voicePath != sourcePath {
+				defer removeWecomAITemp(voicePath)
+			}
+			if err := c.SendVoice(ctx, voicePath); err != nil {
 				return err
 			}
 		default:

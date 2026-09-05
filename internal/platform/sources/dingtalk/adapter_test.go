@@ -71,7 +71,7 @@ func TestGetAccessTokenNestedFallback(t *testing.T) {
 // TestIDToSid 验证钉钉 id 前缀剥离 (对应 Python _id_to_sid)。
 func TestIDToSid(t *testing.T) {
 	cases := map[string]string{
-		"$:LWCP_v1$:user123": "user123",
+		"$:LWCP_v1:$user123": "user123",
 		"user123":            "user123",
 		"":                   "unknown",
 	}
@@ -128,12 +128,12 @@ func TestConvertMsgText(t *testing.T) {
 		ConversationType: "2",
 		CreateAt:         1700000000000,
 		MsgID:            "msg_1",
-		SenderID:         "$:LWCP_v1$:sender_1",
+		SenderID:         "$:LWCP_v1:$sender_1",
 		SenderNick:       "小明",
-		ChatbotUserID:    "$:LWCP_v1$:bot_1",
+		ChatbotUserID:    "$:LWCP_v1:$bot_1",
 		MessageType:      "text",
 		TextContent:      " /server",
-		AtUsers:          []AtUser{{DingtalkID: "$:LWCP_v1$:bot_1"}},
+		AtUsers:          []AtUser{{DingtalkID: "$:LWCP_v1:$bot_1"}},
 	}
 	abm := a.convertMsg(msg)
 	if abm.Type != platform.GroupMessage {
@@ -217,7 +217,7 @@ func TestConvertMsgPrivate(t *testing.T) {
 	a := New(map[string]interface{}{"client_id": "c1", "client_secret": "s1"}, nil, nil)
 	msg := &ChatbotMessage{
 		ConversationType: "1",
-		SenderID:         "$:LWCP_v1$:sender_1",
+		SenderID:         "$:LWCP_v1:$sender_1",
 		SenderNick:       "小明",
 		ChatbotUserID:    "bot_1",
 		MessageType:      "text",

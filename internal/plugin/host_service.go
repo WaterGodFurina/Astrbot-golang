@@ -1196,13 +1196,11 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			if hostExtras.SkillMgr == nil {
 				return nil
 			}
-			// showSandboxPath=true 时 path 返回 sandbox 路径：runtime 为空
-			// 视图不具备混合路径语义，映射为 sandbox 视图（含本地+沙盒缓存
-			// 技能，path 一律为 sandbox 路径）；显式 runtime 优先。
-			if showSandboxPath && runtime == "" {
-				runtime = "sandbox"
-			}
-			items := hostExtras.SkillMgr.ListSkills(activeOnly, runtime)
+			// 对齐 Python list_skills 语义：runtime 仅识别 "sandbox"（其余值
+			// 等价本地视图，"" 不是合法的 sandbox 别名）；show_sandbox_path 只
+			// 影响 sandbox 视图下 path 的显示形态（sandbox_only 技能恒为沙盒
+			// 路径），不改变视图组成。
+			items := hostExtras.SkillMgr.ListSkillsView(activeOnly, runtime, showSandboxPath)
 			out := make([]map[string]any, 0, len(items))
 			for _, s := range items {
 				out = append(out, map[string]any{
@@ -1405,16 +1403,16 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				if v, ok := fields["description"].(string); ok {
 					j.Description = v
 				}
-			if v, ok := fields["payload"].(map[string]any); ok {
-				// _plugin_id 是宿主簿记的路由键（CronCreate 注入）：插件更新
-				// payload 未携带时继承旧值，否则后续 FeedCronJob 无法路由。
-				if _, has := v["_plugin_id"]; !has {
-					if old, hasOld := j.Payload["_plugin_id"]; hasOld {
-						v["_plugin_id"] = old
+				if v, ok := fields["payload"].(map[string]any); ok {
+					// _plugin_id 是宿主簿记的路由键（CronCreate 注入）：插件更新
+					// payload 未携带时继承旧值，否则后续 FeedCronJob 无法路由。
+					if _, has := v["_plugin_id"]; !has {
+						if old, hasOld := j.Payload["_plugin_id"]; hasOld {
+							v["_plugin_id"] = old
+						}
 					}
+					j.Payload = v
 				}
-				j.Payload = v
-			}
 				if v, ok := fields["enabled"].(bool); ok {
 					j.Enabled = v
 				}

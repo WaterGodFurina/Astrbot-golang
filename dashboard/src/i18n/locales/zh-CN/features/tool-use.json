@@ -187,6 +187,7 @@
     "updateToolPermissionSuccess": "工具 {name} 权限已更新",
     "updateToolPermissionFailed": "工具权限更新失败",
     "updateToolPermissionBuiltin": "内置工具不支持单独配置权限",
-    "testError": "测试连接失败: {error}"
+    "testError": "测试连接失败: {error}",
+    "testSuccess": "MCP 服务器测试通过（{count} 个工具）"
   }
 }

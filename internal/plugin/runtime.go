@@ -166,7 +166,7 @@ type SubprocessManager struct {
 	// toolRegMu 保护 toolRegistry：LLM 工具名 → 所属插件 id + 工具描述。
 	// 插件闲置休眠（UnloadIdle）时实例被移出 instances 表，但其工具仍留在
 	// 注册表——LLM 调用该工具时宿主按名查注册表并 EnsureLoaded 唤醒插件；
-	// 仅真实卸载/禁用（unloadLocked notify=true）时清除该插件的条目。
+	// 仅真实卸载/禁用（unloadCoreLocked notify=true）时清除该插件的条目。
 	toolRegMu    sync.RWMutex
 	toolRegistry map[string]toolRegEntry
 
@@ -174,7 +174,7 @@ type SubprocessManager struct {
 	// 快照）。插件闲置休眠时实例被移出 instances 表，但元数据仍保留，供
 	// RebridgePlugins 重建休眠插件的 star handler（命令/过滤器/钩子），保证
 	// 休眠插件指令在 Dashboard 可见、Rebridge 后依然注册、调用时自动唤醒；
-	// 仅真实卸载/禁用（unloadLocked notify=true）时清除该插件的条目。
+	// 仅真实卸载/禁用（unloadCoreLocked notify=true）时清除该插件的条目。
 	handlerMetaMu sync.RWMutex
 	handlerMeta   map[string]*sdkv1.RegisterResponse
 
@@ -1242,7 +1242,7 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 func (m *SubprocessManager) Unload(id string) error {
 	unlock := m.lockOp(id)
 	defer unlock()
-	return m.unloadLocked(id, true)
+	return m.unloadCoreLocked(id, true)
 }
 
 // UnloadIdle stops an idle-sleeping plugin process but KEEPS its star-pipeline
@@ -1252,14 +1252,14 @@ func (m *SubprocessManager) Unload(id string) error {
 func (m *SubprocessManager) UnloadIdle(id string) error {
 	unlock := m.lockOp(id)
 	defer unlock()
-	return m.unloadLocked(id, false)
+	return m.unloadCoreLocked(id, false)
 }
 
-// unloadLocked is Unload/UnloadIdle's body; the caller must hold the
+// unloadCoreLocked is Unload/UnloadIdle's body; the caller must hold the
 // per-plugin lifecycle lock for id (m.lockOp). notify=true fires
 // OnInstancesChanged so the host re-bridges (removes) the handlers; false
 // keeps them for lazy reload.
-func (m *SubprocessManager) unloadLocked(id string, notify bool) error {
+func (m *SubprocessManager) unloadCoreLocked(id string, notify bool) error {
 	m.mu.Lock()
 	inst, ok := m.instances[id]
 	if !ok {
@@ -1269,17 +1269,17 @@ func (m *SubprocessManager) unloadLocked(id string, notify bool) error {
 	delete(m.instances, id)
 	m.mu.Unlock()
 
-	// 通知其余已加载插件：某插件被卸载（on_plugin_unloaded）。已从
-	// instances 中删除，被卸载插件自身不会收到。
-	m.TriggerHookPayload(context.Background(), pluginsdk.EventOnPluginUnloaded, map[string]string{"plugin_name": inst.Name})
+	// 休眠（notify=false）：插件只是进程回收、马上可能被唤醒——跳过
+	// on_plugin_unloaded 广播。其余插件把"休眠"当"卸载"会做错误的清理
+	//（如清缓存/移出列表），唤醒后又对不上状态。唤醒链路不依赖该事件。
+	if notify {
+		m.TriggerHookPayload(context.Background(), pluginsdk.EventOnPluginUnloaded, map[string]string{"plugin_name": inst.Name})
+	}
 
 	inst.mu.Lock()
 	inst.stopped = true
 	inst.mu.Unlock()
 	m.teardownInstance(inst)
-	// 子进程已终止，其 Python 侧 SessionWaiter 状态随之丢失：注销该插件
-	// 的全部会话等待（休眠卸载与真实卸载都适用，防止向死进程反复推送）。
-	m.unregisterPluginWaits(inst.Name)
 	if notify {
 		// 真实卸载/禁用：工具注册表条目与 handler 元数据一并清除（休眠则
 		// 保留，前者供按名唤醒、后者供 Rebridge 重建休眠插件 handler）。
@@ -1291,6 +1291,12 @@ func (m *SubprocessManager) unloadLocked(id string, notify bool) error {
 	} else {
 		logger.I18nInfo("插件 %s 已休眠（闲置卸载，触发时自动唤醒）", id)
 	}
+	// 会话等待注销后移：休眠路径不注销——插件唤醒后 Python 侧虽重建不了
+	// 旧 SessionWaiter 状态，但保留宿主条目没有意义且会向死进程推送；
+	// 休眠的真正防线在 sweep 侧：有活跃 SessionWait 的插件根本不参与
+	// 休眠（见 sweepIdlePlugins），因此走到这里的休眠实例无活跃等待，
+	// 注销是安全的清理。真实卸载必须注销（进程永久消失）。
+	m.unregisterPluginWaits(inst.Name)
 	return nil
 }
 
@@ -1410,6 +1416,12 @@ func (m *SubprocessManager) idleSweepLoop() {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
+			// 全局开关关闭时退出本 loop（SetIdleUnload 置 0 后再启用会重新
+			// 起 loop——不退出会造成多次启停后 goroutine 泄漏、多 loop 并发
+			// 重复清扫）。
+			if !m.IdleUnloadEnabled() {
+				return
+			}
 			m.sweepIdlePlugins()
 		}
 	}
@@ -1444,11 +1456,25 @@ func (m *SubprocessManager) sweepIdlePlugins() {
 			byID[man.Plugins[i].ID] = rule{man.Plugins[i].IdleUnload, man.Plugins[i].IdleUnloadMinutes}
 		}
 	}
+	// 活跃会话等待集合：等待用户回复（如 listen_music"1 选歌"）的插件
+	// 不参与休眠——休眠会杀子进程、丢 Python 侧 SessionWaiter 状态并注销
+	// 宿主条目，用户回复将石沉大海。等待自带超时，超时后插件自然恢复
+	// 休眠资格，不影响休眠策略长期目标。
+	waitingPlugins := map[string]bool{}
+	m.sessionWaitMu.Lock()
+	for _, e := range m.sessionWaitReg {
+		waitingPlugins[e.pluginName] = true
+	}
+	m.sessionWaitMu.Unlock()
+
 	now := time.Now()
 	for _, inst := range insts {
 		// 进行中的 RPC 不判闲：避免正在执行命令/工具的插件被回收。
 		if inst.activeRPC.Load() > 0 {
 			continue
+		}
+		if waitingPlugins[inst.Name] || waitingPlugins[inst.ID] {
+			continue // 有活跃会话等待：本轮不休眠
 		}
 		r, ok := byID[inst.ID]
 		if !ok || !r.allow {
@@ -1475,10 +1501,37 @@ func (m *SubprocessManager) sweepIdlePlugins() {
 		}
 		logger.I18nInfo("插件 %s 已闲置 %v，自动休眠（内存已回收，下次触发时自动唤醒）",
 			inst.ID, now.Sub(inst.LastActive()).Round(time.Second))
-		if err := m.UnloadIdle(inst.ID); err != nil && err.Error() != fmt.Sprintf("plugin %s not loaded", inst.ID) {
+		if err := m.unloadIdleChecked(inst.ID, timeout, now); err != nil && err.Error() != fmt.Sprintf("plugin %s not loaded", inst.ID) {
 			logger.I18nWarn("闲置休眠插件 %s 失败: %v", inst.ID, err)
 		}
 	}
+}
+
+// unloadIdleChecked 在 per-plugin 生命周期锁内重验"仍是快照中的同一实例、
+// 无进行中 RPC、且按当前时间仍闲置"后才休眠——封死 sweep 双重检查与
+// UnloadIdle 拿锁之间被 EnsureLoaded 唤醒的竞态窗口（否则刚唤醒、正在
+// 服务的实例会被锁内拿到并直接停掉，触发进程泄漏与 RPC 打到死实例）。
+func (m *SubprocessManager) unloadIdleChecked(id string, timeout time.Duration, sweepNow time.Time) error {
+	unlock := m.lockOp(id)
+	defer unlock()
+	m.mu.RLock()
+	inst, ok := m.instances[id]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("plugin %s not loaded", id)
+	}
+	if inst.activeRPC.Load() > 0 {
+		return nil // 进行中 RPC：跳过本轮
+	}
+	// 用当前时间重验（新唤醒实例 lastActive=唤醒时刻 > sweep 快照 now，
+	// 必然不满足闲置 → 跳过）。
+	if !inst.IsIdle(time.Now(), timeout) {
+		return nil
+	}
+	_ = sweepNow // 快照时间仅用于日志
+	logger.I18nInfo("插件 %s 已闲置 %v，自动休眠（内存已回收，下次触发时自动唤醒）",
+		id, time.Since(inst.LastActive()).Round(time.Second))
+	return m.unloadCoreLocked(id, false)
 }
 
 // EnsureLoaded returns the running instance for id, lazily re-loading it from

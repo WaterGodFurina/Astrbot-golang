@@ -68,6 +68,8 @@ type Adapter struct {
 
 	// streamPlainCache 流式文本缓存（stream_id → 已聚合文本）
 	streamPlainCache map[string]string
+	// streamImageCache 流式图片缓存（stream_id → 等待 finish 帧一并返回的图片 base64）
+	streamImageCache map[string][]string
 	streamCacheMu    sync.Mutex
 	// sessionStreamMap 会话 ID → 最近的 stream_id（Go 端 Send 接口只有 sessionID）
 	sessionStreamMap sync.Map
@@ -85,6 +87,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		EventBus:         eventBus,
 		queueMgr:         NewWecomAIQueueMgr(),
 		streamPlainCache: make(map[string]string),
+		streamImageCache: make(map[string][]string),
 		stopCh:           make(chan struct{}),
 	}
 	a.id, _ = config["id"].(string)
@@ -251,13 +254,18 @@ func (a *Adapter) WebhookCallback(w http.ResponseWriter, r *http.Request) {
 	a.server.handleCallback(w, r)
 }
 
-// cleanupStreamPlainCache 清理已无输出队列的流式文本缓存（配合队列清理，避免泄漏）。
+// cleanupStreamPlainCache 清理已无输出队列的流式缓存（配合队列清理，避免泄漏）。
 func (a *Adapter) cleanupStreamPlainCache() {
 	a.streamCacheMu.Lock()
 	defer a.streamCacheMu.Unlock()
 	for streamID := range a.streamPlainCache {
 		if !a.queueMgr.HasBackQueue(streamID) {
 			delete(a.streamPlainCache, streamID)
+		}
+	}
+	for streamID := range a.streamImageCache {
+		if !a.queueMgr.HasBackQueue(streamID) {
+			delete(a.streamImageCache, streamID)
 		}
 	}
 }
@@ -370,19 +378,33 @@ func (a *Adapter) processMessage(messageData map[string]interface{}, callbackPar
 		}
 
 		logger.Debug("Aggregated content: %s, image: %d, finish: %v", latestPlainContent, len(imageBase64), finish)
+		// 图片缓存：对齐本体（wecomai_adapter.py:310-321）图片仅随 finish 帧返回；
+		// 非 finish 轮询先并入缓存，避免中途过早下发，finish 时一次性携带。
+		a.streamCacheMu.Lock()
+		cachedImages := a.streamImageCache[streamID]
+		a.streamCacheMu.Unlock()
 		if !finish {
 			a.streamCacheMu.Lock()
 			a.streamPlainCache[streamID] = cachedPlainContent
+			if len(imageBase64) > 0 {
+				a.streamImageCache[streamID] = append(cachedImages, imageBase64...)
+			}
 			a.streamCacheMu.Unlock()
+			imageBase64 = nil
+			cachedImages = nil
 		}
-		if finish && latestPlainContent == "" && len(imageBase64) == 0 {
+		if finish && latestPlainContent == "" && len(imageBase64) == 0 && len(cachedImages) == 0 {
 			endMessage := (WecomAIBotStreamMessageBuilder{}).MakeTextStream(streamID, "", true)
 			return a.apiClient.EncryptMessage(endMessage, callbackParams["nonce"], callbackParams["timestamp"]), nil
 		}
-		if latestPlainContent != "" || len(imageBase64) > 0 {
+		if latestPlainContent != "" || len(imageBase64) > 0 || len(cachedImages) > 0 {
 			var msgItems []interface{}
-			if len(imageBase64) > 0 {
-				for _, imgB64 := range imageBase64 {
+			if finish {
+				// finish 帧：合并历史缓存与本次轮询新到的图片并清空缓存。
+				allImages := make([]string, 0, len(cachedImages)+len(imageBase64))
+				allImages = append(allImages, cachedImages...)
+				allImages = append(allImages, imageBase64...)
+				for _, imgB64 := range allImages {
 					imgData, err := base64Decode(imgB64)
 					if err != nil {
 						continue
@@ -395,7 +417,9 @@ func (a *Adapter) processMessage(messageData map[string]interface{}, callbackPar
 						},
 					})
 				}
-				imageBase64 = nil
+				a.streamCacheMu.Lock()
+				delete(a.streamImageCache, streamID)
+				a.streamCacheMu.Unlock()
 			}
 			plainMessage := (WecomAIBotStreamMessageBuilder{}).MakeMixedStream(streamID, latestPlainContent, msgItems, finish)
 			encryptedMessage := a.apiClient.EncryptMessage(plainMessage, callbackParams["nonce"], callbackParams["timestamp"])
@@ -708,6 +732,17 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		reqID = pending.CallbackParams["req_id"]
 	}
 
+	// 对齐 Python send_by_session（wecomai_adapter.py:564-583）：主动消息
+	// （无本次用户消息对应的待响应上下文）必须配置消息推送 Webhook，未配置时
+	// 报错返回而不是静默降级；正常回复路径（存在待响应上下文）不受影响。
+	if pending == nil && a.webhookClient == nil {
+		return fmt.Errorf(
+			"主动消息发送失败: 未配置企业微信消息推送 Webhook URL，请前往配置添加。"+
+				"详见文档: https://docs.astrbot.app/platform/wecom_ai_bot.html#%%E9%%85%%8D%%E7%%BD%%AE-astrbot。session_id=%s",
+			sessionID,
+		)
+	}
+
 	if connectionMode == longConnectionMode && reqID != "" && a.longConnectionClient != nil {
 		if a.onlyUseWebhookURLToSend && a.webhookClient != nil {
 			if err := a.webhookClient.SendMessageChain(context.Background(), chain, false); err != nil {
@@ -720,6 +755,8 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 				return err
 			}
 		}
+		// LLM 流式回复的增量分片由 StreamFragmenter 承担（见下方实现）；
+		// 此分支用于非流式回复/媒体补发：整链单次 finish=true 收尾。
 		content := extractPlainTextFromChain(chain, true)
 		a.sendLongConnectionRespondMsg(reqID, map[string]interface{}{
 			"msgtype": "stream",
@@ -752,6 +789,93 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 
 // GetAPIClient 获取 API 客户端（对应 get_client）。
 func (a *Adapter) GetAPIClient() *WecomAIBotAPIClient { return a.apiClient }
+
+// ---------- 长连接流式增量分片（实现 platform.StreamFragmenter） ----------
+//
+// 对齐本体 wecomai_event.py:258-301（长连接 send_streaming）：以 0.5s 节流
+// 逐段推送 finish=false 的累计文本，流收尾发送 finish=true。节流由宿主流式
+// 管线驱动（internal/pipeline/stages.go streamSender.push，500ms 间隔），
+// 本适配器只负责帧的传输；帧内容为累计全文（对应本体 increment_plain 累加语义）。
+// 仅长连接模式可用；其他情况返回错误，宿主自动回退到按句切分发送。
+
+// streamRespondBody 构造长连接流式响应帧（对应 stream 分片结构）。
+func streamRespondBody(streamID string, finish bool, content string) map[string]interface{} {
+	return map[string]interface{}{
+		"msgtype": "stream",
+		"stream": map[string]interface{}{
+			"id":      streamID,
+			"finish":  finish,
+			"content": content,
+		},
+	}
+}
+
+// resolveLongConnStream 解析会话当前的长连接流上下文（stream_id + req_id）。
+func (a *Adapter) resolveLongConnStream(sessionID string) (streamID, reqID string, err error) {
+	if a.connectionMode != longConnectionMode {
+		return "", "", fmt.Errorf("仅长连接模式支持原生流式增量")
+	}
+	v, ok := a.sessionStreamMap.Load(sessionID)
+	if !ok {
+		return "", "", fmt.Errorf("会话没有待响应的流上下文: %s", sessionID)
+	}
+	streamID, _ = v.(string)
+	if streamID == "" {
+		return "", "", fmt.Errorf("会话流上下文为空: %s", sessionID)
+	}
+	if pending := a.queueMgr.GetPendingResponse(streamID); pending != nil {
+		reqID = pending.CallbackParams["req_id"]
+	}
+	if reqID == "" {
+		return "", "", fmt.Errorf("流缺少 req_id（响应可能已过期）: %s", streamID)
+	}
+	return streamID, reqID, nil
+}
+
+// StreamStart 打开长连接流式消息并发送首段（finish=false），
+// 返回 stream_id 作为宿主侧消息句柄。
+func (a *Adapter) StreamStart(sessionID, text string) (string, error) {
+	streamID, reqID, err := a.resolveLongConnStream(sessionID)
+	if err != nil {
+		return "", err
+	}
+	if a.longConnectionClient == nil {
+		return "", fmt.Errorf("长连接客户端未初始化")
+	}
+	if !a.sendLongConnectionRespondMsg(reqID, streamRespondBody(streamID, false, text)) {
+		return "", fmt.Errorf("长连接流式起始帧发送失败: stream_id=%s", streamID)
+	}
+	logger.Debug("[WecomAI] 流式起始帧已发送: %s", streamID)
+	return streamID, nil
+}
+
+// StreamUpdate 推送流式增量（累计全文，finish=false）。
+func (a *Adapter) StreamUpdate(_ string, msgID, text string) error {
+	return a.sendStreamFrame(msgID, false, text)
+}
+
+// StreamEnd 收尾流式消息（finish=true）。
+func (a *Adapter) StreamEnd(_ string, msgID, text string) error {
+	return a.sendStreamFrame(msgID, true, text)
+}
+
+// sendStreamFrame 通过长连接发送流式帧；req_id 取自流的待响应缓存。
+func (a *Adapter) sendStreamFrame(streamID string, finish bool, text string) error {
+	if a.longConnectionClient == nil {
+		return fmt.Errorf("长连接客户端未初始化")
+	}
+	reqID := ""
+	if pending := a.queueMgr.GetPendingResponse(streamID); pending != nil {
+		reqID = pending.CallbackParams["req_id"]
+	}
+	if reqID == "" {
+		return fmt.Errorf("流缺少 req_id（响应可能已过期）: %s", streamID)
+	}
+	if !a.sendLongConnectionRespondMsg(reqID, streamRespondBody(streamID, finish, text)) {
+		return fmt.Errorf("长连接流式帧发送失败: stream_id=%s finish=%v", streamID, finish)
+	}
+	return nil
+}
 
 // GetServer 获取 HTTP 服务器实例（对应 get_server）。
 func (a *Adapter) GetServer() *WecomAIBotServer { return a.server }

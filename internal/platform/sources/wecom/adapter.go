@@ -355,11 +355,22 @@ func (a *Adapter) convertMessage(msg *WecomMessage) {
 			logger.I18nError("保存企业微信语音素材失败: %v", err)
 			return
 		}
-		// Python 此处使用 ffmpeg 将 amr 转为 wav；Go 端不内置 ffmpeg，
-		// 直接保留原始 amr 文件，其余字段与 Python 一致。
+		// 对齐 Python：amr 语音经 ffmpeg 转为 wav（MediaResolver
+		// target_format="wav"），供下游语音识别；转码产物为内存数据后
+		// 落盘为 .wav，其余字段与 Python 一致。
+		wavData := convertAudioToWav(data)
+		wavPath := path + ".wav"
+		if err := os.WriteFile(wavPath, wavData, 0600); err != nil {
+			logger.I18nError("保存企业微信语音 wav 失败: %v", err)
+			return
+		}
+		if string(wavData) != string(data) {
+			// 转码成功后清理原始 amr 临时文件（对齐本体临时目录保留 wav 即可）。
+			_ = os.Remove(path)
+		}
 		abm.MessageStr = ""
 		abm.SelfID = msg.Agent
-		abm.Message = []message.Component{&message.Record{File: path, URL: path}}
+		abm.Message = []message.Component{&message.Record{File: wavPath, URL: wavPath}}
 		abm.Type = platform.FriendMessage
 		abm.Sender = platform.MessageMember{UserID: msg.Source, Nickname: msg.Source}
 		abm.MessageID = msg.ID
@@ -442,8 +453,18 @@ func (a *Adapter) convertKFMessage(msg map[string]interface{}) {
 			logger.I18nError("保存微信客服语音素材失败: %v", err)
 			return
 		}
-		// Python 此处用 ffmpeg 转 wav；Go 端保留原始 amr。
-		abm.Message = []message.Component{&message.Record{File: path, URL: path}}
+		// 对齐 Python：amr 语音经 ffmpeg 转 wav 后投递（MediaResolver
+		// target_format="wav"）；转码失败降级保留原 amr。
+		wavData := convertAudioToWav(data)
+		wavPath := path + ".wav"
+		if err := os.WriteFile(wavPath, wavData, 0600); err != nil {
+			logger.I18nError("保存微信客服语音 wav 失败: %v", err)
+			return
+		}
+		if string(wavData) != string(data) {
+			_ = os.Remove(path)
+		}
+		abm.Message = []message.Component{&message.Record{File: wavPath, URL: wavPath}}
 	case "file":
 		mediaID := mapNestedString(msg, "file", "media_id")
 		if mediaID == "" {

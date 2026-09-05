@@ -75,8 +75,15 @@ func (a *Adapter) sendChain(chain *message.MessageChain, selfID, touser string) 
 				return err
 			}
 			defer removeWecomTemp(path)
-			// Python 此处会将音频转码为 amr；Go 端直接上传原文件
-			mediaID, err := a.client.UploadMedia(ctx, "voice", path)
+			// 对齐 Python convert_audio_to_amr（wecom_event.py:230-233）：
+			// 企业微信语音要求 amr 格式，任意音频先经 ffmpeg 转码（amr_nb
+			// 8000Hz 单声道 12.2k）；已是 amr 或转码失败时原样上传。
+			amrPath := convertAudioToAMR(path)
+			if amrPath != path {
+				// 转码产物在临时目录，发送后清理。
+				defer removeWecomTemp(amrPath)
+			}
+			mediaID, err := a.client.UploadMedia(ctx, "voice", amrPath)
 			if err != nil {
 				logger.I18nError("上传语音失败: %v", err)
 				a.sendTextFallback(isKF, selfID, touser, fmt.Sprintf("语音上传失败: %v", err))

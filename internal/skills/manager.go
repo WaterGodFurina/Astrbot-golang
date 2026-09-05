@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -204,7 +205,16 @@ func NormalizeSkillMarkdownPath(skillDir string) string {
 }
 
 // ListSkills returns all discovered skills.
+// showSandboxPath semantics mirror Python's list_skills: it only affects path
+// rendering inside the "sandbox" runtime view (true → sandbox-cached path /
+// default sandbox path; false → local filesystem path). sandbox_only skills
+// always carry the sandbox path.
 func (sm *SkillManager) ListSkills(activeOnly bool, runtime string) []*SkillInfo {
+	return sm.ListSkillsView(activeOnly, runtime, true)
+}
+
+// ListSkillsView is ListSkills with explicit showSandboxPath control.
+func (sm *SkillManager) ListSkillsView(activeOnly bool, runtime string, showSandboxPath bool) []*SkillInfo {
 	// 只在读取配置快照期间持读锁；发现/扫描基于本地副本进行，末尾的自动补全
 	// 保存改在写锁下合并写回（见 persistSkillConfigs），避免读锁下执行磁盘写
 	// 与 SetSkillActive/DeleteSkill 互相覆盖。
@@ -251,7 +261,10 @@ func (sm *SkillManager) ListSkills(activeOnly bool, runtime string) []*SkillInfo
 			if content, err := os.ReadFile(skillMd); err == nil {
 				desc = ParseFrontmatterDescription(string(content))
 			}
-			sandboxExists := runtime == "sandbox" && sandboxDescs[name] != ""
+			// 存在性判定用缓存键（对齐 Python `name in sandbox_cached_descriptions`），
+			// 描述为空的缓存条目同样算 sandbox 已存在。
+			_, cached := sandboxPaths[name]
+			sandboxExists := runtime == "sandbox" && cached
 			sourceType := SourceLocalOnly
 			sourceLabel := "local"
 			if sandboxExists {
@@ -259,7 +272,7 @@ func (sm *SkillManager) ListSkills(activeOnly bool, runtime string) []*SkillInfo
 				sourceLabel = "synced"
 			}
 			pathStr := skillMd
-			if runtime == "sandbox" {
+			if runtime == "sandbox" && showSandboxPath {
 				if p, ok := sandboxPaths[name]; ok {
 					pathStr = p
 				} else {
@@ -281,7 +294,7 @@ func (sm *SkillManager) ListSkills(activeOnly bool, runtime string) []*SkillInfo
 	}
 
 	// Scan plugin skills
-	sm.scanPluginSkills(skillsByName, skillConfigs, &modified, activeOnly, runtime, sandboxPaths, sandboxDescs)
+	sm.scanPluginSkills(skillsByName, skillConfigs, &modified, activeOnly, runtime, showSandboxPath, sandboxPaths, sandboxDescs)
 
 	// Scan sandbox-only skills from cache
 	if runtime == "sandbox" {
@@ -470,23 +483,253 @@ func (sm *SkillManager) GetSandboxSkillsCacheStatus() map[string]interface{} {
 	}
 }
 
+// --- prompt sanitization (ported from skill_manager.py build_skills_prompt) ---
+// Regexes for sanitizing paths/names used in prompt examples — only allow safe
+// characters to prevent prompt injection via crafted skill paths/descriptions.
+var (
+	safePathRe         = regexp.MustCompile(`[^\w./ ,()'\-]`)
+	windowsDrivePathRe = regexp.MustCompile(`^[A-Za-z]:(?:/|\\)`)
+	windowsUNCPathRe   = regexp.MustCompile(`^(//|\\+)[^/\\]+[/\\][^/\\]+`)
+	controlCharsRe     = regexp.MustCompile(`[\x00-\x1F\x7F]`)
+	placeholderSkillMd = "<skills_root>/<skill_name>/SKILL.md"
+)
+
+// isWindowsPromptPath reports whether path is a Windows drive/UNC path (only
+// meaningful on Windows hosts, mirroring os.name == "nt" in Python).
+func isWindowsPromptPath(path string) bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	return windowsDrivePathRe.MatchString(path) || windowsUNCPathRe.MatchString(path)
+}
+
+// sanitizePromptPathForPrompt sanitizes a skill path rendered into the prompt.
+func sanitizePromptPathForPrompt(path string) string {
+	if path == "" {
+		return ""
+	}
+	if windowsDrivePathRe.MatchString(path) || windowsUNCPathRe.MatchString(path) {
+		path = strings.ReplaceAll(path, "\\", "/")
+	}
+	drivePrefix := ""
+	if windowsDrivePathRe.MatchString(path) {
+		drivePrefix = path[:2]
+		path = path[2:]
+	}
+	path = strings.ReplaceAll(path, "`", "")
+	path = controlCharsRe.ReplaceAllString(path, "")
+	path = safePathRe.ReplaceAllString(path, "")
+	return drivePrefix + path
+}
+
+// sanitizePromptDescription sanitizes a skill description rendered into the
+// prompt: backticks stripped, control chars collapsed to spaces, whitespace
+// squashed.
+func sanitizePromptDescription(description string) string {
+	description = strings.ReplaceAll(description, "`", "")
+	description = controlCharsRe.ReplaceAllString(description, " ")
+	return strings.Join(strings.Fields(description), " ")
+}
+
+// sanitizeSkillDisplayName renders the skill name, replacing invalid names
+// (not matching ^[\w.-]+$) with a placeholder.
+func sanitizeSkillDisplayName(name string) string {
+	if skillNameRe.MatchString(name) {
+		return name
+	}
+	return "<invalid_skill_name>"
+}
+
+// buildSkillReadCommandExample builds the example shell command used in the
+// "Mandatory grounding" rule.
+func buildSkillReadCommandExample(path string) string {
+	if path == placeholderSkillMd {
+		return "cat " + path
+	}
+	command, pathArg := "cat", path
+	if isWindowsPromptPath(path) {
+		command = "type"
+		pathArg = `"` + filepath.FromSlash(path) + `"`
+	}
+	return command + " " + pathArg
+}
+
 // BuildSkillsPrompt generates the skills section for the system prompt.
-func BuildSkillsPrompt(skills []*SkillInfo) string {
-	if len(skills) == 0 {
+// Ported 1:1 from Python's build_skills_prompt: only name/description are
+// shown upfront; the LLM must read the SKILL.md before execution
+// (progressive disclosure). Untrusted fields (name/description/path) are
+// sanitized against prompt injection.
+func BuildSkillsPrompt(list []*SkillInfo) string {
+	if len(list) == 0 {
 		return ""
 	}
 	var lines []string
-	lines = append(lines, "## Skills\n\n")
-	lines = append(lines, "You have specialized skills — reusable instruction bundles stored in `SKILL.md` files.\n\n")
-	lines = append(lines, "### Available skills\n\n")
-	for _, s := range skills {
-		desc := s.Description
-		if desc == "" {
-			desc = "No description"
+	examplePath := ""
+	for _, s := range list {
+		displayName := sanitizeSkillDisplayName(s.Name)
+
+		description := s.Description
+		if s.SourceType == SourceSandboxOnly || s.SourceType == SourceWorkspace {
+			description = sanitizePromptDescription(description)
+			if description == "" {
+				description = "Read SKILL.md for details."
+			}
+		} else if description == "" {
+			description = "No description"
 		}
-		lines = append(lines, fmt.Sprintf("- **%s**: %s\n  File: `%s`\n", s.Name, desc, s.Path))
+
+		renderedPath := sanitizePromptPathForPrompt(s.Path)
+		if renderedPath == "" {
+			if s.SourceType == SourceSandboxOnly {
+				renderedPath = DefaultSandboxSkillPath(s.Name)
+			} else {
+				renderedPath = placeholderSkillMd
+			}
+		}
+
+		lines = append(lines, fmt.Sprintf("- **%s**: %s\n  File: `%s`", displayName, description, renderedPath))
+		if examplePath == "" {
+			examplePath = renderedPath
+		}
 	}
-	return strings.Join(lines, "")
+	skillsBlock := strings.Join(lines, "\n")
+	// Sanitize example_path — it may originate from sandbox cache (untrusted).
+	if examplePath != placeholderSkillMd {
+		examplePath = sanitizePromptPathForPrompt(examplePath)
+		if examplePath == "" {
+			examplePath = placeholderSkillMd
+		}
+	}
+	exampleCommand := buildSkillReadCommandExample(examplePath)
+
+	return "## Skills\n\n" +
+		"You have specialized skills — reusable instruction bundles stored " +
+		"in `SKILL.md` files. Each skill has a **name** and a **description** " +
+		"that tells you what it does and when to use it.\n\n" +
+		"### Available skills\n\n" +
+		skillsBlock + "\n\n" +
+		"### Skill rules\n\n" +
+		"1. **Discovery** — The list above is the complete skill inventory " +
+		"for this session. Full instructions are in the referenced " +
+		"`SKILL.md` file.\n" +
+		"2. **When to trigger** — Use a skill if the user names it " +
+		"explicitly, or if the task clearly matches the skill's description. " +
+		"*Never silently skip a matching skill* — either use it or briefly " +
+		"explain why you chose not to.\n" +
+		"3. **Mandatory grounding** — Before executing any skill you MUST " +
+		"first read its `SKILL.md` by running a shell command compatible " +
+		"with the current runtime shell and using the **absolute path** " +
+		"shown above (e.g. `" + exampleCommand + "`). " +
+		"Never rely on memory or assumptions about a skill's content.\n" +
+		"4. **Progressive disclosure** — Load only what is directly " +
+		"referenced from `SKILL.md`:\n" +
+		"   - If `scripts/` exist, prefer running or patching them over " +
+		"rewriting code from scratch.\n" +
+		"   - If `assets/` or templates exist, reuse them.\n" +
+		"   - Do NOT bulk-load every file in the skill directory.\n" +
+		"5. **Coordination** — When multiple skills apply, pick the minimal " +
+		"set needed. Announce which skill(s) you are using and why " +
+		"(one short line). Prefer `astrbot_*` tools when running skill " +
+		"scripts.\n" +
+		"6. **Context hygiene** — Avoid deep reference chasing; open only " +
+		"files that are directly linked from `SKILL.md`.\n" +
+		"7. **Failure handling** — If a skill cannot be applied, state the " +
+		"issue clearly and continue with the best alternative.\n"
+}
+
+// ListWorkspaceSkills lists request-scoped skills from a session workspace
+// (ported from Python SkillManager.list_workspace_skills). Only directories
+// containing a canonical SKILL.md under <workspace_root>/skills are returned;
+// skill names must match ^[\w.-]+$; paths are resolve-checked against the
+// workspace skills root to prevent symlink escape. An empty workspaceRoot or
+// a missing skills dir yields an empty list.
+func (sm *SkillManager) ListWorkspaceSkills(workspaceRoot string) []*SkillInfo {
+	if workspaceRoot == "" {
+		return nil
+	}
+	rawWorkspaceRoot := filepath.Clean(workspaceRoot)
+	skillsRoot := filepath.Join(rawWorkspaceRoot, WorkspaceSkillsRoot)
+	if st, err := os.Stat(skillsRoot); err != nil || !st.IsDir() {
+		return nil
+	}
+
+	// resolve 防逃逸：EvalSymlinks 等价 Python Path.resolve(strict=True)。
+	resolvedWorkspaceRoot, err := filepath.EvalSymlinks(rawWorkspaceRoot)
+	if err != nil {
+		return nil
+	}
+	resolvedSkillsRoot, err := filepath.EvalSymlinks(skillsRoot)
+	if err != nil {
+		return nil
+	}
+	if !withinDir(resolvedWorkspaceRoot, resolvedSkillsRoot) {
+		return nil
+	}
+
+	entries, err := os.ReadDir(resolvedSkillsRoot)
+	if err != nil {
+		return nil
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+
+	var out []*SkillInfo
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		skillName := entry.Name()
+		if !skillNameRe.MatchString(skillName) {
+			continue
+		}
+		skillDir := filepath.Join(resolvedSkillsRoot, skillName)
+		if _, err := os.ReadDir(skillDir); err != nil {
+			continue
+		}
+		skillMd := filepath.Join(skillDir, "SKILL.md")
+		if st, err := os.Stat(skillMd); err != nil || st.IsDir() {
+			continue
+		}
+		resolvedSkillMd, err := filepath.EvalSymlinks(skillMd)
+		if err != nil {
+			continue
+		}
+		if !withinDir(resolvedSkillsRoot, resolvedSkillMd) {
+			continue
+		}
+		// #nosec G304 -- resolvedSkillMd 已通过 EvalSymlinks + withinDir 校验，
+		// 严格位于工作区 skills 根内。
+		content, err := os.ReadFile(resolvedSkillMd)
+		if err != nil {
+			continue
+		}
+		if len(content) > WorkspaceSkillFrontmatterMax {
+			content = content[:WorkspaceSkillFrontmatterMax]
+		}
+		out = append(out, &SkillInfo{
+			Name:        skillName,
+			Description: ParseFrontmatterDescription(string(content)),
+			Path:        filepath.ToSlash(resolvedSkillMd),
+			Active:      true,
+			SourceType:  SourceWorkspace,
+			SourceLabel: "workspace",
+			LocalExists: true,
+			Readonly:    true,
+		})
+	}
+	return out
+}
+
+// withinDir reports whether path is dir itself or located inside dir
+// (lexical+realpath containment, mirroring Python's is_relative_to checks).
+func withinDir(dir, path string) bool {
+	if dir == path {
+		return true
+	}
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // --- internal helpers ---
@@ -613,6 +856,7 @@ func (sm *SkillManager) scanPluginSkills(
 	modified *bool,
 	activeOnly bool,
 	runtime string,
+	showSandboxPath bool,
 	sandboxPaths, sandboxDescs map[string]string,
 ) {
 	entries, err := os.ReadDir(sm.pluginsRoot)
@@ -665,9 +909,11 @@ func (sm *SkillManager) scanPluginSkills(
 			if content, err := os.ReadFile(skillMd); err == nil {
 				desc = ParseFrontmatterDescription(string(content))
 			}
-			sandboxExists := runtime == "sandbox" && sandboxDescs[skillName] != ""
+			// 存在性判定用缓存键（对齐 Python），空描述条目同样算已存在。
+			_, cached := sandboxPaths[skillName]
+			sandboxExists := runtime == "sandbox" && cached
 			pathStr := skillMd
-			if runtime == "sandbox" {
+			if runtime == "sandbox" && showSandboxPath {
 				if p, ok := sandboxPaths[skillName]; ok {
 					pathStr = p
 				} else {
