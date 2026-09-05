@@ -28,7 +28,7 @@ func ffmpegAvailable() bool {
 	return err == nil
 }
 
-// convertAudioToWav 将内存中的音频数据（企业微信语音为 amr）转为 wav。
+// convertAudioToWav 将内存中的音频数据（企业微信语音为 amr 或 silk）转为 wav。
 // 对齐 MediaResolver(target_format="wav") → ensure_wav 的 wav 分支：
 // ffmpeg -y -i in out.wav，无额外编码参数。
 // 输入已是 wav（RIFF 魔数）时原样返回；ffmpeg 不可用或转换失败时返回原数据降级。
@@ -40,8 +40,12 @@ func convertAudioToWav(data []byte) []byte {
 	if len(data) >= 4 && bytes.Equal(data[:4], []byte("RIFF")) {
 		return data
 	}
+	// 尝试纯 Go silk 解码
+	if wavBytes, err := utils.TencentSilkBytesToWAVBytes(data, 24000); err == nil && len(wavBytes) > 0 {
+		return wavBytes
+	}
 	if !ffmpegAvailable() {
-		logger.I18nWarn("未检测到 ffmpeg，企业微信语音跳过 wav 转码，原样保留 amr 文件")
+		logger.I18nWarn("未检测到 ffmpeg，企业微信语音跳过 wav 转码，原样保留文件。如果没有安装 ffmpeg 请先安装。")
 		return data
 	}
 	inPath, outPath, err := writeTempAudioPair(data, ".wav")
@@ -85,8 +89,16 @@ func convertAudioToAMR(path string) string {
 	if detectAMRMagic(path) {
 		return path
 	}
+	// 若输入是 SILK 格式，先尝试使用纯 Go 解码转为 WAV，再转 amr
+	if utils.DetectAudioFormat(path) == "silk" {
+		wavTemp := filepath.Join(os.TempDir(), "astrbot_wecom_silk_tmp_"+randomHex(8)+".wav")
+		if _, err := utils.TencentSilkToWAV(context.Background(), path, wavTemp); err == nil {
+			defer os.Remove(wavTemp)
+			path = wavTemp
+		}
+	}
 	if !ffmpegAvailable() {
-		logger.I18nWarn("未检测到 ffmpeg，企业微信语音跳过 amr 转码，原样上传")
+		logger.I18nWarn("未检测到 ffmpeg，企业微信语音跳过 amr 转码，原样上传。如果没有安装 ffmpeg 请先安装。")
 		return path
 	}
 	outPath := filepath.Join(os.TempDir(), "astrbot_wecom_media_audio_"+randomHex(8)+".amr")

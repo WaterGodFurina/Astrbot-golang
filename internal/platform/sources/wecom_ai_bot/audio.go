@@ -35,8 +35,16 @@ func convertAudioToAMR(path string) string {
 	if detectAMRMagic(path) {
 		return path
 	}
+	// 若输入是 SILK 格式，先尝试使用纯 Go 解码转为 WAV，再转 amr
+	if utils.DetectAudioFormat(path) == "silk" {
+		wavTemp := filepath.Join(os.TempDir(), "astrbot_wecomai_silk_tmp_"+randomHexID()+".wav")
+		if _, err := utils.TencentSilkToWAV(context.Background(), path, wavTemp); err == nil {
+			defer os.Remove(wavTemp)
+			path = wavTemp
+		}
+	}
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		logger.I18nWarn("未检测到 ffmpeg，企业微信智能机器人语音跳过 amr 转码，原样上传")
+		logger.I18nWarn("未检测到 ffmpeg，企业微信智能机器人语音跳过 amr 转码，原样上传。如果没有安装 ffmpeg 请先安装。")
 		return path
 	}
 	// 转码产物以 astrbot_wecomai_ 前缀命名，便于发送后统一清理。

@@ -516,11 +516,17 @@ func convertAudioToWavFile(path string) string {
 	if utils.DetectAudioFormat(path) == "wav" {
 		return path
 	}
+	wavPath := utils.TempFilePath("line_audio_" + randomHex(6) + ".wav")
+	// 若是 silk 格式，优先纯 Go 转码
+	if utils.DetectAudioFormat(path) == "silk" {
+		if _, err := utils.TencentSilkToWAV(context.Background(), path, wavPath); err == nil {
+			return wavPath
+		}
+	}
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		lineLogger.I18nWarn("[LINE] 未检测到 ffmpeg，语音跳过 wav 转码，保留原文件: %s", path)
+		lineLogger.I18nWarn("[LINE] 未检测到 ffmpeg，语音跳过 wav 转码，保留原文件: %s。如果没有安装 ffmpeg 请先安装。", path)
 		return path
 	}
-	wavPath := utils.TempFilePath("line_audio_" + randomHex(6) + ".wav")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	// #nosec G204 -- 输入/输出均为受控临时文件路径，无外部命令注入面。

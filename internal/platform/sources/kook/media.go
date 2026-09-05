@@ -27,16 +27,23 @@ func audioExtFromURL(src string) string {
 // convertAudioToWav 用 ffmpeg 将音频转换为 wav。
 // 对应 Python kook_adapter.py:
 // MediaResolver(file_url, media_type="audio", default_suffix=".wav").to_path(target_format="wav")。
-// ffmpeg 不可用或转换失败时返回原路径 (降级保留原格式); 转换成功后清理原文件。
+// 支持 silk 优先纯 Go 快速解码；ffmpeg 不可用或转换失败时返回原路径 (降级保留原格式); 转换成功后清理原文件。
 func convertAudioToWav(inputPath string) string {
 	if strings.HasSuffix(strings.ToLower(inputPath), ".wav") {
 		return inputPath
 	}
+	outPath := strings.TrimSuffix(inputPath, filepath.Ext(inputPath)) + ".wav"
+	// 若是 silk 格式，优先纯 Go 转码
+	if utils.DetectAudioFormat(inputPath) == "silk" {
+		if _, err := utils.TencentSilkToWAV(context.Background(), inputPath, outPath); err == nil {
+			_ = os.Remove(inputPath)
+			return outPath
+		}
+	}
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		logger.I18nWarn("[KOOK] 未检测到 ffmpeg, 跳过音频转 wav: %s", inputPath)
+		logger.I18nWarn("[KOOK] 未检测到 ffmpeg, 跳过音频转 wav: %s。如果没有安装 ffmpeg 请先安装。", inputPath)
 		return inputPath
 	}
-	outPath := strings.TrimSuffix(inputPath, filepath.Ext(inputPath)) + ".wav"
 	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath, outPath)
 	if err := cmd.Run(); err != nil {
 		logger.I18nWarn("[KOOK] ffmpeg 音频转 wav 失败: %v", err)

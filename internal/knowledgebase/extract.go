@@ -12,7 +12,8 @@
 //     启发式提取（FlateDecode 流内 Tj/TJ 文本），保底不乱码入库；
 //   - DOCX/XLSX：OOXML 文本提取（w:t / sharedStrings），表格转 markdown
 //     的结构信息不保留；
-//   - .xls（BIFF 二进制）：无对等实现，明确报"暂不支持"。
+//   - .xls（BIFF 二进制）：经 github.com/extrame/xls（纯 Go 无 CGO）
+//     解析，对齐 markitdown 的 XlsConverter 输出（每 sheet ## 名+表格）。
 //
 // 所有白名单外格式对齐本体报"暂时不支持的文件格式"。
 package knowledgebase
@@ -29,6 +30,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	xls "github.com/extrame/xls"
 	pdf "github.com/ledongthuc/pdf"
 	"github.com/xuri/excelize/v2"
 	"golang.org/x/text/encoding"
@@ -72,8 +74,7 @@ func ExtractKBText(content []byte, name, contentType string) (string, error) {
 	case ".md", ".txt", ".markdown", ".rst", ".adoc":
 		return DecodeTextBytes(content)
 	case ".xls":
-		// 本体经 markitdown 支持，Go 无对等实现（BIFF 二进制），明确报错。
-		return "", fmt.Errorf("%w: %s（暂不支持旧版 xls，请另存为 xlsx）", ErrUnsupportedFormat, ext)
+		return extractXLSText(content), nil
 	default:
 		return "", fmt.Errorf("%w: %s", ErrUnsupportedFormat, ext)
 	}
@@ -358,6 +359,51 @@ func extractOOXMLText(content []byte) string {
 				out.WriteString("\n\n")
 			}
 		}
+	}
+	return strings.TrimSpace(out.String())
+}
+
+// extractXLSText 提取 .xls（BIFF8）文本（对齐 markitdown XlsConverter：
+// 每 sheet 输出 "## sheet名" + markdown 表格）。实现经 github.com/extrame/xls
+// （354★/Apache-2.0/纯 Go 无 CGO/零第三方依赖仅自带 ole2），覆盖 BIFF8
+// 文本/数值/SST 共享字符串/日期单元格；公式缓存值即单元格显示值（与
+// openpyxl/xlrd 的 data_only 语义一致）。
+func extractXLSText(content []byte) string {
+	wb, err := xls.OpenReader(bytes.NewReader(content), "utf-8")
+	if err != nil {
+		return ""
+	}
+	var out strings.Builder
+	for i := 0; i < wb.NumSheets(); i++ {
+		sheet := wb.GetSheet(i)
+		if sheet == nil {
+			continue
+		}
+		out.WriteString("## " + sheet.Name + "\n\n")
+		maxRow := int(sheet.MaxRow)
+		for r := 0; r <= maxRow; r++ {
+			row := sheet.Row(r)
+			if row == nil {
+				continue
+			}
+			last := int(row.LastCol())
+			cells := make([]string, 0, last)
+			nonEmpty := 0
+			for c := 0; c < last; c++ {
+				v := strings.TrimSpace(row.Col(c))
+				v = strings.ReplaceAll(v, "|", "\\|")
+				v = strings.ReplaceAll(v, "\n", " ")
+				if v != "" {
+					nonEmpty++
+				}
+				cells = append(cells, v)
+			}
+			if nonEmpty == 0 {
+				continue
+			}
+			out.WriteString("| " + strings.Join(cells, " | ") + " |\n")
+		}
+		out.WriteString("\n")
 	}
 	return strings.TrimSpace(out.String())
 }

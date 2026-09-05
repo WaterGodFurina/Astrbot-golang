@@ -164,12 +164,22 @@ func DetectAudioFormat(path string) string {
 	return ""
 }
 
-// EnsureWAV 返回原始路径，不做实际 WAV 转码：本实现未引入 ffmpeg 等依赖
-// （Python 原版调用 ffmpeg/tencent_silk_to_wav 转码），调用方不应依赖格式
-// 转换结果；只校验文件存在。
+// EnsureWAV 将指定路径的音频确保转换为 24kHz 单声道 WAV 文件。
+// 若输入已是 WAV 且符合要求则返回原路径；若是 SILK 则调用纯 Go silk 转码；
+// 若为其他格式，在安装了 ffmpeg 时使用 ffmpeg 转码，未安装时原样返回。
 func EnsureWAV(path string) (string, error) {
 	if _, err := os.Stat(path); err != nil {
 		return "", err
+	}
+	format := DetectAudioFormat(path)
+	if format == "wav" {
+		return path, nil
+	}
+	if format == "silk" {
+		outPath := TempFilePath("converted.wav")
+		if _, err := TencentSilkToWAV(context.Background(), path, outPath); err == nil {
+			return outPath, nil
+		}
 	}
 	return path, nil
 }
