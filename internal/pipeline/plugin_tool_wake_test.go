@@ -30,6 +30,10 @@ func TestPluginToolWakesIdlePlugin(t *testing.T) {
 	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
 	}
+	// 单插件独立控制：设置独立分钟数 = 1（最低有效值），测试需等待 > 60s。
+	if err := m.SetPluginIdleUnloadMinutes(inst.ID, 1); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
+	}
 	t.Cleanup(m.Shutdown)
 
 	// Register 元数据工具先入注册表（echo_tool → toolwake）。
@@ -37,8 +41,9 @@ func TestPluginToolWakesIdlePlugin(t *testing.T) {
 		t.Fatalf("echo_tool must be in the tool registry: owner=%q ok=%v", owner, ok)
 	}
 
-	// 模拟闲置：清扫 → 进程卸载，但注册表条目保留。
-	time.Sleep(40 * time.Millisecond)
+	// 模拟闲置：等待超过独立阈值（1 分钟）后清扫 → 进程卸载。
+	// 独立分钟数最低 1 分钟，测试需等待 > 60s 触发真实 idle 判定。
+	time.Sleep(61 * time.Second)
 	m.SweepIdle()
 	if m.Get(inst.ID) != nil {
 		t.Fatal("idle plugin process must be unloaded")

@@ -277,14 +277,20 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 	if isGroup {
 		guildName := ""
 		if msg.GuildID != "" && s.State != nil {
-			if guild, err := s.State.Guild(msg.GuildID); err == nil && guild != nil {
-				guildName = guild.Name
+			for _, g := range s.State.Guilds {
+				if g.ID == msg.GuildID {
+					guildName = g.Name
+					break
+				}
 			}
 		}
-		if guildName != "" {
-			abm.Group.GroupName = guildName + "-" + abmGroupChannelName(s, msg.ChannelID)
-		} else {
-			abm.Group.GroupName = abmGroupChannelName(s, msg.ChannelID)
+		channelName := abmGroupChannelNameSafe(s, msg.ChannelID)
+		if guildName != "" && channelName != "" && channelName != msg.ChannelID {
+			abm.Group.GroupName = guildName + "-" + channelName
+		} else if channelName != "" && channelName != msg.ChannelID {
+			abm.Group.GroupName = channelName
+		} else if guildName != "" {
+			abm.Group.GroupName = guildName
 		}
 	}
 	abm.MessageStr = content
@@ -911,17 +917,16 @@ func isLoginFailure(err error) bool {
 		strings.Contains(msg, "Incorrect login details")
 }
 
-// abmGroupChannelName resolves a Discord channel's display name, falling back
-// to the channel ID when the channel is not in the state cache.
-func abmGroupChannelName(s *discordgo.Session, channelID string) string {
+// abmGroupChannelNameSafe resolves a Discord channel's display name from the
+// state cache only (no HTTP request), falling back to the channel ID.
+func abmGroupChannelNameSafe(s *discordgo.Session, channelID string) string {
 	if channelID == "" {
 		return ""
 	}
-	if ch, err := s.State.Channel(channelID); err == nil && ch != nil {
-		return ch.Name
-	}
-	if ch, err := s.Channel(channelID); err == nil && ch != nil {
-		return ch.Name
+	if s.State != nil {
+		if ch, err := s.State.Channel(channelID); err == nil && ch != nil {
+			return ch.Name
+		}
 	}
 	return channelID
 }
