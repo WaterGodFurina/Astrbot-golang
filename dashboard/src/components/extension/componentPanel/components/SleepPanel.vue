@@ -44,7 +44,6 @@ const languageOf = (p: Record<string, unknown>) => {
 
 const loading = ref(false);
 const saving = ref(false);
-const globalMinutes = ref(0);
 const plugins = ref<SleepPluginItem[]>([]);
 const snackbar = ref<{ show: boolean; message: string; color: string }>({
   show: false,
@@ -58,47 +57,9 @@ const toast = (message: string, color = "success") => {
   snackbar.value.show = true;
 };
 
-const fetchGlobalMinutes = async () => {
-  // 全局默认阈值（分钟）：openapi 客户端只有 POST 变体，GET 走原始请求。
-  try {
-    const res = await fetchWithAuth("/api/v1/plugins/idle-unload-global", {
-      method: "GET",
-    });
-    const j = await res.json().catch(() => null);
-    if (j?.status === "ok") {
-      globalMinutes.value = Number(j.data?.minutes || 0);
-    }
-  } catch {
-    // 忽略：全局默认仅用于展示，拉不到不阻塞插件列表。
-  }
-};
-
-const saveGlobalMinutes = async (raw: number | string | null) => {
-  const minutes = Math.max(0, Number(raw) || 0);
-  if (saving.value) return;
-  saving.value = true;
-  try {
-    const res = await pluginApi.setGlobalIdleSleep(minutes);
-    if (res.data.status === "ok") {
-      globalMinutes.value = minutes;
-      toast(tm("sleep.globalSaved") || "已保存新装插件默认休眠时间");
-    } else {
-      toast(
-        (res.data as any)?.message || tm("messages.operationFailed"),
-        "error",
-      );
-    }
-  } catch (err) {
-    toast((err as any)?.message || String(err), "error");
-  } finally {
-    saving.value = false;
-  }
-};
-
 const fetchData = async () => {
   loading.value = true;
   try {
-    await fetchGlobalMinutes();
     const listRes = await pluginApi.list();
     if (listRes.data.status === "ok") {
       const items = (listRes.data.data || []) as Array<Record<string, unknown>>;
@@ -183,27 +144,6 @@ onMounted(async () => {
   <div>
     <v-card variant="flat" class="sleep-panel">
       <v-card-text>
-        <div class="d-flex align-center ga-3 mb-2 flex-wrap">
-          <v-text-field
-            type="number"
-            min="0"
-            :model-value="globalMinutes"
-            density="compact"
-            hide-details
-            style="max-width: 150px"
-            :disabled="saving"
-            :label="tm('sleep.globalMinutesLabel')"
-            @change="(v: any) => saveGlobalMinutes(v?.target?.value ?? 0)"
-          />
-          <div>
-            <div class="text-body-1 font-weight-medium">
-              {{ tm("sleep.globalMinutesDesc") }}
-            </div>
-            <div class="text-caption text-medium-emphasis">
-              {{ tm("sleep.globalMinutesHint") }}
-            </div>
-          </div>
-        </div>
         <div class="sleep-warning mb-4">
           {{ tm("sleep.warning") }}
         </div>

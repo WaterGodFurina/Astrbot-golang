@@ -678,3 +678,56 @@ func (c *KookClient) Close() {
 func (c *KookClient) WaitUntilClosed() <-chan struct{} {
 	return c.stopEvent
 }
+
+// GetJSON performs a GET request against the KOOK API and decodes the response
+// data field into a generic map. Used by GetGroupInfo metadata calls.
+func (c *KookClient) GetJSON(ctx context.Context, url string) (map[string]interface{}, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("kook: GET %s status=%d", url, resp.StatusCode)
+	}
+	var apiResp struct {
+		Code int                    `json:"code"`
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		return nil, err
+	}
+	if apiResp.Code != 0 {
+		return nil, fmt.Errorf("kook: GET %s code=%d", url, apiResp.Code)
+	}
+	return apiResp.Data, nil
+}
+
+// GetChannel retrieves channel metadata (channel/view).
+func (c *KookClient) GetChannel(ctx context.Context, channelID string) (map[string]interface{}, error) {
+	return c.GetJSON(ctx, apiChannelView+"?target_id="+channelID)
+}
+
+// GetGuild retrieves guild metadata (guild/view).
+func (c *KookClient) GetGuild(ctx context.Context, guildID string) (map[string]interface{}, error) {
+	return c.GetJSON(ctx, apiGuildView+"?guild_id="+guildID)
+}
+
+// GetGuildUsers retrieves guild members with pagination (guild/user-list).
+func (c *KookClient) GetGuildUsers(ctx context.Context, guildID, channelID string, page, pageSize int) (map[string]interface{}, error) {
+	url := fmt.Sprintf("%s?guild_id=%s&page=%d&page_size=%d", apiGuildUserList, guildID, page, pageSize)
+	if channelID != "" {
+		url += "&channel_id=" + channelID
+	}
+	return c.GetJSON(ctx, url)
+}
+
+// GetGuildRoles retrieves guild roles with pagination (guild-role/list).
+func (c *KookClient) GetGuildRoles(ctx context.Context, guildID string, page, pageSize int) (map[string]interface{}, error) {
+	return c.GetJSON(ctx, fmt.Sprintf("%s?guild_id=%s&page=%d&page_size=%d", apiGuildRoleList, guildID, page, pageSize))
+}

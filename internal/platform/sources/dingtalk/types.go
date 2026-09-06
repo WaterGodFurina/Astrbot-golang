@@ -26,18 +26,19 @@ type AtUser struct {
 
 // ChatbotMessage 对应 dingtalk_stream.ChatbotMessage (from_dict 解析结果)。
 type ChatbotMessage struct {
-	ConversationID   string
-	ConversationType string // "2" = 群聊
-	CreateAt         int64
-	MsgID            string
-	SenderID         string
-	SenderNick       string
-	SenderStaffID    string
-	ChatbotUserID    string
-	IsInAtList       bool
-	RobotCode        string
-	MessageType      string // text / picture / richText / audio / voice / file
-	AtUsers          []AtUser
+	ConversationID    string
+	ConversationType  string // "2" = 群聊
+	ConversationTitle string // 群聊名称 (对应 Python message.conversation_title)
+	CreateAt          int64
+	MsgID             string
+	SenderID          string
+	SenderNick        string
+	SenderStaffID     string
+	ChatbotUserID     string
+	IsInAtList        bool
+	RobotCode         string
+	MessageType       string // text / picture / richText / audio / voice / file
+	AtUsers           []AtUser
 
 	// msgtype 相关的消息内容
 	TextContent  string                   // msgtype=text: text.content
@@ -54,6 +55,9 @@ func parseChatbotMessage(d map[string]interface{}) *ChatbotMessage {
 	}
 	if v, ok := d["conversationType"].(string); ok {
 		msg.ConversationType = v
+	}
+	if v, ok := d["conversationTitle"].(string); ok {
+		msg.ConversationTitle = v
 	}
 	if v, ok := d["createAt"].(float64); ok {
 		msg.CreateAt = int64(v)

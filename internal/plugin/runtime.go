@@ -1106,12 +1106,12 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		I18n:             metaI18n,
 		Pages:            metaPages,
 		LogoPath:         metaLogoPath,
-		// 记录插件在 data 下创建的目录，供卸载时精确清理。目录一律按插件
-		// 实例 id（name_language）分键：同名 Go/Python 插件的本体（plugins/）、
-		// 配置（plugins_config/）、数据（plugins_data/）完全隔离。
-		ConfigDir: filepath.Join("plugins_config", sanitizeID(inst.ID)),
-		DataDir:   filepath.Join("plugins_data", sanitizeID(inst.ID)),
-		DocsDir:   filepath.Join("plugins", sanitizeID(inst.ID)),
+		// 新安装插件默认不开启闲置自动休眠；独立分钟数默认 10（用户开启休眠时生效）。
+		IdleUnload:        false,
+		IdleUnloadMinutes: 10,
+		ConfigDir:         filepath.Join("plugins_config", sanitizeID(inst.ID)),
+		DataDir:           filepath.Join("plugins_data", sanitizeID(inst.ID)),
+		DocsDir:           filepath.Join("plugins", sanitizeID(inst.ID)),
 	})
 	return man.Save(m.manifestPath())
 }
@@ -1313,15 +1313,12 @@ func (m *SubprocessManager) Get(id string) *PluginInstance {
 // idle <= 0 disables the sweep. Cross-platform: works with any plugin process
 // (Go binary / Python interpreter) since it only manages process lifecycles.
 func (m *SubprocessManager) SetIdleUnload(idle time.Duration) {
+	// 休眠为单插件独立控制：全局阈值仅作兼容性保留字段（IdleUnloadEnabled/
+	// IdleUnloadMinutes 报告），不再驱动清扫。清扫循环自 NewSubprocessManager
+	// 常驻运行（见 idleSweepLoop），此处不重复启动。
 	m.mu.Lock()
-	prev := m.idleUnload
 	m.idleUnload = idle
-	start := prev <= 0 && idle > 0
 	m.mu.Unlock()
-	if start {
-		go m.idleSweepLoop()
-		logger.I18nInfo("插件闲置自动卸载已启用（闲置 %v 后回收进程内存）", idle)
-	}
 }
 
 // IdleUnloadEnabled reports whether the idle-unload sweep is enabled (global
@@ -1416,12 +1413,8 @@ func (m *SubprocessManager) idleSweepLoop() {
 		case <-m.ctx.Done():
 			return
 		case <-ticker.C:
-			// 全局开关关闭时退出本 loop（SetIdleUnload 置 0 后再启用会重新
-			// 起 loop——不退出会造成多次启停后 goroutine 泄漏、多 loop 并发
-			// 重复清扫）。
-			if !m.IdleUnloadEnabled() {
-				return
-			}
+			// 休眠为单插件独立控制：无全局开关，循环常驻运行，仅对
+			// 开启休眠且配置有效独立分钟数的插件执行清扫。
 			m.sweepIdlePlugins()
 		}
 	}
@@ -1438,7 +1431,6 @@ func (m *SubprocessManager) SweepIdle() {
 // restart) and triggers OnInstancesChanged so the host re-bridges handlers.
 func (m *SubprocessManager) sweepIdlePlugins() {
 	m.mu.RLock()
-	global := m.idleUnload
 	insts := make([]*PluginInstance, 0, len(m.instances))
 	for _, inst := range m.instances {
 		insts = append(insts, inst)
@@ -1480,13 +1472,11 @@ func (m *SubprocessManager) sweepIdlePlugins() {
 		if !ok || !r.allow {
 			continue // 常驻插件（IdleUnload=false）不参与清扫
 		}
-		timeout := global // 插件未设独立分钟 → 回退全局默认
-		if r.minutes > 0 {
-			timeout = time.Duration(r.minutes) * time.Minute
+		// 单插件独立控制：仅用插件自身分钟数，禁止全局回退。未设独立阈值则不休眠。
+		if r.minutes <= 0 {
+			continue
 		}
-		if timeout <= 0 {
-			continue // 无有效超时：不回收（避免立即反复休眠/唤醒）
-		}
+		timeout := time.Duration(r.minutes) * time.Minute
 		if !inst.IsIdle(now, timeout) {
 			continue
 		}

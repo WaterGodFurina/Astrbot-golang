@@ -2160,35 +2160,6 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			}
 		}
 		writeJSON(w, http.StatusOK, apiError("插件不存在或不可用"))
-	case "idle-unload-global":
-		// 全局闲置自动休眠：GET 返回当前阈值（分钟）；POST {minutes} 设置
-		// （0 = 关闭）。
-		if r.Method == http.MethodGet {
-			minutes := 0
-			if s.subPluginMgr != nil {
-				minutes = s.subPluginMgr.IdleUnloadMinutes()
-			}
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"minutes": minutes}))
-			return
-		}
-		var body struct {
-			Minutes int `json:"minutes"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
-			return
-		}
-		if body.Minutes < 0 {
-			body.Minutes = 0
-		}
-		if err := s.setConfigData("plugin_idle_unload_minutes", body.Minutes); err != nil {
-			writeJSON(w, http.StatusOK, apiError("保存配置失败: "+err.Error()))
-			return
-		}
-		if s.subPluginMgr != nil {
-			s.subPluginMgr.SetIdleUnload(time.Duration(body.Minutes) * time.Minute)
-		}
-		writeJSON(w, http.StatusOK, apiOKMsg("全局休眠策略已更新", map[string]interface{}{"minutes": body.Minutes}))
 	case "failed":
 		// DELETE /plugins/failed/{plugin_id}：卸载失败插件——清除崩溃失败
 		// 记录并清理残留安装目录（对齐前端"卸载失败插件"按钮语义）。
@@ -4860,6 +4831,7 @@ func builtinToolNames() []string {
 	return []string{
 		"web_search_tavily", "web_search_baidu", "web_search_bocha",
 		"web_search_brave", "web_search_exa", "web_search_firecrawl",
+		"web_search_anysearch",
 		"tavily_extract_web_page", "firecrawl_extract_web_page", "exa_get_contents",
 		"send_message_to_user", "get_group_message_history", "future_task",
 		"astr_kb_search",
@@ -9152,254 +9124,259 @@ func (s *Server) t2iTemplatesDir() string {
 }
 
 // t2iDefaultTemplate is the built-in "base" template, seeded into the user
-// template dir when missing（对齐 Python reset_default_template）。直接从 Python
-// AstrBot astrbot/core/utils/t2i/template/base.html 移植的完整模板：t2i 服务端要求
-// 完整 HTML 文档（最小模板会返回 422 Unprocessable Content）。模板用 Jinja 变量
-// {{ text | safe }} / {{ version }} / {{ shiki_runtime | safe }} 渲染。
+// template dir when missing（对齐 Python reset_default_template）。视觉对齐 Python
+// AstrBot v4.28.0 astrbot/core/utils/t2i/template/base.html 的纸面风格：PAPER/INK/
+// ACCENT 配色、Outfit+MiSans 字体、branded masthead、markdown 元素样式。
 const t2iDefaultTemplate = `<!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
-  <meta charset="utf-8"/>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>AstrBot {{ version }}</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@400..700&display=swap">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans@4.1.0/lib/Normal/MiSans-Regular.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/misans@4.1.0/lib/Normal/MiSans-Bold.min.css">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.css" integrity="sha384-wcIxkf4k558AjM3Yz3BBFQUbk/zgIYC2R0QpeeYb+TwlBVMrlgLqwRjRtGZiK7ww" crossorigin="anonymous">
   <style>
-      #content {
-          min-width: 200px;
-          max-width: 85%;
-          margin: 0 auto;
-          padding: 2rem 1em 1em;
-      }
-
-      body {
-          word-break: break-word;
-          line-height: 1.6;
-          font-weight: 400;
-          font-size: 21px;
-          margin: 0;
-          padding: 0;
-          overflow-x: hidden;
-          color: #333;
-          font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif, Apple Color Emoji, Segoe UI Emoji;
-      }
-      h1, h2, h3, h4, h5, h6 {
-          line-height: 1.5;
-          margin-top: 35px;
-          margin-bottom: 10px;
-          padding-bottom: 5px;
-      }
-      h1:first-child, h2:first-child, h3:first-child, h4:first-child, h5:first-child, h6:first-child {
-          margin-top: -1.5rem;
-          margin-bottom: 1rem;
-      }
-      h1::before, h2::before, h3::before, h4::before, h5::before, h6::before {
-          content: "#";
-          display: inline-block;
-          color: #3eaf7c;
-          padding-right: 0.23em;
-      }
-      h1 {
-          position: relative;
-          font-size: 2.5rem;
-          margin-bottom: 5px;
-      }
-      h1::before {
-          font-size: 2.5rem;
-      }
-      h2 {
-          padding-bottom: 0.5rem;
-          font-size: 2.2rem;
-          border-bottom: 1px solid #ececec;
-      }
-      h3 {
-          font-size: 1.5rem;
-          padding-bottom: 0;
-      }
-      h4 {
-          font-size: 1.25rem;
-      }
-      h5 {
-          font-size: 1rem;
-      }
-      h6 {
-          margin-top: 5px;
-      }
-      p {
-          line-height: inherit;
-          margin-top: 22px;
-          margin-bottom: 22px;
-      }
-      strong {
-          color: #3eaf7c;
-      }
-      img {
-          max-width: 100%;
-          border-radius: 2px;
-          display: block;
-          margin: auto;
-          border: 3px solid rgba(62, 175, 124, 0.2);
-      }
-      hr {
-          border-top: 1px solid #3eaf7c;
-          border-bottom: none;
-          border-left: none;
-          border-right: none;
-          margin-top: 32px;
-          margin-bottom: 32px;
-      }
-      code {
-          font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
-          word-break: break-word;
-          overflow-x: auto;
-          padding: 0.2rem 0.5rem;
-          margin: 0;
-          color: #3eaf7c;
-          font-size: 0.85em;
-          background-color: rgba(27, 31, 35, 0.05);
-          border-radius: 3px;
-      }
-      pre {
-          font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
-          overflow: auto;
-          position: relative;
-          line-height: 1.75;
-          border-radius: 6px;
-          border: 2px solid #3eaf7c;
-      }
-      pre > code {
-          font-size: 12px;
-          padding: 15px 12px;
-          margin: 0;
-          word-break: normal;
-          display: block;
-          overflow-x: auto;
-          color: #333;
-          background: #f8f8f8;
-      }
-      pre.shiki {
-          padding: 15px 12px;
-      }
-      pre.shiki > code {
-          padding: 0;
-          background: transparent !important;
-          color: inherit;
-          font-size: 12px;
-      }
-      a {
-          font-weight: 500;
-          text-decoration: none;
-          color: #3eaf7c;
-      }
-      a:hover, a:active {
-          border-bottom: 1.5px solid #3eaf7c;
-      }
-      a:before {
-          content: "⇲";
-      }
-      table {
-          display: inline-block !important;
-          font-size: 12px;
-          width: auto;
-          max-width: 100%;
-          overflow: auto;
-          border: solid 1px #3eaf7c;
-      }
-      thead {
-          background: #3eaf7c;
-          color: #fff;
-          text-align: left;
-      }
-      tr:nth-child(2n) {
-          background-color: rgba(62, 175, 124, 0.2);
-      }
-      th, td {
-          padding: 12px 7px;
-          line-height: 24px;
-      }
-      td {
-          min-width: 120px;
-      }
-      blockquote {
-          color: #666;
-          padding: 1px 23px;
-          margin: 22px 0;
-          border-left: 0.5rem solid rgba(62, 175, 124, 0.6);
-          border-color: #42b983;
-          background-color: #f8f8f8;
-      }
-      blockquote::after {
-          display: block;
-          content: "";
-      }
-      blockquote > p {
-          margin: 10px 0;
-      }
-      details {
-          border: none;
-          outline: none;
-          border-left: 4px solid #3eaf7c;
-          padding-left: 10px;
-          margin-left: 4px;
-      }
-      details summary {
-          cursor: pointer;
-          border: none;
-          outline: none;
-          background: white;
-          margin: 0 -17px;
-      }
-      details summary::-webkit-details-marker {
-          color: #3eaf7c;
-      }
-      ol, ul {
-          padding-left: 28px;
-      }
-      ol li, ul li {
-          margin-bottom: 0;
-          list-style: inherit;
-      }
-      ol li .task-list-item, ul li .task-list-item {
-          list-style: none;
-      }
-      ol li .task-list-item ul, ul li .task-list-item ul, ol li .task-list-item ol, ul li .task-list-item ol {
-          margin-top: 0;
-      }
-      ol ul, ul ul, ol ol, ul ol {
-          margin-top: 3px;
-      }
-      ol li {
-          padding-left: 6px;
-      }
-      ol li::marker {
-          color: #3eaf7c;
-      }
-      ul li {
-          list-style: none;
-      }
-      ul li:before {
-          content: "•";
-          margin-right: 4px;
-          color: #3eaf7c;
-      }
-      @media (max-width: 720px) {
-          h1 {
-              font-size: 24px;
-          }
-          h2 {
-              font-size: 20px;
-          }
-          h3 {
-              font-size: 18px;
-          }
-      }
+    :root {
+      --paper: #fbfbfa;
+      --ink: #202224;
+      --muted: #666b70;
+      --line: #d9dcde;
+      --soft-line: #d4d8db;
+      --strong-line: #bcc2c6;
+      --soft-fill: #f2f3f3;
+      --accent: #2f86bd;
+      --code-fill: #f4f5f5;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html { background: var(--paper); }
+    body {
+      min-width: 320px;
+      margin: 0;
+      padding: 0 32px;
+      overflow-x: hidden;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: "MiSans", -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 25px;
+      font-weight: 400;
+      line-height: 1.72;
+      text-rendering: optimizeLegibility;
+      overflow-wrap: break-word;
+    }
+    .masthead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: min(100%, 920px);
+      margin: 0 auto;
+      padding: 30px 0 0;
+      font-family: "Outfit", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .brand { display: inline-flex; align-items: center; gap: 11px; }
+    .brand-icon { width: 34px; height: 34px; flex: 0 0 auto; }
+    .wordmark { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; }
+    .version { color: var(--muted); font-size: 18px; font-weight: 500; letter-spacing: 0.02em; }
+    main { width: min(100%, 920px); margin: 0 auto; padding: 42px 0 60px; }
+    #content > :first-child { margin-top: 0; }
+    #content > :last-child { margin-bottom: 0; }
+    h1, h2, h3, h4, h5, h6 {
+      color: var(--ink);
+      font-weight: 720;
+      line-height: 1.28;
+      text-wrap: balance;
+    }
+    h1 { margin: 0 0 0.62em; font-size: 2em; letter-spacing: -0.035em; }
+    h2 {
+      margin: 1.65em 0 0.62em;
+      padding-top: 0.45em;
+      border-top: 1px solid var(--soft-line);
+      font-size: 1.5em;
+      letter-spacing: -0.025em;
+    }
+    h3 { margin: 1.4em 0 0.52em; font-size: 1.24em; letter-spacing: -0.015em; }
+    h4 { margin: 1.25em 0 0.45em; font-size: 1.06em; }
+    h5, h6 { margin: 1.15em 0 0.4em; font-size: 0.92em; }
+    h6 { color: var(--muted); }
+    p { margin: 0.78em 0; white-space: normal; }
+    strong { font-weight: 720; }
+    em { font-style: italic; }
+    a {
+      color: var(--accent);
+      text-decoration-color: color-mix(in srgb, var(--accent) 55%, transparent);
+      text-decoration-line: underline;
+      text-decoration-thickness: 0.06em;
+      text-underline-offset: 0.16em;
+    }
+    hr {
+      height: 1px;
+      margin: 1.55em 0;
+      border: 0;
+      background: var(--soft-line);
+    }
+    hr + h2 { margin-top: 1em; padding-top: 0; border-top: 0; }
+    ul, ol { margin: 0.75em 0; padding-left: 1.45em; }
+    li { padding-left: 0.15em; }
+    li + li { margin-top: 0.28em; }
+    li::marker { color: var(--accent); font-weight: 650; }
+    li > p { margin: 0.35em 0; }
+    li.task-list-item {
+      margin-left: -1.35em;
+      padding-left: 0;
+      list-style: none;
+    }
+    .task-list-item input[type="checkbox"] {
+      width: 0.9em;
+      height: 0.9em;
+      margin: 0 0.5em 0 0;
+      vertical-align: -0.05em;
+      accent-color: var(--accent);
+    }
+    blockquote {
+      margin: 1.15em 0;
+      padding: 0.75em 1em;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      color: #4d5256;
+      background: var(--soft-fill);
+    }
+    blockquote > :first-child { margin-top: 0; }
+    blockquote > :last-child { margin-bottom: 0; }
+    code, kbd, samp {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+    :not(pre) > code {
+      padding: 0.12em 0.35em;
+      border: 1px solid var(--soft-line);
+      border-radius: 3px;
+      color: #273a33;
+      background: var(--code-fill);
+      font-size: 0.84em;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      max-width: 100%;
+      margin: 1.15em 0;
+      padding: 1em 1.1em;
+      overflow: visible;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--code-fill);
+      font-size: 0.76em;
+      line-height: 1.58;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      tab-size: 2;
+    }
+    pre > code {
+      display: block;
+      padding: 0;
+      border: 0;
+      color: inherit;
+      background: transparent;
+      font-size: inherit;
+      line-height: inherit;
+      white-space: inherit;
+    }
+    pre.shiki {
+      padding: 1em 1.1em;
+      background: var(--code-fill) !important;
+      white-space: pre-wrap;
+    }
+    pre.shiki > code { white-space: inherit; }
+    img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      margin: 1.2em auto;
+      border: 1px solid var(--line);
+    }
+    table {
+      width: 100%;
+      margin: 1.2em 0;
+      overflow: hidden;
+      border: 1px solid var(--strong-line);
+      border-collapse: separate;
+      border-spacing: 0;
+      border-radius: 4px;
+      background: #fdfdfc;
+      font-size: 0.82em;
+      line-height: 1.5;
+    }
+    th, td {
+      padding: 0.65em 0.75em;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      overflow-wrap: break-word;
+      word-break: normal;
+    }
+    th + th, td + td { border-left: 1px solid var(--line); }
+    th {
+      color: var(--ink);
+      border-bottom-color: var(--strong-line);
+      background: #eef1f2;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+    tbody tr:nth-child(even) { background: #f7f8f8; }
+    tbody tr:last-child td { border-bottom: 0; }
+    th[align="center"], td[align="center"] { text-align: center; white-space: nowrap; }
+    th[align="right"], td[align="right"] { text-align: right; white-space: nowrap; }
+    caption {
+      padding: 0 0 0.55em;
+      color: var(--muted);
+      font-size: 0.9em;
+      text-align: left;
+    }
+    details {
+      margin: 1.05em 0;
+      padding: 0.65em 0;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    summary { cursor: pointer; font-weight: 680; }
+    summary::marker { color: var(--accent); }
+    details[open] summary { margin-bottom: 0.65em; }
+    mark { padding: 0.05em 0.2em; color: inherit; background: #e9e0aa; }
+    del { color: var(--muted); }
+    .katex-display {
+      max-width: 100%;
+      margin: 1.1em 0;
+      overflow-x: auto;
+      overflow-y: hidden;
+      font-size: 0.95em;
+    }
+    @media (max-width: 700px) {
+      body { padding: 0 14px; font-size: 21px; }
+      .masthead { padding-top: 18px; }
+      main { padding: 34px 0 46px; }
+      h1 { font-size: 1.72em; }
+      h2 { font-size: 1.38em; }
+      table { font-size: 0.75em; }
+    }
   </style>
 </head>
 <body>
-  <div style="background-color: #3276dc; color: #fff; font-size: 64px;">
-    <span style="font-weight: bold; margin-left: 16px"># AstrBot</span>
-    <span>{{ version }}</span>
-  </div>
-  <article style="margin-top: 32px" id="content"></article>
-
+  <header class="masthead">
+    <span class="brand">
+      <svg class="brand-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+        <g transform="translate(0.8 0.9)">
+          <g transform="translate(0 32)">
+            <path d="m246.3 328.1 -17.8 41.2c-6.4 14.8-26.9 14.8-33.3 0l-17.8-41.2c-14.9-34.2-41.8-61.4-75.3-76.3l-48.8-21.6c-14.7-6.5-14.7-27.9 0-34.4l47.2-21c34.4-15.3 61.7-43.5 76.4-78.8l18-43.7c6.3-15.2 27.3-15.2 33.6 0l18 43.7c14.7 35.3 42 63.6 76.4 78.8l47.2 21c14.7 6.5 14.7 27.9 0 34.4l-48.8 21.6c-33.5 14.8-60.4 42.1-75.3 76.2z" fill="#2f86bd" transform="translate(0 35)" />
+            <path d="m402.2 449.3 -5.3 12.2c-3.5 7.9-14.4 7.9-17.9 0l-5.3-12.2c-8.4-19.3-23.6-34.6-42.4-43l-15.4-6.9c-7.9-3.5-7.9-14.9 0-18.4l14.5-6.5c19.4-8.6 34.8-24.5 43.1-44.5l5.4-13.1c3.4-8.1 14.6-8.1 18 0l5.4 13.1c8.3 19.9 23.7 35.8 43.1 44.5l14.5 6.5c7.9 3.5 7.9 14.9 0 18.4l-15.4 6.9c-19 8.3-34.1 23.7-42.5 43z" fill="#2f86bd" transform="matrix(0.95 0 0 0.95 22 -278)" />
+          </g>
+        </g>
+      </svg>
+      <span class="wordmark">AstrBot</span>
+    </span>
+    <span class="version">{{ version }}</span>
+  </header>
+  <main>
+    <article id="content"></article>
+  </main>
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/katex.min.js" integrity="sha384-hIoBPJpTUs74ddyc4bFZSM1TVlQDA60VBbJS0oA934VSz82sBx1X7kSx2ATBDIyd" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.10/dist/contrib/auto-render.min.js" integrity="sha384-43gviWU0YVjaDtb/GhzOouOXtZMP/7XUzwPTstBeZFe/+rCMvRwr4yROQP43s0Xk" crossorigin="anonymous"></script>
@@ -9408,13 +9385,11 @@ const t2iDefaultTemplate = `<!doctype html>
     (function () {
       const contentElement = document.getElementById("content");
       const source = document.getElementById("markdown-source").value;
-
+      marked.use({ gfm: true, breaks: false });
       contentElement.innerHTML = marked.parse(source);
-
       if (window.AstrBotT2IShiki) {
         window.AstrBotT2IShiki.highlightAllCodeBlocks(contentElement, "github-light");
       }
-
       if (window.renderMathInElement) {
         window.renderMathInElement(contentElement, {
           delimiters: [
@@ -9422,13 +9397,44 @@ const t2iDefaultTemplate = `<!doctype html>
             { left: "$", right: "$", display: false }
           ]
         });
+        window.addEventListener("load", function () {
+          contentElement.querySelectorAll(".katex-display").forEach(function (el) {
+            const aw = el.clientWidth, rw = el.scrollWidth;
+            if (aw > 0 && rw > aw) {
+              const fs = parseFloat(window.getComputedStyle(el).fontSize);
+              el.style.fontSize = (fs * (aw / rw) * 0.98) + "px";
+            }
+          });
+        }, { once: true });
       }
-
     })();
   </script>
 </body>
 </html>
 `
+
+// t2iLegacyTemplateHashes 是 Python 旧版 base.html 模板内容的 SHA-256（CRLF 规范化后）。
+// 用户目录 base.html 命中任一 hash 时，视为"未修改的旧版模板"，自动用新版覆盖
+// （对齐 Python template_manager._LEGACY_CORE_TEMPLATE_HASHES 语义）。
+var t2iLegacyTemplateHashes = map[string]bool{
+	"23714149d06b3abdcee3a5ac1aed3a95785efd75a49a3a3f4a8d26e0f84253e1":  true,
+	"380ccf1824c877635bd2e97df3df0f1960166dfa582aebce768b583c4d6c480a7": true,
+	"7d0beae08e25ae51f6b3f8f00338fada559e0b883cef15ec609309d17ba708f0":  true,
+}
+
+// t2iIsLegacyTemplate 检测用户模板是否为未修改的旧版（hash 命中则需升级）。
+// 读取后做 CRLF→LF 规范化再 hash（对齐 Python 注释：文本规范化后 hash）。
+func t2iIsLegacyTemplate(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	sum := sha256.Sum256([]byte(normalized))
+	hexHash := fmt.Sprintf("%x", sum)
+	return t2iLegacyTemplateHashes[hexHash]
+}
 
 // t2iTemplatePath 校验模板名并返回用户模板文件路径（防路径穿越，
 // 对齐 Python _get_user_template_path）。
@@ -9439,13 +9445,20 @@ func (s *Server) t2iTemplatePath(name string) (string, error) {
 	return filepath.Join(s.t2iTemplatesDir(), name+".html"), nil
 }
 
-// t2iEnsureBaseTemplate 在用户模板目录缺失时写入内置 base 模板。
+// t2iEnsureBaseTemplate 在用户模板目录缺失时写入内置 base 模板；若已有
+// base.html 但内容是未修改的旧版模板（hash 命中 _LEGACY_CORE_TEMPLATE_HASHES），
+// 自动用新版覆盖（对齐 Python template_manager 旧模板升级逻辑）。
 func (s *Server) t2iEnsureBaseTemplate() {
 	path, err := s.t2iTemplatePath("base")
 	if err != nil {
 		return
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
+		_ = writeFileAtomic(path, []byte(t2iDefaultTemplate), 0o644)
+		return
+	}
+	// 已有文件：检测是否为未修改的旧版模板，是则升级。
+	if t2iIsLegacyTemplate(path) {
 		_ = writeFileAtomic(path, []byte(t2iDefaultTemplate), 0o644)
 	}
 }
@@ -10433,10 +10446,18 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 			}))
 			return
 		}
+		// 对齐 Python v4.28.0 (sqlite.get_filtered_conversations)：
+		// keyword/umo/sort_by/sort_order/group_by_session 过滤参数。
+		groupBySession, _ := strconv.ParseBool(q.Get("group_by_session"))
 		rows, total, err := s.database.GetFilteredConversations(db.ConversationFilter{
 			Platforms:        splitCSV("platforms"),
 			MessageTypes:     splitCSV("message_types"),
 			Search:           q.Get("search"),
+			KeywordQuery:     q.Get("keyword"),
+			UmoQuery:         q.Get("umo"),
+			SortBy:           q.Get("sort_by"),
+			SortOrder:        q.Get("sort_order"),
+			GroupBySession:   groupBySession,
 			ExcludeIDs:       splitCSV("exclude_ids"),
 			ExcludePlatforms: splitCSV("exclude_platforms"),
 			Page:             page,
@@ -10463,6 +10484,11 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 				"total_pages": totalPages,
 			},
 		}))
+	case "filter-options":
+		// 对齐 Python v4.28.0：GET /api/v1/conversations/filter-options，
+		// 返回 {"bots":[{"id","type"}]}，取 config platform 数组中 id 出现在
+		// conversations 表 distinct platform_id 的项。
+		s.handleConversationFilterOptions(w, r)
 	case "by-id":
 		if len(parts) > 1 {
 			s.handleConversationByID(w, r, parts[1], parts[2:])
@@ -10538,6 +10564,26 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 		}
 		s.handleConversationByID(w, r, sub, parts[1:])
 	}
+}
+
+// handleConversationFilterOptions 对齐 Python v4.28.0：GET /api/v1/conversations/
+// filter-options，返回 {"bots":[{"id","type"}]}，取 config platform 数组中 id
+// 出现在 conversations 表 distinct platform_id 的项。
+func (s *Server) handleConversationFilterOptions(w http.ResponseWriter, r *http.Request) {
+	if s.database == nil {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"bots": []interface{}{}}))
+		return
+	}
+	platformIDs, err := s.database.GetConversationPlatformIDs()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiError("查询平台列表失败: "+err.Error()))
+		return
+	}
+	bots := make([]interface{}, 0, len(platformIDs))
+	for _, pid := range platformIDs {
+		bots = append(bots, map[string]interface{}{"id": pid, "type": pid})
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"bots": bots}))
 }
 
 // handleConversationByID serves a single conversation by its id, optionally

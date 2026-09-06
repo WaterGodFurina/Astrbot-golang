@@ -47,6 +47,11 @@ func convertSatoriMessage(msg, user, channel, guild, login map[string]interface{
 	} else {
 		abm.Type = platform.FriendMessage
 	}
+	if abm.Group != nil {
+		if guildName := strField(guild, "name"); guildName != "" {
+			abm.Group.GroupName = guildName
+		}
+	}
 	abm.SessionID, _ = channel["id"].(string)
 
 	// 发送者

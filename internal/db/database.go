@@ -15,6 +15,7 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -563,8 +564,16 @@ type ConversationFilter struct {
 	Search           string   // title/user_id/conversation_id/content LIKE %q%
 	ExcludeIDs       []string // user_id NOT LIKE '<id>%'
 	ExcludePlatforms []string // platform_id NOT IN (...)
-	Page             int
-	PageSize         int
+	// 对齐 Python v4.28.0：keyword_query 对 title/content ilike（content 还要
+	// JSON 转义后的形式）；umo_query 对 user_id ilike；sort_by/sort_order 控制
+	// 排序；group_by_session 按 user_id 分组分页。
+	KeywordQuery   string
+	UmoQuery       string
+	SortBy         string // created_at / updated_at
+	SortOrder      string // asc / desc
+	GroupBySession bool
+	Page           int
+	PageSize       int
 }
 
 // GetFilteredConversations returns a filtered, paginated conversation list
@@ -612,7 +621,95 @@ func (d *Database) GetFilteredConversations(f ConversationFilter) ([]Conversatio
 	if len(f.ExcludePlatforms) > 0 {
 		where = append(where, fmt.Sprintf("platform_id NOT IN (%s)", placeholders(len(f.ExcludePlatforms), &args, f.ExcludePlatforms)))
 	}
+	// 对齐 Python v4.28.0 (sqlite.get_filtered_conversations)：keyword_query 对
+	// title/content ilike，content 还要 JSON 转义后的形式（json.Marshal 去引号）。
+	if kw := strings.TrimSpace(f.KeywordQuery); kw != "" {
+		escaped, _ := json.Marshal(kw)
+		escapedString := string(escaped[1 : len(escaped)-1]) // 去掉首尾双引号
+		where = append(where, "(title LIKE ? OR content LIKE ? OR content LIKE ?)")
+		whereLike := "%" + kw + "%"
+		whereEscapedLike := "%" + escapedString + "%"
+		args = append(args, whereLike, whereLike, whereEscapedLike)
+	}
+	// umo_query：user_id ilike
+	if uq := strings.TrimSpace(f.UmoQuery); uq != "" {
+		where = append(where, "user_id LIKE ?")
+		args = append(args, "%"+uq+"%")
+	}
 	whereSQL := strings.Join(where, " AND ")
+
+	// sort_by / sort_order：对齐 Python v4.28.0，tie-breaker inner_conversation_id 同向。
+	sortCol := "created_at"
+	if f.SortBy == "updated_at" {
+		sortCol = "updated_at"
+	}
+	sortDir := "DESC"
+	if strings.ToLower(f.SortOrder) == "asc" {
+		sortDir = "ASC"
+	}
+	orderBy := fmt.Sprintf("%s %s, inner_conversation_id %s", sortCol, sortDir, sortDir)
+
+	if f.GroupBySession {
+		// 对齐 Python v4.28.0 group_by_session：按 user_id 分组分页，每组取 max(sort_column)
+		// 排序分页，再 in 查询展开行。count 用 count(distinct user_id)。
+		groupWhereSQL := whereSQL
+		countQuery := "SELECT COUNT(DISTINCT user_id) FROM conversations WHERE " + groupWhereSQL
+		var total int
+		if err := d.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
+			return nil, 0, err
+		}
+
+		// 分组查询分页的 user_id 列表
+		groupQuery := fmt.Sprintf(
+			`SELECT user_id, MAX(%s) AS session_sort, MAX(inner_conversation_id) AS session_tie_breaker
+			 FROM conversations WHERE %s GROUP BY user_id ORDER BY session_sort %s, session_tie_breaker %s LIMIT ? OFFSET ?`,
+			sortCol, groupWhereSQL, sortDir, sortDir,
+		)
+		groupArgs := append(append([]interface{}{}, args...), size, (page-1)*size)
+		groupRows, err := d.db.Query(groupQuery, groupArgs...)
+		if err != nil {
+			return nil, 0, err
+		}
+		var userIDs []string
+		for groupRows.Next() {
+			var uid string
+			var sortVal, tieVal int64
+			if err := groupRows.Scan(&uid, &sortVal, &tieVal); err != nil {
+				groupRows.Close()
+				return nil, 0, err
+			}
+			userIDs = append(userIDs, uid)
+		}
+		groupRows.Close()
+		if len(userIDs) == 0 {
+			return nil, total, nil
+		}
+
+		// 展开查询：in 查询并按分组序排列（对齐 Python case-when rank 方案）。
+		expandWhere := fmt.Sprintf("user_id IN (%s)", placeholders(len(userIDs), &args, userIDs))
+		expandQuery := `SELECT inner_conversation_id, conversation_id, platform_id, user_id, content, title, persona_id, created_at, updated_at
+		 FROM conversations WHERE ` + expandWhere + ` ORDER BY ` + orderBy
+		expandArgs := append(append([]interface{}{}, args...))
+		expandRows, err := d.db.Query(expandQuery, expandArgs...)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer expandRows.Close()
+		// 按分组序（userIDs 顺序）排列行。
+		rowMap := make(map[string][]ConversationRow)
+		for expandRows.Next() {
+			var row ConversationRow
+			if err := expandRows.Scan(&row.InnerID, &row.ConversationID, &row.PlatformID, &row.UserID, &row.Content, &row.Title, &row.PersonaID, &row.CreatedAt, &row.UpdatedAt); err != nil {
+				return nil, 0, err
+			}
+			rowMap[row.UserID] = append(rowMap[row.UserID], row)
+		}
+		var result []ConversationRow
+		for _, uid := range userIDs {
+			result = append(result, rowMap[uid]...)
+		}
+		return result, total, nil
+	}
 
 	var total int
 	if err := d.db.QueryRow("SELECT COUNT(*) FROM conversations WHERE "+whereSQL, args...).Scan(&total); err != nil {
@@ -620,7 +717,7 @@ func (d *Database) GetFilteredConversations(f ConversationFilter) ([]Conversatio
 	}
 
 	query := `SELECT inner_conversation_id, conversation_id, platform_id, user_id, content, title, persona_id, created_at, updated_at
-		 FROM conversations WHERE ` + whereSQL + ` ORDER BY updated_at DESC, inner_conversation_id DESC LIMIT ? OFFSET ?`
+		 FROM conversations WHERE ` + whereSQL + ` ORDER BY ` + orderBy + ` LIMIT ? OFFSET ?`
 	args = append(args, size, (page-1)*size)
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
@@ -1493,4 +1590,43 @@ func (d *Database) DeleteKBChunkByID(kbID, chunkID string) (int64, error) {
 // this clears their chunk records.
 func (d *Database) DeleteKBDoc(kbID, docID string) error {
 	return d.DeleteKBChunks(kbID, docID)
+}
+
+// UpsertUmoAutoName 对齐 Python v4.28.0 (#9909) sqlite.upsert_umo_auto_name：
+// 仅更新 auto_name 字段，不改变 user_alias。umo 唯一键 upsert，存在则更新
+// auto_name/updated_at（仅当 auto_name 变化时），不存在插入。
+func (d *Database) UpsertUmoAutoName(umo, creatorSenderID, autoName string) error {
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO umo_aliases (umo, creator_sender_id, auto_name, user_alias, created_at, updated_at)
+			 VALUES (?, ?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			 ON CONFLICT(umo) DO UPDATE SET
+			   auto_name = excluded.auto_name,
+			   updated_at = CURRENT_TIMESTAMP
+			 WHERE umo_aliases.auto_name != excluded.auto_name`,
+			umo, creatorSenderID, autoName,
+		)
+		return err
+	})
+}
+
+// GetConversationPlatformIDs 对齐 Python v4.28.0 sqlite.get_conversation_platform_ids：
+// 返回 conversations 表中 distinct platform_id 的有序列表。
+func (d *Database) GetConversationPlatformIDs() ([]string, error) {
+	rows, err := d.db.Query(`SELECT DISTINCT platform_id FROM conversations ORDER BY platform_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var pid string
+		if err := rows.Scan(&pid); err != nil {
+			return nil, err
+		}
+		if pid != "" {
+			result = append(result, pid)
+		}
+	}
+	return result, rows.Err()
 }

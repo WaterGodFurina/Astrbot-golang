@@ -1,11 +1,18 @@
-﻿{
+{
     "welcome": "Добро пожаловать",
     "dashboard": "Статистика",
     "platforms": "Боты",
     "providers": "Провайдеры моделей",
     "commands": "Команды",
-    "persona": "Персонажи",
-    "subagent": "Субагенты",
+  "persona": "Персонажи",
+  "data": "Данные и логи",
+  "dataTabs": {
+    "statistics": "Статистика",
+    "conversations": "Диалоги",
+    "logs": "Логи",
+    "trace": "Трассировка"
+  },
+  "subagent": "Субагенты",
     "toolUse": "Инструменты MCP",
     "extension": "Плагины",
     "extensionTabs": {

@@ -274,6 +274,25 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 		abm.Type = platform.FriendMessage
 	}
 	abm.Group = &platform.Group{GroupID: msg.ChannelID}
+	if isGroup {
+		guildName := ""
+		if msg.GuildID != "" && s.State != nil {
+			for _, g := range s.State.Guilds {
+				if g.ID == msg.GuildID {
+					guildName = g.Name
+					break
+				}
+			}
+		}
+		channelName := abmGroupChannelNameSafe(s, msg.ChannelID)
+		if guildName != "" && channelName != "" && channelName != msg.ChannelID {
+			abm.Group.GroupName = guildName + "-" + channelName
+		} else if channelName != "" && channelName != msg.ChannelID {
+			abm.Group.GroupName = channelName
+		} else if guildName != "" {
+			abm.Group.GroupName = guildName
+		}
+	}
 	abm.MessageStr = content
 	abm.Sender = platform.MessageMember{
 		UserID:   msg.Author.ID,
@@ -896,6 +915,80 @@ func isLoginFailure(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "401") || strings.Contains(msg, "Unauthorized") ||
 		strings.Contains(msg, "Incorrect login details")
+}
+
+// abmGroupChannelNameSafe resolves a Discord channel's display name from the
+// state cache only (no HTTP request), falling back to the channel ID.
+func abmGroupChannelNameSafe(s *discordgo.Session, channelID string) string {
+	if channelID == "" {
+		return ""
+	}
+	if s.State != nil {
+		if ch, err := s.State.Channel(channelID); err == nil && ch != nil {
+			return ch.Name
+		}
+	}
+	return channelID
+}
+
+// GetGroupInfo enriches Discord channel + guild metadata (Python
+// discord_platform_event.py get_group). Does not fetch all members.
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	group := &platform.Group{GroupID: groupID}
+	if a.session == nil {
+		return group, nil
+	}
+
+	channel, err := a.session.State.Channel(groupID)
+	if err != nil {
+		channel, err = a.session.Channel(groupID)
+		if err != nil {
+			logger.Debug("[Discord] Failed to get channel %s: %v", groupID, err)
+			return group, nil
+		}
+	}
+	if channel == nil {
+		return group, nil
+	}
+
+	channelName := channel.Name
+	guildName := ""
+	var guild *discordgo.Guild
+	if channel.GuildID != "" {
+		guild, _ = a.session.State.Guild(channel.GuildID)
+		if guild == nil {
+			guild, _ = a.session.Guild(channel.GuildID)
+		}
+	}
+	if guild != nil {
+		guildName = guild.Name
+	}
+
+	if guildName != "" && channelName != "" {
+		group.GroupName = guildName + "-" + channelName
+	} else if guildName != "" {
+		group.GroupName = guildName
+	} else if channelName != "" {
+		group.GroupName = channelName
+	}
+
+	if guild != nil {
+		if guild.Icon != "" {
+			group.GroupAvatar = discordgo.EndpointGuildIcon(guild.ID, guild.Icon)
+		}
+		if guild.OwnerID != "" {
+			group.GroupOwner = guild.OwnerID
+		}
+		if guild.MemberCount > 0 {
+			c := guild.MemberCount
+			group.MemberCount = &c
+		}
+	}
+
+	return group, nil
 }
 
 // isDailyQuotaError detects Discord error code 30034.

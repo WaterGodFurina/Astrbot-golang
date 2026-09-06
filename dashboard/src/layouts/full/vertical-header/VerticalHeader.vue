@@ -28,6 +28,7 @@ enableMermaid();
 
 const customizer = useCustomizerStore();
 const commonStore = useCommonStore();
+const authStore = useAuthStore();
 const chatHeader = useChatHeaderStore();
 const theme = useTheme();
 const { lgAndUp } = useDisplay();
@@ -68,6 +69,8 @@ let restartStartTime = ref<number | string | null>(null);
 let restartPollTimer: ReturnType<typeof setInterval> | null = null;
 let restartCompleted = ref(false);
 let restartReloadCountdown = ref(3);
+let updatingDashboardLoading = ref(false);
+let showAdvancedUpdateSettings = ref(false);
 let restartReloadTimer: ReturnType<typeof setInterval> | null = null;
 const RESTART_FEEDBACK_DELAY_SECONDS = 3;
 const RESTART_START_TIME_POLL_INTERVAL_MS = 2000;
@@ -874,6 +877,28 @@ async function switchVersion(targetVersion: string) {
     });
 }
 
+function updateDashboard() {
+  updatingDashboardLoading.value = true;
+  updateStatus.value = t("core.header.updateDialog.status.updating");
+  updatesApi
+    .dashboard()
+    .then((res) => {
+      updateStatus.value = res.data.message || "";
+      if (res.data.status == "ok") {
+        setTimeout(() => {
+          reloadWithCacheBuster();
+        }, 1000);
+      }
+    })
+    .catch((err) => {
+      console.error("Failed to update dashboard:", err);
+      updateStatus.value = err;
+    })
+    .finally(() => {
+      updatingDashboardLoading.value = false;
+    });
+}
+
 // 主题选项配置
 const themeOptions = [
   { mode: 'light' as const,  icon: 'mdi-white-balance-sunny', labelKey: 'core.header.buttons.theme.light'  },
@@ -1371,6 +1396,21 @@ onMounted(async () => {
           t("core.header.accountDialog.title")
         }}</v-list-item-title>
       </v-list-item>
+
+      <v-divider class="my-1" />
+
+      <v-list-item
+        @click="authStore.logout()"
+        class="styled-menu-item text-error"
+        rounded="md"
+      >
+        <template v-slot:prepend>
+          <v-icon>mdi-logout</v-icon>
+        </template>
+        <v-list-item-title>
+          {{ t("core.header.buttons.logout") }}
+        </v-list-item-title>
+      </v-list-item>
       </StyledMenu>
     </div>
 
@@ -1654,6 +1694,68 @@ onMounted(async () => {
                   </v-btn>
                 </template>
               </v-data-table>
+            </div>
+
+            <div v-if="!installLoading" class="advanced-update-settings mt-5">
+              <button
+                class="advanced-settings-toggle"
+                type="button"
+                @click="
+                  showAdvancedUpdateSettings = !showAdvancedUpdateSettings
+                "
+              >
+                <span>{{
+                  t("core.header.updateDialog.advancedSettings")
+                }}</span>
+                <v-icon
+                  :icon="
+                    showAdvancedUpdateSettings
+                      ? 'mdi-chevron-down'
+                      : 'mdi-chevron-right'
+                  "
+                  size="20"
+                ></v-icon>
+              </button>
+
+              <div
+                v-if="showAdvancedUpdateSettings"
+                class="dashboard-update-banner mt-3"
+              >
+                <div>
+                  <div class="font-weight-medium">
+                    {{ t("core.header.updateDialog.dashboardUpdate.title") }}
+                  </div>
+                  <div class="text-caption text-medium-emphasis">
+                    {{
+                      t(
+                        "core.header.updateDialog.dashboardUpdate.currentVersion",
+                      )
+                    }}
+                    {{ dashboardCurrentVersion }}
+                  </div>
+                  <div class="text-caption text-medium-emphasis">
+                    {{
+                      dashboardHasNewVersion
+                        ? t(
+                            "core.header.updateDialog.dashboardUpdate.hasNewVersion",
+                          )
+                        : t("core.header.updateDialog.dashboardUpdate.fallback")
+                    }}
+                  </div>
+                </div>
+                <v-btn
+                  color="primary"
+                  variant="tonal"
+                  @click="updateDashboard()"
+                  :loading="updatingDashboardLoading"
+                >
+                  {{
+                    t(
+                      "core.header.updateDialog.dashboardUpdate.downloadAndUpdate",
+                    )
+                  }}
+                </v-btn>
+              </div>
             </div>
           </v-container>
         </v-card-text>

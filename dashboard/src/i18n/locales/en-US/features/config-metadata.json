@@ -3,13 +3,15 @@
     "name": "AI",
     "agent_runner": {
       "description": "Agent Runner",
-      "hint": "Select the runner for AI conversations. Defaults to AstrBot's built-in Agent runner, which supports knowledge base, persona, and tool calling features. You don't need to modify this section unless you plan to integrate third-party Agent runners like Dify, Coze, or DeerFlow.",
+      "hint": "Select the runner for AI conversations. Switching runners resets the configuration to the new type's defaults.",
       "provider_settings": {
         "enable": {
           "description": "Enable",
           "hint": "Master switch for AI conversations"
-        },
-        "agent_runner_type": {
+        }
+      },
+      "agent_runner": {
+        "runner_type": {
           "description": "Runner",
           "labels": [
             "Built-in Agent",
@@ -18,69 +20,43 @@
             "Alibaba Cloud Bailian Application",
             "DeerFlow"
           ]
-        },
-        "coze_agent_runner_provider_id": {
-          "description": "Coze Agent Runner Provider ID"
-        },
-        "dify_agent_runner_provider_id": {
-          "description": "Dify Agent Runner Provider ID"
-        },
-        "dashscope_agent_runner_provider_id": {
-          "description": "Alibaba Cloud Bailian Application Agent Runner Provider ID"
-        },
-        "deerflow_agent_runner_provider_id": {
-          "description": "DeerFlow Agent Runner Provider ID"
         }
       }
     },
     "ai": {
       "description": "Model",
-      "hint": "When using non-built-in Agent runners, the default chat model and default image caption model may not take effect, but some plugins rely on these settings to invoke AI capabilities.",
+      "hint": "Configure the built-in Agent's chat models and shared image caption and speech models.",
+      "agent_runner": {
+        "config": {
+          "model": {
+            "provider_id": {
+              "description": "Chat Model",
+              "hint": "Uses the first model when left empty"
+            },
+            "fallback_provider_ids": {
+              "description": "Fallback Chat Models",
+              "hint": "Try these chat models in order when the primary model request fails."
+            },
+            "request_max_retries": {
+              "description": "Retries on Error",
+              "hint": "Maximum attempts for a single model request when retryable errors occur."
+            }
+          }
+        }
+      },
       "provider_settings": {
-        "default_provider_id": {
-          "description": "Default Chat Model",
-          "hint": "Uses the first model when left empty"
-        },
-        "fallback_chat_models": {
-          "description": "Fallback chat model IDs",
-          "hint": "When the primary chat model request fails, fallback to these chat models in order."
-        },
-        "request_max_retries": {
-          "description": "Request Max Retries",
-          "hint": "Maximum attempts for a single model request when retryable errors occur."
-        },
         "default_image_caption_provider_id": {
-          "description": "Default Image Caption Model",
+          "description": "Image Caption Model",
           "hint": "Leave empty to disable; useful for non-multimodal models"
         },
         "image_caption_prompt": {
           "description": "Image Caption Prompt"
-        },
-        "request_retry_429_enabled": {
-          "description": "Enable 429 Rate-Limit Retry",
-          "hint": "Whether to retry when the model API returns 429 Too Many Requests. Enabled by default; disable to skip 429 retries."
-        },
-        "request_retry_429_max": {
-          "description": "429 Max Retry Count",
-          "hint": "Maximum retries when receiving 429. Defaults to 5 and cannot be 0 (the backend coerces 0 to 1)."
-        },
-        "request_retry_429_strategy": {
-          "description": "429 Retry Strategy",
-          "hint": "How long to wait between 429 retries: exponential backoff or a fixed per-retry delay.",
-          "labels": [
-            "Exponential backoff",
-            "Fixed delay"
-          ]
-        },
-        "request_retry_429_fixed_seconds": {
-          "description": "Fixed Retry Delay (seconds)",
-          "hint": "Seconds to wait before each retry when “Fixed retry” is selected. Defaults to 10."
         }
       },
       "provider_stt_settings": {
         "enable": {
-          "description": "Enable Speech-to-Text",
-          "hint": "Master switch for STT"
+          "description": "Speech Recognition",
+          "hint": "Use a speech-to-text model to transcribe user voice messages into text for the model to understand."
         },
         "provider_id": {
           "description": "Default Speech-to-Text Model",
@@ -89,8 +65,8 @@
       },
       "provider_tts_settings": {
         "enable": {
-          "description": "Enable Text-to-Speech",
-          "hint": "Master switch for TTS"
+          "description": "Voice Replies",
+          "hint": "Use a text-to-speech model to turn text into voice replies."
         },
         "provider_id": {
           "description": "Default Text-to-Speech Model"
@@ -103,9 +79,21 @@
     "persona": {
       "description": "Persona",
       "hint": "Set the default persona for AI conversations. Personas can be managed in the Persona tab.",
-      "provider_settings": {
-        "default_personality": {
-          "description": "Default Persona"
+      "agent_runner": {
+        "config": {
+          "persona": {
+            "persona_id": {
+              "description": "Default Persona"
+            },
+            "safety_mode": {
+              "description": "Safety Mode",
+              "hint": "Guide the model toward safe content and away from harmful or sensitive topics."
+            },
+            "safety_mode_strategy": {
+              "description": "Safety Mode Strategy",
+              "hint": "Select how safety mode is applied."
+            }
+          }
         }
       }
     },
@@ -164,6 +152,10 @@
         "websearch_exa_key": {
           "description": "Exa API Key",
           "hint": "Multiple keys can be added for rotation. Get a key at https://dashboard.exa.ai"
+        },
+        "websearch_anysearch_key": {
+          "description": "AnySearch API Key",
+          "hint": "Multiple keys can be added for rotation. Leave empty for anonymous mode (daily free quota). Get a key at https://anysearch.com/console/api-keys"
         }
       },
       "hint": "Lets AstrBot access the internet to stay up to date."
@@ -433,6 +425,141 @@
       "provider_tts_settings": {
         "dual_output": {
           "description": "Output Both Voice and Text When TTS is Enabled"
+        }
+      }
+    },
+    "dify_runner": {
+      "description": "Dify Configuration",
+      "agent_runner": {
+        "config": {
+          "dify_api_type": {
+            "description": "Application Type"
+          },
+          "dify_api_key": {
+            "description": "API Key"
+          },
+          "dify_api_base": {
+            "description": "API Base URL"
+          },
+          "dify_workflow_output_key": {
+            "description": "Workflow Output Variable"
+          },
+          "dify_query_input_key": {
+            "description": "Prompt Input Variable"
+          },
+          "variables": {
+            "description": "Variables"
+          },
+          "timeout": {
+            "description": "Timeout (seconds)"
+          },
+          "proxy": {
+            "description": "Proxy URL"
+          }
+        }
+      }
+    },
+    "coze_runner": {
+      "description": "Coze Configuration",
+      "agent_runner": {
+        "config": {
+          "coze_api_key": {
+            "description": "API Key"
+          },
+          "bot_id": {
+            "description": "Bot ID"
+          },
+          "coze_api_base": {
+            "description": "API Base URL"
+          },
+          "auto_save_history": {
+            "description": "Let Coze Manage Conversation History"
+          },
+          "timeout": {
+            "description": "Timeout (seconds)"
+          },
+          "proxy": {
+            "description": "Proxy URL"
+          }
+        }
+      }
+    },
+    "dashscope_runner": {
+      "description": "Alibaba Cloud Bailian Application Configuration",
+      "agent_runner": {
+        "config": {
+          "dashscope_app_type": {
+            "description": "Application Type"
+          },
+          "dashscope_api_key": {
+            "description": "API Key"
+          },
+          "dashscope_app_id": {
+            "description": "Application ID"
+          },
+          "rag_options": {
+            "pipeline_ids": {
+              "description": "Knowledge Base Pipeline IDs"
+            },
+            "file_ids": {
+              "description": "File IDs"
+            },
+            "output_reference": {
+              "description": "Include References"
+            }
+          },
+          "variables": {
+            "description": "Variables"
+          },
+          "timeout": {
+            "description": "Timeout (seconds)"
+          },
+          "proxy": {
+            "description": "Proxy URL"
+          }
+        }
+      }
+    },
+    "deerflow_runner": {
+      "description": "DeerFlow Configuration",
+      "agent_runner": {
+        "config": {
+          "deerflow_api_base": {
+            "description": "API Base URL"
+          },
+          "deerflow_api_key": {
+            "description": "API Key"
+          },
+          "deerflow_auth_header": {
+            "description": "Authorization Header"
+          },
+          "deerflow_assistant_id": {
+            "description": "Assistant ID"
+          },
+          "deerflow_model_name": {
+            "description": "Model Name Override"
+          },
+          "deerflow_thinking_enabled": {
+            "description": "Enable Thinking Mode"
+          },
+          "deerflow_plan_mode": {
+            "description": "Enable Plan Mode"
+          },
+          "deerflow_subagent_enabled": {
+            "description": "Enable Subagents"
+          },
+          "deerflow_max_concurrent_subagents": {
+            "description": "Maximum Concurrent Subagents"
+          },
+          "deerflow_recursion_limit": {
+            "description": "Recursion Limit"
+          },
+          "timeout": {
+            "description": "Timeout (seconds)"
+          },
+          "proxy": {
+            "description": "Proxy URL"
+          }
         }
       }
     }

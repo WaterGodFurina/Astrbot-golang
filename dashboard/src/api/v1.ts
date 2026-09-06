@@ -1292,13 +1292,6 @@ export const pluginApi = {
       }),
     );
   },
-  setGlobalIdleSleep(minutes: number) {
-    return typed<OpenConfig>(
-      openApiV1.setPluginIdleSleepGlobal({
-        body: { minutes },
-      }),
-    );
-  },
   update(pluginId: string, body?: OpenConfig) {
     return typed<OpenConfig>(
       openApiV1.updatePlugins({

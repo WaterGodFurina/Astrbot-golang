@@ -114,8 +114,8 @@ func TestIdlePerPluginTimeout(t *testing.T) {
 	}
 }
 
-// TestIdleMinutesZeroFallsBackToGlobal: 插件未设独立分钟（0）时回退全局默认；
-// 全局默认 0 时不允许回收（避免立即反复休眠/唤醒）。
+// TestIdleMinutesZeroFallsBackToGlobal: 独立控制模式下，插件未设独立分钟（0）时不回收；
+// 设置独立分钟后才能被回收。
 func TestIdleMinutesZeroFallsBackToGlobal(t *testing.T) {
 	requirePlugin(t)
 	m := newTestManager(t)
@@ -124,18 +124,19 @@ func TestIdleMinutesZeroFallsBackToGlobal(t *testing.T) {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
 	}
 
-	// 全局默认 0 → 无有效超时 → 不回收。
 	idleNow(t, m, p.ID, time.Hour)
 	m.SweepIdle()
 	if m.Get(p.ID) == nil {
-		t.Fatal("minutes=0 且全局默认 0 时不应回收")
+		t.Fatal("minutes=0 不应回收")
 	}
-	// 全局默认开启 → minutes=0 回退全局。
-	m.SetIdleUnload(10 * time.Millisecond)
+	// 设置独立分钟后，闲置应被回收。
+	if err := m.SetPluginIdleUnloadMinutes(p.ID, 1); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
+	}
 	idleNow(t, m, p.ID, time.Hour)
 	m.SweepIdle()
 	if m.Get(p.ID) != nil {
-		t.Fatal("minutes=0 应回退全局默认并被回收")
+		t.Fatal("minutes=1 回收")
 	}
 }
 
@@ -253,21 +254,22 @@ func TestUnloadIdleCheckedSkipsFreshlyWoken(t *testing.T) {
 	}
 }
 
-// TestIdleSweepLoopStopsWhenDisabled: SetIdleUnload 置 0 后 sweep loop 应
-// 退出（多次启停不泄漏 goroutine、不重复清扫）。
-func TestIdleSweepLoopStopsWhenDisabled(t *testing.T) {
+// TestIdleSweepLoopAlwaysRuns: 单插件独立控制下清扫循环自 NewSubprocessManager
+// 常驻运行（不依赖全局开关启停），SetIdleUnload 仅保留全局阈值字段供报告，
+// 不得重复启动循环（防并发双清扫 goroutine 泄漏）。
+func TestIdleSweepLoopAlwaysRuns(t *testing.T) {
 	m := newTestManager(t)
-	m.SetIdleUnload(50 * time.Millisecond)
-	m.SetIdleUnload(0) // 关闭
-	// loop 在下个 tick 检测到关闭后退出：给足时间并观察无 panic/无卸载
-	// 行为即可（goroutine 数量断言在 CI 中不稳定，这里验证开关语义）。
-	if m.IdleUnloadEnabled() {
-		t.Fatal("disabled after SetIdleUnload(0)")
-	}
+	// 全局阈值保留语义（报告用），循环本身不受影响。
 	m.SetIdleUnload(50 * time.Millisecond)
 	if !m.IdleUnloadEnabled() {
-		t.Fatal("enabled again")
+		t.Fatal("global threshold field must be reported when set")
 	}
+	m.SetIdleUnload(0)
+	if m.IdleUnloadEnabled() {
+		t.Fatal("global threshold field cleared")
+	}
+	// 循环已常驻：手动 SweepIdle 无 panic 即验证语义（多循环断言在 CI 不稳定）。
+	m.SweepIdle()
 }
 
 // TestSweepSkipsPluginsWithActiveSessionWait: 有活跃会话等待的插件不参与

@@ -584,7 +584,7 @@ func (a *Adapter) handleMessage(d map[string]interface{}, scene string) {
 	chain = append(chain, a.parseAttachments(d)...)
 
 	a.remember(scene, senderOpenID, msgID)
-	a.publish(senderOpenID, senderName, senderOpenID, false, plain, msgID, chain, d, "")
+	a.publish(senderOpenID, senderName, senderOpenID, false, plain, msgID, chain, d, "", "")
 }
 
 // handleGroupMessage parses and publishes a group message.
@@ -667,7 +667,8 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 		a.memberGroup[memberOpenID] = groupOpenID
 		a.mu.Unlock()
 	}
-	a.publish(memberOpenID, senderName, groupOpenID, true, plain, msgID, chain, d, memberRole)
+	groupName, _ := d["group_name"].(string)
+	a.publish(memberOpenID, senderName, groupOpenID, true, plain, msgID, chain, d, memberRole, groupName)
 }
 
 // handleChannelMessage parses and publishes a guild (@) message.
@@ -695,7 +696,8 @@ func (a *Adapter) handleChannelMessage(d map[string]interface{}) {
 	chain = append(chain, &message.Plain{Text: plain})
 
 	a.remember("channel", channelID, msgID)
-	a.publish(authorID, authorName, channelID, true, plain, msgID, chain, d, "")
+	channelName, _ := d["channel_name"].(string)
+	a.publish(authorID, authorName, channelID, true, plain, msgID, chain, d, "", channelName)
 }
 
 // handleDirectMessage parses and publishes a direct (DM) message.
@@ -714,7 +716,7 @@ func (a *Adapter) handleDirectMessage(d map[string]interface{}) {
 	chain = append(chain, &message.Plain{Text: plain})
 
 	a.remember("friend", authorID, msgID)
-	a.publish(authorID, authorName, authorID, false, plain, msgID, chain, d, "")
+	a.publish(authorID, authorName, authorID, false, plain, msgID, chain, d, "", "")
 }
 
 // buildQuotedReply builds a Reply component from a quoted message (message_type 103).
@@ -771,7 +773,7 @@ func (a *Adapter) remember(scene, convID, msgID string) {
 	a.mu.Unlock()
 }
 
-func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}, role string) {
+func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}, role, groupName string) {
 	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q", convID, isGroup, msgStr)
 	// Deduplicate identical msg_id re-deliveries within a short window (the QQ
 	// official WS may redeliver the same event after a reconnect/retry).
@@ -799,6 +801,9 @@ func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msg
 	if isGroup {
 		msgObj.Type = platform.GroupMessage
 		msgObj.Group = &platform.Group{GroupID: convID}
+		if groupName != "" {
+			msgObj.Group.GroupName = groupName
+		}
 	} else {
 		msgObj.Type = platform.FriendMessage
 	}
@@ -1147,4 +1152,67 @@ func (a *Adapter) StreamUpdate(sessionID, msgID, text string) error {
 func (a *Adapter) StreamEnd(sessionID, msgID, text string) error {
 	_, err := a.streamFragment(sessionID, 10, msgID, 2, text)
 	return err
+}
+
+// GetGroupInfo enriches QQ group/channel metadata (Python
+// qqofficial_message_event.py get_group). Only GroupMessage scene calls the
+// group info API; guild channels use channel + guild info APIs.
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	group := &platform.Group{GroupID: groupID}
+
+	// Determine scene from session tracking
+	a.mu.Lock()
+	scene := a.sessionScene[groupID]
+	a.mu.Unlock()
+
+	switch scene {
+	case "group":
+		data, err := a.apiRequest(http.MethodGet, "/v2/groups/"+groupID+"/info", nil)
+		if err != nil {
+			logger.Debug("[QQOfficial] Group info API failed for %s: %v", groupID, err)
+			return group, nil
+		}
+		if name, ok := data["group_name"].(string); ok {
+			group.GroupName = name
+		}
+		if mc, ok := data["group_member_num"].(float64); ok {
+			c := int(mc)
+			group.MemberCount = &c
+		} else if mc, ok := data["member_count"].(float64); ok {
+			c := int(mc)
+			group.MemberCount = &c
+		}
+		return group, nil
+
+	case "channel":
+		data, err := a.apiRequest(http.MethodGet, "/channels/"+groupID, nil)
+		if err != nil {
+			logger.Debug("[QQOfficial] Channel API failed for %s: %v", groupID, err)
+			return group, nil
+		}
+		if name, ok := data["name"].(string); ok {
+			group.GroupName = name
+		}
+		if guildID, ok := data["guild_id"].(string); ok && guildID != "" {
+			guildData, err := a.apiRequest(http.MethodGet, "/guilds/"+guildID, nil)
+			if err == nil {
+				if icon, ok := guildData["icon"].(string); ok {
+					group.GroupAvatar = icon
+				}
+				if ownerID, ok := guildData["owner_id"].(string); ok {
+					group.GroupOwner = ownerID
+				}
+				if mc, ok := guildData["member_count"].(float64); ok {
+					c := int(mc)
+					group.MemberCount = &c
+				}
+			}
+		}
+		return group, nil
+	}
+
+	return group, nil
 }

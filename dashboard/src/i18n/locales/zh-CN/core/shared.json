@@ -30,7 +30,13 @@
     "notActivated": "未激活",
     "note": "*不显示系统插件和已经在插件页禁用的插件。",
     "selectedPluginsLabel": "已选择的插件：",
-    "allPluginsLabel": "所有插件"
+    "allPluginsLabel": "所有插件",
+    "title": "插件",
+    "subtitle": "选择此配置文件可使用的插件",
+    "preset": "预设",
+    "searchPlaceholder": "搜索插件",
+    "selectAll": "全选",
+    "noSearchResults": "没有匹配的插件"
   },
   "providerSelector": {
     "notSelected": "未选择",
@@ -46,7 +52,11 @@
     "createProvider": "创建提供商",
     "manageProviders": "提供商管理",
     "selectProviderPool": "选择提供商池...",
-    "selectedCount": "已选择 {count} 个提供商"
+    "selectedCount": "已选择 {count} 个提供商",
+    "defaultModel": "默认模型",
+    "model": "模型",
+    "searchPlaceholder": "搜索模型",
+    "selectedModelCount": "{count} 个模型已选择"
   },
   "personaSelector": {
     "notSelected": "未选择",

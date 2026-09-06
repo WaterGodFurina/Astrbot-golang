@@ -10,6 +10,8 @@
 package wecom
 
 import (
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
+
 	"bytes"
 	"context"
 	"os"

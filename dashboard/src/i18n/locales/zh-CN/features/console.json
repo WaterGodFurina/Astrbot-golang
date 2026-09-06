@@ -2,24 +2,21 @@
   "title": "平台日志",
   "autoScroll": {
     "enabled": "自动滚动已开启",
-    "disabled": "自动滚动已关闭"
+    "disabled": "自动滚动已关闭",
+    "label": "自动滚动"
   },
   "hideUserChat": {
-    "enabled": "已排除用户对话",
-    "disabled": "排除用户对话"
+    "label": "隐藏用户聊天"
   },
   "debugHint": {
     "text": "Debug 日志需要在「配置文件 → 系统 → 控制台日志级别」中开启"
   },
-  "goInstall": {
-    "button": "安装 Go 库",
-    "dialogTitle": "安装 Go 库",
-    "packageLabel": "*模块路径，如 github.com/user/repo",
-    "mirrorLabel": "GOPROXY 镜像地址（可选）",
-    "mirrorHint": "GOPROXY 代理地址，默认使用系统配置（如 goproxy.cn）。留空则使用配置项 `goproxy`。",
-    "installButton": "安装",
-    "installSuccess": "安装成功。",
-    "installFailed": "安装失败。",
-    "requestFailed": "请求失败。"
+  "pipInstall": {
+    "button": "安装 pip 包",
+    "dialogTitle": "安装 Pip 包",
+    "packageLabel": "*包名, 例如 llmtuner",
+    "mirrorLabel": "强制 PyPI 仓库地址（可选）",
+    "mirrorHint": "强制 PyPI 仓库 URL > 配置项 `PyPI 仓库地址`",
+    "cancelButton": "取消"
   }
 }

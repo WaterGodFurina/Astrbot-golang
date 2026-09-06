@@ -931,9 +931,11 @@ func TestIdleUnloadAndLazyReload(t *testing.T) {
 	}
 
 	// 启用闲置卸载（阈值极短）并手动触发清扫（不依赖 ticker 定时）。
-	m.SetIdleUnload(10 * time.Millisecond)
 	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
+	if err := m.SetPluginIdleUnloadMinutes(inst.ID, 1); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
 	}
 	inst.lastActiveNano.Store(time.Now().Add(-time.Minute).UnixNano()) // 模拟闲置
 	m.sweepIdlePlugins()
@@ -963,11 +965,16 @@ func TestIdleUnloadAndLazyReload(t *testing.T) {
 func TestSweepSkipsActivePlugins(t *testing.T) {
 	requirePlugin(t)
 	m := newTestManager(t)
-	m.SetIdleUnload(10 * time.Millisecond)
 
 	inst, err := m.InstallFromSource(context.Background(), "pooled2", filepath.Join("testdata", "plugin"), InstallOptions{GoChoice: "download"})
 	if err != nil {
 		t.Fatalf("InstallFromSource: %v", err)
+	}
+	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
+		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
+	if err := m.SetPluginIdleUnloadMinutes(inst.ID, 1); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
 	}
 	inst.Touch() // 活跃
 	m.sweepIdlePlugins()
@@ -1001,9 +1008,12 @@ func TestIdleUnloadKeepsResidentByDefault(t *testing.T) {
 		t.Fatal("default-resident plugin must survive the idle sweep")
 	}
 
-	// 显式允许休眠后，闲置会被清扫。
+	// 显式允许休眠 + 设置独立分钟后，闲置会被清扫。
 	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
+	if err := m.SetPluginIdleUnloadMinutes(inst.ID, 1); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
 	}
 	if !m.PluginIdleUnload(inst.ID) {
 		t.Fatal("allow-sleep flag must be readable")

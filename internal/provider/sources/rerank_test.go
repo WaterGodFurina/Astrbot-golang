@@ -89,7 +89,7 @@ func TestNvidiaRerankSource(t *testing.T) {
 	if gotAuth != "Bearer nv-key" {
 		t.Errorf("unexpected auth: %q", gotAuth)
 	}
-	if gotModel != "nv-rerank-qa-mistral-4b:1" {
+	if gotModel != "nvidia/llama-nemotron-rerank-vl-1b-v2" {
 		t.Errorf("unexpected model: %q", gotModel)
 	}
 	if len(results) != 2 {

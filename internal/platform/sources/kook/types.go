@@ -23,6 +23,12 @@ const (
 	apiChannelMsgCreate = kookBaseURL + kookAPIVersion + "/message/create"        // 频道消息
 	apiDirectMsgCreate  = kookBaseURL + kookAPIVersion + "/direct-message/create" // 私聊消息
 	apiReactionAdd      = kookBaseURL + kookAPIVersion + "/message/reaction/add"  // 表情回应
+
+	// KOOK metadata APIs (aligned with Python kook_event.py get_group)
+	apiChannelView   = kookBaseURL + kookAPIVersion + "/channel/view"
+	apiGuildView     = kookBaseURL + kookAPIVersion + "/guild/view"
+	apiGuildUserList = kookBaseURL + kookAPIVersion + "/guild/user-list"
+	apiGuildRoleList = kookBaseURL + kookAPIVersion + "/guild-role/list"
 )
 
 // KookMessageType 对应 Python kook_types.py 的 KookMessageType (IntEnum)。
