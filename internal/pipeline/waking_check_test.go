@@ -162,8 +162,8 @@ func TestWakingCheckUniqueSession(t *testing.T) {
 	if _, err := s.Process(context.Background(), ev); err != nil {
 		t.Fatalf("Process: %v", err)
 	}
-	if ev.Source.ConvID != "u123" {
-		t.Errorf("qq_official unique session: want u123, got %q", ev.Source.ConvID)
+	if ev.Source.ConvID != "u123_g456" {
+		t.Errorf("qq_official unique session: want u123_g456, got %q", ev.Source.ConvID)
 	}
 	ev2 := wakeEvent("hello", true, "bot-openid", []message.Component{&message.Plain{Text: "hello"}})
 	ev2.Source.Platform = "lark"

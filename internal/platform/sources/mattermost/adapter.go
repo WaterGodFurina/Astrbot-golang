@@ -419,6 +419,11 @@ func (a *Adapter) convertMessage(ctx context.Context, post, data map[string]inte
 	} else {
 		abm.Type = platform.GroupMessage
 		abm.Group = &platform.Group{GroupID: channelID}
+		if displayName := stringVal(data["display_name"]); displayName != "" {
+			abm.Group.GroupName = displayName
+		} else if channelName := stringVal(data["channel_name"]); channelName != "" {
+			abm.Group.GroupName = channelName
+		}
 	}
 
 	var tempPaths []string
@@ -439,9 +444,10 @@ func (a *Adapter) convertMessage(ctx context.Context, post, data map[string]inte
 	return abm
 }
 
-// GetGroup 获取频道信息（对齐本体 MattermostMessageEvent.get_group，
-// mattermost_event.py:72-88）：group_name 取 display_name，回退 name/channel_id；
-// members 为该频道最近一次消息的发送者（本体为当前事件发送者）。
+// GetGroup enriches Mattermost channel metadata (Python
+// MattermostMessageEvent.get_group, mattermost_event.py:72-88): group_name
+// from display_name/name/channel_id; members from recent sender + paginated
+// channel members; member_count from channel stats.
 func (a *Adapter) GetGroup(groupID string) (*platform.Group, error) {
 	if groupID == "" {
 		return nil, nil
@@ -463,11 +469,49 @@ func (a *Adapter) GetGroup(groupID string) (*platform.Group, error) {
 	} else if name := stringVal(channel["name"]); name != "" {
 		group.GroupName = name
 	}
-	a.mu.Lock()
-	if sender, ok := a.lastSenders[groupID]; ok {
-		group.Members = []platform.MessageMember{sender}
+
+	stats, err := a.client.GetChannelStats(ctx, groupID)
+	if err == nil {
+		if mc, ok := stats["member_count"].(float64); ok {
+			c := int(mc)
+			group.MemberCount = &c
+		}
 	}
-	a.mu.Unlock()
+
+	var members []platform.MessageMember
+	page := 0
+	for {
+		items, err := a.client.GetChannelMembers(ctx, groupID, page, 200)
+		if err != nil {
+			break
+		}
+		if len(items) == 0 {
+			break
+		}
+		for _, m := range items {
+			uid := stringVal(m["user_id"])
+			if uid == "" {
+				continue
+			}
+			displayName := stringVal(m["display_name"])
+			if displayName == "" {
+				displayName = stringVal(m["username"])
+			}
+			if displayName == "" {
+				displayName = uid
+			}
+			members = append(members, platform.MessageMember{UserID: uid, Nickname: displayName})
+		}
+		if len(items) < 200 {
+			break
+		}
+		page++
+	}
+
+	if len(members) > 0 {
+		group.Members = members
+	}
+
 	return group, nil
 }
 
@@ -664,6 +708,14 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 		Timestamp: ts,
 		Metadata:  make(map[string]interface{}),
 	}
+
+	if abm.Group != nil {
+		event.MessageObj.Group = &core.Group{
+			GroupID:   abm.Group.GroupID,
+			GroupName: abm.Group.GroupName,
+		}
+	}
+
 	// 附件临时文件路径（对应 Python 的 temporary_file_paths 属性）
 	a.mu.Lock()
 	if len(a.lastTempPaths) > 0 {

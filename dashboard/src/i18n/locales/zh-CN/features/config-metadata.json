@@ -22,21 +22,193 @@
         "coze_agent_runner_provider_id": {
           "description": "Coze Agent 执行器提供商 ID"
         },
-        "dify_agent_runner_provider_id": {
-          "description": "Dify Agent 执行器提供商 ID"
-        },
         "dashscope_agent_runner_provider_id": {
           "description": "阿里云百炼应用 Agent 执行器提供商 ID"
         },
         "deerflow_agent_runner_provider_id": {
           "description": "DeerFlow Agent 执行器提供商 ID"
+        },
+        "dify_agent_runner_provider_id": {
+          "description": "Dify Agent 执行器提供商 ID"
+        }
+      },
+      "agent_runner": {
+        "runner_type": {
+          "description": "执行器",
+          "labels": [
+            "内置 Agent",
+            "Dify",
+            "Coze",
+            "阿里云百炼应用",
+            "DeerFlow"
+          ]
+        }
+      }
+    },
+    "dify_runner": {
+      "description": "Dify 配置",
+      "agent_runner": {
+        "config": {
+          "dify_api_type": {
+            "description": "应用类型"
+          },
+          "dify_api_key": {
+            "description": "API Key"
+          },
+          "dify_api_base": {
+            "description": "API Base URL"
+          },
+          "dify_workflow_output_key": {
+            "description": "Workflow 输出变量名"
+          },
+          "dify_query_input_key": {
+            "description": "Prompt 输入变量名"
+          },
+          "variables": {
+            "description": "变量"
+          },
+          "timeout": {
+            "description": "超时时间（秒）"
+          },
+          "proxy": {
+            "description": "代理地址"
+          }
+        }
+      }
+    },
+    "coze_runner": {
+      "description": "Coze 配置",
+      "agent_runner": {
+        "config": {
+          "coze_api_key": {
+            "description": "API Key"
+          },
+          "bot_id": {
+            "description": "Bot ID"
+          },
+          "coze_api_base": {
+            "description": "API Base URL"
+          },
+          "auto_save_history": {
+            "description": "由 Coze 管理对话记录"
+          },
+          "timeout": {
+            "description": "超时时间（秒）"
+          },
+          "proxy": {
+            "description": "代理地址"
+          }
+        }
+      }
+    },
+    "dashscope_runner": {
+      "description": "阿里云百炼应用配置",
+      "agent_runner": {
+        "config": {
+          "dashscope_app_type": {
+            "description": "应用类型"
+          },
+          "dashscope_api_key": {
+            "description": "API Key"
+          },
+          "dashscope_app_id": {
+            "description": "应用 ID"
+          },
+          "rag_options": {
+            "pipeline_ids": {
+              "description": "知识库 Pipeline ID"
+            },
+            "file_ids": {
+              "description": "文件 ID"
+            },
+            "output_reference": {
+              "description": "输出引用"
+            }
+          },
+          "variables": {
+            "description": "变量"
+          },
+          "timeout": {
+            "description": "超时时间（秒）"
+          },
+          "proxy": {
+            "description": "代理地址"
+          }
+        }
+      }
+    },
+    "deerflow_runner": {
+      "description": "DeerFlow 配置",
+      "agent_runner": {
+        "config": {
+          "deerflow_api_base": {
+            "description": "API Base URL"
+          },
+          "deerflow_api_key": {
+            "description": "API Key"
+          },
+          "deerflow_auth_header": {
+            "description": "Authorization Header"
+          },
+          "deerflow_assistant_id": {
+            "description": "Assistant ID"
+          },
+          "deerflow_model_name": {
+            "description": "模型名称覆盖"
+          },
+          "deerflow_thinking_enabled": {
+            "description": "启用思考模式"
+          },
+          "deerflow_plan_mode": {
+            "description": "启用计划模式"
+          },
+          "deerflow_subagent_enabled": {
+            "description": "启用子智能体"
+          },
+          "deerflow_max_concurrent_subagents": {
+            "description": "子智能体最大并发数"
+          },
+          "deerflow_recursion_limit": {
+            "description": "递归深度上限"
+          },
+          "timeout": {
+            "description": "超时时间（秒）"
+          },
+          "proxy": {
+            "description": "代理地址"
+          }
         }
       }
     },
     "ai": {
       "description": "模型",
       "hint": "当使用非内置 Agent 执行器时,默认对话模型和默认图片转述模型可能会无效,但某些插件会依赖此配置项来调用 AI 能力。",
+      "agent_runner": {
+        "config": {
+          "model": {
+            "provider_id": {
+              "description": "对话模型",
+              "hint": "留空时使用第一个模型"
+            },
+            "fallback_provider_ids": {
+              "description": "回退对话模型",
+              "hint": "主对话模型请求失败时，按顺序切换到这些对话模型。"
+            },
+            "request_max_retries": {
+              "description": "异常重试次数",
+              "hint": "单次模型请求遇到可重试错误时的最大尝试次数。"
+            }
+          }
+        }
+      },
       "provider_settings": {
+        "default_image_caption_provider_id": {
+          "description": "默认图片转述模型",
+          "hint": "留空代表不使用,可用于非多模态模型"
+        },
+        "image_caption_prompt": {
+          "description": "图片转述提示词"
+        },
         "default_provider_id": {
           "description": "默认对话模型",
           "hint": "留空时使用第一个模型"
@@ -49,16 +221,13 @@
           "description": "请求最大重试次数",
           "hint": "单次模型请求遇到可重试错误时的最大尝试次数。"
         },
-        "default_image_caption_provider_id": {
-          "description": "默认图片转述模型",
-          "hint": "留空代表不使用,可用于非多模态模型"
-        },
-        "image_caption_prompt": {
-          "description": "图片转述提示词"
-        },
         "request_retry_429_enabled": {
           "description": "限流429重试总开关",
           "hint": "是否开启 429（Too Many Requests）限流重试。默认开启；关闭后遇到 429 不再重试。"
+        },
+        "request_retry_429_fixed_seconds": {
+          "description": "单次时间重试的秒数",
+          "hint": "选择“单次时间重试”时，每次重试前固定等待的秒数。默认 10 秒。"
         },
         "request_retry_429_max": {
           "description": "限流429的模型调用重试次数",
@@ -71,10 +240,6 @@
             "指数重试",
             "单次时间重试"
           ]
-        },
-        "request_retry_429_fixed_seconds": {
-          "description": "单次时间重试的秒数",
-          "hint": "选择“单次时间重试”时，每次重试前固定等待的秒数。默认 10 秒。"
         }
       },
       "provider_stt_settings": {
@@ -103,6 +268,23 @@
     "persona": {
       "description": "人格",
       "hint": "赋予 AstrBot 人格。",
+      "agent_runner": {
+        "config": {
+          "persona": {
+            "persona_id": {
+              "description": "默认采用的人格"
+            },
+            "safety_mode": {
+              "description": "安全模式",
+              "hint": "引导模型输出安全内容，远离有害或敏感话题。"
+            },
+            "safety_mode_strategy": {
+              "description": "安全模式策略",
+              "hint": "选择安全模式的应用方式。"
+            }
+          }
+        }
+      },
       "provider_settings": {
         "default_personality": {
           "description": "默认采用的人格"
@@ -165,6 +347,10 @@
         "websearch_exa_key": {
           "description": "Exa API Key",
           "hint": "可添加多个 Key 进行轮询。获取 Key: https://dashboard.exa.ai"
+        },
+        "websearch_anysearch_key": {
+          "description": "AnySearch API Key",
+          "hint": "支持匿名调用（每日免费额度）；配置 Key 可提升配额，可添加多个 Key 轮询。"
         }
       }
     },
@@ -190,7 +376,12 @@
       "provider_settings": {
         "computer_use_runtime": {
           "description": "运行环境",
-          "hint": "允许 Agent 访问的环境。local 为本机环境，sandbox 为沙箱环境，none 为不允许任何环境。"
+          "hint": "允许 Agent 访问的环境。local 为本机环境，sandbox 为沙箱环境，none 为不允许任何环境。",
+          "labels": [
+            "不允许",
+            "本机环境",
+            "沙箱环境"
+          ]
         },
         "computer_use_require_admin": {
           "description": "需要 AstrBot 管理员权限",
@@ -202,7 +393,12 @@
         },
         "sandbox": {
           "booter": {
-            "description": "沙箱环境驱动器"
+            "description": "沙箱环境驱动器",
+            "labels": [
+              "Shipyard Neo",
+              "Shipyard",
+              "CUA"
+            ]
           },
           "shipyard_neo_endpoint": {
             "description": "Shipyard Neo API Endpoint",
@@ -226,7 +422,13 @@
           },
           "cua_os_type": {
             "description": "CUA 操作系统类型",
-            "hint": "CUA 沙箱操作系统类型，默认 linux。"
+            "hint": "CUA 沙箱操作系统类型，默认 linux。",
+            "labels": [
+              "Linux",
+              "macOS",
+              "Windows",
+              "Android"
+            ]
           },
           "cua_idle_timeout": {
             "description": "CUA 空闲超时(秒)",
@@ -1115,6 +1317,14 @@
         "description": "Python 库仓库地址（PyPI）",
         "hint": "安装 Python 插件依赖时使用的 PyPI 仓库地址，默认 https://mirrors.aliyun.com/pypi/simple/"
       },
+      "python_deps_install_mode": {
+        "description": "Python 依赖安装模式",
+        "hint": "需要时安装：仅预装 gRPC 核心依赖，插件运行缺包时按映射表自动补装（推荐）。完整安装：一次性预装全部宿主依赖，离线/无网络环境适用。",
+        "labels": [
+          "需要时安装",
+          "完整安装"
+        ]
+      },
       "callback_api_base": {
         "description": "对外可达的回调接口地址",
         "hint": "外部服务可能会通过 AstrBot 生成的回调链接(如文件下载链接)访问 AstrBot 后端。由于 AstrBot 无法自动判断部署环境中对外可达的主机地址(host),因此需要通过此配置项显式指定外部服务如何访问 AstrBot 的地址。如 [http://localhost:6185](http://localhost:6185),[https://example.com](https://example.com) 等。"
@@ -1225,6 +1435,14 @@
       "goflags": {
         "description": "Go 构建额外参数",
         "hint": "附加到 go build 的参数，如 -tags xxx"
+      },
+      "github_proxy": {
+        "description": "GitHub 加速地址",
+        "hint": "访问 GitHub（插件市场、发布产物下载等）使用的加速代理，留空则直连。"
+      },
+      "language": {
+        "description": "界面语言",
+        "hint": "WebUI 显示语言。"
       }
     }
   },

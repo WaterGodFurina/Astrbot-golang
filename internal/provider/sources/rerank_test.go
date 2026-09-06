@@ -83,13 +83,17 @@ func TestNvidiaRerankSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rerank: %v", err)
 	}
-	if gotPath != "/nvidia/reranking" {
+	// 新默认模型含 "/"，NVIDIA URL 规则把模型名映射进路径
+	// （对齐 Python _get_endpoint：nvidia/llama-nemotron-rerank-vl-1b-v2 →
+	// .../retrieval/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking）。
+	if gotPath != "/nvidia/llama-nemotron-rerank-vl-1b-v2/reranking" {
 		t.Errorf("unexpected path: %q", gotPath)
 	}
 	if gotAuth != "Bearer nv-key" {
 		t.Errorf("unexpected auth: %q", gotAuth)
 	}
-	if gotModel != "nv-rerank-qa-mistral-4b:1" {
+	if gotModel != "nvidia/llama-nemotron-rerank-vl-1b-v2" {
+		// （默认模型 v4.28 对齐，见 nvidia_rerank_source.go）
 		t.Errorf("unexpected model: %q", gotModel)
 	}
 	if len(results) != 2 {

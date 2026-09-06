@@ -197,7 +197,8 @@
             <v-menu
               location="end"
               offset="8"
-              open-on-hover
+              :open-on-hover="!isTouchDevice"
+              :open-on-click="isTouchDevice"
               :close-on-content-click="true"
             >
               <template #activator="{ props: transportMenuProps }">
@@ -251,7 +252,8 @@
             <v-menu
               location="end"
               offset="8"
-              open-on-hover
+              :open-on-hover="!isTouchDevice"
+              :open-on-click="isTouchDevice"
               :close-on-content-click="true"
             >
               <template #activator="{ props: languageMenuProps }">
@@ -1016,7 +1018,15 @@ onBeforeUnmount(() => {
   composerResizeObserver?.disconnect();
   chatHeader.CLEAR_CONTEXT();
   cleanupMediaCache();
+  pointerMediaQuery.removeEventListener("change", handlePointerChange);
 });
+
+const pointerMediaQuery = window.matchMedia("(pointer: coarse)");
+const isTouchDevice = ref<boolean>(pointerMediaQuery.matches);
+const handlePointerChange = (e: MediaQueryListEvent) => {
+  isTouchDevice.value = e.matches;
+};
+pointerMediaQuery.addEventListener("change", handlePointerChange);
 
 watch(composerShell, (element, previousElement) => {
   if (!composerResizeObserver) return;

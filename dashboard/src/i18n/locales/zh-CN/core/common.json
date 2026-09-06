@@ -140,5 +140,8 @@
       "title": "暂无首次提示内容",
       "subtitle": "未找到 FIRST_NOTICE.md 或文件为空。"
     }
-  }
+  },
+  "collapse": "收起",
+  "expand": "展开",
+  "unauthorized": "未授权"
 }

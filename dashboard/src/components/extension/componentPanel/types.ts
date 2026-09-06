@@ -23,6 +23,8 @@ export interface CommandItem {
   has_conflict: boolean;
   reserved: boolean;
   sub_commands: CommandItem[];
+  /** 插件是否已启用（禁用时该指令不生效，对齐 Python v4.28） */
+  plugin_activated?: boolean;
 }
 
 /** 指令类型 */

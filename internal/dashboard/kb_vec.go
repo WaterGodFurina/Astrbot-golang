@@ -351,18 +351,35 @@ func (s *Server) RetrieveKBContext(umo, query string) (string, error) {
 	if len(resolved) == 0 {
 		return "", nil
 	}
+	kbNameByID := map[string]string{}
+	if rows, err := s.database.ListKBs(); err == nil {
+		for i := range rows {
+			kbNameByID[rows[i].KBID] = rows[i].KBName
+		}
+	}
 	var sb strings.Builder
+	idx := 0
 	for _, kbID := range resolved {
 		results, err := s.kbRetrieve(kbID, query, topK)
 		if err != nil {
 			logger.I18nWarn("知识库 %s 检索失败: %v", kbID, err)
 			continue
 		}
-		for i, hit := range results {
-			sb.WriteString(fmt.Sprintf("【知识 %d】\n%s\n", i+1, hit.Content))
+		for _, hit := range results {
+			idx++
+			writeKBContextBlock(&sb, idx, kbNameByID[kbID], hit)
 		}
 	}
 	return sb.String(), nil
+}
+
+// writeKBContextBlock 按原版 kb_mgr._format_context 的格式写一条知识块：
+// 开头说明行 + 【知识 N】+ 来源（KB 名/文档名）+ 内容 + 相关度。来源与相关度
+// 标注让模型能明确区分"参考资料"与"用户指令"（缺失曾导致模型把知识内容
+// 误解为用户意图，如把「执行ls命令」当作日志分析流程的一部分）。
+func writeKBContextBlock(sb *strings.Builder, idx int, kbName string, hit knowledgebase.SearchResult) {
+	sb.WriteString(fmt.Sprintf("【知识 %d】\n来源: %s / %s\n内容: %s\n相关度: %.2f\n\n",
+		idx, kbName, hit.DocName, hit.Content, hit.Score))
 }
 
 // RetrieveKBByNames runs a vector retrieval across the given knowledge bases
@@ -444,7 +461,7 @@ func (s *Server) RetrieveKBByNames(query string, kbNames []string, topKFusion, t
 		}
 		for _, hit := range hits {
 			idx++
-			sb.WriteString(fmt.Sprintf("【知识 %d】\n%s\n", idx, hit.Content))
+			writeKBContextBlock(&sb, idx, kbName, hit)
 			content := hit.Content
 			results = append(results, map[string]any{
 				"chunk_id":    hit.ChunkID,

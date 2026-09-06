@@ -27,7 +27,7 @@ func TestExecuteSandboxToolNilOnlyBlocksSandboxTools(t *testing.T) {
 	}
 	// Non-sandbox names must fall through unhandled.
 	for _, name := range []string{"web_search", "get_current_time", "future_task"} {
-		if result, handled := s.executeSandboxTool(context.Background(), "g:1", name, map[string]interface{}{}); handled {
+		if result, handled := s.executeSandboxTool(context.Background(), &core.Event{Source: core.EventSource{Platform: "g", ConvID: "1"}}, name, map[string]interface{}{}); handled {
 			t.Fatalf("%s must not be marked handled without a sandbox, got %q", name, result)
 		}
 	}
@@ -38,7 +38,7 @@ func TestExecuteSandboxToolNilOnlyBlocksSandboxTools(t *testing.T) {
 		"astrbot_file_edit_tool", "astrbot_grep_tool",
 		"astrbot_upload_file", "astrbot_download_file",
 	} {
-		result, handled := s.executeSandboxTool(context.Background(), "g:1", name, map[string]interface{}{})
+		result, handled := s.executeSandboxTool(context.Background(), &core.Event{Source: core.EventSource{Platform: "g", ConvID: "1"}}, name, map[string]interface{}{})
 		if !handled || !strings.Contains(result, "not configured") {
 			t.Fatalf("%s must report not-configured, got handled=%v result=%q", name, handled, result)
 		}
@@ -57,17 +57,19 @@ func TestExecuteSandboxToolNilOnlyBlocksSandboxTools(t *testing.T) {
 
 func TestMaterializeToolResultSanitizesToolCallID(t *testing.T) {
 	inTempDir(t)
-	big := strings.Repeat("x", maxInlineToolResultChars+100)
-	out := materializeToolResult(big, "../../../etc/evil..name")
+	big := strings.Repeat("x", maxOutputBudget+100)
+	out := materializeToolResult(big, "../../../etc/evil..name", maxOutputBudget, func(name, content string) (string, bool) {
+		return spillHostToolResult(name, content)
+	})
 	if strings.Contains(out, "..") {
 		t.Fatalf("notice must not carry traversal dots: %q", out)
 	}
-	start := strings.Index(out, "保存到 ")
-	end := strings.Index(out, "（共")
+	start := strings.Index(out, "Full output saved to: ")
+	end := strings.Index(out, " (total ")
 	if start < 0 || end < 0 || end <= start {
 		t.Fatalf("cannot locate saved path in notice: %q", out)
 	}
-	path := out[start+len("保存到 ") : end]
+	path := out[start+len("Full output saved to: ") : end]
 	wantDir := filepath.Join("data", "temp", "tool_results")
 	if !strings.HasPrefix(path, wantDir) {
 		t.Fatalf("overflow file escaped tool_results dir: %q", path)

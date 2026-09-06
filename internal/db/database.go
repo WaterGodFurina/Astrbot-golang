@@ -1,20 +1,9 @@
-// Package db implements AstrBot's SQLite database layer.
-// Ported from astrbot/core/db/
-//
-// Bug fix for issue #9572: SQLAlchemy async engine connection pool issue.
-// The Python code used a single async engine whose internal asyncio.Queue
-// was bound to the first event loop that awaited it. When SharedPreferences
-// ran DB ops on a separate background loop (_sync_loop), concurrent pool
-// exhaustion caused "Queue is bound to a different event loop" errors.
-//
-// In Go, database/sql manages a thread-safe connection pool with no event
-// loop affinity. Connections are acquired/released across goroutines without
-// any cross-loop binding. This entirely eliminates the root cause of #9572.
-// Additionally, we use WAL mode + busy_timeout for SQLite concurrency.
+// Package db implements AstrBot's SQLite database layer. Ported from astrbot/core/db/ Bug fix for issue #9572: SQLAlchemy async engine connection pool issue. The Python code used a single async engine whose internal asyncio.Queue was bound to the first event loop that awaited it. When SharedPreferences ran DB ops on a separate background loop (_sync_loop), concurrent pool exhaustion caused "Queue is bound to a different event loop" errors. In Go, database/sql manages a thread-safe connection pool with no event loop affinity. Connections are acquired/released across goroutines without any cross-loop binding. This entirely eliminates the root cause of #9572. Additionally, we use WAL mode + busy_timeout for SQLite concurrency.
 package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -39,11 +28,7 @@ type Database struct {
 	path string
 }
 
-// New opens (or creates) a SQLite database at the given path.
-//
-// 使用纯 Go 驱动 modernc.org/sqlite（注册名 "sqlite"），消除对 mattn/
-// go-sqlite3 的 CGO 依赖，使主程序能在 CGO_ENABLED=0、无 C 编译器的
-// 环境下构建和运行。DSN 参数写法与 mattn 不同（_pragma=...）。
+// New opens (or creates) a SQLite database at the given path. 使用纯 Go 驱动 modernc.org/sqlite（注册名 "sqlite"），消除对 mattn/ go-sqlite3 的 CGO 依赖，使主程序能在 CGO_ENABLED=0、无 C 编译器的 环境下构建和运行。DSN 参数写法与 mattn 不同（_pragma=...）。
 func New(dbPath string) (*Database, error) {
 	// WAL mode enables concurrent readers + one writer without "database is locked"
 	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)", dbPath)
@@ -52,12 +37,7 @@ func New(dbPath string) (*Database, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	// Connection pool settings.
-	// Unlike Python's SQLAlchemy where a single async connection pool caused
-	// cross-event-loop issues (#9572), Go's database/sql pool is inherently
-	// goroutine-safe and has no event loop binding.
-	// WAL 模式下任意时刻只有一个写者，这里允许 10 个连接：读取可并发进行，
-	// 写入靠 busy_timeout 排队 + withRetry 兜底，而非把连接数压到 1。
+	// Connection pool settings. Unlike Python's SQLAlchemy where a single async connection pool caused cross-event-loop issues (#9572), Go's database/sql pool is inherently goroutine-safe and has no event loop binding. WAL 模式下任意时刻只有一个写者，这里允许 10 个连接：读取可并发进行， 写入靠 busy_timeout 排队 + withRetry 兜底，而非把连接数压到 1。
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(0) // No max lifetime for SQLite
@@ -87,9 +67,7 @@ func (d *Database) quickCheck() error {
 	return nil
 }
 
-// isBusyErr 判断错误是否为 SQLite 的写锁冲突（SQLITE_BUSY / SQLITE_LOCKED），
-// 供 withRetry 决定是否需要重试。modernc.org/sqlite 的错误是 *sqlite.Error，
-// 用 errors.As 提取后比对 lib.SQLITE_BUSY / lib.SQLITE_LOCKED 错误码。
+// isBusyErr 判断错误是否为 SQLite 的写锁冲突（SQLITE_BUSY / SQLITE_LOCKED）， 供 withRetry 决定是否需要重试。modernc.org/sqlite 的错误是 *sqlite.Error， 用 errors.As 提取后比对 lib.SQLITE_BUSY / lib.SQLITE_LOCKED 错误码。
 func isBusyErr(err error) bool {
 	var se *sqlite.Error
 	if errors.As(err, &se) {
@@ -99,9 +77,7 @@ func isBusyErr(err error) bool {
 	return strings.Contains(msg, "busy") || strings.Contains(msg, "locked")
 }
 
-// withRetry 对写操作做 SQLITE_BUSY 重试（初始 1 次 + 重试 3 次，递增退避
-// 50ms/200ms/500ms），作为 WAL + busy_timeout 之外的兜底：高并发写入下单个
-// 连接仍可能遇到 "database is locked"。
+// withRetry 对写操作做 SQLITE_BUSY 重试（初始 1 次 + 重试 3 次，递增退避 50ms/200ms/500ms），作为 WAL + busy_timeout 之外的兜底：高并发写入下单个 连接仍可能遇到 "database is locked"。
 func (d *Database) withRetry(fn func() error) error {
 	backoff := []time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 500 * time.Millisecond}
 	var lastErr error
@@ -408,8 +384,7 @@ func (d *Database) initSchema() error {
 		}
 	}
 
-	// 迁移机制：以 PRAGMA user_version 记录 schema 版本。当前版本尚无迁移脚本，
-	// 仅确保版本号写入（后续 schema 变更在此处按版本递增执行 ALTER 等迁移）。
+	// 迁移机制：以 PRAGMA user_version 记录 schema 版本。当前版本尚无迁移脚本， 仅确保版本号写入（后续 schema 变更在此处按版本递增执行 ALTER 等迁移）。
 	var version int
 	if err := d.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("read user_version: %w", err)
@@ -446,11 +421,7 @@ func (d *Database) CreateConversation(convID, userID, platformID, content, title
 	return err
 }
 
-// UpsertConversation atomically persists a conversation: it checks existence
-// and performs INSERT-or-UPDATE inside a single transaction, so concurrent
-// persists cannot both decide to INSERT (unique-violation) or clobber each
-// other's history. Callers that previously did GetConversationByID + Update/
-// Create (a classic TOCTOU race) should switch to this.
+// UpsertConversation atomically persists a conversation: it checks existence and performs INSERT-or-UPDATE inside a single transaction, so concurrent persists cannot both decide to INSERT (unique-violation) or clobber each other's history. Callers that previously did GetConversationByID + Update/ Create (a classic TOCTOU race) should switch to this.
 func (d *Database) UpsertConversation(convID, userID, platformID, content, title, personaID string) error {
 	return d.withRetry(func() error {
 		tx, err := d.db.Begin()
@@ -491,8 +462,7 @@ func (d *Database) UpsertConversation(convID, userID, platformID, content, title
 	})
 }
 
-// GetConversationByUserID returns the most recent conversation for a user
-// (unified_msg_origin), or an empty row with found=false.
+// GetConversationByUserID returns the most recent conversation for a user (unified_msg_origin), or an empty row with found=false.
 func (d *Database) GetConversationByUserID(userID string) (ConversationRow, bool, error) {
 	var row ConversationRow
 	err := d.db.QueryRow(
@@ -546,6 +516,26 @@ func (d *Database) ListConversations() ([]ConversationRow, error) {
 	return result, rows.Err()
 }
 
+// ListConversationMetas returns all conversations' metadata WITHOUT the history content column — used by the conversation manager's startup load so full histories are not resident in memory (lazy-loaded on first access).
+func (d *Database) ListConversationMetas() ([]ConversationRow, error) {
+	rows, err := d.db.Query(
+		`SELECT inner_conversation_id, conversation_id, platform_id, user_id, title, persona_id, created_at, updated_at
+		 FROM conversations ORDER BY updated_at DESC, inner_conversation_id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []ConversationRow
+	for rows.Next() {
+		var row ConversationRow
+		if err := rows.Scan(&row.InnerID, &row.ConversationID, &row.PlatformID, &row.UserID, &row.Title, &row.PersonaID, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
 // UpdateConversationContent updates a conversation's history JSON.
 func (d *Database) UpdateConversationContent(convID, content string) error {
 	_, err := d.db.Exec(
@@ -555,20 +545,24 @@ func (d *Database) UpdateConversationContent(convID, content string) error {
 	return err
 }
 
-// ConversationFilter mirrors the dashboard conversation list query params
-// (aligned with Python sqlite.get_filtered_conversations).
+// ConversationFilter mirrors the dashboard conversation list query params (aligned with Python sqlite.get_filtered_conversations).
 type ConversationFilter struct {
 	Platforms        []string // platform_id IN (...)
 	MessageTypes     []string // user_id LIKE '%:<type>:%' (UMO segment match)
 	Search           string   // title/user_id/conversation_id/content LIKE %q%
 	ExcludeIDs       []string // user_id NOT LIKE '<id>%'
 	ExcludePlatforms []string // platform_id NOT IN (...)
-	Page             int
-	PageSize         int
+	// 对齐 Python v4.28.0：keyword_query 对 title/content ilike（content 还要 JSON 转义后的形式）；umo_query 对 user_id ilike；sort_by/sort_order 控制 排序；group_by_session 按 user_id 分组分页。
+	KeywordQuery   string
+	UmoQuery       string
+	SortBy         string // created_at / updated_at
+	SortOrder      string // asc / desc
+	GroupBySession bool
+	Page           int
+	PageSize       int
 }
 
-// GetFilteredConversations returns a filtered, paginated conversation list
-// plus the total count matching the filter.
+// GetFilteredConversations returns a filtered, paginated conversation list plus the total count matching the filter.
 func (d *Database) GetFilteredConversations(f ConversationFilter) ([]ConversationRow, int, error) {
 	page := f.Page
 	if page < 1 {
@@ -612,7 +606,93 @@ func (d *Database) GetFilteredConversations(f ConversationFilter) ([]Conversatio
 	if len(f.ExcludePlatforms) > 0 {
 		where = append(where, fmt.Sprintf("platform_id NOT IN (%s)", placeholders(len(f.ExcludePlatforms), &args, f.ExcludePlatforms)))
 	}
+	// 对齐 Python v4.28.0 (sqlite.get_filtered_conversations)：keyword_query 对 title/content ilike，content 还要 JSON 转义后的形式（json.Marshal 去引号）。
+	if kw := strings.TrimSpace(f.KeywordQuery); kw != "" {
+		escaped, _ := json.Marshal(kw)
+		escapedString := string(escaped[1 : len(escaped)-1]) // 去掉首尾双引号
+		where = append(where, "(title LIKE ? OR content LIKE ? OR content LIKE ?)")
+		whereLike := "%" + kw + "%"
+		whereEscapedLike := "%" + escapedString + "%"
+		args = append(args, whereLike, whereLike, whereEscapedLike)
+	}
+	// umo_query：user_id ilike
+	if uq := strings.TrimSpace(f.UmoQuery); uq != "" {
+		where = append(where, "user_id LIKE ?")
+		args = append(args, "%"+uq+"%")
+	}
 	whereSQL := strings.Join(where, " AND ")
+
+	// sort_by / sort_order：对齐 Python v4.28.0，tie-breaker inner_conversation_id 同向。
+	sortCol := "created_at"
+	if f.SortBy == "updated_at" {
+		sortCol = "updated_at"
+	}
+	sortDir := "DESC"
+	if strings.ToLower(f.SortOrder) == "asc" {
+		sortDir = "ASC"
+	}
+	orderBy := fmt.Sprintf("%s %s, inner_conversation_id %s", sortCol, sortDir, sortDir)
+
+	if f.GroupBySession {
+		// 对齐 Python v4.28.0 group_by_session：按 user_id 分组分页，每组取 max(sort_column) 排序分页，再 in 查询展开行。count 用 count(distinct user_id)。
+		groupWhereSQL := whereSQL
+		countQuery := "SELECT COUNT(DISTINCT user_id) FROM conversations WHERE " + groupWhereSQL
+		var total int
+		if err := d.db.QueryRow(countQuery, args...).Scan(&total); err != nil {
+			return nil, 0, err
+		}
+
+		// 分组查询分页的 user_id 列表
+		groupQuery := fmt.Sprintf(
+			`SELECT user_id, MAX(%s) AS session_sort, MAX(inner_conversation_id) AS session_tie_breaker
+			 FROM conversations WHERE %s GROUP BY user_id ORDER BY session_sort %s, session_tie_breaker %s LIMIT ? OFFSET ?`,
+			sortCol, groupWhereSQL, sortDir, sortDir,
+		)
+		groupArgs := append(append([]interface{}{}, args...), size, (page-1)*size)
+		groupRows, err := d.db.Query(groupQuery, groupArgs...)
+		if err != nil {
+			return nil, 0, err
+		}
+		var userIDs []string
+		for groupRows.Next() {
+			var uid string
+			var sortVal, tieVal int64
+			if err := groupRows.Scan(&uid, &sortVal, &tieVal); err != nil {
+				groupRows.Close()
+				return nil, 0, err
+			}
+			userIDs = append(userIDs, uid)
+		}
+		groupRows.Close()
+		if len(userIDs) == 0 {
+			return nil, total, nil
+		}
+
+		// 展开查询：in 查询并按分组序排列（对齐 Python case-when rank 方案）。
+		expandWhere := fmt.Sprintf("user_id IN (%s)", placeholders(len(userIDs), &args, userIDs))
+		expandQuery := `SELECT inner_conversation_id, conversation_id, platform_id, user_id, content, title, persona_id, created_at, updated_at
+		 FROM conversations WHERE ` + expandWhere + ` ORDER BY ` + orderBy
+		expandArgs := args
+		expandRows, err := d.db.Query(expandQuery, expandArgs...)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer expandRows.Close()
+		// 按分组序（userIDs 顺序）排列行。
+		rowMap := make(map[string][]ConversationRow)
+		for expandRows.Next() {
+			var row ConversationRow
+			if err := expandRows.Scan(&row.InnerID, &row.ConversationID, &row.PlatformID, &row.UserID, &row.Content, &row.Title, &row.PersonaID, &row.CreatedAt, &row.UpdatedAt); err != nil {
+				return nil, 0, err
+			}
+			rowMap[row.UserID] = append(rowMap[row.UserID], row)
+		}
+		var result []ConversationRow
+		for _, uid := range userIDs {
+			result = append(result, rowMap[uid]...)
+		}
+		return result, total, nil
+	}
 
 	var total int
 	if err := d.db.QueryRow("SELECT COUNT(*) FROM conversations WHERE "+whereSQL, args...).Scan(&total); err != nil {
@@ -620,7 +700,7 @@ func (d *Database) GetFilteredConversations(f ConversationFilter) ([]Conversatio
 	}
 
 	query := `SELECT inner_conversation_id, conversation_id, platform_id, user_id, content, title, persona_id, created_at, updated_at
-		 FROM conversations WHERE ` + whereSQL + ` ORDER BY updated_at DESC, inner_conversation_id DESC LIMIT ? OFFSET ?`
+		 FROM conversations WHERE ` + whereSQL + ` ORDER BY ` + orderBy + ` LIMIT ? OFFSET ?`
 	args = append(args, size, (page-1)*size)
 	rows, err := d.db.Query(query, args...)
 	if err != nil {
@@ -680,8 +760,7 @@ type PreferenceRow struct {
 	Value   string
 }
 
-// GetPreference returns the value for (scope, scope_id, key) and whether it
-// exists. Mirrors the Python session preference read (`sp.session_get`).
+// GetPreference returns the value for (scope, scope_id, key) and whether it exists. Mirrors the Python session preference read (`sp.session_get`).
 func (d *Database) GetPreference(scope, scopeID, key string) (string, bool, error) {
 	var val string
 	err := d.db.QueryRow(
@@ -764,8 +843,7 @@ func (d *Database) ListPreferencesByScopeID(scope, scopeID string) ([]Preference
 	return out, rows.Err()
 }
 
-// DeletePreferencesByScopeID removes every preference row for a scope + id
-// (e.g. all rules of a session when deleting "all rules").
+// DeletePreferencesByScopeID removes every preference row for a scope + id (e.g. all rules of a session when deleting "all rules").
 func (d *Database) DeletePreferencesByScopeID(scope, scopeID string) error {
 	return d.withRetry(func() error {
 		_, err := d.db.Exec(
@@ -848,9 +926,7 @@ func (d *Database) GetCronJob(jobID string) (CronJobRow, bool, error) {
 	return row, true, nil
 }
 
-// cronJobWritableFields is the allowlist of columns UpdateCronJob may touch.
-// Using a fixed allowlist (rather than interpolating map keys) prevents SQL
-// injection through arbitrary field names.
+// cronJobWritableFields is the allowlist of columns UpdateCronJob may touch. Using a fixed allowlist (rather than interpolating map keys) prevents SQL injection through arbitrary field names.
 var cronJobWritableFields = map[string]bool{
 	"name":            true,
 	"description":     true,
@@ -881,8 +957,7 @@ func (d *Database) UpdateCronJob(jobID string, fields map[string]interface{}) er
 		}
 		switch k {
 		case "enabled", "run_once", "persistent":
-			// Accept bool or JSON-ish int; reject other types instead of
-			// panicking on an unsafe type assertion.
+			// Accept bool or JSON-ish int; reject other types instead of panicking on an unsafe type assertion.
 			b, err := asBool(v)
 			if err != nil {
 				return fmt.Errorf("UpdateCronJob: field %q: %w", k, err)
@@ -896,8 +971,7 @@ func (d *Database) UpdateCronJob(jobID string, fields map[string]interface{}) er
 	}
 	set += ", updated_at = CURRENT_TIMESTAMP"
 	args = append(args, jobID)
-	// #nosec G202 -- `set` is assembled only from keys validated against the
-	// cronJobWritableFields whitelist; all values go through placeholders.
+	// #nosec G202 -- `set` is assembled only from keys validated against the cronJobWritableFields whitelist; all values go through placeholders.
 	query := `UPDATE cron_jobs SET ` + set + ` WHERE job_id = ?` // nosemgrep: go.lang.security.audit.database.string-formatted-query.string-formatted-query
 	return d.withRetry(func() error {
 		_, err := d.db.Exec(query, args...)
@@ -965,8 +1039,7 @@ func (d *Database) RecordPlatformMessage(platformID, userID, senderID, content s
 	})
 }
 
-// TrimPlatformMessageHistory keeps only the most recent `keep` rows for a
-// platform session (mirrors Python insert_message_chain max_messages trimming).
+// TrimPlatformMessageHistory keeps only the most recent `keep` rows for a platform session (mirrors Python insert_message_chain max_messages trimming).
 func (d *Database) TrimPlatformMessageHistory(platformID, userID string, keep int) error {
 	if keep < 1 {
 		keep = 1
@@ -991,8 +1064,7 @@ type PlatformMessageRow struct {
 	CreatedAt  string
 }
 
-// GetPlatformMessageHistory returns the most recent messages for a platform
-// session (used by the get_group_message_history tool).
+// GetPlatformMessageHistory returns the most recent messages for a platform session (used by the get_group_message_history tool).
 func (d *Database) GetPlatformMessageHistory(platformID, userID string, limit int) ([]PlatformMessageRow, error) {
 	rows, err := d.db.Query(
 		`SELECT id, COALESCE(sender_id,''), COALESCE(sender_name,''), content, COALESCE(created_at,'')
@@ -1025,8 +1097,7 @@ func (d *Database) TotalMessageCount() int {
 	return n
 }
 
-// UpdatePlatformMessageHistory updates a platform message history record's
-// content and/or llm_checkpoint_id by ID (returns whether a row was updated).
+// UpdatePlatformMessageHistory updates a platform message history record's content and/or llm_checkpoint_id by ID (returns whether a row was updated).
 func (d *Database) UpdatePlatformMessageHistory(id int64, content *string, llmCheckpointID *string) (bool, error) {
 	updated := false
 	err := d.withRetry(func() error {
@@ -1059,8 +1130,7 @@ func (d *Database) UpdatePlatformMessageHistory(id int64, content *string, llmCh
 	return updated, err
 }
 
-// DeletePlatformMessageHistoryByID deletes one platform message history record
-// by ID (returns whether a row was deleted).
+// DeletePlatformMessageHistoryByID deletes one platform message history record by ID (returns whether a row was deleted).
 func (d *Database) DeletePlatformMessageHistoryByID(id int64) (bool, error) {
 	deleted := false
 	err := d.withRetry(func() error {
@@ -1084,8 +1154,7 @@ func changedRowCount(res any) bool {
 	return true
 }
 
-// RecordProviderCall inserts a provider call record for statistics.
-// 高频写点：经 withRetry 处理 SQLITE_BUSY。
+// RecordProviderCall inserts a provider call record for statistics. 高频写点：经 withRetry 处理 SQLITE_BUSY。
 func (d *Database) RecordProviderCall(umo, providerID, model string, inputOther, inputCached, output int, start, end float64) error {
 	return d.withRetry(func() error {
 		_, err := d.db.Exec(
@@ -1128,8 +1197,7 @@ type MessageBucket struct {
 	Count     int
 }
 
-// PlatformMessageRank returns messages grouped by platform within the given
-// lookback window (offsetSec seconds). Ordered by count descending.
+// PlatformMessageRank returns messages grouped by platform within the given lookback window (offsetSec seconds). Ordered by count descending.
 func (d *Database) PlatformMessageRank(offsetSec int) []map[string]interface{} {
 	rows, err := d.db.Query(
 		`SELECT platform_id, COUNT(*) FROM platform_message_history
@@ -1157,11 +1225,9 @@ func (d *Database) PlatformMessageRank(offsetSec int) []map[string]interface{} {
 	return out
 }
 
-// MessageTimeSeries buckets message history into `bucketSec`-wide windows over
-// the last offsetSec seconds, returning [timestamp_seconds, count] pairs.
+// MessageTimeSeries buckets message history into `bucketSec`-wide windows over the last offsetSec seconds, returning [timestamp_seconds, count] pairs.
 func (d *Database) MessageTimeSeries(offsetSec, bucketSec int) [][]int {
-	// 防御非法入参：bucketSec<=0 会触发除零 panic（ts/bucketSec）或死循环
-	// （t += 0），offsetSec<=0 则退化为单桶；这里统一回退到 3600。
+	// 防御非法入参：bucketSec<=0 会触发除零 panic（ts/bucketSec）或死循环 （t += 0），offsetSec<=0 则退化为单桶；这里统一回退到 3600。
 	if bucketSec < 1 {
 		bucketSec = 3600
 	}
@@ -1211,8 +1277,7 @@ type ProviderStatRow struct {
 	CreatedAt   time.Time
 }
 
-// ProviderStatsSince returns provider_stats records with created_at >= the
-// given time, ordered ascending.
+// ProviderStatsSince returns provider_stats records with created_at >= the given time, ordered ascending.
 func (d *Database) ProviderStatsSince(since time.Time) ([]ProviderStatRow, error) {
 	rows, err := d.db.Query(
 		`SELECT umo, provider_id, provider_model, token_input_other, token_input_cached,
@@ -1258,9 +1323,7 @@ type KBRow struct {
 	UpdatedAt           time.Time
 }
 
-// CreateKB persists a new knowledge base row.
-// KB 写点统一经 withRetry 处理 SQLITE_BUSY（与 SetPreference/RecordProviderCall
-// 等写点一致）：KB 批量导入最容易与其他高频写并发。
+// CreateKB persists a new knowledge base row. KB 写点统一经 withRetry 处理 SQLITE_BUSY（与 SetPreference/RecordProviderCall 等写点一致）：KB 批量导入最容易与其他高频写并发。
 func (d *Database) CreateKB(r KBRow) error {
 	return d.withRetry(func() error {
 		_, err := d.db.Exec(
@@ -1351,8 +1414,7 @@ func scanKBRow(rows *sql.Rows) (*KBRow, error) {
 		&created, &updated); err != nil {
 		return nil, err
 	}
-	// SQLite CURRENT_TIMESTAMP stores UTC; parse as UTC so timezone conversion
-	// happens at render time (kbRowToMap outputs local time).
+	// SQLite CURRENT_TIMESTAMP stores UTC; parse as UTC so timezone conversion happens at render time (kbRowToMap outputs local time).
 	if t, err := time.Parse("2006-01-02 15:04:05", created); err == nil {
 		r.CreatedAt = t
 	}
@@ -1389,8 +1451,7 @@ func (d *Database) ListKBChunks(kbID, docID string) ([]KBChunk, error) {
 	return d.ListKBChunksPage(kbID, docID, 0, 0)
 }
 
-// ListKBChunksPage returns one page of chunk records for a KB (limit<=0 =
-// no limit), optionally filtered by doc_id.
+// ListKBChunksPage returns one page of chunk records for a KB (limit<=0 = no limit), optionally filtered by doc_id.
 func (d *Database) ListKBChunksPage(kbID, docID string, limit, offset int) ([]KBChunk, error) {
 	query := `SELECT chunk_id, kb_id, doc_id, COALESCE(doc_name,''), content, chunk_index
 		FROM knowledge_base_chunks WHERE kb_id=?`
@@ -1434,8 +1495,7 @@ func (d *Database) CountKBChunks(kbID, docID string) (int, error) {
 	return n, err
 }
 
-// CountKBChunksByDoc returns chunk counts grouped by doc_id for a KB in a
-// single query（文档列表统计的聚合版，替代逐文档 N+1 的 CountKBChunks）。
+// CountKBChunksByDoc returns chunk counts grouped by doc_id for a KB in a single query（文档列表统计的聚合版，替代逐文档 N+1 的 CountKBChunks）。
 func (d *Database) CountKBChunksByDoc(kbID string) (map[string]int, error) {
 	rows, err := d.db.Query(
 		`SELECT doc_id, COUNT(*) FROM knowledge_base_chunks WHERE kb_id=? GROUP BY doc_id`,
@@ -1470,8 +1530,7 @@ func (d *Database) DeleteKBChunks(kbID, docID string) error {
 	})
 }
 
-// DeleteKBChunkByID removes a single chunk row (chunk_id is the primary
-// lookup key within the KB). Returns rows affected for not-found detection.
+// DeleteKBChunkByID removes a single chunk row (chunk_id is the primary lookup key within the KB). Returns rows affected for not-found detection.
 func (d *Database) DeleteKBChunkByID(kbID, chunkID string) (int64, error) {
 	var affected int64
 	err := d.withRetry(func() error {
@@ -1489,8 +1548,43 @@ func (d *Database) DeleteKBChunkByID(kbID, chunkID string) (int64, error) {
 	return affected, err
 }
 
-// DeleteKBDoc removes a document's file records. Documents are stored on disk;
-// this clears their chunk records.
+// DeleteKBDoc removes a document's file records. Documents are stored on disk; this clears their chunk records.
 func (d *Database) DeleteKBDoc(kbID, docID string) error {
 	return d.DeleteKBChunks(kbID, docID)
+}
+
+// UpsertUmoAutoName 对齐 Python v4.28.0 (#9909) sqlite.upsert_umo_auto_name： 仅更新 auto_name 字段，不改变 user_alias。umo 唯一键 upsert，存在则更新 auto_name/updated_at（仅当 auto_name 变化时），不存在插入。
+func (d *Database) UpsertUmoAutoName(umo, creatorSenderID, autoName string) error {
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO umo_aliases (umo, creator_sender_id, auto_name, user_alias, created_at, updated_at)
+			 VALUES (?, ?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			 ON CONFLICT(umo) DO UPDATE SET
+			   auto_name = excluded.auto_name,
+			   updated_at = CURRENT_TIMESTAMP
+			 WHERE umo_aliases.auto_name != excluded.auto_name`,
+			umo, creatorSenderID, autoName,
+		)
+		return err
+	})
+}
+
+// GetConversationPlatformIDs 对齐 Python v4.28.0 sqlite.get_conversation_platform_ids： 返回 conversations 表中 distinct platform_id 的有序列表。
+func (d *Database) GetConversationPlatformIDs() ([]string, error) {
+	rows, err := d.db.Query(`SELECT DISTINCT platform_id FROM conversations ORDER BY platform_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []string
+	for rows.Next() {
+		var pid string
+		if err := rows.Scan(&pid); err != nil {
+			return nil, err
+		}
+		if pid != "" {
+			result = append(result, pid)
+		}
+	}
+	return result, rows.Err()
 }

@@ -237,44 +237,24 @@
       "preparing": "准备安装…"
     },
     "risk_warning": {
-      "title": "风险代码警告",
-      "message": "该插件源码包含被禁止导入的危险包（os/exec、syscall、unsafe 等），可能具备执行任意系统命令或访问底层内存的能力。",
-      "hint": "仅在完全信任该插件来源时选择“无视风险，继续安装”。",
-      "confirm": "无视风险，继续安装",
-      "cancel": "取消安装"
+      "message": "插件源码中检测到潜在风险，请确认后继续"
     },
     "c_compiler": {
-      "title": "C 编译器",
-      "message": "该插件声明需要 cgo（C 编译器）才能编译。",
-      "choose_hint": "通常建议在 Linux 下使用 GCC 进行预编译，当然你也可以选择 clang（没有 clang 则自动下载 zig cc）。",
-      "download_hint": "未检测到可用的 C 编译器。选择下载将自动下载并安装当前平台的 Clang。",
-      "use_gcc": "使用系统 GCC",
-      "use_clang": "使用 Clang",
-      "download": "下载并安装 Clang",
-      "cancel": "取消安装"
+      "message": "未检测到可用的 C 编译器，需要选择系统编译器或自动下载 zig"
     },
     "go_sdk": {
-      "title": "需要 Go 工具链/SDK",
-      "message": "该插件需要 Go 工具链（Go SDK）才能编译。",
-      "android_hint": "请在 Termux 中执行以下命令安装 Go SDK：",
-      "download_hint": "是否自动下载 Go 工具链？",
-      "mirrorLabel": "加速下载镜像",
-      "download": "自动下载",
-      "cancel": "取消",
-      "copy": "复制命令",
-      "installed": "我已安装"
+      "message": "未检测到可用的 Go 工具链/SDK，需要确认是否自动下载 Go 工具链"
     },
     "python_runtime": {
-      "title": "需要 Python 运行时",
-      "message": "该插件需要 Python 运行时才能运行。",
-      "android_hint": "请在 Termux 中执行以下命令安装缺失的预编译依赖：",
-      "download_hint": "是否自动下载 CPython？",
-      "mirrorLabel": "加速下载镜像",
-      "download": "自动下载",
-      "cancel": "取消",
-      "copy": "复制命令",
-      "installed": "我已安装",
-      "primaryLabel": "加速地址（官方 CDN）"
+      "message": "无法准备 Python 运行时，需要确认是否自动下载 CPython"
+    },
+    "depsMode": {
+      "title": "选择 Python 依赖安装方式",
+      "desc": "完整安装将预装全部宿主依赖（约 3-5 分钟）；需要时安装仅装核心依赖，运行缺包时自动补装。可随时在 设置-网络 中修改。",
+      "lazyLabel": "需要时安装（推荐）",
+      "fullLabel": "完整安装",
+      "hint": "选择后此设置将保存到系统配置（python_deps_install_mode）。",
+      "cancel": "取消"
     },
     "update": {
       "title": "更新插件",
@@ -468,6 +448,16 @@
     "sandboxPresetReadonly": "Sandbox 预置技能在此处为只读，无法在本地技能页面删除或启用/停用。",
     "pluginReadonly": "插件提供的技能由插件管理，无法在本地技能页面删除或下载。",
     "pluginDisabled": "插件已禁用",
+    "select": "选择",
+    "selectSkill": "选择技能 {name}",
+    "selectAll": "全选",
+    "clearSelection": "取消选择",
+    "deleteSelected": "删除所选 ({count})",
+    "batchDeleteTitle": "批量删除技能",
+    "batchDeleteMessage": "确定要删除这 {count} 个技能吗？此操作不可撤销。",
+    "batchDeleteConfirm": "删除 {count} 个",
+    "batchDeleteSuccess": "成功删除 {count} 个技能。",
+    "batchDeletePartial": "已删除 {succeeded} 个；{failed} 个删除失败",
     "openEditor": "查看/编辑",
     "editorTitle": "编辑技能",
     "editorLoadFailed": "读取技能文件失败",

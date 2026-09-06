@@ -1,11 +1,12 @@
 <script setup lang="ts">
 /**
  * 休眠策略面板 - 组件管理页第三个视图（与"指令/函数工具"按钮同列）。
- * 每插件的"允许休眠"开关 + 独立闲置分钟数（0 = 回退全局默认）+ 过滤器/钩子
- * 风险提示。顶部"新装插件默认休眠时间"仅作为新装插件的默认阈值，不覆盖已
- * 单独配置的插件（也不控制所有插件的开关）。
+ * 每插件的"允许休眠"开关 + 独立闲置分钟数（0 = 回退全局默认）+ 唤醒方式
+ * （仅插件唤醒 / 过滤器钩子+指令唤醒）+ 过滤器/钩子风险提示。顶部"新装
+ * 插件默认休眠时间"仅作为新装插件的默认阈值，不覆盖已单独配置的插件
+ * （也不控制所有插件的开关）。
  */
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { pluginApi } from "@/api/v1";
 import { fetchWithAuth } from "@/api/http";
 import { useModuleI18n } from "@/i18n/composables";
@@ -25,11 +26,22 @@ interface SleepPluginItem {
   enabled: boolean;
   allowSleep: boolean;
   idleUnloadMinutes: number;
+  idleWakeMode: string;
   hasFilter: boolean;
   hasHook: boolean;
   activeEventListener: boolean;
   version: string;
 }
+
+// 休眠唤醒方式选项：command_only = 插件指令+工具唤醒（默认；钩子/被动事件不唤醒）；
+// hook_and_command = 插件指令+工具+过滤器唤醒。
+const WAKE_COMMAND_ONLY = "command_only";
+const WAKE_HOOK_AND_COMMAND = "hook_and_command";
+
+const wakeModeItems = computed(() => [
+  { value: WAKE_HOOK_AND_COMMAND, title: tm("sleep.wakeHookAndCommand") },
+  { value: WAKE_COMMAND_ONLY, title: tm("sleep.wakeCommandOnly") },
+]);
 
 // 插件语言从 id 后缀（_go/_python）推断，优先用后端 language 字段。
 const languageOf = (p: Record<string, unknown>) => {
@@ -44,7 +56,6 @@ const languageOf = (p: Record<string, unknown>) => {
 
 const loading = ref(false);
 const saving = ref(false);
-const globalMinutes = ref(0);
 const plugins = ref<SleepPluginItem[]>([]);
 const snackbar = ref<{ show: boolean; message: string; color: string }>({
   show: false,
@@ -58,47 +69,9 @@ const toast = (message: string, color = "success") => {
   snackbar.value.show = true;
 };
 
-const fetchGlobalMinutes = async () => {
-  // 全局默认阈值（分钟）：openapi 客户端只有 POST 变体，GET 走原始请求。
-  try {
-    const res = await fetchWithAuth("/api/v1/plugins/idle-unload-global", {
-      method: "GET",
-    });
-    const j = await res.json().catch(() => null);
-    if (j?.status === "ok") {
-      globalMinutes.value = Number(j.data?.minutes || 0);
-    }
-  } catch {
-    // 忽略：全局默认仅用于展示，拉不到不阻塞插件列表。
-  }
-};
-
-const saveGlobalMinutes = async (raw: number | string | null) => {
-  const minutes = Math.max(0, Number(raw) || 0);
-  if (saving.value) return;
-  saving.value = true;
-  try {
-    const res = await pluginApi.setGlobalIdleSleep(minutes);
-    if (res.data.status === "ok") {
-      globalMinutes.value = minutes;
-      toast(tm("sleep.globalSaved") || "已保存新装插件默认休眠时间");
-    } else {
-      toast(
-        (res.data as any)?.message || tm("messages.operationFailed"),
-        "error",
-      );
-    }
-  } catch (err) {
-    toast((err as any)?.message || String(err), "error");
-  } finally {
-    saving.value = false;
-  }
-};
-
 const fetchData = async () => {
   loading.value = true;
   try {
-    await fetchGlobalMinutes();
     const listRes = await pluginApi.list();
     if (listRes.data.status === "ok") {
       const items = (listRes.data.data || []) as Array<Record<string, unknown>>;
@@ -111,6 +84,7 @@ const fetchData = async () => {
           enabled: Boolean(p.enabled),
           allowSleep: Boolean(p.idle_unload),
           idleUnloadMinutes: Number(p.idle_unload_minutes || 0),
+          idleWakeMode: String(p.idle_wake_mode || WAKE_COMMAND_ONLY),
           hasFilter: Boolean(p.has_filter),
           hasHook: Boolean(p.has_hook),
           activeEventListener: Boolean(p.active_event_listener),
@@ -124,17 +98,18 @@ const fetchData = async () => {
   }
 };
 
+/** 开启休眠时不传阈值，由后端落 plugin.DefaultIdleUnloadMinutes（单一真源在后端）。 */
 const togglePlugin = async (item: SleepPluginItem, allowSleep: boolean) => {
   if (saving.value || !item.id) return;
   saving.value = true;
   try {
-    const res = await pluginApi.setIdleSleep(
-      item.id,
-      allowSleep,
-      item.idleUnloadMinutes || undefined,
-    );
+    const res = await pluginApi.setIdleSleep(item.id, allowSleep);
     if (res.data.status === "ok") {
       item.allowSleep = allowSleep;
+      const echo = (res.data as any)?.data?.idle_unload_minutes;
+      if (allowSleep && typeof echo === "number") {
+        item.idleUnloadMinutes = echo;
+      }
       toast(tm("sleep.pluginSaved"));
     } else {
       toast(
@@ -174,6 +149,32 @@ const savePluginMinutes = async (
   }
 };
 
+const savePluginWakeMode = async (item: SleepPluginItem, mode: string) => {
+  if (saving.value || !item.id) return;
+  saving.value = true;
+  try {
+    const res = await pluginApi.setIdleSleep(
+      item.id,
+      item.allowSleep,
+      item.idleUnloadMinutes,
+      mode,
+    );
+    if (res.data.status === "ok") {
+      item.idleWakeMode = mode;
+      toast(tm("sleep.pluginSaved"));
+    } else {
+      toast(
+        (res.data as any)?.message || tm("messages.operationFailed"),
+        "error",
+      );
+    }
+  } catch (err) {
+    toast((err as any)?.message || String(err), "error");
+  } finally {
+    saving.value = false;
+  }
+};
+
 onMounted(async () => {
   await fetchData();
 });
@@ -183,29 +184,8 @@ onMounted(async () => {
   <div>
     <v-card variant="flat" class="sleep-panel">
       <v-card-text>
-        <div class="d-flex align-center ga-3 mb-2 flex-wrap">
-          <v-text-field
-            type="number"
-            min="0"
-            :model-value="globalMinutes"
-            density="compact"
-            hide-details
-            style="max-width: 150px"
-            :disabled="saving"
-            :label="tm('sleep.globalMinutesLabel')"
-            @change="(v: any) => saveGlobalMinutes(v?.target?.value ?? 0)"
-          />
-          <div>
-            <div class="text-body-1 font-weight-medium">
-              {{ tm("sleep.globalMinutesDesc") }}
-            </div>
-            <div class="text-caption text-medium-emphasis">
-              {{ tm("sleep.globalMinutesHint") }}
-            </div>
-          </div>
-        </div>
-        <div class="sleep-warning mb-4">
-          {{ tm("sleep.warning") }}
+        <div class="text-body-2 text-medium-emphasis mb-4">
+          {{ tm("sleep.intro") }}
         </div>
 
         <v-table v-if="plugins.length" class="detail-info-table sleep-table">
@@ -215,6 +195,7 @@ onMounted(async () => {
               <th>{{ tm("sleep.columnLanguage") }}</th>
               <th>{{ tm("sleep.columnAllow") }}</th>
               <th>{{ tm("sleep.columnMinutes") }}</th>
+              <th>{{ tm("sleep.columnWake") }}</th>
               <th>{{ tm("sleep.columnRisk") }}</th>
             </tr>
           </thead>
@@ -258,11 +239,28 @@ onMounted(async () => {
                 </span>
               </td>
               <td>
+                <v-select
+                  v-if="item.allowSleep"
+                  :model-value="item.idleWakeMode"
+                  :items="wakeModeItems"
+                  item-title="title"
+                  item-value="value"
+                  density="compact"
+                  hide-details
+                  style="max-width: 180px"
+                  :disabled="saving"
+                  @update:model-value="(v: string) => savePluginWakeMode(item, v)"
+                />
+                <span v-else class="text-caption text-medium-emphasis">
+                  {{ tm("sleep.residentLabel") }}
+                </span>
+              </td>
+              <td>
                 <span
-                  v-if="item.activeEventListener"
+                  v-if="item.allowSleep && item.idleWakeMode !== WAKE_HOOK_AND_COMMAND && item.activeEventListener"
                   class="sleep-warning"
                 >
-                  ⚠️ {{ tm("sleep.listenerRisk") }}
+                  ⚠️ {{ tm("sleep.commandOnlyRisk") }}
                 </span>
               </td>
             </tr>

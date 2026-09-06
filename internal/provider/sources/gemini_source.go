@@ -15,13 +15,17 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
 
+// 对齐 Python #9881：Gemini thinking level 允许集合与回退值。
+var geminiThinkingLevels = []string{"MINIMAL", "LOW", "MEDIUM", "HIGH"}
+
 // GeminiSource is a Google Gemini chat provider.
 type GeminiSource struct {
 	*provider.BaseProvider
-	apiBase      string
-	apiKey       string
-	client       *http.Client
-	streamClient *http.Client
+	apiBase        string
+	apiKey         string
+	client         *http.Client
+	streamClient   *http.Client
+	thinkingConfig map[string]interface{}
 }
 
 // NewGeminiSource creates a Gemini provider.
@@ -45,6 +49,9 @@ func NewGeminiSource(config, settings map[string]interface{}) *GeminiSource {
 		if k, ok := keys[0].(string); ok {
 			s.apiKey = k
 		}
+	}
+	if tc, ok := config["gm_thinking_config"].(map[string]interface{}); ok {
+		s.thinkingConfig = tc
 	}
 	return s
 }
@@ -106,9 +113,10 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 			} `json:"content"`
 		} `json:"candidates"`
 		UsageMetadata struct {
-			PromptTokenCount     int `json:"promptTokenCount"`
-			CandidatesTokenCount int `json:"candidatesTokenCount"`
-			TotalTokenCount      int `json:"totalTokenCount"`
+			PromptTokenCount        int `json:"promptTokenCount"`
+			CandidatesTokenCount    int `json:"candidatesTokenCount"`
+			TotalTokenCount         int `json:"totalTokenCount"`
+			CachedContentTokenCount int `json:"cachedContentTokenCount"`
 		} `json:"usageMetadata"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -136,12 +144,17 @@ func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderReque
 		}
 	}
 	logger.Debug("LLM response: text_len=%d", len(text))
+	// prompt_token_count 包含从缓存服务的 token，需减去 cached_content_token_count
+	// 以避免重复计算缓存 input（对齐 Python #9881）。
+	promptTokens := result.UsageMetadata.PromptTokenCount
+	cached := result.UsageMetadata.CachedContentTokenCount
 	llmResp := &provider.LLMResponse{
 		Role:           "assistant",
 		CompletionText: text,
 		Usage: &provider.TokenUsage{
-			InputOther: result.UsageMetadata.PromptTokenCount,
-			Output:     result.UsageMetadata.CandidatesTokenCount,
+			InputOther:  promptTokens - cached,
+			InputCached: cached,
+			Output:      result.UsageMetadata.CandidatesTokenCount,
 		},
 	}
 	for _, tc := range toolCalls {
@@ -205,17 +218,22 @@ func (s *GeminiSource) TextChatStream(ctx context.Context, req *provider.Provide
 					} `json:"content"`
 				} `json:"candidates"`
 				UsageMetadata *struct {
-					PromptTokenCount     int `json:"promptTokenCount"`
-					CandidatesTokenCount int `json:"candidatesTokenCount"`
+					PromptTokenCount        int `json:"promptTokenCount"`
+					CandidatesTokenCount    int `json:"candidatesTokenCount"`
+					CachedContentTokenCount int `json:"cachedContentTokenCount"`
 				} `json:"usageMetadata"`
 			}
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 				return false
 			}
 			if chunk.UsageMetadata != nil {
+				// 对齐 Python #9881：减去 cached_content_token_count 避免重复计算缓存 input。
+				pt := chunk.UsageMetadata.PromptTokenCount
+				cc := chunk.UsageMetadata.CachedContentTokenCount
 				usage = &provider.TokenUsage{
-					InputOther: chunk.UsageMetadata.PromptTokenCount,
-					Output:     chunk.UsageMetadata.CandidatesTokenCount,
+					InputOther:  pt - cc,
+					InputCached: cc,
+					Output:      chunk.UsageMetadata.CandidatesTokenCount,
 				}
 			}
 			for _, cand := range chunk.Candidates {
@@ -361,5 +379,40 @@ func (s *GeminiSource) buildRequestBody(req *provider.ProviderRequest, stream bo
 			}
 		}
 	}
+	// 对齐 Python #9881：Gemini thinking level 校验与注入。
+	s.applyThinkingConfig(body)
 	return body
+}
+
+// applyThinkingConfig 校验并注入 Gemini thinking level（对齐 Python #9881）。
+// 允许集合 {MINIMAL,LOW,MEDIUM,HIGH}；gemini-3.7 模型仅 {LOW,MEDIUM,HIGH}，回退 MEDIUM；
+// 其余模型回退 HIGH。
+func (s *GeminiSource) applyThinkingConfig(body map[string]interface{}) {
+	if s.thinkingConfig == nil {
+		return
+	}
+	level, _ := s.thinkingConfig["level"].(string)
+	if level == "" {
+		return
+	}
+	level = strings.ToUpper(level)
+	modelName := s.GetModel()
+	allowedLevels := geminiThinkingLevels
+	fallbackLevel := "HIGH"
+	if strings.HasPrefix(modelName, "gemini-3.7") {
+		allowedLevels = []string{"LOW", "MEDIUM", "HIGH"}
+		fallbackLevel = "MEDIUM"
+	}
+	valid := false
+	for _, l := range allowedLevels {
+		if level == l {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		logger.Warn("Invalid thinking level %s for %s, using %s", level, modelName, fallbackLevel)
+		level = fallbackLevel
+	}
+	body["thinkingConfig"] = map[string]interface{}{"thinkingLevel": level}
 }

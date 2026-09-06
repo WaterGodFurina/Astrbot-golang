@@ -40,7 +40,30 @@ type EventSource struct {
 	IsAdmin    bool
 }
 
-// MessageObj holds the raw platform message metadata.
+// MessageMember identifies a chat member (defined here so MessageObj can
+// reference Group without an import cycle; platform package aliases it).
+type MessageMember struct {
+	UserID   string `json:"user_id"`
+	Nickname string `json:"nickname,omitempty"`
+}
+
+// String implements the historical platform.MessageMember String method.
+func (m MessageMember) String() string {
+	return fmt.Sprintf("User ID: %s, Nickname: %s", m.UserID, m.Nickname)
+}
+
+// Group describes a chat group.
+type Group struct {
+	GroupID     string          `json:"group_id"`
+	GroupName   string          `json:"group_name,omitempty"`
+	GroupAvatar string          `json:"group_avatar,omitempty"`
+	GroupOwner  string          `json:"group_owner,omitempty"`
+	GroupAdmins []string        `json:"group_admins,omitempty"`
+	Members     []MessageMember `json:"members,omitempty"`
+	// MemberCount is the total member count, available even when the member
+	// list is incomplete (aligned with Python MessageGroup.member_count).
+	MemberCount *int `json:"member_count,omitempty"`
+}
 type MessageObj struct {
 	MessageID   string
 	SelfID      string
@@ -50,6 +73,9 @@ type MessageObj struct {
 	MessageStr  string
 	RawMessage  interface{}
 	Timestamp   time.Time
+	// Group carries inbound group metadata (aligned with Python
+	// AstrBotMessage.group); adapters fill what the platform provides.
+	Group *Group
 }
 
 // Event represents an incoming message event.
@@ -159,6 +185,32 @@ func (e *Event) GetGroupID() string {
 		return e.Source.ConvID
 	}
 	return ""
+}
+
+// GetGroup returns group information (aligned with Python
+// AstrMessageEvent.get_group default implementation): the inbound group data
+// when it matches, or an ID-only group object for an explicit query. Platform
+// event enrichments (member lists, avatars, APIs) are layered on top by
+// adapters owning the event.
+func (e *Event) GetGroup(groupID string) *Group {
+	resolved := groupID
+	if resolved == "" {
+		resolved = e.GetGroupID()
+	}
+	if resolved == "" {
+		return nil
+	}
+	resolved = toStringValue(resolved)
+	if e.MessageObj != nil && e.MessageObj.Group != nil && e.MessageObj.Group.GroupID == resolved {
+		return e.MessageObj.Group
+	}
+	return &Group{GroupID: resolved}
+}
+
+// toStringValue normalizes an ID string (identity for strings; kept as a hook
+// so numeric ID types stay toString per project convention).
+func toStringValue(s string) string {
+	return s
 }
 
 // GetPlatformID returns the platform name.

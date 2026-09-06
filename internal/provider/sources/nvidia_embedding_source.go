@@ -39,7 +39,7 @@ func NewNvidiaEmbeddingSource(config, settings map[string]interface{}) *NvidiaEm
 	s.apiBase = strings.TrimSuffix(s.apiBase, "/")
 	s.apiBase = strings.TrimSuffix(s.apiBase, "/embeddings")
 	s.apiKey = configString(config, "embedding_api_key", "")
-	s.model = configString(config, "embedding_model", "nvidia/llama-nemotron-embed-1b-v2")
+	s.model = configString(config, "embedding_model", "nvidia/nemotron-3-embed-1b")
 	s.inputType = configString(config, "input_type", "")
 	s.dim = configInt(config, "embedding_dimensions", 0)
 	s.SetModel(s.model)

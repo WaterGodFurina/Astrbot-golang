@@ -160,11 +160,10 @@ func (s *Server) fetchProviderSourceModels(sourceID string) ([]string, map[strin
 }
 
 // fetchOpenAICompatModels lists models via an OpenAI-compatible /models endpoint.
-// URL 出站前过 SSRF 校验（拒绝内网/回环地址）。
+// 注意：api_base 是管理员在 WebUI 主动配置的自有模型服务端点（本地部署
+// Ollama/vLLM 等内网地址合法），故不做 SSRF 内网拦截；provider 配置接口
+// 本身 systemOnly，SSRF 面与 Python 原版一致。
 func (s *Server) fetchOpenAICompatModels(client *http.Client, url, authHeader, authValue, extraHeader, extraValue string) ([]string, error) {
-	if err := validateOutboundURL(url); err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -204,12 +203,9 @@ func (s *Server) fetchOpenAICompatModels(client *http.Client, url, authHeader, a
 }
 
 // fetchOllamaModels lists models via the Ollama /api/tags endpoint.
-// URL 出站前过 SSRF 校验（拒绝内网/回环地址）。
+// api_base 为管理员配置的自有服务端点（本地/内网 Ollama 合法），不做 SSRF 拦截。
 func (s *Server) fetchOllamaModels(client *http.Client, apiBase string) ([]string, error) {
 	url := strings.TrimSuffix(apiBase, "/") + "/api/tags"
-	if err := validateOutboundURL(url); err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -21,6 +22,10 @@ type FunctionTool struct {
 	Handler           func(ctx context.Context, args map[string]interface{}) (interface{}, error) `json:"-"`
 	Active            bool                                                                        `json:"active"`
 	HandlerModulePath string                                                                      `json:"handler_module_path,omitempty"`
+	// IsBackgroundTask 声明该工具为后台任务（对齐 Python
+	// FunctionTool.is_background_task）：调用立即返回任务标识，实际工作在
+	// 后台继续执行，完成后合成事件唤醒主 Agent（见 pipeline executeTool）。
+	IsBackgroundTask bool `json:"is_background_task,omitempty"`
 }
 
 // NewFunctionTool creates a tool.
@@ -83,10 +88,20 @@ func NewToolSet() *ToolSet {
 	return &ToolSet{tools: make(map[string]*FunctionTool)}
 }
 
-// AddTool adds or replaces a tool (last wins for same name).
+// AddTool adds a tool. 语义对齐 Python ToolSet.add_tool（tool.py）：
+// 同名工具冲突时优先保留 Active 的一方——
+//
+//	existing active + new inactive → 保留 existing
+//	existing inactive + new active → 换成 new
+//	两侧 active 状态相同 → new 覆盖（last wins）
 func (ts *ToolSet) AddTool(tool *FunctionTool) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
+	if existing, ok := ts.tools[tool.Name]; ok {
+		if existing.Active && !tool.Active {
+			return
+		}
+	}
 	ts.tools[tool.Name] = tool
 }
 
@@ -126,8 +141,14 @@ func (ts *ToolSet) Empty() bool {
 func (ts *ToolSet) OpenAISchema() []map[string]interface{} {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	result := make([]map[string]interface{}, 0, len(ts.tools))
+	// 稳定排序保 prompt-cache 前缀（对齐 Python #9798）。
+	sorted := make([]*FunctionTool, 0, len(ts.tools))
 	for _, t := range ts.tools {
+		sorted = append(sorted, t)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	result := make([]map[string]interface{}, 0, len(sorted))
+	for _, t := range sorted {
 		if t.Active {
 			result = append(result, t.ToOpenAISchema())
 		}
@@ -139,8 +160,13 @@ func (ts *ToolSet) OpenAISchema() []map[string]interface{} {
 func (ts *ToolSet) AnthropicSchema() []map[string]interface{} {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	result := make([]map[string]interface{}, 0, len(ts.tools))
+	sorted := make([]*FunctionTool, 0, len(ts.tools))
 	for _, t := range ts.tools {
+		sorted = append(sorted, t)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	result := make([]map[string]interface{}, 0, len(sorted))
+	for _, t := range sorted {
 		if t.Active {
 			result = append(result, t.ToAnthropicSchema())
 		}
@@ -152,8 +178,13 @@ func (ts *ToolSet) AnthropicSchema() []map[string]interface{} {
 func (ts *ToolSet) GoogleSchema() map[string]interface{} {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	functions := make([]map[string]interface{}, 0, len(ts.tools))
+	sorted := make([]*FunctionTool, 0, len(ts.tools))
 	for _, t := range ts.tools {
+		sorted = append(sorted, t)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	functions := make([]map[string]interface{}, 0, len(sorted))
+	for _, t := range sorted {
 		if t.Active {
 			functions = append(functions, t.ToGoogleSchema())
 		}
@@ -182,6 +213,13 @@ func (m *FunctionToolManager) Empty() bool {
 
 // AddFunc registers a function tool.
 func (m *FunctionToolManager) AddFunc(name, desc string, params map[string]interface{}, handler func(ctx context.Context, args map[string]interface{}) (interface{}, error)) {
+	m.AddFuncFull(name, desc, params, handler, false)
+}
+
+// AddFuncFull registers a function tool with full control, including the
+// background-task declaration（对齐 Python FunctionTool.is_background_task）。
+// 同名冲突语义与 ToolSet.AddTool 一致：新 inactive 不覆盖已有 active。
+func (m *FunctionToolManager) AddFuncFull(name, desc string, params map[string]interface{}, handler func(ctx context.Context, args map[string]interface{}) (interface{}, error), isBackgroundTask bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Remove existing tool with same name
@@ -192,13 +230,19 @@ func (m *FunctionToolManager) AddFunc(name, desc string, params map[string]inter
 		}
 	}
 	m.funcList = append(m.funcList, &FunctionTool{
-		Name:        name,
-		Description: desc,
-		Parameters:  params,
-		Handler:     handler,
-		Active:      true,
+		Name:             name,
+		Description:      desc,
+		Parameters:       params,
+		Handler:          handler,
+		Active:           true,
+		IsBackgroundTask: isBackgroundTask,
 	})
 }
+
+// DefaultFuncTools 是宿主侧 LLM 函数工具的默认注册表：宿主代码/未来 SDK
+// 注册的 FunctionTool 挂在这里，pipeline executeTool 按其派发（含后台任务
+// 语义判定）。Go 内置工具走 stages.go 的 dispatch switch，不经过此表。
+var DefaultFuncTools = NewFunctionToolManager()
 
 // RemoveFunc removes a tool by name.
 func (m *FunctionToolManager) RemoveFunc(name string) {

@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -183,27 +184,28 @@ func fontHasGlyph(path string, r rune) bool {
 
 // ImageOptions controls the whole rendered image.
 type ImageOptions struct {
-	// Width is the canvas width in pixels (0 defaults to 1080).
+	// Width is the canvas width in pixels (0 defaults to 800).
 	Width int
-	// BgColor is the background color (zero value = white).
+	// BgColor is the background color (zero value = PAPER).
 	BgColor color.RGBA
 	// FontPath is a TTF/OTF font file. When empty a system CJK-capable font
 	// is searched (Droid Sans Fallback etc.); an error is returned if none
 	// is found.
 	FontPath string
-	// FontSize is the body text size in points (0 defaults to 17).
+	// FontSize is the body text size in points (0 defaults to 25).
 	FontSize float64
-	// LineSpacing is the line spacing multiplier (0 defaults to 1.6).
+	// LineSpacing is the line spacing multiplier (0 defaults to 1.72).
 	LineSpacing float64
-	// Padding is the inner margin on all four sides (0 defaults to 48).
+	// Padding is the inner margin on all four sides (0 defaults to 32).
 	Padding int
-	// TextColor is the body text color (zero value = near black).
+	// TextColor is the body text color (zero value = INK).
 	TextColor color.RGBA
 	// Title is an optional heading drawn at the top (empty = none).
+	// Note: the paper-style renderer uses a branded masthead instead.
 	Title string
-	// TitleSize is the title font size (0 defaults to FontSize+10).
+	// TitleSize is the title font size (0 defaults to 28).
 	TitleSize float64
-	// TitleColor is the title color (zero value = TextColor).
+	// TitleColor is the title color (zero value = INK).
 	TitleColor color.RGBA
 	// JPEGQuality is used by RenderJPEG (default 90).
 	JPEGQuality int
@@ -211,28 +213,28 @@ type ImageOptions struct {
 
 func (o ImageOptions) withDefaults() ImageOptions {
 	if o.Width <= 0 {
-		o.Width = 1080
+		o.Width = 800
 	}
 	if o.BgColor == (color.RGBA{}) {
-		o.BgColor = color.RGBA{255, 255, 255, 255}
+		o.BgColor = color.RGBA{251, 251, 250, 255} // PAPER
 	}
 	if o.FontSize <= 0 {
-		o.FontSize = 17
+		o.FontSize = 25
 	}
 	if o.LineSpacing <= 0 {
-		o.LineSpacing = 1.6
+		o.LineSpacing = 1.72
 	}
 	if o.Padding <= 0 {
-		o.Padding = 48
+		o.Padding = 32 // CONTENT_MARGIN
 	}
 	if o.TextColor == (color.RGBA{}) {
-		o.TextColor = color.RGBA{30, 30, 30, 255}
+		o.TextColor = color.RGBA{32, 34, 36, 255} // INK
 	}
 	if o.TitleSize <= 0 {
-		o.TitleSize = o.FontSize + 10
+		o.TitleSize = 28
 	}
 	if o.TitleColor == (color.RGBA{}) {
-		o.TitleColor = o.TextColor
+		o.TitleColor = color.RGBA{32, 34, 36, 255} // INK
 	}
 	if o.JPEGQuality <= 0 {
 		o.JPEGQuality = 90
@@ -240,17 +242,46 @@ func (o ImageOptions) withDefaults() ImageOptions {
 	return o
 }
 
-// imageLine is a unit of layout: either a wrapped text block or a picture.
+// imageLine is a unit of layout: either a raw text block or a picture.
 type imageLine struct {
-	kind     string // "text" | "image"
-	text     []string
-	size     float64
-	color    color.RGBA
-	align    string // "left" | "center" | "right"
-	hasEmoji bool
-	img      image.Image
-	imgW     int
-	imgH     int
+	kind  string // "text" | "image"
+	text  []string
+	size  float64
+	color color.RGBA
+	align string // "left" | "center" | "right"
+	img   image.Image
+	imgW  int
+	imgH  int
+}
+
+// Paper-style color palette (对齐 Python local_strategy.py).
+func paperPaper() color.RGBA      { return color.RGBA{251, 251, 250, 255} }
+func paperInk() color.RGBA        { return color.RGBA{32, 34, 36, 255} }
+func paperMuted() color.RGBA      { return color.RGBA{102, 107, 112, 255} }
+func paperLine() color.RGBA       { return color.RGBA{212, 216, 219, 255} }
+func paperStrongLine() color.RGBA { return color.RGBA{188, 194, 198, 255} }
+func paperSoftFill() color.RGBA   { return color.RGBA{242, 243, 243, 255} }
+func paperCodeFill() color.RGBA   { return color.RGBA{244, 245, 245, 255} }
+func paperAccent() color.RGBA     { return color.RGBA{47, 134, 189, 255} }
+
+// mdBlock is a measured markdown block (paragraph, heading, list, code, etc).
+type mdBlock interface {
+	measure(r *ImageRenderer, width float64) int
+	render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxF(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // cachedFontFace returns a font.Face for the given path and size. The parsed
@@ -359,7 +390,8 @@ func NewImageRenderer(opts ImageOptions) (*ImageRenderer, error) {
 	return r, nil
 }
 
-// AddText appends a text block (auto word/rune wrapped to the content width).
+// AddText appends a raw markdown text block. The text is re-parsed as markdown
+// at render time (so block-level layout aligns with Python local_strategy).
 // Emoji are preserved and rendered as Twemoji images.
 func (r *ImageRenderer) AddText(text string, size float64, c color.RGBA, align string) error {
 	if size <= 0 {
@@ -368,29 +400,12 @@ func (r *ImageRenderer) AddText(text string, size float64, c color.RGBA, align s
 	if c == (color.RGBA{}) {
 		c = r.opts.TextColor
 	}
-	face, err := cachedFontFace(r.font, size)
-	if err != nil {
-		return err
-	}
-	mdc := gg.NewContext(1, 1)
-	mdc.SetFontFace(face)
-	maxW := float64(r.opts.Width - 2*r.opts.Padding)
-	var wrapped []string
-	hasEmoji := strings.ContainsFunc(text, isEmojiRune)
-	if hasEmoji {
-		// Emoji occupy roughly font-size width; wrap at grapheme boundaries so
-		// ZWJ sequences / skin tones stay together and take correct width.
-		wrapped = r.wrapByGraphemes(mdc, text, maxW, size)
-	} else {
-		wrapped = wrapSmart(mdc, text, maxW)
-	}
 	r.lines = append(r.lines, &imageLine{
-		kind:     "text",
-		text:     wrapped,
-		size:     size,
-		color:    c,
-		align:    align,
-		hasEmoji: hasEmoji,
+		kind:  "text",
+		text:  []string{text},
+		size:  size,
+		color: c,
+		align: align,
 	})
 	return nil
 }
@@ -410,94 +425,1015 @@ func (r *ImageRenderer) AddImage(img image.Image) {
 	r.lines = append(r.lines, &imageLine{kind: "image", img: img, imgW: w, imgH: h})
 }
 
-// layoutHeight computes the total content height by simulating the layout.
-func (r *ImageRenderer) layoutHeight() int {
-	y := float64(r.opts.Padding)
-	if r.opts.Title != "" {
-		face, _ := cachedFontFace(r.font, r.opts.TitleSize)
-		mdc := gg.NewContext(1, 1)
-		mdc.SetFontFace(face)
-		_, th := mdc.MeasureString(r.opts.Title)
-		y += th * 1.4
-		y += float64(r.opts.Padding) / 2 // gap after title
-	}
+// rawText concatenates all text lines added via AddText (preserving \n
+// between separate AddText calls) so render() can parse the full markdown.
+func (r *ImageRenderer) rawText() string {
+	var parts []string
 	for _, ln := range r.lines {
-		if ln.kind == "image" {
-			y += float64(ln.imgH) + float64(r.opts.Padding)/2
-			continue
+		if ln.kind == "text" {
+			parts = append(parts, strings.Join(ln.text, "\n"))
 		}
-		face, _ := cachedFontFace(r.font, ln.size)
-		mdc := gg.NewContext(1, 1)
-		mdc.SetFontFace(face)
-		_, th := mdc.MeasureString("中")
-		lineH := th * r.opts.LineSpacing
-		y += lineH*float64(len(ln.text)) + float64(r.opts.Padding)/3
 	}
-	y += float64(r.opts.Padding)
-	return int(y)
+	return strings.Join(parts, "\n")
 }
 
-// render draws everything onto a new canvas of the computed height.
+// collectImages returns all image lines in order (rendered inline after text).
+func (r *ImageRenderer) collectImages() []*imageLine {
+	var imgs []*imageLine
+	for _, ln := range r.lines {
+		if ln.kind == "image" {
+			imgs = append(imgs, ln)
+		}
+	}
+	return imgs
+}
+
+// render draws the paper-style AstrBot image: masthead + markdown blocks.
 func (r *ImageRenderer) render() (*image.RGBA, error) {
-	height := r.layoutHeight()
-	dc := gg.NewContext(r.opts.Width, height)
+	mdText := r.rawText()
+	contentW := float64(r.opts.Width - 2*r.opts.Padding)
+	blocks := parseMarkdownBlocks(mdText)
+
+	// Measure all blocks.
+	blockHeights := make([]int, len(blocks))
+	totalContent := 0
+	for i, b := range blocks {
+		h := b.measure(r, contentW)
+		blockHeights[i] = h
+		totalContent += h
+	}
+
+	// Images: append after text blocks (简化——Go 端 AddImage 在 pipeline 里
+	// 不与 AddText 混用，但保留兼容：图片接在文字后依次排列）。
+	images := r.collectImages()
+	imgTotalH := 0.0
+	for _, im := range images {
+		imgTotalH += float64(im.imgH) + 20
+	}
+
+	mastheadH := 91.0
+	bottomPad := 34.0
+	totalH := mastheadH + float64(totalContent) + imgTotalH + bottomPad
+	if totalH < 140 {
+		totalH = 140
+	}
+
+	dc := gg.NewContext(r.opts.Width, int(totalH))
 	dc.SetColor(r.opts.BgColor)
 	dc.Clear()
 
-	x := float64(r.opts.Padding)
-	y := float64(r.opts.Padding)
-	contentW := float64(r.opts.Width - 2*r.opts.Padding)
+	r.drawMasthead(dc)
 
-	if r.opts.Title != "" {
-		face, err := cachedFontFace(r.font, r.opts.TitleSize)
-		if err != nil {
-			return nil, err
+	y := mastheadH
+	for i, b := range blocks {
+		_ = blockHeights[i]
+		y = b.render(r, dc, float64(r.opts.Padding), y, contentW)
+	}
+
+	// Draw images after text.
+	for _, im := range images {
+		ix := float64(r.opts.Padding)
+		if im.imgW < int(contentW) {
+			ix += (contentW - float64(im.imgW)) / 2
+		}
+		dc.DrawImage(im.img, int(ix), int(y)+10)
+		y += float64(im.imgH) + 20
+	}
+
+	return dc.Image().(*image.RGBA), nil
+}
+
+// drawMasthead draws the AstrBot branded header (star mark + wordmark + version).
+func (r *ImageRenderer) drawMasthead(dc *gg.Context) {
+	mx := float64(r.opts.Padding) + 14 // center_x
+	my := 43.0                         // center_y
+	outer := 13.0
+	inner := 4.0
+	accent := paperAccent()
+
+	// Main star polygon (8-pointed).
+	star := []struct{ x, y float64 }{
+		{mx, my - outer},
+		{mx + inner, my - inner},
+		{mx + outer, my},
+		{mx + inner, my + inner},
+		{mx, my + outer},
+		{mx - inner, my + inner},
+		{mx - outer, my},
+		{mx - inner, my - inner},
+	}
+	dc.NewSubPath()
+	for i, p := range star {
+		if i == 0 {
+			dc.MoveTo(p.x, p.y)
+		} else {
+			dc.LineTo(p.x, p.y)
+		}
+	}
+	dc.ClosePath()
+	dc.SetColor(accent)
+	dc.Fill()
+
+	// Small star (offset up-right).
+	smallX := mx + 16
+	smallY := my - 14
+	sOuter := 5.0
+	sInner := 2.0
+	dc.NewSubPath()
+	smallStar := []struct{ x, y float64 }{
+		{smallX, smallY - sOuter},
+		{smallX + sInner, smallY - sInner},
+		{smallX + sOuter, smallY},
+		{smallX + sInner, smallY + sInner},
+		{smallX, smallY + sOuter},
+		{smallX - sInner, smallY + sInner},
+		{smallX - sOuter, smallY},
+		{smallX - sInner, smallY - sInner},
+	}
+	for i, p := range smallStar {
+		if i == 0 {
+			dc.MoveTo(p.x, p.y)
+		} else {
+			dc.LineTo(p.x, p.y)
+		}
+	}
+	dc.ClosePath()
+	dc.SetColor(accent)
+	dc.Fill()
+
+	// Wordmark.
+	brandFace, _ := cachedFontFace(r.font, 28)
+	dc.SetFontFace(brandFace)
+	dc.SetColor(paperInk())
+	dc.DrawString("AstrBot", float64(r.opts.Padding)+42, 27)
+
+	// Version.
+	if T2IVersion != "" {
+		verFace, _ := cachedFontFace(r.font, 18)
+		dc.SetFontFace(verFace)
+		dc.SetColor(paperMuted())
+		verText := "v" + T2IVersion
+		vw, _ := dc.MeasureString(verText)
+		dc.DrawString(verText, float64(r.opts.Width-r.opts.Padding)-vw, 31)
+	}
+}
+
+// wrapMarkdownText wraps text to maxWidth using the renderer's font/size.
+func (r *ImageRenderer) wrapMarkdownText(text string, maxWidth float64) []string {
+	face, _ := cachedFontFace(r.font, r.opts.FontSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	return wrapSmart(mdc, text, maxWidth)
+}
+
+// wrapPreserveSpace wraps text preserving leading/trailing whitespace (for code).
+func (r *ImageRenderer) wrapPreserveSpace(text string, maxWidth float64) []string {
+	face, _ := cachedFontFace(r.font, r.opts.FontSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	var out []string
+	for _, seg := range strings.Split(text, "\n") {
+		if seg == "" {
+			out = append(out, "")
+			continue
+		}
+		cur := ""
+		curW := 0.0
+		for _, ch := range seg {
+			cw, _ := mdc.MeasureString(string(ch))
+			if curW+cw > maxWidth && cur != "" {
+				out = append(out, cur)
+				cur = ""
+				curW = 0
+			}
+			cur += string(ch)
+			curW += cw
+		}
+		if cur != "" {
+			out = append(out, cur)
+		}
+	}
+	return out
+}
+
+// --- ParagraphBlock ---
+
+type paragraphBlock struct {
+	content    string
+	lines      []string
+	lineHeight float64
+	height     int
+}
+
+func (b *paragraphBlock) measure(r *ImageRenderer, width float64) int {
+	face, _ := cachedFontFace(r.font, r.opts.FontSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	_, th := mdc.MeasureString("Ag")
+	b.lineHeight = th + 8
+	b.lines = r.wrapMarkdownText(b.content, width)
+	b.height = int(float64(len(b.lines))*b.lineHeight) + 7
+	return b.height
+}
+
+func (b *paragraphBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	face, _ := cachedFontFace(r.font, r.opts.FontSize)
+	dc.SetFontFace(face)
+	dc.SetColor(paperInk())
+	textY := y
+	for _, line := range b.lines {
+		r.drawMixedLine(dc, line, x, textY, r.opts.FontSize, paperInk())
+		textY += b.lineHeight
+	}
+	return y + float64(b.height)
+}
+
+// --- HeadingBlock ---
+
+type headingBlock struct {
+	content    string
+	level      int
+	lines      []string
+	lineHeight float64
+	topGap     float64
+	bottomGap  float64
+	height     int
+}
+
+func (b *headingBlock) measure(r *ImageRenderer, width float64) int {
+	factors := []float64{1.84, 1.48, 1.28, 1.12, 1.0, 0.92}
+	lvl := b.level
+	if lvl < 1 {
+		lvl = 1
+	}
+	if lvl > 6 {
+		lvl = 6
+	}
+	headingSize := r.opts.FontSize * factors[lvl-1]
+	if headingSize < 18 {
+		headingSize = 18
+	}
+	face, _ := cachedFontFace(r.font, headingSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	_, th := mdc.MeasureString("Ag")
+	b.lineHeight = th + 6
+	b.lines = r.wrapMarkdownText(b.content, width)
+
+	topGaps := []float64{0, 28, 22, 18, 15, 13}
+	bottomGaps := []float64{14, 12, 10, 8, 7, 6}
+	b.topGap = topGaps[lvl-1]
+	b.bottomGap = bottomGaps[lvl-1]
+	b.height = int(b.topGap + float64(len(b.lines))*b.lineHeight + b.bottomGap)
+	return b.height
+}
+
+func (b *headingBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	factors := []float64{1.84, 1.48, 1.28, 1.12, 1.0, 0.92}
+	lvl := b.level
+	if lvl < 1 {
+		lvl = 1
+	}
+	if lvl > 6 {
+		lvl = 6
+	}
+	headingSize := r.opts.FontSize * factors[lvl-1]
+	if headingSize < 18 {
+		headingSize = 18
+	}
+	face, _ := cachedFontFace(r.font, headingSize)
+	dc.SetFontFace(face)
+	dc.SetColor(paperInk())
+
+	textY := y + b.topGap
+	if lvl == 2 {
+		ruleY := y + maxF(8, b.topGap-10)
+		dc.SetColor(paperLine())
+		dc.SetLineWidth(1)
+		dc.DrawLine(x, ruleY, x+width, ruleY)
+		dc.Stroke()
+		dc.SetColor(paperInk())
+	}
+	for _, line := range b.lines {
+		dc.DrawString(line, x, textY)
+		textY += b.lineHeight
+	}
+	return y + float64(b.height)
+}
+
+// --- RuleBlock ---
+
+type ruleBlock struct{}
+
+func (b *ruleBlock) measure(r *ImageRenderer, width float64) int { return 30 }
+
+func (b *ruleBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	dc.SetColor(paperLine())
+	dc.SetLineWidth(1)
+	dc.DrawLine(x, y+15, x+width, y+15)
+	dc.Stroke()
+	return y + 30
+}
+
+// --- QuoteBlock ---
+
+type quoteBlock struct {
+	content    string
+	lines      []string
+	lineHeight float64
+	height     int
+}
+
+func (b *quoteBlock) measure(r *ImageRenderer, width float64) int {
+	faceSize := r.opts.FontSize - 1
+	if faceSize < 16 {
+		faceSize = 16
+	}
+	face, _ := cachedFontFace(r.font, faceSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	_, th := mdc.MeasureString("Ag")
+	b.lineHeight = th + 7
+
+	b.lines = nil
+	for _, src := range strings.Split(b.content, "\n") {
+		b.lines = append(b.lines, r.wrapMarkdownText(src, width-32)...)
+	}
+	b.height = int(float64(len(b.lines))*b.lineHeight) + 28
+	return b.height
+}
+
+func (b *quoteBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	faceSize := r.opts.FontSize - 1
+	if faceSize < 16 {
+		faceSize = 16
+	}
+	face, _ := cachedFontFace(r.font, faceSize)
+	dc.SetFontFace(face)
+
+	dc.SetColor(paperSoftFill())
+	dc.DrawRectangle(x, y+4, width, float64(b.height)-8)
+	dc.Fill()
+
+	dc.SetColor(paperLine())
+	dc.SetLineWidth(1)
+	dc.DrawLine(x, y+4, x+width, y+4)
+	dc.Stroke()
+	dc.DrawLine(x, y+float64(b.height)-4, x+width, y+float64(b.height)-4)
+	dc.Stroke()
+
+	dc.SetColor(paperMuted())
+	textY := y + 13
+	for _, line := range b.lines {
+		dc.DrawString(line, x+16, textY)
+		textY += b.lineHeight
+	}
+	return y + float64(b.height)
+}
+
+// --- ListBlock ---
+
+type listEntry struct {
+	marker  string
+	content string
+	depth   int
+	checked *bool
+}
+
+type listBlock struct {
+	entries    []listEntry
+	lines      [][]string
+	lineHeight float64
+	height     int
+}
+
+func (b *listBlock) measure(r *ImageRenderer, width float64) int {
+	face, _ := cachedFontFace(r.font, r.opts.FontSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	_, th := mdc.MeasureString("Ag")
+	b.lineHeight = th + 7
+
+	b.lines = nil
+	totalH := 6.0
+	for _, entry := range b.entries {
+		indent := float64(min(entry.depth, 3) * 22)
+		avail := width - 34 - indent
+		if avail < 40 {
+			avail = 40
+		}
+		wrapped := r.wrapMarkdownText(entry.content, avail)
+		b.lines = append(b.lines, wrapped)
+		totalH += float64(len(wrapped))*b.lineHeight + 5
+	}
+	b.height = int(totalH) + 3
+	return b.height
+}
+
+func (b *listBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	face, _ := cachedFontFace(r.font, r.opts.FontSize)
+	dc.SetFontFace(face)
+	textY := y + 6
+	for i, entry := range b.entries {
+		indent := float64(min(entry.depth, 3) * 22)
+		markerX := x + indent
+		textX := markerX + 30
+
+		if entry.checked == nil {
+			dc.SetColor(paperAccent())
+			dc.DrawString(entry.marker, markerX, textY)
+		} else {
+			boxTop := textY + 6
+			dc.SetColor(paperAccent())
+			dc.SetLineWidth(2)
+			dc.DrawRectangle(markerX+2, boxTop, 14, 14)
+			dc.Stroke()
+			if *entry.checked {
+				dc.DrawLine(markerX+5, boxTop+7, markerX+9, boxTop+11)
+				dc.Stroke()
+				dc.DrawLine(markerX+9, boxTop+11, markerX+15, boxTop+3)
+				dc.Stroke()
+			}
+		}
+
+		dc.SetColor(paperInk())
+		for _, line := range b.lines[i] {
+			dc.DrawString(line, textX, textY)
+			textY += b.lineHeight
+		}
+		textY += 5
+	}
+	return y + float64(b.height)
+}
+
+// --- CodeBlock ---
+
+type codeBlock struct {
+	content    string
+	language   string
+	lines      []string
+	lineHeight float64
+	labelH     float64
+	height     int
+}
+
+func (b *codeBlock) measure(r *ImageRenderer, width float64) int {
+	codeSize := r.opts.FontSize - 5
+	if codeSize < 16 {
+		codeSize = 16
+	}
+	face, _ := cachedFontFace(r.font, codeSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	_, th := mdc.MeasureString("Ag")
+	b.lineHeight = th + 6
+	if b.language != "" {
+		b.labelH = 22
+	}
+
+	b.lines = nil
+	for _, src := range strings.Split(b.content, "\n") {
+		b.lines = append(b.lines, r.wrapPreserveSpace(src, width-30)...)
+	}
+	b.height = int(24 + b.labelH + float64(len(b.lines))*b.lineHeight)
+	return b.height
+}
+
+func (b *codeBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	codeSize := r.opts.FontSize - 5
+	if codeSize < 16 {
+		codeSize = 16
+	}
+	face, _ := cachedFontFace(r.font, codeSize)
+	dc.SetFontFace(face)
+
+	dc.SetColor(paperCodeFill())
+	dc.DrawRoundedRectangle(x, y+4, width, float64(b.height)-8, 4)
+	dc.Fill()
+	dc.SetColor(paperLine())
+	dc.SetLineWidth(1)
+	dc.DrawRoundedRectangle(x, y+4, width, float64(b.height)-8, 4)
+	dc.Stroke()
+
+	textY := y + 13
+	if b.language != "" {
+		labelSize := codeSize - 5
+		if labelSize < 13 {
+			labelSize = 13
+		}
+		labelFace, _ := cachedFontFace(r.font, labelSize)
+		dc.SetFontFace(labelFace)
+		dc.SetColor(paperMuted())
+		label := strings.ToUpper(b.language)
+		lw, _ := dc.MeasureString(label)
+		dc.DrawString(label, x+width-lw-14, textY)
+		dc.SetFontFace(face)
+		textY += b.labelH
+	}
+
+	dc.SetColor(paperInk())
+	for _, line := range b.lines {
+		dc.DrawString(line, x+15, textY)
+		textY += b.lineHeight
+	}
+	return y + float64(b.height)
+}
+
+// --- TableBlock ---
+
+type tableBlock struct {
+	headers    []string
+	rows       []string
+	aligns     []string
+	colWidths  []float64
+	rowHeights []float64
+	lineHeight float64
+	height     int
+}
+
+func (b *tableBlock) measure(r *ImageRenderer, width float64) int {
+	tableSize := r.opts.FontSize - 4
+	if tableSize < 16 {
+		tableSize = 16
+	}
+	bodyFace, _ := cachedFontFace(r.font, tableSize)
+	headerFace, _ := cachedFontFace(r.font, tableSize)
+	_ = headerFace
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(bodyFace)
+	_, th := mdc.MeasureString("Ag")
+	b.lineHeight = th + 6
+
+	colCount := len(b.headers)
+	if colCount == 0 {
+		return 0
+	}
+
+	natural := make([]float64, colCount)
+	allRows := append([][]string{b.headers}, parseTableRows(b.rows)...)
+	for ci := 0; ci < colCount; ci++ {
+		maxNat := 0.0
+		for _, row := range allRows {
+			cell := ""
+			if ci < len(row) {
+				cell = row[ci]
+			}
+			cw, _ := mdc.MeasureString(cell)
+			if cw+24 > maxNat {
+				maxNat = cw + 24
+			}
+		}
+		if maxNat > width*0.55 {
+			maxNat = width * 0.55
+		}
+		natural[ci] = maxNat
+	}
+
+	minW := width / float64(colCount*2)
+	if minW > 78 {
+		minW = 78
+	}
+	if minW < 42 {
+		minW = 42
+	}
+	remaining := width - minW*float64(colCount)
+	totalNat := 0.0
+	for _, n := range natural {
+		totalNat += n
+	}
+	if totalNat < 1 {
+		totalNat = 1
+	}
+
+	b.colWidths = make([]float64, colCount)
+	for i, n := range natural {
+		b.colWidths[i] = minW + remaining*n/totalNat
+	}
+	sumW := 0.0
+	for i := 0; i < colCount-1; i++ {
+		sumW += b.colWidths[i]
+	}
+	b.colWidths[colCount-1] = width - sumW
+
+	b.rowHeights = nil
+	for _, row := range allRows {
+		maxLines := 0
+		for ci, cw := range b.colWidths {
+			cell := ""
+			if ci < len(row) {
+				cell = row[ci]
+			}
+			wrapped := r.wrapMarkdownText(cell, cw-24)
+			if len(wrapped) > maxLines {
+				maxLines = len(wrapped)
+			}
+		}
+		b.rowHeights = append(b.rowHeights, float64(maxLines)*b.lineHeight+20)
+	}
+
+	totalH := 0.0
+	for _, h := range b.rowHeights {
+		totalH += h
+	}
+	b.height = int(totalH) + 16
+	return b.height
+}
+
+func (b *tableBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	tableSize := r.opts.FontSize - 4
+	if tableSize < 16 {
+		tableSize = 16
+	}
+	bodyFace, _ := cachedFontFace(r.font, tableSize)
+	headerFace, _ := cachedFontFace(r.font, tableSize)
+
+	tableY := y + 8
+	tableH := 0.0
+	for _, h := range b.rowHeights {
+		tableH += h
+	}
+
+	allRows := append([][]string{b.headers}, parseTableRows(b.rows)...)
+	rowY := tableY
+	for ri, rowH := range b.rowHeights {
+		var fill color.RGBA
+		if ri == 0 {
+			fill = color.RGBA{238, 241, 242, 255}
+		} else if ri%2 == 0 {
+			fill = color.RGBA{247, 248, 248, 255}
+		} else {
+			fill = color.RGBA{253, 253, 252, 255}
+		}
+		dc.SetColor(fill)
+		dc.DrawRectangle(x, rowY, width, rowH)
+		dc.Fill()
+
+		colX := x
+		var face font.Face
+		if ri == 0 {
+			face = headerFace
+		} else {
+			face = bodyFace
 		}
 		dc.SetFontFace(face)
-		dc.SetColor(r.opts.TitleColor)
-		dc.DrawStringAnchored(r.opts.Title, float64(r.opts.Width)/2, y, 0.5, 0)
-		_, th := dc.MeasureString(r.opts.Title)
-		y += th*1.4 + float64(r.opts.Padding)/2
-		// separator line
-		dc.SetLineWidth(2)
-		dc.SetColor(color.RGBA{0xCC, 0xCC, 0xCC, 0xFF})
-		dc.DrawLine(x, y-float64(r.opts.Padding)/3, x+contentW, y-float64(r.opts.Padding)/3)
+		dc.SetColor(paperInk())
+
+		for ci, cw := range b.colWidths {
+			cell := ""
+			if ci < len(allRows[ri]) {
+				cell = allRows[ri][ci]
+			}
+			wrapped := r.wrapMarkdownText(cell, cw-24)
+			textY := rowY + 10
+			align := "left"
+			if ci < len(b.aligns) {
+				align = b.aligns[ci]
+			}
+			for _, line := range wrapped {
+				lw, _ := dc.MeasureString(line)
+				tx := colX + 12
+				switch align {
+				case "center":
+					tx = colX + (cw-lw)/2
+				case "right":
+					tx = colX + cw - lw - 12
+				}
+				dc.DrawString(line, tx, textY)
+				textY += b.lineHeight
+			}
+			colX += cw
+		}
+		rowY += rowH
+	}
+
+	dc.SetColor(paperStrongLine())
+	dc.SetLineWidth(1)
+	dc.DrawRectangle(x, tableY, width, tableH)
+	dc.Stroke()
+
+	rowY = tableY
+	for _, h := range b.rowHeights[:len(b.rowHeights)-1] {
+		rowY += h
+		dc.DrawLine(x, rowY, x+width, rowY)
+		dc.Stroke()
+	}
+	colX := x
+	for _, cw := range b.colWidths[:len(b.colWidths)-1] {
+		colX += cw
+		dc.DrawLine(colX, tableY, colX, tableY+tableH)
 		dc.Stroke()
 	}
 
-	for _, ln := range r.lines {
-		if ln.kind == "image" {
-			ix := x
-			if ln.imgW < int(contentW) {
-				ix = x + float64(int(contentW)-ln.imgW)/2
-			}
-			dc.DrawImage(ln.img, int(ix), int(y))
-			y += float64(ln.imgH) + float64(r.opts.Padding)/2
+	return y + float64(b.height)
+}
+
+// --- MathBlock (display-math fallback) ---
+
+type mathBlock struct {
+	content    string
+	lines      []string
+	lineHeight float64
+	height     int
+}
+
+func (b *mathBlock) measure(r *ImageRenderer, width float64) int {
+	mathSize := r.opts.FontSize - 2
+	if mathSize < 16 {
+		mathSize = 16
+	}
+	face, _ := cachedFontFace(r.font, mathSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	_, th := mdc.MeasureString("Ag")
+	b.lineHeight = th + 7
+
+	b.lines = nil
+	for _, src := range strings.Split(b.content, "\n") {
+		b.lines = append(b.lines, r.wrapMarkdownText(strings.TrimSpace(src), width-28)...)
+	}
+	b.height = int(float64(len(b.lines))*b.lineHeight) + 24
+	return b.height
+}
+
+func (b *mathBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	mathSize := r.opts.FontSize - 2
+	if mathSize < 16 {
+		mathSize = 16
+	}
+	face, _ := cachedFontFace(r.font, mathSize)
+	dc.SetFontFace(face)
+	dc.SetColor(paperInk())
+	textY := y + 10
+	for _, line := range b.lines {
+		lw, _ := dc.MeasureString(line)
+		dc.DrawString(line, x+maxF(0, (width-lw)/2), textY)
+		textY += b.lineHeight
+	}
+	return y + float64(b.height)
+}
+
+// --- ImageBlock (placeholder for remote images) ---
+
+type mdImageBlock struct {
+	altText string
+	height  int
+}
+
+func (b *mdImageBlock) measure(r *ImageRenderer, width float64) int {
+	faceSize := r.opts.FontSize - 2
+	if faceSize < 16 {
+		faceSize = 16
+	}
+	face, _ := cachedFontFace(r.font, faceSize)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	_, th := mdc.MeasureString("Ag")
+	lineH := th + 6
+	fallback := "[Image unavailable: " + b.altText + "]"
+	lines := r.wrapMarkdownText(fallback, width)
+	b.height = int(float64(len(lines))*lineH) + 16
+	return b.height
+}
+
+func (b *mdImageBlock) render(r *ImageRenderer, dc *gg.Context, x, y, width float64) float64 {
+	faceSize := r.opts.FontSize - 2
+	if faceSize < 16 {
+		faceSize = 16
+	}
+	face, _ := cachedFontFace(r.font, faceSize)
+	dc.SetFontFace(face)
+	dc.SetColor(paperMuted())
+	textY := y + 7
+	fallback := "[Image unavailable: " + b.altText + "]"
+	lines := r.wrapMarkdownText(fallback, width)
+	mdc := gg.NewContext(1, 1)
+	mdc.SetFontFace(face)
+	_, th := mdc.MeasureString("Ag")
+	lineH := th + 6
+	for _, line := range lines {
+		dc.DrawString(line, x, textY)
+		textY += lineH
+	}
+	return y + float64(b.height)
+}
+
+// --- Markdown parser ---
+
+var (
+	reHeading   = regexp.MustCompile(`^\s*(#{1,6})\s+(.+?)\s*$`)
+	reList      = regexp.MustCompile(`^(\s*)([-+*]|\d+[.)])\s+(.+)$`)
+	reRule      = regexp.MustCompile(`^\s{0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$`)
+	reImage     = regexp.MustCompile(`^\s*!\[([^\]]*)\]\((\S+?)(?:\s+"[^"]*")?\)\s*$`)
+	reTableSep  = regexp.MustCompile(`^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$`)
+	reTaskCheck = regexp.MustCompile(`^\[([ xX])\]\s+(.*)$`)
+)
+
+func parseTableRows(rows []string) [][]string {
+	result := make([][]string, len(rows))
+	for i, row := range rows {
+		result[i] = splitTableRow(row)
+	}
+	return result
+}
+
+func splitTableRow(line string) []string {
+	line = strings.TrimSpace(line)
+	line = strings.Trim(line, "|")
+	parts := strings.Split(line, "|")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}
+
+func parseMarkdownBlocks(text string) []mdBlock {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	expanded := ""
+	for _, ch := range text {
+		if ch == '\t' {
+			expanded += "    "
+		} else {
+			expanded += string(ch)
+		}
+	}
+	text = expanded
+
+	lines := strings.Split(text, "\n")
+	var blocks []mdBlock
+	i := 0
+	for i < len(lines) {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			i++
 			continue
 		}
-		face, err := cachedFontFace(r.font, ln.size)
-		if err != nil {
-			return nil, err
-		}
-		dc.SetFontFace(face)
-		dc.SetColor(ln.color)
-		_, th := dc.MeasureString("中")
-		lineH := th * r.opts.LineSpacing
-		for _, line := range ln.text {
-			w := r.measureLineWidth(dc, line, ln.size)
-			tx := x
-			switch ln.align {
-			case "center":
-				tx = x + (contentW-w)/2
-			case "right":
-				tx = x + contentW - w
+
+		if strings.HasPrefix(trimmed, "```") {
+			lang := strings.TrimPrefix(trimmed, "```")
+			lang = strings.TrimSpace(lang)
+			i++
+			var codeLines []string
+			for i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), "```") {
+				codeLines = append(codeLines, lines[i])
+				i++
 			}
-			r.drawMixedLine(dc, line, tx, y, ln.size, ln.color)
-			y += lineH
+			if i < len(lines) {
+				i++
+			}
+			blocks = append(blocks, &codeBlock{content: strings.Join(codeLines, "\n"), language: lang})
+			continue
 		}
-		y += float64(r.opts.Padding) / 3
+
+		if strings.HasPrefix(trimmed, "$$") {
+			if strings.HasSuffix(trimmed, "$$") && len(trimmed) > 4 {
+				mathContent := strings.TrimSpace(trimmed[2 : len(trimmed)-2])
+				i++
+				blocks = append(blocks, &mathBlock{content: mathContent})
+			} else {
+				var mathLines []string
+				remainder := strings.TrimSpace(trimmed[2:])
+				if remainder != "" {
+					mathLines = append(mathLines, remainder)
+				}
+				i++
+				for i < len(lines) && !strings.HasSuffix(strings.TrimSpace(lines[i]), "$$") {
+					mathLines = append(mathLines, lines[i])
+					i++
+				}
+				if i < len(lines) {
+					closing := strings.TrimSpace(lines[i])
+					if closing != "$$" {
+						mathLines = append(mathLines, closing[:len(closing)-2])
+					}
+					i++
+				}
+				blocks = append(blocks, &mathBlock{content: strings.Join(mathLines, "\n")})
+			}
+			continue
+		}
+
+		if m := reImage.FindStringSubmatch(line); m != nil {
+			blocks = append(blocks, &mdImageBlock{altText: m[1]})
+			i++
+			continue
+		}
+
+		if m := reHeading.FindStringSubmatch(line); m != nil {
+			level := len(m[1])
+			blocks = append(blocks, &headingBlock{content: m[2], level: level})
+			i++
+			continue
+		}
+
+		if reRule.MatchString(line) {
+			blocks = append(blocks, &ruleBlock{})
+			i++
+			continue
+		}
+
+		if i+1 < len(lines) && strings.Contains(lines[i], "|") && reTableSep.MatchString(lines[i+1]) {
+			headers := splitTableRow(lines[i])
+			sepCells := splitTableRow(lines[i+1])
+			var aligns []string
+			for _, cell := range sepCells {
+				c := strings.TrimSpace(cell)
+				if strings.HasPrefix(c, ":") && strings.HasSuffix(c, ":") {
+					aligns = append(aligns, "center")
+				} else if strings.HasSuffix(c, ":") {
+					aligns = append(aligns, "right")
+				} else {
+					aligns = append(aligns, "left")
+				}
+			}
+			i += 2
+			var rows []string
+			for i < len(lines) && strings.Contains(lines[i], "|") && strings.TrimSpace(lines[i]) != "" {
+				rows = append(rows, lines[i])
+				i++
+			}
+			blocks = append(blocks, &tableBlock{headers: headers, rows: rows, aligns: aligns})
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, ">") {
+			var quoteLines []string
+			for i < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i]), ">") {
+				q := strings.TrimSpace(lines[i])
+				q = strings.TrimPrefix(q, ">")
+				q = strings.TrimSpace(q)
+				quoteLines = append(quoteLines, q)
+				i++
+			}
+			blocks = append(blocks, &quoteBlock{content: strings.Join(quoteLines, "\n")})
+			continue
+		}
+
+		if m := reList.FindStringSubmatch(line); m != nil {
+			marker := m[2]
+			var entries []listEntry
+			for i < len(lines) {
+				itemMatch := reList.FindStringSubmatch(lines[i])
+				if itemMatch != nil {
+					ind, mk, ct := itemMatch[1], itemMatch[2], itemMatch[3]
+					checked := (*bool)(nil)
+					if tm := reTaskCheck.FindStringSubmatch(ct); tm != nil {
+						val := tm[1] == "x" || tm[1] == "X"
+						checked = &val
+						ct = tm[2]
+					}
+					visMarker := marker
+					if mk[0] >= '0' && mk[0] <= '9' {
+						visMarker = mk
+					} else {
+						visMarker = "•"
+					}
+					entries = append(entries, listEntry{
+						marker:  visMarker,
+						content: ct,
+						depth:   min(len(ind)/2, 3),
+						checked: checked,
+					})
+					i++
+					continue
+				}
+				if len(entries) > 0 && strings.HasPrefix(lines[i], "  ") && strings.TrimSpace(lines[i]) != "" {
+					entries[len(entries)-1].content += " " + strings.TrimSpace(lines[i])
+					i++
+					continue
+				}
+				break
+			}
+			blocks = append(blocks, &listBlock{entries: entries})
+			continue
+		}
+
+		// Paragraph: collect lines until a block boundary.
+		paraLines := []string{trimmed}
+		i++
+		for i < len(lines) {
+			next := lines[i]
+			nextTrim := strings.TrimSpace(next)
+			if nextTrim == "" {
+				break
+			}
+			if strings.HasPrefix(nextTrim, "```") || strings.HasPrefix(nextTrim, "$$") ||
+				strings.HasPrefix(nextTrim, ">") || reHeading.MatchString(next) ||
+				reRule.MatchString(next) || reList.MatchString(next) ||
+				reImage.FindStringSubmatch(next) != nil {
+				break
+			}
+			if i+1 < len(lines) && strings.Contains(next, "|") && reTableSep.MatchString(lines[i+1]) {
+				break
+			}
+			paraLines = append(paraLines, nextTrim)
+			i++
+		}
+		blocks = append(blocks, &paragraphBlock{content: strings.Join(paraLines, "\n")})
 	}
-	return dc.Image().(*image.RGBA), nil
+
+	return blocks
 }
 
 // measureLineWidth computes a line's advance width, treating emoji clusters as

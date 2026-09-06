@@ -15,28 +15,65 @@
             "Built-in Agent",
             "Dify",
             "Coze",
-            "Alibaba Cloud Bailian Application",
+            "DashScope App",
             "DeerFlow"
           ]
         },
         "coze_agent_runner_provider_id": {
           "description": "Coze Agent Runner Provider ID"
         },
-        "dify_agent_runner_provider_id": {
-          "description": "Dify Agent Runner Provider ID"
-        },
         "dashscope_agent_runner_provider_id": {
           "description": "Alibaba Cloud Bailian Application Agent Runner Provider ID"
         },
         "deerflow_agent_runner_provider_id": {
           "description": "DeerFlow Agent Runner Provider ID"
+        },
+        "dify_agent_runner_provider_id": {
+          "description": "Dify Agent Runner Provider ID"
+        }
+      },
+      "agent_runner": {
+        "runner_type": {
+          "description": "Runner",
+          "labels": [
+            "Built-in Agent",
+            "Dify",
+            "Coze",
+            "Alibaba Cloud Bailian Application",
+            "DeerFlow"
+          ]
         }
       }
     },
     "ai": {
       "description": "Model",
       "hint": "When using non-built-in Agent runners, the default chat model and default image caption model may not take effect, but some plugins rely on these settings to invoke AI capabilities.",
+      "agent_runner": {
+        "config": {
+          "model": {
+            "provider_id": {
+              "description": "Chat Model",
+              "hint": "Uses the first model when left empty"
+            },
+            "fallback_provider_ids": {
+              "description": "Fallback Chat Models",
+              "hint": "Try these chat models in order when the primary model request fails."
+            },
+            "request_max_retries": {
+              "description": "Retries on Error",
+              "hint": "Maximum attempts for a single model request when retryable errors occur."
+            }
+          }
+        }
+      },
       "provider_settings": {
+        "default_image_caption_provider_id": {
+          "description": "Default Image Caption Model",
+          "hint": "Leave empty to disable; useful for non-multimodal models"
+        },
+        "image_caption_prompt": {
+          "description": "Image Caption Prompt"
+        },
         "default_provider_id": {
           "description": "Default Chat Model",
           "hint": "Uses the first model when left empty"
@@ -49,16 +86,13 @@
           "description": "Request Max Retries",
           "hint": "Maximum attempts for a single model request when retryable errors occur."
         },
-        "default_image_caption_provider_id": {
-          "description": "Default Image Caption Model",
-          "hint": "Leave empty to disable; useful for non-multimodal models"
-        },
-        "image_caption_prompt": {
-          "description": "Image Caption Prompt"
-        },
         "request_retry_429_enabled": {
           "description": "Enable 429 Rate-Limit Retry",
           "hint": "Whether to retry when the model API returns 429 Too Many Requests. Enabled by default; disable to skip 429 retries."
+        },
+        "request_retry_429_fixed_seconds": {
+          "description": "Fixed Retry Delay (seconds)",
+          "hint": "Seconds to wait before each retry when “Fixed retry” is selected. Defaults to 10."
         },
         "request_retry_429_max": {
           "description": "429 Max Retry Count",
@@ -69,12 +103,8 @@
           "hint": "How long to wait between 429 retries: exponential backoff or a fixed per-retry delay.",
           "labels": [
             "Exponential backoff",
-            "Fixed delay"
+            "Fixed interval"
           ]
-        },
-        "request_retry_429_fixed_seconds": {
-          "description": "Fixed Retry Delay (seconds)",
-          "hint": "Seconds to wait before each retry when “Fixed retry” is selected. Defaults to 10."
         }
       },
       "provider_stt_settings": {
@@ -103,6 +133,23 @@
     "persona": {
       "description": "Persona",
       "hint": "Set the default persona for AI conversations. Personas can be managed in the Persona tab.",
+      "agent_runner": {
+        "config": {
+          "persona": {
+            "persona_id": {
+              "description": "Default Persona"
+            },
+            "safety_mode": {
+              "description": "Safety Mode",
+              "hint": "Guide the model toward safe content and away from harmful or sensitive topics."
+            },
+            "safety_mode_strategy": {
+              "description": "Safety Mode Strategy",
+              "hint": "Select how safety mode is applied."
+            }
+          }
+        }
+      },
       "provider_settings": {
         "default_personality": {
           "description": "Default Persona"
@@ -164,6 +211,10 @@
         "websearch_exa_key": {
           "description": "Exa API Key",
           "hint": "Multiple keys can be added for rotation. Get a key at https://dashboard.exa.ai"
+        },
+        "websearch_anysearch_key": {
+          "description": "AnySearch API Key",
+          "hint": "Anonymous access supported (daily free quota); configure keys for higher quota. Multiple keys are rotated."
         }
       },
       "hint": "Lets AstrBot access the internet to stay up to date."
@@ -190,7 +241,12 @@
       "provider_settings": {
         "computer_use_runtime": {
           "description": "Computer Use Runtime",
-          "hint": "Environment allowed for Agent usage. `local` means the local machine environment, `sandbox` means the sandbox environment, and `none` means no environment is allowed."
+          "hint": "Environment allowed for Agent usage. `local` means the local machine environment, `sandbox` means the sandbox environment, and `none` means no environment is allowed.",
+          "labels": [
+            "Disabled",
+            "Local",
+            "Sandbox"
+          ]
         },
         "computer_use_require_admin": {
           "description": "Require AstrBot Admin Permission",
@@ -202,7 +258,12 @@
         },
         "sandbox": {
           "booter": {
-            "description": "Sandbox Environment Driver"
+            "description": "Sandbox Environment Driver",
+            "labels": [
+              "Shipyard Neo",
+              "Shipyard",
+              "CUA"
+            ]
           },
           "shipyard_neo_endpoint": {
             "description": "Shipyard Neo API Endpoint",
@@ -226,7 +287,13 @@
           },
           "cua_os_type": {
             "description": "CUA OS Type",
-            "hint": "CUA sandbox operating system type. Defaults to linux."
+            "hint": "CUA sandbox operating system type. Defaults to linux.",
+            "labels": [
+              "Linux",
+              "macOS",
+              "Windows",
+              "Android"
+            ]
           },
           "cua_idle_timeout": {
             "description": "CUA Idle Timeout",
@@ -433,6 +500,141 @@
       "provider_tts_settings": {
         "dual_output": {
           "description": "Output Both Voice and Text When TTS is Enabled"
+        }
+      }
+    },
+    "dify_runner": {
+      "description": "Dify Configuration",
+      "agent_runner": {
+        "config": {
+          "dify_api_type": {
+            "description": "Application Type"
+          },
+          "dify_api_key": {
+            "description": "API Key"
+          },
+          "dify_api_base": {
+            "description": "API Base URL"
+          },
+          "dify_workflow_output_key": {
+            "description": "Workflow Output Variable"
+          },
+          "dify_query_input_key": {
+            "description": "Prompt Input Variable"
+          },
+          "variables": {
+            "description": "Variables"
+          },
+          "timeout": {
+            "description": "Timeout (seconds)"
+          },
+          "proxy": {
+            "description": "Proxy URL"
+          }
+        }
+      }
+    },
+    "coze_runner": {
+      "description": "Coze Configuration",
+      "agent_runner": {
+        "config": {
+          "coze_api_key": {
+            "description": "API Key"
+          },
+          "bot_id": {
+            "description": "Bot ID"
+          },
+          "coze_api_base": {
+            "description": "API Base URL"
+          },
+          "auto_save_history": {
+            "description": "Let Coze Manage Conversation History"
+          },
+          "timeout": {
+            "description": "Timeout (seconds)"
+          },
+          "proxy": {
+            "description": "Proxy URL"
+          }
+        }
+      }
+    },
+    "dashscope_runner": {
+      "description": "Alibaba Cloud Bailian Application Configuration",
+      "agent_runner": {
+        "config": {
+          "dashscope_app_type": {
+            "description": "Application Type"
+          },
+          "dashscope_api_key": {
+            "description": "API Key"
+          },
+          "dashscope_app_id": {
+            "description": "Application ID"
+          },
+          "rag_options": {
+            "pipeline_ids": {
+              "description": "Knowledge Base Pipeline IDs"
+            },
+            "file_ids": {
+              "description": "File IDs"
+            },
+            "output_reference": {
+              "description": "Include References"
+            }
+          },
+          "variables": {
+            "description": "Variables"
+          },
+          "timeout": {
+            "description": "Timeout (seconds)"
+          },
+          "proxy": {
+            "description": "Proxy URL"
+          }
+        }
+      }
+    },
+    "deerflow_runner": {
+      "description": "DeerFlow Configuration",
+      "agent_runner": {
+        "config": {
+          "deerflow_api_base": {
+            "description": "API Base URL"
+          },
+          "deerflow_api_key": {
+            "description": "API Key"
+          },
+          "deerflow_auth_header": {
+            "description": "Authorization Header"
+          },
+          "deerflow_assistant_id": {
+            "description": "Assistant ID"
+          },
+          "deerflow_model_name": {
+            "description": "Model Name Override"
+          },
+          "deerflow_thinking_enabled": {
+            "description": "Enable Thinking Mode"
+          },
+          "deerflow_plan_mode": {
+            "description": "Enable Plan Mode"
+          },
+          "deerflow_subagent_enabled": {
+            "description": "Enable Subagents"
+          },
+          "deerflow_max_concurrent_subagents": {
+            "description": "Maximum Concurrent Subagents"
+          },
+          "deerflow_recursion_limit": {
+            "description": "Recursion Limit"
+          },
+          "timeout": {
+            "description": "Timeout (seconds)"
+          },
+          "proxy": {
+            "description": "Proxy URL"
+          }
         }
       }
     }
@@ -1115,6 +1317,14 @@
         "description": "Python package index (PyPI) URL",
         "hint": "PyPI index used when installing Python plugin dependencies. Default: https://mirrors.aliyun.com/pypi/simple/"
       },
+      "python_deps_install_mode": {
+        "description": "Python dependency install mode",
+        "hint": "Install on demand: only core gRPC dependencies are pre-installed; missing packages are installed automatically per the mapping table when plugins run (recommended). Full install: pre-install all host dependencies at once, suitable for offline/no-network environments.",
+        "labels": [
+          "Install on demand",
+          "Full install"
+        ]
+      },
       "callback_api_base": {
         "description": "Externally Accessible Callback API Address",
         "hint": "External services may access AstrBot's backend through callback links generated by AstrBot (such as file download links). Since AstrBot cannot automatically determine the externally accessible host address in the deployment environment, this configuration item is needed to explicitly specify how external services should access AstrBot's address. Examples: [http://localhost:6185](http://localhost:6185), [https://example.com](https://example.com), etc."
@@ -1225,6 +1435,14 @@
       "goflags": {
         "description": "Go Build Extra Arguments",
         "hint": "Extra args appended to go build, e.g. -tags xxx"
+      },
+      "github_proxy": {
+        "description": "GitHub proxy",
+        "hint": "Accelerating proxy for GitHub access (plugin marketplace, release downloads). Leave empty for direct connection."
+      },
+      "language": {
+        "description": "Language",
+        "hint": "WebUI display language."
       }
     }
   },

@@ -5,8 +5,8 @@ go 1.26
 require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.1
-	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.5
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.2
+	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.9
 	github.com/blusewang/wx v1.3.3
 	github.com/bwmarrin/discordgo v0.25.1
 	github.com/dobest1024/go-weixin-ilink v0.2.0
@@ -51,13 +51,13 @@ require (
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/extrame/ole2 v0.0.0-20160812065207-d69429661ad7 // indirect
-	github.com/extrame/xls v0.0.1 // indirect
+	github.com/extrame/xls v0.0.1
 	github.com/fatih/color v1.7.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
-	github.com/hashicorp/go-hclog v0.14.1 // indirect
+	github.com/hashicorp/go-hclog v0.14.1
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 	github.com/hashicorp/yamux v0.1.1 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
@@ -85,7 +85,7 @@ require (
 	github.com/ulikunitz/xz v0.5.16 // indirect
 	github.com/xuri/efp v0.0.1 // indirect
 	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9 // indirect
-	github.com/yoshino-s/silk-go v0.1.0 // indirect
+	github.com/yoshino-s/silk-go v0.1.0
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	github.com/youkale/go-querystruct v1.0.0 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect

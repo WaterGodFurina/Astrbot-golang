@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,11 +18,13 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 )
@@ -100,16 +104,55 @@ func sandboxPython(ctx context.Context, mgr *sandbox.Manager, sessionID, code st
 	return stdout
 }
 
-func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path string) string {
+// sandboxFileRead reads a sandbox file; images are returned as base64 for the multimodal channel (py probe→image: text channel corrupts binary, so both probe and full read ride `base64 -w0`, mirroring py _build_probe_script/_build_image_read_script over a byte-safe transport).
+func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path string, offset, limit int) (string, string, string) {
 	path = sandboxResolvePath(path)
 	if path == "" {
-		return "Error reading file: `path` must be a non-empty string."
+		return "Error reading file: `path` must be a non-empty string.", "", ""
+	}
+	q := strings.ReplaceAll(path, "'", "'\\''")
+	isDoc := docExtSet[strings.ToLower(pathExt(path))]
+	maxBytes := int64(maxToolImageBytes)
+	if isDoc {
+		maxBytes = maxDocExtractBytes
+	}
+	probe := "n=$(wc -c < '" + q + "' 2>/dev/null) || exit 1; if [ \"$n\" -le " + fmt.Sprintf("%d", maxBytes) + " ]; then base64 -w0 '" + q + "'; else echo OVERSIZE; fi"
+	if out, _, code, err := mgr.Exec(ctx, sessionID, "sh", []string{"-c", probe}, sandboxWorkdir); err == nil && code == 0 {
+		out = strings.TrimSpace(out)
+		if out == "OVERSIZE" {
+			return fmt.Sprintf("Error reading file: exceeds the %d-byte sandbox read limit. Use the shell tool (head/sed/python) for targeted extraction.", maxBytes), "", ""
+		}
+		if out != "" {
+			if raw, derr := base64.StdEncoding.DecodeString(out); derr == nil && len(raw) > 0 {
+				if mime, ok := imageSniffMime(raw); ok {
+					return "", base64.StdEncoding.EncodeToString(raw), mime
+				}
+				if isDoc {
+					if text, ok := extractDocumentText(raw, pathBase(path)); ok {
+						return formatDocumentRead(text, path, sessionID, offset, limit, raw), "", ""
+					}
+					if looksBinarySample(raw) {
+						return "Error reading file: binary files are not supported by this tool.", "", ""
+					}
+				}
+			}
+		}
 	}
 	content, err := mgr.ReadFile(ctx, sessionID, path)
 	if err != nil {
-		return "Error reading file: " + err.Error()
+		return "Error reading file: " + err.Error(), "", ""
 	}
-	return fmt.Sprintf("Content of %s:\n%s", path, content)
+	return windowedFileRead(content, fmt.Sprintf("Content of %s:", path), offset, limit), "", ""
+}
+
+// pathExt/pathBase work on POSIX sandbox paths regardless of host OS.
+func pathExt(p string) string { return filepath.Ext(strings.ReplaceAll(p, "\\", "/")) }
+func pathBase(p string) string {
+	p = strings.ReplaceAll(p, "\\", "/")
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, sessionID, path, content string) string {
@@ -121,6 +164,60 @@ func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, sessionID, path
 		return "Error writing file: " + err.Error()
 	}
 	return "File written successfully: " + path
+}
+
+// stageFileIntoSandbox 把宿主附件自动复制进沙盒 /workspace（同名复用），返回沙盒路径；非沙盒模式/未配置/任何一步失败返回 ""（调用方回退宿主路径+引导文案）。
+func (s *ProcessStage) stageFileIntoSandbox(ctx context.Context, sessionID, hostPath string, sandboxMode bool) string {
+	if !sandboxMode || s.sandboxMgr == nil || strings.TrimSpace(hostPath) == "" {
+		return ""
+	}
+	data, err := os.ReadFile(hostPath)
+	if err != nil {
+		return ""
+	}
+	dst := sandboxWorkdir + "/" + filepath.Base(hostPath)
+	if err := s.sandboxMgr.WriteFile(ctx, sessionID, dst, string(data)); err != nil {
+		return ""
+	}
+	return dst
+}
+
+// sandboxNeoBackend reports whether the sandbox booter config targets shipyard_neo (the only backend with browser/neo-skill APIs). Mirrors py _SHIPYARD_NEO_TOOL_CONFIG matching.
+func sandboxNeoBackend(config map[string]interface{}) bool {
+	ps, _ := config["provider_settings"].(map[string]interface{})
+	sb, _ := ps["sandbox"].(map[string]interface{})
+	bt, _ := sb["booter"].(string)
+	bt = strings.ToLower(strings.TrimSpace(bt))
+	return bt == "" || bt == "shipyard_neo"
+}
+
+// neoToolAvailability decides browser/neo tool exposure (py astr_main_agent conservative rule: capabilities unknown → register browser; shipyard_neo always registers neo lifecycle tools).
+func (s *ProcessStage) neoToolAvailability(umo string) (browser, neo bool) {
+	if s.sandboxMgr == nil || !sandboxNeoBackend(s.config) {
+		return false, false
+	}
+	caps := s.sandboxMgr.SessionCapsNow(umo)
+	if caps == nil {
+		return true, true
+	}
+	for _, c := range caps {
+		if c == "browser" {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// computerAdminDenied mirrors Python check_admin_permission for computer-use tools: with provider_settings.computer_use_require_admin (default true) only admins may execute them.
+func (s *ProcessStage) computerAdminDenied(event *core.Event, operation string) string {
+	requireAdmin := true
+	if s.providerConf != nil && s.providerConf.ComputerUseRequireAdmin != nil {
+		requireAdmin = *s.providerConf.ComputerUseRequireAdmin
+	}
+	if !requireAdmin || event.Role == "admin" {
+		return ""
+	}
+	return "error: Permission denied. " + operation + " is only allowed for admin users. Tell user to set admins in `AstrBot WebUI -> Config -> General Config` by adding their user ID to the admins list if they need this feature. User's ID is: " + event.GetSenderID() + ". User's ID can be found by using /sid command."
 }
 
 // sandboxUploadFile transfers a file FROM the host machine INTO the sandbox
@@ -278,8 +375,34 @@ func allowedReadRoots(umo string) []string {
 	return append([]string{
 		workspaceRoot(umo),
 		filepath.Join("data", "skills"),
-		filepath.Join("data", "plugins"),
-	}, localTempRoots()...)
+	}, pluginSkillRoots()...)
+}
+
+// pluginSkillRoots lists <plugin>/skills dirs shipped with installed plugins (py _plugin_skill_roots: members may read plugin SKILL.md, not plugin source/config).
+func pluginSkillRoots() []string {
+	var out []string
+	entries, err := os.ReadDir(filepath.Join("data", "plugins"))
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		skillsDir := filepath.Join("data", "plugins", e.Name(), "skills")
+		if st, err := os.Stat(skillsDir); err == nil && st.IsDir() {
+			out = append(out, skillsDir)
+		}
+	}
+	return out
+}
+
+// restrictedPathLabels mirrors py _restricted_env_path_labels: human-readable allowed dirs for the denial message.
+func restrictedPathLabels(umo string, write bool) []string {
+	if !write {
+		return []string{"data/skills", "data/plugins/*/skills", workspaceRoot(umo), filepath.Join(os.TempDir(), ".astrbot"), filepath.Join("data", "temp")}
+	}
+	return []string{workspaceRoot(umo), filepath.Join(os.TempDir(), ".astrbot"), filepath.Join("data", "temp")}
 }
 
 // allowedWriteRoots lists directories file tools may write to (workspace and
@@ -306,12 +429,8 @@ func expandHome(path string) string {
 	return path
 }
 
-// resolveLocalPath resolves a tool-supplied path relative to the workspace
-// root, expanding ~ and normalizing to an absolute path, then enforces it
-// stays within the allowed roots. Returning an absolute path (like Python's
-// Path.resolve) lets the model feed the reported path straight back into
-// another tool without it being re-anchored under the workspace again.
-func resolveLocalPath(path, umo string, write bool) (string, error) {
+// resolveLocalPath resolves a tool-supplied path relative to the workspace root, expanding ~ and normalizing to an absolute path. enforce (py _is_restricted_env: local runtime + require_admin + non-admin role) additionally restricts the result to the allowed roots and rejects multi-hardlink aliases; admins keep the unrestricted py behavior.
+func resolveLocalPath(path, umo string, write, enforce bool) (string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return "", fmt.Errorf("`path` must be a non-empty string")
@@ -325,6 +444,9 @@ func resolveLocalPath(path, umo string, write bool) (string, error) {
 		resolved = abs
 	}
 	resolved = filepath.Clean(resolved)
+	if !enforce {
+		return resolved, nil
+	}
 	roots := allowedReadRoots(umo)
 	if write {
 		roots = allowedWriteRoots(umo)
@@ -338,10 +460,29 @@ func resolveLocalPath(path, umo string, write bool) (string, error) {
 			if err := enforceRealPathWithin(resolved, roots); err != nil {
 				return "", err
 			}
+			if err := rejectMultiLinkFile(resolved); err != nil {
+				return "", err
+			}
 			return resolved, nil
 		}
 	}
-	return "", fmt.Errorf("path %q is outside the allowed workspace and skill directories", path)
+	access := "Read"
+	if write {
+		access = "Write"
+	}
+	return "", fmt.Errorf("%s access is restricted for this user. Allowed directories: %s. Blocked path: %s.", access, strings.Join(restrictedPathLabels(umo, write), ", "), resolved)
+}
+
+// rejectMultiLinkFile blocks regular files with nlink>1 in restricted mode: a hardlink could alias content from outside the allowed roots (py _reject_multi_link_file). Platform nlink lookup lives in filelink_{unix,windows}.go.
+func rejectMultiLinkFile(path string) error {
+	nlink, regular, err := fileHardlinks(path)
+	if err != nil {
+		return fmt.Errorf("Access denied: unable to inspect restricted path link count. Blocked path: %s.", path)
+	}
+	if regular && nlink > 1 {
+		return fmt.Errorf("Access denied: file has multiple hard links and may alias content outside allowed directories. Link count: %d. Blocked path: %s.", nlink, path)
+	}
+	return nil
 }
 
 // enforceRealPathWithin resolves symlinks on the given path (falling back to
@@ -455,25 +596,25 @@ func sandboxModePrompt() string {
 }
 
 // collectSandboxTools builds the OpenAI tool schemas for the sandbox runtime.
-func collectSandboxTools() []map[string]interface{} {
-	return collectComputerTools(true)
+func collectSandboxTools(browser, neo bool) []map[string]interface{} {
+	return collectComputerTools(true, browser, neo)
 }
 
 // collectLocalTools builds the OpenAI tool schemas for the local runtime.
 func collectLocalTools() []map[string]interface{} {
-	return collectComputerTools(false)
+	return collectComputerTools(false, false, false)
 }
 
 // collectComputerTools builds the computer-use tool schemas. 沙盒与本地运行时
 // 使用同一组工具但语义不同：沙盒内 shell/python 在隔离容器 /workspace 执行、
 // 且容器有网络可 curl 下载；本地运行时的描述则强调直接操作宿主机需谨慎。
-func collectComputerTools(sandbox bool) []map[string]interface{} {
-	shellDesc := "The shell command to execute in the current runtime shell (for example, powershell.exe on Windows). Equivalent to `cd {working_dir} && {command}` where {working_dir} is the conversation workspace. Prefer relative paths. 注意：该命令直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。当用户发送或引用了文件消息（上下文里显示为 [File Attachment ...]）时，请先使用 astrbot_upload_file 把文件上传到工作区再处理，而不是自行猜测文件路径。"
+func collectComputerTools(sandbox, browser, neo bool) []map[string]interface{} {
+	shellDesc := "The shell command to execute in the current runtime shell (for example, powershell.exe on Windows). Equivalent to `cd {working_dir} && {command}` where {working_dir} is the conversation workspace. If the output is very large it will be truncated with a preview and the FULL output saved to a file — read that file in windows (astrbot_file_read_tool offset/limit) or grep it, and summarize each segment before continuing. 注意：该命令直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。当用户发送或引用了文件消息（上下文里显示为 [File Attachment ...]）时，请先使用 astrbot_upload_file 把文件上传到工作区再处理，而不是自行猜测文件路径。"
 	pythonDesc := "Execute codes in a Python environment. Current OS: " + runtime.GOOS + ". Use system-compatible commands. 注意：该代码直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。"
 	uploadDesc := "Transfer a file FROM the host machine INTO the current runtime so that code can access it. Use this when the user sends/attaches a file and you need to process it. The local_path must point to an existing file on the host filesystem (e.g. a [File Attachment: ...] path shown in the context)."
 	downloadDesc := "Transfer a file OUT of the current runtime to the host machine. Use this only when the user asks to retrieve/export a file that was created or modified inside the runtime."
 	if sandbox {
-		shellDesc = "Execute a shell command inside the sandbox container. Working directory is `/workspace`; relative paths resolve there. The sandbox has network access, so you can download files directly with curl/wget, e.g. `curl -L -o bug.md '<url>'`. 当用户发送或引用了文件消息（上下文显示为 [File Attachment ...]）时，请先用 astrbot_upload_file 把宿主侧的文件路径上传到 /workspace 再读取分析，而不是自行猜测文件路径或到处 ls 找文件。"
+		shellDesc = "Execute a shell command inside the sandbox container. Working directory is `/workspace`; relative paths resolve there. The sandbox has network access, so you can download files directly with curl/wget, e.g. `curl -L -o bug.md '<url>'`. If the output is very large it is truncated with a preview and the FULL output saved in the sandbox workspace — read it in windows with astrbot_file_read_tool (offset/limit) or search with astrbot_grep_tool, digesting each segment before continuing. 当用户发送或引用了文件消息（上下文显示为 [File Attachment ...]）时，请先用 astrbot_upload_file 把宿主侧的文件路径上传到 /workspace 再读取分析，而不是自行猜测文件路径或到处 ls 找文件。"
 		pythonDesc = "Execute Python code inside the sandbox container. An IPython kernel is used and variables/state persist across calls within the same sandbox session. Working directory is `/workspace`."
 		uploadDesc = "Transfer a file FROM the host machine INTO the sandbox so that sandbox code can access it. Use this when the user sends/attaches a file (shown in context as [File Attachment: name X, path Y]) and you need to process it inside the sandbox. The local_path must be the host path from the [File Attachment ...] line."
 		downloadDesc = "Transfer a file FROM the sandbox OUT to the host. Use this ONLY when the user asks to retrieve/export a file that was created or modified inside the sandbox."
@@ -557,7 +698,7 @@ func collectComputerTools(sandbox bool) []map[string]interface{} {
 			"type": "function",
 			"function": map[string]interface{}{
 				"name":        "astrbot_file_read_tool",
-				"description": "read file content. Supports text, image, and PDF (text extraction), docx and epub files.",
+				"description": "read file content. Supports text, image, and PDF (text extraction), docx, xlsx, pptx and epub files. Text reads are windowed: up to 2000 lines / 50 KB per call, output is line-numbered and ends with a continuation hint (use offset=<line> for the next window); do NOT try to read huge files at once — read and digest one window at a time, or use astrbot_grep_tool to locate content first.",
 				"parameters": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -692,7 +833,170 @@ func collectComputerTools(sandbox bool) []map[string]interface{} {
 			},
 		},
 	}
+	schemas = append(schemas, browserToolSchemas(browser)...)
+	schemas = append(schemas, neoSkillToolSchemas(neo)...)
 	return schemas
+}
+
+// browserToolSchemas builds the 3 browser automation tool schemas (py shipyard_neo/browser.py), exposed only when the sandbox profile advertises the browser capability (conservatively exposed when capabilities are not yet known).
+func browserToolSchemas(browser bool) []map[string]interface{} {
+	if !browser {
+		return nil
+	}
+	str := func(desc string) map[string]interface{} {
+		return map[string]interface{}{"type": "string", "description": desc}
+	}
+	boolp := func(desc string) map[string]interface{} {
+		return map[string]interface{}{"type": "boolean", "description": desc}
+	}
+	intp := func(desc string) map[string]interface{} {
+		return map[string]interface{}{"type": "integer", "description": desc}
+	}
+	common := map[string]interface{}{
+		"description":   str("Optional execution description."),
+		"tags":          str("Optional tags."),
+		"learn":         boolp("Whether to mark execution as learn evidence."),
+		"include_trace": boolp("Whether to include trace_ref in response."),
+	}
+	wrap := func(name, desc string, props map[string]interface{}, required []string) map[string]interface{} {
+		p := map[string]interface{}{}
+		for k, v := range props {
+			p[k] = v
+		}
+		for k, v := range common {
+			p[k] = v
+		}
+		req := make([]interface{}, 0, len(required))
+		for _, r := range required {
+			req = append(req, r)
+		}
+		return map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        name,
+				"description": desc,
+				"parameters": map[string]interface{}{
+					"type":       "object",
+					"properties": p,
+					"required":   req,
+				},
+			},
+		}
+	}
+	return []map[string]interface{}{
+		wrap("astrbot_execute_browser", "Execute one browser automation command in the sandbox.", map[string]interface{}{
+			"cmd":     str("Browser command to execute."),
+			"timeout": intp("Execution timeout in seconds (1-300, default 30)."),
+		}, []string{"cmd"}),
+		wrap("astrbot_execute_browser_batch", "Execute a browser command batch in the sandbox.", map[string]interface{}{
+			"commands": map[string]interface{}{
+				"type":        "array",
+				"items":       map[string]interface{}{"type": "string"},
+				"description": "Ordered browser commands.",
+			},
+			"timeout":       intp("Overall timeout in seconds for all commands (default 60)."),
+			"stop_on_error": boolp("Whether to stop on first failure (default true)."),
+		}, []string{"commands"}),
+		wrap("astrbot_run_browser_skill", "Run a released browser skill in the sandbox by skill_key.", map[string]interface{}{
+			"skill_key":     str("Released browser skill key."),
+			"timeout":       intp("Overall timeout in seconds (default 60)."),
+			"stop_on_error": boolp("Whether to stop on first failure (default true)."),
+		}, []string{"skill_key"}),
+	}
+}
+
+// neoSkillToolSchemas builds the 11 Neo skill lifecycle tool schemas (py shipyard_neo/neo_skills.py), exposed only for the shipyard_neo sandbox backend.
+func neoSkillToolSchemas(neo bool) []map[string]interface{} {
+	if !neo {
+		return nil
+	}
+	wrap := func(name, desc string, props map[string]interface{}, required []string) map[string]interface{} {
+		req := make([]interface{}, 0, len(required))
+		for _, r := range required {
+			req = append(req, r)
+		}
+		return map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name": name, "description": desc,
+				"parameters": map[string]interface{}{"type": "object", "properties": props, "required": req},
+			},
+		}
+	}
+	str := func(d string) map[string]interface{} {
+		return map[string]interface{}{"type": "string", "description": d}
+	}
+	num := func(d string) map[string]interface{} {
+		return map[string]interface{}{"type": "number", "description": d}
+	}
+	bl := func(d string) map[string]interface{} {
+		return map[string]interface{}{"type": "boolean", "description": d}
+	}
+	obj := func(d string) map[string]interface{} {
+		return map[string]interface{}{"type": "object", "description": d}
+	}
+	return []map[string]interface{}{
+		wrap("astrbot_get_execution_history", "List sandbox execution history records (browser/shell runs) for this session.", map[string]interface{}{
+			"exec_type": str("Filter by execution type (e.g. browser)."),
+			"limit":     map[string]interface{}{"type": "integer", "description": "Page size (default 20)."},
+			"offset":    map[string]interface{}{"type": "integer", "description": "Page offset."},
+			"tags":      str("Filter by tags."),
+		}, []string{}),
+		wrap("astrbot_annotate_execution", "Annotate one execution history record (description/tags/notes) so later skill mining can use it.", map[string]interface{}{
+			"execution_id": str("Execution id from get_execution_history."),
+			"description":  str("Optional description."),
+			"tags":         str("Optional tags."),
+			"notes":        str("Optional notes."),
+		}, []string{"execution_id"}),
+		wrap("astrbot_create_skill_payload", "Store canonical skill payload (JSON with skill_markdown etc.) and return payload_ref.", map[string]interface{}{
+			"payload": obj("The payload object to store."),
+			"kind":    str("Payload kind (default 'skill')."),
+		}, []string{"payload"}),
+		wrap("astrbot_get_skill_payload", "Fetch a stored skill payload by payload_ref.", map[string]interface{}{
+			"payload_ref": str("Payload reference returned by create_skill_payload."),
+		}, []string{"payload_ref"}),
+		wrap("astrbot_create_skill_candidate", "Create a Neo skill candidate from payload + source execution ids.", map[string]interface{}{
+			"skill_key":            str("Stable skill key."),
+			"payload_ref":          str("Optional payload reference."),
+			"source_execution_ids": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}, "description": "Evidence execution ids."},
+			"scenario_key":         str("Optional scenario key."),
+			"summary":              str("Optional candidate summary."),
+			"usage_notes":          str("Optional usage notes."),
+		}, []string{"skill_key"}),
+		wrap("astrbot_list_skill_candidates", "List Neo skill candidates (filter by status/skill_key).", map[string]interface{}{
+			"status":    str("Filter by status (proposed/evaluating/released/rejected)."),
+			"skill_key": str("Filter by skill key."),
+			"limit":     map[string]interface{}{"type": "integer", "description": "Page size (default 20)."},
+			"offset":    map[string]interface{}{"type": "integer", "description": "Page offset."},
+		}, []string{}),
+		wrap("astrbot_evaluate_skill_candidate", "Record an evaluation result (passed/score/report) for a candidate.", map[string]interface{}{
+			"candidate_id": str("Candidate id."),
+			"passed":       bl("Whether the evaluation passed."),
+			"score":        num("Optional numeric score."),
+			"benchmark_id": str("Optional benchmark id."),
+			"report":       str("Optional evaluation report."),
+		}, []string{"candidate_id", "passed"}),
+		wrap("astrbot_promote_skill_candidate", "Promote a candidate to a release (stage canary/stable). For stable set sync_to_local=true to sync SKILL.md.", map[string]interface{}{
+			"candidate_id":  str("Candidate id."),
+			"stage":         str("Release stage: canary or stable (default stable)."),
+			"sync_to_local": bl("Also sync payload skill_markdown into the local skills directory (stable)."),
+		}, []string{"candidate_id"}),
+		wrap("astrbot_list_skill_releases", "List Neo skill releases (filter by skill_key/stage; active_only skips rolled-back).", map[string]interface{}{
+			"skill_key":   str("Filter by skill key."),
+			"stage":       str("Filter by stage (canary/stable)."),
+			"active_only": bl("Only active releases (default true)."),
+			"limit":       map[string]interface{}{"type": "integer", "description": "Page size (default 20)."},
+			"offset":      map[string]interface{}{"type": "integer", "description": "Page offset."},
+		}, []string{}),
+		wrap("astrbot_rollback_skill_release", "Roll back an active skill release.", map[string]interface{}{
+			"release_id": str("Release id."),
+		}, []string{"release_id"}),
+		wrap("astrbot_sync_skill_release", "Re-sync a release to the local skill workspace (by release_id or skill_key; require_stable gates to stable stage).", map[string]interface{}{
+			"release_id":     str("Release id (preferred)."),
+			"skill_key":      str("Skill key when release_id is absent."),
+			"require_stable": bl("Only sync stable-stage releases (default false)."),
+		}, []string{}),
+	}
 }
 
 // --- local tool executors ---
@@ -740,6 +1044,10 @@ type shellSession struct {
 	Stdin      io.WriteCloser
 	Owner      string
 
+	// pollMu guards the incremental read cursor (py poll_session cursor semantics: every byte is delivered exactly once; nothing is skipped or replayed).
+	pollMu     sync.Mutex
+	pollCursor int64
+
 	// exitMu guards the exit state written by the Wait goroutine and read by
 	// status(); reading Cmd.ProcessState directly would race with cmd.Wait().
 	exitMu   sync.Mutex
@@ -778,32 +1086,6 @@ func (s *shellSession) status() map[string]interface{} {
 		"owner":       s.Owner,
 	}
 }
-
-// cappedWriter caps buffered output at max bytes, flagging truncation instead
-// of growing without bound.
-type cappedWriter struct {
-	buf       bytes.Buffer
-	max       int
-	truncated bool
-}
-
-func (w *cappedWriter) Write(p []byte) (int, error) {
-	if w.buf.Len() >= w.max {
-		w.truncated = true
-		return len(p), nil
-	}
-	n := len(p)
-	if room := w.max - w.buf.Len(); room < n {
-		n = room
-		w.truncated = true
-	}
-	w.buf.Write(p[:n])
-	return len(p), nil
-}
-
-// Bytes returns the buffered output (a byte slice sharing the underlying
-// buffer; callers must not mutate it).
-func (w *cappedWriter) Bytes() []byte { return w.buf.Bytes() }
 
 // maxShellOutput caps how much of a synchronous shell command's output is
 // buffered in memory.
@@ -915,10 +1197,9 @@ func executeLocalShell(umo, senderID, command string, background bool, timeout i
 	// inherit the output pipes would keep CombinedOutput blocked and survive as
 	// orphans. Start first so cmd.Process is set before the kill goroutine
 	// reads it, then kill the whole process group the moment the timeout fires.
-	var outCap cappedWriter
-	outCap.max = maxShellOutput
-	cmd.Stdout = &outCap
-	cmd.Stderr = &outCap
+	outCap := &spoolWriter{max: maxShellOutput, dir: filepath.Join(ws, ".astrbot-outputs")}
+	cmd.Stdout = outCap
+	cmd.Stderr = outCap
 	if err := cmd.Start(); err != nil {
 		return "Error executing command: " + err.Error()
 	}
@@ -932,9 +1213,9 @@ func executeLocalShell(umo, senderID, command string, background bool, timeout i
 	}()
 	err := cmd.Wait()
 	close(groupDone)
-	out := outCap.Bytes()
-	if outCap.truncated {
-		out = append(out, []byte("\n...(output truncated)\n")...)
+	out := outCap.Head()
+	if sp := outCap.Close(); sp != "" {
+		out = append(out, []byte(spoolNotice(sp, outCap.total))...)
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("Command timed out after %d seconds. Output so far:\n%s", timeout, string(out))
@@ -1003,17 +1284,44 @@ func shellSessionPoll(sessionID, umo, senderID string) string {
 	if !sessionOwnedBy(s, umo, senderID) {
 		return "Session " + sessionID + " does not belong to the current user."
 	}
-	tail := ""
-	if data, err := os.ReadFile(s.OutputFile); err == nil {
-		if len(data) > 20000 {
-			data = data[len(data)-20000:]
-			tail = "...(truncated)\n"
+	s.pollMu.Lock()
+	defer s.pollMu.Unlock()
+	chunk := ""
+	size := int64(0)
+	if st, err := os.Stat(s.OutputFile); err == nil {
+		size = st.Size()
+	}
+	if s.pollCursor > size {
+		s.pollCursor = 0 // log rotated/replaced: restart the stream
+	}
+	if size > s.pollCursor {
+		// #nosec G304 -- OutputFile is a host-generated session log path.
+		if f, err := os.Open(s.OutputFile); err == nil {
+			defer f.Close()
+			if _, err := f.Seek(s.pollCursor, io.SeekStart); err == nil {
+				buf := make([]byte, pollWindowBytes)
+				if n, _ := f.Read(buf); n > 0 {
+					if s.pollCursor+int64(n) < size {
+						if li := bytes.LastIndexByte(buf[:n], '\n'); li >= 0 {
+							n = li + 1 // stop at a line boundary so the next poll continues cleanly
+						}
+					}
+					s.pollCursor += int64(n)
+					chunk = string(buf[:n])
+				}
+			}
 		}
-		tail += string(data)
 	}
 	st, _ := json.Marshal(s.status())
-	return string(st) + "\nOutput:\n" + tail
+	out := string(st) + "\nOutput:\n" + chunk
+	if s.pollCursor < size {
+		out += fmt.Sprintf("\n\n(output continues: %d of %d bytes consumed — poll again for the next segment, or read `%s` with astrbot_file_read_tool offset/limit)", s.pollCursor, size, s.OutputFile)
+	}
+	return out
 }
+
+// pollWindowBytes bounds one shell_session poll segment (py max_output_chars=10000, doubled for multibyte safety).
+const pollWindowBytes = 20000
 
 // shellSessionWrite writes raw data to a session's stdin. addNewline appends
 // a real line feed (the write_line action) so the session receives it.
@@ -1080,18 +1388,17 @@ func executeLocalPython(umo, code string, timeout int) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", "-c", code) // #nosec G204 -- astrbot_execute_python 工具核心：执行 AI 指令给定的 Python 代码（host 本地运行，功能明确，前端已警示）
 	cmd.Dir = ws
-	// 与同步 shell 路径一致：输出经 cappedWriter 限幅，防止超时窗口内
-	// print 风暴把宿主进程 OOM。
-	cw := &cappedWriter{max: maxShellOutput}
+	// 与同步 shell 路径一致：输出限幅 + 全量 spool 落盘（超限不丢数据）。
+	cw := &spoolWriter{max: maxShellOutput, dir: filepath.Join(ws, ".astrbot-outputs")}
 	cmd.Stdout = cw
 	cmd.Stderr = cw
 	if err := cmd.Start(); err != nil {
 		return "error: code execution failed to start: " + err.Error()
 	}
 	waitErr := cmd.Wait()
-	out := string(cw.Bytes())
-	if cw.truncated {
-		out += fmt.Sprintf("\n[输出超过 %d 字节已截断]", maxShellOutput)
+	out := string(cw.Head())
+	if sp := cw.Close(); sp != "" {
+		out += spoolNotice(sp, cw.total)
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("Code execution timed out after %d seconds. Output so far:\n%s", timeout, out)
@@ -1109,65 +1416,108 @@ func executeLocalPython(umo, code string, timeout int) string {
 // at once; larger files must be read in chunks via offset/limit.
 const maxFileReadBytes = 1 << 20
 
-func executeFileRead(path, umo string, offset, limit int) string {
-	resolved, err := resolveLocalPath(path, umo, false)
+func executeFileRead(path, umo string, offset, limit int, restricted bool) (string, string, string) {
+	resolved, err := resolveLocalPath(path, umo, false, restricted)
 	if err != nil {
-		return "Error reading file: " + err.Error()
+		return "Error reading file: " + err.Error(), "", ""
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
-		return "Error reading file: " + err.Error()
+		return "Error reading file: " + err.Error(), "", ""
 	}
 	if info.IsDir() {
 		return fmt.Sprintf("Error: '%s' is a directory, not a file. "+
-			"Use a file path instead, or use 'astrbot_execute_shell' to list directory contents.", resolved)
+			"Use a file path instead, or use 'astrbot_execute_shell' to list directory contents.", resolved), "", ""
 	}
-	// 先 stat 判断大小：超限文件拒绝整体读入内存。带 offset/limit 时走
-	// 分页路径（按行流式读取，不整体载入内存），否则提示用 offset/limit。
+	// 图片嗅探（py read_file_utils probe→image 分支）：命中则整体读入并以 base64 交给多模态通道。
+	if mime, ok := sniffLocalImage(resolved); ok {
+		if info.Size() > maxToolImageBytes {
+			return fmt.Sprintf("Error reading file: image %s is %d bytes, exceeds the %d-byte image read limit.", resolved, info.Size(), maxToolImageBytes), "", ""
+		}
+		data, err := os.ReadFile(resolved)
+		if err != nil {
+			return "Error reading file: " + err.Error(), "", ""
+		}
+		return "", base64.StdEncoding.EncodeToString(data), mime
+	}
+	// 文档抽取（pdf/docx/xlsx/pptx/epub/xls）复用知识库解析层（py probe→_parse_local_supported_document）。
+	if docExtSet[strings.ToLower(filepath.Ext(resolved))] {
+		if info.Size() > maxDocExtractBytes {
+			return fmt.Sprintf("Error reading file: document %s is %d bytes, exceeds the %d-byte document read limit.", resolved, info.Size(), maxDocExtractBytes), "", ""
+		}
+		data, err := os.ReadFile(resolved)
+		if err != nil {
+			return "Error reading file: " + err.Error(), "", ""
+		}
+		if text, ok := extractDocumentText(data, filepath.Base(resolved)); ok {
+			return formatDocumentRead(text, resolved, umo, offset, limit, data), "", ""
+		}
+		return "Error reading file: binary files are not supported by this tool.", "", ""
+	}
+	// 大文件（>整读上限）流式窗口：只扫到 offset+窗口行数，避免载入全文件。
 	if info.Size() > maxFileReadBytes {
-		if offset <= 0 && limit <= 0 {
-			return fmt.Sprintf("Error reading file: %s is %d bytes, exceeds the %d-byte read limit. "+
-				"Use offset/limit to read a portion of the file.", resolved, info.Size(), maxFileReadBytes)
+		effLimit := limit
+		if effLimit <= 0 {
+			effLimit = defaultReadLines
 		}
 		f, err := os.Open(resolved)
 		if err != nil {
-			return "Error reading file: " + err.Error()
+			return "Error reading file: " + err.Error(), "", ""
 		}
 		defer f.Close()
-		var lines []string
+		var out []string
+		more := false
+		cut := false
+		bytes := 0
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for i := 0; sc.Scan() && (limit <= 0 || i < offset+limit); i++ {
-			if i >= offset {
-				lines = append(lines, sc.Text())
+		for i := 0; sc.Scan(); i++ {
+			if i < offset {
+				continue
 			}
+			if len(out) >= effLimit {
+				more = true
+				break
+			}
+			line := sc.Text()
+			if r := []rune(line); len(r) > maxReadLineChars {
+				line = string(r[:maxReadLineChars]) + fmt.Sprintf("... (line truncated to %d chars)", maxReadLineChars)
+			}
+			size := len(line) + 3
+			if bytes > 0 {
+				size++
+			}
+			if bytes+size > maxReadWindowBytes {
+				cut = true
+				break
+			}
+			out = append(out, fmt.Sprintf("%d: %s", i+1, line))
+			bytes += size
 		}
-		return fmt.Sprintf("Read %d lines from %s:\n%s", len(lines), resolved, strings.Join(lines, "\n"))
+		header := fmt.Sprintf("Read %s (%d bytes):", resolved, info.Size())
+		last := offset + len(out)
+		body := strings.Join(out, "\n")
+		switch {
+		case cut:
+			return header + "\n" + body + fmt.Sprintf("\n\n(Output capped at %d KB. Showing lines %d-%d. Use offset=%d to continue.)", maxReadWindowBytes/1024, offset+1, last, last), "", ""
+		case more:
+			return header + "\n" + body + fmt.Sprintf("\n\n(Showing lines %d-%d. Use offset=%d to continue.)", offset+1, last, last), "", ""
+		default:
+			return header + "\n" + body + fmt.Sprintf("\n\n(End of file - total %d lines)", last), "", ""
+		}
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil {
-		return "Error reading file: " + err.Error()
+		return "Error reading file: " + err.Error(), "", ""
 	}
-	content := string(data)
-	if offset > 0 || limit > 0 {
-		lines := strings.Split(content, "\n")
-		if offset < 0 {
-			offset = 0
-		}
-		if offset > len(lines) {
-			offset = len(lines)
-		}
-		end := len(lines)
-		if limit > 0 && offset+limit < end {
-			end = offset + limit
-		}
-		content = strings.Join(lines[offset:end], "\n")
+	if looksBinarySample(data) {
+		return "Error reading file: binary files are not supported by this tool.", "", ""
 	}
-	return fmt.Sprintf("Read %d bytes from %s:\n%s", info.Size(), resolved, content)
+	return windowedFileRead(string(data), fmt.Sprintf("Read %s (%d bytes):", resolved, info.Size()), offset, limit), "", ""
 }
 
-func executeFileWrite(path, content, umo string) string {
-	resolved, err := resolveLocalPath(path, umo, true)
+func executeFileWrite(path, content, umo string, restricted bool) string {
+	resolved, err := resolveLocalPath(path, umo, true, restricted)
 	if err != nil {
 		return "Error writing file: " + err.Error()
 	}
@@ -1183,7 +1533,7 @@ func executeFileWrite(path, content, umo string) string {
 // executeLocalUpload copies a host file into the conversation workspace on the
 // local runtime (the workspace IS the host filesystem). Mirrors Python's
 // ast rbot_upload_file for the local computer-use runtime.
-func executeLocalUpload(localPath, umo string) string {
+func executeLocalUpload(localPath, umo string, restricted bool) string {
 	if strings.TrimSpace(localPath) == "" {
 		return "Error uploading file: `local_path` must be a non-empty string."
 	}
@@ -1202,11 +1552,11 @@ func executeLocalUpload(localPath, umo string) string {
 // executeLocalDownload copies a workspace file out to the host temp directory
 // on the local runtime (the workspace IS the host filesystem). Mirrors Python's
 // ast rbot_download_file for the local computer-use runtime.
-func executeLocalDownload(remotePath, umo string) string {
+func executeLocalDownload(remotePath, umo string, restricted bool) string {
 	if strings.TrimSpace(remotePath) == "" {
 		return "Error downloading file: `remote_path` must be a non-empty string."
 	}
-	resolved, err := resolveLocalPath(remotePath, umo, false)
+	resolved, err := resolveLocalPath(remotePath, umo, false, restricted)
 	if err != nil {
 		return "Error downloading file: " + err.Error()
 	}
@@ -1240,8 +1590,8 @@ func copyLocalFile(src, dst string) error {
 	return os.WriteFile(dst, data, 0o600)
 }
 
-func executeFileEdit(path, old, new string, replaceAll bool, umo string) string {
-	resolved, err := resolveLocalPath(path, umo, true)
+func executeFileEdit(path, old, new string, replaceAll bool, umo string, restricted bool) string {
+	resolved, err := resolveLocalPath(path, umo, true, restricted)
 	if err != nil {
 		return "Error editing file: " + err.Error()
 	}
@@ -1275,7 +1625,7 @@ func executeFileEdit(path, old, new string, replaceAll bool, umo string) string 
 	return fmt.Sprintf("Edited %s. Replaced %d occurrence(s) using %s mode.", resolved, replacements, modeText)
 }
 
-func executeGrep(pattern, path, glob string, resultLimit int, umo string) string {
+func executeGrep(pattern, path, glob string, resultLimit int, umo string, restricted bool) string {
 	if strings.TrimSpace(pattern) == "" {
 		return "Error: `pattern` must be a non-empty string."
 	}
@@ -1290,7 +1640,7 @@ func executeGrep(pattern, path, glob string, resultLimit int, umo string) string
 	if searchPath == "" {
 		searchPath = "."
 	}
-	resolved, err := resolveLocalPath(searchPath, umo, false)
+	resolved, err := resolveLocalPath(searchPath, umo, false, restricted)
 	if err != nil {
 		return "Error searching: " + err.Error()
 	}
@@ -1332,4 +1682,611 @@ func executeGrep(pattern, path, glob string, resultLimit int, umo string) string
 		return "No matches found."
 	}
 	return strings.Join(matches, "\n")
+}
+
+// argStringOpt returns (value, present) for an optional string arg.
+func argStringOpt(args map[string]interface{}, key string) (string, bool) {
+	v, ok := args[key]
+	if !ok {
+		return "", false
+	}
+	switch t := v.(type) {
+	case string:
+		return t, t != ""
+	case nil:
+		return "", false
+	default:
+		return fmt.Sprint(t), true
+	}
+}
+
+func jsonOrError(data map[string]interface{}, err error) string {
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	b, jerr := json.Marshal(data)
+	if jerr != nil {
+		return fmt.Sprint(data)
+	}
+	return string(b)
+}
+
+func jsonTextOrError(text string, err error) string {
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	return text
+}
+
+// browserBody builds the Bay browser exec request body (SDK _BrowserExecRequest semantics: omit empty optional strings, always send learn/include_trace/timeout).
+func browserBody(args map[string]interface{}, defaults map[string]interface{}) map[string]interface{} {
+	body := map[string]interface{}{}
+	for k, def := range defaults {
+		body[k] = def
+	}
+	for _, k := range []string{"cmd", "description", "tags"} {
+		if v, ok := argStringOpt(args, k); ok {
+			body[k] = v
+		}
+	}
+	if v, ok := args["timeout"]; ok {
+		body["timeout"] = v
+	} else {
+		body["timeout"] = defaults["timeout"]
+	}
+	for _, k := range []string{"learn", "include_trace", "stop_on_error"} {
+		if v, ok := args[k].(bool); ok {
+			body[k] = v
+		} else if _, exists := defaults[k]; !exists {
+			body[k] = false
+		}
+	}
+	if raw, ok := args["commands"].([]interface{}); ok {
+		cmds := make([]string, 0, len(raw))
+		for _, r := range raw {
+			if cmds2, ok := r.(string); ok && strings.TrimSpace(cmds2) != "" {
+				cmds = append(cmds, cmds2)
+			}
+		}
+		body["commands"] = cmds
+	}
+	return body
+}
+
+// executeNeoLifecycleTool dispatches the 11 Neo skill lifecycle tools: payload/candidate/release go through the host NeoStore (same instance the dashboard API uses), execution history/annotate go through the session's Bay sandbox.
+func (s *ProcessStage) executeNeoLifecycleTool(ctx context.Context, sessionID, name string, args map[string]interface{}) string {
+	switch name {
+	case "astrbot_execute_browser":
+		data, err := s.sandboxMgr.BrowserExec(ctx, sessionID, browserBody(args, map[string]interface{}{"timeout": 30, "learn": false, "include_trace": false}), argInt(args, "timeout", 30))
+		return browserResult("browser command", data, err)
+	case "astrbot_execute_browser_batch":
+		data, err := s.sandboxMgr.BrowserExecBatch(ctx, sessionID, browserBody(args, map[string]interface{}{"timeout": 60, "stop_on_error": true, "learn": false, "include_trace": false}))
+		return browserResult("browser batch", data, err)
+	case "astrbot_run_browser_skill":
+		key := argString(args, "skill_key")
+		if strings.TrimSpace(key) == "" {
+			return "Error running browser skill: `skill_key` is required."
+		}
+		data, err := s.sandboxMgr.BrowserRunSkill(ctx, sessionID, key, browserBody(args, map[string]interface{}{"timeout": 60, "stop_on_error": true, "include_trace": false}))
+		return browserResult("browser skill", data, err)
+	case "astrbot_get_execution_history":
+		params := map[string]string{}
+		for _, k := range []string{"exec_type", "tags"} {
+			if v, ok := argStringOpt(args, k); ok {
+				params[k] = v
+			}
+		}
+		if v := argInt(args, "limit", 0); v > 0 {
+			params["limit"] = strconv.Itoa(v)
+		}
+		if v := argInt(args, "offset", 0); v > 0 {
+			params["offset"] = strconv.Itoa(v)
+		}
+		data, err := s.sandboxMgr.GetExecutionHistory(ctx, sessionID, params)
+		return jsonTextOrError(data, err)
+	case "astrbot_annotate_execution":
+		eid := argString(args, "execution_id")
+		if strings.TrimSpace(eid) == "" {
+			return "Error: `execution_id` is required."
+		}
+		body := map[string]interface{}{}
+		for _, k := range []string{"description", "tags", "notes"} {
+			if v, ok := argStringOpt(args, k); ok {
+				body[k] = v
+			}
+		}
+		if len(body) == 0 {
+			return "Error: provide at least one of description/tags/notes."
+		}
+		data, err := s.sandboxMgr.AnnotateExecution(ctx, sessionID, eid, body)
+		return jsonTextOrError(data, err)
+	}
+	// Host-side lifecycle (payload/candidate/release) — needs the shared NeoStore.
+	if s.neoStore == nil {
+		return "Error: Neo skill lifecycle store is not initialized."
+	}
+	switch name {
+	case "astrbot_create_skill_payload":
+		data, err := s.neoStore.PutPayload(args["payload"], argString(args, "kind"))
+		return jsonOrError(data, err)
+	case "astrbot_get_skill_payload":
+		data, err := s.neoStore.GetPayload(argString(args, "payload_ref"))
+		return jsonOrError(data, err)
+	case "astrbot_create_skill_candidate":
+		ids := []string{}
+		if raw, ok := args["source_execution_ids"].([]interface{}); ok {
+			for _, r := range raw {
+				if sv, ok := r.(string); ok {
+					ids = append(ids, sv)
+				}
+			}
+		}
+		c, err := s.neoStore.AddCandidate(argString(args, "skill_key"), ids, argString(args, "scenario_key"), argString(args, "payload_ref"), argString(args, "summary"), argString(args, "usage_notes"))
+		if err != nil {
+			return "Error: " + err.Error()
+		}
+		b, jerr := json.Marshal(c)
+		if jerr != nil {
+			return fmt.Sprint(c)
+		}
+		return string(b)
+	case "astrbot_list_skill_candidates":
+		return marshalable(s.neoStore.ListCandidates(argString(args, "status"), argString(args, "skill_key"), argInt(args, "limit", 20), argInt(args, "offset", 0)))
+	case "astrbot_evaluate_skill_candidate":
+		var score *float64
+		if f, ok := args["score"].(float64); ok {
+			score = &f
+		}
+		data, err := s.neoStore.EvaluateCandidate(argString(args, "candidate_id"), argBool(args, "passed"), score, argString(args, "benchmark_id"), argString(args, "report"))
+		return jsonOrError(data, err)
+	case "astrbot_promote_skill_candidate":
+		data, err := s.neoStore.PromoteCandidate(argString(args, "candidate_id"), argString(args, "stage"), argBool(args, "sync_to_local"))
+		return jsonOrError(data, err)
+	case "astrbot_list_skill_releases":
+		activeOnly := true
+		if v, ok := args["active_only"].(bool); ok {
+			activeOnly = v
+		}
+		return marshalable(s.neoStore.ListReleases(argString(args, "skill_key"), argString(args, "stage"), activeOnly, argInt(args, "limit", 20), argInt(args, "offset", 0)))
+	case "astrbot_rollback_skill_release":
+		r, err := s.neoStore.RollbackRelease(argString(args, "release_id"))
+		if err != nil {
+			return "Error: " + err.Error()
+		}
+		b, _ := json.Marshal(r)
+		return string(b)
+	case "astrbot_sync_skill_release":
+		data, err := s.neoStore.SyncRelease(argString(args, "release_id"), argString(args, "skill_key"), argBool(args, "require_stable"))
+		return jsonOrError(data, err)
+	}
+	return "Error: unknown neo skill tool " + name
+}
+
+func marshalable(v map[string]interface{}) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprint(v)
+	}
+	return string(b)
+}
+
+func browserResult(kind, data string, err error) string {
+	if err != nil {
+		return "Error executing " + kind + ": " + err.Error()
+	}
+	return data
+}
+
+// neoLifecycleToolSet marks tools dispatched through executeNeoLifecycleTool (host NeoStore + Bay history).
+var neoLifecycleToolSet = map[string]bool{
+	"astrbot_execute_browser": true, "astrbot_execute_browser_batch": true, "astrbot_run_browser_skill": true,
+	"astrbot_get_execution_history": true, "astrbot_annotate_execution": true,
+	"astrbot_create_skill_payload": true, "astrbot_get_skill_payload": true,
+	"astrbot_create_skill_candidate": true, "astrbot_list_skill_candidates": true,
+	"astrbot_evaluate_skill_candidate": true, "astrbot_promote_skill_candidate": true,
+	"astrbot_list_skill_releases": true, "astrbot_rollback_skill_release": true, "astrbot_sync_skill_release": true,
+}
+
+// neoLifecycleHostSet: Bay-independent skill lifecycle tools (host NeoStore only).
+var neoLifecycleHostSet = map[string]bool{
+	"astrbot_create_skill_payload": true, "astrbot_get_skill_payload": true,
+	"astrbot_create_skill_candidate": true, "astrbot_list_skill_candidates": true,
+	"astrbot_evaluate_skill_candidate": true, "astrbot_promote_skill_candidate": true,
+	"astrbot_list_skill_releases": true, "astrbot_rollback_skill_release": true, "astrbot_sync_skill_release": true,
+}
+
+// neoModePrompt mirrors Python's shipyard_neo-only system prompt blocks: workspace-relative path rule + the skill lifecycle workflow guidance.
+func neoModePrompt() string {
+	return "[Shipyard Neo File Path Rule]\n" +
+		"When using sandbox filesystem tools (upload/download/read/write/list/delete), " +
+		"always pass paths relative to the sandbox workspace root. " +
+		"Example: use `baidu_homepage.png` instead of `/workspace/baidu_homepage.png`.\n\n" +
+		"[Neo Skill Lifecycle Workflow]\n" +
+		"When user asks to create/update a reusable skill in Neo mode, use lifecycle tools instead of directly writing local skill folders.\n" +
+		"Preferred sequence:\n" +
+		"1) Use `astrbot_create_skill_payload` to store canonical payload content and get `payload_ref`.\n" +
+		"2) Use `astrbot_create_skill_candidate` with `skill_key` + `source_execution_ids` (and optional `payload_ref`) to create a candidate.\n" +
+		"3) Use `astrbot_promote_skill_candidate` to release: `stage=canary` for trial; `stage=stable` for production.\n" +
+		"For stable release, set `sync_to_local=true` to sync `payload.skill_markdown` into local `SKILL.md`.\n" +
+		"Do not treat ad-hoc generated files as reusable Neo skills unless they are captured via payload/candidate/release.\n" +
+		"To update an existing skill, create a new payload/candidate and promote a new release version; avoid patching old local folders directly.\n"
+}
+
+// computerUseRestricted mirrors Python fs._is_restricted_env: local-runtime file tools whitelist enforcement for non-admin users when provider_settings.computer_use_require_admin (default true). Call sites must gate on runtime=="local" themselves.
+func (s *ProcessStage) computerUseRestricted(event *core.Event) bool {
+	requireAdmin := true
+	if s.providerConf != nil && s.providerConf.ComputerUseRequireAdmin != nil {
+		requireAdmin = *s.providerConf.ComputerUseRequireAdmin
+	}
+	return requireAdmin && event.Role != "admin"
+}
+
+// imageSniffMime detects common image formats from magic bytes (py file_read_utils _probe_file subset: image kinds).
+func imageSniffMime(sample []byte) (string, bool) {
+	switch {
+	case len(sample) >= 8 && string(sample[:8]) == "\x89PNG\r\n\x1a\n":
+		return "image/png", true
+	case len(sample) >= 3 && sample[0] == 0xFF && sample[1] == 0xD8 && sample[2] == 0xFF:
+		return "image/jpeg", true
+	case len(sample) >= 6 && (string(sample[:6]) == "GIF87a" || string(sample[:6]) == "GIF89a"):
+		return "image/gif", true
+	case len(sample) >= 12 && string(sample[:4]) == "RIFF" && string(sample[8:12]) == "WEBP":
+		return "image/webp", true
+	case len(sample) >= 2 && string(sample[:2]) == "BM":
+		return "image/bmp", true
+	}
+	return "", false
+}
+
+// toolImageSinkKeys: pending images collected per event during a tool round (mirrors py ToolImageCache + from_cached_image flow).
+const toolImageSinkKey = "tool_images_pending"
+
+type pendingToolImage struct {
+	Mime   string
+	Base64 string
+	Path   string
+}
+
+// registerToolImage caches a tool-produced image (compressed per provider settings) into data/temp/tool_images and stashes it on the event for the agent loop to inject as a follow-up user message; returns the py-compatible tool text.
+func (s *ProcessStage) registerToolImage(event *core.Event, rawB64, mime, toolName string) string {
+	data, err := base64.StdEncoding.DecodeString(rawB64)
+	if err != nil {
+		return "Error reading file: image payload is empty."
+	}
+	dir := filepath.Join("data", "temp", "tool_images")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "Error reading file: failed to cache image: " + err.Error()
+	}
+	path := filepath.Join(dir, fmt.Sprintf("astrbot-toolimg-%d-%s", time.Now().UnixNano(), sanitizeFileName(toolName)))
+	ext := ".img"
+	switch mime {
+	case "image/png":
+		ext = ".png"
+	case "image/jpeg":
+		ext = ".jpg"
+	case "image/gif":
+		ext = ".gif"
+	case "image/webp":
+		ext = ".webp"
+	case "image/bmp":
+		ext = ".bmp"
+	}
+	path += ext
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "Error reading file: failed to cache image: " + err.Error()
+	}
+	if compressed := s.compressImageForProvider(path); compressed != path {
+		if cb, err := os.ReadFile(compressed); err == nil {
+			data = cb
+			mime = "image/jpeg" // compressImageForProvider 统一 JPEG 输出（透明压平白底，与 provider 图片通道同语义）。
+		}
+	}
+	if event.Metadata == nil {
+		event.Metadata = map[string]interface{}{}
+	}
+	pending, _ := event.Metadata[toolImageSinkKey].(*[]pendingToolImage)
+	if pending == nil {
+		pending = &[]pendingToolImage{}
+		event.Metadata[toolImageSinkKey] = pending
+	}
+	*pending = append(*pending, pendingToolImage{Mime: mime, Base64: base64.StdEncoding.EncodeToString(data), Path: path})
+	return fmt.Sprintf("Image returned and cached at path='%s'. Review the image below. Use send_message_to_user to send it to the user if satisfied, with type='image' and path='%s'.", path, path)
+}
+
+// providerSupportsImages mirrors py's modalities gate: empty list = unconfigured = assume image input is supported.
+func providerSupportsImages(providerCfg map[string]interface{}) bool {
+	mods := providerModalities(providerCfg)
+	if len(mods) == 0 {
+		return true
+	}
+	for _, m := range mods {
+		if m == "image" {
+			return true
+		}
+	}
+	return false
+}
+
+// drainToolImages returns and clears the event's pending tool images.
+func drainToolImages(event *core.Event) []pendingToolImage {
+	if event.Metadata == nil {
+		return nil
+	}
+	pending, _ := event.Metadata[toolImageSinkKey].(*[]pendingToolImage)
+	if pending == nil || len(*pending) == 0 {
+		return nil
+	}
+	out := *pending
+	event.Metadata[toolImageSinkKey] = &[]pendingToolImage{}
+	return out
+}
+
+func sanitizeFileName(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			out = append(out, r)
+		}
+	}
+	if len(out) == 0 {
+		return "tool"
+	}
+	return string(out)
+}
+
+// maxToolImageBytes bounds raw image payloads captured from file tools (base64 inflates ~33%).
+const maxToolImageBytes = 20 << 20
+
+// sniffLocalImage reports the mime type when the first bytes of the file look like a supported image.
+func sniffLocalImage(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil && n == 0 {
+		return "", false
+	}
+	return imageSniffMime(buf[:n])
+}
+
+// docExtSet lists binary document extensions routed through the knowledge-base extractor (py probe → _parse_local_supported_document).
+var docExtSet = map[string]bool{".pdf": true, ".docx": true, ".xlsx": true, ".pptx": true, ".epub": true, ".xls": true}
+
+// maxDocExtractBytes bounds raw document bytes fed to the extractor (converted text is re-checked against maxFileReadBytes).
+const maxDocExtractBytes = 64 << 20
+
+// extractDocumentText reuses knowledgebase.ExtractKBText; false when the extension is not a binary document or extraction yields nothing (py: parse None → fall through to text/binary handling).
+func extractDocumentText(data []byte, name string) (string, bool) {
+	if !docExtSet[strings.ToLower(filepath.Ext(name))] {
+		return "", false
+	}
+	text, err := knowledgebase.ExtractKBText(data, name, "")
+	if err != nil || strings.TrimSpace(text) == "" {
+		return "", false
+	}
+	return text, true
+}
+
+// sliceTextLines returns lines[offset:offset+limit] like py _slice_text_by_lines.
+func sliceTextLines(text string, offset, limit int) string {
+	lines := strings.Split(text, "\n")
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(lines) {
+		return ""
+	}
+	end := len(lines)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	return strings.Join(lines[offset:end], "\n")
+}
+
+// formatDocumentRead mirrors py _read_local_supported_document_result: text within the read limit is returned (line-sliced by offset/limit); larger text is stored under the workspace converted_files/ directory and a notice with that path is returned so the model can grep/read it in narrow windows.
+func formatDocumentRead(text, resolved, umo string, offset, limit int, rawBytes []byte) string {
+	if int64(len(text)) <= maxFileReadBytes {
+		return windowedFileRead(text, fmt.Sprintf("Extracted text from %s:", resolved), offset, limit)
+	}
+	convertedPath := storeConvertedText(text, resolved, umo, rawBytes)
+	if convertedPath == "" {
+		return "Error reading file: parsed document exceeds the read output limit and no workspace is available for storing converted text."
+	}
+	if offset <= 0 && limit <= 0 {
+		return fmt.Sprintf("Converted text was saved to `%s` because the parsed document is too large to return directly. Read or grep that file with a narrow window.", convertedPath)
+	}
+	selected := sliceTextLines(text, offset, limit)
+	if selected == "" {
+		return "No content found at the requested line offset."
+	}
+	if int64(len(selected)) > maxFileReadBytes {
+		return fmt.Sprintf("Converted text was saved to `%s`. The requested output is still too large to return directly. Read or grep that file with a narrower window.", convertedPath)
+	}
+	return fmt.Sprintf("%s\n\nFull converted text is also available at `%s`. Read or grep that file with a narrow window for additional reads.", selected, convertedPath)
+}
+
+// storeConvertedText writes the extracted document text into <workspace>/converted_files/<name>_<md5[6]>/text.txt (py _store_converted_text_for_workspace).
+func storeConvertedText(text, resolved, umo string, rawBytes []byte) string {
+	sum := md5.Sum(rawBytes)
+	name := fmt.Sprintf("%s_%x", filepath.Base(resolved), sum[len(sum)-6:])
+	dir := filepath.Join(workspaceRoot(umo), "converted_files", name)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return ""
+	}
+	target := filepath.Join(dir, "text.txt")
+	if err := os.WriteFile(target, []byte(text), 0o600); err != nil {
+		return ""
+	}
+	return target
+}
+
+// looksBinarySample rejects NUL-bearing samples from the plain-text read path (py probe kind == binary → "binary files are not supported").
+func looksBinarySample(data []byte) bool {
+	n := len(data)
+	if n > 512 {
+		n = 512
+	}
+	for _, b := range data[:n] {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// Windowed file reading ported from opencode tool/read.ts: DEFAULT_READ_LIMIT=2000 lines, MAX_LINE_LENGTH=2000 chars per line, MAX_BYTES=50KB per response, numbered output, and a trailing hint (capped / showing X-Y of N / end of file) so the model continues with offset instead of blindly re-reading whole files.
+const (
+	defaultReadLines   = 2000
+	maxReadLineChars   = 2000
+	maxReadWindowBytes = 50 * 1024
+)
+
+// windowedFileRead renders content in one window. offset is 0-based (tool contract), display line numbers 1-based (opencode style). header is the tool-specific title line.
+func windowedFileRead(content, header string, offset, limit int) string {
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	total := len(lines)
+	if limit <= 0 {
+		limit = defaultReadLines
+	}
+	if offset > 0 && offset >= total && total > 0 {
+		return fmt.Sprintf("Error: offset %d is out of range for this file (%d lines).", offset, total)
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var out []string
+	bytes := 0
+	cut := false
+	more := false
+	for i := offset; i < total; i++ {
+		if len(out) >= limit {
+			more = true
+			break
+		}
+		line := lines[i]
+		if r := []rune(line); len(r) > maxReadLineChars {
+			line = string(r[:maxReadLineChars]) + fmt.Sprintf("... (line truncated to %d chars)", maxReadLineChars)
+		}
+		size := len(line) + 2 + fmtLen(i+offset+1)
+		if bytes > 0 {
+			size++
+		}
+		if bytes+size > maxReadWindowBytes {
+			cut = true
+			break
+		}
+		out = append(out, fmt.Sprintf("%d: %s", i+offset+1, line))
+		bytes += size
+	}
+	if len(out) == 0 && !cut && !more {
+		return header + "\n(End of file - file has no content at this offset.)"
+	}
+	lastShown := offset + len(out)
+	body := strings.Join(out, "\n")
+	var suffix string
+	switch {
+	case cut:
+		suffix = fmt.Sprintf("\n\n(Output capped at %d KB. Showing lines %d-%d%s. Use offset=%d to continue.)",
+			maxReadWindowBytes/1024, offset+1, lastShown, ofTotal(total), lastShown)
+	case more:
+		suffix = fmt.Sprintf("\n\n(Showing lines %d-%d of %d. Use offset=%d to continue.)", offset+1, lastShown, total, lastShown)
+	default:
+		suffix = fmt.Sprintf("\n\n(End of file - total %d lines)", total)
+	}
+	return header + "\n" + body + suffix
+}
+
+func ofTotal(total int) string {
+	return fmt.Sprintf(" of %d", total)
+}
+
+// fmtLen reports the digit count of n (≥1) for width accounting of "N: " prefixes.
+func fmtLen(n int) int {
+	if n < 1 {
+		n = 1
+	}
+	l := 0
+	for n > 0 {
+		n /= 10
+		l++
+	}
+	return l
+}
+
+// spoolWriter caps the in-memory head at max bytes but keeps the FULL output on disk (lazily opened spool file under dir), so oversized command results are never silently lost — the caller reports the spool path with read-window instructions (opencode truncate semantics at the source, where the data actually streams past).
+type spoolWriter struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	headLen int
+	max     int
+	dir     string
+	f       *os.File
+	path    string
+	total   int
+}
+
+func (w *spoolWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.total += len(p)
+	if w.f != nil {
+		_, _ = w.f.Write(p)
+		return len(p), nil
+	}
+	room := w.max - w.headLen
+	if len(p) <= room {
+		w.buf.Write(p)
+		w.headLen += len(p)
+		return len(p), nil
+	}
+	if room > 0 {
+		w.buf.Write(p[:room])
+		w.headLen += room
+	}
+	w.buf.Write(p[room:]) // tail beyond the head cap: buffer == full spool content at open time
+	if err := w.openSpoolLocked(); err != nil {
+		return len(p), nil // spool unavailable: pure head-cap behavior
+	}
+	return len(p), nil
+}
+
+func (w *spoolWriter) openSpoolLocked() error {
+	if err := os.MkdirAll(w.dir, 0o750); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(w.dir, "exec-*.log")
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(w.buf.Bytes()); err != nil {
+		_ = f.Close()
+		return err
+	}
+	w.f = f
+	w.path = f.Name()
+	return nil
+}
+
+func (w *spoolWriter) Close() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		_ = w.f.Close()
+		w.f = nil
+	}
+	return w.path
+}
+
+func (w *spoolWriter) Head() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Bytes()[:w.headLen]
+}
+
+// spoolNotice renders the tail hint appended when output spilled to disk.
+func spoolNotice(spoolPath string, total int) string {
+	return fmt.Sprintf("\n\n...(output capped at %d bytes of %d total; FULL OUTPUT saved to: %s. Use astrbot_grep_tool to search it or astrbot_file_read_tool with offset/limit to read windows — digest each segment before reading the next)...", maxShellOutput, total, spoolPath)
 }

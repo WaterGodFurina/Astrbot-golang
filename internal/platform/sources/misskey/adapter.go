@@ -836,3 +836,99 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 	// 保留事件指针供发送帖子时读取附加字段
 	a.rememberSessionEvent(abm.SessionID, event)
 }
+
+// GetGroupInfo enriches Misskey chat room metadata (Python misskey_event.py get_group).
+// ponytail: only implements room (chat rooms); notes use note session type.
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	if a.api == nil {
+		return &platform.Group{GroupID: groupID}, nil
+	}
+
+	group := &platform.Group{GroupID: groupID}
+
+	room, err := a.api.apiRequest(ctx, "chat/rooms/show", map[string]interface{}{"roomId": groupID}, false)
+	if err != nil {
+		logger.Debug("[Misskey] chat/rooms/show failed for %s: %v", groupID, err)
+		return group, nil
+	}
+
+	if name, ok := room["name"].(string); ok {
+		group.GroupName = name
+	}
+	ownerID, _ := room["ownerId"].(string)
+	if ownerID == "" {
+		ownerID, _ = room["owner_id"].(string)
+	}
+
+	var members []platform.MessageMember
+	seenIDs := make(map[string]bool)
+	untilID := ""
+	for {
+		payload := map[string]interface{}{"roomId": groupID, "limit": 100}
+		if untilID != "" {
+			payload["untilId"] = untilID
+		}
+		pageResp, err := a.api.apiRequest(ctx, "chat/rooms/members", payload, false)
+		if err != nil {
+			break
+		}
+		page, ok := pageResp["data"].([]interface{})
+		if !ok {
+			// Might be a direct array response
+			page, _ = pageResp["data"].([]interface{})
+			if len(page) == 0 {
+				break
+			}
+		}
+		for _, item := range page {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			user, _ := m["user"].(map[string]interface{})
+			uid, _ := m["userId"].(string)
+			if uid == "" {
+				uid, _ = user["id"].(string)
+			}
+			if uid == "" || seenIDs[uid] {
+				continue
+			}
+			seenIDs[uid] = true
+			nick, _ := user["name"].(string)
+			if nick == "" {
+				nick, _ = user["username"].(string)
+			}
+			members = append(members, platform.MessageMember{UserID: uid, Nickname: nick})
+		}
+		if len(page) < 100 {
+			break
+		}
+		nextUntil, _ := page[len(page)-1].(map[string]interface{})
+		nextID, _ := nextUntil["id"].(string)
+		if nextID == "" || nextID == untilID {
+			break
+		}
+		untilID = nextID
+	}
+
+	if ownerID != "" && !seenIDs[ownerID] {
+		ownerData, _ := room["owner"].(map[string]interface{})
+		nick, _ := ownerData["name"].(string)
+		if nick == "" {
+			nick, _ = ownerData["username"].(string)
+		}
+		members = append(members, platform.MessageMember{UserID: ownerID, Nickname: nick})
+		group.GroupOwner = ownerID
+	}
+
+	if len(members) > 0 {
+		group.Members = members
+		c := len(members)
+		group.MemberCount = &c
+	}
+
+	return group, nil
+}

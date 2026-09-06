@@ -134,5 +134,6 @@
     "messages": {
       "updateFailed": "修改失败，请重试"
     }
-  }
+  },
+  "logout": "退出登录"
 }

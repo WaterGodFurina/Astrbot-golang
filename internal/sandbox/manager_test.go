@@ -142,21 +142,36 @@ func TestManagerPerSessionSandbox(t *testing.T) {
 	}
 
 	// 模拟 g:1 的沙盒被 Bay 回收：booter 自我重置 running=false（等价于
-	// markDeadIfNeeded 命中 "Sandbox not found"）。下一次 Exec 应丢弃会话，
-	// 再 EnsureSession 时自动拉取新沙盒。
+	// markDeadIfNeeded 命中 "Sandbox not found"）。EnsureSession 须原地重建
+	// （对齐 py get_booter 的 available→shutdown→reboot），Exec 直接成功。
 	booters[0].mu.Lock()
 	booters[0].running = false
 	booters[0].mu.Unlock()
 
-	_, _, _, err = m.Exec(ctx, "g:1", "sh", []string{"-c", "echo hi"}, SandboxWorkdir)
-	if err == nil {
-		t.Fatal("Exec on a dead sandbox must fail")
-	}
-	// 会话已被丢弃，下一次 EnsureSession 拉取新沙盒。
-	if _, err := m.EnsureSession(ctx, "g:1"); err != nil {
-		t.Fatalf("EnsureSession g:1 after dead: %v", err)
+	if _, _, _, err = m.Exec(ctx, "g:1", "sh", []string{"-c", "echo hi"}, SandboxWorkdir); err != nil {
+		t.Fatalf("Exec on a dead sandbox must auto-rebuild and succeed: %v", err)
 	}
 	if len(booters) != 3 {
 		t.Fatalf("dead sandbox must auto-pull a new booter, expected 3 instances, got %d", len(booters))
+	}
+	// 重建后同一实例复用（不再反复拉新）。
+	if _, err := m.EnsureSession(ctx, "g:1"); err != nil {
+		t.Fatalf("EnsureSession g:1 after rebuild: %v", err)
+	}
+	if len(booters) != 3 {
+		t.Fatalf("rebuilt session must be reused, got %d instances", len(booters))
+	}
+	// EnsureSession 对死 booter 的原地重建（skill 变更 resync 触达前的兜底路径）。
+	booters[2].mu.Lock()
+	booters[2].running = false
+	booters[2].mu.Unlock()
+	if m.IsRunning("g:1") {
+		t.Fatal("sanity: dead booter must report not running")
+	}
+	if _, err := m.EnsureSession(ctx, "g:1"); err != nil {
+		t.Fatalf("EnsureSession after second death: %v", err)
+	}
+	if len(booters) != 4 {
+		t.Fatalf("EnsureSession must rebuild dead booter in place, expected 4 instances, got %d", len(booters))
 	}
 }

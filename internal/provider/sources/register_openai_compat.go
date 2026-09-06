@@ -30,4 +30,8 @@ func init() {
 	provider.RegisterProvider("xiaomi_chat_completion", func(config, settings map[string]interface{}) (provider.AbstractProvider, error) {
 		return NewXiaomiSource(config, settings), nil
 	})
+
+	provider.RegisterProvider("mirarouter_chat_completion", func(config, settings map[string]interface{}) (provider.AbstractProvider, error) {
+		return NewMiraRouterSource(config, settings), nil
+	})
 }

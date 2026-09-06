@@ -222,6 +222,10 @@ func (a *Adapter) convertMsg(msg *ChatbotMessage) *platform.AstrBotMessage {
 			}
 		}
 		abm.Group = &platform.Group{GroupID: msg.ConversationID}
+		// 对齐 Python dingtalk_adapter.py #9808：补全群聊名称
+		if msg.ConversationTitle != "" {
+			abm.Group.GroupName = msg.ConversationTitle
+		}
 		abm.SessionID = msg.ConversationID
 		a.rememberGroup(msg.ConversationID)
 	} else {

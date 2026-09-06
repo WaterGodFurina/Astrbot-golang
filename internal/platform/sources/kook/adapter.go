@@ -276,6 +276,9 @@ func (a *Adapter) convertMessage(data *kookMessageEventData) *platform.AstrBotMe
 		}
 		abm.Type = platform.GroupMessage
 		abm.Group = &platform.Group{GroupID: sessionID}
+		if data.Extra.ChannelName != "" {
+			abm.Group.GroupName = data.Extra.ChannelName
+		}
 		abm.SessionID = sessionID
 		a.rememberChannel(sessionID, channelType)
 	case KookChannelPerson:
@@ -921,4 +924,162 @@ func decodeBase64(s string) ([]byte, error) {
 		return data, nil
 	}
 	return base64.URLEncoding.DecodeString(s)
+}
+
+// GetGroupInfo enriches KOOK channel/guild metadata (Python kook_event.py get_group).
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	if a.client == nil {
+		return &platform.Group{GroupID: groupID}, nil
+	}
+
+	group := &platform.Group{GroupID: groupID}
+
+	channel, err := a.client.GetChannel(ctx, groupID)
+	if err != nil {
+		logger.Debug("[KOOK] channel lookup failed for %s: %v", groupID, err)
+		return group, nil
+	}
+	if name, _ := channel["name"].(string); name != "" {
+		group.GroupName = name
+	}
+
+	guildID, _ := channel["guild_id"].(string)
+	if guildID == "" {
+		return group, nil
+	}
+
+	var guildRoles []map[string]interface{}
+	guild, err := a.client.GetGuild(ctx, guildID)
+	if err != nil {
+		logger.Debug("[KOOK] guild lookup failed for %s: %v", guildID, err)
+	} else {
+		if icon, _ := guild["icon"].(string); icon != "" {
+			group.GroupAvatar = icon
+		}
+		if ownerID, _ := guild["user_id"].(string); ownerID != "" {
+			group.GroupOwner = ownerID
+		}
+		if roles, ok := guild["roles"].([]interface{}); ok {
+			for _, r := range roles {
+				if rm, ok := r.(map[string]interface{}); ok {
+					guildRoles = append(guildRoles, rm)
+				}
+			}
+		}
+	}
+
+	if len(guildRoles) == 0 {
+		rolePage := 1
+		for {
+			roleResp, err := a.client.GetGuildRoles(ctx, guildID, rolePage, 50)
+			if err != nil {
+				break
+			}
+			items, _ := roleResp["items"].([]interface{})
+			for _, item := range items {
+				if rm, ok := item.(map[string]interface{}); ok {
+					guildRoles = append(guildRoles, rm)
+				}
+			}
+			meta, _ := roleResp["meta"].(map[string]interface{})
+			pageTotal, _ := meta["page_total"].(float64)
+			if int(pageTotal) > 0 && rolePage >= int(pageTotal) {
+				break
+			}
+			if len(items) < 50 {
+				break
+			}
+			rolePage++
+		}
+	}
+
+	adminRoleIDs := make(map[int64]bool)
+	for _, role := range guildRoles {
+		roleID, _ := role["role_id"].(float64)
+		if roleID == 0 {
+			if rid, ok := role["id"].(float64); ok {
+				roleID = rid
+			}
+		}
+		permissions, _ := role["permissions"].(float64)
+		if roleID != 0 && int(permissions)&1 != 0 {
+			adminRoleIDs[int64(roleID)] = true
+		}
+	}
+
+	page := 1
+	pageSize := 50
+	memberMap := make(map[string]map[string]interface{})
+	for {
+		resp, err := a.client.GetGuildUsers(ctx, guildID, groupID, page, pageSize)
+		if err != nil {
+			break
+		}
+		items, _ := resp["items"].([]interface{})
+		for _, item := range items {
+			if m, ok := item.(map[string]interface{}); ok {
+				uid, _ := m["id"].(string)
+				if uid != "" {
+					memberMap[uid] = m
+				}
+			}
+		}
+		meta, _ := resp["meta"].(map[string]interface{})
+		pageTotal, _ := meta["page_total"].(float64)
+		total, _ := meta["total"].(float64)
+		if int(pageTotal) > 0 && page >= int(pageTotal) {
+			break
+		}
+		if len(items) < pageSize {
+			break
+		}
+		if total > 0 && len(memberMap) >= int(total) {
+			break
+		}
+		page++
+	}
+
+	var members []platform.MessageMember
+	var admins []string
+	for uid, member := range memberMap {
+		nick, _ := member["nickname"].(string)
+		if nick == "" {
+			nick, _ = member["username"].(string)
+		}
+		if nick == "" {
+			nick = uid
+		}
+		members = append(members, platform.MessageMember{UserID: uid, Nickname: nick})
+
+		if roles, ok := member["roles"].([]interface{}); ok {
+			isAdmin := false
+			for _, rid := range roles {
+				if ridFloat, ok := rid.(float64); ok {
+					if adminRoleIDs[int64(ridFloat)] {
+						isAdmin = true
+						break
+					}
+				} else if ridStr, ok := rid.(string); ok {
+					if ridInt, err := strconv.ParseInt(ridStr, 10, 64); err == nil && adminRoleIDs[ridInt] {
+						isAdmin = true
+						break
+					}
+				}
+			}
+			if isAdmin {
+				admins = append(admins, uid)
+			}
+		}
+	}
+	group.Members = members
+	group.GroupAdmins = admins
+	if len(members) > 0 {
+		c := len(members)
+		group.MemberCount = &c
+	}
+
+	return group, nil
 }

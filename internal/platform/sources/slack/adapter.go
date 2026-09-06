@@ -745,6 +745,12 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		},
 		Metadata: map[string]interface{}{},
 	}
+	if abm.Group != nil {
+		event.MessageObj.Group = &core.Group{
+			GroupID:   abm.Group.GroupID,
+			GroupName: abm.Group.GroupName,
+		}
+	}
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.I18nError("发布事件失败: %v", err)
 	}
@@ -835,6 +841,59 @@ func writeJSONError(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+// GetGroupInfo enriches Slack channel metadata via conversations.info +
+// conversations.members pagination (Python slack_event.py get_group).
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" || a.client == nil {
+		return nil, nil
+	}
+	group := &platform.Group{GroupID: groupID}
+
+	info, err := a.client.GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
+		ChannelID: groupID,
+	})
+	if err != nil {
+		logger.Debug("[Slack] conversations.info failed for %s: %v", groupID, err)
+		return group, nil
+	}
+	if info.Name != "" {
+		group.GroupName = info.Name
+	}
+	if info.Purpose.Value != "" {
+		if group.GroupName == "" {
+			group.GroupName = info.Purpose.Value
+		}
+	}
+
+	var members []platform.MessageMember
+	cursor := ""
+	for {
+		membersResp, cursorNext, err := a.client.GetUsersInConversationContext(ctx, &slack.GetUsersInConversationParameters{
+			ChannelID: groupID,
+			Cursor:    cursor,
+			Limit:     200,
+		})
+		if err != nil {
+			break
+		}
+		for _, uid := range membersResp {
+			name := a.fetchUserName(ctx, uid)
+			members = append(members, platform.MessageMember{UserID: uid, Nickname: name})
+		}
+		if cursorNext == "" {
+			break
+		}
+		cursor = cursorNext
+	}
+	if len(members) > 0 {
+		group.Members = members
+		c := len(members)
+		group.MemberCount = &c
+	}
+
+	return group, nil
 }
 
 // isFreshTimestamp 判断回调时间戳是否为 Unix 秒且与当前时间偏差不超过 maxSkew。

@@ -134,6 +134,17 @@ func currentActive(mgr *plugin.SubprocessManager, id string) *plugin.PluginInsta
 	return inst
 }
 
+// wakeFilterHookInstance 按插件的休眠唤醒方式返回过滤器/钩子处理实例：
+// idle_wake_mode == "hook_and_command" 时懒加载唤醒（resolveActive，被动
+// 事件可达）；默认（""/"command_only"，仅插件唤醒）不唤醒——插件已休眠时
+// 静默跳过，仅指令/工具可唤醒。
+func wakeFilterHookInstance(mgr *plugin.SubprocessManager, pluginID string) *plugin.PluginInstance {
+	if mgr != nil && mgr.PluginIdleWakeMode(pluginID) == "hook_and_command" {
+		return resolveActive(mgr, pluginID)
+	}
+	return currentActive(mgr, pluginID)
+}
+
 // RegisterSubprocessPlugin bridges one subprocess plugin's commands, filters
 // and hooks into the star registry. Uses the same `plugin_` prefixes as the
 // legacy .so bridge, so RemovePluginCommands/Filters/Hooks clean them up.
@@ -258,9 +269,10 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				if !ok {
 					return nil
 				}
-				// 过滤器是被动广播：不懒加载、不刷新活动时间（否则带过滤器的
-				// 插件永不休眠）；插件已休眠时静默跳过。
-				cur := currentActive(mgr, pluginID)
+				// 过滤器按插件「唤醒方式」处理：默认仅插件唤醒（不懒加载、
+				// 不刷新活动时间，已休眠时静默跳过）；hook_and_command 模式
+				// 懒加载唤醒（被动事件可达，刷新活动时间）。
+				cur := wakeFilterHookInstance(mgr, pluginID)
 				if cur == nil || cur.Client == nil {
 					return nil
 				}
@@ -314,8 +326,8 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				if !ok {
 					return nil
 				}
-				// 钩子是被动广播：不懒加载、不刷新活动时间（同过滤器）。
-				cur := currentActive(mgr, pluginID)
+				// 钩子同过滤器：按插件「唤醒方式」处理（默认不唤醒）。
+				cur := wakeFilterHookInstance(mgr, pluginID)
 				if cur == nil || cur.Client == nil {
 					return nil
 				}
@@ -400,6 +412,15 @@ func CoreEventToSDKEvent(e *core.Event) *sdkv1.SDKEvent {
 // messageToProtoComponents 把宿主 message.Component 链直接转为 proto
 // Component（P1 native，跳过 SDK 中间 struct）。
 func messageToProtoComponents(chain []message.Component) []*sdkv1.Component {
+	return messageToProtoComponentsDepth(chain, 0)
+}
+
+// maxProtoComponentDepth 限制组件链的嵌套深度（Reply 引用内容、Forward 节点
+// 等），与 Python SDK _bridge/serialize.py 的 _MAX_NODE_DEPTH 对齐，防御
+// 畸形自嵌套链导致 proto 递归构造过深。
+const maxProtoComponentDepth = 50
+
+func messageToProtoComponentsDepth(chain []message.Component, depth int) []*sdkv1.Component {
 	out := make([]*sdkv1.Component, 0, len(chain))
 	for _, c := range chain {
 		if c == nil {
@@ -441,7 +462,17 @@ func messageToProtoComponents(chain []message.Component) []*sdkv1.Component {
 				}
 			}
 		case *message.Reply:
+			// 引用消息完整传输（对齐 Python Reply：id/chain/sender_id/
+			// sender_nickname/time/message_str）。message_str/text 沿用
+			// 既有字段；被引用内容链与发送者信息走 sender_* / chain 字段。
 			pc.Id, pc.Text = v.MessageID, v.MessageStr
+			pc.SenderId, pc.SenderName = v.SenderID, v.SenderNick
+			if !v.CreatedAt.IsZero() {
+				pc.SenderTime = v.CreatedAt.Unix()
+			}
+			if depth < maxProtoComponentDepth && len(v.Chain) > 0 {
+				pc.Chain = messageToProtoComponentsDepth(v.Chain, depth+1)
+			}
 		}
 		out = append(out, pc)
 	}

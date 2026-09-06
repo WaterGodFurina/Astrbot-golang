@@ -28,7 +28,7 @@
   "messages": {
     "configApplied": "配置成功应用。如要保存，需再点击右下角保存按钮。",
     "configApplyError": "配置未应用，Json 格式错误。",
-    "unsavedChangesNotice": "当前配置有未保存修改。请点击右下角保存按钮以生效。",
+    "unsavedChangesNotice": "未保存更改。点击右下角按钮保存。",
     "saveSuccess": "配置保存成功",
     "saveError": "配置保存失败",
     "loadError": "配置加载失败",
@@ -116,7 +116,7 @@
     "addToConfig": "已加入配置",
     "fileCount": "文件：{count}",
     "done": "完成"
-    },
+  },
   "unsavedChangesWarning": {
     "dialogTitle": "未保存的更改",
     "leavePage": "当前配置有未保存的更改，切换前是否保存？",
@@ -128,6 +128,73 @@
       "closeCard": "关闭弹窗",
       "confirm": "确定",
       "cancel": "取消"
+    }
+  },
+  "aiSettings": {
+    "title": "AI",
+    "enable": "启用 AI",
+    "more": "更多操作",
+    "changeRunner": "切换执行模式",
+    "localSettingsTitle": "AstrBot 内置 AI",
+    "settingsSuffix": "设置",
+    "tabs": {
+      "model": "模型",
+      "persona": "人格",
+      "capabilities": "能力",
+      "advanced": "高级"
+    },
+    "groups": {
+      "model": "模型",
+      "modelHint": "选择内置 AI 使用的对话模型和重试策略。",
+      "execution": "执行",
+      "executionHint": "配置工具调用循环和执行流程。",
+      "media": "图像与语音",
+      "mediaHint": "配置图片理解、语音转文字和文字转语音。",
+      "behavior": "消息处理",
+      "behaviorHint": "这些设置适用于此配置文件中的每种执行模式。"
+    },
+    "common": {
+      "title": "通用设置",
+      "subtitle": "这些设置在执行模式更改时保持不变。"
+    },
+    "disabled": {
+      "title": "AI 已禁用",
+      "subtitle": "启用 AI 以处理需要模型的消息。"
+    },
+    "runnerDialog": {
+      "title": "切换执行模式",
+      "subtitle": "仅在连接外部 AI 应用程序时更改此设置。内置 AI 适合大多数用户。",
+      "warningPrefix": "切换将使用新执行模式的默认配置。当前执行模式的配置",
+      "warningEmphasis": "将不会保留",
+      "warningSuffix": "。",
+      "confirm": "使用此模式"
+    },
+    "runners": {
+      "local": {
+        "title": "内置 AI",
+        "summary": "配置 AstrBot 的 AI 能力，包括模型、人格、知识库和工具。",
+        "description": "使用 AstrBot 的内置 AI，包括模型、人格、知识库和工具。"
+      },
+      "dify": {
+        "title": "Dify",
+        "summary": "AI 对话当前由 Dify 应用程序处理。",
+        "description": "连接 Dify 应用程序并配置其访问参数。"
+      },
+      "coze": {
+        "title": "Coze",
+        "summary": "AI 对话当前由 Coze Bot 处理。",
+        "description": "连接 Coze Bot 并配置其访问参数。"
+      },
+      "dashscope": {
+        "title": "阿里云百炼",
+        "summary": "AI 对话当前由百炼应用程序处理。",
+        "description": "连接百炼应用程序并配置其访问参数。"
+      },
+      "deerflow": {
+        "title": "DeerFlow",
+        "summary": "AI 对话当前由 DeerFlow 处理。",
+        "description": "连接 DeerFlow 并配置其访问参数。"
+      }
     }
   }
 }

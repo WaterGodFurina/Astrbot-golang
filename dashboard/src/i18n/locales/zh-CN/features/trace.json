@@ -6,5 +6,16 @@
   },
   "hint": "当前仅记录部分 AstrBot 主 Agent 的模型调用路径，后续会不断完善。",
   "recording": "记录中",
-  "paused": "已暂停"
+  "paused": "已暂停",
+  "toggleLabel": "记录追踪",
+  "table": {
+    "time": "时间",
+    "eventId": "事件 ID",
+    "sender": "发送者",
+    "outline": "内容"
+  },
+  "expand": "展开",
+  "collapse": "折叠",
+  "showMore": "显示更多",
+  "empty": "暂无追踪数据"
 }

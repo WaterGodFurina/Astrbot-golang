@@ -140,5 +140,8 @@
       "title": "No first notice content available",
       "subtitle": "FIRST_NOTICE.md was not found or is empty."
     }
-  }
+  },
+  "collapse": "Collapse",
+  "expand": "Expand",
+  "unauthorized": "Unauthorized"
 }

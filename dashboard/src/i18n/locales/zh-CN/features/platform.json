@@ -211,5 +211,48 @@
     "occurredAt": "发生时间",
     "traceback": "错误堆栈",
     "close": "关闭"
+  },
+  "workspace": {
+    "listTitle": "机器人",
+    "selectHint": "选择要配置的机器人",
+    "empty": "暂无机器人。创建一个开始配置。",
+    "enabled": "启用机器人",
+    "disabled": "已禁用",
+    "delete": "删除机器人",
+    "save": "保存更改",
+    "configTitle": "连接设置",
+    "configDescription": "配置此机器人如何连接到其消息平台。",
+    "routes": {
+      "title": "对话配置",
+      "description": "对不同对话使用不同的配置文件。未绑定的对话使用下方的默认配置。",
+      "loadFailed": "无法加载对话配置。连接设置仍然可编辑，但本次不会更改对话分配。",
+      "defaultTitle": "此机器人的默认配置",
+      "defaultDescription": "每个没有自己绑定的对话使用此配置。",
+      "systemDefault": "系统默认配置（默认）",
+      "bindTitle": "为对话选择配置",
+      "bindDescription": "选择一个已知对话，然后选择它应使用的配置文件。",
+      "sessionLabel": "选择对话",
+      "configLabel": "配置文件",
+      "bind": "添加绑定",
+      "noSessions": "暂无对话。请先在消息平台上给此机器人发送一条消息。",
+      "boundTitle": "已绑定的对话",
+      "boundCount": "{count}",
+      "remove": "移除绑定",
+      "noBindings": "没有单独绑定的对话。所有对话使用默认配置。",
+      "advanced": "高级路由规则",
+      "advancedDescription": "使用 UMO 模式匹配多个对话。规则从上到下匹配，适合熟悉 AstrBot 消息来源的用户。",
+      "patternLabel": "UMO 模式",
+      "patternPlaceholder": "例如 bot-id:GroupMessage:*",
+      "addPattern": "添加规则",
+      "patternRequired": "请输入 UMO 模式",
+      "patternInvalid": "使用格式 平台:消息类型:对话ID",
+      "patternPlatformMismatch": "平台部分必须与当前机器人 ID 匹配",
+      "duplicatePattern": "发现重复的配置路由。请检查后重试。",
+      "sessionTypes": {
+        "group": "群聊",
+        "friend": "私聊",
+        "other": "对话"
+      }
+    }
   }
 }

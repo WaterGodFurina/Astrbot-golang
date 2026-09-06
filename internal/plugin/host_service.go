@@ -135,8 +135,10 @@ type RecallAdapter interface {
 }
 
 // pluginAdminListFromConfig 从主配置读取插件管理管理员名单（config 键
-// plugin_admin_list，字符串数组）。缺省返回 nil（无管理插件）。
-func pluginAdminListFromConfig(cfgMgr *config.ConfigManager) []string {
+// plugin_admin_list，字符串数组），并按 manifest 把 id 与注册名双向展开——
+// 配置写 id 形式（astrbot_plugin_xxx_python）或注册名形式
+// （astrbot_plugin_xxx）都能命中 SDK 侧按注册名的授权校验。缺省返回 nil。
+func pluginAdminListFromConfig(cfgMgr *config.ConfigManager, subMgr *SubprocessManager) []string {
 	if cfgMgr == nil {
 		return nil
 	}
@@ -152,13 +154,49 @@ func pluginAdminListFromConfig(cfgMgr *config.ConfigManager) []string {
 	if !ok {
 		return nil
 	}
-	var out []string
+	base := make([]string, 0, len(arr))
 	for _, e := range arr {
 		if s, ok := e.(string); ok && s != "" {
+			base = append(base, s)
+		}
+	}
+	if len(base) == 0 || subMgr == nil {
+		return base
+	}
+	// manifest 展开：id ↔ 注册名同入名单（SDK 授权校验用注册名）。
+	out := make([]string, 0, len(base)*2)
+	seen := map[string]bool{}
+	add := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
 			out = append(out, s)
 		}
 	}
-	return out
+	if man := subMgr.cachedManifest(); man != nil {
+		byID := map[string]string{}
+		byName := map[string]string{}
+		for i := range man.Plugins {
+			byID[man.Plugins[i].ID] = man.Plugins[i].Name
+			byName[man.Plugins[i].Name] = man.Plugins[i].ID
+		}
+		for _, e := range base {
+			add(e)
+			if n, ok := byID[e]; ok {
+				add(n)
+			}
+			if id, ok := byName[e]; ok {
+				add(id)
+			}
+		}
+		return out
+	}
+	return base
+}
+
+// RefreshPluginAdminList 在 config 变更后重新注入插件管理名单（WebUI
+// "管理插件授权"保存后即时生效，无需重启）。
+func RefreshPluginAdminList(cfgMgr *config.ConfigManager, subMgr *SubprocessManager) {
+	pluginsdk.SetPluginAdminList(pluginAdminListFromConfig(cfgMgr, subMgr))
 }
 
 // pluginConfigID 把 HostService 反调用携带的插件注册名解析为实例 id
@@ -475,9 +513,9 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		}
 	}
 	// 插件管理管理员名单：默认无管理插件（插件仅能启停自身）。
-	// config 的 plugin_admin_list 数组可授权指定插件（注册名，如
-	// astrbot_plugin_xxx_python）执行安装/卸载/操作其他插件。
-	pluginsdk.SetPluginAdminList(pluginAdminListFromConfig(cfgMgr))
+	// config 的 plugin_admin_list 数组可授权指定插件（注册名或 manifest id
+	// 均可，注入时双向展开）执行安装/卸载/操作其他插件。
+	pluginsdk.SetPluginAdminList(pluginAdminListFromConfig(cfgMgr, subMgr))
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
 		CallAction: func(platformID, api string, params map[string]any) (map[string]any, error) {
 			adapter := pm.Get(platformID)

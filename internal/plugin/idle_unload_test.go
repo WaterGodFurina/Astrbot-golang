@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	"os"
 	"path/filepath"
 	"testing"
@@ -114,28 +115,44 @@ func TestIdlePerPluginTimeout(t *testing.T) {
 	}
 }
 
-// TestIdleMinutesZeroFallsBackToGlobal: 插件未设独立分钟（0）时回退全局默认；
-// 全局默认 0 时不允许回收（避免立即反复休眠/唤醒）。
-func TestIdleMinutesZeroFallsBackToGlobal(t *testing.T) {
+// TestIdleMinutesZeroFallsBackToGlobal: 独立控制模式下，插件未设独立分钟（0）时不回收；
+// 设置独立分钟后才能被回收。
+// TestIdleEnableBackfillsDefaultMinutes: 「关闭→开启」翻转且未设阈值时后端落
+// DefaultIdleUnloadMinutes（修 API 开了永不休眠 bug）；已开启态显式设 0 不被覆盖。
+func TestIdleEnableBackfillsDefaultMinutes(t *testing.T) {
 	requirePlugin(t)
 	m := newTestManager(t)
 	p := idleTestPlugin(t, m, filepath.Join("testdata", "plugin"), "pzero")
 	if err := m.SetPluginIdleUnload(p.ID, true); err != nil {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
 	}
-
-	// 全局默认 0 → 无有效超时 → 不回收。
-	idleNow(t, m, p.ID, time.Hour)
-	m.SweepIdle()
-	if m.Get(p.ID) == nil {
-		t.Fatal("minutes=0 且全局默认 0 时不应回收")
+	if got := m.PluginIdleUnloadMinutes(p.ID); got != DefaultIdleUnloadMinutes {
+		t.Fatalf("开启翻转后阈值 = %d, want %d", got, DefaultIdleUnloadMinutes)
 	}
-	// 全局默认开启 → minutes=0 回退全局。
-	m.SetIdleUnload(10 * time.Millisecond)
+	// 阈值真实生效（而非旧 bug 的「开了但永不休眠」）。
 	idleNow(t, m, p.ID, time.Hour)
 	m.SweepIdle()
 	if m.Get(p.ID) != nil {
-		t.Fatal("minutes=0 应回退全局默认并被回收")
+		t.Fatal("默认阈值下闲置 1 小时应被回收")
+	}
+
+	// 唤醒后进入开启态；显式设 0（常驻意图）不得被后续 SetPluginIdleUnload(true) 覆盖。
+	if _, err := m.EnsureLoaded(context.Background(), p.ID); err != nil {
+		t.Fatalf("EnsureLoaded: %v", err)
+	}
+	if err := m.SetPluginIdleUnloadMinutes(p.ID, 0); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
+	}
+	if err := m.SetPluginIdleUnload(p.ID, true); err != nil {
+		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
+	if got := m.PluginIdleUnloadMinutes(p.ID); got != 0 {
+		t.Fatalf("非翻转不得覆盖显式 0, got %d", got)
+	}
+	idleNow(t, m, p.ID, time.Hour)
+	m.SweepIdle()
+	if m.Get(p.ID) == nil {
+		t.Fatal("minutes=0 应常驻不回收")
 	}
 }
 
@@ -253,21 +270,22 @@ func TestUnloadIdleCheckedSkipsFreshlyWoken(t *testing.T) {
 	}
 }
 
-// TestIdleSweepLoopStopsWhenDisabled: SetIdleUnload 置 0 后 sweep loop 应
-// 退出（多次启停不泄漏 goroutine、不重复清扫）。
-func TestIdleSweepLoopStopsWhenDisabled(t *testing.T) {
+// TestIdleSweepLoopAlwaysRuns: 单插件独立控制下清扫循环自 NewSubprocessManager
+// 常驻运行（不依赖全局开关启停），SetIdleUnload 仅保留全局阈值字段供报告，
+// 不得重复启动循环（防并发双清扫 goroutine 泄漏）。
+func TestIdleSweepLoopAlwaysRuns(t *testing.T) {
 	m := newTestManager(t)
-	m.SetIdleUnload(50 * time.Millisecond)
-	m.SetIdleUnload(0) // 关闭
-	// loop 在下个 tick 检测到关闭后退出：给足时间并观察无 panic/无卸载
-	// 行为即可（goroutine 数量断言在 CI 中不稳定，这里验证开关语义）。
-	if m.IdleUnloadEnabled() {
-		t.Fatal("disabled after SetIdleUnload(0)")
-	}
+	// 全局阈值保留语义（报告用），循环本身不受影响。
 	m.SetIdleUnload(50 * time.Millisecond)
 	if !m.IdleUnloadEnabled() {
-		t.Fatal("enabled again")
+		t.Fatal("global threshold field must be reported when set")
 	}
+	m.SetIdleUnload(0)
+	if m.IdleUnloadEnabled() {
+		t.Fatal("global threshold field cleared")
+	}
+	// 循环已常驻：手动 SweepIdle 无 panic 即验证语义（多循环断言在 CI 不稳定）。
+	m.SweepIdle()
 }
 
 // TestSweepSkipsPluginsWithActiveSessionWait: 有活跃会话等待的插件不参与
@@ -351,5 +369,51 @@ func TestUnloadIdleSkipsPluginUnloadedBroadcast(t *testing.T) {
 	m.handlerMetaMu.RUnlock()
 	if meta == nil {
 		t.Fatal("idle-unload must keep handler meta for lazy reload")
+	}
+}
+
+// TestPluginIdleWakeModePersisted: 休眠唤醒方式（idle_wake_mode）的设置、
+// 读取与 manifest 持久化；非法值必须被拒绝。
+func TestPluginIdleWakeModePersisted(t *testing.T) {
+	m := newTestManager(t)
+	id := "sleepy_plugin_python"
+	m.manifestMu.Lock()
+	man, _ := LoadManifest(m.manifestPath())
+	if man == nil {
+		man = &Manifest{}
+	}
+	man.Plugins = append(man.Plugins, ManifestEntry{ID: id, Name: "sleepy_plugin", Language: "python"})
+	_ = man.Save(m.manifestPath())
+	m.manifestMu.Unlock()
+
+	// 默认（未配置）= 空 → 仅插件唤醒语义。
+	if got := m.PluginIdleWakeMode(id); got != "" {
+		t.Fatalf("default wake mode = %q, want empty", got)
+	}
+
+	if err := m.SetPluginIdleWakeMode(id, "hook_and_command"); err != nil {
+		t.Fatalf("SetPluginIdleWakeMode: %v", err)
+	}
+	if got := m.PluginIdleWakeMode(id); got != "hook_and_command" {
+		t.Fatalf("wake mode = %q, want hook_and_command", got)
+	}
+
+	// 持久化：重新加载 manifest 后仍可读取（新 manager 指向同一 dataDir）。
+	m2 := NewSubprocessManager(toolchain.New(), m.dataDir)
+	if got := m2.PluginIdleWakeMode(id); got != "hook_and_command" {
+		t.Fatalf("wake mode after reload = %q, want hook_and_command", got)
+	}
+
+	// 切回默认（仅插件唤醒）。
+	if err := m.SetPluginIdleWakeMode(id, "command_only"); err != nil {
+		t.Fatalf("SetPluginIdleWakeMode(command_only): %v", err)
+	}
+	if got := m.PluginIdleWakeMode(id); got != "command_only" {
+		t.Fatalf("wake mode = %q, want command_only", got)
+	}
+
+	// 非法值拒绝。
+	if err := m.SetPluginIdleWakeMode(id, "bogus"); err == nil {
+		t.Fatal("invalid wake mode must be rejected")
 	}
 }

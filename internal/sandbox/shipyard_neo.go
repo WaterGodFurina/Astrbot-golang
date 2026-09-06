@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -543,6 +544,104 @@ func discoverBayCredentials() string {
 		}
 	}
 	return ""
+}
+
+// Capabilities returns the sandbox profile capability list detected at boot (e.g. "browser").
+func (b *ShipyardNeoBooter) Capabilities() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, len(b.caps))
+	copy(out, b.caps)
+	return out
+}
+
+// sandboxPath returns the per-sandbox API base after liveness guard.
+func (b *ShipyardNeoBooter) sandboxPath() (string, error) {
+	b.mu.Lock()
+	running, id, ep := b.running, b.sandboxID, b.endpointURL
+	b.mu.Unlock()
+	if !running || id == "" {
+		return "", fmt.Errorf("shipyard neo sandbox not running")
+	}
+	return strings.TrimSuffix(strings.TrimSpace(ep), "/") + "/v1/sandboxes/" + id, nil
+}
+
+// BrowserExec runs one browser automation command (Gull runtime). Mirrors SDK BrowserCapability.exec.
+func (b *ShipyardNeoBooter) BrowserExec(ctx context.Context, body map[string]interface{}, timeoutSec int) (string, error) {
+	base, err := b.sandboxPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := b.do(ctx, b.execClient, base, http.MethodPost, "/browser/exec", body, nil, "application/json")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// BrowserExecBatch runs ordered browser commands in one round-trip. Mirrors SDK BrowserCapability.exec_batch.
+func (b *ShipyardNeoBooter) BrowserExecBatch(ctx context.Context, body map[string]interface{}) (string, error) {
+	base, err := b.sandboxPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := b.do(ctx, b.execClient, base, http.MethodPost, "/browser/exec_batch", body, nil, "application/json")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// BrowserRunSkill replays a released browser skill in this sandbox. Mirrors SDK BrowserCapability.run_skill.
+func (b *ShipyardNeoBooter) BrowserRunSkill(ctx context.Context, skillKey string, body map[string]interface{}) (string, error) {
+	base, err := b.sandboxPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := b.do(ctx, b.execClient, base, http.MethodPost, "/browser/skills/"+url.PathEscape(skillKey)+"/run", body, nil, "application/json")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// GetExecutionHistory lists sandbox execution records. Mirrors SDK Sandbox.get_execution_history.
+func (b *ShipyardNeoBooter) GetExecutionHistory(ctx context.Context, params map[string]string) (string, error) {
+	base, err := b.sandboxPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := b.do(ctx, b.client, base, http.MethodGet, "/history", nil, params, "")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// GetExecution reads one execution history record by id. Mirrors SDK Sandbox.get_execution.
+func (b *ShipyardNeoBooter) GetExecution(ctx context.Context, executionID string) (string, error) {
+	base, err := b.sandboxPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := b.do(ctx, b.client, base, http.MethodGet, "/history/"+url.PathEscape(executionID), nil, nil, "")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// AnnotateExecution patches description/tags/notes on one execution record. Mirrors SDK Sandbox.annotate_execution.
+func (b *ShipyardNeoBooter) AnnotateExecution(ctx context.Context, executionID string, body map[string]interface{}) (string, error) {
+	base, err := b.sandboxPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := b.do(ctx, b.client, base, http.MethodPatch, "/history/"+url.PathEscape(executionID), body, nil, "application/json")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // ensure ShipyardNeoBooter implements Booter.

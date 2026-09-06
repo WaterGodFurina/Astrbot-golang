@@ -61,6 +61,7 @@ type Lifecycle struct {
 	toolchain       *toolchain.Toolchain
 	skillMgr        *skills.SkillManager
 	sandboxMgr      *sandbox.Manager
+	neoStore        *skills.NeoStore
 	sandboxSig      string // last booter-selection signature (avoids needless rebuilds)
 	eventBus        *core.EventBus
 	conversationMgr *conversation.Manager
@@ -208,6 +209,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.skillMgr = skills.NewSkillManager("data/skills", "data/plugins", "data")
 	logger.I18nInfo("技能管理器已初始化（%d 个技能）", len(l.skillMgr.ListSkills(false, "local")))
 	l.sandboxMgr = sandbox.NewManager(l.skillMgr)
+	// Neo 生命周期存储由 lifecycle 先建（pipeline 首轮构建早于 dashboard 创建，dashboard.Neo() 那时还是 nil），再注入 dashboard 共享同一实例。
+	l.neoStore = skills.NewNeoStore("data")
 	l.syncSandboxBooter()
 	logger.I18nInfo("沙盒管理器已初始化")
 
@@ -305,13 +308,17 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// Python 插件依赖安装的 PyPI 镜像与额外 pip 参数（config pypi_index_url /
 	// pip_install_arg），供插件 requirements.txt 与宿主 venv 基础依赖安装使用。
 	l.subPluginMgr.SetPipConfig(cfg.GetString("pypi_index_url"), cfg.GetString("pip_install_arg"))
+	// Python 宿主依赖分层模式（config python_deps_install_mode："lazy" 只预装
+	// grpcio/protobuf 核心层，"full" 全量预装；空=用户未选择过，首次安装
+	// Python 插件时经 python_deps_prompt 弹窗询问并回写 config）。
+	l.subPluginMgr.SetPipDepsMode(cfg.GetString("python_deps_install_mode"))
 	// Python SDK（非嵌入，从 astrbot-python-sdk 仓库下载）的 GitHub 加速前缀。
 	pysdk.SetSDKGitHubProxy(cfg.GetString("github_proxy"))
 	// pip/venv 安装代理：config http_proxy 优先于系统代理，为空时 pip 才回退
 	// 系统 https_proxy（与通用请求"配置为空即直连"不同）。
 	pysdk.SetPipProxy(cfg.GetString("http_proxy"))
-	// 嵌入式/低内存设备：插件闲置自动卸载（进程内存回收），触发时懒加载唤醒。
-	l.syncIdleUnload()
+	// 注意：已移除全局 plugin_idle_unload_minutes 同步；
+	// 休眠为单插件独立控制，lifecycle 不再向 runtime 推全局阈值。
 	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
 	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
 	// back into the host. 同时注入会话/人格/Provider/Star 管理器，供插件
@@ -408,6 +415,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		"star":              l.starMgr,
 		"knowledgebase":     l.kbMgr,
 		"skills":            l.skillMgr,
+		"sandbox":           l.sandboxMgr,
+		"neo":               l.neoStore,
 		"database":          l.database,
 		"file_tokens":       fileTokens,
 	}
@@ -435,12 +444,12 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		l.RebridgePlugins()
 	})
 	l.dashboard.SetOnConfigChanged(func() {
-		// 同步插件休眠阈值：用户在系统配置页直接改 plugin_idle_unload_minutes
-		// （非休眠策略 API）时，运行时清扫必须立即生效——否则配置已关（0）
-		// 但 sweep 仍按旧阈值继续休眠插件。
-		l.syncIdleUnload()
+		// 注意：已移除全局 plugin_idle_unload_minutes 同步；
+		// 休眠为单插件独立控制，lifecycle 不再向 runtime 推全局阈值。
+		// 插件管理名单（plugin_admin_list）热更新即时生效。
+		plugin.RefreshPluginAdminList(l.configMgr, l.subPluginMgr)
 		// Rebuild the pipeline so provider/platform settings changes (e.g. the
-		// default chat model) take effect immediately instead of on restart.
+		// default chat model) take effect immediately instead of on reload.
 		if err := l.ReloadPipelineScheduler("default"); err != nil {
 			logger.Error("Failed to reload pipeline after config change: %v", err)
 		}
@@ -632,6 +641,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 		UmoAliasResolver:      l.umoAliasResolver,
 		SkillManager:          l.skillMgr,
 		SandboxManager:        l.sandboxMgr,
+		NeoStore:              l.neoStore,
 		CronManager:           l.cronMgr,
 		Database:              l.database,
 		EventBus:              l.eventBus,
@@ -901,24 +911,6 @@ func personaSkillsResolver(personaID string) []string {
 		return result
 	}
 	return nil
-}
-
-// syncIdleUnload reads plugin_idle_unload_minutes from the default config and
-// applies it to the subprocess runtime (0 = 全局休眠关闭，所有插件常驻）。
-// 启动与配置热更新共用，保证配置与运行时清扫行为一致。
-func (l *Lifecycle) syncIdleUnload() {
-	if l.subPluginMgr == nil || l.configMgr == nil {
-		return
-	}
-	cfg := l.configMgr.Get("default")
-	if cfg == nil {
-		return
-	}
-	idleMin := cfg.GetInt("plugin_idle_unload_minutes")
-	if idleMin < 0 {
-		idleMin = 0
-	}
-	l.subPluginMgr.SetIdleUnload(time.Duration(idleMin) * time.Minute)
 }
 
 // fixedHostCapabilities 是宿主无条件公开的固定能力（与 Python AstrBot 的

@@ -1,17 +1,4 @@
-// Package pipeline implements the message processing stages.
-// Ported from astrbot/core/pipeline/
-//
-// The pipeline processes events through 10 ordered stages:
-//  1. SessionWaitStage      - Feed events to session-waiting plugins (SessionWaiter)
-//  2. WakingCheckStage      - Check wake conditions
-//  3. WhitelistCheckStage   - Check whitelist/blacklist
-//  4. SessionStatusCheckStage - Check session enabled
-//  5. RateLimitStage         - Check rate limit
-//  6. ContentSafetyCheckStage - Check content safety
-//  7. PreProcessStage        - Preprocess media, STT, path mapping
-//  8. ProcessStage           - Plugin handler execution + LLM agent
-//  9. ResultDecorateStage    - Decorate result (prefix, T2I, TTS, etc.)
-//  10. RespondStage           - Send message chain to platform
+// Package pipeline implements the message processing stages. Ported from astrbot/core/pipeline/ The pipeline processes events through 10 ordered stages:  1. SessionWaitStage      - Feed events to session-waiting plugins (SessionWaiter)  2. WakingCheckStage      - Check wake conditions  3. WhitelistCheckStage   - Check whitelist/blacklist  4. SessionStatusCheckStage - Check session enabled  5. RateLimitStage         - Check rate limit  6. ContentSafetyCheckStage - Check content safety  7. PreProcessStage        - Preprocess media, STT, path mapping  8. ProcessStage           - Plugin handler execution + LLM agent  9. ResultDecorateStage    - Decorate result (prefix, T2I, TTS, etc.)  10. RespondStage           - Send message chain to platform
 package pipeline
 
 import (
@@ -64,12 +51,10 @@ import (
 
 var logger = log.GetDefault().WithComponent("Pipeline")
 
-// pluginRPCTimeout bounds every gRPC call into a subprocess plugin so a hung
-// plugin handler (infinite loop, deadlock) cannot freeze the pipeline forever.
+// pluginRPCTimeout bounds every gRPC call into a subprocess plugin so a hung plugin handler (infinite loop, deadlock) cannot freeze the pipeline forever.
 const pluginRPCTimeout = 30 * time.Second
 
-// errNoAvailableProvider 表示配置中没有可用的模型提供商。平台侧静默处理
-// （不回复用户），宿主启动时会打印一条 warn 提示（见 lifecycle）。
+// errNoAvailableProvider 表示配置中没有可用的模型提供商。平台侧静默处理 （不回复用户），宿主启动时会打印一条 warn 提示（见 lifecycle）。
 var errNoAvailableProvider = errors.New("未找到可用的模型提供商，请先配置")
 
 var (
@@ -91,43 +76,31 @@ type PipelineContext struct {
 	ConvManager    *conversation.Manager
 	SessionService *conversation.SessionServiceManager
 	PlatformMgr    *platform.PlatformManager
-	// PersonaResolver resolves a persona's system prompt by conversation UMO
-	// and persona id. Optional.
+	// PersonaResolver resolves a persona's system prompt by conversation UMO and persona id. Optional.
 	PersonaResolver func(umo, personaID string) string
-	// PersonaSkillsResolver returns the skill allow-list configured on a
-	// persona. nil = unrestricted, empty slice = no skills allowed.
-	// Optional.
+	// PersonaSkillsResolver returns the skill allow-list configured on a persona. nil = unrestricted, empty slice = no skills allowed. Optional.
 	PersonaSkillsResolver func(personaID string) []string
-	// UmoAliasResolver returns the display name a user set for a session UMO
-	// (via the /name command). Optional.
+	// UmoAliasResolver returns the display name a user set for a session UMO (via the /name command). Optional.
 	UmoAliasResolver func(umo string) string
-	// SkillManager provides active skills for LLM system prompt injection.
-	// Optional.
+	// SkillManager provides active skills for LLM system prompt injection. Optional.
 	SkillManager *skills.SkillManager
-	// SandboxManager routes computer-use tools when the sandbox runtime is
-	// active. Optional.
+	// SandboxManager routes computer-use tools when the sandbox runtime is active. Optional.
 	SandboxManager *sandbox.Manager
+	// NeoStore is the host-side Neo skill lifecycle store shared with the dashboard (optional).
+	NeoStore *skills.NeoStore
 	// CronManager schedules future tasks (future_task tool). Optional.
 	CronManager *cron.CronJobManager
-	// Database records platform messages / provider calls for statistics.
-	// Optional.
+	// Database records platform messages / provider calls for statistics. Optional.
 	Database *db.Database
-	// EventBus allows stages to re-publish events (e.g. rate-limit stall).
-	// Optional.
+	// EventBus allows stages to re-publish events (e.g. rate-limit stall). Optional.
 	EventBus *core.EventBus
-	// KBManager provides knowledge-base retrieval for context injection.
-	// Optional.
+	// KBManager provides knowledge-base retrieval for context injection. Optional.
 	KBManager *knowledgebase.Manager
-	// KBRetriever resolves KB context text for a prompt (umo, query) -> formatted
-	// reference text. When set it overrides KBManager for injection.
-	// Optional.
+	// KBRetriever resolves KB context text for a prompt (umo, query) -> formatted reference text. When set it overrides KBManager for injection. Optional.
 	KBRetriever func(umo, query string) (string, error)
-	// ProviderManager resolves chat/STT/TTS/embedding providers.
-	// Optional.
+	// ProviderManager resolves chat/STT/TTS/embedding providers. Optional.
 	ProviderManager *provider.ProviderManager
-	// SubPlugins is the subprocess plugin runtime. When set, ProcessStage and
-	// ResultDecorateStage use it to collect LLM tools, apply on_llm_request
-	// hooks, and run result-decoration hooks. Optional.
+	// SubPlugins is the subprocess plugin runtime. When set, ProcessStage and ResultDecorateStage use it to collect LLM tools, apply on_llm_request hooks, and run result-decoration hooks. Optional.
 	SubPlugins *plugin.SubprocessManager
 }
 
@@ -138,12 +111,9 @@ type PipelineStage interface {
 	Process(ctx context.Context, event *core.Event) (*StageResult, error)
 }
 
-// ---------------------------------------------------------------------------
-// Stage 1: WakingCheckStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 1: WakingCheckStage ---------------------------------------------------------------------------
 
-// WakingCheckStage checks whether the bot should wake up for this message.
-// Ported from astrbot/core/pipeline/waking_check/stage.py
+// WakingCheckStage checks whether the bot should wake up for this message. Ported from astrbot/core/pipeline/waking_check/stage.py
 type WakingCheckStage struct {
 	wakePrefixes []string
 	nickname     []string
@@ -160,18 +130,18 @@ type WakingCheckStage struct {
 	emptyMentionWaiting          bool
 	emptyMentionWaitingNeedReply bool
 
-	// adminsID lists the configured admin sender ids (config "admins_id").
-	// Senders in this list get event.Role="admin" (mirrors Python's waking_check
-	// admin detection); everyone else is "member".
+	// adminsID lists the configured admin sender ids (config "admins_id"). Senders in this list get event.Role="admin" (mirrors Python's waking_check admin detection); everyone else is "member".
 	adminsID []string
+
+	// umoAutoNameRecorder 对齐 Python v4.28.0 (#9909)：唤醒成功时异步记录 UMO 可读名称（群名/用户名）到数据库，供 WebUI 展示。
+	umoAutoNameRecorder *UmoAutoNameRecorder
 }
 
 func NewWakingCheckStage() *WakingCheckStage {
 	return &WakingCheckStage{
 		wakeByAt:     true,
 		wakeByPrefix: true,
-		// Friend messages auto-wake unless friend_message_needs_wake_prefix is
-		// set (mirrors Python's private-chat wake logic); overridden below.
+		// Friend messages auto-wake unless friend_message_needs_wake_prefix is set (mirrors Python's private-chat wake logic); overridden below.
 		wakeByFriend: true,
 		cmdPrefix:    "/",
 	}
@@ -180,8 +150,7 @@ func NewWakingCheckStage() *WakingCheckStage {
 func (s *WakingCheckStage) Name() string { return "waking_check" }
 
 func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
-	// wake_prefix lives at the top level of the config (astrbot/core/config/default.py:294),
-	// not inside platform_settings.
+	// wake_prefix lives at the top level of the config (astrbot/core/config/default.py:294), not inside platform_settings.
 	s.wakePrefixes = append(s.wakePrefixes, toStringList(ctx.AstrbotConfig["wake_prefix"])...)
 	// Fall back to the "/" command prefix (Python DEFAULT_CONFIG ships wake_prefix=["/"])
 	if len(s.wakePrefixes) == 0 && s.cmdPrefix != "" {
@@ -212,15 +181,18 @@ func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
 		s.cmdPrefix = ps.CmdPrefix
 	}
 
-	// AI wake word: provider_settings.wake_prefix (e.g. "ai").
-	// When set, LLM chat requires "<prefix><ai word> <text>".
+	// AI wake word: provider_settings.wake_prefix (e.g. "ai"). When set, LLM chat requires "<prefix><ai word> <text>".
 	if psAI := bindProviderSettings(ctx.AstrbotConfig); psAI != nil {
 		s.aiWakePrefix = strings.TrimSpace(psAI.WakePrefix)
 	}
 
-	// Admin ids (top-level "admins_id", e.g. ["astrbot"]). Used to mark the
-	// sender as admin so admin-gated commands (/provider /name) respond.
+	// Admin ids (top-level "admins_id", e.g. ["astrbot"]). Used to mark the sender as admin so admin-gated commands (/provider /name) respond.
 	s.adminsID = toStringList(ctx.AstrbotConfig["admins_id"])
+
+	// 对齐 Python v4.28.0 (#9909)：唤醒成功时异步记录 UMO 可读名称到数据库。
+	if ctx.Database != nil {
+		s.umoAutoNameRecorder = NewUmoAutoNameRecorder(ctx.Database, "")
+	}
 
 	logger.Debug("WakingCheck initialized: prefixes=%v, nicknames=%v, wakeByAt=%v, wakeByPrefix=%v, wakeByFriend=%v, aiWakePrefix=%q",
 		s.wakePrefixes, s.nickname, s.wakeByAt, s.wakeByPrefix, s.wakeByFriend, s.aiWakePrefix)
@@ -228,9 +200,7 @@ func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
 }
 
 func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
-	// Ported from waking_check/stage.py: 设置 sender 身份。配置在
-	// admins_id 中的发送者标记为 admin，其余为 member；webchat 的 API key
-	// 可通过 _api_key_allow_admin_role 显式关闭管理员身份。
+	// Ported from waking_check/stage.py: 设置 sender 身份。配置在 admins_id 中的发送者标记为 admin，其余为 member；webchat 的 API key 可通过 _api_key_allow_admin_role 显式关闭管理员身份。
 	event.Role = "member"
 	apiKeyAllowAdminRole := true
 	if v := event.GetExtra("_api_key_allow_admin_role"); v != nil {
@@ -238,8 +208,7 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 			apiKeyAllowAdminRole = b
 		}
 	}
-	// 平台已标记管理员（如 QQ 群 owner/admin member_role）时直接保留，
-	// 不依赖 admins_id 配置。
+	// 平台已标记管理员（如 QQ 群 owner/admin member_role）时直接保留， 不依赖 admins_id 配置。
 	if apiKeyAllowAdminRole && event.Source.IsAdmin {
 		event.Role = "admin"
 	}
@@ -258,8 +227,7 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 		return &StageResult{Continue: true}, nil
 	}
 
-	// Apply unique session: in group chats each member gets an isolated
-	// conversation id (ported from build_unique_session_id).
+	// Apply unique session: in group chats each member gets an isolated conversation id (ported from build_unique_session_id).
 	if s.uniqueSession && event.Source.IsGroup {
 		if sid := buildUniqueSessionID(event.Source.Platform, event.Source.SenderID, event.Source.ConvID); sid != "" {
 			event.Source.ConvID = sid
@@ -275,8 +243,7 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 		return &StageResult{Continue: false}, nil
 	}
 
-	// Use the pure-text message string (Python's event.message_str), which
-	// excludes At components, so "/help" is matched by the "/" wake prefix.
+	// Use the pure-text message string (Python's event.message_str), which excludes At components, so "/help" is matched by the "/" wake prefix.
 	text := event.MessageStr
 	if text == "" {
 		text = event.PlainText
@@ -292,11 +259,12 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 		for _, prefix := range s.wakePrefixes {
 			if strings.HasPrefix(text, prefix) {
 				s.applyPrefixWake(event, text, prefix)
-				// A message that is only the wake prefix (e.g. "/") triggers
-				// the empty-mention flow (ported from builtin_stars/astrbot/main.py).
+				// A message that is only the wake prefix (e.g. "/") triggers the empty-mention flow (ported from builtin_stars/astrbot/main.py).
 				if event.WakeCommand == "" && s.emptyMentionWaiting {
 					return s.applyEmptyMention(event)
 				}
+				// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+				s.scheduleUmoAutoName(event)
 				return &StageResult{Continue: true}, nil
 			}
 		}
@@ -309,6 +277,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 				event.IsAtOrWakeCommand = true
 				event.SetExtra("llm_wake", true)
 				logger.Debug("Woken by nickname '%s'", nick)
+				// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+				s.scheduleUmoAutoName(event)
 				return &StageResult{Continue: true}, nil
 			}
 		}
@@ -337,14 +307,15 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 						}
 					}
 					if !matched {
-						// @mention without a prefix still starts a chat
-						// (Python: is_at_or_wake_command triggers the LLM agent).
+						// @mention without a prefix still starts a chat (Python: is_at_or_wake_command triggers the LLM agent).
 						if s.emptyMentionWaiting && isSingleEmptyMention(event) {
 							return s.applyEmptyMention(event)
 						}
 						event.SetExtra("llm_wake", true)
 						logger.Debug("Woken by @mention (chat enabled)")
 					}
+					// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+					s.scheduleUmoAutoName(event)
 					return &StageResult{Continue: true}, nil
 				}
 			}
@@ -355,6 +326,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 				event.IsAtOrWakeCommand = true
 				event.SetExtra("llm_wake", true)
 				logger.Debug("Woken by @all")
+				// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+				s.scheduleUmoAutoName(event)
 				return &StageResult{Continue: true}, nil
 			}
 			if r, ok := comp.(*message.Reply); ok && !event.Source.IsGroup {
@@ -362,6 +335,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 				if r.SenderID == event.Source.SelfID {
 					event.IsAtOrWakeCommand = true
 					event.SetExtra("llm_wake", true)
+					// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+					s.scheduleUmoAutoName(event)
 					return &StageResult{Continue: true}, nil
 				}
 			}
@@ -372,24 +347,22 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 	if s.wakeByFriend && !event.Source.IsGroup {
 		event.IsAtOrWakeCommand = true
 		event.SetExtra("llm_wake", true)
+		// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+		s.scheduleUmoAutoName(event)
 		return &StageResult{Continue: true}, nil
 	}
 
-	// Not woken — allow plugin handlers to decide (they may have their own filters)
-	// In Python, this sets is_wake=False and continues; if no handlers match, the event is stopped.
+	// Not woken — allow plugin handlers to decide (they may have their own filters) In Python, this sets is_wake=False and continues; if no handlers match, the event is stopped.
 	event.IsAtOrWakeCommand = false
 	return &StageResult{Continue: true}, nil
 }
 
-// applyPrefixWake strips the wake prefix (and optional AI wake word) from the
-// event text and marks whether LLM chat should be triggered.
+// applyPrefixWake strips the wake prefix (and optional AI wake word) from the event text and marks whether LLM chat should be triggered.
 func (s *WakingCheckStage) applyPrefixWake(event *core.Event, text, prefix string) {
 	event.IsAtOrWakeCommand = true
 	trimmed := strings.TrimSpace(strings.TrimPrefix(text, prefix))
 	event.WakeCommand = trimmed
-	// AI wake word: when provider_settings.wake_prefix is configured
-	// (e.g. "ai"), LLM chat requires "<prefix><ai wake word> <text>".
-	// Without an AI wake word, the prefix alone triggers chat.
+	// AI wake word: when provider_settings.wake_prefix is configured (e.g. "ai"), LLM chat requires "<prefix><ai wake word> <text>". Without an AI wake word, the prefix alone triggers chat.
 	if s.aiWakePrefix != "" {
 		if strings.HasPrefix(trimmed, s.aiWakePrefix) {
 			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, s.aiWakePrefix))
@@ -401,22 +374,19 @@ func (s *WakingCheckStage) applyPrefixWake(event *core.Event, text, prefix strin
 	} else {
 		event.SetExtra("llm_wake", true)
 	}
-	// Strip the wake prefix so command filters match the bare command
-	// (mirrors astrbot/core/pipeline/waking_check/stage.py).
+	// Strip the wake prefix so command filters match the bare command (mirrors astrbot/core/pipeline/waking_check/stage.py).
 	event.MessageStr = trimmed
 	event.PlainText = trimmed
 	logger.Debug("Woken by prefix '%s', stripped to %q (llm_wake=%v)",
 		prefix, event.MessageStr, event.GetExtra("llm_wake"))
 }
 
-// emptyMentionPrompt instructs the LLM to greet the user when they only
-// mentioned the bot without content (mirrors builtin_stars/astrbot/main.py).
+// emptyMentionPrompt instructs the LLM to greet the user when they only mentioned the bot without content (mirrors builtin_stars/astrbot/main.py).
 const emptyMentionPrompt = "注意，你正在社交媒体上中与用户进行聊天，用户只是通过@来唤醒你，但并未在这条消息中输入内容，他可能会在接下来一条发送他想发送的内容。" +
 	"你友好地询问用户想要聊些什么或者需要什么帮助，回复要符合人设，不要太过机械化。" +
 	"请注意，你仅需要输出要回复用户的内容，不要输出其他任何东西"
 
-// isSingleEmptyMention reports whether the message chain contains only a
-// single @-mention of the bot (Python: len(messages)==1 and At self).
+// isSingleEmptyMention reports whether the message chain contains only a single @-mention of the bot (Python: len(messages)==1 and At self).
 func isSingleEmptyMention(event *core.Event) bool {
 	if event.Message == nil || len(event.Message.Chain) != 1 {
 		return false
@@ -425,9 +395,13 @@ func isSingleEmptyMention(event *core.Event) bool {
 	return ok && at.TargetID != "" && at.TargetID == event.Source.SelfID
 }
 
-// applyEmptyMention handles a message that only mentions the bot (or only
-// carries a wake prefix) without any content. When empty_mention_waiting_need_reply
-// is enabled the LLM is asked to greet the user; otherwise the event is stopped.
+// applyEmptyMention handles a message that only mentions the bot (or only carries a wake prefix) without any content. When empty_mention_waiting_need_reply is enabled the LLM is asked to greet the user; otherwise the event is stopped. scheduleUmoAutoName 对齐 Python v4.28.0 (#9909)：唤醒成功时异步记录 UMO 可读名称到数据库。nil-safe。
+func (s *WakingCheckStage) scheduleUmoAutoName(event *core.Event) {
+	if s.umoAutoNameRecorder != nil {
+		s.umoAutoNameRecorder.Schedule(event)
+	}
+}
+
 func (s *WakingCheckStage) applyEmptyMention(event *core.Event) (*StageResult, error) {
 	if !s.emptyMentionWaitingNeedReply {
 		event.Stop()
@@ -437,19 +411,22 @@ func (s *WakingCheckStage) applyEmptyMention(event *core.Event) (*StageResult, e
 	event.PlainText = emptyMentionPrompt
 	event.MessageStr = emptyMentionPrompt
 	event.SetExtra("llm_wake", true)
+	// 对齐 Python v4.28.0 (#9909)：空提及唤醒成功，异步记录 UMO 名称。
+	s.scheduleUmoAutoName(event)
 	logger.Debug("WakingCheck: empty mention -> LLM greeting")
 	return &StageResult{Continue: true}, nil
 }
 
-// buildUniqueSessionID constructs the per-member session id for group chats
-// when unique_session is enabled (ported from waking_check/stage.py
-// UNIQUE_SESSION_ID_BUILDERS).
+// buildUniqueSessionID constructs the per-member session id for group chats when unique_session is enabled (ported from waking_check/stage.py UNIQUE_SESSION_ID_BUILDERS).
 func buildUniqueSessionID(platform, senderID, groupID string) string {
 	switch platform {
 	case "aiocqhttp", "slack":
 		return senderID + "_" + groupID
-	case "dingtalk", "qq_official", "qq_official_webhook":
+	case "dingtalk":
 		return senderID
+	// qq_official / qq_official_webhook: 对齐 Python v4.28.0 (#9814)， 群聊场景拼接 senderID_groupID 实现按成员隔离。
+	case "qq_official", "qq_official_webhook":
+		return senderID + "_" + groupID
 	case "lark":
 		return senderID + "%" + groupID
 	case "misskey":
@@ -465,12 +442,9 @@ func buildUniqueSessionID(platform, senderID, groupID string) string {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Stage 2: WhitelistCheckStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 2: WhitelistCheckStage ---------------------------------------------------------------------------
 
-// WhitelistCheckStage filters events by whitelist/blacklist.
-// Ported from astrbot/core/pipeline/whitelist_check/stage.py
+// WhitelistCheckStage filters events by whitelist/blacklist. Ported from astrbot/core/pipeline/whitelist_check/stage.py
 type WhitelistCheckStage struct {
 	enableWhitelist       bool
 	whitelist             map[string]bool
@@ -516,8 +490,7 @@ func (s *WhitelistCheckStage) Process(ctx context.Context, event *core.Event) (*
 		return &StageResult{Continue: true}, nil
 	}
 
-	// An empty whitelist means the check is disabled (all sessions allowed),
-	// mirroring astrbot/core/pipeline/whitelist_check/stage.py.
+	// An empty whitelist means the check is disabled (all sessions allowed), mirroring astrbot/core/pipeline/whitelist_check/stage.py.
 	if len(s.whitelist) == 0 {
 		return &StageResult{Continue: true}, nil
 	}
@@ -546,12 +519,9 @@ func (s *WhitelistCheckStage) Process(ctx context.Context, event *core.Event) (*
 	return &StageResult{Continue: true}, nil
 }
 
-// ---------------------------------------------------------------------------
-// Stage 3: SessionStatusCheckStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 3: SessionStatusCheckStage ---------------------------------------------------------------------------
 
-// SessionStatusCheckStage checks if the session is overall enabled.
-// Ported from astrbot/core/pipeline/session_status_check/stage.py
+// SessionStatusCheckStage checks if the session is overall enabled. Ported from astrbot/core/pipeline/session_status_check/stage.py
 type SessionStatusCheckStage struct {
 	sessionService *conversation.SessionServiceManager
 	convMgr        *conversation.Manager
@@ -592,12 +562,9 @@ func (s *SessionStatusCheckStage) Process(ctx context.Context, event *core.Event
 	return &StageResult{Continue: true}, nil
 }
 
-// ---------------------------------------------------------------------------
-// Stage 4: RateLimitStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 4: RateLimitStage ---------------------------------------------------------------------------
 
-// RateLimitStage checks rate limits per session.
-// Ported from astrbot/core/pipeline/rate_limit_check/stage.py
+// RateLimitStage checks rate limits per session. Ported from astrbot/core/pipeline/rate_limit_check/stage.py
 type RateLimitStage struct {
 	limiter  *ratelimit.RateLimiter
 	eventBus *core.EventBus
@@ -645,16 +612,13 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 	if !allowed {
 		if stall > 0 {
 			logger.Debug("Session %s rate-limited, stalling for %.2fs", sessionID, stall.Seconds())
-			// Stall strategy: re-publish the event once the window frees up,
-			// matching Python's async sleep + resume. This must not block the
-			// single-goroutine event bus, so we schedule a delayed re-queue.
+			// Stall strategy: re-publish the event once the window frees up, matching Python's async sleep + resume. This must not block the single-goroutine event bus, so we schedule a delayed re-queue.
 			if s.eventBus != nil {
 				delays := 0
 				if v, ok := event.GetExtra(rateLimitDelaysKey).(int); ok {
 					delays = v
 				}
-				// Bound the re-queues: under sustained traffic an event must
-				// not be re-delayed forever (queue starvation/growth).
+				// Bound the re-queues: under sustained traffic an event must not be re-delayed forever (queue starvation/growth).
 				if delays >= rateLimitMaxDelays {
 					logger.I18nWarn("会话 %s 限流: 事件 %q 已延迟重排队 %d 次，超过上限 %d，丢弃",
 						sessionID, event.MessageStr, delays, rateLimitMaxDelays)
@@ -676,21 +640,15 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 	return &StageResult{Continue: true}, nil
 }
 
-// rateLimitDelaysKey is the Event.Metadata key counting how many times an
-// event has been re-queued by the rate-limit stall strategy.
+// rateLimitDelaysKey is the Event.Metadata key counting how many times an event has been re-queued by the rate-limit stall strategy.
 const rateLimitDelaysKey = "rate_limit_delays"
 
-// rateLimitMaxDelays bounds how many times a rate-limited event may be
-// re-queued before it is dropped with a notice, so sustained traffic cannot
-// keep a single event (and the queue) alive forever.
+// rateLimitMaxDelays bounds how many times a rate-limited event may be re-queued before it is dropped with a notice, so sustained traffic cannot keep a single event (and the queue) alive forever.
 const rateLimitMaxDelays = 5
 
-// ---------------------------------------------------------------------------
-// Stage 5: ContentSafetyCheckStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 5: ContentSafetyCheckStage ---------------------------------------------------------------------------
 
-// ContentSafetyCheckStage checks message content against safety rules.
-// Ported from astrbot/core/pipeline/content_safety_check/stage.py
+// ContentSafetyCheckStage checks message content against safety rules. Ported from astrbot/core/pipeline/content_safety_check/stage.py
 type ContentSafetyCheckStage struct {
 	selector    *contentsafety.StrategySelector
 	platformMgr *platform.PlatformManager
@@ -739,9 +697,7 @@ func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event
 
 	ok, info := s.selector.Check(strings.Join(texts, "\n"))
 	if !ok {
-		// 与 ProcessStage 的 no_permission_reply 相同：调度器对
-		// Continue:false 直接短路，写 event.Result 的提示不会被
-		// RespondStage 送达，必须直接经平台发送。
+		// 与 ProcessStage 的 no_permission_reply 相同：调度器对 Continue:false 直接短路，写 event.Result 的提示不会被 RespondStage 送达，必须直接经平台发送。
 		if event.IsAtOrWakeCommand && s.platformMgr != nil {
 			chain := message.NewMessageChain(&message.Plain{Text: "Your message or the model response contains inappropriate content and has been blocked."})
 			_ = s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
@@ -753,12 +709,9 @@ func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event
 	return &StageResult{Continue: true}, nil
 }
 
-// ---------------------------------------------------------------------------
-// Stage 6: PreProcessStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 6: PreProcessStage ---------------------------------------------------------------------------
 
-// PreProcessStage normalizes media components, maps paths, and runs STT.
-// Ported from astrbot/core/pipeline/preprocess_stage/stage.py
+// PreProcessStage normalizes media components, maps paths, and runs STT. Ported from astrbot/core/pipeline/preprocess_stage/stage.py
 type PreProcessStage struct {
 	config      map[string]interface{}
 	providerMgr *provider.ProviderManager
@@ -780,10 +733,7 @@ func (s *PreProcessStage) Initialize(ctx *PipelineContext) error {
 	return nil
 }
 
-// applyPreAckEmoji sends a pre-response emoji reaction when the platform
-// config enables platform_specific.<platform>.pre_ack_emoji for a woken
-// message (ported from preprocess_stage/stage.py). Runs async so a slow
-// platform API never blocks the pipeline.
+// applyPreAckEmoji sends a pre-response emoji reaction when the platform config enables platform_specific.<platform>.pre_ack_emoji for a woken message (ported from preprocess_stage/stage.py). Runs async so a slow platform API never blocks the pipeline.
 func (s *PreProcessStage) applyPreAckEmoji(event *core.Event) {
 	if !event.IsAtOrWakeCommand || s.platformMgr == nil ||
 		event.MessageObj == nil || event.MessageObj.MessageID == "" {
@@ -827,8 +777,7 @@ func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*Stag
 	// Pre-response emoji reaction for platforms that enable pre_ack_emoji.
 	s.applyPreAckEmoji(event)
 
-	// Quoted-message parser limits (provider_settings.quoted_message_parser):
-	// cap nested quote/forward depth and quoted image count.
+	// Quoted-message parser limits (provider_settings.quoted_message_parser): cap nested quote/forward depth and quoted image count.
 	applyQuotedMessageParser(s.config, event)
 
 	if event.Message == nil || len(event.Message.Chain) == 0 {
@@ -847,8 +796,7 @@ func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*Stag
 		}
 	}
 
-	// Speech-to-text: convert Record (voice) components to plain text when a
-	// STT provider is enabled (mirrors Python preprocess_stage).
+	// Speech-to-text: convert Record (voice) components to plain text when a STT provider is enabled (mirrors Python preprocess_stage).
 	if s.sttEnabled(event.UnifiedMsgOrigin()) {
 		for i, comp := range event.Message.Chain {
 			rec, ok := comp.(*message.Record)
@@ -886,8 +834,7 @@ func (s *PreProcessStage) sttEnabled(umo string) bool {
 	return enabled
 }
 
-// sttRecord transcribes a voice component using the session/global STT provider
-// (provider_perf_speech_to_text rule wins).
+// sttRecord transcribes a voice component using the session/global STT provider (provider_perf_speech_to_text rule wins).
 func (s *PreProcessStage) sttRecord(event *core.Event, rec *message.Record) (string, error) {
 	var stt provider.STTProvider
 	providerID := ""
@@ -922,12 +869,9 @@ func (s *PreProcessStage) sttRecord(event *core.Event, rec *message.Record) (str
 	return stt.GetText(ctx, audioURL)
 }
 
-// ---------------------------------------------------------------------------
-// Stage 7: ProcessStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 7: ProcessStage ---------------------------------------------------------------------------
 
-// ProcessStage dispatches to plugin handlers (star) and/or LLM agent.
-// Ported from astrbot/core/pipeline/process_stage/stage.py
+// ProcessStage dispatches to plugin handlers (star) and/or LLM agent. Ported from astrbot/core/pipeline/process_stage/stage.py
 type ProcessStage struct {
 	pluginMgr     *star.Manager
 	convMgr       *conversation.Manager
@@ -938,66 +882,61 @@ type ProcessStage struct {
 	skillMgr      *skills.SkillManager
 	platformMgr   *platform.PlatformManager
 	sandboxMgr    *sandbox.Manager
+	neoStore      *skills.NeoStore
 	cronMgr       *cron.CronJobManager
 	database      *db.Database
 	providerConf  *ProviderSettings
-	// subPlugins is the subprocess plugin runtime: source of LLM tools and
-	// on_llm_request hooks.
+	// subPlugins is the subprocess plugin runtime: source of LLM tools and on_llm_request hooks.
 	subPlugins *plugin.SubprocessManager
 
-	// MCP servers (data/mcp_server.json). Loaded lazily on the first tool
-	// collection; full tool name = "<sanitized_server>.<tool_name>".
+	// eventBus re-publishes synthetic events (background-task wakeups). Optional; nil disables background-result wakeups.
+	eventBus *core.EventBus
+
+	// MCP servers (data/mcp_server.json). Loaded lazily on the first tool collection; full tool name = "<sanitized_server>.<tool_name>".
 	mcpMu      sync.Mutex
 	mcpLoaded  bool
 	mcpClients map[string]*agent.MCPClient       // sanitized server name -> client
 	mcpSchemas map[string]map[string]interface{} // full tool name -> OpenAI tool schema
 
-	// toolPermsMu guards toolPerms (tool name -> configured permission level),
-	// parsed lazily once from the stage's immutable config snapshot.
+	// toolPermsMu guards toolPerms (tool name -> configured permission level), parsed lazily once from the stage's immutable config snapshot.
 	toolPermsMu sync.Mutex
 	toolPerms   map[string]string
 
-	// Subagents (subagent_orchestrator): handoff tools injected into the main
-	// LLM and executed as a fresh persona round.
+	// Subagents (subagent_orchestrator): handoff tools injected into the main LLM and executed as a fresh persona round.
 	subAgentEnabled bool
 	subAgents       []*SubAgent
 
-	// Platform config toggles consumed by handler matching (ported from
-	// waking_check/stage.py).
+	// Platform config toggles consumed by handler matching (ported from waking_check/stage.py).
 	disableBuiltinCommands bool
 	noPermissionReply      bool
 
-	// groupCtx tracks group-chat context awareness (provider_ltm_settings:
-	// group_icl_enable records + active_reply probability).
+	// groupCtx tracks group-chat context awareness (provider_ltm_settings: group_icl_enable records + active_reply probability).
 	groupCtx *GroupChatContext
 
-	// Knowledge-base context retrieval for prompt injection. Provided by the
-	// lifecycle (reuses the dashboard retrieval pipeline); nil = no KB.
+	// Knowledge-base context retrieval for prompt injection. Provided by the lifecycle (reuses the dashboard retrieval pipeline); nil = no KB.
 	kbRetriever func(umo, query string) (string, error)
 
-	// toolSchemaMode: "full" (default) sends complete tool schemas; "skills_like"
-	// sends light schemas and re-queries the LLM for arguments when a tool is
-	// chosen (saves tokens on large tool sets).
+	// toolSchemaMode: "full" (default) sends complete tool schemas; "skills_like" sends light schemas and re-queries the LLM for arguments when a tool is chosen (saves tokens on large tool sets).
 	toolSchemaMode string
 
-	// doom loop protection: track consecutive same-tool calls per session and
-	// pause the tool after a threshold, asking the session owner to confirm.
+	// doom loop protection: track consecutive same-tool calls per session and pause the tool after a threshold, asking the session owner to confirm.
 	doomMu       sync.Mutex
 	doomTrackers map[string]*doomTracker // key: unified msg origin
+
+	// umoAutoNameRecorder 对齐 Python v4.28.0 (#9909)：handler 命中时异步记录 UMO 可读名称到数据库（handler 命中路径的 schedule 在 Python 的 WakingCheckStage 中，Go 侧移至 ProcessStage，因 handler 匹配在此执行）。
+	umoAutoNameRecorder *UmoAutoNameRecorder
 }
 
 func NewProcessStage() *ProcessStage {
 	return &ProcessStage{}
 }
 
-// SetPersonaResolver registers a callback that resolves a persona's system
-// prompt for a conversation (persona id -> prompt text).
+// SetPersonaResolver registers a callback that resolves a persona's system prompt for a conversation (persona id -> prompt text).
 func (s *ProcessStage) SetPersonaResolver(fn func(umo, personaID string) string) {
 	s.personaPrompt = fn
 }
 
-// SetPersonaSkillsResolver registers a callback that resolves a persona's
-// skill allow-list (persona id -> allowed skill names).
+// SetPersonaSkillsResolver registers a callback that resolves a persona's skill allow-list (persona id -> allowed skill names).
 func (s *ProcessStage) SetPersonaSkillsResolver(fn func(personaID string) []string) {
 	s.personaSkills = fn
 }
@@ -1011,12 +950,12 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.skillMgr = ctx.SkillManager
 	s.platformMgr = ctx.PlatformMgr
 	s.sandboxMgr = ctx.SandboxManager
+	s.neoStore = ctx.NeoStore
 	s.cronMgr = ctx.CronManager
 	s.database = ctx.Database
 	s.subPlugins = ctx.SubPlugins
-	// Wire the plugin-activation snapshot for filterSkillsForCurrentConfig
-	// (subprocess plugin ids are the data/plugins root dir names, matching
-	// the plugin skill source_label).
+	s.eventBus = ctx.EventBus
+	// Wire the plugin-activation snapshot for filterSkillsForCurrentConfig (subprocess plugin ids are the data/plugins root dir names, matching the plugin skill source_label).
 	if ctx.SubPlugins != nil {
 		sub := ctx.SubPlugins
 		SetActivePluginIDsProvider(func() map[string]bool {
@@ -1031,10 +970,7 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 		})
 	}
 	s.providerConf = bindProviderSettings(ctx.AstrbotConfig)
-	// Wire dequeue_context_length into the conversation manager so AppendHistory
-	// truncates stored history instead of growing it without bound (M-33).
-	// max_context_length <= 0 (the default -1) keeps the historical no-truncate
-	// behavior.
+	// Wire dequeue_context_length into the conversation manager so AppendHistory truncates stored history instead of growing it without bound (M-33). max_context_length <= 0 (the default -1) keeps the historical no-truncate behavior.
 	if s.convMgr != nil && s.providerConf != nil {
 		dequeue := 0
 		if s.providerConf.MaxContextLength > 0 {
@@ -1066,35 +1002,32 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 		s.disableBuiltinCommands = db
 	}
 	s.groupCtx = NewGroupChatContext(ctx.AstrbotConfig)
+
+	// 对齐 Python v4.28.0 (#9909)：handler 命中路径的 UMO 自动名称记录。
+	if ctx.Database != nil {
+		s.umoAutoNameRecorder = NewUmoAutoNameRecorder(ctx.Database, "")
+	}
 	return nil
 }
 
 func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
-	// Prefer the event's own execution context (e.g. a WebSocket session that
-	// can be cancelled by an interrupt) over the dispatch loop's process-level
-	// context, so cancelling one run does not affect the whole bus.
+	// Prefer the event's own execution context (e.g. a WebSocket session that can be cancelled by an interrupt) over the dispatch loop's process-level context, so cancelling one run does not affect the whole bus.
 	if event.Ctx != nil {
 		ctx = event.Ctx
 	}
-	// Doom-loop confirmation: if a tool was paused for this session, only the
-	// original asker may confirm. A confirmation resumes the original request
-	// (message is rewritten to it); any other reply clears the paused state
-	// and the message flows through the normal pipeline.
+	// Doom-loop confirmation: if a tool was paused for this session, only the original asker may confirm. A confirmation resumes the original request (message is rewritten to it); any other reply clears the paused state and the message flows through the normal pipeline.
 	switch s.maybeHandleDoomConfirm(event) {
 	case doomResumed:
 		// fall through: re-run the original request through the pipeline
 	case doomNotConsumed:
 		// normal message
 	}
-	// Run subprocess plugin on_message hooks (mirrors Python's
-	// @filter.on_message): plugins observe every incoming message.
+	// Run subprocess plugin on_message hooks (mirrors Python's @filter.on_message): plugins observe every incoming message.
 	dispatchSubprocessHooks(s.subPlugins, event, "on_message")
-	// Push serialized events to plugins that registered a bridge hook
-	// (botpy/telegram compat layers); no-op unless a plugin opted in.
+	// Push serialized events to plugins that registered a bridge hook (botpy/telegram compat layers); no-op unless a plugin opted in.
 	dispatchBridgeHooks(s.subPlugins, event)
 
-	// Group chat context awareness (mirrors main.py on_message): record the
-	// message when group_icl_enable (or active_reply) is enabled.
+	// Group chat context awareness (mirrors main.py on_message): record the message when group_icl_enable (or active_reply) is enabled.
 	if s.groupCtx != nil && s.groupChatContextEnabled(event) && event.Message != nil {
 		hasImageOrPlain := false
 		for _, comp := range event.Message.Chain {
@@ -1112,8 +1045,7 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 			if s.groupLTMSetting(event, "group_icl_enable") {
 				s.groupCtx.HandleMessage(event)
 			}
-			// Active reply: a non-woken group message may trigger an LLM
-			// reply with a configured probability (mirrors main.py).
+			// Active reply: a non-woken group message may trigger an LLM reply with a configured probability (mirrors main.py).
 			if needActive && !event.IsAtOrWakeCommand {
 				event.SetExtra("active_reply", true)
 			}
@@ -1140,18 +1072,15 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 
 	// Try plugin handlers first
 	activated, permissionDenied := s.findMatchingHandlers(event)
-	// Session custom rules (session_plugin_config) can disable/enable plugins
-	// for this session.
+	// Session custom rules (session_plugin_config) can disable/enable plugins for this session.
 	activated = s.filterHandlersBySession(event, activated)
-	// Ported from waking_check/stage.py: a permission filter failure only skips
-	// that handler (raise_error=False path); the other matched handlers still
-	// run. Only when NO handler is left does the event stop before the LLM.
+	// Ported from waking_check/stage.py: a permission filter failure only skips that handler (raise_error=False path); the other matched handlers still run. Only when NO handler is left does the event stop before the LLM.
 	if permissionDenied && len(activated) == 0 {
-		// When no_permission_reply is enabled, send the reply directly —
-		// Continue=false short-circuits the pipeline before
-		// ResultDecorateStage/RespondStage, so an event.Result chain would
-		// never be delivered; either way the event is stopped before any
-		// handler or the LLM runs.
+		// 对齐 Python v4.28.0 (#9909)：权限拒绝且无其他 handler 命中时， 若此前已被前缀/@提及唤醒（IsAtOrWakeCommand=true），异步记录 UMO 名称。 对应 Python waking_check 中 permission_not_pass + raise_error 路径。
+		if event.IsAtOrWakeCommand {
+			s.scheduleUmoAutoName(event)
+		}
+		// When no_permission_reply is enabled, send the reply directly — Continue=false short-circuits the pipeline before ResultDecorateStage/RespondStage, so an event.Result chain would never be delivered; either way the event is stopped before any handler or the LLM runs.
 		if s.noPermissionReply && !event.IsStopped() {
 			s.replyText(event, fmt.Sprintf("您(ID: %s)的权限不足以使用此指令。通过 /sid 获取 ID 并请管理员添加。", event.Source.SenderID))
 		}
@@ -1159,6 +1088,8 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 		return &StageResult{Continue: false}, nil
 	}
 	if len(activated) > 0 {
+		// 对齐 Python v4.28.0 (#9909)：handler 命中（is_wake=True），异步记录 UMO 名称。 Python 在 WakingCheckStage 中 handler 匹配时设置 is_wake=True， Go 侧 handler 匹配在 ProcessStage，故在此 schedule。
+		s.scheduleUmoAutoName(event)
 		// Execute handlers in priority order
 		for _, handler := range activated {
 			if event.IsStopped() {
@@ -1178,25 +1109,19 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 		if event.Result != nil {
 			return &StageResult{Continue: true}, nil
 		}
-		// 插件 handler 主动发送过回复（对齐 Python _has_send_oper）：事件已
-		// 处理，不得再走 LLM（box 等"主动发图回复"的插件命令）。
+		// 插件 handler 主动发送过回复（对齐 Python _has_send_oper）：事件已 处理，不得再走 LLM（box 等"主动发图回复"的插件命令）。
 		if event.HasSendOper {
 			logger.Debug("ProcessStage: plugin 已发送回复，跳过 LLM")
 			return &StageResult{Continue: true}, nil
 		}
-		// 插件 handler 调用了 event.stop_event()（stop_propagation，无
-		// Result/send 的主动回复路径，如 box recall_task）：事件已处理，
-		// 停止管线，不得走 LLM 兜底。
+		// 插件 handler 调用了 event.stop_event()（stop_propagation，无 Result/send 的主动回复路径，如 box recall_task）：事件已处理， 停止管线，不得走 LLM 兜底。
 		if event.IsStopped() {
 			logger.Debug("ProcessStage: plugin 已停止事件，跳过 LLM")
 			return &StageResult{Continue: false}, nil
 		}
 	}
 
-	// If not woken, stop — unless an active reply was requested by the group
-	// chat context (provider_ltm_settings.active_reply probability hit) or the
-	// caller explicitly requested an LLM call (event.CallLLM, e.g. the WebUI
-	// dashboard chat which bypasses platform wake words).
+	// If not woken, stop — unless an active reply was requested by the group chat context (provider_ltm_settings.active_reply probability hit) or the caller explicitly requested an LLM call (event.CallLLM, e.g. the WebUI dashboard chat which bypasses platform wake words).
 	if !event.IsAtOrWakeCommand {
 		if event.CallLLM {
 			logger.Debug("ProcessStage: explicit CallLLM for %s", event.UnifiedMsgOrigin())
@@ -1214,8 +1139,7 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	if s.shouldCallLLM(event) {
 		if err := s.callLLMAgent(ctx, event); err != nil {
 			if errors.Is(err, errNoAvailableProvider) {
-				// 未配置可用模型提供商：平台侧静默（不回复用户），
-				// 仅在启动时打印 warn（见 lifecycle）。
+				// 未配置可用模型提供商：平台侧静默（不回复用户）， 仅在启动时打印 warn（见 lifecycle）。
 				logger.Debug("skip LLM call: %v", err)
 				event.Result = nil
 			} else {
@@ -1229,11 +1153,7 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	return &StageResult{Continue: true}, nil
 }
 
-// findMatchingHandlers returns plugin handlers that match this event.
-// Ported from waking_check/stage.py: non-permission filters are AND-ed
-// together; a failing PermissionFilter marks permissionDenied (the caller
-// decides whether to notify the user). Built-in command handlers are skipped
-// when disable_builtin_commands is enabled.
+// findMatchingHandlers returns plugin handlers that match this event. Ported from waking_check/stage.py: non-permission filters are AND-ed together; a failing PermissionFilter marks permissionDenied (the caller decides whether to notify the user). Built-in command handlers are skipped when disable_builtin_commands is enabled.
 func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star.StarHandlerMetadata, permissionDenied bool) {
 	if s.pluginMgr == nil {
 		return nil, false
@@ -1250,9 +1170,7 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 
 	logger.Debug("[dbg] findMatchingHandlers: %d 个 filter handler, msg=%q wake=%v", len(all), event.MessageStr, event.IsAtOrWakeCommand)
 	for _, handler := range all {
-		// 经快照读取 filters/Enabled：dashboard 可能在运行期经写锁修改
-		// EventFilters/Enabled（SetHandlerPermission/Enable/Disable），
-		// 直接遍历共享切片会与写者并发构成数据竞争。
+		// 经快照读取 filters/Enabled：dashboard 可能在运行期经写锁修改 EventFilters/Enabled（SetHandlerPermission/Enable/Disable）， 直接遍历共享切片会与写者并发构成数据竞争。
 		filters, enabled, ok := registry.SnapshotFilters(handler.HandlerFullName)
 		if !ok || !enabled {
 			continue
@@ -1268,8 +1186,7 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 			EventPlatform: event.Source.Platform,
 			EventRole:     event.Role,
 		}
-		// All non-permission filters must pass (AND); a failing permission
-		// filter marks the event as permission-denied.
+		// All non-permission filters must pass (AND); a failing permission filter marks the event as permission-denied.
 		passed := true
 		filterDenied := false
 		for _, filter := range filters {
@@ -1306,11 +1223,7 @@ func (s *ProcessStage) executeHandler(ctx context.Context, event *core.Event, ha
 	return handler.Handler(event)
 }
 
-// sessionRulesMemo returns the event-level memoized session rules.
-// GetSessionRules runs 2 SQL queries + JSON decode per call; the pipeline
-// queries it up to 6 times per event (plugin filter, provider override,
-// persona override, TTS ×2, STT). Rules cannot change mid-event, so caching
-// on the event is safe. Returns nil when the conversation manager is absent.
+// sessionRulesMemo returns the event-level memoized session rules. GetSessionRules runs 2 SQL queries + JSON decode per call; the pipeline queries it up to 6 times per event (plugin filter, provider override, persona override, TTS ×2, STT). Rules cannot change mid-event, so caching on the event is safe. Returns nil when the conversation manager is absent.
 func sessionRulesMemo(event *core.Event, convMgr *conversation.Manager) map[string]interface{} {
 	if convMgr == nil {
 		return nil
@@ -1323,9 +1236,13 @@ func sessionRulesMemo(event *core.Event, convMgr *conversation.Manager) map[stri
 	return r
 }
 
-// filterHandlersBySession applies the session_plugin_config rule
-// (disabled_plugins / enabled_plugins) to the matched plugin handlers,
-// mirroring Python SessionPluginManager.filter_handlers_by_session.
+// filterHandlersBySession applies the session_plugin_config rule (disabled_plugins / enabled_plugins) to the matched plugin handlers, mirroring Python SessionPluginManager.filter_handlers_by_session. scheduleUmoAutoName 对齐 Python v4.28.0 (#9909)：handler 命中或权限拒绝路径 触发时异步记录 UMO 名称。nil-safe。
+func (s *ProcessStage) scheduleUmoAutoName(event *core.Event) {
+	if s.umoAutoNameRecorder != nil {
+		s.umoAutoNameRecorder.Schedule(event)
+	}
+}
+
 func (s *ProcessStage) filterHandlersBySession(event *core.Event, handlers []*star.StarHandlerMetadata) []*star.StarHandlerMetadata {
 	if s.convMgr == nil || len(handlers) == 0 {
 		return handlers
@@ -1373,8 +1290,7 @@ func (s *ProcessStage) filterHandlersBySession(event *core.Event, handlers []*st
 
 // shouldCallLLM returns true if the LLM agent should be invoked.
 func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
-	// Check if provider is enabled (absent key -> allowed, matching the
-	// original assertion logic).
+	// Check if provider is enabled (absent key -> allowed, matching the original assertion logic).
 	if s.providerConf != nil && s.providerConf.Enable != nil && !*s.providerConf.Enable {
 		return false
 	}
@@ -1389,11 +1305,7 @@ func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
 		return true
 	}
 
-	// Chat is triggered when the event was woken and llm_wake is set by
-	// WakingCheckStage. Prefix wake honors the optional AI wake word
-	// (provider_settings.wake_prefix); @mention / nickname / @all / friend
-	// auto-wake always enable chat (Python parity: is_at_or_wake_command runs
-	// the LLM agent).
+	// Chat is triggered when the event was woken and llm_wake is set by WakingCheckStage. Prefix wake honors the optional AI wake word (provider_settings.wake_prefix); @mention / nickname / @all / friend auto-wake always enable chat (Python parity: is_at_or_wake_command runs the LLM agent).
 	if v, ok := event.GetExtra("llm_wake").(bool); ok {
 		return v
 	}
@@ -1401,8 +1313,7 @@ func (s *ProcessStage) shouldCallLLM(event *core.Event) bool {
 	return false
 }
 
-// agentRequest carries the state prepared for one LLM agent invocation
-// through the tool loop and the reply finalization (the callLLMAgent split).
+// agentRequest carries the state prepared for one LLM agent invocation through the tool loop and the reply finalization (the callLLMAgent split).
 type agentRequest struct {
 	event              *core.Event
 	prompt             string // final user prompt (after knowledge-base injection)
@@ -1413,22 +1324,13 @@ type agentRequest struct {
 	req                *provider.ProviderRequest
 	computerUseRuntime string
 	streaming          bool
-	// cleanup removes image-compress temp files once the whole request
-	// completes; nil when there is nothing to clean up.
+	// cleanup removes image-compress temp files once the whole request completes; nil when there is nothing to clean up.
 	cleanup func()
 }
 
-// callLLMAgent invokes the LLM provider and sets the result. It is a thin
-// orchestrator: prepareAgentRequest resolves the persona/provider and
-// assembles the request, runAgentToolLoop drives the chat + tool-call rounds,
-// and finalizeAgentReply persists the reply and flushes the stream.
+// callLLMAgent invokes the LLM provider and sets the result. It is a thin orchestrator: prepareAgentRequest resolves the persona/provider and assembles the request, runAgentToolLoop drives the chat + tool-call rounds, and finalizeAgentReply persists the reply and flushes the stream.
 func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) error {
-	// Pre-boot the sandbox BEFORE the first LLM request when Computer Use runs
-	// in sandbox mode. 沙盒此前在首次工具调用时才惰性启动，导致首轮系统提示词
-	// 构建（applySkills）时沙盒技能缓存仍为空，python-sandbox 等沙盒内置技能
-	// 从未注入 agent 上下文（agent 因此不了解沙盒环境与文件处理流程）。此处
-	// 提前启动并同步技能，使首轮请求即可带上沙盒技能。ensureSandboxStarted 幂等，
-	// 已运行则直接返回，仅首个请求付出 ~10s 启动成本。
+	// Pre-boot the sandbox BEFORE the first LLM request when Computer Use runs in sandbox mode. 沙盒此前在首次工具调用时才惰性启动，导致首轮系统提示词 构建（applySkills）时沙盒技能缓存仍为空，python-sandbox 等沙盒内置技能 从未注入 agent 上下文（agent 因此不了解沙盒环境与文件处理流程）。此处 提前启动并同步技能，使首轮请求即可带上沙盒技能。ensureSandboxStarted 幂等， 已运行则直接返回，仅首个请求付出 ~10s 启动成本。
 	if s.providerConf != nil && s.providerConf.ComputerUseRuntime == "sandbox" && s.sandboxMgr != nil {
 		if err := s.ensureSandboxStarted(ctx, event.UnifiedMsgOrigin()); err != nil {
 			logger.I18nWarn("沙盒预启动失败（继续处理）: %v", err)
@@ -1437,8 +1339,7 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 
 	ar, err := s.prepareAgentRequest(event)
 	if err != nil || ar == nil {
-		// A failure reply was already written to event.Result, a plugin hook
-		// stopped the call, or the prompt was empty.
+		// A failure reply was already written to event.Result, a plugin hook stopped the call, or the prompt was empty.
 		return nil
 	}
 	if ar.cleanup != nil {
@@ -1456,16 +1357,9 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	return nil
 }
 
-// resolveAgentContext extracts the prompt, resolves the effective provider
-// config and the persona system prompt, and applies the prompt-shaping steps
-// (skills, safety mode, on_llm_request hooks, knowledge base). It returns
-// (nil, nil) when the call is already finished (empty prompt or a plugin hook
-// stopped it) and (nil, err) when a failure reply was written to event.Result.
+// resolveAgentContext extracts the prompt, resolves the effective provider config and the persona system prompt, and applies the prompt-shaping steps (skills, safety mode, on_llm_request hooks, knowledge base). It returns (nil, nil) when the call is already finished (empty prompt or a plugin hook stopped it) and (nil, err) when a failure reply was written to event.Result.
 func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, error) {
-	// Prefer the adapter's clean message_str (mirrors Python's use of
-	// event.message_str). PlainText is the chain-rendered text and may carry a
-	// self-mention (e.g. the qq_official adapter prepends At{qq_official} to
-	// C2C messages), which would otherwise pollute the prompt and history.
+	// Prefer the adapter's clean message_str (mirrors Python's use of event.message_str). PlainText is the chain-rendered text and may carry a self-mention (e.g. the qq_official adapter prepends At{qq_official} to C2C messages), which would otherwise pollute the prompt and history.
 	prompt := event.MessageStr
 	if prompt == "" {
 		prompt = event.PlainText
@@ -1474,8 +1368,7 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		prompt = extractPlainText(event.Message)
 	}
 	logger.Debug("callLLMAgent: prompt=%q plaintext=%q messagestr=%q", prompt, event.PlainText, event.MessageStr)
-	// 纯媒体消息（图片/语音）没有可提取的文本，但同样需要调用 LLM（对齐
-	// Python：req.prompt 为空但 image_urls/audio_urls 非空时继续）。
+	// 纯媒体消息（图片/语音）没有可提取的文本，但同样需要调用 LLM（对齐 Python：req.prompt 为空但 image_urls/audio_urls 非空时继续）。
 	if prompt == "" {
 		imgs, auds := collectMediaURLs(event)
 		if len(imgs) == 0 && len(auds) == 0 {
@@ -1483,9 +1376,7 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		}
 	}
 
-	// Reset the doom-loop counters for this session at each request entry so
-	// repetition is never measured across request boundaries. The paused tool
-	// state is preserved (L-18).
+	// Reset the doom-loop counters for this session at each request entry so repetition is never measured across request boundaries. The paused tool state is preserved (L-18).
 	s.resetDoomLoopCount(event.UnifiedMsgOrigin())
 
 	// Trace span for this agent invocation (TracePage).
@@ -1509,9 +1400,7 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		return nil, err
 	}
 
-	// Session-level provider override (custom rules / /provider command):
-	// when the session has a provider_perf_chat_completion rule, use that
-	// provider instead of the global default.
+	// Session-level provider override (custom rules / /provider command): when the session has a provider_perf_chat_completion rule, use that provider instead of the global default.
 	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
 		if pid, _ := rules[conversation.RuleProviderChatCompletion].(string); pid != "" {
 			if pc := findProviderByID(s.config, pid); pc != nil {
@@ -1520,16 +1409,10 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		}
 	}
 
-	// Dashboard-selected provider/model override (WebUI chat writes
-	// selected_provider/selected_model into event.Metadata, chat_stream.go).
-	// Applied on a copy so the shared provider config is never mutated (L-23).
+	// Dashboard-selected provider/model override (WebUI chat writes selected_provider/selected_model into event.Metadata, chat_stream.go). Applied on a copy so the shared provider config is never mutated (L-23).
 	providerCfg = s.applySelectedProviderModel(event, providerCfg)
 
-	// Resolve the conversation. Mirrors Python's `_get_session_conv`: the
-	// conversation is lazily created if it does not exist yet. The current
-	// user message is appended to history only after the LLM round finishes
-	// (Python appends the user+assistant pair post-completion), so the prompt
-	// is not duplicated in req.Contexts.
+	// Resolve the conversation. Mirrors Python's `_get_session_conv`: the conversation is lazily created if it does not exist yet. The current user message is appended to history only after the LLM round finishes (Python appends the user+assistant pair post-completion), so the prompt is not duplicated in req.Contexts.
 	personaID := ""
 	if s.convMgr != nil {
 		conv := s.convMgr.GetOrCreateConversation(event.UnifiedMsgOrigin(), event.Source.PlatformID)
@@ -1546,8 +1429,7 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		}
 	}
 
-	// Session custom-rule persona overrides everything (highest priority):
-	// session_service_config.persona_id from the WebUI rules editor.
+	// Session custom-rule persona overrides everything (highest priority): session_service_config.persona_id from the WebUI rules editor.
 	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
 		if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
 			if pid, ok := sc["persona_id"].(string); ok && pid != "" {
@@ -1570,24 +1452,19 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		systemPrompt = s.personaPrompt(event.UnifiedMsgOrigin(), personaID)
 	}
 	if systemPrompt == "" {
-		// providerSettings["persona"] 在上方被写成 persona ID（非提示词文本），
-		// 不能再把它当系统提示词回退（persona 被删除/改名时会把 ID 直接发给
-		// 模型）。仅兼容历史遗留的"纯文本 persona"形态配置。
+		// providerSettings["persona"] 在上方被写成 persona ID（非提示词文本）， 不能再把它当系统提示词回退（persona 被删除/改名时会把 ID 直接发给 模型）。仅兼容历史遗留的"纯文本 persona"形态配置。
 		if p, ok := providerSettings["persona_prompt_text"].(string); ok && p != "" {
 			systemPrompt = p
 		}
 	}
 
-	// Inject active skills into the system prompt (mirrors Python's
-	// astr_main_agent._ensure_persona_and_skills).
+	// Inject active skills into the system prompt (mirrors Python's astr_main_agent._ensure_persona_and_skills).
 	systemPrompt = s.applySkills(systemPrompt, providerSettings, personaID, event.UnifiedMsgOrigin())
 
-	// LLM safety mode: prefix the safety prompt when enabled (mirrors
-	// astr_main_agent._apply_llm_safety_mode).
+	// LLM safety mode: prefix the safety prompt when enabled (mirrors astr_main_agent._apply_llm_safety_mode).
 	systemPrompt = s.applyLLMSafetyMode(systemPrompt)
 
-	// Apply on_llm_request hooks from subprocess plugins: they may modify the
-	// system prompt and/or user prompt, or stop the LLM call entirely.
+	// Apply on_llm_request hooks from subprocess plugins: they may modify the system prompt and/or user prompt, or stop the LLM call entirely.
 	if s.subPlugins != nil {
 		sp, up, stop, err := s.applyLLMRequestHooks(event, systemPrompt, prompt)
 		if err != nil {
@@ -1603,16 +1480,13 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		}
 	}
 
-	// on_waiting_llm_request fires right before the provider call (e.g. a
-	// plugin may show a "processing" indicator).
+	// on_waiting_llm_request fires right before the provider call (e.g. a plugin may show a "processing" indicator).
 	dispatchSubprocessHooks(s.subPlugins, event, "on_waiting_llm_request")
 
-	// Knowledge-base retrieval: inject related KB content into the prompt
-	// (non-agentic mode), using the session kb_config rule when set.
+	// Knowledge-base retrieval: inject related KB content into the prompt (non-agentic mode), using the session kb_config rule when set.
 	prompt = s.applyKnowledgeBase(event, prompt)
 
-	// computer_use_runtime drives whether local/sandbox tools are exposed and
-	// whether the local-mode hint is appended to the system prompt.
+	// computer_use_runtime drives whether local/sandbox tools are exposed and whether the local-mode hint is appended to the system prompt.
 	computerUseRuntime := "local"
 	if s.providerConf != nil && s.providerConf.ComputerUseRuntime != "" {
 		computerUseRuntime = s.providerConf.ComputerUseRuntime
@@ -1628,11 +1502,7 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 	}, nil
 }
 
-// prepareAgentRequest resolves the persona/provider for the event (via
-// resolveAgentContext), assembles the ProviderRequest, creates the chat
-// provider instance, and injects the tool schemas / streaming flags.
-// Return conventions match resolveAgentContext: (nil, nil) = already
-// finished, (nil, err) = failure reply written to event.Result.
+// prepareAgentRequest resolves the persona/provider for the event (via resolveAgentContext), assembles the ProviderRequest, creates the chat provider instance, and injects the tool schemas / streaming flags. Return conventions match resolveAgentContext: (nil, nil) = already finished, (nil, err) = failure reply written to event.Result.
 func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, error) {
 	ar, err := s.resolveAgentContext(event)
 	if err != nil || ar == nil {
@@ -1652,18 +1522,15 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 		Contexts:     s.conversationHistory(event.UnifiedMsgOrigin()),
 	}
 
-	// File attachments (当前消息与引用回复中的 File 组件) 注入 LLM 上下文，
-	// 使 agent 能看到下载 URL 并 astrbot_download_file（对齐 Python
-	// astr_main_agent 的 [File Attachment ...]）。
-	for _, part := range collectFileAttachments(event) {
+	// File attachments (当前消息与引用回复中的 File 组件) 注入 LLM 上下文， 使 agent 能看到下载 URL 并 astrbot_download_file（对齐 Python astr_main_agent 的 [File Attachment ...]）。
+	for _, part := range s.collectFileAttachments(context.Background(), event, ar.computerUseRuntime == "sandbox") {
 		req.ExtraUserContentParts = append(req.ExtraUserContentParts, map[string]interface{}{
 			"type": "text",
 			"text": part,
 		})
 	}
 
-	// Sanitize context by the provider's supported modalities
-	// (provider_settings.sanitize_context_by_modalities).
+	// Sanitize context by the provider's supported modalities (provider_settings.sanitize_context_by_modalities).
 	if s.providerConf != nil && s.providerConf.SanitizeContextByModalities {
 		if mods := providerModalities(providerCfg); len(mods) > 0 {
 			req.Contexts = sanitizeContextByModalities(req.Contexts, mods)
@@ -1677,9 +1544,7 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 			compressed = append(compressed, s.compressImageForProvider(u))
 		}
 		req.ImageURLs = compressed
-		// Temp files created by compressImageForProvider are consumed by the
-		// provider during chatRound; the orchestrator removes them once the
-		// whole request completes.
+		// Temp files created by compressImageForProvider are consumed by the provider during chatRound; the orchestrator removes them once the whole request completes.
 		tempFiles := []string{}
 		for _, p := range compressed {
 			if isCompressTempFile(p) {
@@ -1695,8 +1560,7 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 		}
 	}
 
-	// Group chat context injection: records received before this message are
-	// appended to the request (mirrors GroupChatContext.on_req_llm).
+	// Group chat context injection: records received before this message are appended to the request (mirrors GroupChatContext.on_req_llm).
 	if s.groupCtx != nil && s.groupChatContextEnabled(event) && s.groupLTMSetting(event, "group_icl_enable") {
 		s.groupCtx.OnReqLLM(event, req)
 	}
@@ -1711,8 +1575,7 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 		return nil, fmt.Errorf("provider config missing type field")
 	}
 
-	// Merge the provider source config (api_base/key live on the source,
-	// mirroring astrbot/core/provider/manager.py get_merged_provider_config).
+	// Merge the provider source config (api_base/key live on the source, mirroring astrbot/core/provider/manager.py get_merged_provider_config).
 	mergedCfg := mergeProviderSource(providerCfg, s.config["provider_sources"])
 
 	inst, err := provider.CreateProvider(providerType, mergedCfg, providerSettings)
@@ -1730,13 +1593,11 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 	}
 	ar.chatInst = chatInst
 
-	// Inject active tools (built-in + MCP servers) so the model can call them.
-	// skills_like mode sends light schemas (name/description only) to save
-	// tokens; arguments are re-queried once a tool is selected.
+	// Inject active tools (built-in + MCP servers) so the model can call them. skills_like mode sends light schemas (name/description only) to save tokens; arguments are re-queried once a tool is selected.
 	if s.toolSchemaMode == "skills_like" {
-		req.Tools = s.collectLightTools(ar.computerUseRuntime)
+		req.Tools = s.collectLightTools(ar.computerUseRuntime, event.UnifiedMsgOrigin())
 	} else {
-		req.Tools = s.collectTools(ar.computerUseRuntime)
+		req.Tools = s.collectTools(ar.computerUseRuntime, event.UnifiedMsgOrigin())
 	}
 	toolNames := make([]string, 0, len(req.Tools))
 	for _, t := range req.Tools {
@@ -1754,10 +1615,12 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 		req.SystemPrompt += "\n" + localModePrompt(workspaceRoot(event.UnifiedMsgOrigin())) + "\n"
 	case "sandbox":
 		req.SystemPrompt += "\n" + sandboxModePrompt() + "\n"
+		if _, neoOK := s.neoToolAvailability(event.UnifiedMsgOrigin()); neoOK {
+			req.SystemPrompt += "\n" + neoModePrompt() + "\n"
+		}
 	}
 
-	// Streaming is only supported for providers that implement ChatProvider;
-	// the OpenAI-compatible path covers most backends.
+	// Streaming is only supported for providers that implement ChatProvider; the OpenAI-compatible path covers most backends.
 	streamingEnabled := false
 	if s.providerConf != nil {
 		streamingEnabled = s.providerConf.StreamingResponse
@@ -1768,8 +1631,7 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 	}
 	ar.streaming = streamingEnabled
 
-	// System context reminder (identifier / group name / datetime), appended as
-	// an extra user-content part like Python's astr_main_agent.
+	// System context reminder (identifier / group name / datetime), appended as an extra user-content part like Python's astr_main_agent.
 	if reminder := s.buildSystemReminder(event); reminder != "" {
 		logger.Debug("callLLMAgent: system_reminder=%q", reminder)
 		req.ExtraUserContentParts = append(req.ExtraUserContentParts, map[string]interface{}{
@@ -1782,10 +1644,7 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 	return ar, nil
 }
 
-// collectMediaURLs gathers image/audio URLs from the event message chain for
-// the multimodal provider request (mirrors Python's astr_main_agent media
-// attachment collection). Image components prefer URL, then local path
-// (file://), then base64 data; Record components prefer URL, then path.
+// collectMediaURLs gathers image/audio URLs from the event message chain for the multimodal provider request (mirrors Python's astr_main_agent media attachment collection). Image components prefer URL, then local path (file://), then base64 data; Record components prefer URL, then path.
 func collectMediaURLs(event *core.Event) (imageURLs, audioURLs []string) {
 	if event.Message == nil {
 		return nil, nil
@@ -1813,13 +1672,8 @@ func collectMediaURLs(event *core.Event) (imageURLs, audioURLs []string) {
 	return imageURLs, audioURLs
 }
 
-// collectFileAttachments gathers File components from the event's message chain
-// and any quoted-reply / forward-node chains. For each file with a resolvable
-// download URL it downloads the file to a host temp path (mirroring Python's
-// astr_main_agent File.get_file()) and returns "[File Attachment ...]" text
-// parts for the LLM context, so the agent can astrbot_upload_file the host
-// path into the sandbox.
-func collectFileAttachments(event *core.Event) []string {
+// collectFileAttachments gathers File components from the event's message chain and any quoted-reply / forward-node chains. For each file with a resolvable download URL it downloads the file to a host temp path (mirroring Python's astr_main_agent File.get_file()). sandboxMode 时把文件自动暂存进 /workspace 并展示沙盒路径（不依赖模型自觉调 upload_file）；暂存失败回退宿主路径+显式引导文案。
+func (s *ProcessStage) collectFileAttachments(ctx context.Context, event *core.Event, sandboxMode bool) []string {
 	if event.Message == nil {
 		return nil
 	}
@@ -1842,7 +1696,13 @@ func collectFileAttachments(event *core.Event) []string {
 				}
 				if path := downloadFileAttachment(c); path != "" {
 					c.Path = path
-					parts = append(parts, fmt.Sprintf("%sname %s, path %s]", prefix, name, path))
+					if sbPath := s.stageFileIntoSandbox(ctx, event.UnifiedMsgOrigin(), path, sandboxMode); sbPath != "" {
+						parts = append(parts, fmt.Sprintf("%sname %s, path %s (already copied into the sandbox — read this path directly)]", prefix, name, sbPath))
+					} else if sandboxMode {
+						parts = append(parts, fmt.Sprintf("%sname %s, path %s (HOST path — call astrbot_upload_file with this local_path first, then read the returned sandbox path)]", prefix, name, path))
+					} else {
+						parts = append(parts, fmt.Sprintf("%sname %s, path %s]", prefix, name, path))
+					}
 				} else if validHTTPURL(c.URL) {
 					parts = append(parts, fmt.Sprintf("%sname %s, url %s (download failed)]", prefix, name, c.URL))
 				} else {
@@ -1863,10 +1723,7 @@ func collectFileAttachments(event *core.Event) []string {
 	return parts
 }
 
-// downloadFileAttachment downloads a File component's URL to a host temp
-// directory (data/temp) and returns the local path, or "" when there is no
-// usable URL or the download fails. Mirrors Python's File.get_file()/
-// _download_file which caches the remote file locally before the LLM round.
+// downloadFileAttachment downloads a File component's URL to a host temp directory (data/temp) and returns the local path, or "" when there is no usable URL or the download fails. Mirrors Python's File.get_file()/ _download_file which caches the remote file locally before the LLM round.
 func downloadFileAttachment(c *message.File) string {
 	if c == nil || !validHTTPURL(c.URL) {
 		return ""
@@ -1897,11 +1754,7 @@ func downloadFileAttachment(c *message.File) string {
 	return dst
 }
 
-// runAgentToolLoop issues the initial chat round, executes the requested
-// tools (up to provider_settings.max_agent_step rounds) and runs the
-// follow-up rounds with the tool results. It returns ok=false when a failure
-// reply was already written to event.Result (or the provider reported an
-// error role), in which case the caller must not finalize the reply.
+// runAgentToolLoop issues the initial chat round, executes the requested tools (up to provider_settings.max_agent_step rounds) and runs the follow-up rounds with the tool results. It returns ok=false when a failure reply was already written to event.Result (or the provider reported an error role), in which case the caller must not finalize the reply.
 func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, streamer *streamSender) (*provider.LLMResponse, bool) {
 	event := ar.event
 	req := ar.req
@@ -1909,13 +1762,20 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 	llmCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
 
-	// Context-limit handling: llm_compress / truncate_by_turns based on
-	// provider_settings.max_context_length (token estimate).
+	// Context-limit handling: llm_compress / truncate_by_turns based on provider_settings.max_context_length (token estimate).
 	req.Contexts = s.maybeCompressContext(llmCtx, ar.chatInst, ar.systemPrompt, req.Contexts)
 
 	// Tool-call loop: up to 5 rounds of tool execution + follow-up.
 	messages := append([]map[string]interface{}{}, req.Contexts...)
 	messages = append(messages, req.ToUserMessage())
+
+	// 对齐 Python tool_loop_agent_runner：messages 为空（且无新 prompt）时跳过 LLM 请求，返回 err 响应而非发空请求。
+	if len(messages) == 0 && req.Prompt == "" {
+		logger.Warn("Skipping LLM request because no messages remain after agent/request hooks and context processing.")
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "No messages remain for the LLM request."}}
+		return nil, false
+	}
 
 	resp, err := s.chatRound(llmCtx, ar.chatInst, req, ar.streaming, streamer)
 	if err != nil {
@@ -1925,17 +1785,17 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 		return nil, false
 	}
 	s.recordProviderCall(ar.providerCfg, event.UnifiedMsgOrigin(), resp)
-	// skills_like: the main request carried no tool parameters. When the model
-	// chose tools, re-query once with the chosen tools' full parameter schemas
-	// (minimal context) so the LLM produces proper arguments.
+	// skills_like: the main request carried no tool parameters. When the model chose tools, re-query once with the chosen tools' full parameter schemas (minimal context) so the LLM produces proper arguments.
 	if s.toolSchemaMode == "skills_like" && len(resp.ToolsCallName) > 0 {
-		if requery, ok := s.requeryToolArgs(llmCtx, ar.chatInst, req, resp, ar.computerUseRuntime); ok {
+		if requery, ok := s.requeryToolArgs(llmCtx, ar.chatInst, req, resp, ar.computerUseRuntime, event.UnifiedMsgOrigin()); ok {
 			resp = requery
 		}
 	}
-	// Max agent steps: config provider_settings.max_agent_step (default 5).
+	// Max agent steps: 优先 agent_runner.config.misc.max_steps，回退 provider_settings.max_agent_step， 默认 5（对齐 Python #9801/#9818）。
 	maxSteps := 5
-	if s.providerConf != nil && s.providerConf.MaxAgentStep > 0 {
+	if v := agentRunnerMaxSteps(s.config); v > 0 {
+		maxSteps = v
+	} else if s.providerConf != nil && s.providerConf.MaxAgentStep > 0 {
 		maxSteps = s.providerConf.MaxAgentStep
 	}
 	for round := 0; round < maxSteps && len(resp.ToolsCallName) > 0; round++ {
@@ -1963,10 +1823,7 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 				doomed = true
 				break
 			}
-			// provider_settings.show_tool_use_status: notify the user a tool is
-			// being called (mirrors astr_agent_run_util.py). When
-			// show_tool_call_result is also enabled the status is folded into
-			// the result notice sent after the tool returns.
+			// provider_settings.show_tool_use_status: notify the user a tool is being called (mirrors astr_agent_run_util.py). When show_tool_call_result is also enabled the status is folded into the result notice sent after the tool returns.
 			if s.providerConf != nil && s.providerConf.ShowToolUseStatus && !s.providerConf.ShowToolCallResult {
 				s.sendToolStatus(event, toolStatusCall(name))
 			}
@@ -1978,18 +1835,15 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 				})
 			}
 			result := s.executeToolWithTimeout(event, ar.computerUseRuntime, name, args)
-			// on_llm_tool_respond fires after the tool executed, carrying the
-			// tool name/args plus its result.
+			// on_llm_tool_respond fires after the tool executed, carrying the tool name/args plus its result.
 			dispatchSubprocessHooksPayload(s.subPlugins, event, "on_llm_tool_respond", &pluginsdk.ToolCall{
 				Name:   name,
 				Args:   args,
 				Result: result,
 			})
-			// Oversized tool output is spilled to a file with a read hint so the
-			// model does not re-run the tool just to see the full result.
-			result = materializeToolResult(result, toolID)
-			// provider_settings.show_tool_use_status + show_tool_call_result:
-			// send a combined "tool called → result" notice.
+			// Oversized tool output is spilled to a file with a read hint so the model does not re-run the tool just to see the full result (opencode truncate.ts semantics: preview + ...N lines truncated... + Grep/Read(offset/limit) hint; budget = 1/5 of the model context).
+			result = s.materializeForRuntime(result, toolID, ar.computerUseRuntime, event.UnifiedMsgOrigin())
+			// provider_settings.show_tool_use_status + show_tool_call_result: send a combined "tool called → result" notice.
 			if s.providerConf != nil && s.providerConf.ShowToolUseStatus && s.providerConf.ShowToolCallResult {
 				s.sendToolStatus(event, fmt.Sprintf("%s\n%s", toolStatusCall(name), toolStatusResult(result)))
 			}
@@ -2009,8 +1863,25 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 			break
 		}
 
-		// Follow-up request with tool results. Each round gets its own timeout
-		// so one slow round does not exhaust the whole tool-loop budget.
+		// Tool-produced images (file_read multimodal, py ToolImageCache flow): append a user message carrying the images so the model can actually see them; tool messages stay text-only per OpenAI protocol.
+		if imgs := drainToolImages(event); len(imgs) > 0 {
+			if providerSupportsImages(ar.providerCfg) {
+				parts := make([]interface{}, 0, len(imgs)*2)
+				for _, img := range imgs {
+					parts = append(parts,
+						map[string]interface{}{"type": "text", "text": fmt.Sprintf("[Image from tool 'astrbot_file_read_tool', path='%s']", img.Path)},
+						map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": "data:" + img.Mime + ";base64," + img.Base64, "id": img.Path}},
+					)
+				}
+				messages = append(messages, map[string]interface{}{"role": "user", "content": parts})
+			} else {
+				for _, img := range imgs {
+					os.Remove(img.Path)
+				}
+			}
+		}
+
+		// Follow-up request with tool results. Each round gets its own timeout so one slow round does not exhaust the whole tool-loop budget.
 		req.Contexts = messages
 		roundCtx, roundCancel := context.WithTimeout(llmCtx, 120*time.Second)
 		resp, err = s.chatRound(roundCtx, ar.chatInst, req, ar.streaming, streamer)
@@ -2032,36 +1903,27 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 	return resp, true
 }
 
-// finalizeAgentReply appends the user/assistant pair to the conversation
-// history, fires the on_llm_response hooks, persists the reply for enabled
-// group sessions (group LTM), flushes the stream and sets event.Result.
+// finalizeAgentReply appends the user/assistant pair to the conversation history, fires the on_llm_response hooks, persists the reply for enabled group sessions (group LTM), flushes the stream and sets event.Result.
 func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMResponse, streamer *streamSender) {
 	event := ar.event
 
-	// The tool loop ends early when the model hit maxSteps or a tool was paused
-	// by doom-loop detection: the last response carries tool calls and usually
-	// no text. Record a visible notice instead of polluting history with an
-	// empty assistant turn (L-24).
+	// The tool loop ends early when the model hit maxSteps or a tool was paused by doom-loop detection: the last response carries tool calls and usually no text. Record a visible notice instead of polluting history with an empty assistant turn (L-24).
 	if strings.TrimSpace(resp.CompletionText) == "" && len(resp.ToolsCallName) > 0 {
 		resp.CompletionText = "（已达最大工具调用步数/工具被暂停，未能生成最终回复。）"
 	}
 
-	// Append user + assistant reply to history (Python appends the pair
-	// post-completion; the user message is intentionally not in req.Contexts
-	// since it is sent as the current prompt).
+	// Append user + assistant reply to history (Python appends the pair post-completion; the user message is intentionally not in req.Contexts since it is sent as the current prompt).
 	if s.convMgr != nil {
 		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "user", ar.prompt)
 		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "assistant", resp.CompletionText)
 	}
 
-	// on_llm_response fires after the LLM reply is produced (e.g. plugins that
-	// capture conversation memory). Payload carries the reply text.
+	// on_llm_response fires after the LLM reply is produced (e.g. plugins that capture conversation memory). Payload carries the reply text.
 	dispatchSubprocessHooksPayload(s.subPlugins, event, "on_llm_response", &pluginsdk.LLMResponse{
 		Text: resp.CompletionText,
 	})
 
-	// Persist the bot reply for enabled group sessions (mirrors
-	// builtin_stars/astrbot/main.py persist_llm_response).
+	// Persist the bot reply for enabled group sessions (mirrors builtin_stars/astrbot/main.py persist_llm_response).
 	if s.database != nil && event.Source.IsGroup && event.Source.Platform != "webchat" &&
 		s.groupLTMSetting(event, "group_message_history_enable") && resp.CompletionText != "" {
 		_ = s.database.RecordPlatformMessage(event.Source.Platform, event.UnifiedMsgOrigin(), event.Source.SelfID, resp.CompletionText)
@@ -2071,8 +1933,7 @@ func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMRe
 
 	streamer.flush()
 	if streamer.sentAny() {
-		// Text was already streamed to the platform incrementally; mark the
-		// event so RespondStage does not send a duplicate full message.
+		// Text was already streamed to the platform incrementally; mark the event so RespondStage does not send a duplicate full message.
 		event.SetExtra("streamed", true)
 	}
 
@@ -2080,9 +1941,7 @@ func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMRe
 	event.Result.Chain = []message.Component{&message.Plain{Text: resp.CompletionText}}
 }
 
-// chatRound issues a single LLM request. When streaming is enabled it consumes
-// the stream channel, forwards content deltas to the platform incrementally,
-// and consolidates content + tool calls into a single response.
+// chatRound issues a single LLM request. When streaming is enabled it consumes the stream channel, forwards content deltas to the platform incrementally, and consolidates content + tool calls into a single response.
 func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider, req *provider.ProviderRequest, streaming bool, streamer *streamSender) (*provider.LLMResponse, error) {
 	start := time.Now()
 	if !streaming {
@@ -2090,9 +1949,7 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 		if err != nil {
 			return nil, err
 		}
-		// Anthropic-style XML tool calls (<function_calls>) are parsed into
-		// real tool calls (same as the streaming path) so they execute instead
-		// of leaking into the reply.
+		// Anthropic-style XML tool calls (<function_calls>) are parsed into real tool calls (same as the streaming path) so they execute instead of leaking into the reply.
 		if calls, ok := parseXMLToolCalls(resp.CompletionText); ok {
 			for i, c := range calls {
 				resp.ToolsCallName = append(resp.ToolsCallName, c.name)
@@ -2111,16 +1968,11 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 	}
 	full := &provider.LLMResponse{Role: "assistant", CompletionText: "", ToolsCallName: []string{}, ToolsCallArgs: []map[string]interface{}{}, ToolsCallIDs: []string{}}
 	var content, reasoning strings.Builder
-	// ctrlPending accumulates the tail of the stream that might be a control
-	// marker split across chunks; only the confirmed-safe prefix is released.
+	// ctrlPending accumulates the tail of the stream that might be a control marker split across chunks; only the confirmed-safe prefix is released.
 	var ctrlPending string
 	for chunk := range streamCh {
 		if chunk.Role == "err" {
-			// err chunk 提前返回后，生产者 goroutine 仍可能继续向缓冲为 100
-			// 的 channel 写数据而被阻塞（泄漏 goroutine 与 resp.Body）。
-			// 用后台 goroutine 排空剩余流，直到生产者关闭 channel；这样既能
-			// 立刻返回错误，又能让生产者退出并执行其 defer（close(ch)、
-			// resp.Body.Close()），避免重复 Close。
+			// err chunk 提前返回后，生产者 goroutine 仍可能继续向缓冲为 100 的 channel 写数据而被阻塞（泄漏 goroutine 与 resp.Body）。 用后台 goroutine 排空剩余流，直到生产者关闭 channel；这样既能 立刻返回错误，又能让生产者退出并执行其 defer（close(ch)、 resp.Body.Close()），避免重复 Close。
 			go func() {
 				for range streamCh {
 				}
@@ -2130,14 +1982,10 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 		if chunk.IsChunk {
 			content.WriteString(chunk.CompletionText)
 			reasoning.WriteString(chunk.GetReasoningContent())
-			// Suppress model control markup (XML tool calls, advisor/reasoning
-			// tags) from the user-facing stream; parsed/handled at completion.
-			// A marker split across chunks is caught by holding back the suffix
-			// that could begin a marker until the next chunk resolves it (L-21).
+			// Suppress model control markup (XML tool calls, advisor/reasoning tags) from the user-facing stream; parsed/handled at completion. A marker split across chunks is caught by holding back the suffix that could begin a marker until the next chunk resolves it (L-21).
 			ctrlPending += chunk.CompletionText
 			if containsControlText(ctrlPending) {
-				// A (possibly split) control marker is present; drop it all so
-				// none of it leaks to the user.
+				// A (possibly split) control marker is present; drop it all so none of it leaks to the user.
 				ctrlPending = ""
 			} else {
 				safe := len(ctrlPending) - controlTextPendingLen(ctrlPending)
@@ -2146,10 +1994,7 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 					ctrlPending = ctrlPending[safe:]
 				}
 			}
-			// Display the reasoning content when provider_settings.
-			// display_reasoning_text is enabled (mirrors the Python
-			// `chain.type == "reasoning" and not show_reasoning: continue`).
-			// 通过回退取值接口 GetReasoningContent 读取，空值返回空串，不显示。
+			// Display the reasoning content when provider_settings. display_reasoning_text is enabled (mirrors the Python `chain.type == "reasoning" and not show_reasoning: continue`). 通过回退取值接口 GetReasoningContent 读取，空值返回空串，不显示。
 			if s.providerConf != nil && s.providerConf.DisplayReasoningText &&
 				chunk.GetReasoningContent() != "" {
 				streamer.push(chunk.GetReasoningContent())
@@ -2165,22 +2010,19 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 			full.Usage = u
 		}
 		if chunk.CompletionText != "" && !chunk.IsChunk {
-			// The final consolidated chunk carries the authoritative full text;
-			// replace (not append to) the accumulated deltas to avoid doubling.
+			// The final consolidated chunk carries the authoritative full text; replace (not append to) the accumulated deltas to avoid doubling.
 			content.Reset()
 			content.WriteString(chunk.CompletionText)
 		}
 	}
-	// Release any buffered tail that never resolved into a control marker
-	// (the stream ended without completing one).
+	// Release any buffered tail that never resolved into a control marker (the stream ended without completing one).
 	if ctrlPending != "" {
 		streamer.push(ctrlPending)
 		ctrlPending = ""
 	}
 	full.CompletionText = content.String()
 	full.ReasoningContent = reasoning.String()
-	// Anthropic-style XML tool calls (<function_calls>) are parsed into real
-	// tool calls so they execute instead of leaking into the reply.
+	// Anthropic-style XML tool calls (<function_calls>) are parsed into real tool calls so they execute instead of leaking into the reply.
 	if calls, ok := parseXMLToolCalls(full.CompletionText); ok {
 		for i, c := range calls {
 			full.ToolsCallName = append(full.ToolsCallName, c.name)
@@ -2194,17 +2036,7 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 	return full, nil
 }
 
-// streamSender emits streamed content.
-//
-// Priority:
-//  1. Native stream-edit messaging (QQ C2C) — deltas are throttled into a
-//     single progressively-updated message. Requires markdown permission on
-//     QQ Open Platform; if the fragment call fails we fall back to #2.
-//  2. Sentence segmentation — complete sentences (。！？!?；;\n) are sent as
-//     separate natural messages as they form.
-//
-// Group chats and unsupported platforms get no incremental sends; the final
-// response is delivered once by RespondStage (matches AstrBot).
+// streamSender emits streamed content. Priority:  1. Native stream-edit messaging (QQ C2C) — deltas are throttled into a     single progressively-updated message. Requires markdown permission on     QQ Open Platform; if the fragment call fails we fall back to #2.  2. Sentence segmentation — complete sentences (。！？!?；;\n) are sent as     separate natural messages as they form. Group chats and unsupported platforms get no incremental sends; the final response is delivered once by RespondStage (matches AstrBot).
 type streamSender struct {
 	stage     *ProcessStage
 	event     *core.Event
@@ -2246,8 +2078,7 @@ func (ss *streamSender) push(text string) {
 	}
 }
 
-// flushFragment pushes the full accumulated text through the native
-// stream-edit protocol (final=true also emits the state=10 end fragment).
+// flushFragment pushes the full accumulated text through the native stream-edit protocol (final=true also emits the state=10 end fragment).
 func (ss *streamSender) flushFragment(final bool) {
 	if ss.pending.Len() == 0 {
 		return
@@ -2273,8 +2104,7 @@ func (ss *streamSender) flushFragment(final bool) {
 	}
 }
 
-// onFragFailure switches from native streaming to sentence segmentation so
-// the user still gets progressive output when the platform rejects streaming.
+// onFragFailure switches from native streaming to sentence segmentation so the user still gets progressive output when the platform rejects streaming.
 func (ss *streamSender) onFragFailure(err error) {
 	if !ss.fragWarn {
 		logger.I18nWarn("原生流式不可用 (%v)，回退到按句子切分输出", err)
@@ -2310,8 +2140,7 @@ func (ss *streamSender) flushSentences() {
 }
 
 func (ss *streamSender) sendSegment(text string) {
-	// Trim paragraph-break whitespace so segments don't render with stray
-	// blank lines, and drop whitespace-only fragments entirely.
+	// Trim paragraph-break whitespace so segments don't render with stray blank lines, and drop whitespace-only fragments entirely.
 	text = strings.TrimSpace(text)
 	if text == "" || ss.stage.platformMgr == nil {
 		return
@@ -2330,9 +2159,7 @@ const sentenceMaxLen = 1500
 // sentenceTerminators are the characters that end a natural sentence.
 const sentenceTerminators = "。！？!?；;\n"
 
-// cutAtSentenceBoundary splits s at the LAST sentence-terminating rune,
-// returning the prefix (including the full terminator rune) and the remainder.
-// Returns ("", s) when no boundary exists.
+// cutAtSentenceBoundary splits s at the LAST sentence-terminating rune, returning the prefix (including the full terminator rune) and the remainder. Returns ("", s) when no boundary exists.
 func cutAtSentenceBoundary(s string) (string, string) {
 	idx := strings.LastIndexAny(s, sentenceTerminators)
 	if idx < 0 {
@@ -2346,8 +2173,7 @@ func cutAtSentenceBoundary(s string) (string, string) {
 	return s[:end], s[end:]
 }
 
-// cutUTF8 returns the longest prefix of s that is valid UTF-8 and at most max
-// bytes, together with the remainder. It never splits a multi-byte rune.
+// cutUTF8 returns the longest prefix of s that is valid UTF-8 and at most max bytes, together with the remainder. It never splits a multi-byte rune.
 func cutUTF8(s string, max int) (string, string) {
 	if len(s) <= max {
 		return "", s
@@ -2383,8 +2209,7 @@ func (ss *streamSender) sentAny() bool {
 	return ss.sent
 }
 
-// buildSystemReminder builds the <system_reminder> context block for the LLM
-// request, mirroring Python's astr_main_agent._apply_system_context_reminder.
+// buildSystemReminder builds the <system_reminder> context block for the LLM request, mirroring Python's astr_main_agent._apply_system_context_reminder.
 func (s *ProcessStage) buildSystemReminder(event *core.Event) string {
 	if s.providerConf == nil {
 		return ""
@@ -2437,16 +2262,7 @@ func (s *ProcessStage) recordProviderCall(providerCfg map[string]interface{}, um
 	_ = s.database.RecordProviderCall(umo, providerID, model, input, 0, output, now, now)
 }
 
-// applySkills appends the active-skills section to the system prompt.
-// It mirrors Python's astr_main_agent._ensure_persona_and_skills:
-//   - list active skills for the configured computer_use_runtime;
-//   - drop plugin skills whose plugin is deactivated or excluded by the
-//     plugin_set allow-list (mirrors _filter_skills_for_current_config);
-//   - for the "local" runtime, merge request-scoped workspace skills
-//     (workspace overrides same-name skills, sorted by name);
-//   - honor the persona skill allow-list (nil = unrestricted, empty =
-//     disabled; workspace skills are skipped only when disabled);
-//   - a runtime of "none" warns that Computer Use is disabled.
+// applySkills appends the active-skills section to the system prompt. It mirrors Python's astr_main_agent._ensure_persona_and_skills:   - list active skills for the configured computer_use_runtime;   - drop plugin skills whose plugin is deactivated or excluded by the     plugin_set allow-list (mirrors _filter_skills_for_current_config);   - for the "local" runtime, merge request-scoped workspace skills     (workspace overrides same-name skills, sorted by name);   - honor the persona skill allow-list (nil = unrestricted, empty =     disabled; workspace skills are skipped only when disabled);   - a runtime of "none" warns that Computer Use is disabled.
 func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[string]interface{}, personaID string, umo string) string {
 	if s.skillMgr == nil {
 		return systemPrompt
@@ -2484,10 +2300,7 @@ func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[str
 				}
 			}
 		}
-		// Workspace skills merge AFTER persona filtering: a disabled persona
-		// (persona.skills == []) excludes workspace skills too; otherwise
-		// workspace skills override same-name entries and the merged map is
-		// sorted by name (mirrors astr_main_agent.py:586-590).
+		// Workspace skills merge AFTER persona filtering: a disabled persona (persona.skills == []) excludes workspace skills too; otherwise workspace skills override same-name entries and the merged map is sorted by name (mirrors astr_main_agent.py:586-590).
 		if len(workspaceSkills) > 0 && personaWorkspaceUnrestricted(s.personaSkills, personaID) {
 			byName := make(map[string]*skills.SkillInfo, len(active)+len(workspaceSkills))
 			for _, sk := range active {
@@ -2521,10 +2334,7 @@ func (s *ProcessStage) applySkills(systemPrompt string, providerSettings map[str
 	return systemPrompt
 }
 
-// personaWorkspaceUnrestricted reports whether workspace skills may merge:
-// Python gates the merge on `not persona or persona.get("skills") != []`,
-// i.e. only a persona explicitly configured with an empty skills list blocks
-// workspace skills.
+// personaWorkspaceUnrestricted reports whether workspace skills may merge: Python gates the merge on `not persona or persona.get("skills") != []`, i.e. only a persona explicitly configured with an empty skills list blocks workspace skills.
 func personaWorkspaceUnrestricted(personaSkills func(personaID string) []string, personaID string) bool {
 	if personaSkills == nil || personaID == "" {
 		return true
@@ -2532,13 +2342,7 @@ func personaWorkspaceUnrestricted(personaSkills func(personaID string) []string,
 	return personaSkills(personaID) == nil
 }
 
-// filterSkillsForCurrentConfig mirrors Python's
-// astr_main_agent._filter_skills_for_current_config: plugin-sourced skills
-// require their plugin to be registered+activated and (unless no allow-list
-// is configured) be included in the plugin_set config. Non-plugin skills
-// pass through. In this Go host every subprocess plugin registered in the
-// star registry is activated (subprocess_bridge registers Activated: true),
-// so activation == registry presence.
+// filterSkillsForCurrentConfig mirrors Python's astr_main_agent._filter_skills_for_current_config: plugin-sourced skills require their plugin to be registered+activated and (unless no allow-list is configured) be included in the plugin_set config. Non-plugin skills pass through. In this Go host every subprocess plugin registered in the star registry is activated (subprocess_bridge registers Activated: true), so activation == registry presence.
 func filterSkillsForCurrentConfig(list []*skills.SkillInfo, config map[string]interface{}) []*skills.SkillInfo {
 	if len(list) == 0 {
 		return list
@@ -2576,19 +2380,13 @@ func filterSkillsForCurrentConfig(list []*skills.SkillInfo, config map[string]in
 	return filtered
 }
 
-// activePluginIDs snapshots the activated plugin ids (subprocess plugin
-// registry; mirrors iterating star_registry for plugin.activated). The
-// package-level indirection keeps filterSkillsForCurrentConfig testable
-// without a full ProcessStage.
+// activePluginIDs snapshots the activated plugin ids (subprocess plugin registry; mirrors iterating star_registry for plugin.activated). The package-level indirection keeps filterSkillsForCurrentConfig testable without a full ProcessStage.
 var activePluginIDs = func() map[string]bool {
-	// Default no-op: without a wired snapshot no plugin id is known, so
-	// plugin-sourced skills would be dropped. Pipeline initialization always
-	// wires this (see SetActivePluginIDsProvider).
+	// Default no-op: without a wired snapshot no plugin id is known, so plugin-sourced skills would be dropped. Pipeline initialization always wires this (see SetActivePluginIDsProvider).
 	return nil
 }
 
-// SetActivePluginIDsProvider wires the plugin-activation snapshot used by
-// filterSkillsForCurrentConfig. Called by ProcessStage.Initialize.
+// SetActivePluginIDsProvider wires the plugin-activation snapshot used by filterSkillsForCurrentConfig. Called by ProcessStage.Initialize.
 func SetActivePluginIDsProvider(fn func() map[string]bool) {
 	if fn == nil {
 		return
@@ -2596,8 +2394,7 @@ func SetActivePluginIDsProvider(fn func() map[string]bool) {
 	activePluginIDs = fn
 }
 
-// buildToolCallsMessage converts LLMResponse tool calls into the OpenAI
-// assistant message tool_calls structure.
+// buildToolCallsMessage converts LLMResponse tool calls into the OpenAI assistant message tool_calls structure.
 func buildToolCallsMessage(resp *provider.LLMResponse) []map[string]interface{} {
 	result := []map[string]interface{}{}
 	for i, name := range resp.ToolsCallName {
@@ -2622,17 +2419,12 @@ func buildToolCallsMessage(resp *provider.LLMResponse) []map[string]interface{} 
 	return result
 }
 
-// dispatchSubprocessHooks runs every loaded subprocess plugin's hooks whose
-// Event matches the given event name (payload-less). These are
-// pipeline-adjacent events (on_message, on_llm_response, on_after_message_sent,
-// on_waiting_llm_request, on_tool_call) that are not star filter handlers.
+// dispatchSubprocessHooks runs every loaded subprocess plugin's hooks whose Event matches the given event name (payload-less). These are pipeline-adjacent events (on_message, on_llm_response, on_after_message_sent, on_waiting_llm_request, on_tool_call) that are not star filter handlers.
 func dispatchSubprocessHooks(sub *plugin.SubprocessManager, event *core.Event, hookEvent string) {
 	dispatchSubprocessHooksPayload(sub, event, hookEvent, nil)
 }
 
-// dispatchBridgeHooks pushes serialized events to plugins that registered a
-// bridge hook (botpy/telegram compat layers). The registry is empty unless a
-// plugin opted in, so the common path is a single nil-check return.
+// dispatchBridgeHooks pushes serialized events to plugins that registered a bridge hook (botpy/telegram compat layers). The registry is empty unless a plugin opted in, so the common path is a single nil-check return.
 func dispatchBridgeHooks(sub *plugin.SubprocessManager, event *core.Event) {
 	if sub == nil {
 		return
@@ -2658,10 +2450,7 @@ func dispatchBridgeHooks(sub *plugin.SubprocessManager, event *core.Event) {
 	}
 }
 
-// dispatchSubprocessHooksPayload is dispatchSubprocessHooks with a JSON payload
-// for payload-carrying events (on_llm_response → sdk.LLMResponse,
-// on_using_llm_tool/on_llm_tool_respond → sdk.ToolCall, on_plugin_error →
-// sdk.PluginError).
+// dispatchSubprocessHooksPayload is dispatchSubprocessHooks with a JSON payload for payload-carrying events (on_llm_response → sdk.LLMResponse, on_using_llm_tool/on_llm_tool_respond → sdk.ToolCall, on_plugin_error → sdk.PluginError).
 func dispatchSubprocessHooksPayload(sub *plugin.SubprocessManager, event *core.Event, hookEvent string, payload any) {
 	if sub == nil {
 		return
@@ -2690,9 +2479,7 @@ func dispatchSubprocessHooksPayload(sub *plugin.SubprocessManager, event *core.E
 	}
 }
 
-// applyLLMRequestHooks runs every loaded subprocess plugin's on_llm_request
-// hooks, letting them modify the system prompt, the user prompt, or stop the
-// LLM call.
+// applyLLMRequestHooks runs every loaded subprocess plugin's on_llm_request hooks, letting them modify the system prompt, the user prompt, or stop the LLM call.
 func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, userPrompt string) (string, string, bool, error) {
 	if s.subPlugins == nil {
 		return systemPrompt, userPrompt, false, nil
@@ -2706,8 +2493,7 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 			if h.Event != "on_llm_request" {
 				continue
 			}
-			// on_llm_request 是被动广播，不计入活动时间（但计入进行中 RPC，
-			// 防止执行中被闲置清扫回收）。
+			// on_llm_request 是被动广播，不计入活动时间（但计入进行中 RPC， 防止执行中被闲置清扫回收）。
 			defer inst.RPCGuardPassive()()
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 			sp, up, stop, res, err := inst.Client.HandleLLMRequest(rpcCtx, h.Name, sdkEvent, systemPrompt, userPrompt)
@@ -2729,22 +2515,15 @@ func (s *ProcessStage) applyLLMRequestHooks(event *core.Event, systemPrompt, use
 	return systemPrompt, userPrompt, false, nil
 }
 
-// toolsRefreshTTL 是插件工具列表 ListTools RPC 的缓存时长：TTL 内跳过重复
-// 刷新，避免每次 LLM 调用都对每个插件同步发起一次 RPC。
+// toolsRefreshTTL 是插件工具列表 ListTools RPC 的缓存时长：TTL 内跳过重复 刷新，避免每次 LLM 调用都对每个插件同步发起一次 RPC。
 const toolsRefreshTTL = 5 * time.Minute
 
-// collectPluginTools returns the OpenAI tool schemas contributed by all loaded
-// subprocess plugins (each plugin's registered LLM function tools).
+// collectPluginTools returns the OpenAI tool schemas contributed by all loaded subprocess plugins (each plugin's registered LLM function tools).
 func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 	if s.subPlugins == nil {
 		return nil
 	}
-	// 先刷新运行中插件的实时工具列表（插件工具在实例化阶段注册，晚于
-	// Register 快照；RefreshTools 成功后回写管理器工具注册表）。TTL 内已
-	// 刷新过的插件跳过，避免每次 LLM 调用都同步发起 ListTools RPC。TTL
-	// 过期时先用旧快照（AllPluginTools 兜底），后台异步刷新，下次请求生效
-	// ——同步刷新会阻塞 LLM 热路径最长 30s/插件（插件假死/被调试器暂停时
-	// 用户消息长时间无响应）。
+	// 先刷新运行中插件的实时工具列表（插件工具在实例化阶段注册，晚于 Register 快照；RefreshTools 成功后回写管理器工具注册表）。TTL 内已 刷新过的插件跳过，避免每次 LLM 调用都同步发起 ListTools RPC。TTL 过期时先用旧快照（AllPluginTools 兜底），后台异步刷新，下次请求生效 ——同步刷新会阻塞 LLM 热路径最长 30s/插件（插件假死/被调试器暂停时 用户消息长时间无响应）。
 	for _, inst := range s.subPlugins.List() {
 		if inst.Meta == nil {
 			continue
@@ -2754,8 +2533,7 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 		}
 		go inst.RefreshTools(context.Background())
 	}
-	// 注入全部已注册工具（含闲置休眠插件：其工具保留在注册表中，LLM 调用
-	// 时按名唤醒——避免休眠导致 LLM 工具集收缩）。
+	// 注入全部已注册工具（含闲置休眠插件：其工具保留在注册表中，LLM 调用 时按名唤醒——避免休眠导致 LLM 工具集收缩）。
 	seen := make(map[string]bool, len(s.subPlugins.List()))
 	var out []map[string]interface{}
 	for _, e := range s.subPlugins.AllPluginTools() {
@@ -2784,8 +2562,39 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 	return out
 }
 
-// executePluginTool dispatches a tool call to the subprocess plugin that
-// registered a tool with the given name. Returns (result, handled).
+// executePluginTool dispatches a tool call to the subprocess plugin that registered a tool with the given name. Returns (result, handled). wakeMainAgentForBackgroundResult 后台任务完成后唤醒主 Agent：合成一条 proactive 事件（CallLLM=true）经 eventBus 重入管线，对齐 Python _wake_main_agent_for_background_result —— LLM 拿到任务结果后自主决定是否 联系用户，回复经 RespondStage 投递回原会话。
+func (s *ProcessStage) wakeMainAgentForBackgroundResult(event *core.Event, taskID, toolName, resultText string, toolArgs map[string]interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("background task wake panic: %v", r)
+		}
+	}()
+	if s.eventBus == nil {
+		logger.Warn("后台任务 %s（%s）完成但 eventBus 不可用，结果丢弃: %s", taskID, toolName, truncateRunes(resultText, 200))
+		return
+	}
+	argsJSON, _ := json.Marshal(toolArgs)
+	prompt := fmt.Sprintf(
+		"[后台任务完成通知]\n后台任务已完成执行，结果如下。\n- task_id: %s\n- tool: %s\n- 参数: %s\n- 结果:\n%s\n\n请基于以上结果继续处理：如需告知用户请直接生成回复内容；若无需联系用户，请回复空内容。",
+		taskID, toolName, string(argsJSON), resultText,
+	)
+	evt := &core.Event{
+		Type:              core.EventMessage,
+		Source:            event.Source,
+		Message:           &message.MessageChain{Chain: []message.Component{&message.Plain{Text: prompt}}},
+		MessageStr:        prompt,
+		PlainText:         prompt,
+		Timestamp:         time.Now(),
+		Metadata:          map[string]interface{}{"proactive": true, "background_task_result": true},
+		IsAtOrWakeCommand: true,
+		CallLLM:           true,
+	}
+	logger.Info("后台任务 %s（%s）完成，唤醒主 Agent", taskID, toolName)
+	if err := s.eventBus.Publish(evt); err != nil {
+		logger.Warn("后台任务 %s 唤醒事件发布失败: %v", taskID, err)
+	}
+}
+
 func (s *ProcessStage) executePluginTool(event *core.Event, name string, args map[string]interface{}) (string, bool) {
 	if s.subPlugins == nil {
 		return "", false
@@ -2846,9 +2655,8 @@ func (s *ProcessStage) dispatchPluginTool(inst *plugin.PluginInstance, t *sdkv1.
 	return text, true
 }
 
-// collectTools builds the OpenAI tool schema for all active tools
-// (built-in tools + enabled MCP servers + Computer Use local tools).
-func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]interface{} {
+// collectTools builds the OpenAI tool schema for all active tools (built-in tools + enabled MCP servers + Computer Use local tools).
+func (s *ProcessStage) collectTools(computerUseRuntime, umo string) []map[string]interface{} {
 	tools := []map[string]interface{}{}
 
 	// Built-in tools with real Go executors
@@ -2858,7 +2666,8 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	if computerUseRuntime == "local" {
 		tools = append(tools, collectLocalTools()...)
 	} else if computerUseRuntime == "sandbox" {
-		tools = append(tools, collectSandboxTools()...)
+		browserOK, neoOK := s.neoToolAvailability(umo)
+		tools = append(tools, collectSandboxTools(browserOK, neoOK)...)
 	}
 
 	// Proactive capability: future_task tool.
@@ -2866,8 +2675,7 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 		tools = append(tools, futureTaskToolSchema())
 	}
 
-	// MCP server tools (enabled servers from data/mcp_server.json). Loading is
-	// async so a slow MCP server never blocks the LLM call.
+	// MCP server tools (enabled servers from data/mcp_server.json). Loading is async so a slow MCP server never blocks the LLM call.
 	s.ensureMCPTools()
 	tools = append(tools, s.mcpSchemasSnapshot()...)
 	// Subprocess plugin LLM function tools.
@@ -2878,8 +2686,7 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 		tools = append(tools, subAgentToolSchemas(s.subAgents)...)
 	}
 
-	// Web search + extract tools — injected only when the matching provider is
-	// enabled AND its API key is configured (per provider_settings).
+	// Web search + extract tools — injected only when the matching provider is enabled AND its API key is configured (per provider_settings).
 	provider, webOn := webSearchProviderInfo(s.config)
 	if webOn {
 		switch provider {
@@ -2907,11 +2714,13 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 			if len(exaKeys(s.config)) > 0 {
 				tools = append(tools, exaSearchToolSchema(), exaContentsToolSchema())
 			}
+		case "anysearch":
+			// 对齐 Python v4.28.0 #9767 AnySearch：支持匿名调用，key 列表 为空时也注入工具（执行时会发一次无 Authorization 的请求）。
+			tools = append(tools, anySearchToolSchema())
 		}
 	}
 
-	// send_message_to_user: proactive messaging (always available when a
-	// platform manager exists).
+	// send_message_to_user: proactive messaging (always available when a platform manager exists).
 	if s.platformMgr != nil {
 		tools = append(tools, sendMessageToolSchema())
 	}
@@ -2928,17 +2737,14 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	return tools
 }
 
-// collectLightTools returns the tool schemas with empty parameters (only name +
-// description). Used by skills_like mode to reduce token usage; the arguments
-// are filled in by a follow-up re-query when the LLM chooses a tool.
-func (s *ProcessStage) collectLightTools(computerUseRuntime string) []map[string]interface{} {
-	all := s.collectTools(computerUseRuntime)
+// collectLightTools returns the tool schemas with empty parameters (only name + description). Used by skills_like mode to reduce token usage; the arguments are filled in by a follow-up re-query when the LLM chooses a tool.
+func (s *ProcessStage) collectLightTools(computerUseRuntime, umo string) []map[string]interface{} {
+	all := s.collectTools(computerUseRuntime, umo)
 	for i, tool := range all {
 		if _, ok := tool["function"].(map[string]interface{}); !ok {
 			continue
 		}
-		// Deep-copy the schema before rewriting parameters so MCP schemas
-		// shared with the cached s.mcpSchemas map are not polluted.
+		// Deep-copy the schema before rewriting parameters so MCP schemas shared with the cached s.mcpSchemas map are not polluted.
 		cloned := deepCopyInterface(tool).(map[string]interface{})
 		cfn, _ := cloned["function"].(map[string]interface{})
 		cfn["parameters"] = map[string]interface{}{
@@ -2950,8 +2756,7 @@ func (s *ProcessStage) collectLightTools(computerUseRuntime string) []map[string
 	return all
 }
 
-// deepCopyInterface returns a deep copy of a JSON-like value (map, slice or
-// scalar) so callers can mutate a schema without affecting the original.
+// deepCopyInterface returns a deep copy of a JSON-like value (map, slice or scalar) so callers can mutate a schema without affecting the original.
 func deepCopyInterface(v interface{}) interface{} {
 	switch t := v.(type) {
 	case map[string]interface{}:
@@ -2977,10 +2782,9 @@ func deepCopyInterface(v interface{}) interface{} {
 	}
 }
 
-// collectParamToolsFor returns the full-parameters schemas of the named tools
-// (description kept minimal). Used by the skills_like re-query.
-func (s *ProcessStage) collectParamToolsFor(computerUseRuntime string, names []string) []map[string]interface{} {
-	all := s.collectTools(computerUseRuntime)
+// collectParamToolsFor returns the full-parameters schemas of the named tools (description kept minimal). Used by the skills_like re-query.
+func (s *ProcessStage) collectParamToolsFor(computerUseRuntime, umo string, names []string) []map[string]interface{} {
+	all := s.collectTools(computerUseRuntime, umo)
 	want := make(map[string]bool, len(names))
 	for _, n := range names {
 		want[n] = true
@@ -3000,15 +2804,9 @@ func (s *ProcessStage) collectParamToolsFor(computerUseRuntime string, names []s
 	return out
 }
 
-// requeryToolArgs re-queries the LLM with the chosen tools' full parameter
-// schemas so it produces concrete arguments (skills_like mode). Unlike the
-// Python reference, the re-query context is minimal (original prompt + an
-// explicit instruction) instead of the full conversation history, which avoids
-// the model re-deciding the tool selection and saves tokens. Returns ok=false
-// when the re-query fails or returns no tool call, in which case the caller
-// keeps the original response.
-func (s *ProcessStage) requeryToolArgs(ctx context.Context, chatInst provider.ChatProvider, req *provider.ProviderRequest, resp *provider.LLMResponse, computerUseRuntime string) (*provider.LLMResponse, bool) {
-	paramTools := s.collectParamToolsFor(computerUseRuntime, resp.ToolsCallName)
+// requeryToolArgs re-queries the LLM with the chosen tools' full parameter schemas so it produces concrete arguments (skills_like mode). Unlike the Python reference, the re-query context is minimal (original prompt + an explicit instruction) instead of the full conversation history, which avoids the model re-deciding the tool selection and saves tokens. Returns ok=false when the re-query fails or returns no tool call, in which case the caller keeps the original response.
+func (s *ProcessStage) requeryToolArgs(ctx context.Context, chatInst provider.ChatProvider, req *provider.ProviderRequest, resp *provider.LLMResponse, computerUseRuntime, umo string) (*provider.LLMResponse, bool) {
+	paramTools := s.collectParamToolsFor(computerUseRuntime, umo, resp.ToolsCallName)
 	if len(paramTools) == 0 {
 		return resp, false
 	}
@@ -3037,12 +2835,7 @@ func (s *ProcessStage) requeryToolArgs(ctx context.Context, chatInst provider.Ch
 	return requery, true
 }
 
-// loadMCPTools (re)loads enabled MCP servers from data/mcp_server.json and
-// caches their tool schemas under "<sanitized_server>.<tool_name>".
-// ensureMCPTools marks the schemas as loaded once (under the lock, avoiding a
-// TOCTOU double load when dashboard chat and the event bus pipeline run
-// concurrently) and kicks off the actual connection work in a goroutine so a
-// slow MCP server never blocks the LLM call.
+// loadMCPTools (re)loads enabled MCP servers from data/mcp_server.json and caches their tool schemas under "<sanitized_server>.<tool_name>". ensureMCPTools marks the schemas as loaded once (under the lock, avoiding a TOCTOU double load when dashboard chat and the event bus pipeline run concurrently) and kicks off the actual connection work in a goroutine so a slow MCP server never blocks the LLM call.
 func (s *ProcessStage) ensureMCPTools() {
 	s.mcpMu.Lock()
 	if s.mcpLoaded {
@@ -3054,9 +2847,7 @@ func (s *ProcessStage) ensureMCPTools() {
 	go s.loadMCPTools()
 }
 
-// mcpSchemasSnapshot returns a shallow copy of the MCP tool schema map so the
-// caller can iterate without holding the lock while loadMCPTools may be
-// replacing the map.
+// mcpSchemasSnapshot returns a shallow copy of the MCP tool schema map so the caller can iterate without holding the lock while loadMCPTools may be replacing the map.
 func (s *ProcessStage) mcpSchemasSnapshot() []map[string]interface{} {
 	s.mcpMu.Lock()
 	defer s.mcpMu.Unlock()
@@ -3067,10 +2858,7 @@ func (s *ProcessStage) mcpSchemasSnapshot() []map[string]interface{} {
 	return schemas
 }
 
-// loadMCPTools connects to enabled MCP servers and caches their tools. It runs
-// in a goroutine (see ensureMCPTools) so connecting to slow servers does not
-// stall the pipeline. 连接过程在锁外进行（无锁构建局部 clients/schemas），
-// 最后一次性持锁替换，慢服务器不会阻塞 mcpMu 的并发读。
+// loadMCPTools connects to enabled MCP servers and caches their tools. It runs in a goroutine (see ensureMCPTools) so connecting to slow servers does not stall the pipeline. 连接过程在锁外进行（无锁构建局部 clients/schemas）， 最后一次性持锁替换，慢服务器不会阻塞 mcpMu 的并发读。
 func (s *ProcessStage) loadMCPTools() {
 	data, err := os.ReadFile("data/mcp_server.json")
 	if err != nil {
@@ -3102,8 +2890,7 @@ func (s *ProcessStage) loadMCPTools() {
 		}
 		safeName := sanitizeToolName(name)
 		client := agent.NewMCPClient(name, cfg)
-		// Use a fresh context for the connection; do NOT cancel it afterwards,
-		// because the underlying SSE transport may share it for its read loop.
+		// Use a fresh context for the connection; do NOT cancel it afterwards, because the underlying SSE transport may share it for its read loop.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err := client.Connect(ctx)
 		cancel()
@@ -3138,9 +2925,7 @@ func (s *ProcessStage) loadMCPTools() {
 	s.mcpMu.Unlock()
 }
 
-// executeMCPTool dispatches a tool call to the matching MCP server. The tool
-// name format is "<sanitized_server>.<tool_name>". Returns ("", false) when
-// the name is not an MCP tool.
+// executeMCPTool dispatches a tool call to the matching MCP server. The tool name format is "<sanitized_server>.<tool_name>". Returns ("", false) when the name is not an MCP tool.
 func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map[string]interface{}) (string, bool) {
 	dot := strings.IndexByte(name, '.')
 	if dot <= 0 || dot == len(name)-1 {
@@ -3156,18 +2941,13 @@ func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map
 		return fmt.Sprintf("MCP 工具 %s 执行失败: 服务器 %q 未连接", name, serverName), true
 	}
 	logger.Debug("executeMCPTool: server=%s tool=%s", serverName, toolName)
-	// Bound the tool call: the SSE transport waits for a response event. A
-	// short first-attempt timeout lets a stale connection fail fast so the
-	// reconnect path (below) kicks in instead of hanging the pipeline.
+	// Bound the tool call: the SSE transport waits for a response event. A short first-attempt timeout lets a stale connection fail fast so the reconnect path (below) kicks in instead of hanging the pipeline.
 	conn := client.Conn()
 	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	result, err := client.CallTool(callCtx, toolName, args)
 	if err != nil {
-		// A transport failure (e.g. SSE connection lost) can leave the client
-		// unable to receive responses; reconnect once and retry with a fresh
-		// timeout. Pass the connection the failed call used so a concurrent
-		// reconnect that already rebuilt the connection is not torn down again.
+		// A transport failure (e.g. SSE connection lost) can leave the client unable to receive responses; reconnect once and retry with a fresh timeout. Pass the connection the failed call used so a concurrent reconnect that already rebuilt the connection is not torn down again.
 		logger.I18nWarn("MCP 工具 %s 调用失败 (%v)，正在重连并重试…", name, err)
 		reconnCtx, reconnCancel := context.WithTimeout(ctx, 30*time.Second)
 		rc := client.Reconnect(reconnCtx, conn)
@@ -3197,8 +2977,7 @@ func (s *ProcessStage) executeMCPTool(ctx context.Context, name string, args map
 	return text, true
 }
 
-// mcpContentText extracts the textual content from an MCP tool call result,
-// joining text-type blocks with newlines.
+// mcpContentText extracts the textual content from an MCP tool call result, joining text-type blocks with newlines.
 func mcpContentText(content []map[string]interface{}) string {
 	var parts []string
 	for _, block := range content {
@@ -3217,8 +2996,7 @@ func mcpContentText(content []map[string]interface{}) string {
 	return strings.Join(parts, "\n")
 }
 
-// sanitizeToolName replaces characters invalid for OpenAI tool names
-// (^[a-zA-Z0-9_-]+$) with underscores.
+// sanitizeToolName replaces characters invalid for OpenAI tool names (^[a-zA-Z0-9_-]+$) with underscores.
 func sanitizeToolName(name string) string {
 	var sb strings.Builder
 	for _, r := range name {
@@ -3232,9 +3010,7 @@ func sanitizeToolName(name string) string {
 	return sb.String()
 }
 
-// builtinTools returns the OpenAI tool schemas for built-in tools that have
-// real Go executors in executeTool. These are always available regardless of
-// the Computer Use runtime.
+// builtinTools returns the OpenAI tool schemas for built-in tools that have real Go executors in executeTool. These are always available regardless of the Computer Use runtime.
 func builtinTools() []map[string]interface{} {
 	return []map[string]interface{}{
 		{
@@ -3277,8 +3053,7 @@ func builtinTools() []map[string]interface{} {
 	}
 }
 
-// executeBuiltinTool runs a built-in tool by name and returns the result text.
-// Returns (result, handled); handled=false means the name is not a built-in.
+// executeBuiltinTool runs a built-in tool by name and returns the result text. Returns (result, handled); handled=false means the name is not a built-in.
 func executeBuiltinTool(name string, args map[string]interface{}) (string, bool) {
 	switch name {
 	case "get_current_time":
@@ -3289,8 +3064,7 @@ func executeBuiltinTool(name string, args map[string]interface{}) (string, bool)
 	return "", false
 }
 
-// executeGetCurrentTime formats the current time, optionally in a given IANA
-// timezone.
+// executeGetCurrentTime formats the current time, optionally in a given IANA timezone.
 func executeGetCurrentTime(timezone string) string {
 	now := time.Now()
 	loc, err := time.LoadLocation(timezone)
@@ -3300,28 +3074,22 @@ func executeGetCurrentTime(timezone string) string {
 	return now.In(loc).Format("2006-01-02 15:04:05") + " " + loc.String()
 }
 
-// webFetchMaxBytes caps how much of a fetched response body is read so a
-// malicious server cannot dump an unbounded payload into the model context.
+// webFetchMaxBytes caps how much of a fetched response body is read so a malicious server cannot dump an unbounded payload into the model context.
 const webFetchMaxBytes = 4 << 20
 
 // maxRedirects bounds how many redirects web_fetch follows before giving up.
 const maxRedirects = 10
 
 var (
-	// cloudMetadataAddr is the well-known AWS/GCP/Azure metadata endpoint that
-	// must never be reachable from the fetcher.
+	// cloudMetadataAddr is the well-known AWS/GCP/Azure metadata endpoint that must never be reachable from the fetcher.
 	cloudMetadataAddr = netip.MustParseAddr("169.254.169.254")
-	// blockedNetPrefixes are extra reserved ranges (e.g. CGNAT space used by
-	// some cloud metadata endpoints) rejected on top of the built-in netip
-	// classifications.
+	// blockedNetPrefixes are extra reserved ranges (e.g. CGNAT space used by some cloud metadata endpoints) rejected on top of the built-in netip classifications.
 	blockedNetPrefixes = []netip.Prefix{
 		netip.MustParsePrefix("100.64.0.0/10"),
 	}
 )
 
-// validateWebFetchHost resolves host and rejects loopback, private, link-local,
-// multicast, CGNAT and cloud-metadata addresses. It fails closed when the host
-// cannot be resolved at all.
+// validateWebFetchHost resolves host and rejects loopback, private, link-local, multicast, CGNAT and cloud-metadata addresses. It fails closed when the host cannot be resolved at all.
 func validateWebFetchHost(host string) error {
 	if host == "" {
 		return fmt.Errorf("url 缺少主机名")
@@ -3364,9 +3132,7 @@ func validateWebFetchHost(host string) error {
 	return nil
 }
 
-// validateWebFetchURL parses rawURL and verifies it is an http(s) URL whose
-// host is safe to fetch. It returns a normalized URL (fragment stripped) for
-// the actual request.
+// validateWebFetchURL parses rawURL and verifies it is an http(s) URL whose host is safe to fetch. It returns a normalized URL (fragment stripped) for the actual request.
 func validateWebFetchURL(rawURL string) (string, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -3382,8 +3148,7 @@ func validateWebFetchURL(rawURL string) (string, error) {
 	return u.String(), nil
 }
 
-// webFetchRedirectGuard re-validates the destination of every redirect hop so
-// a chain cannot bounce into a blocked address after the initial check.
+// webFetchRedirectGuard re-validates the destination of every redirect hop so a chain cannot bounce into a blocked address after the initial check.
 func webFetchRedirectGuard(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
 		return fmt.Errorf("重定向次数过多")
@@ -3397,9 +3162,7 @@ func webFetchRedirectGuard(req *http.Request, via []*http.Request) error {
 	return validateWebFetchHost(req.URL.Hostname())
 }
 
-// allowedWebFetchContentType reports whether a response Content-Type is safe to
-// surface to the model. Only textual payloads are allowed; binary media
-// (images, archives, PDFs, ...) is rejected.
+// allowedWebFetchContentType reports whether a response Content-Type is safe to surface to the model. Only textual payloads are allowed; binary media (images, archives, PDFs, ...) is rejected.
 func allowedWebFetchContentType(ct string) bool {
 	ct = strings.ToLower(strings.TrimSpace(ct))
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
@@ -3421,8 +3184,7 @@ func allowedWebFetchContentType(ct string) bool {
 	}
 }
 
-// executeWebFetch fetches a URL and converts its content to plain text,
-// truncated to maxLength characters.
+// executeWebFetch fetches a URL and converts its content to plain text, truncated to maxLength characters.
 func executeWebFetch(rawURL string, maxLength int) string {
 	if strings.TrimSpace(rawURL) == "" {
 		return "web_fetch 错误: 缺少 url 参数"
@@ -3439,8 +3201,7 @@ func executeWebFetch(rawURL string, maxLength int) string {
 		return "web_fetch 错误: " + err.Error()
 	}
 
-	// Dial 时校验解析后的真实 IP：validateWebFetchHost 的 LookupIP 与真正
-	// 建连之间可能发生 DNS rebinding，连接时刻的校验封死该 TOCTOU 窗口。
+	// Dial 时校验解析后的真实 IP：validateWebFetchHost 的 LookupIP 与真正 建连之间可能发生 DNS rebinding，连接时刻的校验封死该 TOCTOU 窗口。
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
 		Control: func(network, address string, _ syscall.RawConn) error {
@@ -3503,8 +3264,7 @@ func executeWebFetch(rawURL string, maxLength int) string {
 	return text
 }
 
-// htmlToText strips HTML tags/entities, collapsing runs of whitespace into a
-// single space.
+// htmlToText strips HTML tags/entities, collapsing runs of whitespace into a single space.
 func htmlToText(body []byte) string {
 	// Drop script/style blocks first so their content is not surfaced.
 	s := string(body)
@@ -3515,47 +3275,50 @@ func htmlToText(body []byte) string {
 	return s
 }
 
-// executeTool runs a tool call and returns the result text.
-// Dispatches to built-in tools, MCP servers, and the Computer Use local or
-// sandbox executors.
-// coreBuiltinToolSet lists the LLM tools implemented by the host itself
-// (built-ins, Computer Use host tools, web-search/KB/message tools and the
-// proactive future_task). tool_permissions only governs non-builtin tools —
-// the dashboard exposes built-ins as readonly — mirroring Python, where the
-// permission guard is applied to function tools registered by MCP servers and
-// plugins, never to the core's own executors.
+// executeTool runs a tool call and returns the result text. Dispatches to built-in tools, MCP servers, and the Computer Use local or sandbox executors. coreBuiltinToolSet lists the LLM tools implemented by the host itself (built-ins, Computer Use host tools, web-search/KB/message tools and the proactive future_task). tool_permissions only governs non-builtin tools — the dashboard exposes built-ins as readonly — mirroring Python, where the permission guard is applied to function tools registered by MCP servers and plugins, never to the core's own executors.
 var coreBuiltinToolSet = map[string]bool{
-	"get_current_time":           true,
-	"web_fetch":                  true,
-	"astrbot_execute_shell":      true,
-	"astrbot_shell_session":      true,
-	"astrbot_execute_python":     true,
-	"astrbot_file_read_tool":     true,
-	"astrbot_file_write_tool":    true,
-	"astrbot_file_edit_tool":     true,
-	"astrbot_grep_tool":          true,
-	"astrbot_upload_file":        true,
-	"astrbot_download_file":      true,
-	"web_search_tavily":          true,
-	"web_search_bocha":           true,
-	"web_search_brave":           true,
-	"web_search_firecrawl":       true,
-	"web_search_baidu":           true,
-	"web_search_exa":             true,
-	"tavily_extract_web_page":    true,
-	"firecrawl_extract_web_page": true,
-	"exa_get_contents":           true,
-	"send_message_to_user":       true,
-	"get_group_message_history":  true,
-	"astr_kb_search":             true,
-	"future_task":                true,
+	"get_current_time":                 true,
+	"web_fetch":                        true,
+	"astrbot_execute_shell":            true,
+	"astrbot_shell_session":            true,
+	"astrbot_execute_python":           true,
+	"astrbot_file_read_tool":           true,
+	"astrbot_file_write_tool":          true,
+	"astrbot_file_edit_tool":           true,
+	"astrbot_grep_tool":                true,
+	"astrbot_upload_file":              true,
+	"astrbot_download_file":            true,
+	"astrbot_execute_browser":          true,
+	"astrbot_execute_browser_batch":    true,
+	"astrbot_run_browser_skill":        true,
+	"astrbot_get_execution_history":    true,
+	"astrbot_annotate_execution":       true,
+	"astrbot_create_skill_payload":     true,
+	"astrbot_get_skill_payload":        true,
+	"astrbot_create_skill_candidate":   true,
+	"astrbot_list_skill_candidates":    true,
+	"astrbot_evaluate_skill_candidate": true,
+	"astrbot_promote_skill_candidate":  true,
+	"astrbot_list_skill_releases":      true,
+	"astrbot_rollback_skill_release":   true,
+	"astrbot_sync_skill_release":       true,
+	"web_search_tavily":                true,
+	"web_search_bocha":                 true,
+	"web_search_brave":                 true,
+	"web_search_firecrawl":             true,
+	"web_search_baidu":                 true,
+	"web_search_exa":                   true,
+	"web_search_anysearch":             true,
+	"tavily_extract_web_page":          true,
+	"firecrawl_extract_web_page":       true,
+	"exa_get_contents":                 true,
+	"send_message_to_user":             true,
+	"get_group_message_history":        true,
+	"astr_kb_search":                   true,
+	"future_task":                      true,
 }
 
-// parseToolPermissions reads config["tool_permissions"] into a tool name ->
-// permission level map. Both the dashboard shape
-// {"<tool>": {"permission": "admin"|"member"}} and a bare "<tool>": "admin"
-// value are accepted (the python-sdk guard parses both shapes too); unknown
-// levels are ignored so a malformed entry never locks a tool out.
+// parseToolPermissions reads config["tool_permissions"] into a tool name -> permission level map. Both the dashboard shape {"<tool>": {"permission": "admin"|"member"}} and a bare "<tool>": "admin" value are accepted (the python-sdk guard parses both shapes too); unknown levels are ignored so a malformed entry never locks a tool out.
 func parseToolPermissions(config map[string]interface{}) map[string]string {
 	raw, _ := config["tool_permissions"].(map[string]interface{})
 	if len(raw) == 0 {
@@ -3580,13 +3343,7 @@ func parseToolPermissions(config map[string]interface{}) map[string]string {
 	return perms
 }
 
-// adminOnlyTools returns the admin-only tool names configured in
-// tool_permissions. The map is parsed once from the stage's config snapshot
-// and cached: s.config is the deep copy taken at Initialize (config.Get/All
-// already return copies, so the read is race-free) and the whole pipeline is
-// rebuilt whenever the dashboard saves the config, so the cache never goes
-// stale within a stage lifetime — repeated tool calls in one request (or
-// across requests served by this stage) do not re-parse the config.
+// adminOnlyTools returns the admin-only tool names configured in tool_permissions. The map is parsed once from the stage's config snapshot and cached: s.config is the deep copy taken at Initialize (config.Get/All already return copies, so the read is race-free) and the whole pipeline is rebuilt whenever the dashboard saves the config, so the cache never goes stale within a stage lifetime — repeated tool calls in one request (or across requests served by this stage) do not re-parse the config.
 func (s *ProcessStage) adminOnlyTools() map[string]string {
 	s.toolPermsMu.Lock()
 	defer s.toolPermsMu.Unlock()
@@ -3596,12 +3353,7 @@ func (s *ProcessStage) adminOnlyTools() map[string]string {
 	return s.toolPerms
 }
 
-// toolPermissionDenied reports whether the event's role is not allowed to run
-// the named tool under config tool_permissions (the dashboard tools panel). A
-// tool configured as "admin" is refused for member events; builtin tools and
-// the host-generated transfer_to_* subagent handoffs always pass. This is the
-// host-side closure of the python-sdk permission guard, which has no host RPC
-// to consult (review 1.2-6): MCP and plugin tools are both governed here.
+// toolPermissionDenied reports whether the event's role is not allowed to run the named tool under config tool_permissions (the dashboard tools panel). A tool configured as "admin" is refused for member events; builtin tools and the host-generated transfer_to_* subagent handoffs always pass. This is the host-side closure of the python-sdk permission guard, which has no host RPC to consult (review 1.2-6): MCP and plugin tools are both governed here.
 func (s *ProcessStage) toolPermissionDenied(name string, event *core.Event) bool {
 	if event.Role == "admin" {
 		return false
@@ -3612,22 +3364,85 @@ func (s *ProcessStage) toolPermissionDenied(name string, event *core.Event) bool
 	return s.adminOnlyTools()[name] == "admin"
 }
 
+// computerToolAdminSet lists Computer-Use runtime tools gated by provider_settings.computer_use_require_admin (mirrors Python check_admin_permission on shell/python/fs/cua/browser/neo tools).
+var computerToolAdminSet = map[string]bool{
+	"astrbot_execute_shell": true, "astrbot_shell_session": true, "astrbot_execute_python": true,
+	"astrbot_file_read_tool": true, "astrbot_file_write_tool": true, "astrbot_file_edit_tool": true,
+	"astrbot_grep_tool": true, "astrbot_upload_file": true, "astrbot_download_file": true,
+	"astrbot_execute_browser": true, "astrbot_execute_browser_batch": true, "astrbot_run_browser_skill": true,
+	"astrbot_get_execution_history": true, "astrbot_annotate_execution": true,
+	"astrbot_create_skill_payload": true, "astrbot_get_skill_payload": true,
+	"astrbot_create_skill_candidate": true, "astrbot_list_skill_candidates": true,
+	"astrbot_evaluate_skill_candidate": true, "astrbot_promote_skill_candidate": true,
+	"astrbot_list_skill_releases": true, "astrbot_rollback_skill_release": true, "astrbot_sync_skill_release": true,
+}
+
+// toolDisplayName returns the operation label used in the admin-denied message (mirrors Python's per-tool operation strings).
+func toolDisplayName(name string) string {
+	switch name {
+	case "astrbot_execute_shell", "astrbot_shell_session":
+		return "Shell execution"
+	case "astrbot_execute_python":
+		return "Python execution"
+	case "astrbot_upload_file":
+		return "File upload/download"
+	case "astrbot_download_file":
+		return "File upload/download"
+	case "astrbot_execute_browser", "astrbot_execute_browser_batch", "astrbot_run_browser_skill":
+		return "Using browser tools"
+	case "astrbot_get_execution_history", "astrbot_annotate_execution", "astrbot_create_skill_payload",
+		"astrbot_get_skill_payload", "astrbot_create_skill_candidate", "astrbot_list_skill_candidates",
+		"astrbot_evaluate_skill_candidate", "astrbot_promote_skill_candidate", "astrbot_list_skill_releases",
+		"astrbot_rollback_skill_release", "astrbot_sync_skill_release":
+		return "Using skill lifecycle tools"
+	default:
+		return "Filesystem access"
+	}
+}
+
 func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runtime, name string, args map[string]interface{}) string {
 	umo := event.UnifiedMsgOrigin()
 	logger.Debug("executeTool: name=%s args=%v", name, args)
 
-	// Host-side tool permission guard: a tool marked admin-only in
-	// tool_permissions refuses to run for member events. Checked before any
-	// dispatch so neither the executors nor the on_tool_call hooks observe a
-	// denied invocation.
+	// Host-side tool permission guard: a tool marked admin-only in tool_permissions refuses to run for member events. Checked before any dispatch so neither the executors nor the on_tool_call hooks observe a denied invocation.
+	if computerToolAdminSet[name] {
+		if msg := s.computerAdminDenied(event, toolDisplayName(name)); msg != "" {
+			return msg
+		}
+	}
+
 	if s.toolPermissionDenied(name, event) {
 		logger.I18nWarn("工具 %s 需要管理员权限，用户 %s 无权调用", name, event.GetSenderID())
 		return fmt.Sprintf("工具 %s 需要管理员权限，当前用户无权调用", name)
 	}
 
-	// Dispatch registered plugins' on_tool_call / on_using_llm_tool hooks before
-	// executing the tool, stashing the tool name/args on the event metadata for
-	// them to read and carrying a sdk.ToolCall payload.
+	// Background task tools（对齐 Python astr_agent_tool_exec.execute 的 tool.is_background_task 分支）：立即返回任务标识，实际执行放入后台 goroutine（1h 超时）；完成后合成 proactive 事件经 eventBus 重入管线 唤醒主 Agent（_wake_main_agent_for_background_result 语义）。
+	if tool := agent.DefaultFuncTools.GetFunc(name); tool != nil && tool.IsBackgroundTask && tool.Handler != nil {
+		taskID := fmt.Sprintf("bgtask-%d", time.Now().UnixNano())
+		argsCopy := make(map[string]interface{}, len(args))
+		for k, v := range args {
+			argsCopy[k] = v
+		}
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), time.Hour)
+			defer cancel()
+			res, err := tool.Handler(bgCtx, argsCopy)
+			text := ""
+			if err != nil {
+				text = fmt.Sprintf("error: Background task execution failed, internal error: %v", err)
+			} else if s, ok := res.(string); ok {
+				text = s
+			} else if res != nil {
+				if b, jerr := json.Marshal(res); jerr == nil {
+					text = string(b)
+				}
+			}
+			s.wakeMainAgentForBackgroundResult(event, taskID, name, text, argsCopy)
+		}()
+		return fmt.Sprintf("Background task submitted. task_id=%s", taskID)
+	}
+
+	// Dispatch registered plugins' on_tool_call / on_using_llm_tool hooks before executing the tool, stashing the tool name/args on the event metadata for them to read and carrying a sdk.ToolCall payload.
 	if s.subPlugins != nil {
 		if event.Metadata == nil {
 			event.Metadata = make(map[string]interface{})
@@ -3642,14 +3457,16 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 	result := ""
 	handled := false
 	if strings.HasPrefix(name, "transfer_to_") {
-		// Subagent handoff: run the subagent's persona round and return its
-		// reply as the tool result.
+		// Subagent handoff: run the subagent's persona round and return its reply as the tool result.
 		if r, h := s.executeSubAgent(event, name, args); h {
 			result, handled = r, true
 		}
 	}
+	if !handled && runtime == "sandbox" && neoLifecycleHostSet[name] {
+		return s.executeNeoLifecycleTool(ctx, event.UnifiedMsgOrigin(), name, args)
+	}
 	if !handled && runtime == "sandbox" {
-		if r, h := s.executeSandboxTool(ctx, event.UnifiedMsgOrigin(), name, args); h {
+		if r, h := s.executeSandboxTool(ctx, event, name, args); h {
 			result, handled = r, true
 		}
 	}
@@ -3669,12 +3486,7 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		}
 	}
 	if !handled {
-		// Computer Use host tools (shell/python/file/grep) run only on the
-		// "local" runtime. collectTools injects them solely for that runtime,
-		// but OpenAI-compatible providers do not validate tool names, so an
-		// unregistered name could otherwise reach the host executors while
-		// Computer Use is disabled (M-19). The sandbox branch above is gated
-		// the same way.
+		// Computer Use host tools (shell/python/file/grep) run only on the "local" runtime. collectTools injects them solely for that runtime, but OpenAI-compatible providers do not validate tool names, so an unregistered name could otherwise reach the host executors while Computer Use is disabled (M-19). The sandbox branch above is gated the same way.
 		switch name {
 		case "astrbot_execute_shell", "astrbot_shell_session", "astrbot_execute_python",
 			"astrbot_file_read_tool", "astrbot_file_write_tool", "astrbot_file_edit_tool",
@@ -3685,6 +3497,7 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				// 用户 ACL：本地运行时直接操作宿主机，仅白名单用户可调用。
 				result = fmt.Sprintf("工具 %s 执行失败: computer_use 未授权该用户", name)
 			} else {
+				restrictedLocal := s.computerUseRestricted(event)
 				switch name {
 				case "astrbot_execute_shell":
 					result = executeLocalShell(umo, event.GetSenderID(), argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
@@ -3693,28 +3506,32 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				case "astrbot_execute_python":
 					result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
 				case "astrbot_file_read_tool":
-					result = executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0))
+					rdText, rdImg, rdMime := executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0), restrictedLocal)
+					if rdImg != "" {
+						result = s.registerToolImage(event, rdImg, rdMime, name)
+					} else {
+						result = rdText
+					}
 				case "astrbot_file_write_tool":
 					ws := workspaceRoot(umo)
 					before := gitTreeHash(ws)
-					r := executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
+					r := executeFileWrite(argString(args, "path"), argString(args, "content"), umo, restrictedLocal)
 					result = snapshotFileMutation(ws, before, name, r)
 				case "astrbot_file_edit_tool":
 					ws := workspaceRoot(umo)
 					before := gitTreeHash(ws)
-					r := executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
+					r := executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo, restrictedLocal)
 					result = snapshotFileMutation(ws, before, name, r)
 				case "astrbot_grep_tool":
-					result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
+					result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo, restrictedLocal)
 				case "astrbot_upload_file":
-					result = executeLocalUpload(argString(args, "local_path"), umo)
+					result = executeLocalUpload(argString(args, "local_path"), umo, restrictedLocal)
 				case "astrbot_download_file":
-					result = executeLocalDownload(argString(args, "remote_path"), umo)
+					result = executeLocalDownload(argString(args, "remote_path"), umo, restrictedLocal)
 				}
 			}
 		case "future_task":
-			// 存三段式 unified_msg_origin（platform_id:MessageType:session_id），
-			// 保证 WebUI/Python future_task 解析时 message_type 与 session_id 对位。
+			// 存三段式 unified_msg_origin（platform_id:MessageType:session_id）， 保证 WebUI/Python future_task 解析时 message_type 与 session_id 对位。
 			result = executeFutureTask(s.cronMgr, event.PythonUMO(), event.GetSenderID(), args)
 		case "web_search_tavily":
 			result = executeWebSearchTavily(s.config, args)
@@ -3728,6 +3545,8 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 			result = executeWebSearchBaidu(s.config, args)
 		case "web_search_exa":
 			result = executeWebSearchExa(s.config, args)
+		case "web_search_anysearch":
+			result = executeWebSearchAnySearch(s.config, args)
 		case "tavily_extract_web_page":
 			result = executeTavilyExtract(s.config, args)
 		case "firecrawl_extract_web_page":
@@ -3748,9 +3567,7 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 	return result
 }
 
-// addCronTools reports whether the proactive future_task tool should be
-// injected (provider_settings.proactive_capability.add_cron_tools; absent key
-// defaults to true).
+// addCronTools reports whether the proactive future_task tool should be injected (provider_settings.proactive_capability.add_cron_tools; absent key defaults to true).
 func addCronTools(config map[string]interface{}) bool {
 	ps := bindProviderSettings(config)
 	if ps == nil || ps.Proactive.AddCronTools == nil {
@@ -3759,25 +3576,23 @@ func addCronTools(config map[string]interface{}) bool {
 	return *ps.Proactive.AddCronTools
 }
 
-// executeSandboxTool routes computer-use tools into the per-session sandbox
-// runtime. sessionID 是事件的 unified_msg_origin（群/私聊），每个会话独立
-// 沙盒（对齐 Python session_booter 模型），同一会话的沙盒任务天然串行。
-func (s *ProcessStage) executeSandboxTool(ctx context.Context, sessionID, name string, args map[string]interface{}) (string, bool) {
+// executeSandboxTool routes computer-use tools into the per-session sandbox runtime. sessionID 是事件的 unified_msg_origin（群/私聊），每个会话独立 沙盒（对齐 Python session_booter 模型），同一会话的沙盒任务天然串行。
+func (s *ProcessStage) executeSandboxTool(ctx context.Context, event *core.Event, name string, args map[string]interface{}) (string, bool) {
+	sessionID := event.UnifiedMsgOrigin()
 	if s.sandboxMgr == nil {
-		// Only sandbox-only tools are reported as unavailable here; any other
-		// name must fall through to the remaining executors so it is not
-		// swallowed by the missing sandbox.
+		// Only sandbox-only tools are reported as unavailable here; any other name must fall through to the remaining executors so it is not swallowed by the missing sandbox.
 		switch name {
 		case "astrbot_execute_shell", "astrbot_execute_python",
 			"astrbot_file_read_tool", "astrbot_file_write_tool",
 			"astrbot_file_edit_tool", "astrbot_grep_tool",
-			"astrbot_upload_file", "astrbot_download_file":
+			"astrbot_upload_file", "astrbot_download_file",
+			"astrbot_execute_browser", "astrbot_execute_browser_batch", "astrbot_run_browser_skill",
+			"astrbot_get_execution_history", "astrbot_annotate_execution":
 			return "Sandbox manager not configured.", true
 		}
 		return "", false
 	}
-	// Default 300s (aligned with the local shell runtime); the model-supplied
-	// timeout is respected but capped so a single call cannot hang forever.
+	// Default 300s (aligned with the local shell runtime); the model-supplied timeout is respected but capped so a single call cannot hang forever.
 	timeout := argInt(args, "timeout", 0)
 	if timeout <= 0 {
 		timeout = 300
@@ -3802,7 +3617,11 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, sessionID, name s
 		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxFileRead(tctx, s.sandboxMgr, sessionID, argString(args, "path")), true
+		rdText, rdImg, rdMime := sandboxFileRead(tctx, s.sandboxMgr, sessionID, argString(args, "path"), argInt(args, "offset", 0), argInt(args, "limit", 0))
+		if rdImg != "" {
+			return s.registerToolImage(event, rdImg, rdMime, name), true
+		}
+		return rdText, true
 	case "astrbot_file_write_tool":
 		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
@@ -3828,57 +3647,26 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, sessionID, name s
 			return "Sandbox error: " + err.Error(), true
 		}
 		return sandboxDownloadFile(tctx, s.sandboxMgr, sessionID, argString(args, "remote_path")), true
+	case "astrbot_execute_browser", "astrbot_execute_browser_batch", "astrbot_run_browser_skill",
+		"astrbot_get_execution_history", "astrbot_annotate_execution":
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return s.executeNeoLifecycleTool(tctx, sessionID, name, args), true
 	}
 	return "", false
 }
 
-// ensureSandboxStarted lazily ensures the session's sandbox is booted on first
-// use (per-session, mirroring Python get_booter). 内部会做健康检查：会话沙盒
-// 已失效（404/TTL 到期）时自动重建。
+// ensureSandboxStarted lazily ensures the session's sandbox is booted on first use (per-session, mirroring Python get_booter). 死沙盒（404/TTL）自动重建+重推技能，均由 EnsureSession 内部完成（对齐 py get_booter 的 available→reboot→sync 时机）。
 func (s *ProcessStage) ensureSandboxStarted(ctx context.Context, sessionID string) error {
-	if _, err := s.sandboxMgr.EnsureSession(ctx, sessionID); err != nil {
-		return err
-	}
-	if s.skillMgr != nil {
-		// 先推送宿主 active 技能进 /workspace/skills（对齐 Python
-		// computer_client._sync_skills_to_sandbox），再回扫沙盒技能刷新
-		// 缓存（含沙盒内置技能——推送后 SyncSkills 才能看到全部条目）。
-		if err := s.sandboxMgr.PushHostSkills(ctx, sessionID); err != nil {
-			logger.Warn("推送宿主技能到沙盒失败: %v", err)
-		}
-		s.syncSandboxSkills(ctx, sessionID)
-	}
-	return nil
-}
-
-// syncSandboxSkills syncs sandbox skill metadata with a short retry window.
-// /workspace/skills 由 cargo volume 挂载，容器刚就绪时可能尚未挂载完成，首次
-// 扫描返回 0 个技能（观察为 "Synced 0 skills from sandbox"），导致 python-
-// sandbox 内置技能丢失。重试直到扫到技能或窗口耗尽。
-func (s *ProcessStage) syncSandboxSkills(ctx context.Context, sessionID string) {
-	for attempt := 0; attempt < 5; attempt++ {
-		if err := s.sandboxMgr.SyncSkills(ctx, sessionID); err == nil {
-			if st := s.skillMgr.GetSandboxSkillsCacheStatus(); st != nil {
-				if ready, _ := st["ready"].(bool); ready {
-					return
-				}
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
-	}
+	_, err := s.sandboxMgr.EnsureSession(ctx, sessionID)
+	return err
 }
 
 // resolveProvider picks the provider config to use for this chat.
 func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]interface{}, error) {
 	providers, _ := s.config["provider"].([]interface{})
-	// Copy the shared provider_settings map so per-request writes (e.g.
-	// persona below) never mutate the shared config that other concurrent
-	// requests read (M-21). Only the top level is written by callers, so a
-	// shallow copy is sufficient.
+	// Copy the shared provider_settings map so per-request writes (e.g. persona below) never mutate the shared config that other concurrent requests read (M-21). Only the top level is written by callers, so a shallow copy is sufficient.
 	providerSettings := map[string]interface{}{}
 	if ps, ok := s.config["provider_settings"].(map[string]interface{}); ok {
 		for k, v := range ps {
@@ -3915,11 +3703,7 @@ func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]int
 	return nil, nil, errNoAvailableProvider
 }
 
-// applySelectedProviderModel applies the dashboard-selected provider/model
-// metadata (event.Metadata["selected_provider"] / ["selected_model"], written
-// by chat_stream.go) on top of providerCfg. The result is a fresh map so the
-// shared provider config is never mutated. With no selection the input map is
-// returned unchanged.
+// applySelectedProviderModel applies the dashboard-selected provider/model metadata (event.Metadata["selected_provider"] / ["selected_model"], written by chat_stream.go) on top of providerCfg. The result is a fresh map so the shared provider config is never mutated. With no selection the input map is returned unchanged.
 func (s *ProcessStage) applySelectedProviderModel(event *core.Event, providerCfg map[string]interface{}) map[string]interface{} {
 	if event.Metadata == nil {
 		return providerCfg
@@ -3947,16 +3731,7 @@ func (s *ProcessStage) applySelectedProviderModel(event *core.Event, providerCfg
 	return pc
 }
 
-// conversationHistory converts conversation history to LLM context messages.
-// The history slice is shallow-copied so a concurrent AppendHistory (from
-// another message racing the same session) can never mutate the slice the LLM
-// is reading. When provider_settings.max_context_length is set (>0), the
-// history is truncated to the most recent 2*max_context_length entries,
-// keeping user/assistant message pairs together, and a short system hint notes
-// that older history was dropped.
-// maybeCompressContext applies context-limit handling: token-based detection
-// with either llm_compress (LLM summary + keep-recent) or truncate_by_turns.
-// Mirrors Python's context manager (astr_main_agent + agent/context/compressor).
+// conversationHistory converts conversation history to LLM context messages. The history slice is shallow-copied so a concurrent AppendHistory (from another message racing the same session) can never mutate the slice the LLM is reading. When provider_settings.max_context_length is set (>0), the history is truncated to the most recent 2*max_context_length entries, keeping user/assistant message pairs together, and a short system hint notes that older history was dropped. maybeCompressContext applies context-limit handling: token-based detection with either llm_compress (LLM summary + keep-recent) or truncate_by_turns. Mirrors Python's context manager (astr_main_agent + agent/context/compressor).
 func (s *ProcessStage) maybeCompressContext(ctx context.Context, chatInst provider.ChatProvider, systemPrompt string, contexts []map[string]interface{}) []map[string]interface{} {
 	if s.providerConf == nil || len(contexts) == 0 {
 		return contexts
@@ -3978,13 +3753,11 @@ func (s *ProcessStage) maybeCompressContext(ctx context.Context, chatInst provid
 			return compressed
 		}
 	}
-	// Fallback: keep the most recent 2*max_context_length entries on even
-	// boundaries (user/assistant pair intact).
+	// Fallback: keep the most recent 2*max_context_length entries on even boundaries (user/assistant pair intact).
 	return truncateContextEntries(contexts, maxCtx)
 }
 
-// estimateContextTokens is a rough token estimate (chars/2 for CJK-heavy text,
-// ~4 chars per token for others) used for overflow detection.
+// estimateContextTokens is a rough token estimate (chars/2 for CJK-heavy text, ~4 chars per token for others) used for overflow detection.
 func estimateContextTokens(contexts []map[string]interface{}) int {
 	total := 0
 	for _, m := range contexts {
@@ -3995,8 +3768,7 @@ func estimateContextTokens(contexts []map[string]interface{}) int {
 	return total / 2
 }
 
-// truncateContextEntries keeps the recent 2*maxCtx entries aligned to a pair
-// boundary, appending a truncation notice.
+// truncateContextEntries keeps the recent 2*maxCtx entries aligned to a pair boundary, appending a truncation notice.
 func truncateContextEntries(contexts []map[string]interface{}, maxCtx int) []map[string]interface{} {
 	history := append([]map[string]interface{}{}, contexts...)
 	if maxCtx > 0 && len(history) > maxCtx*2 {
@@ -4013,8 +3785,7 @@ func truncateContextEntries(contexts []map[string]interface{}, maxCtx int) []map
 	return history
 }
 
-// llmCompressContext summarizes the older rounds via the LLM and keeps the
-// recent rounds exact (mirrors Python LLMSummaryCompressor).
+// llmCompressContext summarizes the older rounds via the LLM and keeps the recent rounds exact (mirrors Python LLMSummaryCompressor).
 func (s *ProcessStage) llmCompressContext(ctx context.Context, chatInst provider.ChatProvider, systemPrompt string, contexts []map[string]interface{}) ([]map[string]interface{}, bool) {
 	keepRatio := s.providerConf.LLMCompressKeepRecentRatio
 	if keepRatio < 0 {
@@ -4132,9 +3903,7 @@ func (s *ProcessStage) conversationHistory(umo string) []map[string]interface{} 
 	if convID == "" {
 		return nil
 	}
-	// Read through the manager so the History slice is deep-copied under its
-	// lock — AppendHistory (another message racing this one) mutates the live
-	// History, so reading conv.History directly here would be a data race.
+	// Read through the manager so the History slice is deep-copied under its lock — AppendHistory (another message racing this one) mutates the live History, so reading conv.History directly here would be a data race.
 	history := s.convMgr.GetConversationHistory(convID)
 	if history == nil {
 		return nil
@@ -4147,8 +3916,7 @@ func (s *ProcessStage) conversationHistory(umo string) []map[string]interface{} 
 		}
 	}
 	if maxCtx > 0 && len(history) > maxCtx*2 {
-		// Keep only the most recent 2*max_context_length entries, aligned to an
-		// even boundary so a user/assistant pair is never split.
+		// Keep only the most recent 2*max_context_length entries, aligned to an even boundary so a user/assistant pair is never split.
 		start := len(history) - maxCtx*2
 		if start%2 != 0 {
 			start++
@@ -4162,9 +3930,7 @@ func (s *ProcessStage) conversationHistory(umo string) []map[string]interface{} 
 	return history
 }
 
-// mergeProviderSource overlays the provider source config onto a provider config
-// (source provides api_base/key etc.; provider values win; id stays the provider's).
-// Ported from astrbot/core/provider/manager.py get_merged_provider_config.
+// mergeProviderSource overlays the provider source config onto a provider config (source provides api_base/key etc.; provider values win; id stays the provider's). Ported from astrbot/core/provider/manager.py get_merged_provider_config.
 func mergeProviderSource(pc map[string]interface{}, sourcesRaw interface{}) map[string]interface{} {
 	sourceID, _ := pc["provider_source_id"].(string)
 	if sourceID == "" {
@@ -4193,12 +3959,9 @@ func mergeProviderSource(pc map[string]interface{}, sourcesRaw interface{}) map[
 	return merged
 }
 
-// ---------------------------------------------------------------------------
-// Stage 8: ResultDecorateStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 8: ResultDecorateStage ---------------------------------------------------------------------------
 
-// ResultDecorateStage applies decorations to the result (prefix, split, at, quote).
-// Ported from astrbot/core/pipeline/result_decorate/stage.py
+// ResultDecorateStage applies decorations to the result (prefix, split, at, quote). Ported from astrbot/core/pipeline/result_decorate/stage.py
 type ResultDecorateStage struct {
 	replyPrefix      string
 	replyWithMention bool
@@ -4220,8 +3983,7 @@ type ResultDecorateStage struct {
 	ttsTriggerProb float64
 	ttsDualOutput  bool
 
-	// forward_threshold: replies longer than this are sent as a forward
-	// message (OneBot node) on the aiocqhttp platform.
+	// forward_threshold: replies longer than this are sent as a forward message (OneBot node) on the aiocqhttp platform.
 	forwardThreshold int
 
 	// segmented reply (platform_settings.segmented_reply) settings.
@@ -4301,8 +4063,7 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 		}
 	}
 
-	// t2i top-level keys: t2i (bool), t2i_word_threshold, t2i_strategy
-	// (local/remote), t2i_endpoint, t2i_active_template, t2i_use_file_service.
+	// t2i top-level keys: t2i (bool), t2i_word_threshold, t2i_strategy (local/remote), t2i_endpoint, t2i_active_template, t2i_use_file_service.
 	s.t2iEnabled, _ = ctx.AstrbotConfig["t2i"].(bool)
 	s.t2iWordThreshold = 150
 	switch v := ctx.AstrbotConfig["t2i_word_threshold"].(type) {
@@ -4355,17 +4116,14 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		}
 	}
 
-	// Segmented reply: split long Plain components into multiple segments
-	// (mirrors result_decorate/stage.py). The actual per-segment delivery
-	// with intervals happens in RespondStage.
+	// Segmented reply: split long Plain components into multiple segments (mirrors result_decorate/stage.py). The actual per-segment delivery with intervals happens in RespondStage.
 	if s.segEnabled && s.isSegmentedReplyPlatform(event.Source.Platform) {
 		if !s.segOnlyLLMResult || event.Result.IsModelResult() {
 			s.applySegmentedReply(event)
 		}
 	}
 
-	// Text-to-image: when enabled and the reply is long enough, replace the
-	// plain text with a rendered image (local gg engine or remote t2i service).
+	// Text-to-image: when enabled and the reply is long enough, replace the plain text with a rendered image (local gg engine or remote t2i service).
 	if s.t2iEnabled {
 		if err := s.applyT2I(event); err != nil {
 			// On failure keep the original text reply.
@@ -4373,10 +4131,7 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		}
 	}
 
-	// Forward message: on the aiocqhttp (OneBot) platform a reply whose plain
-	// text is longer than forward_threshold is sent as a forward node
-	// (ported from result_decorate/stage.py). When triggered the chain becomes
-	// a single Node and @/quote decorations are skipped (Python can_decorate).
+	// Forward message: on the aiocqhttp (OneBot) platform a reply whose plain text is longer than forward_threshold is sent as a forward node (ported from result_decorate/stage.py). When triggered the chain becomes a single Node and @/quote decorations are skipped (Python can_decorate).
 	forwarded := false
 	if event.Source.Platform == "aiocqhttp" && s.forwardThreshold > 0 {
 		wordCnt := 0
@@ -4422,14 +4177,12 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		event.Result.Chain = newChain
 	}
 
-	// TTS: convert the reply to voice when enabled (global switch + session
-	// tts_enabled + trigger probability + a usable TTS provider).
+	// TTS: convert the reply to voice when enabled (global switch + session tts_enabled + trigger probability + a usable TTS provider).
 	if err := s.applyTTS(event); err != nil {
 		logger.I18nWarn("TTS 转换失败，回退文本回复: %v", err)
 	}
 
-	// Run subprocess plugin on_decorating_result hooks (may rewrite the chain,
-	// e.g. message transforms) and stop the pipeline if requested.
+	// Run subprocess plugin on_decorating_result hooks (may rewrite the chain, e.g. message transforms) and stop the pipeline if requested.
 	if s.subPlugins != nil && len(event.Result.Chain) > 0 {
 		sdkChain := chainToSDK(event.Result.Chain)
 		stop, err := s.applyResultHooks(event, &sdkChain)
@@ -4447,14 +4200,9 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 	return &StageResult{Continue: true}, nil
 }
 
-// applyT2I converts a long plain-text reply into an image when the t2i option
-// is enabled and the text length reaches t2i_word_threshold. Non-text
-// components (at/quote/reply) are preserved; the plain text is replaced by an
-// Image component carrying the rendered bytes as base64.
+// applyT2I converts a long plain-text reply into an image when the t2i option is enabled and the text length reaches t2i_word_threshold. Non-text components (at/quote/reply) are preserved; the plain text is replaced by an Image component carrying the rendered bytes as base64.
 func (s *ResultDecorateStage) applyT2I(event *core.Event) error {
-	// Streaming replies already delivered the text incrementally (sentence by
-	// sentence); converting to an image would duplicate the content. Only
-	// convert when the reply was produced non-streamed.
+	// Streaming replies already delivered the text incrementally (sentence by sentence); converting to an image would duplicate the content. Only convert when the reply was produced non-streamed.
 	if streamed, _ := event.GetExtra("streamed").(bool); streamed {
 		return nil
 	}
@@ -4482,8 +4230,7 @@ func (s *ResultDecorateStage) applyT2I(event *core.Event) error {
 	case "local":
 		imgData, err = renderLocalT2I(trimmed, s.t2iTemplate)
 	case "remote", "":
-		// 回退优先级：配置端点 → 官方默认远程端点 → 本地渲染（对齐用户
-		// 期望的"配置t2i > 回退默认远程t2i > 本地gg"）。
+		// 回退优先级：配置端点 → 官方默认远程端点 → 本地渲染（对齐用户 期望的"配置t2i > 回退默认远程t2i > 本地gg"）。
 		if s.t2iEndpoint != "" {
 			imgData, err = t2i.RenderRemote(s.t2iEndpoint, trimmed, s.t2iTemplate)
 			if err == nil {
@@ -4518,19 +4265,16 @@ func (s *ResultDecorateStage) applyT2I(event *core.Event) error {
 	return nil
 }
 
-// renderLocalT2I renders text locally with the gg engine. A system CJK font is
-// used when no font path is configured (the renderer falls back automatically).
+// renderLocalT2I renders text locally with the gg engine. A system CJK font is used when no font path is configured (the renderer falls back automatically).
 func renderLocalT2I(text, templateName string) ([]byte, error) {
 	opts := t2i.ImageOptions{}
 	if templateName != "" && templateName != "base" {
-		// templateName only affects the (optional) title in future templates;
-		// it is accepted for forward compatibility.
+		// templateName only affects the (optional) title in future templates; it is accepted for forward compatibility.
 	}
 	return t2i.RenderTextToPNG(text, opts)
 }
 
-// applyTTS converts the reply plain text to a voice Record component when TTS
-// is enabled (mirrors Python result_decorate stage TTS block).
+// applyTTS converts the reply plain text to a voice Record component when TTS is enabled (mirrors Python result_decorate stage TTS block).
 func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
 	if !s.ttsEnabled || s.providerMgr == nil {
 		return nil
@@ -4604,8 +4348,7 @@ func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
 	return nil
 }
 
-// applyResultHooks runs every loaded subprocess plugin's on_decorating_result
-// hooks against the outgoing chain.
+// applyResultHooks runs every loaded subprocess plugin's on_decorating_result hooks against the outgoing chain.
 func (s *ResultDecorateStage) applyResultHooks(event *core.Event, chain *[]pluginsdk.Component) (bool, error) {
 	sdkEvent := star.CoreEventToSDKEvent(event)
 	cur := *chain
@@ -4688,12 +4431,9 @@ func chainToSDK(chain []message.Component) []pluginsdk.Component {
 	return out
 }
 
-// ---------------------------------------------------------------------------
-// Stage 9: RespondStage
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Stage 9: RespondStage ---------------------------------------------------------------------------
 
-// RespondStage sends the result message chain to the platform.
-// Ported from astrbot/core/pipeline/respond/stage.py
+// RespondStage sends the result message chain to the platform. Ported from astrbot/core/pipeline/respond/stage.py
 type RespondStage struct {
 	platformMgr *platform.PlatformManager
 	subPlugins  *plugin.SubprocessManager
@@ -4753,13 +4493,9 @@ func (s *RespondStage) Initialize(ctx *PipelineContext) error {
 }
 
 func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
-	// Content was already streamed to the platform incrementally by
-	// ProcessStage; skip the duplicate final send.
+	// Content was already streamed to the platform incrementally by ProcessStage; skip the duplicate final send.
 	if streamed, _ := event.GetExtra("streamed").(bool); streamed {
-		// The plain text was already streamed out. However, the result chain
-		// may still carry media components produced after streaming (e.g. a
-		// t2i-rendered image that replaced the text). Those must still be
-		// delivered; only a pure-text chain is skipped to avoid duplication.
+		// The plain text was already streamed out. However, the result chain may still carry media components produced after streaming (e.g. a t2i-rendered image that replaced the text). Those must still be delivered; only a pure-text chain is skipped to avoid duplication.
 		if s.platformMgr != nil {
 			media := mediaOnlyChain(event.Result)
 			if len(media) > 0 {
@@ -4770,6 +4506,12 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 				}
 			}
 		}
+		return &StageResult{Continue: false}, nil
+	}
+
+	// 对齐 Python v4.28.0 (respond/stage.py.diff)：空消息链且非流式中间态时 直接返回，不发送、不触发 after_message_sent 钩子。
+	if event.Result != nil && len(event.Result.Chain) == 0 &&
+		event.Result.ResultContentType != message.ResultStreamingResult {
 		return &StageResult{Continue: false}, nil
 	}
 
@@ -4795,9 +4537,7 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 
 	// Send via platform manager
 	if s.platformMgr != nil {
-		// Segmented reply: deliver each component with a computed interval,
-		// keeping Reply/At as the header of the first segment and sending
-		// Record components separately (mirrors respond/stage.py).
+		// Segmented reply: deliver each component with a computed interval, keeping Reply/At as the header of the first segment and sending Record components separately (mirrors respond/stage.py).
 		if s.segReplyRequired(event) && len(validChain) > 1 {
 			s.sendSegmented(ctx, event, validChain)
 		} else {
@@ -4807,8 +4547,7 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 			if err != nil {
 				logger.Error("Failed to send message chain: %v", err)
 			} else if s.subPlugins != nil {
-				// on_after_message_sent fires after a reply is delivered (e.g.
-				// plugins that clean up pending state or react to sent messages).
+				// on_after_message_sent fires after a reply is delivered (e.g. plugins that clean up pending state or react to sent messages).
 				dispatchSubprocessHooks(s.subPlugins, event, "on_after_message_sent")
 			}
 		}
@@ -4819,8 +4558,7 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	return &StageResult{Continue: false}, nil
 }
 
-// segReplyRequired mirrors respond/stage.py is_seg_reply_required: enabled +
-// (not only_llm_result or the result is a model result) + platform allowed.
+// segReplyRequired mirrors respond/stage.py is_seg_reply_required: enabled + (not only_llm_result or the result is a model result) + platform allowed.
 func (s *RespondStage) segReplyRequired(event *core.Event) bool {
 	if s.segEnabled == nil || !*s.segEnabled {
 		return false
@@ -4834,9 +4572,7 @@ func (s *RespondStage) segReplyRequired(event *core.Event) bool {
 	return !segPlatformBlacklist[event.Source.Platform]
 }
 
-// sendSegmented delivers the chain component by component with an interval
-// between sends. Reply/At header components are attached to the first
-// segment only; Record components are always sent alone.
+// sendSegmented delivers the chain component by component with an interval between sends. Reply/At header components are attached to the first segment only; Record components are always sent alone.
 func (s *RespondStage) sendSegmented(ctx context.Context, event *core.Event, chain []message.Component) {
 	header := []message.Component{}
 	body := []message.Component{}
@@ -4895,9 +4631,7 @@ func (s *RespondStage) sendSegmented(ctx context.Context, event *core.Event, cha
 	}
 }
 
-// calcSegmentInterval mirrors respond/stage.py _calc_comp_interval: log
-// method uses log(word_count+1, log_base) + [0, 0.5); random uses the
-// configured interval range.
+// calcSegmentInterval mirrors respond/stage.py _calc_comp_interval: log method uses log(word_count+1, log_base) + [0, 0.5); random uses the configured interval range.
 func (s *RespondStage) calcSegmentInterval(ctx context.Context, comp message.Component) time.Duration {
 	if s.intervalMethod == "log" {
 		var base float64 = 2.6
@@ -4921,8 +4655,7 @@ func (s *RespondStage) calcSegmentInterval(ctx context.Context, comp message.Com
 	return time.Duration(seconds * float64(time.Second))
 }
 
-// wordCount mirrors _word_cnt: words for ASCII text, alphanumeric runes
-// otherwise.
+// wordCount mirrors _word_cnt: words for ASCII text, alphanumeric runes otherwise.
 func wordCount(text string) int {
 	allASCII := true
 	for _, r := range text {
@@ -4947,13 +4680,9 @@ func isAlnum(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Helpers ---------------------------------------------------------------------------
 
-// mediaOnlyChain keeps only non-plain-text components (Image/File/Video/
-// Record) from a result, dropping At/Reply/Plain. Used to deliver media after
-// the text was already streamed out.
+// mediaOnlyChain keeps only non-plain-text components (Image/File/Video/ Record) from a result, dropping At/Reply/Plain. Used to deliver media after the text was already streamed out.
 func mediaOnlyChain(result *message.MessageEventResult) []message.Component {
 	if result == nil {
 		return nil
@@ -5074,8 +4803,7 @@ func (p *Pipeline) Process(ctx context.Context, event *core.Event) error {
 	return nil
 }
 
-// personaIDOrDefault returns the configured default persona id (used by the
-// trace span record).
+// personaIDOrDefault returns the configured default persona id (used by the trace span record).
 func personaIDOrDefault(cfg map[string]interface{}) string {
 	if ps, ok := cfg["provider_settings"].(map[string]interface{}); ok {
 		if v, ok := ps["default_personality"].(string); ok {

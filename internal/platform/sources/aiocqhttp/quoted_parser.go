@@ -288,13 +288,26 @@ func (a *Adapter) fetchForwardMessage(forwardID string) []*message.Node {
 	return a.parseForwardNodes(messages, 0, "")
 }
 
+// quotedMessage 携带 get_msg 返回的被引用消息内容与元数据，对齐 Python
+// aiocqhttp_platform_adapter.py:327-338 构造 Reply 的语义
+// （id/chain/sender_id/sender_nickname/time/message_str）。
+type quotedMessage struct {
+	Chain      []message.Component
+	ForwardIDs []string
+	SenderID   string
+	SenderNick string
+	Timestamp  int64  // 被引用消息发送时间（unix 秒，get_msg 的 time 字段）
+	MessageStr string // 被引用消息纯文本（对齐宿主 MessageStr 提取约定）
+}
+
 // fetchQuotedContent fetches the message referenced by a reply id
 // (get_msg) and collects nested forward ids from its content (mirrors
-// QuotedMessageExtractor._fetch_quoted_content). Returns the parsed chain
-// and the collected forward ids. groupID/userID provide the file-URL
+// QuotedMessageExtractor._fetch_quoted_content). Returns the parsed chain,
+// collected forward ids and sender metadata (sender_id/sender_nickname/time，
+// 对齐 Python 原版填入 Reply 的字段)。groupID/userID provide the file-URL
 // resolution context (get_group_file_url / get_private_file_url) for any File
 // component in the quoted message; empty values leave file URLs unset.
-func (a *Adapter) fetchQuotedContent(messageID, groupID, userID string) ([]message.Component, []string) {
+func (a *Adapter) fetchQuotedContent(messageID, groupID, userID string) *quotedMessage {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ret, err := a.CallActionCtx(ctx, "get_msg", map[string]interface{}{"message_id": messageID})
@@ -302,7 +315,7 @@ func (a *Adapter) fetchQuotedContent(messageID, groupID, userID string) ([]messa
 		if a.quotedParser.warnOnActionFailure {
 			logger.Warn("quoted_message_parser: get_msg 失败 id=%s: %v", messageID, err)
 		}
-		return nil, nil
+		return nil
 	}
 	data, _ := ret["data"].(map[string]interface{})
 	if data == nil {
@@ -310,13 +323,31 @@ func (a *Adapter) fetchQuotedContent(messageID, groupID, userID string) ([]messa
 	}
 	segments, _ := data["message"].([]interface{})
 	if len(segments) == 0 {
-		return nil, nil
+		return nil
 	}
 	chain, forwardIDs := a.parseOneBotSegments(segments, 0, groupID)
 	if groupID != "" || userID != "" {
 		a.enrichFileURLsIn(chain, groupID, userID)
 	}
-	return chain, forwardIDs
+	qm := &quotedMessage{
+		Chain:      chain,
+		ForwardIDs: forwardIDs,
+		MessageStr: extractPlainText(&message.MessageChain{Chain: chain}),
+	}
+	// sender 元数据：card 优先、nickname 兜底（对齐 Python
+	// `event.sender.get("card") or event.sender.get("nickname", "N/A")`）。
+	if sender, ok := data["sender"].(map[string]interface{}); ok {
+		qm.SenderID = toString(sender["user_id"])
+		if card, ok := sender["card"].(string); ok && card != "" {
+			qm.SenderNick = card
+		} else if nick, ok := sender["nickname"].(string); ok {
+			qm.SenderNick = nick
+		}
+	}
+	if t, ok := data["time"].(float64); ok && t > 0 {
+		qm.Timestamp = int64(t)
+	}
+	return qm
 }
 
 // resolveNestedForwards performs a BFS over forward-message ids, fetching

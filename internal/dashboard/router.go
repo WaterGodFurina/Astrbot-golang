@@ -389,10 +389,6 @@ func pluginEndpointRule(parts []string, method string) endpointScope {
 		case "install", "update", "reload", "enabled", "idle-unload",
 			"log-level", "source":
 			return endpointScope{systemOnly: true}
-		case "idle-unload-global":
-			if method != http.MethodGet {
-				return endpointScope{systemOnly: true}
-			}
 		}
 	}
 	switch sub {

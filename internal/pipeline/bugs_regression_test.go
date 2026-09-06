@@ -88,6 +88,7 @@ func TestToolCallTimeoutApplies(t *testing.T) {
 	}
 	event := &core.Event{
 		Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"},
+		Role:   "admin",
 	}
 	start := time.Now()
 	result := s.executeToolWithTimeout(event, "local", "astrbot_execute_shell", map[string]interface{}{
@@ -108,7 +109,7 @@ func TestExecuteSandboxToolUnconfigured(t *testing.T) {
 	if s.sandboxMgr != nil {
 		t.Skip("sandbox manager unexpectedly configured")
 	}
-	result, handled := s.executeSandboxTool(context.Background(), "g:1", "astrbot_execute_shell", map[string]interface{}{})
+	result, handled := s.executeSandboxTool(context.Background(), &core.Event{Source: core.EventSource{Platform: "g", ConvID: "1"}}, "astrbot_execute_shell", map[string]interface{}{})
 	if !handled {
 		t.Fatal("sandbox tool must be marked handled")
 	}

@@ -116,7 +116,7 @@ func TestExecuteFutureTaskOwnershipIsolation(t *testing.T) {
 // tool name directly (M-19).
 func TestExecuteToolRuntimeNoneBlocksHostTools(t *testing.T) {
 	s := testProcessStageWithConfig(t, map[string]interface{}{})
-	event := &core.Event{Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"}}
+	event := &core.Event{Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"}, Role: "admin"}
 	for _, tc := range []struct {
 		name string
 		args map[string]interface{}
@@ -142,7 +142,7 @@ func TestExecuteToolRuntimeLocalRunsShell(t *testing.T) {
 			"computer_use_allowed_senders": []interface{}{"u1"},
 		},
 	})
-	event := &core.Event{Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"}}
+	event := &core.Event{Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"}, Role: "admin"}
 	result := s.executeTool(context.Background(), event, "local", "astrbot_execute_shell", map[string]interface{}{"command": "echo hello"})
 	if strings.Contains(result, "未启用") {
 		t.Fatalf("runtime=local must run the host shell, got %q", result)

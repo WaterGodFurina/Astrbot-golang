@@ -2,7 +2,7 @@
   <div class="umo-display" :class="{ 'umo-display--compact': compact }">
     <div class="umo-display__main">
       <div class="umo-display__line">
-        <span class="umo-display__name" :class="{ 'umo-display__name--umo': !hasReadableName }" :title="displayNameTitle">
+        <span class="umo-display__name" :class="{ 'umo-display__name--umo': !hasReadableName }" :title="showRawTitle ? displayNameTitle : displayName">
           {{ displayName }}
         </span>
       </div>
@@ -63,6 +63,10 @@ export default {
       type: String,
       default: '',
     },
+    displayName: {
+      type: String,
+      default: '',
+    },
     customName: {
       type: String,
       default: '',
@@ -80,6 +84,10 @@ export default {
       default: true,
     },
     showMeta: {
+      type: Boolean,
+      default: true,
+    },
+    showRawTitle: {
       type: Boolean,
       default: true,
     },
@@ -107,7 +115,7 @@ export default {
       return this.sessionId || this.umoParts.slice(2).join(':') || this.umo
     },
     aliasName() {
-      return this.userAlias || this.customName || ''
+      return this.displayName || this.userAlias || this.customName || ''
     },
     displayName() {
       if (this.aliasName && this.autoName && this.aliasName !== this.autoName) {

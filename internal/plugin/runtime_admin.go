@@ -46,6 +46,14 @@ func idleMinutesOf(e *ManifestEntry) int {
 	return e.IdleUnloadMinutes
 }
 
+// idleWakeModeOf returns the plugin's idle wake mode ("" = 默认 command_only).
+func idleWakeModeOf(e *ManifestEntry) string {
+	if e == nil {
+		return ""
+	}
+	return e.IdleWakeMode
+}
+
 func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
@@ -86,6 +94,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"repo":                    "",
 			"idle_unload":             e != nil && e.IdleUnload,
 			"idle_unload_minutes":     idleMinutesOf(e),
+			"idle_wake_mode":          idleWakeModeOf(e),
 			"has_filter":              pluginHasMetaFilters(inst.Meta),
 			"has_hook":                pluginHasMetaHooks(inst.Meta),
 			"active_event_listener":   pluginHasPassiveEvents(inst.Meta),
@@ -158,6 +167,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"repo":                    repo,
 			"idle_unload":             e.IdleUnload,
 			"idle_unload_minutes":     e.IdleUnloadMinutes,
+			"idle_wake_mode":          e.IdleWakeMode,
 			"has_filter":              pluginHasMetaFilters(m.handlerMeta[e.ID]),
 			"has_hook":                pluginHasMetaHooks(m.handlerMeta[e.ID]),
 			"active_event_listener":   pluginHasPassiveEvents(m.handlerMeta[e.ID]),
@@ -408,7 +418,7 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 		}
 		entry.Enabled = false
 	}
-	err = man.Save(m.manifestPath())
+	err = m.saveManifest(man)
 	m.manifestMu.Unlock()
 	return err
 }
@@ -446,7 +456,7 @@ func (m *SubprocessManager) BindSource(id string, method, registryURL, registryN
 	if downloadURL != "" {
 		entry.DownloadURL = downloadURL
 	}
-	return man.Save(m.manifestPath())
+	return m.saveManifest(man)
 }
 
 // ReinstallSource reinstalls a plugin from its persisted source: it unloads
@@ -491,12 +501,15 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		return nil, fmt.Errorf("plugin %s has no install source", id)
 	}
 	carry := InstallOptions{
-		IgnoreRisk:     opts.IgnoreRisk,
-		CCChoice:       opts.CCChoice,
-		GoChoice:       opts.GoChoice,
-		PythonChoice:   opts.PythonChoice,
-		GoMirror:       opts.GoMirror,
-		PythonMirror:   opts.PythonMirror,
+		IgnoreRisk:   opts.IgnoreRisk,
+		CCChoice:     opts.CCChoice,
+		GoChoice:     opts.GoChoice,
+		PythonChoice: opts.PythonChoice,
+		GoMirror:     opts.GoMirror,
+		PythonMirror: opts.PythonMirror,
+		// 依赖分层选择：更新路径同样要透传（config 为空时安装路径会弹
+		// python_deps_prompt，重发请求带的 deps_choice 不能在重装链路丢）。
+		DepsChoice:     opts.DepsChoice,
 		Progress:       opts.Progress,
 		InstallMethod:  entry.InstallMethod,
 		RegistryURL:    entry.RegistryURL,
@@ -563,7 +576,7 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 		}
 	}
 	man.Remove(id)
-	if err := man.Save(m.manifestPath()); err != nil {
+	if err := m.saveManifest(man); err != nil {
 		m.manifestMu.Unlock()
 		return err
 	}
@@ -742,15 +755,15 @@ func (m *SubprocessManager) Components(id string) map[string]interface{} {
 	}
 	// 休眠策略：与指令/函数工具同列的行为配置项。global_* 反映全局闲置
 	// 自动休眠开关；blocked 表示本插件是否被排除在休眠之外（常驻）。
+	// 注意：全局休眠已移除，休眠为单插件独立控制。
 	out["sleep"] = []interface{}{map[string]interface{}{
 		"name":                "idle_sleep",
 		"handler_name":        "idle_sleep",
 		"desc":                "插件闲置自动休眠（回收空闲插件进程内存，触发时自动唤醒）",
 		"type":                "休眠策略",
-		"global_enabled":      m.IdleUnloadEnabled(),
-		"global_minutes":      m.IdleUnloadMinutes(),
 		"idle_unload":         m.PluginIdleUnload(inst.ID),
 		"idle_unload_minutes": m.PluginIdleUnloadMinutes(inst.ID),
+		"idle_wake_mode":      m.PluginIdleWakeMode(inst.ID),
 	}}
 	if len(out) == 0 {
 		return nil

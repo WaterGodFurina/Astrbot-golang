@@ -646,6 +646,10 @@ func (a *Adapter) convertMessage(payload *QueueItem) *platform.AstrBotMessage {
 	// 消息类型
 	if chattype, _ := messageData["chattype"].(string); chattype == "group" {
 		abm.Type = platform.GroupMessage
+		// 对齐 Python wecomai_adapter.py #9808：GROUP_MESSAGE 且有 chatid 时补全 GroupID
+		if chatID, ok := messageData["chatid"].(string); ok && chatID != "" {
+			abm.Group = &platform.Group{GroupID: chatID}
+		}
 	} else {
 		abm.Type = platform.FriendMessage
 	}

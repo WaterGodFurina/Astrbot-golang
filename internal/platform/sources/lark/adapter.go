@@ -16,6 +16,7 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	larkcontactv3 "github.com/larksuite/oapi-sdk-go/v3/service/contact/v3"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
@@ -23,6 +24,14 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
+)
+
+// userNameCacheTTL 用户名缓存 TTL（成功 1800s，失败 60s，容量 1000）。
+const (
+	userNameCacheTTLSeconds        = 1800
+	userNameFailureCacheTTLSeconds = 60
+	userNameCacheMaxSize           = 1000
+	userNameLookupTimeoutSeconds   = 5
 )
 
 var logger = log.GetDefault().WithComponent("Lark")
@@ -62,21 +71,32 @@ type Adapter struct {
 	// streamCards 记录进行中的 CardKit 流式卡片（sessionID → card + sequence）。
 	streamCards map[string]*streamCard
 
+	// userNameCache 私聊用户名缓存（open_id → name + expireAt）。
+	// 对齐 Python lark_adapter.py _user_name_cache：成功缓存 1800s，失败缓存 60s，容量 1000。
+	userNameCache   map[string]userNameCacheEntry
+	userNameCacheMu sync.Mutex
+
 	stopCh   chan struct{}
 	stopOnce sync.Once
+}
+
+type userNameCacheEntry struct {
+	name     string
+	expireAt time.Time
 }
 
 // New creates a Lark adapter.
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		config:      config,
-		settings:    settings,
-		EventBus:    eventBus,
-		botName:     "astrbot",
-		evIDTime:    make(map[string]time.Time),
-		replyIDs:    make(map[string]string),
-		streamCards: make(map[string]*streamCard),
-		stopCh:      make(chan struct{}),
+		config:        config,
+		settings:      settings,
+		EventBus:      eventBus,
+		botName:       "astrbot",
+		evIDTime:      make(map[string]time.Time),
+		replyIDs:      make(map[string]string),
+		streamCards:   make(map[string]*streamCard),
+		userNameCache: make(map[string]userNameCacheEntry),
+		stopCh:        make(chan struct{}),
 	}
 	a.appID, _ = config["app_id"].(string)
 	a.appSecret, _ = config["app_secret"].(string)
@@ -348,7 +368,8 @@ func (a *Adapter) convertMsg(event *larkim.P2MessageReceiveV1) {
 	}
 	parsed := a.parseMessageComponents(context.Background(), msgID, msgType, contentJSON, atMap)
 	abm.Message = append(abm.Message, parsed...)
-	abm.MessageStr = buildMessageStr(parsed)
+	// 对齐 Python #9872：构建 message_str 时剥离首位 bot 自提及
+	abm.MessageStr = buildMessageStrWithBotID(parsed, a.botOpenID, a.botName)
 
 	if msgID == "" {
 		logger.I18nWarn("飞书消息缺少 message_id")
@@ -362,12 +383,23 @@ func (a *Adapter) convertMsg(event *larkim.P2MessageReceiveV1) {
 	abm.MessageID = msgID
 	abm.RawMessage = event
 	senderOpenID := *event.Event.Sender.SenderId.OpenId
+	senderName := senderOpenID
+	if len(senderOpenID) > 8 {
+		senderName = senderOpenID[:8]
+	}
+	// 对齐 Python #9872：私聊消息通过 contact API 查询真实姓名
+	if abm.Type == platform.FriendMessage {
+		senderType := ""
+		if event.Event.Sender.SenderType != nil {
+			senderType = *event.Event.Sender.SenderType
+		}
+		if senderType == "user" {
+			senderName = a.lookupUserName(senderOpenID)
+		}
+	}
 	abm.Sender = platform.MessageMember{
 		UserID:   senderOpenID,
-		Nickname: senderOpenID,
-	}
-	if len(senderOpenID) > 8 {
-		abm.Sender.Nickname = senderOpenID[:8]
+		Nickname: senderName,
 	}
 
 	sessionID := senderOpenID
@@ -533,9 +565,30 @@ func (a *Adapter) handleWebhookEvent(eventData map[string]interface{}) {
 }
 
 // buildMessageStr mirrors _build_message_str_from_components.
+// 对齐 Python #9872：首位为 bot 自身提及时跳过（不修改原组件列表，仅影响文本投影）。
 func buildMessageStr(components []message.Component) string {
+	return buildMessageStrWithBotID(components, "", "")
+}
+
+// buildMessageStrWithBotID 构建文本投影，botSelfID/botName 非空时跳过首位 bot 自提及。
+func buildMessageStrWithBotID(components []message.Component, botSelfID, botName string) string {
 	parts := []string{}
-	for _, comp := range components {
+	normalizedSelfID := strings.TrimSpace(botSelfID)
+	normalizedBotName := strings.TrimSpace(botName)
+	for i, comp := range components {
+		if i == 0 {
+			if at, ok := comp.(*message.At); ok {
+				mentionID := strings.TrimSpace(at.TargetID)
+				mentionName := strings.TrimSpace(at.Name)
+				isSelf := normalizedSelfID != "" && mentionID != "" && mentionID == normalizedSelfID
+				if !isSelf && mentionID == "" && normalizedBotName != "" {
+					isSelf = mentionName == normalizedBotName
+				}
+				if isSelf {
+					continue
+				}
+			}
+		}
 		switch c := comp.(type) {
 		case *message.Plain:
 			text := strings.TrimSpace(c.Text)
@@ -565,6 +618,63 @@ func buildMessageStr(components []message.Component) string {
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// lookupUserName 对齐 Python lark_adapter.py #9872：通过 contact v3 user get 查询私聊用户真实姓名。
+// 带 TTL 缓存：成功缓存 1800s，失败缓存 60s，容量 1000（超过淘汰最早条目）。
+func (a *Adapter) lookupUserName(senderOpenID string) string {
+	a.userNameCacheMu.Lock()
+	entry, ok := a.userNameCache[senderOpenID]
+	a.userNameCacheMu.Unlock()
+	if ok && time.Now().Before(entry.expireAt) {
+		return entry.name
+	}
+	if ok {
+		a.userNameCacheMu.Lock()
+		delete(a.userNameCache, senderOpenID)
+		a.userNameCacheMu.Unlock()
+	}
+
+	cachedName := ""
+	nameCacheTTL := userNameFailureCacheTTLSeconds
+	ctx, cancel := context.WithTimeout(context.Background(), userNameLookupTimeoutSeconds*time.Second)
+	defer cancel()
+
+	req := larkcontactv3.NewGetUserReqBuilder().
+		UserId(senderOpenID).
+		UserIdType("open_id").
+		Build()
+	resp, err := a.client.Contact.V3.User.Get(ctx, req)
+	if err != nil {
+		logger.Debug("[Lark] Sender name lookup failed for %s: %v", senderOpenID, err)
+	} else if resp.Success() && resp.Data != nil && resp.Data.User != nil && resp.Data.User.Name != nil {
+		cachedName = strings.TrimSpace(*resp.Data.User.Name)
+		if cachedName != "" {
+			nameCacheTTL = userNameCacheTTLSeconds
+		}
+	} else {
+		logger.Debug("[Lark] Sender name lookup failed for %s: code=%d msg=%s", senderOpenID, resp.Code, resp.Msg)
+	}
+
+	if cachedName == "" {
+		cachedName = senderOpenID
+		if len(cachedName) > 8 {
+			cachedName = cachedName[:8]
+		}
+	}
+	a.userNameCacheMu.Lock()
+	a.userNameCache[senderOpenID] = userNameCacheEntry{
+		name:     cachedName,
+		expireAt: time.Now().Add(time.Duration(nameCacheTTL) * time.Second),
+	}
+	if len(a.userNameCache) > userNameCacheMaxSize {
+		for k := range a.userNameCache {
+			delete(a.userNameCache, k)
+			break
+		}
+	}
+	a.userNameCacheMu.Unlock()
+	return cachedName
 }
 
 // parsePostContent flattens a post message's content into a tag list.

@@ -35,6 +35,11 @@ type WecomAIBotLongConnectionClient struct {
 	sendLock        sync.Mutex
 	commandLock     sync.Mutex
 
+	// messageHandlerTasks 跟踪异步回调处理任务（对齐 Python _message_handler_tasks 集合）。
+	messageHandlerTasks   map[uint64]struct{}
+	messageHandlerTasksMu sync.Mutex
+	messageHandlerTaskID  uint64
+
 	shutdownCh chan struct{}
 	stopOnce   sync.Once
 }
@@ -47,13 +52,14 @@ func NewWecomAIBotLongConnectionClient(botID, secret, wsURL string, heartbeatInt
 		interval = 5
 	}
 	return &WecomAIBotLongConnectionClient{
-		botID:             botID,
-		secret:            secret,
-		wsURL:             wsURL,
-		heartbeatInterval: time.Duration(interval) * time.Second,
-		messageHandler:    messageHandler,
-		responseWaiters:   make(map[string]chan map[string]interface{}),
-		shutdownCh:        make(chan struct{}),
+		botID:               botID,
+		secret:              secret,
+		wsURL:               wsURL,
+		heartbeatInterval:   time.Duration(interval) * time.Second,
+		messageHandler:      messageHandler,
+		responseWaiters:     make(map[string]chan map[string]interface{}),
+		messageHandlerTasks: make(map[uint64]struct{}),
+		shutdownCh:          make(chan struct{}),
 		httpDialer: &websocket.Dialer{
 			HandshakeTimeout: 15 * time.Second,
 		},
@@ -182,22 +188,43 @@ func (c *WecomAIBotLongConnectionClient) runOnce(ctx context.Context) error {
 	return nil
 }
 
-// handlerLoop 顺序消费回调消息并交给 messageHandler 处理。
+// handlerLoop 消费回调消息并异步交给 messageHandler 处理。
+// 对齐 Python wecomai_long_connection.py #9808：每条回调消息独立并发处理，
+// 避免回调处理器中的 SendCommand 阻塞接收循环。
 func (c *WecomAIBotLongConnectionClient) handlerLoop(ch chan map[string]interface{}, done chan struct{}) {
 	defer close(done)
 	for payload := range ch {
 		if c.messageHandler == nil {
 			continue
 		}
-		func() {
+		taskID := c.trackTask()
+		go func(taskID uint64, p map[string]interface{}) {
+			defer c.untrackTask(taskID)
 			defer func() {
 				if r := recover(); r != nil {
 					logger.I18nError("[WecomAI][LongConn] 处理回调消息异常: %v", r)
 				}
 			}()
-			c.messageHandler(payload)
-		}()
+			c.messageHandler(p)
+		}(taskID, payload)
 	}
+}
+
+// trackTask 注册一个异步回调任务（对齐 Python _message_handler_tasks.add）。
+func (c *WecomAIBotLongConnectionClient) trackTask() uint64 {
+	c.messageHandlerTasksMu.Lock()
+	defer c.messageHandlerTasksMu.Unlock()
+	c.messageHandlerTaskID++
+	id := c.messageHandlerTaskID
+	c.messageHandlerTasks[id] = struct{}{}
+	return id
+}
+
+// untrackTask 移除已完成的异步回调任务（对齐 Python _message_handler_tasks.discard）。
+func (c *WecomAIBotLongConnectionClient) untrackTask(id uint64) {
+	c.messageHandlerTasksMu.Lock()
+	defer c.messageHandlerTasksMu.Unlock()
+	delete(c.messageHandlerTasks, id)
 }
 
 // subscribe 发送 aibot_subscribe 并等待响应（对应 _subscribe）。
