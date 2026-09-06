@@ -1016,8 +1016,6 @@ export default {
         skills.value.some((s) => s.name === name && !isReadOnlySourceSkill(s))
       )
     );
-      () => neoReleases.value.filter((item) => item?.is_active).length,
-    );
     const editorLanguage = computed(() => {
       const path = String(editorDialog.filePath || "").toLowerCase();
       if (path.endsWith(".json")) return "json";
