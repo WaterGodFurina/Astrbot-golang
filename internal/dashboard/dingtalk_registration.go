@@ -170,10 +170,11 @@ func dingtalkPoll(deviceCode string) (map[string]interface{}, error) {
 }
 
 // dingtalkRegistrationPollResult mirrors dingtalk_registration_poll_result.
+// 对齐 Python #9808：CREATING 状态同样视为 pending。
 func dingtalkRegistrationPollResult(raw map[string]interface{}) map[string]interface{} {
 	statusRaw := strings.ToUpper(dingtalkRegStringField(raw, "status"))
 	switch statusRaw {
-	case "WAITING":
+	case "WAITING", "CREATING":
 		return map[string]interface{}{"status": "pending"}
 	case "SUCCESS":
 		clientID := dingtalkRegStringField(raw, "client_id")

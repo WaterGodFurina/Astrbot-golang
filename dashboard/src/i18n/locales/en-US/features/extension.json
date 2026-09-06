@@ -140,10 +140,6 @@
       "authorWebsite": "Author Website",
       "repository": "Repository",
       "pluginLanguage": "Plugin Language"
-    },
-    "sleep": {
-      "globalLabel": "Global idle auto-sleep",
-      "pluginLabel": "Allow this plugin to idle-sleep"
     }
   },
   "market": {
@@ -472,6 +468,16 @@
     "sandboxPresetReadonly": "Sandbox preset skills are read-only here. You cannot delete or enable/disable them from Local Skills.",
     "pluginReadonly": "Plugin-provided skills are managed by their plugin. They cannot be deleted or downloaded from Local Skills.",
     "pluginDisabled": "Plugin disabled",
+    "select": "Select",
+    "selectSkill": "Select Skill {name}",
+    "selectAll": "Select all",
+    "clearSelection": "Clear selection",
+    "deleteSelected": "Delete selected ({count})",
+    "batchDeleteTitle": "Delete selected Skills",
+    "batchDeleteMessage": "Are you sure you want to delete these {count} Skills? This action cannot be undone.",
+    "batchDeleteConfirm": "Delete {count}",
+    "batchDeleteSuccess": "All {count} skill(s) deleted successfully.",
+    "batchDeletePartial": "Deleted {succeeded}; failed to delete {failed}",
     "openEditor": "View/Edit",
     "editorTitle": "Edit Skill",
     "editorLoadFailed": "Failed to load Skill file",

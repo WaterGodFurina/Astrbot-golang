@@ -93,25 +93,9 @@ func TestWebhookEncryptedEventWrongSignature(t *testing.T) {
 	enc := encryptForTest(t, encryptKey, `{"header":{"event_type":"im.message.receive_v1"},"event":{}}`)
 	body := `{"encrypt":"` + enc + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
-	// 单一时间戳：避免 header 与签名计算各取一次 time.Now() 在秒边界跨秒导致
-	// "签名头新鲜度"与"签名内容"基于不同秒（旧实现两次调用偶发偶一致/偶不一致）。
-	ts := fmt.Sprintf("%d", time.Now().Unix())
-	req.Header.Set("X-Lark-Request-Timestamp", ts)
+	req.Header.Set("X-Lark-Request-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
 	req.Header.Set("X-Lark-Request-Nonce", "nonce_1")
-	// 篡改真实签名：把首字符 hex 加 1（原 'f' → '0'，其余字符 +1），保证
-	// 必然与真实签名不同。旧实现 "00"+sig[2:] 在真实签名前 2 hex 恰为 "00"
-	// 时概率性等于原签名（约 1/256），导致签名校验意外通过、返回 200 →
-	// 测试偶发失败（CI race 已观察到此 flaky）。
-	real := signatureForTest(t, encryptKey, ts, "nonce_1", body)
-	first := real[0]
-	if first >= 'f' {
-		first = '0'
-	} else if first == '9' {
-		first = 'a'
-	} else {
-		first++
-	}
-	req.Header.Set("X-Lark-Signature", string(first)+real[1:])
+	req.Header.Set("X-Lark-Signature", "00"+signatureForTest(t, encryptKey, fmt.Sprintf("%d", time.Now().Unix()), "nonce_1", body)[2:])
 	w := httptest.NewRecorder()
 	srv.HandleCallback(w, req)
 	if w.Code != http.StatusUnauthorized {

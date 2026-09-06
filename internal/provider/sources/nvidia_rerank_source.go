@@ -31,7 +31,7 @@ func NewNvidiaRerankSource(config, settings map[string]interface{}) *NvidiaReran
 	bp := provider.NewBaseProvider(config, settings)
 	s := &NvidiaRerankSource{
 		BaseProvider:  bp,
-		model:         configString(config, "nvidia_rerank_model", "nv-rerank-qa-mistral-4b:1"),
+		model:         configString(config, "nvidia_rerank_model", "nvidia/llama-nemotron-rerank-vl-1b-v2"),
 		modelEndpoint: configString(config, "nvidia_rerank_model_endpoint", "/reranking"),
 		truncate:      configString(config, "nvidia_rerank_truncate", ""),
 		client: &http.Client{

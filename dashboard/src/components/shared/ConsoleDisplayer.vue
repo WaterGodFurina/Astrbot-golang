@@ -6,15 +6,35 @@ import { EventSourcePolyfill } from 'event-source-polyfill';
 </script>
 
 <template>
-  <div class="console-displayer-wrapper" id="console-wrapper">
+  <div
+    id="console-wrapper"
+    class="console-displayer-wrapper"
+    :class="{ 'console-displayer-wrapper--workspace': workspaceMode }"
+  >
     <div class="filter-controls mb-2" v-if="showLevelBtns">
-      <v-chip-group v-model="selectedLevels" column multiple>
-        <v-chip v-for="level in logLevels" :key="level" :color="getLevelColor(level)" filter variant="flat" size="small"
-          :text-color="level === 'DEBUG' || level === 'INFO' ? 'black' : 'white'" class="font-weight-medium">
+      <v-chip-group
+        v-model="selectedLevels"
+        class="log-level-filters"
+        column
+        multiple
+      >
+        <v-chip
+          v-for="level in logLevels"
+          :key="level"
+          :color="getLevelColor(level)"
+          filter
+          variant="flat"
+          size="small"
+          :text-color="
+            level === 'DEBUG' || level === 'INFO' ? 'black' : 'white'
+          "
+          class="font-weight-medium log-level-chip"
+        >
           {{ level }}
         </v-chip>
       </v-chip-group>
       <v-spacer></v-spacer>
+      <slot name="header-actions"></slot>
       <v-btn
         :icon="isFullscreen ? 'mdi-fullscreen-exit' : 'mdi-fullscreen'"
         variant="text"
@@ -24,14 +44,19 @@ import { EventSourcePolyfill } from 'event-source-polyfill';
       ></v-btn>
     </div>
 
-    <div id="term" class="console-term">
-    </div>
+    <div id="term" class="console-term"></div>
   </div>
 </template>
 
 <script>
 export default {
   name: 'ConsoleDisplayer',
+  props: {
+    workspaceMode: {
+      type: Boolean,
+      default: false,
+    },
+  },
   data() {
     return {
       autoScroll: true,

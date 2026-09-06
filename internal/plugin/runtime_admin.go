@@ -742,13 +742,12 @@ func (m *SubprocessManager) Components(id string) map[string]interface{} {
 	}
 	// 休眠策略：与指令/函数工具同列的行为配置项。global_* 反映全局闲置
 	// 自动休眠开关；blocked 表示本插件是否被排除在休眠之外（常驻）。
+	// 注意：全局休眠已移除，休眠为单插件独立控制。
 	out["sleep"] = []interface{}{map[string]interface{}{
 		"name":                "idle_sleep",
 		"handler_name":        "idle_sleep",
 		"desc":                "插件闲置自动休眠（回收空闲插件进程内存，触发时自动唤醒）",
 		"type":                "休眠策略",
-		"global_enabled":      m.IdleUnloadEnabled(),
-		"global_minutes":      m.IdleUnloadMinutes(),
 		"idle_unload":         m.PluginIdleUnload(inst.ID),
 		"idle_unload_minutes": m.PluginIdleUnloadMinutes(inst.ID),
 	}}

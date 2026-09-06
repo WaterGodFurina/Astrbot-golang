@@ -48,9 +48,59 @@
         </div>
 
         <div v-else class="pb-3">
-          <h3 class="skills-list-title text-h3">
-            {{ tm("status.installed") }}
-          </h3>
+          <div class="skills-list-header">
+            <h3 class="skills-list-title text-h3">
+              {{ tm("status.installed") }}
+            </h3>
+            <div class="skills-list-actions">
+              <template v-if="batchSelectionEnabled">
+                <v-btn
+                  variant="text"
+                  size="small"
+                  :disabled="batchDeleting"
+                  @click="toggleSelectAll"
+                >
+                  {{
+                    allDeletableSelected
+                      ? tm("skills.clearSelection")
+                      : tm("skills.selectAll")
+                  }}
+                </v-btn>
+                <v-btn
+                  color="error"
+                  variant="tonal"
+                  size="small"
+                  prepend-icon="mdi-delete-outline"
+                  :disabled="selectedSkillNames.length === 0 || batchDeleting"
+                  @click="confirmBatchDelete"
+                >
+                  {{
+                    tm("skills.deleteSelected", {
+                      count: selectedSkillNames.length,
+                    })
+                  }}
+                </v-btn>
+                <v-btn
+                  variant="text"
+                  size="small"
+                  :disabled="batchDeleting"
+                  @click="cancelBatchSelection"
+                >
+                  {{ tm("skills.cancel") }}
+                </v-btn>
+              </template>
+              <v-btn
+                v-else
+                variant="tonal"
+                size="small"
+                prepend-icon="mdi-select-multiple"
+                :disabled="deletableSkills.length === 0"
+                @click="startBatchSelection"
+              >
+                {{ tm("skills.select") }}
+              </v-btn>
+            </div>
+          </div>
 
           <div class="skills-list">
             <OutlinedActionListItem
@@ -61,10 +111,29 @@
               :class="{
                 'skill-list-item--inactive':
                   skill.active === false || isInactivePluginSkill(skill),
+                'skill-list-item--selected':
+                  batchSelectionEnabled &&
+                  selectedSkillNames.includes(skill.name),
               }"
-              clickable
+              :clickable="!batchSelectionEnabled"
               @click="openSkillEditor(skill)"
             >
+              <template #title-prepend>
+                <v-checkbox-btn
+                  v-if="batchSelectionEnabled && !isReadOnlySourceSkill(skill)"
+                  v-model="selectedSkillNames"
+                  :value="skill.name"
+                  density="compact"
+                  hide-details
+                  :disabled="batchDeleting"
+                  :aria-label="
+                    tm('skills.selectSkill', {
+                      name: skill.name,
+                    })
+                  "
+                  @click.stop
+                />
+              </template>
               <template #title-extra>
                 <div class="d-flex align-center ga-1">
                   <v-chip
@@ -95,7 +164,7 @@
                 {{ tm("skills.path") }}: {{ skill.path }}
               </div>
 
-              <template #actions>
+              <template v-if="!batchSelectionEnabled" #actions>
                 <v-tooltip :text="tm('skills.download')" location="top">
                   <template #activator="{ props }">
                     <v-btn
@@ -132,7 +201,7 @@
                 </v-tooltip>
               </template>
 
-              <template #control>
+              <template v-if="!batchSelectionEnabled" #control>
                 <v-tooltip location="top">
                   <template #activator="{ props }">
                     <v-switch
@@ -618,6 +687,40 @@
       </v-card>
     </v-dialog>
 
+    <v-dialog v-model="batchDeleteDialog" max-width="520px" :persistent="batchDeleting">
+      <v-card>
+        <v-card-title class="text-h3 pa-4 pb-0 pl-6">
+          {{ tm("skills.batchDeleteTitle") }}
+        </v-card-title>
+        <v-card-text>
+          <p>
+            {{
+              tm("skills.batchDeleteMessage", {
+                count: batchDeleteTargets.length,
+              })
+            }}
+          </p>
+          <v-list class="batch-delete-targets mt-3" density="compact">
+            <v-list-item
+              v-for="name in batchDeleteTargets"
+              :key="name"
+              class="batch-delete-target"
+              :title="name"
+              prepend-icon="mdi-puzzle-outline"
+            />
+          </v-list>
+        </v-card-text>
+        <v-card-actions class="d-flex justify-end">
+          <v-btn variant="text" :disabled="batchDeleting" @click="batchDeleteDialog = false">
+            {{ tm("skills.cancel") }}
+          </v-btn>
+          <v-btn color="error" variant="tonal" :loading="batchDeleting" @click="executeBatchDelete">
+            {{ tm("skills.batchDeleteConfirm", { count: batchDeleteTargets.length }) }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-dialog v-model="deleteDialog" max-width="400px">
       <v-card>
         <v-card-title class="text-h3 pa-4 pb-0 pl-6">{{
@@ -846,6 +949,10 @@ export default {
     const deleteDialog = ref(false);
     const deleting = ref(false);
     const skillToDelete = ref(null);
+    const batchSelectionEnabled = ref(false);
+    const selectedSkillNames = ref([]);
+    const batchDeleteDialog = ref(false);
+    const batchDeleting = ref(false);
     const snackbar = reactive({ show: false, message: "", color: "success" });
 
     const neoLoading = ref(false);
@@ -897,7 +1004,18 @@ export default {
       { title: "stable", value: "stable" },
     ]);
 
-    const activeReleaseCount = computed(
+    const deletableSkills = computed(() =>
+      skills.value.filter((skill) => !isReadOnlySourceSkill(skill))
+    );
+    const allDeletableSelected = computed(
+      () => deletableSkills.value.length > 0
+        && deletableSkills.value.every((skill) => selectedSkillNames.value.includes(skill.name))
+    );
+    const batchDeleteTargets = computed(() =>
+      selectedSkillNames.value.filter((name) =>
+        skills.value.some((s) => s.name === name && !isReadOnlySourceSkill(s))
+      )
+    );
       () => neoReleases.value.filter((item) => item?.is_active).length,
     );
     const editorLanguage = computed(() => {
@@ -1541,7 +1659,63 @@ export default {
         if (!item || typeof item !== "object") {
           return item;
         }
-        return {
+    const startBatchSelection = () => {
+      batchSelectionEnabled.value = true;
+      selectedSkillNames.value = [];
+    };
+
+    const cancelBatchSelection = () => {
+      batchSelectionEnabled.value = false;
+      selectedSkillNames.value = [];
+    };
+
+    const toggleSelectAll = () => {
+      if (allDeletableSelected.value) {
+        selectedSkillNames.value = [];
+      } else {
+        selectedSkillNames.value = deletableSkills.value.map((s) => s.name);
+      }
+    };
+
+    const confirmBatchDelete = () => {
+      if (batchDeleteTargets.value.length === 0) return;
+      batchDeleteDialog.value = true;
+    };
+
+    const executeBatchDelete = async () => {
+      if (batchDeleteTargets.value.length === 0) return;
+      batchDeleting.value = true;
+      try {
+        let succeeded = 0;
+        let failed = 0;
+        for (const name of batchDeleteTargets.value) {
+          try {
+            const res = await skillApi.delete(name);
+            if (res?.data?.status === "ok") {
+              succeeded++;
+            } else {
+              failed++;
+            }
+          } catch (_err) {
+            failed++;
+          }
+        }
+        if (failed === 0) {
+          showMessage(tm("skills.batchDeleteSuccess", { count: succeeded }), "success");
+        } else {
+          showMessage(tm("skills.batchDeletePartial", { succeeded, failed }), "warning");
+        }
+        batchDeleteDialog.value = false;
+        cancelBatchSelection();
+        await fetchSkills();
+      } catch (_err) {
+        showMessage(tm("skills.deleteFailed"), "error");
+      } finally {
+        batchDeleting.value = false;
+      }
+    };
+
+    return {
           ...item,
           is_active: item.is_active ?? item.active ?? false,
         };
@@ -1814,6 +1988,10 @@ export default {
       itemLoading,
       deleteDialog,
       deleting,
+      batchSelectionEnabled,
+      selectedSkillNames,
+      batchDeleteDialog,
+      batchDeleting,
       snackbar,
       neoEnabled,
       neoUnavailableMessage,
@@ -1852,6 +2030,10 @@ export default {
       toggleSkill,
       confirmDelete,
       deleteSkill,
+      startBatchSelection,
+      cancelBatchSelection,
+      toggleSelectAll,
+      confirmBatchDelete,
       evaluateCandidate,
       promoteCandidate,
       isCandidatePromoteLoading,
@@ -2402,7 +2584,34 @@ export default {
 }
 
 @media (max-width: 860px) {
-  .skills-list {
+.skills-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.skills-list-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.skill-list-item--selected {
+  border-color: rgb(var(--v-theme-primary)) !important;
+  background-color: rgba(var(--v-theme-primary), 0.06);
+}
+
+.batch-delete-targets {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.batch-delete-target:nth-child(odd) {
+  background-color: rgba(var(--v-theme-on-surface), 0.03);
+}
+
+.skills-list {
     grid-template-columns: minmax(0, 1fr);
   }
 

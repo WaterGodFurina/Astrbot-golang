@@ -6,6 +6,8 @@
 package wecom_ai_bot
 
 import (
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
+
 	"bytes"
 	"context"
 	"os"

@@ -75,6 +75,34 @@ func providerLTMBool(cfg map[string]interface{}, key string) bool {
 }
 
 // providerLTMInt reads an int under provider_ltm_settings with a default.
+// agentRunnerMaxSteps 读取 agent_runner.config.misc.max_steps（对齐 Python #9801/#9818），
+// 值 <= 0 时返回 0 让调用方回退 provider_settings.max_agent_step。
+func agentRunnerMaxSteps(cfg map[string]interface{}) int {
+	ar, _ := cfg["agent_runner"].(map[string]interface{})
+	if ar == nil {
+		return 0
+	}
+	arCfg, _ := ar["config"].(map[string]interface{})
+	if arCfg == nil {
+		return 0
+	}
+	misc, _ := arCfg["misc"].(map[string]interface{})
+	if misc == nil {
+		return 0
+	}
+	switch v := misc["max_steps"].(type) {
+	case int:
+		if v > 0 {
+			return v
+		}
+	case float64:
+		if v > 0 {
+			return int(v)
+		}
+	}
+	return 0
+}
+
 func providerLTMInt(cfg map[string]interface{}, key string, def int) int {
 	ps, _ := cfg["provider_ltm_settings"].(map[string]interface{})
 	if ps == nil {

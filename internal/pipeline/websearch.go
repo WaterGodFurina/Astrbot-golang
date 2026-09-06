@@ -208,6 +208,19 @@ func exaSearchToolSchema() map[string]interface{} {
 		})
 }
 
+// anySearchToolSchema 对齐 Python v4.28.0 #9767 AnySearch 的 Field 定义。
+func anySearchToolSchema() map[string]interface{} {
+	return webSearchToolSchema("web_search_anysearch",
+		"A web search tool powered by AnySearch. Supports general web search and domain-specific search over academic, code, finance, legal and security sources.",
+		map[string]interface{}{
+			"query":       map[string]interface{}{"type": "string", "description": "Required. Search query."},
+			"max_results": map[string]interface{}{"type": "integer", "description": "Optional. The maximum number of results to return. Default is 10. Range is 1-20."},
+			"tag":         map[string]interface{}{"type": "string", "description": `Optional. Domain capability tag in "{domain}.{subdomain}" form, for example "academic.paper" or "finance.news". Omit it for general web search.`},
+			"zone":        map[string]interface{}{"type": "string", "description": `Optional. Result region, must be one of "cn", "intl".`},
+			"language":    map[string]interface{}{"type": "string", "description": `Optional. Preferred result language, for example "zh-CN" or "en".`},
+		})
+}
+
 // urlToolSchema builds an OpenAI tool schema with a required url plus optional
 // extra parameters (for web-page extraction tools).
 func urlToolSchema(name, description string, extra map[string]interface{}) map[string]interface{} {
@@ -762,6 +775,148 @@ func executeExaGetContents(cfg map[string]interface{}, args map[string]interface
 	}
 	r := resp.Results[0]
 	return fmt.Sprintf("URL: %s\nContent: %s", orEmpty(r.URL, "No URL"), orEmpty(r.Text, "No content"))
+}
+
+// ---------------------------------------------------------------------------
+// AnySearch
+// ---------------------------------------------------------------------------
+
+func anySearchKeys(cfg map[string]interface{}) []string {
+	return providerStringKeys(cfg, "websearch_anysearch_key")
+}
+
+// executeWebSearchAnySearch 对齐 Python v4.28.0 #9767 AnySearch：
+// AnySearch 支持匿名调用（每日免费额度），key 列表为空时发送一次无
+// Authorization 的请求；配置了 key 时按顺序轮询，遇到可重试状态码
+// {401,402,403,429} 换下一个 key 重试直至耗尽，其余状态码直接失败。
+func executeWebSearchAnySearch(cfg map[string]interface{}, args map[string]interface{}) string {
+	query := strings.TrimSpace(argString(args, "query"))
+	if query == "" {
+		return "Error: web_search_anysearch requires a query."
+	}
+	maxResults := argIntDefault(args, "max_results", 10)
+	if maxResults < 1 {
+		maxResults = 1
+	}
+	if maxResults > 20 {
+		maxResults = 20
+	}
+	payload := map[string]interface{}{
+		"query":       query,
+		"max_results": maxResults,
+		"format":      "json",
+	}
+	if v := strings.TrimSpace(argString(args, "tag")); v != "" {
+		payload["tag"] = v
+	}
+	if v := strings.TrimSpace(argString(args, "zone")); v == "cn" || v == "intl" {
+		payload["zone"] = v
+	}
+	if v := strings.TrimSpace(argString(args, "language")); v != "" {
+		payload["language"] = v
+	}
+
+	results, err := anySearchSearch(cfg, payload)
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	if len(results) == 0 {
+		return "Error: AnySearch web search does not return any results."
+	}
+	return formatSearchResults(results)
+}
+
+// anySearchSearch POSTs to the AnySearch /v1/search endpoint with key
+// failover; a nil/empty key list results in one anonymous request. 对齐
+// Python v4.28.0 #9767：可重试状态码 {401,402,403,429} 换下一个 key 重试
+// 至 keys 耗尽后抛最后错误，其余状态码直接失败。
+func anySearchSearch(cfg map[string]interface{}, payload interface{}) ([]searchResult, error) {
+	keys := anySearchKeys(cfg)
+	if len(keys) == 0 {
+		// key 列表为空：匿名调用一次，headers 无 Authorization。
+		data, status, err := httpJSON(http.MethodPost, "https://api.anysearch.com/v1/search",
+			map[string]string{"Content-Type": "application/json"}, payload)
+		if err != nil {
+			return nil, err
+		}
+		if status != 200 {
+			return nil, fmt.Errorf("AnySearch web search failed: %s, status: %d", string(data), status)
+		}
+		return parseAnySearchResults(data)
+	}
+	var lastErr error
+	for _, key := range keys {
+		headers := map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer " + key,
+		}
+		data, status, err := httpJSON(http.MethodPost, "https://api.anysearch.com/v1/search", headers, payload)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if status != 200 {
+			lastErr = fmt.Errorf("AnySearch web search failed: %s, status: %d", string(data), status)
+			if !anySearchRetryableStatus(status) {
+				return nil, lastErr
+			}
+			continue
+		}
+		return parseAnySearchResults(data)
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("AnySearch web search failed with all configured keys.")
+}
+
+// anySearchRetryableStatus 对齐 Python 的 _ANYSEARCH_RETRYABLE_HTTP_STATUSES：
+// 401 未授权 / 402 余额不足 / 403 禁用 / 429 限流，均可换 key 重试。
+func anySearchRetryableStatus(status int) bool {
+	switch status {
+	case 401, 402, 403, 429:
+		return true
+	}
+	return false
+}
+
+func parseAnySearchResults(data []byte) ([]searchResult, error) {
+	var resp struct {
+		Data struct {
+			Results []struct {
+				Title   string `json:"title"`
+				URL     string `json:"url"`
+				Snippet string `json:"snippet"`
+				Content string `json:"content"`
+			} `json:"results"`
+		} `json:"data"`
+		Results []struct {
+			Title   string `json:"title"`
+			URL     string `json:"url"`
+			Snippet string `json:"snippet"`
+			Content string `json:"content"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	// results 在 data.results，兼容顶层 results。
+	items := resp.Data.Results
+	if len(items) == 0 {
+		items = resp.Results
+	}
+	var out []searchResult
+	for _, r := range items {
+		if r.URL == "" {
+			continue
+		}
+		snippet := r.Snippet
+		if snippet == "" {
+			snippet = r.Content
+		}
+		out = append(out, searchResult{Title: r.Title, URL: r.URL, Snippet: snippet})
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -30,7 +30,13 @@
     "notActivated": "Not activated",
     "note": "*System plugins and disabled plugins are not shown.",
     "selectedPluginsLabel": "Selected Plugins:",
-    "allPluginsLabel": "All Plugins"
+    "allPluginsLabel": "All Plugins",
+    "title": "Plugins",
+    "subtitle": "Choose which plugins this profile can use.",
+    "preset": "Preset",
+    "searchPlaceholder": "Search plugins",
+    "selectAll": "Select all",
+    "noSearchResults": "No matching plugins"
   },
   "providerSelector": {
     "notSelected": "Not selected",
@@ -46,7 +52,11 @@
     "createProvider": "Create Provider",
     "manageProviders": "Provider Management",
     "selectProviderPool": "Select Provider Pool...",
-    "selectedCount": "{count} provider(s) selected"
+    "selectedCount": "{count} provider(s) selected",
+    "defaultModel": "Default model",
+    "model": "Model",
+    "searchPlaceholder": "Search models",
+    "selectedModelCount": "{count} model(s) selected"
   },
   "personaSelector": {
     "notSelected": "Not selected",

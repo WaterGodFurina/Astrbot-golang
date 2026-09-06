@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1119,7 +1120,8 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 		}
 	}
 
-	// Publish event
+	groupName, _ := raw["group_name"].(string)
+
 	event := &core.Event{
 		Type: core.EventMessage,
 		Source: core.EventSource{
@@ -1146,6 +1148,12 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 			RawMessage:  raw,
 			Timestamp:   time.Now(),
 		},
+	}
+	if isGroup && groupName != "" {
+		event.MessageObj.Group = &core.Group{
+			GroupID:   convID,
+			GroupName: groupName,
+		}
 	}
 
 	a.publishEvent(event)
@@ -1521,6 +1529,88 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 		}
 	}
 	return segments
+}
+
+// GetGroupInfo enriches group metadata via OneBot get_group_info +
+// get_group_member_list, preserving inbound group data on failure (Python
+// aiocqhttp_message_event.py get_group).
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	group := &platform.Group{GroupID: groupID}
+
+	gid := groupID
+	if _, err := strconv.Atoi(groupID); err == nil {
+		gid = groupID
+	}
+
+	info, err := a.CallActionCtx(ctx, "get_group_info", map[string]interface{}{"group_id": gid})
+	if err != nil {
+		logger.Debug("aiocqhttp: get_group_info failed for %s: %v", groupID, err)
+		return group, nil
+	}
+	if name, ok := info["group_name"].(string); ok {
+		group.GroupName = name
+	}
+	if mc, ok := info["member_count"].(float64); ok {
+		c := int(mc)
+		group.MemberCount = &c
+	}
+
+	members, err := a.CallActionCtx(ctx, "get_group_member_list", map[string]interface{}{"group_id": gid})
+	if err != nil {
+		logger.Debug("aiocqhttp: get_group_member_list failed for %s: %v", groupID, err)
+		return group, nil
+	}
+	memberList, _ := members["list"].([]interface{})
+	if memberList == nil {
+		if ml, ok := members["list"].([]map[string]interface{}); ok {
+			for _, m := range ml {
+				if uid, ok := m["user_id"].(float64); ok {
+					nick, _ := m["nickname"].(string)
+					card, _ := m["card"].(string)
+					if card != "" {
+						nick = card
+					}
+					group.Members = append(group.Members, platform.MessageMember{UserID: strconv.FormatFloat(uid, 'f', 0, 64), Nickname: nick})
+					if role, _ := m["role"].(string); role == "owner" {
+						group.GroupOwner = strconv.FormatFloat(uid, 'f', 0, 64)
+					} else if role == "admin" {
+						group.GroupAdmins = append(group.GroupAdmins, strconv.FormatFloat(uid, 'f', 0, 64))
+					}
+				}
+			}
+			return group, nil
+		}
+	}
+	for _, item := range memberList {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		uid, ok := m["user_id"].(float64)
+		if !ok {
+			continue
+		}
+		nick, _ := m["nickname"].(string)
+		card, _ := m["card"].(string)
+		if card != "" {
+			nick = card
+		}
+		memberID := strconv.FormatFloat(uid, 'f', 0, 64)
+		group.Members = append(group.Members, platform.MessageMember{UserID: memberID, Nickname: nick})
+		if role, _ := m["role"].(string); role == "owner" {
+			group.GroupOwner = memberID
+		} else if role == "admin" {
+			group.GroupAdmins = append(group.GroupAdmins, memberID)
+		}
+	}
+	if group.MemberCount == nil && len(group.Members) > 0 {
+		c := len(group.Members)
+		group.MemberCount = &c
+	}
+	return group, nil
 }
 
 // extractPlainText extracts plain text from a message chain.

@@ -131,6 +131,36 @@ func (c *MattermostClient) GetChannel(ctx context.Context, channelID string) (ma
 	return c.getJSON(ctx, "channels/"+channelID)
 }
 
+// GetChannelStats 获取频道统计（GET /api/v4/channels/{id}/stats）。
+func (c *MattermostClient) GetChannelStats(ctx context.Context, channelID string) (map[string]interface{}, error) {
+	return c.getJSON(ctx, "channels/"+channelID+"/stats")
+}
+
+// GetChannelMembers 获取频道成员（GET /api/v4/channels/{id}/members）。
+func (c *MattermostClient) GetChannelMembers(ctx context.Context, channelID string, page, pageSize int) ([]map[string]interface{}, error) {
+	path := fmt.Sprintf("channels/%s/members?page=%d&per_page=%d", channelID, page, pageSize)
+	u := c.baseURL + "/api/v4/" + path
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = c.jsonHeaders()
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("mattermost GET %s failed: %d %s", path, resp.StatusCode, body)
+	}
+	var result []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("mattermost GET %s returned invalid JSON: %w", path, err)
+	}
+	return result, nil
+}
+
 // GetFileInfo 获取文件信息（GET /api/v4/files/{id}/info）。
 func (c *MattermostClient) GetFileInfo(ctx context.Context, fileID string) (map[string]interface{}, error) {
 	return c.getJSON(ctx, "files/"+fileID+"/info")

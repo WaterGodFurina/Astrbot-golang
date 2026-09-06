@@ -17,26 +17,40 @@ AstrBot-golang 是一个**高性能、可扩展**的聊天机器人框架，原�
 
 ```text
 astrbot-go/
-├── cmd/astrbot/               # 主程序入口
-├── internal/
-│   ├── plugin/                # 子进程插件运行时（go-plugin + gRPC）
-│   ├── toolchain/             # 自带 Go / Clang 工具链（自动下载与管理）
-│   ├── star/                  # 指令系统（命令/filter/hook 桥接）
-│   ├── lifecycle/             # 生命周期管理（模块组装）
+├── cmd/astrbot/               # 主程序入口（--webui-dir / --reset-password）
+├── internal/                  # 核心（27 个包）
+│   ├── lifecycle/             # 生命周期管理（模块组装与启动顺序）
+│   ├── core/                  # 事件总线 + Pipeline 调度器
 │   ├── pipeline/              # 消息处理管线（9 阶段）
+│   ├── star/                  # 指令系统（命令/filter/hook 桥接）
+│   ├── plugin/                # 子进程插件运行时（go-plugin + gRPC）
+│   ├── pysdk/                 # Python 插件 SDK 运行管理（venv/运行时）
+│   ├── toolchain/             # 自带 Go / Clang / Python 工具链（自动下载与管理）
 │   ├── platform/              # 18 个平台适配器
 │   ├── provider/              # LLM Provider 管理（Chat/TTS/STT/Embedding/Rerank）
-│   ├── dashboard/             # WebUI API 服务器 + 认证
-│   ├── core/                  # 事件总线 + Pipeline 调度器
-│   ├── sandbox/               # 沙箱（Docker/本地/Shipyard）
-│   ├── skills/                # 技能管理
+│   ├── agent/                 # Agent 系统（FunctionTool / MCP / 子代理 / 上下文压缩）
 │   ├── conversation/          # 会话管理
+│   ├── session/               # 会话自定义规则
+│   ├── persona/               # 人格管理
+│   ├── knowledgebase/         # 知识库（nanovec 向量检索 + SQLite 双写）
+│   ├── skills/                # 技能管理（SKILL.md + LLM 注入）
+│   ├── sandbox/               # 沙箱（Docker/本地/Shipyard）
+│   ├── t2i/                   # 文本转图片（远程 t2i + 本地 gg 回退）
+│   ├── contentsafety/         # 内容安全（关键词 + 百度 AIP）
+│   ├── ratelimit/             # 消息速率限制
+│   ├── cron/                  # 定时任务
+│   ├── backup/                # 备份（导出/导入/校验）
+│   ├── dashboard/             # WebUI API 服务器 + 认证（前端 embed）
 │   ├── config/                # 配置管理
-│   ├── db/                    # SQLite 数据库（纯 Go 驱动）
-│   └── ...                    # 其他支持包
+│   ├── db/                    # SQLite 数据库（纯 Go 驱动，WAL）
+│   ├── i18n/                  # 国际化（520+ 内置 key）
+│   ├── log/                   # 日志（loguru ANSI 配色）
+│   ├── utils/                 # 通用工具
+│   └── version/               # 版本信息
 ├── pkg/
 │   ├── message/               # 消息组件
 │   └── sdk/                   # 插件 SDK 文档入口
+├── dashboard/                 # 前端源码（Vue）
 └── go.mod
 ```
 
@@ -51,6 +65,8 @@ astrbot-go/
 ## 插件系统
 
 插件系统采用 子进程方案（go-plugin + gRPC），保证隔离性和稳定性
+
+为防止因为宿主强退而带来的插件孤儿进程，本项目在启动时会检查孤儿进程是否存在，如果有，则会执行清理
 
 ### 核心特性
 

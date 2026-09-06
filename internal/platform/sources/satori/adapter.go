@@ -544,3 +544,69 @@ func (a *Adapter) sendHTTPRequest(method, path string, data map[string]interface
 	}
 	return map[string]interface{}{}
 }
+
+// GetGroupInfo enriches Satori guild metadata (Python satori_event.py get_group).
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+
+	platformName, userID := a.currentLogin()
+	group := &platform.Group{GroupID: groupID}
+
+	guildResp := a.sendHTTPRequest(http.MethodPost, "/guild.get", map[string]interface{}{"guild_id": groupID}, platformName, userID)
+	if name, ok := guildResp["name"].(string); ok {
+		group.GroupName = name
+	}
+	if avatar, ok := guildResp["avatar"].(string); ok {
+		group.GroupAvatar = avatar
+	}
+
+	var members []platform.MessageMember
+	page := 0
+	for {
+		data := map[string]interface{}{"guild_id": groupID}
+		if page > 0 {
+			data["next"] = fmt.Sprintf("%d", page)
+		}
+		resp := a.sendHTTPRequest(http.MethodPost, "/guild.member.list", data, platformName, userID)
+		items, _ := resp["data"].([]interface{})
+		if len(items) == 0 {
+			break
+		}
+		for _, item := range items {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			user, _ := m["user"].(map[string]interface{})
+			uid, _ := user["id"].(string)
+			if uid == "" {
+				continue
+			}
+			nick, _ := m["nick"].(string)
+			if nick == "" {
+				nick, _ = user["nick"].(string)
+			}
+			if nick == "" {
+				nick, _ = user["name"].(string)
+			}
+			members = append(members, platform.MessageMember{UserID: uid, Nickname: nick})
+		}
+		next, _ := resp["next"].(string)
+		if next == "" {
+			break
+		}
+		page++
+		if page > 1000 {
+			break
+		}
+	}
+	if len(members) > 0 {
+		group.Members = members
+		c := len(members)
+		group.MemberCount = &c
+	}
+
+	return group, nil
+}

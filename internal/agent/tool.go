@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -126,8 +127,14 @@ func (ts *ToolSet) Empty() bool {
 func (ts *ToolSet) OpenAISchema() []map[string]interface{} {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	result := make([]map[string]interface{}, 0, len(ts.tools))
+	// 稳定排序保 prompt-cache 前缀（对齐 Python #9798）。
+	sorted := make([]*FunctionTool, 0, len(ts.tools))
 	for _, t := range ts.tools {
+		sorted = append(sorted, t)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	result := make([]map[string]interface{}, 0, len(sorted))
+	for _, t := range sorted {
 		if t.Active {
 			result = append(result, t.ToOpenAISchema())
 		}
@@ -139,8 +146,13 @@ func (ts *ToolSet) OpenAISchema() []map[string]interface{} {
 func (ts *ToolSet) AnthropicSchema() []map[string]interface{} {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	result := make([]map[string]interface{}, 0, len(ts.tools))
+	sorted := make([]*FunctionTool, 0, len(ts.tools))
 	for _, t := range ts.tools {
+		sorted = append(sorted, t)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	result := make([]map[string]interface{}, 0, len(sorted))
+	for _, t := range sorted {
 		if t.Active {
 			result = append(result, t.ToAnthropicSchema())
 		}
@@ -152,8 +164,13 @@ func (ts *ToolSet) AnthropicSchema() []map[string]interface{} {
 func (ts *ToolSet) GoogleSchema() map[string]interface{} {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	functions := make([]map[string]interface{}, 0, len(ts.tools))
+	sorted := make([]*FunctionTool, 0, len(ts.tools))
 	for _, t := range ts.tools {
+		sorted = append(sorted, t)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	functions := make([]map[string]interface{}, 0, len(sorted))
+	for _, t := range sorted {
 		if t.Active {
 			functions = append(functions, t.ToGoogleSchema())
 		}

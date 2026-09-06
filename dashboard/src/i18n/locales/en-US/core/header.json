@@ -134,5 +134,6 @@
     "messages": {
       "updateFailed": "Update failed, please try again"
     }
-  }
+  },
+  "logout": "Log out"
 }

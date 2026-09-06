@@ -164,6 +164,10 @@ type WakingCheckStage struct {
 	// Senders in this list get event.Role="admin" (mirrors Python's waking_check
 	// admin detection); everyone else is "member".
 	adminsID []string
+
+	// umoAutoNameRecorder 对齐 Python v4.28.0 (#9909)：唤醒成功时异步记录
+	// UMO 可读名称（群名/用户名）到数据库，供 WebUI 展示。
+	umoAutoNameRecorder *UmoAutoNameRecorder
 }
 
 func NewWakingCheckStage() *WakingCheckStage {
@@ -221,6 +225,11 @@ func (s *WakingCheckStage) Initialize(ctx *PipelineContext) error {
 	// Admin ids (top-level "admins_id", e.g. ["astrbot"]). Used to mark the
 	// sender as admin so admin-gated commands (/provider /name) respond.
 	s.adminsID = toStringList(ctx.AstrbotConfig["admins_id"])
+
+	// 对齐 Python v4.28.0 (#9909)：唤醒成功时异步记录 UMO 可读名称到数据库。
+	if ctx.Database != nil {
+		s.umoAutoNameRecorder = NewUmoAutoNameRecorder(ctx.Database, "")
+	}
 
 	logger.Debug("WakingCheck initialized: prefixes=%v, nicknames=%v, wakeByAt=%v, wakeByPrefix=%v, wakeByFriend=%v, aiWakePrefix=%q",
 		s.wakePrefixes, s.nickname, s.wakeByAt, s.wakeByPrefix, s.wakeByFriend, s.aiWakePrefix)
@@ -297,6 +306,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 				if event.WakeCommand == "" && s.emptyMentionWaiting {
 					return s.applyEmptyMention(event)
 				}
+				// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+				s.scheduleUmoAutoName(event)
 				return &StageResult{Continue: true}, nil
 			}
 		}
@@ -309,6 +320,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 				event.IsAtOrWakeCommand = true
 				event.SetExtra("llm_wake", true)
 				logger.Debug("Woken by nickname '%s'", nick)
+				// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+				s.scheduleUmoAutoName(event)
 				return &StageResult{Continue: true}, nil
 			}
 		}
@@ -345,6 +358,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 						event.SetExtra("llm_wake", true)
 						logger.Debug("Woken by @mention (chat enabled)")
 					}
+					// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+					s.scheduleUmoAutoName(event)
 					return &StageResult{Continue: true}, nil
 				}
 			}
@@ -355,6 +370,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 				event.IsAtOrWakeCommand = true
 				event.SetExtra("llm_wake", true)
 				logger.Debug("Woken by @all")
+				// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+				s.scheduleUmoAutoName(event)
 				return &StageResult{Continue: true}, nil
 			}
 			if r, ok := comp.(*message.Reply); ok && !event.Source.IsGroup {
@@ -362,6 +379,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 				if r.SenderID == event.Source.SelfID {
 					event.IsAtOrWakeCommand = true
 					event.SetExtra("llm_wake", true)
+					// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+					s.scheduleUmoAutoName(event)
 					return &StageResult{Continue: true}, nil
 				}
 			}
@@ -372,6 +391,8 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 	if s.wakeByFriend && !event.Source.IsGroup {
 		event.IsAtOrWakeCommand = true
 		event.SetExtra("llm_wake", true)
+		// 对齐 Python v4.28.0 (#9909)：唤醒成功，异步记录 UMO 名称。
+		s.scheduleUmoAutoName(event)
 		return &StageResult{Continue: true}, nil
 	}
 
@@ -428,6 +449,14 @@ func isSingleEmptyMention(event *core.Event) bool {
 // applyEmptyMention handles a message that only mentions the bot (or only
 // carries a wake prefix) without any content. When empty_mention_waiting_need_reply
 // is enabled the LLM is asked to greet the user; otherwise the event is stopped.
+// scheduleUmoAutoName 对齐 Python v4.28.0 (#9909)：唤醒成功时异步记录 UMO
+// 可读名称到数据库。nil-safe。
+func (s *WakingCheckStage) scheduleUmoAutoName(event *core.Event) {
+	if s.umoAutoNameRecorder != nil {
+		s.umoAutoNameRecorder.Schedule(event)
+	}
+}
+
 func (s *WakingCheckStage) applyEmptyMention(event *core.Event) (*StageResult, error) {
 	if !s.emptyMentionWaitingNeedReply {
 		event.Stop()
@@ -437,6 +466,8 @@ func (s *WakingCheckStage) applyEmptyMention(event *core.Event) (*StageResult, e
 	event.PlainText = emptyMentionPrompt
 	event.MessageStr = emptyMentionPrompt
 	event.SetExtra("llm_wake", true)
+	// 对齐 Python v4.28.0 (#9909)：空提及唤醒成功，异步记录 UMO 名称。
+	s.scheduleUmoAutoName(event)
 	logger.Debug("WakingCheck: empty mention -> LLM greeting")
 	return &StageResult{Continue: true}, nil
 }
@@ -448,8 +479,12 @@ func buildUniqueSessionID(platform, senderID, groupID string) string {
 	switch platform {
 	case "aiocqhttp", "slack":
 		return senderID + "_" + groupID
-	case "dingtalk", "qq_official", "qq_official_webhook":
+	case "dingtalk":
 		return senderID
+	// qq_official / qq_official_webhook: 对齐 Python v4.28.0 (#9814)，
+	// 群聊场景拼接 senderID_groupID 实现按成员隔离。
+	case "qq_official", "qq_official_webhook":
+		return senderID + "_" + groupID
 	case "lark":
 		return senderID + "%" + groupID
 	case "misskey":
@@ -984,6 +1019,11 @@ type ProcessStage struct {
 	// pause the tool after a threshold, asking the session owner to confirm.
 	doomMu       sync.Mutex
 	doomTrackers map[string]*doomTracker // key: unified msg origin
+
+	// umoAutoNameRecorder 对齐 Python v4.28.0 (#9909)：handler 命中时异步记录
+	// UMO 可读名称到数据库（handler 命中路径的 schedule 在 Python 的
+	// WakingCheckStage 中，Go 侧移至 ProcessStage，因 handler 匹配在此执行）。
+	umoAutoNameRecorder *UmoAutoNameRecorder
 }
 
 func NewProcessStage() *ProcessStage {
@@ -1066,6 +1106,11 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 		s.disableBuiltinCommands = db
 	}
 	s.groupCtx = NewGroupChatContext(ctx.AstrbotConfig)
+
+	// 对齐 Python v4.28.0 (#9909)：handler 命中路径的 UMO 自动名称记录。
+	if ctx.Database != nil {
+		s.umoAutoNameRecorder = NewUmoAutoNameRecorder(ctx.Database, "")
+	}
 	return nil
 }
 
@@ -1147,6 +1192,12 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	// that handler (raise_error=False path); the other matched handlers still
 	// run. Only when NO handler is left does the event stop before the LLM.
 	if permissionDenied && len(activated) == 0 {
+		// 对齐 Python v4.28.0 (#9909)：权限拒绝且无其他 handler 命中时，
+		// 若此前已被前缀/@提及唤醒（IsAtOrWakeCommand=true），异步记录 UMO 名称。
+		// 对应 Python waking_check 中 permission_not_pass + raise_error 路径。
+		if event.IsAtOrWakeCommand {
+			s.scheduleUmoAutoName(event)
+		}
 		// When no_permission_reply is enabled, send the reply directly —
 		// Continue=false short-circuits the pipeline before
 		// ResultDecorateStage/RespondStage, so an event.Result chain would
@@ -1159,6 +1210,10 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 		return &StageResult{Continue: false}, nil
 	}
 	if len(activated) > 0 {
+		// 对齐 Python v4.28.0 (#9909)：handler 命中（is_wake=True），异步记录 UMO 名称。
+		// Python 在 WakingCheckStage 中 handler 匹配时设置 is_wake=True，
+		// Go 侧 handler 匹配在 ProcessStage，故在此 schedule。
+		s.scheduleUmoAutoName(event)
 		// Execute handlers in priority order
 		for _, handler := range activated {
 			if event.IsStopped() {
@@ -1326,6 +1381,14 @@ func sessionRulesMemo(event *core.Event, convMgr *conversation.Manager) map[stri
 // filterHandlersBySession applies the session_plugin_config rule
 // (disabled_plugins / enabled_plugins) to the matched plugin handlers,
 // mirroring Python SessionPluginManager.filter_handlers_by_session.
+// scheduleUmoAutoName 对齐 Python v4.28.0 (#9909)：handler 命中或权限拒绝路径
+// 触发时异步记录 UMO 名称。nil-safe。
+func (s *ProcessStage) scheduleUmoAutoName(event *core.Event) {
+	if s.umoAutoNameRecorder != nil {
+		s.umoAutoNameRecorder.Schedule(event)
+	}
+}
+
 func (s *ProcessStage) filterHandlersBySession(event *core.Event, handlers []*star.StarHandlerMetadata) []*star.StarHandlerMetadata {
 	if s.convMgr == nil || len(handlers) == 0 {
 		return handlers
@@ -1917,6 +1980,15 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 	messages := append([]map[string]interface{}{}, req.Contexts...)
 	messages = append(messages, req.ToUserMessage())
 
+	// 对齐 Python tool_loop_agent_runner：messages 为空（且无新 prompt）时跳过 LLM
+	// 请求，返回 err 响应而非发空请求。
+	if len(messages) == 0 && req.Prompt == "" {
+		logger.Warn("Skipping LLM request because no messages remain after agent/request hooks and context processing.")
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "No messages remain for the LLM request."}}
+		return nil, false
+	}
+
 	resp, err := s.chatRound(llmCtx, ar.chatInst, req, ar.streaming, streamer)
 	if err != nil {
 		logger.Error("LLM call failed: %v", err)
@@ -1933,9 +2005,12 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 			resp = requery
 		}
 	}
-	// Max agent steps: config provider_settings.max_agent_step (default 5).
+	// Max agent steps: 优先 agent_runner.config.misc.max_steps，回退 provider_settings.max_agent_step，
+	// 默认 5（对齐 Python #9801/#9818）。
 	maxSteps := 5
-	if s.providerConf != nil && s.providerConf.MaxAgentStep > 0 {
+	if v := agentRunnerMaxSteps(s.config); v > 0 {
+		maxSteps = v
+	} else if s.providerConf != nil && s.providerConf.MaxAgentStep > 0 {
 		maxSteps = s.providerConf.MaxAgentStep
 	}
 	for round := 0; round < maxSteps && len(resp.ToolsCallName) > 0; round++ {
@@ -2907,6 +2982,10 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 			if len(exaKeys(s.config)) > 0 {
 				tools = append(tools, exaSearchToolSchema(), exaContentsToolSchema())
 			}
+		case "anysearch":
+			// 对齐 Python v4.28.0 #9767 AnySearch：支持匿名调用，key 列表
+			// 为空时也注入工具（执行时会发一次无 Authorization 的请求）。
+			tools = append(tools, anySearchToolSchema())
 		}
 	}
 
@@ -3542,6 +3621,7 @@ var coreBuiltinToolSet = map[string]bool{
 	"web_search_firecrawl":       true,
 	"web_search_baidu":           true,
 	"web_search_exa":             true,
+	"web_search_anysearch":       true,
 	"tavily_extract_web_page":    true,
 	"firecrawl_extract_web_page": true,
 	"exa_get_contents":           true,
@@ -3728,6 +3808,8 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 			result = executeWebSearchBaidu(s.config, args)
 		case "web_search_exa":
 			result = executeWebSearchExa(s.config, args)
+		case "web_search_anysearch":
+			result = executeWebSearchAnySearch(s.config, args)
 		case "tavily_extract_web_page":
 			result = executeTavilyExtract(s.config, args)
 		case "firecrawl_extract_web_page":
@@ -4770,6 +4852,13 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 				}
 			}
 		}
+		return &StageResult{Continue: false}, nil
+	}
+
+	// 对齐 Python v4.28.0 (respond/stage.py.diff)：空消息链且非流式中间态时
+	// 直接返回，不发送、不触发 after_message_sent 钩子。
+	if event.Result != nil && len(event.Result.Chain) == 0 &&
+		event.Result.ResultContentType != message.ResultStreamingResult {
 		return &StageResult{Continue: false}, nil
 	}
 

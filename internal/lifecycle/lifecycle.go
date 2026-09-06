@@ -310,8 +310,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// pip/venv 安装代理：config http_proxy 优先于系统代理，为空时 pip 才回退
 	// 系统 https_proxy（与通用请求"配置为空即直连"不同）。
 	pysdk.SetPipProxy(cfg.GetString("http_proxy"))
-	// 嵌入式/低内存设备：插件闲置自动卸载（进程内存回收），触发时懒加载唤醒。
-	l.syncIdleUnload()
+	// 注意：已移除全局 plugin_idle_unload_minutes 同步；
+	// 休眠为单插件独立控制，lifecycle 不再向 runtime 推全局阈值。
 	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
 	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
 	// back into the host. 同时注入会话/人格/Provider/Star 管理器，供插件
@@ -435,12 +435,10 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		l.RebridgePlugins()
 	})
 	l.dashboard.SetOnConfigChanged(func() {
-		// 同步插件休眠阈值：用户在系统配置页直接改 plugin_idle_unload_minutes
-		// （非休眠策略 API）时，运行时清扫必须立即生效——否则配置已关（0）
-		// 但 sweep 仍按旧阈值继续休眠插件。
-		l.syncIdleUnload()
+		// 注意：已移除全局 plugin_idle_unload_minutes 同步；
+		// 休眠为单插件独立控制，lifecycle 不再向 runtime 推全局阈值。
 		// Rebuild the pipeline so provider/platform settings changes (e.g. the
-		// default chat model) take effect immediately instead of on restart.
+		// default chat model) take effect immediately instead of on reload.
 		if err := l.ReloadPipelineScheduler("default"); err != nil {
 			logger.Error("Failed to reload pipeline after config change: %v", err)
 		}
@@ -901,24 +899,6 @@ func personaSkillsResolver(personaID string) []string {
 		return result
 	}
 	return nil
-}
-
-// syncIdleUnload reads plugin_idle_unload_minutes from the default config and
-// applies it to the subprocess runtime (0 = 全局休眠关闭，所有插件常驻）。
-// 启动与配置热更新共用，保证配置与运行时清扫行为一致。
-func (l *Lifecycle) syncIdleUnload() {
-	if l.subPluginMgr == nil || l.configMgr == nil {
-		return
-	}
-	cfg := l.configMgr.Get("default")
-	if cfg == nil {
-		return
-	}
-	idleMin := cfg.GetInt("plugin_idle_unload_minutes")
-	if idleMin < 0 {
-		idleMin = 0
-	}
-	l.subPluginMgr.SetIdleUnload(time.Duration(idleMin) * time.Minute)
 }
 
 // fixedHostCapabilities 是宿主无条件公开的固定能力（与 Python AstrBot 的

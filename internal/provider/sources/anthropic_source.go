@@ -35,9 +35,13 @@ func NewAnthropicSource(config, settings map[string]interface{}) *AnthropicSourc
 		streamClient: newStreamClient(),
 	}
 	s.apiBase, _ = config["api_base"].(string)
+	s.apiBase = strings.TrimSpace(s.apiBase)
 	if s.apiBase == "" {
-		s.apiBase = "https://api.anthropic.com/v1"
+		s.apiBase = "https://api.anthropic.com"
 	}
+	// 对齐 Python #9802：api_base trim 空格，空则默认 https://api.anthropic.com；
+	// rstrip("/")；removesuffix("/v1")——用户配了 /v1 也剥掉，Go 侧统一拼 /v1/messages。
+	s.apiBase = strings.TrimSuffix(strings.TrimRight(s.apiBase, "/"), "/v1")
 	if key, ok := config["key"].(string); ok {
 		s.apiKey = key
 	}
@@ -55,7 +59,7 @@ func (s *AnthropicSource) doRequest(ctx context.Context, body map[string]interfa
 	if err != nil {
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
-	url := fmt.Sprintf("%s/messages", s.apiBase)
+	url := fmt.Sprintf("%s/v1/messages", s.apiBase)
 	msgs, _ := body["messages"].([]map[string]interface{})
 	logger.Debug("LLM request: url=%s model=%s messages=%d", url, s.GetModel(), len(msgs))
 	cfg := RetryConfigFromSettings(s.Settings())
@@ -105,13 +109,15 @@ func (s *AnthropicSource) TextChat(ctx context.Context, req *provider.ProviderRe
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
+	// Anthropic 的 input_tokens 排除了 cache 读写，需把 cache_creation_input_tokens
+	// 加回 input_other 以保持总 input 与上下文占用统计准确（对齐 Python #9880）。
 	llmResp := &provider.LLMResponse{
 		Role:          "assistant",
 		ToolsCallArgs: []map[string]interface{}{},
 		ToolsCallName: []string{},
 		ToolsCallIDs:  []string{},
 		Usage: &provider.TokenUsage{
-			InputOther:  result.Usage.InputTokens,
+			InputOther:  result.Usage.InputTokens + result.Usage.CacheCreationInputTokens,
 			InputCached: result.Usage.CacheReadInputTokens,
 			Output:      result.Usage.OutputTokens,
 		},
@@ -234,7 +240,8 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 			case "message_start":
 				if event.Message != nil {
 					responseID = event.Message.ID
-					usage.InputOther = event.Message.Usage.InputTokens
+					// 对齐 Python #9880：input_tokens 不含 cache 读写，需加回 cache_creation。
+					usage.InputOther = event.Message.Usage.InputTokens + event.Message.Usage.CacheCreationInputTokens
 					usage.InputCached = event.Message.Usage.CacheReadInputTokens
 					usage.Output = event.Message.Usage.OutputTokens
 				}
@@ -275,6 +282,10 @@ func (s *AnthropicSource) TextChatStream(ctx context.Context, req *provider.Prov
 				// _update_usage：input 字段缺失时保留 message_start 的值）。
 				if event.Usage != nil {
 					usage.Output = event.Usage.OutputTokens
+					// 对齐 Python #9880：若 message_delta 携带 cache_creation_input_tokens 则累加。
+					if event.Usage.CacheCreationInputTokens > 0 {
+						usage.InputOther += event.Usage.CacheCreationInputTokens
+					}
 				}
 			case "message_stop":
 				ch <- buildFinal()

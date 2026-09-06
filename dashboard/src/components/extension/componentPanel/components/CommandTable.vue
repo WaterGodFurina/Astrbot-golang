@@ -67,6 +67,10 @@ const getPermissionLabel = (permission: string): string => {
 
 // 获取状态信息
 const getStatusInfo = (cmd: CommandItem): StatusInfo => {
+  const isPluginInactive = (cmd: CommandItem) => !cmd.plugin_activated;
+  if (isPluginInactive(cmd)) {
+    return { text: tm('status.pluginDisabled'), color: 'default', variant: 'outlined' };
+  }
   if (cmd.has_conflict) {
     return { text: tm('status.conflict'), color: 'warning', variant: 'flat' };
   }
@@ -87,6 +91,9 @@ const getRowProps = ({ item }: { item: CommandItem }) => {
   }
   if (item.is_group) {
     classes.push('group-row');
+  }
+  if (!item.plugin_activated) {
+    classes.push('plugin-inactive-row');
   }
   return classes.length > 0 ? { class: classes.join(' ') } : {};
 };
@@ -198,6 +205,7 @@ const getRowProps = ({ item }: { item: CommandItem }) => {
               icon
               size="small"
               color="success"
+              :disabled="!item.plugin_activated"
               @click="emit('toggle-command', item)"
             >
               <v-icon size="22">mdi-play</v-icon>

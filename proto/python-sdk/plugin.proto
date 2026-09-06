@@ -1,0 +1,1227 @@
+// AstrBot Go plugin service contract.
+//
+// This is the RPC boundary between the AstrBot host process and a plugin
+// running as a subprocess (go-plugin, gRPC flavor). Plugin authors do NOT
+// touch this file directly; they implement the `sdk.Plugin` struct and call
+// `sdk.Serve(&plugin)`. The generated code under ../gen is produced with:
+//
+//	buf generate
+//
+// The event/component payloads cross the wire as native protobuf (P1 data
+// plane): SDKEvent uses fixed native fields, message chains use `repeated
+// Component`, and only metadata (and component-internal dynamic payloads) use
+// JSON. The SDK (event.go) provides the typed plugin-facing helpers.
+//
+// Bidirectional calls: the HOST serves HostService over the go-plugin gRPC
+// broker (fixed AppID 9000). Plugins dial it lazily via the broker to call
+// platform actions (OneBot API), send messages, or recall messages. The high
+// AppID never collides with go-plugin's auto-incrementing NextId() stream
+// (which starts low and is only used when a plugin implementation opts into
+// the broker itself).
+//
+// EventResult is the extension point for handler outcomes: instead of piling
+// more ad-hoc bool fields onto every response message, future semantics
+// (blocked/consumed/etc.) are added as EventResult fields. Old plugin binaries
+// (compiled against a proto without `result`) leave the field unset; hosts
+// then fall back to the legacy bool fields (stop/sent/handled) that are kept
+// for that exact reason. New plugin binaries fill BOTH the result sub-message
+// and the legacy fields so old hosts keep working. Proto3 forward/backward
+// compatibility rule: only append fields, never remove/reorder/rename.
+syntax = "proto3";
+
+package astrbot.sdk.v1;
+
+option go_package = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1";
+
+// HostServiceAppID is the fixed broker AppID of the HostService
+// (9000). Define this constant in Go on both the SDK and host sides.
+//
+// PluginService is implemented by every plugin subprocess.
+service PluginService {
+  // Register returns plugin metadata and its handler descriptors.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // HandleCommand invokes a registered command handler.
+  rpc HandleCommand(HandleCommandRequest) returns (HandleCommandResponse);
+  // HandleFilter invokes a registered event filter.
+  rpc HandleFilter(HandleFilterRequest) returns (HandleFilterResponse);
+  // HandleHook invokes a registered lifecycle/pipeline hook.
+  rpc HandleHook(HandleHookRequest) returns (HookResponse);
+  // HandleLLMRequest invokes an on_llm_request hook, letting the plugin
+  // inspect/modify the LLM system prompt before the provider call.
+  rpc HandleLLMRequest(HandleLLMRequestRequest) returns (HandleLLMRequestResponse);
+  // HandleTool invokes a registered LLM function tool.
+  rpc HandleTool(HandleToolRequest) returns (HandleToolResponse);
+  // ListTools returns the plugin's CURRENT LLM function tools. Plugin tools are
+  // typically registered during instantiation (Context.add_llm_tools in
+  // __init__/initialize), which happens AFTER Register — so the host pulls the
+  // live tool list through this RPC instead of relying on the Register
+  // snapshot (aligned with Python AstrBot's runtime tool collection).
+  rpc ListTools(Empty) returns (ListToolsResponse);
+  // ListWebApis returns the plugin's CURRENT Web API routes. Plugin routes may
+  // be registered during instantiation (context.register_web_api in
+  // __init__/initialize), after the Register snapshot — so the host pulls the
+  // live route list through this RPC (aligned with ListTools). Old plugin
+  // binaries without this RPC return UNIMPLEMENTED; the host falls back to the
+  // Register snapshot.
+  rpc ListWebApis(Empty) returns (ListWebApisResponse);
+  // HandleWebRequest dispatches a dashboard HTTP request to a plugin-registered
+  // Web API (context.register_web_api / /api/plug/<path>).
+  rpc HandleWebRequest(HandleWebRequestRequest) returns (HandleWebRequestResponse);
+  // HealthCheck is used for keep-alive/readiness probing.
+  rpc HealthCheck(Empty) returns (HealthResponse);
+  // SetLogLevel adjusts the plugin's log level at runtime: the host's
+  // per-plugin override (DEBUG/INFO/WARNING/ERROR/CRITICAL), or "" to
+  // follow the host's global level. Old plugin binaries (compiled against
+  // a proto without this RPC) return UNIMPLEMENTED; the host tolerates it.
+  rpc SetLogLevel(SetLogLevelRequest) returns (Empty);
+  // FeedSessionWait pushes an inbound message event to a plugin that
+  // registered a session wait (session_waiter). Triggered by the host when
+  // a message arrives for a waiting umo. The plugin feeds it into
+  // SessionWaiter.trigger; if no wait matches it returns handled=false.
+  rpc FeedSessionWait(FeedSessionWaitRequest) returns (FeedSessionWaitResponse);
+  // GetConfigSchema returns the plugin's CURRENT config schema (JSON), which
+  // plugins may refresh at runtime (e.g. update_manager fills plugin-list
+  // dropdown options in __init__). Aligns with Python AstrBot's WebUI reading
+  // the live star instance config.schema. Host falls back to the Register
+  // snapshot when this RPC is unimplemented/empty.
+  rpc GetConfigSchema(Empty) returns (GetConfigSchemaResponse);
+  // Cleanup is called when the host unloads the plugin.
+  rpc Cleanup(Empty) returns (Empty);
+  // FeedCronJob 宿主 cron 到点触发插件注册的 basic 任务（经 CronCreate
+  // 注册、payload 带 _plugin_id），插件执行注册的 handler；无匹配 handler
+  // 返回 handled=false（对齐 FeedSessionWait 语义）。
+  rpc FeedCronJob(FeedCronJobRequest) returns (FeedCronJobResponse);
+}
+
+// HostService is served by the HOST and dialed by plugins for reverse calls.
+service HostService {
+  // CallAction forwards a platform API call (e.g. OneBot v11 call_action).
+  rpc CallAction(CallActionRequest) returns (CallActionResponse);
+  // SendMessage sends a message chain to a session (proactive/reactive send).
+  rpc SendMessage(SendMessageRequest) returns (Empty);
+  // RecallMessage recalls an already-sent message by platform message id.
+  rpc RecallMessage(RecallMessageRequest) returns (Empty);
+  // GetConfig returns the plugin's persisted config (plugins/<name>/config.json).
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+  // SetConfig persists the plugin's config (plugins/<name>/config.json).
+  rpc SetConfig(SetConfigRequest) returns (Empty);
+  // ChatLLM calls the host's default chat LLM provider and returns the reply.
+  rpc ChatLLM(ChatLLMRequest) returns (ChatLLMResponse);
+  // React adds an emoji reaction to a message (platforms supporting it).
+  rpc React(ReactRequest) returns (Empty);
+  // TextToImage renders text into an image (host t2i engine) and returns the
+  // PNG bytes (base64). The plugin can then send it as an Image component.
+  rpc TextToImage(TextToImageRequest) returns (TextToImageResponse);
+  // HtmlRender renders an HTML template + data into an image via the host
+  // (t2i remote preferred, local gg fallback). Returns PNG bytes (base64).
+  rpc HtmlRender(HtmlRenderRequest) returns (HtmlRenderResponse);
+
+  // ── 会话管理（对齐 Python AstrBot conversation_manager）──
+  // 取会话当前 ID（umo 无会话时返回空串）。
+  rpc GetCurrConversationID(ConversationIDRequest) returns (ConversationIDResponse);
+  // 新建会话（设为当前）并返回其 ID。
+  rpc NewConversation(NewConversationRequest) returns (ConversationIDResponse);
+  // 按 umo+cid 取会话（create_if_not_exists 时不存在则新建）。
+  rpc GetConversation(GetConversationRequest) returns (ConversationResponse);
+  // 列出某 umo 的全部会话（无 umo 时列出全部）。
+  rpc GetConversations(GetConversationsRequest) returns (ConversationsResponse);
+  // 删除会话（按 umo+cid；cid 空时删除当前会话）。
+  rpc DeleteConversation(DeleteConversationRequest) returns (Empty);
+  // 切换当前会话（设置 umo 的 current cid）。
+  rpc SwitchConversation(SwitchConversationRequest) returns (Empty);
+  // 更新会话标题。
+  rpc UpdateConversationTitle(UpdateConversationTitleRequest) returns (Empty);
+  // 更新会话绑定的人格。
+  rpc UpdateConversationPersonaID(UpdateConversationPersonaRequest) returns (Empty);
+
+  // ── 人格管理（对齐 Python AstrBot persona_manager）──
+  // 取全部人格。
+  rpc GetPersonas(Empty) returns (PersonasResponse);
+  // 取默认人格（按 umo 解析默认人格 id/name）。
+  rpc GetDefaultPersona(GetDefaultPersonaRequest) returns (PersonaResponse);
+  // 取文件夹树（嵌套结构）+ 全部人格。
+  rpc GetPersonaTree(Empty) returns (PersonaTreeResponse);
+  // 解析当前生效人格（会话/规则/默认的优先级合并）。
+  rpc ResolveSelectedPersona(ResolvePersonaRequest) returns (ResolvePersonaResponse);
+
+  // ── Provider 管理（对齐 Python AstrBot provider_manager）──
+  // 列出全部 provider（按能力类型过滤，空=全部）。
+  rpc ListProviders(ListProvidersRequest) returns (ProvidersResponse);
+  // 取某 umo 当前使用的 provider（按能力类型）。
+  rpc GetUsingProvider(GetUsingProviderRequest) returns (ProviderResponse);
+  // 设置某 umo 的当前 provider。
+  rpc SetProvider(SetProviderRequest) returns (Empty);
+  // 取 provider 的模型列表。
+  rpc GetProviderModels(GetProviderModelsRequest) returns (ProviderModelsResponse);
+
+  // ── 插件/Star 管理（对齐 Python AstrBot star_manager）──
+  // 列出全部已安装插件（Star 元数据）。
+  rpc GetPluginRegistry(Empty) returns (StarsResponse);
+  // 按插件名取 Star 元数据。
+  rpc GetStar(GetStarRequest) returns (StarResponse);
+  // 启用/禁用插件。
+  rpc SetPluginEnabled(SetPluginEnabledRequest) returns (Empty);
+  // 安装插件（git/url 源）。
+  rpc InstallPlugin(InstallPluginRequest) returns (Empty);
+  // UninstallPlugin 卸载插件。
+  rpc UninstallPlugin(UninstallPluginRequest) returns (Empty);
+  // ListCommandDescriptors 返回全部插件的命令描述符（含子命令/组/别名/
+  // 权限/描述）。子进程架构下插件自身进程的 star 注册表只含自己的
+  // handler，helps 类插件需经宿主查询全局指令列表。
+  rpc ListCommandDescriptors(Empty) returns (CommandDescriptorsResponse);
+  // ListPlatforms 返回全部已加载平台实例元数据（id/type/name/display_name/
+  // config），供插件（如群分析类）发现平台并创建跨进程 bot 代理。
+  rpc ListPlatforms(Empty) returns (PlatformsResponse);
+
+  // ── 会话等待（SessionWaiter 跨进程喂入）──
+  // 插件注册"等待某 umo 的下一条消息"（session_waiter.register_wait）。
+  // 宿主收到该 umo 的消息时经 PluginService.FeedSessionWait 推送事件。
+  rpc RegisterSessionWait(RegisterSessionWaitRequest) returns (RegisterSessionWaitResponse);
+  // 插件注销等待（会话结束/超时）。
+  rpc UnregisterSessionWait(UnregisterSessionWaitRequest) returns (Empty);
+
+  // ── 桥接钩子（botpy/telegram 等兼容层）──
+  rpc RegisterBridgeHook(BridgeHookRequest) returns (Empty);
+  rpc UnregisterBridgeHook(BridgeHookRequest) returns (Empty);
+
+  // ── 大文件 Blob 存储（P0-2）──────────────────────────────
+  // 插件把大于 inline 阈值（1MB）的二进制交给宿主持久化，拿到一个受控
+  // handle；后续经 ReadBlob 分块读取。宿主统一管理生命周期（TTL/GC），
+  // 插件只传 handle，绝不传任意文件路径（防路径穿越）。
+  rpc CreateBlob(CreateBlobRequest) returns (CreateBlobResponse);
+  // ReadBlob 按 offset/limit 分块读，避免单次大缓冲。
+  rpc ReadBlob(ReadBlobRequest) returns (ReadBlobResponse);
+  rpc GetBlobInfo(GetBlobInfoRequest) returns (GetBlobInfoResponse);
+  rpc ReleaseBlob(ReleaseBlobRequest) returns (Empty);
+
+  // ── 技能（Skills，宿主 internal/skills 能力 → 插件可读可改）──
+  // ListSkills 返回宿主技能管理器中的全部技能（SkillInfo JSON 列表）。
+  rpc ListSkills(Empty) returns (SkillsResponse);
+  // SetSkillActive 启用/禁用指定技能。
+  rpc SetSkillActive(SetSkillActiveRequest) returns (Empty);
+  // DeleteSkill 删除指定技能。
+  rpc DeleteSkill(DeleteSkillRequest) returns (Empty);
+
+  // ── 平台消息历史（宿主 db platform_message_history 表 → 插件可读可改）──
+  // GetPlatformMessageHistory 按平台/用户取最近 n 条消息记录。
+  rpc GetPlatformMessageHistory(GetPMHistoryRequest) returns (PMHistoryRecordsResponse);
+  // InsertPlatformMessageHistory 插入一条平台消息记录。
+  rpc InsertPlatformMessageHistory(InsertPMHistoryRequest) returns (PMHistoryRecordResponse);
+  // UpdatePlatformMessageHistory 更新一条记录（content / llm_checkpoint_id）。
+  rpc UpdatePlatformMessageHistory(UpdatePMHistoryRequest) returns (Empty);
+  // DeletePlatformMessageHistory 按 ID 删除一条记录。
+  rpc DeletePlatformMessageHistory(DeletePMHistoryRequest) returns (Empty);
+
+  // ── 知识库（对齐宿主 internal/knowledgebase/manager.go）──
+  // KBRetrieve 检索知识库：按 query 做向量/融合检索。kb_names 为空 =
+  // 宿主全部启用中的知识库；top_k_fusion 为融合召回数，top_m_final 为最终
+  // 保留条数（<=0 用宿主默认）。返回拼接后的上下文文本与检索结果 JSON 数组
+  // （空结果时 context_text 为空、results_json 为 "[]"）。
+  rpc KBRetrieve(KBRetrieveRequest) returns (KBRetrieveResponse);
+  // KBUploadFromURL 让宿主从 URL 拉取文档写入指定知识库并分块（chunk_size/
+  // chunk_overlap <=0 用宿主默认）。
+  rpc KBUploadFromURL(KBUploadFromURLRequest) returns (Empty);
+  // KBListKBs 列出宿主全部知识库元数据（每项为 KnowledgeBase 结构 JSON）。
+  rpc KBListKBs(Empty) returns (KBListResponse);
+
+  // ── 技能视图扩展（sandbox runtime 视图）──
+  // ListSkillsV2 带过滤参数的技能列表：active_only 仅返回启用技能；runtime
+  // 过滤运行时视图（"local"/"sandbox"/""=全部）；show_sandbox_path 返回
+  // sandbox 路径而非宿主本地路径。复用既有 SkillsResponse。
+  rpc ListSkillsV2(ListSkillsV2Request) returns (SkillsResponse);
+
+  // ── 文件令牌（file_token 文件服务）──
+  // RegisterFileToken 把一个宿主侧文件路径登记为一次性令牌（timeout_sec
+  // =0 用宿主默认 TTL），返回的 token 可供下游（如 sandbox runtime）凭
+  // token 读取文件，避免暴露真实路径。
+  rpc RegisterFileToken(RegisterFileTokenRequest) returns (RegisterFileTokenResponse);
+
+  // ── 插件定时任务（宿主 internal/cron）──
+  // CronCreate 创建定时任务（job_type: cron / interval / once 等，run_once
+  // + run_at(RFC3339) 用于一次性任务），返回宿主 Job 快照。
+  rpc CronCreate(CronCreateRequest) returns (CronJobResponse);
+  // CronUpdate 按 job_id 更新任务字段（fields_json 指定更新字段集）。
+  rpc CronUpdate(CronUpdateRequest) returns (CronJobResponse);
+  // CronDelete 删除指定定时任务。
+  rpc CronDelete(CronDeleteRequest) returns (Empty);
+  // CronList 列出定时任务（job_type 空=全部）。
+  rpc CronList(CronListRequest) returns (CronJobsResponse);
+  // CronRunNow 立即触发一次指定任务。
+  rpc CronRunNow(CronRunNowRequest) returns (Empty);
+
+  // ── 宿主 MCP 读写桥接（只读列出 + 调用宿主侧 MCP 工具；插件自管 MCP
+  // 不经此通道）──
+  // McpListTools 列出宿主已连接 MCP server 的全部工具
+  //（每项 {server, name, description, schema_json}）。
+  rpc McpListTools(Empty) returns (McpToolsResponse);
+  // McpCallTool 调用宿主侧 MCP 工具（server + tool_name + arguments_json），
+  // 返回完整结果 JSON / 纯文本摘要 / 是否出错。
+  rpc McpCallTool(McpCallToolRequest) returns (McpCallToolResponse);
+}
+
+
+// SDKEvent 是事件的 proto 原生表示（P1）。固定高频字段走 protobuf 原生，
+// 组件走 repeated Component（原生），仅动态 metadata 保留 JSON。新协议下
+// Event 分发路径 0 次 JSON 编解码。
+message SDKEvent {
+  string type          = 1;
+  string platform      = 2;
+  string platform_id   = 3;
+  string message_type  = 4;
+  string self_id       = 5;
+  string sender_id     = 6;
+  string sender_name   = 7;
+  string conv_id       = 8;
+  string group_name    = 9;
+  bool   is_group      = 10;
+  bool   is_at_bot     = 11;
+  bool   is_admin      = 12;
+  string message_str   = 13;
+  string plain_text    = 14;
+  string raw_message   = 15;
+  int64  timestamp     = 16;
+  string message_id    = 17;
+  repeated Component components = 18;
+  bytes  metadata_json = 19;
+}
+
+// BinaryPayload 承载二进制内容：≤inline 阈值内联 bytes；超过阈值走
+// FileReference（宿主 blob handle）。用于图片/音频/视频/文件/渲染结果等。
+message BinaryPayload {
+  oneof payload {
+    bytes inline_data = 1;
+    FileReference file = 2;
+  }
+  string mime_type = 3;
+  string filename = 4;
+}
+
+// FileReference 引用宿主 Blob 存储中的一个文件。handle_id 为高熵随机串，
+// 非文件路径，杜绝 ../ 等路径穿越；大小/MIME 便于下游无需 ReadBlob 也能
+// 决策。
+message FileReference {
+  string handle_id = 1;
+  int64 size = 2;
+  string mime_type = 3;
+  string filename = 4;
+  int64 expires_at = 5; // Unix 秒；宿主 TTL 判定用（仅信息性）。
+}
+
+message CreateBlobRequest {
+  // 待持久化的原始字节（一次一 blob，宿主负责落盘）。
+  bytes data = 1;
+  string mime_type = 2;
+  string filename = 3;
+  int32 ttl_seconds = 4; // 可选覆盖默认 TTL；<=0 用宿主默认。
+}
+
+message CreateBlobResponse {
+  FileReference file = 1;
+}
+
+message ReadBlobRequest {
+  string handle_id = 1;
+  int64 offset = 2; // 0 起
+  int32 limit = 3;  // 0 = 宿主默认块大小（1MB）
+}
+
+message ReadBlobResponse {
+  bytes data = 1;
+  bool eof = 2;
+  int64 total_size = 3;
+}
+
+message GetBlobInfoRequest {
+  string handle_id = 1;
+}
+
+message GetBlobInfoResponse {
+  FileReference file = 1;
+}
+
+message ReleaseBlobRequest {
+  string handle_id = 1;
+}
+
+message Empty {}
+
+// EventResult aggregates the handler-outcome flags that used to be scattered
+// bool fields on individual response messages (sent / stop / handled). It is
+// the forward extension point: future semantics (blocked, consumed, ...) are
+// added here instead of as more top-level bools. `skip_llm` is reserved for
+// "do not invoke the LLM" (conceptually distinct from stop_propagation) and
+// is currently only passed through — hosts that do not consume it ignore it.
+message EventResult {
+  // handler 产生了结果（例如回复链/文本/拒绝动作已产生）。
+  bool handled = 1;
+  // sent: the plugin performed a send operation during the handler
+  // (Python _has_send_oper semantics). The host must not fall through to the
+  // LLM when a reply was already produced this way.
+  bool sent = 2;
+  // stop_propagation: stop the pipeline from continuing (legacy `stop`).
+  bool stop_propagation = 3;
+  // skip_llm: reserved concept — skip the LLM call for this message.
+  bool skip_llm = 4;
+}
+
+// CommandDesc describes a command the plugin accepts.
+message CommandDesc {
+  string name = 1;
+  repeated string aliases = 2;
+  string description = 3;
+  string usage = 4;
+  string permission = 5; // "everyone" | "admin"
+  // Group/sub-command relation (empty when the command is top-level).
+  string parent_group = 6;
+  bool is_sub_command = 7;
+}
+
+// FilterDesc describes an event filter the plugin registers.
+message FilterDesc {
+  string name = 1;
+}
+
+// HookDesc describes a lifecycle/pipeline hook the plugin registers.
+message HookDesc {
+  string name = 1;
+  string event = 2; // e.g. "startup", "on_message", "on_llm_response"
+}
+
+// ToolDesc describes an LLM function tool the plugin exposes to the model.
+message ToolDesc {
+  string name = 1;
+  string description = 2;
+  // JSON object schema of the tool parameters.
+  bytes params_json = 3;
+}
+
+message RegisterRequest {
+  // 连接级协议版本（P1 协商）：插件上报自身支持的最高协议版本。旧 SDK 不填
+  // =0 → 宿主按 legacy（event_json / chain_json）路径。P1_MIN_PROTOCOL=2。
+  int32 protocol_version = 1;
+}
+
+// SetLogLevelRequest carries the desired log level name
+// (DEBUG/INFO/WARNING/ERROR/CRITICAL) or "" to follow the host's global level.
+message SetLogLevelRequest {
+  string level = 1;
+}
+
+message RegisterResponse {
+  string name = 1;
+  string version = 2;
+  string description = 3;
+  string author = 4;
+  repeated CommandDesc commands = 5;
+  repeated FilterDesc filters = 6;
+  repeated HookDesc hooks = 7;
+  // JSON of the plugin's config schema (map[string]any).
+  bytes config_schema_json = 8;
+  repeated ToolDesc tools = 9;
+  // Web APIs registered via context.register_web_api (Python SDK).
+  repeated WebApiDesc web_apis = 10;
+  // 宿主支持的协议版本（P1 协商）。插件据此决定后续事件/链走 native 还是 legacy。
+  int32 protocol_version = 11;
+}
+
+// WebApiDesc describes a Web UI API route a plugin registered
+// (context.register_web_api). The host proxies /api/plug/<plugin>/<route>
+// requests to the plugin process, which matches the route (including dynamic
+// <param> segments) and runs the handler.
+message WebApiDesc {
+  // Route pattern like "/meme_manager/emoji/<category>" (or without the
+  // leading plugin segment).
+  string route = 1;
+  repeated string methods = 2;
+  string description = 3;
+}
+
+message WebKV {
+  string key = 1;
+  string value = 2;
+}
+
+message WebUploadFile {
+  string field = 1;
+  string filename = 2;
+  string content_type = 3;
+  bytes content = 4;
+}
+
+message HandleWebRequestRequest {
+  string method = 1;
+  // Sub-path after /api/plug/<plugin_name>/ (e.g. "emoji/happy").
+  string path = 2;
+  // Multi-value query string pairs.
+  repeated WebKV query = 3;
+  repeated WebKV headers = 4;
+  bytes body = 5;
+  repeated WebUploadFile files = 6;
+}
+
+message HandleWebRequestResponse {
+  int32 status_code = 1;
+  repeated WebKV headers = 2;
+  bytes body = 3;
+}
+
+message HandleCommandRequest {
+  string name = 1;
+  repeated string args = 2;
+  reserved 3; // 曾为 legacy event_json（P1 移除，不复用 field number）
+  // 原生事件（P1）：Event 路径 0 JSON。
+  SDKEvent event = 4;
+}
+
+message HandleCommandResponse {
+  string text = 1;
+  reserved 2; // 曾为 legacy chain_json（P1 移除）
+  bool stop = 3;
+  // sent: the plugin performed a send operation during the handler (Python
+  // AstrBot _has_send_oper semantics). The host must not fall through to the
+  // LLM when the command already produced a reply this way.
+  bool sent = 4;
+  // EventResult aggregates the outcome flags; hosts read from `result` and
+  // fall back to the legacy fields above when it is absent (old binaries).
+  EventResult result = 5;
+  // 原生响应链（P1）：协议版本≥2 时优先，Response 链 0 JSON。
+  repeated Component chain = 6;
+}
+
+message HandleFilterRequest {
+  string name = 1;
+  reserved 2; // 曾为 legacy event_json（P1 移除）
+  // 原生事件（P1）。
+  SDKEvent event = 3;
+}
+
+message HandleFilterResponse {
+  bool allow = 1;
+  // sent: the plugin sent a message while running the filter.
+  bool sent = 2;
+  // EventResult aggregates the outcome flags (legacy fallback: sent).
+  EventResult result = 3;
+}
+
+message HandleHookRequest {
+  string name = 1;
+  reserved 2, 3; // 曾为 legacy event_json / chain_json（P1 移除）
+  // 原生事件（P1）。
+  SDKEvent event = 5;
+  // 原生入站 result chain（P1）：装饰类钩子的当前结果链。
+  repeated Component chain = 6;
+  // JSON of the hook-specific dynamic payload (e.g. sdk.LLMResponse for
+  // on_llm_response, sdk.ToolCall for on_using_llm_tool/on_llm_tool_respond,
+  // sdk.PluginError for on_plugin_error). 保留 JSON（动态结构，非 Message Chain）。
+  bytes payload_json = 4;
+}
+
+// HookResponse replaces Empty as the HandleHook return value so hooks can
+// decorate the outgoing reply chain and/or stop the pipeline.
+message HookResponse {
+  reserved 1; // 曾为 legacy chain_json（P1 移除）
+  bool stop = 2;
+  bool handled = 3;
+  // sent: the plugin sent a message while running the hook.
+  bool sent = 4;
+  // EventResult aggregates the outcome flags (legacy fallback: stop/handled/sent).
+  EventResult result = 5;
+  // 原生响应链（P1）：协议版本≥2 时优先。
+  repeated Component chain = 6;
+}
+
+message HandleLLMRequestRequest {
+  string name = 1;
+  reserved 2; // 曾为 legacy event_json（P1 移除）
+  // 原生事件（P1）。
+  SDKEvent event = 5;
+  // Current system prompt (may be modified by the plugin).
+  string system_prompt = 3;
+  // User prompt being sent to the model.
+  string user_prompt = 4;
+}
+
+message HandleLLMRequestResponse {
+  // (Possibly modified) system prompt.
+  string system_prompt = 1;
+  // Stop: do not call the LLM for this message.
+  bool stop = 2;
+  // sent: the plugin sent a message while running the hook.
+  bool sent = 3;
+  // EventResult aggregates the outcome flags (legacy fallback: stop/sent).
+  EventResult result = 4;
+  // (Possibly modified) user prompt sent back to the model.
+  string user_prompt = 5;
+}
+
+message HandleToolRequest {
+  string name = 1;
+  // JSON of the tool arguments (map[string]any)。动态参数结构，保留 JSON。
+  bytes args_json = 2;
+  reserved 3; // 曾为 legacy event_json（P1 移除）
+  // 原生事件（P1）。
+  SDKEvent event = 4;
+}
+
+message HandleToolResponse {
+  // Text result fed back to the model as the tool message.
+  string text = 1;
+  bool is_error = 2;
+  // sent: the plugin sent a message while running the tool.
+  bool sent = 3;
+  // EventResult aggregates the outcome flags (legacy fallback: sent).
+  EventResult result = 4;
+}
+
+message ListToolsResponse {
+  repeated ToolDesc tools = 1;
+}
+
+message ListWebApisResponse {
+  repeated WebApiDesc web_apis = 1;
+}
+
+message HealthResponse {
+  bool ok = 1;
+  double load = 2;
+  string version = 3;
+}
+
+// --- HostService payloads --------------------------------------------------
+
+message CallActionRequest {
+  // Platform adapter id (e.g. "aiocqhttp"). Empty = any adapter.
+  string platform = 1;
+  // OneBot v11 API name, e.g. "get_group_member_info".
+  string api = 2;
+  // JSON object of action params.
+  bytes params_json = 3;
+}
+
+message CallActionResponse {
+  // JSON object returned by the platform (data field unwrapped).
+  bytes result_json = 1;
+}
+
+message SendMessageRequest {
+  // Platform adapter id (e.g. "aiocqhttp").
+  string platform = 1;
+  // Conversation id (group id or friend user id).
+  string session_id = 2;
+  reserved 3; // 曾为 legacy chain_json（P1 移除）
+  // 原生组件链。媒体组件可携带 BinaryPayload（≤inline 阈值内联 bytes；
+  // >阈值走 FileReference blob handle），宿主读 blob 组装平台消息。
+  repeated Component chain_components = 4;
+}
+
+// Component 是消息链的 proto 原生表示（P0-2），与 SDK 的扁平 Component
+// 结构对齐；媒体二进制经 payload（BinaryPayload）承载。
+message Component {
+  string type = 1;
+  string text = 2;
+  string target_id = 3;
+  string name = 4;
+  string url = 5;
+  string path = 6;
+  string file = 7;
+  bytes base64_data = 8;
+  string file_id = 9;
+  string id = 10;
+  bytes data_json = 11;      // Json 卡片等动态结构（保留 JSON）
+  BinaryPayload payload = 12; // 媒体二进制（inline bytes 或 FileReference）
+}
+
+message RecallMessageRequest {
+  // Platform adapter id.
+  string platform = 1;
+  // Platform message id to recall.
+  string message_id = 2;
+}
+
+message GetConfigRequest {
+  // Plugin name (the value returned by Register).
+  string plugin_name = 1;
+}
+
+message GetConfigResponse {
+  // JSON object of the plugin's persisted config.
+  bytes config_json = 1;
+}
+
+message SetConfigRequest {
+  // Plugin name (the value returned by Register).
+  string plugin_name = 1;
+  // JSON object of the full config to persist.
+  bytes config_json = 2;
+}
+
+// 只追加字段保持前后向兼容：旧字段不改名/不改号/不删除。
+message ChatLLMRequest {
+  // User prompt sent to the model.
+  string prompt = 1;
+  // Optional system prompt prepended to the request.
+  string system_prompt = 2;
+  // Optional session id (unified message origin) used to resolve the session's
+  // preferred provider. Empty = default provider.
+  string session_id = 3;
+  // Optional image URLs/paths/base64 appended to the user message
+  // (multimodal request).
+  repeated string image_urls = 4;
+  // 多模态音频 URL/路径（provider 支持时）。
+  repeated string audio_urls = 5;
+  // 函数工具定义 JSON 数组（OpenAI function schema）。
+  bytes tools_json = 6;
+  // 多轮上下文 JSON 数组（[{"role","content"}]）。
+  bytes contexts_json = 7;
+  // 指定 provider id；空 = 使用默认 provider。
+  string provider_id = 8;
+}
+
+message ChatLLMResponse {
+  // The model's reply text.
+  string text = 1;
+}
+
+message ReactRequest {
+  // Platform adapter id (e.g. "qq_official").
+  string platform = 1;
+  // Conversation id (group id or friend user id).
+  string session_id = 2;
+  // Platform message id to react to.
+  string message_id = 3;
+  // Emoji to add (e.g. "👍").
+  string emoji = 4;
+}
+
+message TextToImageRequest {
+  // Text to render into an image.
+  string text = 1;
+  // Optional t2i template name (host-dependent; empty = default).
+  string template_name = 2;
+}
+
+message TextToImageResponse {
+  // PNG image bytes, base64-encoded (no data: prefix). 保留：旧 SDK 依赖。
+  string image_base64 = 1;
+  // PNG image raw bytes. 新增（P0-1）：新 SDK 优先读它，免去一次 base64 往返。
+  bytes image_bytes = 2;
+}
+
+message HtmlRenderRequest {
+  // HTML/Jinja2 模板字符串。
+  string template = 1;
+  // 模板数据 JSON 字符串。
+  string data = 2;
+  // 渲染选项 JSON 字符串（如 {"type":"png","full_page":true}）。
+  string options = 3;
+}
+
+message HtmlRenderResponse {
+  // PNG bytes base64（无 data: 前缀）。保留：旧 SDK 依赖。
+  string image_base64 = 1;
+  // PNG image raw bytes. 新增（P0-1）：新 SDK 优先读它。
+  bytes image_bytes = 2;
+}
+
+// --- Conversation management payloads ---------------------------------------
+
+message ConversationIDRequest {
+  string unified_msg_origin = 1;
+}
+
+message ConversationIDResponse {
+  string cid = 1;
+}
+
+message NewConversationRequest {
+  string unified_msg_origin = 1;
+  string platform_id = 2;
+  string persona_id = 3;
+}
+
+message GetConversationRequest {
+  string unified_msg_origin = 1;
+  string conversation_id = 2;
+  bool create_if_not_exists = 3;
+}
+
+message ConversationResponse {
+  // JSON of the conversation (cid/title/persona_id/history/updated_at/...).
+  bytes conversation_json = 1;
+}
+
+message GetConversationsRequest {
+  string unified_msg_origin = 1; // empty = all
+}
+
+message ConversationsResponse {
+  repeated bytes conversations_json = 1; // JSON per conversation
+}
+
+message DeleteConversationRequest {
+  string unified_msg_origin = 1;
+  string conversation_id = 2; // empty = current
+}
+
+message SwitchConversationRequest {
+  string unified_msg_origin = 1;
+  string conversation_id = 2;
+}
+
+message UpdateConversationTitleRequest {
+  string unified_msg_origin = 1;
+  string conversation_id = 2; // empty = current
+  string title = 3;
+}
+
+message UpdateConversationPersonaRequest {
+  string unified_msg_origin = 1;
+  string conversation_id = 2; // empty = current
+  string persona_id = 3;
+}
+
+// --- Persona management payloads --------------------------------------------
+
+message PersonaPayload {
+  string id = 1;
+  string name = 2;
+  string prompt = 3;
+  bool is_default = 4;
+  string folder_id = 5;
+}
+
+message GetDefaultPersonaRequest {
+  string umo = 1;
+}
+
+message PersonaResponse {
+  bytes persona_json = 1; // JSON of PersonaPayload
+}
+
+message PersonasResponse {
+  repeated bytes personas_json = 1;
+}
+
+message PersonaTreeResponse {
+  repeated bytes folders_json = 1; // nested {name,folder_id,children}
+  repeated bytes personas_json = 2; // flat PersonaPayload list
+}
+
+message ResolvePersonaRequest {
+  string umo = 1;
+  string conversation_persona_id = 2;
+  string platform_name = 3;
+  bytes provider_settings_json = 4; // JSON of provider_settings map
+}
+
+message ResolvePersonaResponse {
+  string persona_id = 1;
+  string persona_name = 2;
+  string persona_prompt = 3;
+  string force_applied_persona_id = 4;
+  bool is_default = 5;
+}
+
+// --- Provider management payloads -------------------------------------------
+
+message ListProvidersRequest {
+  // capability filter: chat_completion | text_to_speech | speech_to_text |
+  // embedding | rerank. Empty = all.
+  string capability = 1;
+}
+
+message ProviderPayload {
+  string id = 1;
+  string model = 2;
+  string type = 3; // adapter name (openai, ollama, ...)
+  string provider_type = 4; // capability
+  string desc = 5;
+}
+
+message ProvidersResponse {
+  repeated bytes providers_json = 1; // JSON of ProviderPayload
+}
+
+message GetUsingProviderRequest {
+  string umo = 1;
+  string capability = 2; // empty = chat_completion
+}
+
+message ProviderResponse {
+  bytes provider_json = 1; // JSON of ProviderPayload
+}
+
+message SetProviderRequest {
+  string umo = 1;
+  string provider_id = 2;
+  string capability = 3; // empty = chat_completion
+}
+
+message GetProviderModelsRequest {
+  string provider_id = 1;
+}
+
+message ProviderModelsResponse {
+  repeated string models = 1;
+}
+
+// --- Plugin/Star management payloads ----------------------------------------
+
+message StarPayload {
+  string name = 1;
+  string author = 2;
+  string desc = 3;
+  string version = 4;
+  string module_path = 5;
+  bool activated = 6;
+  string repo = 7;
+}
+
+message GetStarRequest {
+  string name = 1;
+}
+
+message StarsResponse {
+  repeated bytes stars_json = 1; // JSON of StarPayload
+}
+
+// 单条命令描述符（JSON 序列化承载，对齐宿主 star.CommandDescriptor）。
+message CommandDescriptorPayload {
+  string plugin_name = 1;       // 归属插件 id（如 astrbot_plugin_xxx_python）
+  string handler_full_name = 2; // 宿主注册表全名
+  string handler_name = 3;      // 命令 handler 名
+  string command = 4;           // 有效命令（组命令为组名）
+  repeated string aliases = 5;  // 别名（不含父组前缀）
+  string description = 6;
+  string permission = 7;        // "admin" | "member"
+  bool enabled = 8;
+  string parent_group = 9;      // 子命令的父组名（非子命令为空）
+  bool is_sub_command = 10;
+  string command_type = 11;     // "group" 或空
+}
+
+message CommandDescriptorsResponse {
+  repeated bytes descriptors_json = 1; // JSON of CommandDescriptorPayload
+}
+
+// 单条平台实例元数据（JSON 序列化承载）。
+message PlatformPayload {
+  string id = 1;           // 实例 ID（如 "default"）
+  string type = 2;         // 平台类型（如 "aiocqhttp"）
+  string name = 3;         // 类型名（同 type）
+  string display_name = 4; // 展示名
+  bytes config_json = 5;   // 平台配置 JSON（appid 等）
+}
+
+message PlatformsResponse {
+  repeated bytes platforms_json = 1; // JSON of PlatformPayload
+}
+
+message StarResponse {
+  bytes star_json = 1; // JSON of StarPayload
+}
+
+message SetPluginEnabledRequest {
+  string plugin_name = 1;
+  bool enabled = 2;
+}
+
+message InstallPluginRequest {
+  string repo = 1; // git url / plugin name
+}
+
+message UninstallPluginRequest {
+  string plugin_name = 1;
+}
+
+// --- Session wait payloads --------------------------------------------------
+
+message RegisterSessionWaitRequest {
+  // Unified message origin the plugin waits on (e.g. "aiocqhttp:GroupMessage:123").
+  string umo = 1;
+  // Timeout seconds after which the wait expires (host does not push events).
+  int32 timeout_seconds = 2;
+}
+
+message RegisterSessionWaitResponse {
+  // Host-assigned wait id, used by UnregisterSessionWait.
+  string wait_id = 1;
+}
+
+message UnregisterSessionWaitRequest {
+  string wait_id = 1;
+}
+
+// 插件向宿主注册"桥接钩子"（botpy/telegram 等兼容层用）：宿主收到入站
+// 消息时把序列化事件推给该插件的 HandleHook(name=hook_name)，兼容层再
+// 分发到装饰器注册的 handler。注册表为空 = 宿主零额外推送开销。
+message BridgeHookRequest {
+  string plugin_name = 1;
+  string hook_name = 2;
+}
+
+message FeedSessionWaitRequest {
+  reserved 1; // 曾为 legacy event_json（P1 移除）
+  // 原生事件（P1）。
+  SDKEvent event = 2;
+}
+
+message FeedSessionWaitResponse {
+  // Whether a registered wait consumed this event.
+  bool handled = 1;
+}
+
+message GetConfigSchemaResponse {
+  bytes schema_json = 1; // JSON schema (FlatSchema format: {"type":..., "properties":{...}} or raw)
+}
+
+// ── 技能（Skills）──
+// 宿主 internal/skills 的 SkillInfo 序列化（字段名与 Python SDK
+// skills/SkillInfo + 宿主 go ListSkillsInfo 对齐）。
+message SkillsResponse {
+  repeated bytes skills_json = 1; // 每条为 SkillInfo JSON（name/description/path/active/...）
+}
+
+message SetSkillActiveRequest {
+  // 技能名（目录段安全校验由宿主执行）。
+  string name = 1;
+  bool active = 2;
+}
+
+message DeleteSkillRequest {
+  string name = 1;
+}
+
+// ── 平台消息历史 ──
+// 与宿主 db platform_message_history 表 + Python SDK
+// PlatformMessageHistoryManager 字段对齐。
+message PMHistoryRecord {
+  int64 id = 1;
+  string platform_id = 2;
+  string user_id = 3;
+  string sender_id = 4;
+  bytes content_json = 5;
+  string llm_checkpoint_id = 6;
+  string created_at = 7; // RFC3339 / ISO 串
+}
+
+message GetPMHistoryRequest {
+  // 平台实例 ID（空 = 全部）。
+  string platform_id = 1;
+  // 用户 ID / unified message origin（空 = 全部）。
+  string user_id = 2;
+  // 返回最近 limit 条（<=0 = 宿主默认 200）。
+  int32 limit = 3;
+}
+
+message PMHistoryRecordsResponse {
+  repeated bytes records_json = 1; // 每条为 PMHistoryRecord JSON
+}
+
+message InsertPMHistoryRequest {
+  string platform_id = 1;
+  string user_id = 2;
+  string sender_id = 3;
+  bytes content_json = 4;
+  string llm_checkpoint_id = 5;
+  // max_messages：该 (platform_id,user_id) 键保留的最大条数
+  //（>0 时宿主自动裁剪最旧记录；=0 / 省略按宿主默认）。
+  int32 max_messages = 6;
+}
+
+message PMHistoryRecordResponse {
+  bytes record_json = 1; // 插入后的完整记录 JSON
+}
+
+message UpdatePMHistoryRequest {
+  int64 id = 1;
+  bytes content_json = 2;
+  string llm_checkpoint_id = 3;
+}
+
+message DeletePMHistoryRequest {
+  int64 id = 1;
+}
+
+// ── 知识库（KnowledgeBase，宿主 internal/knowledgebase/manager.go）──
+
+// KBRetrieveRequest 检索请求。kb_names 空 = 宿主全部启用中的知识库。
+message KBRetrieveRequest {
+  // 检索查询文本。
+  string query = 1;
+  // 限定参与检索的知识库名列表；空 = 宿主全部启用 KB。
+  repeated string kb_names = 2;
+  // 融合召回条数（<=0 用宿主默认）。
+  int32 top_k_fusion = 3;
+  // 最终保留条数（<=0 用宿主默认）。
+  int32 top_m_final = 4;
+}
+
+// KBRetrieveResponse 检索结果。results_json 为检索结果 JSON 数组
+// （空结果时 context_text 为空、results_json 为 "[]"）。
+message KBRetrieveResponse {
+  // 拼接后的检索上下文文本（可直接注入 prompt）。
+  string context_text = 1;
+  // 检索结果 JSON 数组（分块内容/来源/分数等，结构以宿主检索结果为准）。
+  string results_json = 2;
+}
+
+// KBUploadFromURLRequest 从 URL 拉取文档写入指定知识库并分块。
+message KBUploadFromURLRequest {
+  // 目标知识库 ID（宿主 KnowledgeBase.kb_id）。
+  string kb_id = 1;
+  // 文档来源 URL。
+  string url = 2;
+  // 分块大小（<=0 用宿主默认）。
+  int32 chunk_size = 3;
+  // 分块重叠（<=0 用宿主默认）。
+  int32 chunk_overlap = 4;
+}
+
+// KBListResponse 列出宿主全部知识库。每项为一个 KnowledgeBase 元数据
+// JSON（kb_id/kb_name/description/emoji/doc_count/chunk_count 等，字段
+// 以宿主 KnowledgeBase 结构为准）。
+message KBListResponse {
+  repeated bytes kbs_json = 1;
+}
+
+// ── 技能视图扩展（sandbox runtime 视图）──
+
+// ListSkillsV2Request 带过滤参数的技能列表请求。runtime 取值：
+// "local"（仅宿主本地）/ "sandbox"（仅 sandbox runtime 视图）/ ""（全部）。
+message ListSkillsV2Request {
+  // 仅返回启用中的技能。
+  bool active_only = 1;
+  // 运行时过滤："local"/"sandbox"/""=全部。
+  string runtime = 2;
+  // true 时技能 JSON 的 path 字段返回 sandbox 路径而非宿主本地路径。
+  bool show_sandbox_path = 3;
+}
+
+// ── 文件令牌（file_token 文件服务）──
+
+// RegisterFileTokenRequest 把宿主侧文件路径登记为令牌。
+message RegisterFileTokenRequest {
+  // 宿主侧文件绝对路径（安全校验由宿主执行）。
+  string path = 1;
+  // 令牌 TTL 秒数；0 = 宿主默认 TTL。
+  int32 timeout_sec = 2;
+}
+
+// RegisterFileTokenResponse 返回文件令牌：下游凭 token 读取文件，
+// 避免暴露真实路径。
+message RegisterFileTokenResponse {
+  string token = 1;
+}
+
+// ── 插件定时任务（宿主 internal/cron）──
+
+// CronCreateRequest 创建定时任务。job_type 由宿主 internal/cron 定义；
+// run_once=true 时 run_at（RFC3339，可空）指定一次性触发时间。
+message CronCreateRequest {
+  // 任务名。
+  string name = 1;
+  // 任务类型（对齐宿主 Job.Type，如 cron / interval / once）。
+  string job_type = 2;
+  // cron 表达式（job_type=cron 时有效）。
+  string cron_expression = 3;
+  // IANA 时区（空 = 宿主默认）。
+  string timezone = 4;
+  // 任务负载 JSON（宿主触发时回传插件）。
+  bytes payload_json = 5;
+  // 任务描述。
+  string description = 6;
+  // 是否启用。
+  bool enabled = 7;
+  // 是否一次性任务。
+  bool run_once = 8;
+  // 一次性任务的触发时间（RFC3339，可空）。
+  string run_at = 9;
+}
+
+// CronUpdateRequest 按 job_id 更新任务字段。fields_json 为更新字段集
+// JSON：{name?, cron_expression?, timezone?, payload?, description?,
+// enabled?}，仅出现的字段会被更新。
+message CronUpdateRequest {
+  // 目标任务 ID。
+  string job_id = 1;
+  // 更新字段集 JSON（部分更新语义）。
+  bytes fields_json = 2;
+}
+
+// CronJobResponse 返回宿主 Job 快照 JSON：job_id/name/job_type/
+// cron_expression/payload/enabled/next_run_time/last_run_at/status 等。
+message CronJobResponse {
+  bytes job_json = 1;
+}
+
+// CronDeleteRequest 删除指定定时任务。
+message CronDeleteRequest {
+  string job_id = 1;
+}
+
+// CronListRequest 列出任务。job_type 空 = 全部类型。
+message CronListRequest {
+  string job_type = 1;
+}
+
+// CronJobsResponse 任务列表（每项为一个 Job 快照 JSON）。
+message CronJobsResponse {
+  repeated bytes jobs_json = 1;
+}
+
+// CronRunNowRequest 立即触发一次指定任务。
+message CronRunNowRequest {
+  string job_id = 1;
+}
+
+// ── 定时任务触发（宿主 cron 到点 → 插件，FeedCronJob 通道）──
+
+// FeedCronJobRequest 宿主 cron 到点触发插件注册的 basic 任务（宿主 → 插件
+// 方向）。插件按 job_id 匹配注册时保留的本地 handler 并执行。
+message FeedCronJobRequest {
+  // 宿主 Job ID（CronCreate 返回快照的 job_id）。
+  string job_id = 1;
+  // 任务名（冗余携带，便于插件侧日志）。
+  string job_name = 2;
+  // 任务负载 JSON（含宿主注入的 _plugin_id 路由键；handler 触发参数以
+  // 用户 payload 为准，路由键由插件侧剥离）。
+  bytes payload_json = 3;
+  // 宿主实际触发时刻（RFC3339）。
+  string run_at = 4;
+}
+
+// FeedCronJobResponse handled=插件存在匹配 handler 并已调度执行；无匹配
+// handler 返回 false（对齐 FeedSessionWait 语义）。
+message FeedCronJobResponse {
+  bool handled = 1;
+}
+
+// ── 宿主 MCP 读写桥接（只读列出 + 调用宿主侧 MCP 工具）──
+
+// McpToolsResponse 列出宿主已连接 MCP server 的工具。每项 JSON 结构：
+// {server, name, description, schema_json}。
+message McpToolsResponse {
+  repeated bytes tools_json = 1;
+}
+
+// McpCallToolRequest 调用宿主侧 MCP 工具。
+message McpCallToolRequest {
+  // MCP server 名。
+  string server = 1;
+  // 工具名。
+  string tool_name = 2;
+  // 工具参数 JSON 对象。
+  bytes arguments_json = 3;
+}
+
+// McpCallToolResponse 工具调用结果。text 为纯文本摘要，result_json 为
+// 完整结果 JSON（含结构化 content），is_error 标记宿主侧调用是否出错。
+message McpCallToolResponse {
+  // 完整结果 JSON。
+  bytes result_json = 1;
+  // 宿主侧调用是否出错。
+  bool is_error = 2;
+  // 纯文本摘要。
+  string text = 3;
+}

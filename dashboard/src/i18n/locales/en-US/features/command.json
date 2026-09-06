@@ -30,7 +30,9 @@
   "status": {
     "enabled": "Enabled",
     "disabled": "Disabled",
-    "conflict": "Conflict"
+    "conflict": "Conflict",
+    "pluginDisabled": "Plugin off",
+    "pluginInactive": "Enable the plugin first"
   },
   "permission": {
     "everyone": "Everyone",
@@ -93,19 +95,19 @@
     "showSystemPlugins": "Show system plugins commands",
     "systemPluginConflictHint": "System plugin conflicts detected. Resolve conflicts to hide."
   },
-   "sleep": {
-     "globalMinutesLabel": "Default idle minutes for new plugins",
-     "globalMinutesDesc": "New plugin default idle time",
-     "globalMinutesHint": "Used only as the default idle threshold for newly installed plugins; 0 = resident by default, does not override individually configured plugins.",
-     "columnPlugin": "Plugin",
-     "columnLanguage": "Plugin Language",
-     "columnAllow": "Allow sleep",
-     "columnMinutes": "Idle time (min)",
-     "columnRisk": "Risk",
-     "residentLabel": "Resident",
-     "noPlugins": "No enabled plugins",
-     "globalSaved": "New-plugin default idle time saved",
-     "pluginSaved": "Plugin sleep policy updated",
-     "listenerRisk": "This plugin has filters/hooks (active event listeners). Once hibernated its process is terminated and it can no longer receive messages/events."
-   }
+  "sleep": {
+    "globalMinutesLabel": "Default idle minutes for new plugins",
+    "globalMinutesDesc": "New plugin default idle time",
+    "globalMinutesHint": "Used only as the default idle threshold for newly installed plugins; 0 = resident by default, does not override individually configured plugins.",
+    "columnPlugin": "Plugin",
+    "columnLanguage": "Plugin Language",
+    "columnAllow": "Allow sleep",
+    "columnMinutes": "Idle time (min)",
+    "columnRisk": "Risk",
+    "residentLabel": "Resident",
+    "noPlugins": "No enabled plugins",
+    "globalSaved": "New-plugin default idle time saved",
+    "pluginSaved": "Plugin sleep policy updated",
+    "listenerRisk": "This plugin has filters/hooks (active event listeners). Once hibernated its process is terminated and it can no longer receive messages/events."
+  }
 }

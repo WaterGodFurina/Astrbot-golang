@@ -27,24 +27,13 @@ const (
 )
 
 // MessageMember describes a message sender.
-type MessageMember struct {
-	UserID   string `json:"user_id"`
-	Nickname string `json:"nickname,omitempty"`
-}
-
-func (m MessageMember) String() string {
-	return fmt.Sprintf("User ID: %s, Nickname: %s", m.UserID, m.Nickname)
-}
-
-// Group describes a chat group.
-type Group struct {
-	GroupID     string          `json:"group_id"`
-	GroupName   string          `json:"group_name,omitempty"`
-	GroupAvatar string          `json:"group_avatar,omitempty"`
-	GroupOwner  string          `json:"group_owner,omitempty"`
-	GroupAdmins []string        `json:"group_admins,omitempty"`
-	Members     []MessageMember `json:"members,omitempty"`
-}
+// MessageMember and Group are defined in internal/core (so MessageObj can
+// reference them without an import cycle); they are aliased here to keep the
+// historical platform.* references working.
+type (
+	MessageMember = core.MessageMember
+	Group         = core.Group
+)
 
 // PlatformMetadata describes a platform instance.
 type PlatformMetadata struct {
@@ -588,6 +577,17 @@ func (b *BaseAdapter) PublishEvent(msgStr string, msgObj *AstrBotMessage) error 
 		},
 		Timestamp: time.Now(),
 		Metadata:  make(map[string]interface{}),
+	}
+
+	// Propagate inbound group metadata so the host's Event.GetGroup() can
+	// return the group data that arrived with the message (aligned with Python
+	// AstrBotMessage.group → AstrMessageEvent.get_group default).
+	if msgObj.Group != nil {
+		event.MessageObj.Group = &core.Group{
+			GroupID:     msgObj.Group.GroupID,
+			GroupName:   msgObj.Group.GroupName,
+			GroupAvatar: msgObj.Group.GroupAvatar,
+		}
 	}
 
 	if b.eventBus != nil {

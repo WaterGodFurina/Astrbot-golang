@@ -2,24 +2,21 @@
   "title": "Console",
   "autoScroll": {
     "enabled": "Auto-scroll enabled",
-    "disabled": "Auto-scroll disabled"
+    "disabled": "Auto-scroll disabled",
+    "label": "Auto-scroll"
   },
   "hideUserChat": {
-    "enabled": "User chat hidden",
-    "disabled": "Hide user chat"
+    "label": "Hide user chat"
   },
   "debugHint": {
     "text": "Debug logs can be enabled in \"Configuration File → System → Console Log Level\""
   },
-  "goInstall": {
-    "button": "Install Go Package",
-    "dialogTitle": "Install Go Package",
-    "packageLabel": "*Module path, e.g. github.com/user/repo",
-    "mirrorLabel": "GOPROXY mirror URL (optional)",
-    "mirrorHint": "GOPROXY proxy address; defaults to the configured `goproxy`.",
-    "installButton": "Install",
-    "installSuccess": "Installation successful.",
-    "installFailed": "Installation failed.",
-    "requestFailed": "Request failed."
+  "pipInstall": {
+    "button": "Install pip Package",
+    "dialogTitle": "Install Pip Package",
+    "packageLabel": "*Package name, e.g. llmtuner",
+    "mirrorLabel": "Force PyPI repository URL (optional)",
+    "mirrorHint": "Force PyPI repository URL > Config item `PyPI Repository Address`",
+    "cancelButton": "Cancel"
   }
 }

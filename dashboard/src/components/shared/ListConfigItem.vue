@@ -3,6 +3,10 @@
     <div v-if="isSingleItemMode" class="flex-grow-1 d-flex align-center ga-2">
       <v-text-field
         v-model="singleItemValue"
+        :type="secretInputType"
+        :append-inner-icon="secretToggleIcon"
+        :autocomplete="secret ? 'new-password' : undefined"
+        @click:append-inner="secretVisible = !secretVisible"
         hide-details
         variant="outlined"
         density="compact"
@@ -15,7 +19,7 @@
       </span>
       <div v-else class="d-flex flex-wrap ga-2">
         <v-chip v-for="item in displayItems" :key="item" size="x-small" label color="primary">
-          {{ item.length > 20 ? item.slice(0, 20) + '...' : item }}
+          {{ secret && !secretVisible ? '••••••••' : (item.length > 20 ? item.slice(0, 20) + '...' : item) }}
         </v-chip>
         <v-chip v-if="modelValue.length > maxDisplayItems" size="x-small" label color="grey-lighten-1">
           +{{ modelValue.length - maxDisplayItems }}
@@ -37,14 +41,18 @@
       <!-- Add new item section - moved to top -->
       <v-card-text class="pa-4 pb-2">
         <div class="d-flex align-center ga-2">
-          <v-text-field 
-            v-model="newItem" 
-            :label="t('core.common.list.addItemPlaceholder')" 
-            @keyup.enter="addItem" 
-            clearable 
+          <v-text-field
+            v-model="newItem"
+            :label="t('core.common.list.addItemPlaceholder')"
+            @keyup.enter="addItem"
+            :type="secretInputType"
+            :append-inner-icon="secretToggleIcon"
+            :autocomplete="secret ? 'new-password' : undefined"
+            @click:append-inner="secretVisible = !secretVisible"
+            clearable
             hide-details
-            variant="outlined" 
-            density="compact" 
+            variant="outlined"
+            density="compact"
             :placeholder="t('core.common.list.inputPlaceholder')"
             class="flex-grow-1">
           </v-text-field>
@@ -76,15 +84,19 @@
             class="ma-1 list-item-clickable"
             @click="startEdit(index, item)">
             <v-list-item-title v-if="editIndex !== index" class="item-text">
-              {{ item }}
+              {{ secret && !secretVisible ? '••••••••' : item }}
             </v-list-item-title>
-            <v-text-field 
+            <v-text-field
               v-else
-              v-model="editItem" 
-              hide-details 
-              variant="outlined" 
+              v-model="editItem"
+              hide-details
+              variant="outlined"
               density="compact"
-              @keyup.enter="saveEdit" 
+              :type="secretInputType"
+              :append-inner-icon="secretToggleIcon"
+              :autocomplete="secret ? 'new-password' : undefined"
+              @click:append-inner="secretVisible = !secretVisible"
+              @keyup.enter="saveEdit"
               @keyup.esc="cancelEdit"
               @click.stop
               autofocus
@@ -188,6 +200,10 @@ const props = defineProps({
   preferSingleItem: {
     type: Boolean,
     default: true
+  },
+  secret: {
+    type: Boolean,
+    default: false
   }
 })
 
@@ -202,6 +218,12 @@ const editItem = ref('')
 const showBatchImport = ref(false)
 const batchImportText = ref('')
 const isSingleItemMode = computed(() => (props.modelValue?.length ?? 0) <= 1 && props.preferSingleItem)
+const secretVisible = ref(false)
+const secretInputType = computed(() => props.secret && !secretVisible.value ? 'password' : 'text')
+const secretToggleIcon = computed(() => {
+  if (!props.secret) return undefined
+  return secretVisible.value ? 'mdi-eye-off-outline' : 'mdi-eye-outline'
+})
 const singleItemValue = computed({
   get: () => props.modelValue?.[0] ?? '',
   set: (value) => {

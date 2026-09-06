@@ -276,7 +276,31 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 		if containerID == "" {
 			containerID = roomID
 		}
-		abm.Group = &platform.Group{GroupID: containerID, GroupName: containerID}
+		groupName := strings.TrimSpace(stringVal(source["groupName"]))
+		if groupName == "" {
+			groupName = strings.TrimSpace(stringVal(source["roomName"]))
+		}
+		if groupName == "" {
+			groupName = strings.TrimSpace(stringVal(event["groupName"]))
+		}
+		if groupName == "" {
+			groupName = strings.TrimSpace(stringVal(event["roomName"]))
+		}
+		avatarURL := strings.TrimSpace(stringVal(source["pictureUrl"]))
+		if avatarURL == "" {
+			avatarURL = strings.TrimSpace(stringVal(event["pictureUrl"]))
+		}
+		abm.Group = &platform.Group{
+			GroupID:     containerID,
+			GroupName:   groupName,
+			GroupAvatar: avatarURL,
+		}
+		if abm.Group.GroupName == "" {
+			abm.Group.GroupName = ""
+		}
+		if abm.Group.GroupAvatar == "" {
+			abm.Group.GroupAvatar = ""
+		}
 		abm.SessionID = containerID
 		abm.Sender = platform.MessageMember{UserID: userID, Nickname: userID}
 		if abm.Sender.UserID == "" {
@@ -750,4 +774,15 @@ func (a *Adapter) takeReplyToken(sessionID string) string {
 	}
 	delete(a.replyTokens, sessionID)
 	return entry.token
+}
+
+// GetGroupInfo returns the basic group object with the inbound group name.
+// Full enrichment (group summary, member count, member list) requires the
+// LINE Messaging API group/room endpoints not yet wrapped by line_api.go.
+// ponytail: skeleton only — implement line_api client calls when needed.
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	return &platform.Group{GroupID: groupID}, nil
 }

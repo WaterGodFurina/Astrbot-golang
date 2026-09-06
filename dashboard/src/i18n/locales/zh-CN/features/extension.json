@@ -140,10 +140,6 @@
       "authorWebsite": "作者网站",
       "repository": "仓库",
       "pluginLanguage": "插件语言"
-    },
-    "sleep": {
-      "globalLabel": "全局闲置自动休眠",
-      "pluginLabel": "允许本插件闲置自动休眠"
     }
   },
   "market": {
@@ -472,6 +468,16 @@
     "sandboxPresetReadonly": "Sandbox 预置技能在此处为只读，无法在本地技能页面删除或启用/停用。",
     "pluginReadonly": "插件提供的技能由插件管理，无法在本地技能页面删除或下载。",
     "pluginDisabled": "插件已禁用",
+    "select": "选择",
+    "selectSkill": "选择技能 {name}",
+    "selectAll": "全选",
+    "clearSelection": "取消选择",
+    "deleteSelected": "删除所选 ({count})",
+    "batchDeleteTitle": "批量删除技能",
+    "batchDeleteMessage": "确定要删除这 {count} 个技能吗？此操作不可撤销。",
+    "batchDeleteConfirm": "删除 {count} 个",
+    "batchDeleteSuccess": "成功删除 {count} 个技能。",
+    "batchDeletePartial": "已删除 {succeeded} 个；{failed} 个删除失败",
     "openEditor": "查看/编辑",
     "editorTitle": "编辑技能",
     "editorLoadFailed": "读取技能文件失败",

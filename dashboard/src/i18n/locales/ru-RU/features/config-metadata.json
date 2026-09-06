@@ -2,98 +2,74 @@
   "ai_group": {
     "name": "AI",
     "agent_runner": {
-      "description": "Запуск агентов (Agent Runner)",
-      "hint": "Выберите среду для работы AI-диалогов. По умолчанию используется встроенный агент AstrBot, поддерживающий базу знаний, персонализацию и вызов технических инструментов. Не изменяйте этот раздел, если не планируете использовать сторонние платформы, такие как Dify, Coze или DeerFlow.",
+      "description": "Agent Runner",
+      "hint": "Выберите исполнителя для AI-диалогов. При смене исполнителя конфигурация сбрасывается на значения по умолчанию нового типа.",
       "provider_settings": {
         "enable": {
           "description": "Включить",
           "hint": "Главный переключатель для AI-диалогов"
-        },
-        "agent_runner_type": {
-          "description": "Запуск (Runner)",
+        }
+      },
+      "agent_runner": {
+        "runner_type": {
+          "description": "Исполнитель",
           "labels": [
-            "Встроенный агент",
+            "Встроенный Agent",
             "Dify",
             "Coze",
             "Приложение Alibaba Cloud Bailian",
             "DeerFlow"
           ]
-        },
-        "coze_agent_runner_provider_id": {
-          "description": "ID провайдера Coze Agent Runner"
-        },
-        "dify_agent_runner_provider_id": {
-          "description": "ID провайдера Dify Agent Runner"
-        },
-        "dashscope_agent_runner_provider_id": {
-          "description": "ID провайдера Alibaba Cloud Bailian"
-        },
-        "deerflow_agent_runner_provider_id": {
-          "description": "ID провайдера DeerFlow Agent Runner"
         }
       }
     },
     "ai": {
       "description": "Модель",
-      "hint": "При использовании сторонних сред запуска модель чата и модель описания изображений могут не работать напрямую, но некоторые плагины всё равно зависят от этих настроек.",
+      "hint": "Настройте модели чата встроенного Agent и общие модели описания изображений и речи.",
+      "agent_runner": {
+        "config": {
+          "model": {
+            "provider_id": {
+              "description": "Модель чата",
+              "hint": "Используется первая модель, если пусто"
+            },
+            "fallback_provider_ids": {
+              "description": "Резервные модели чата",
+              "hint": "Попробуйте эти модели по порядку при сбое основной модели."
+            },
+            "request_max_retries": {
+              "description": "Повторные попытки при ошибке",
+              "hint": "Максимум попыток при повторяемых ошибках."
+            }
+          }
+        }
+      },
       "provider_settings": {
-        "default_provider_id": {
-          "description": "Модель чата по умолчанию",
-          "hint": "Если пусто, используется первая доступная модель"
-        },
-        "fallback_chat_models": {
-          "description": "Резервные модели чата (ID)",
-          "hint": "Если текущая модель недоступна, запрос будет перенаправлен на эти модели по порядку."
-        },
-        "request_max_retries": {
-          "description": "Максимум повторов запроса",
-          "hint": "Максимальное число попыток для одного запроса модели при повторяемых ошибках."
-        },
         "default_image_caption_provider_id": {
           "description": "Модель описания изображений",
-          "hint": "Оставьте пустым для отключения; полезно для моделей без поддержки мультимодальности"
+          "hint": "Оставьте пустым для отключения; полезно для немультимодальных моделей"
         },
         "image_caption_prompt": {
-          "description": "Промпт для описания изображений"
-        },
-        "request_retry_429_enabled": {
-          "description": "Повтор при 429 (лимит запросов)",
-          "hint": "Повторять ли запрос при ответе 429 Too Many Requests. Включено по умолчанию; выключите, чтобы не повторять при 429."
-        },
-        "request_retry_429_max": {
-          "description": "Лимит повторов при 429",
-          "hint": "Максимум повторов при 429. По умолчанию 5 и не может быть 0 (бэкенд превращает 0 в 1)."
-        },
-        "request_retry_429_strategy": {
-          "description": "Стратегия повтора при 429",
-          "hint": "Как ждать между повторами при 429: экспоненциальная пауза или фиксированная задержка.",
-          "labels": [
-            "Экспоненциальная пауза",
-            "Фиксированная задержка"
-          ]
-        },
-        "request_retry_429_fixed_seconds": {
-          "description": "Фиксированная задержка (сек)",
-          "hint": "Секунды ожидания перед каждым повтором при стратегии «фиксированная задержка». По умолчанию 10."
+          "description": "Промпт описания изображений"
         }
       },
       "provider_stt_settings": {
         "enable": {
-          "description": "Включить преобразование речи в текст (STT)",
-          "hint": "Главный переключатель для STT"
+          "description": "Распознавание речи",
+          "hint": "Используйте модель преобразования речи в текст для транскрипции голосовых сообщений."
         },
         "provider_id": {
-          "description": "Модель STT по умолчанию",
-          "hint": "Пользователи могут выбирать другие модели STT через команду /provider."
+          "description": "Модель преобразования речи в текст по умолчанию",
+          "hint": "Пользователи также могут выбрать модель STT для сессии командой /provider."
         }
       },
       "provider_tts_settings": {
         "enable": {
-          "description": "Включить преобразование текста в речь (TTS)",
-          "hint": "Главный переключатель для TTS"
+          "description": "Голосовые ответы",
+          "hint": "Используйте модель преобразования текста в речь для голосовых ответов."
         },
         "provider_id": {
-          "description": "Модель TTS по умолчанию"
+          "description": "Модель преобразования текста в речь по умолчанию"
         },
         "trigger_probability": {
           "description": "Вероятность срабатывания TTS"
@@ -101,11 +77,23 @@
       }
     },
     "persona": {
-      "description": "Персонаж",
-      "hint": "Установите персонажа по умолчанию для AI-диалогов. Управлять персонажами можно на вкладке «Персонажи».",
-      "provider_settings": {
-        "default_personality": {
-          "description": "Персонаж по умолчанию"
+      "description": "Персона",
+      "hint": "Установите персону по умолчанию для AI-диалогов. Персоны можно управлять на вкладке Персоны.",
+      "agent_runner": {
+        "config": {
+          "persona": {
+            "persona_id": {
+              "description": "Персона по умолчанию"
+            },
+            "safety_mode": {
+              "description": "Безопасный режим",
+              "hint": "Направляйте модель к безопасному контенту и от вредных или чувствительных тем."
+            },
+            "safety_mode_strategy": {
+              "description": "Стратегия безопасного режима",
+              "hint": "Выберите способ применения безопасного режима."
+            }
+          }
         }
       }
     },
@@ -164,6 +152,10 @@
         "websearch_exa_key": {
           "description": "API-ключ Exa",
           "hint": "Можно добавить несколько ключей для ротации. Получить ключ: https://dashboard.exa.ai"
+        },
+        "websearch_anysearch_key": {
+          "description": "API-ключ AnySearch",
+          "hint": "Можно добавить несколько ключей для ротации. Если оставить пустым, используется анонимный режим (бесплатная дневная квота). Получить ключ: https://anysearch.com/console/api-keys"
         }
       },
       "hint": "Позволяет AstrBot выходить в интернет и быть в курсе событий."
@@ -433,6 +425,141 @@
       "provider_tts_settings": {
         "dual_output": {
           "description": "Выводить и голос, и текст при включенном TTS"
+        }
+      }
+    },
+    "dify_runner": {
+      "description": "Конфигурация Dify",
+      "agent_runner": {
+        "config": {
+          "dify_api_type": {
+            "description": "Тип приложения"
+          },
+          "dify_api_key": {
+            "description": "API Key"
+          },
+          "dify_api_base": {
+            "description": "API Base URL"
+          },
+          "dify_workflow_output_key": {
+            "description": "Переменная выхода Workflow"
+          },
+          "dify_query_input_key": {
+            "description": "Переменная ввода Prompt"
+          },
+          "variables": {
+            "description": "Переменные"
+          },
+          "timeout": {
+            "description": "Таймаут (секунды)"
+          },
+          "proxy": {
+            "description": "Прокси URL"
+          }
+        }
+      }
+    },
+    "coze_runner": {
+      "description": "Конфигурация Coze",
+      "agent_runner": {
+        "config": {
+          "coze_api_key": {
+            "description": "API Key"
+          },
+          "bot_id": {
+            "description": "Bot ID"
+          },
+          "coze_api_base": {
+            "description": "API Base URL"
+          },
+          "auto_save_history": {
+            "description": "Позволить Coze управлять историей диалогов"
+          },
+          "timeout": {
+            "description": "Таймаут (секунды)"
+          },
+          "proxy": {
+            "description": "Прокси URL"
+          }
+        }
+      }
+    },
+    "dashscope_runner": {
+      "description": "Конфигурация приложения Alibaba Cloud Bailian",
+      "agent_runner": {
+        "config": {
+          "dashscope_app_type": {
+            "description": "Тип приложения"
+          },
+          "dashscope_api_key": {
+            "description": "API Key"
+          },
+          "dashscope_app_id": {
+            "description": "ID приложения"
+          },
+          "rag_options": {
+            "pipeline_ids": {
+              "description": "ID Pipeline базы знаний"
+            },
+            "file_ids": {
+              "description": "ID файлов"
+            },
+            "output_reference": {
+              "description": "Включить ссылки"
+            }
+          },
+          "variables": {
+            "description": "Переменные"
+          },
+          "timeout": {
+            "description": "Таймаут (секунды)"
+          },
+          "proxy": {
+            "description": "Прокси URL"
+          }
+        }
+      }
+    },
+    "deerflow_runner": {
+      "description": "Конфигурация DeerFlow",
+      "agent_runner": {
+        "config": {
+          "deerflow_api_base": {
+            "description": "API Base URL"
+          },
+          "deerflow_api_key": {
+            "description": "API Key"
+          },
+          "deerflow_auth_header": {
+            "description": "Заголовок авторизации"
+          },
+          "deerflow_assistant_id": {
+            "description": "ID ассистента"
+          },
+          "deerflow_model_name": {
+            "description": "Переопределение имени модели"
+          },
+          "deerflow_thinking_enabled": {
+            "description": "Включить режим размышлений"
+          },
+          "deerflow_plan_mode": {
+            "description": "Включить режим планирования"
+          },
+          "deerflow_subagent_enabled": {
+            "description": "Включить субагентов"
+          },
+          "deerflow_max_concurrent_subagents": {
+            "description": "Максимум параллельных субагентов"
+          },
+          "deerflow_recursion_limit": {
+            "description": "Лимит рекурсии"
+          },
+          "timeout": {
+            "description": "Таймаут (секунды)"
+          },
+          "proxy": {
+            "description": "Прокси URL"
+          }
         }
       }
     }

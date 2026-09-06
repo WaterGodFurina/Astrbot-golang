@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -75,6 +76,12 @@ type Adapter struct {
 	//（见 dispatchUpdate）。
 	workerMu sync.Mutex
 	workers  map[string]chan map[string]interface{}
+
+	// _forum_topic_names caches Telegram forum topic names keyed by
+	// (chat_id, thread_id). Aligned with Python tg_adapter _forum_topic_names.
+	forumTopicMu    sync.Mutex
+	forumTopicNames map[string]string
+	forumTopicOrder []string
 }
 
 // New creates a Telegram adapter.
@@ -87,6 +94,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		},
 		stopCh: make(chan struct{}),
 	}
+	a.forumTopicNames = make(map[string]string)
 	a.Token, _ = config["token"].(string)
 	if base, ok := config["telegram_api_base_url"].(string); ok && base != "" {
 		a.apiBase = base + a.Token
@@ -220,6 +228,164 @@ func (a *Adapter) React(sessionID, messageID, emoji string) error {
 	}
 	_, err := a.apiCall(ctx, "setMessageReaction", params)
 	return err
+}
+
+// resolveForumTopicName discovers and caches Telegram forum topic names
+// (aligned with Python tg_adapter _forum_topic_names cache + "title-topic" format).
+func (a *Adapter) resolveForumTopicName(chatID string, threadID int64, isForum bool, msg map[string]interface{}) string {
+	a.forumTopicMu.Lock()
+	defer a.forumTopicMu.Unlock()
+
+	var topicKey string
+	if threadID > 0 {
+		topicKey = fmt.Sprintf("%s#%d", chatID, threadID)
+	} else if isForum {
+		topicKey = chatID
+	}
+	if topicKey == "" {
+		return ""
+	}
+
+	discovered := ""
+	if ft, ok := msg["forum_topic_created"].(map[string]interface{}); ok {
+		if n, _ := ft["name"].(string); n != "" {
+			discovered = n
+		}
+	}
+	if discovered == "" {
+		if ft, ok := msg["forum_topic_edited"].(map[string]interface{}); ok {
+			if n, _ := ft["name"].(string); n != "" {
+				discovered = n
+			}
+		}
+	}
+	if discovered == "" {
+		if replyRaw, ok := msg["reply_to_message"].(map[string]interface{}); ok {
+			if ft, ok := replyRaw["forum_topic_created"].(map[string]interface{}); ok {
+				if n, _ := ft["name"].(string); n != "" {
+					discovered = n
+				}
+			}
+		}
+	}
+
+	if discovered != "" {
+		delete(a.forumTopicNames, topicKey)
+		a.forumTopicNames[topicKey] = discovered
+		a.forumTopicOrder = append(a.forumTopicOrder, topicKey)
+		for len(a.forumTopicNames) > 1000 && len(a.forumTopicOrder) > 0 {
+			oldest := a.forumTopicOrder[0]
+			a.forumTopicOrder = a.forumTopicOrder[1:]
+			delete(a.forumTopicNames, oldest)
+		}
+	}
+
+	if name, ok := a.forumTopicNames[topicKey]; ok {
+		return name
+	}
+	return ""
+}
+
+// GetGroupInfo enriches Telegram group metadata via Bot API get_chat +
+// get_chat_member_count + get_chat_administrators (Python tg_event.py get_group).
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	group := &platform.Group{GroupID: groupID}
+
+	apiChatID, threadID := splitThreadID(groupID)
+	numID, err := strconv.ParseInt(apiChatID, 10, 64)
+	if err != nil {
+		logger.Debug("[Telegram] Invalid group ID for GetGroupInfo: %s", groupID)
+		return group, nil
+	}
+
+	resp, err := a.apiCall(ctx, "getChat", map[string]interface{}{"chat_id": numID})
+	if err != nil {
+		logger.Debug("[Telegram] getChat failed for %s: %v", apiChatID, err)
+	} else {
+		if result, ok := resp["result"].(map[string]interface{}); ok {
+			if title, _ := result["title"].(string); title != "" {
+				if threadID != "" {
+					topicName := a.getCachedTopicName(apiChatID, threadID)
+					if topicName != "" {
+						title = title + "-" + topicName
+					}
+				}
+				group.GroupName = title
+			}
+			if photo, ok := result["photo"].(map[string]interface{}); ok {
+				if fileID, _ := photo["big_file_id"].(string); fileID != "" {
+					if filePath := a.getFileFilePath(ctx, fileID); filePath != "" {
+						group.GroupAvatar = filePath
+					}
+				}
+			}
+		}
+	}
+
+	countResp, err := a.apiCall(ctx, "getChatMemberCount", map[string]interface{}{"chat_id": numID})
+	if err == nil {
+		if result, ok := countResp["result"].(float64); ok {
+			c := int(result)
+			group.MemberCount = &c
+		}
+	}
+
+	adminResp, err := a.apiCall(ctx, "getChatAdministrators", map[string]interface{}{"chat_id": numID})
+	if err == nil {
+		if result, ok := adminResp["result"].([]interface{}); ok {
+			for _, admin := range result {
+				am, ok := admin.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				user, ok := am["user"].(map[string]interface{})
+				if !ok {
+					continue
+				}
+				userID, _ := user["id"].(float64)
+				if userID == 0 {
+					continue
+				}
+				userIDStr := strconv.FormatFloat(userID, 'f', 0, 64)
+				status, _ := am["status"].(string)
+				if status == "creator" {
+					group.GroupOwner = userIDStr
+				} else if status == "administrator" {
+					group.GroupAdmins = append(group.GroupAdmins, userIDStr)
+				}
+			}
+		}
+	}
+
+	return group, nil
+}
+
+// getCachedTopicName looks up a cached forum topic name.
+func (a *Adapter) getCachedTopicName(chatID, threadID string) string {
+	a.forumTopicMu.Lock()
+	defer a.forumTopicMu.Unlock()
+	topicKey := fmt.Sprintf("%s#%s", chatID, threadID)
+	if name, ok := a.forumTopicNames[topicKey]; ok {
+		return name
+	}
+	return ""
+}
+
+// getFileFilePath retrieves a file's download path via getFile API.
+func (a *Adapter) getFileFilePath(ctx context.Context, fileID string) string {
+	resp, err := a.apiCall(ctx, "getFile", map[string]interface{}{"file_id": fileID})
+	if err != nil {
+		return ""
+	}
+	if result, ok := resp["result"].(map[string]interface{}); ok {
+		if path, _ := result["file_path"].(string); path != "" {
+			return a.fileBase + "/" + path
+		}
+	}
+	return ""
 }
 
 // ---------- 流式输出（审计项 12） ----------
@@ -913,17 +1079,18 @@ func (a *Adapter) commandRefreshLoop(ctx context.Context) {
 // 的构造（tg_adapter.py:469-494），并按 core.Event/MessageObj 的需求供给。
 type tgMsg struct {
 	MessageID  string
-	ChatID     string // 不含话题后缀的 chat id（API 调用目标）
-	SessionID  string // 会话 id（话题群 = "chatid#thread_id"，本体 :478-481）
+	ChatID     string
+	SessionID  string
 	GroupID    string
 	IsGroup    bool
 	SenderID   string
 	SenderName string
+	GroupName  string
 	MessageStr string
 	Chain      []message.Component
 	RawMessage map[string]interface{}
-	// Skip 为 true 时不发布事件（如 /start 已回复欢迎语，本体 :570-572）。
-	Skip bool
+	TopicName  string
+	Skip       bool
 }
 
 // handleUpdate processes a single Telegram update.
@@ -1119,6 +1286,13 @@ func (a *Adapter) publishMsg(m *tgMsg) {
 		},
 	}
 
+	if m.IsGroup && m.GroupID != "" {
+		event.MessageObj.Group = &core.Group{
+			GroupID:   m.GroupID,
+			GroupName: m.GroupName,
+		}
+	}
+
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.Error("Failed to publish event: %v", err)
 	}
@@ -1150,14 +1324,29 @@ func (a *Adapter) convertMessage(ctx context.Context, msg map[string]interface{}
 		m.IsGroup = false
 	} else {
 		m.IsGroup = true
-		m.GroupID = chatID
-		// Telegram 话题群：group_id 附加 "#<thread_id>" 隔离每话题会话
-		// （本体 :478-481）。
-		isTopic, _ := msg["is_topic_message"].(bool)
-		if threadID := int64FromAny(msg["message_thread_id"]); isTopic && threadID > 0 {
-			m.GroupID = fmt.Sprintf("%s#%d", chatID, threadID)
-			m.SessionID = m.GroupID
+		groupID := chatID
+		isForum, _ := chat["is_forum"].(bool)
+		var threadID int64
+		if tid := int64FromAny(msg["message_thread_id"]); tid > 0 {
+			threadID = tid
 		}
+		if !(isForum && threadID == 1) && threadID > 0 {
+			groupID = fmt.Sprintf("%s#%d", chatID, threadID)
+			m.SessionID = groupID
+		}
+		m.GroupID = groupID
+
+		chatTitle, _ := chat["title"].(string)
+		topicName := a.resolveForumTopicName(chatID, threadID, isForum, msg)
+		if chatTitle != "" && topicName != "" {
+			chatTitle = chatTitle + "-" + topicName
+		} else if topicName != "" {
+			chatTitle = topicName
+		}
+		if chatTitle != "" {
+			m.GroupName = chatTitle
+		}
+		m.TopicName = topicName
 	}
 	if id := int64FromAny(msg["message_id"]); id != 0 {
 		m.MessageID = fmt.Sprintf("%d", id)
