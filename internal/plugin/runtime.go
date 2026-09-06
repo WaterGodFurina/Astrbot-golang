@@ -1107,11 +1107,11 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		Pages:            metaPages,
 		LogoPath:         metaLogoPath,
 		// 新安装插件默认不开启闲置自动休眠；独立分钟数默认 10（用户开启休眠时生效）。
-		IdleUnload:       false,
+		IdleUnload:        false,
 		IdleUnloadMinutes: 10,
-		ConfigDir: filepath.Join("plugins_config", sanitizeID(inst.ID)),
-		DataDir:   filepath.Join("plugins_data", sanitizeID(inst.ID)),
-		DocsDir:   filepath.Join("plugins", sanitizeID(inst.ID)),
+		ConfigDir:         filepath.Join("plugins_config", sanitizeID(inst.ID)),
+		DataDir:           filepath.Join("plugins_data", sanitizeID(inst.ID)),
+		DocsDir:           filepath.Join("plugins", sanitizeID(inst.ID)),
 	})
 	return man.Save(m.manifestPath())
 }

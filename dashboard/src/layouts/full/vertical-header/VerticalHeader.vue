@@ -28,6 +28,7 @@ enableMermaid();
 
 const customizer = useCustomizerStore();
 const commonStore = useCommonStore();
+const authStore = useAuthStore();
 const chatHeader = useChatHeaderStore();
 const theme = useTheme();
 const { lgAndUp } = useDisplay();
