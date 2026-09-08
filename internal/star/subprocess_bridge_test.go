@@ -182,6 +182,9 @@ func TestIdleSleepKeepsHandlersAndWakesUp(t *testing.T) {
 	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
 	}
+	if err := m.SetPluginIdleUnloadMinutes(inst.ID, 1); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
+	}
 
 	starMgr := NewManagerSimple()
 	RegisterSubprocessPlugin(starMgr, m, inst)

@@ -437,6 +437,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.dashboard.SetOnConfigChanged(func() {
 		// 注意：已移除全局 plugin_idle_unload_minutes 同步；
 		// 休眠为单插件独立控制，lifecycle 不再向 runtime 推全局阈值。
+		// 插件管理名单（plugin_admin_list）热更新即时生效。
+		plugin.RefreshPluginAdminList(l.configMgr, l.subPluginMgr)
 		// Rebuild the pipeline so provider/platform settings changes (e.g. the
 		// default chat model) take effect immediately instead of on reload.
 		if err := l.ReloadPipelineScheduler("default"); err != nil {

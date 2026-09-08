@@ -21,6 +21,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
+	"github.com/hashicorp/go-hclog"
 	goplugin "github.com/hashicorp/go-plugin"
 	"golang.org/x/mod/module"
 )
@@ -1313,15 +1314,12 @@ func (m *SubprocessManager) Get(id string) *PluginInstance {
 // idle <= 0 disables the sweep. Cross-platform: works with any plugin process
 // (Go binary / Python interpreter) since it only manages process lifecycles.
 func (m *SubprocessManager) SetIdleUnload(idle time.Duration) {
+	// 休眠为单插件独立控制：全局阈值仅作兼容性保留字段（IdleUnloadEnabled/
+	// IdleUnloadMinutes 报告），不再驱动清扫。清扫循环自 NewSubprocessManager
+	// 常驻运行（见 idleSweepLoop），此处不重复启动。
 	m.mu.Lock()
-	prev := m.idleUnload
 	m.idleUnload = idle
-	start := prev <= 0 && idle > 0
 	m.mu.Unlock()
-	if start {
-		go m.idleSweepLoop()
-		logger.I18nInfo("插件闲置自动卸载已启用（闲置 %v 后回收进程内存）", idle)
-	}
 }
 
 // IdleUnloadEnabled reports whether the idle-unload sweep is enabled (global
@@ -1872,6 +1870,13 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		Cmd:              cmd,
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 		Managed:          true,
+		// 与 go-plugin 默认 logger 一致（DefaultOutput/Trace/Name=plugin），
+		// 套一层过滤器吞掉 Python SDK 保活空包（channel=INVALID）的告警刷屏。
+		Logger: stdioFilterLogger{Logger: hclog.New(&hclog.LoggerOptions{
+			Output: hclog.DefaultOutput,
+			Level:  hclog.Trace,
+			Name:   "plugin",
+		})},
 	}
 	if stderrParser != nil {
 		cfg.Stderr = stderrParser
