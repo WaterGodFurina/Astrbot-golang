@@ -120,6 +120,10 @@ func TestIdleMinutesZeroFallsBackToGlobal(t *testing.T) {
 	requirePlugin(t)
 	m := newTestManager(t)
 	p := idleTestPlugin(t, m, filepath.Join("testdata", "plugin"), "pzero")
+	// 新装插件 manifest 默认 minutes=10；显式置 0 以验证"0=不休眠"语义。
+	if err := m.SetPluginIdleUnloadMinutes(p.ID, 0); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
+	}
 	if err := m.SetPluginIdleUnload(p.ID, true); err != nil {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
 	}

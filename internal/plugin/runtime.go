@@ -242,6 +242,12 @@ func (inst *PluginInstance) Touch() {
 	inst.lastActiveNano.Store(time.Now().UnixNano())
 }
 
+// BackdateIdle 将活跃时间回拨 d（测试专用：模拟"已闲置超过阈值"，
+// 免去真实等待）。
+func (inst *PluginInstance) BackdateIdle(d time.Duration) {
+	inst.lastActiveNano.Store(time.Now().Add(-d).UnixNano())
+}
+
 // RPCGuard marks the start of a host→plugin RPC (Touch + in-flight counter)
 // and returns the end-of-RPC function. 用法：defer inst.RPCGuard()()。闲置清扫
 // 会跳过 activeRPC>0 的插件，确保长时间运行的命令/工具不被误判为空闲。

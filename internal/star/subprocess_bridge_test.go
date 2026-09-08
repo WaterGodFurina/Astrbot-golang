@@ -193,8 +193,9 @@ func TestIdleSleepKeepsHandlersAndWakesUp(t *testing.T) {
 		t.Fatal("expected bridged handlers")
 	}
 
-	// 模拟闲置：真实等待超过阈值后触发一次清扫 → 进程被卸载，但 handler 保留。
-	time.Sleep(40 * time.Millisecond)
+	// 模拟闲置：回拨 lastActiveNano 超过独立阈值（1 分钟）后触发一次清扫
+	// → 进程被卸载，但 handler 保留。
+	inst.BackdateIdle(2 * time.Minute)
 	m.SweepIdle()
 	if m.Get(inst.ID) != nil {
 		t.Fatal("idle plugin process must be unloaded")

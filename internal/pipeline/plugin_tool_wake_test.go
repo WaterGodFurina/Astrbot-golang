@@ -41,9 +41,8 @@ func TestPluginToolWakesIdlePlugin(t *testing.T) {
 		t.Fatalf("echo_tool must be in the tool registry: owner=%q ok=%v", owner, ok)
 	}
 
-	// 模拟闲置：等待超过独立阈值（1 分钟）后清扫 → 进程卸载。
-	// 独立分钟数最低 1 分钟，测试需等待 > 60s 触发真实 idle 判定。
-	time.Sleep(61 * time.Second)
+	// 模拟闲置：回拨 lastActiveNano 超过独立阈值（1 分钟）后清扫 → 进程卸载。
+	inst.BackdateIdle(2 * time.Minute)
 	m.SweepIdle()
 	if m.Get(inst.ID) != nil {
 		t.Fatal("idle plugin process must be unloaded")
