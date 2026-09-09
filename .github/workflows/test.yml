@@ -273,12 +273,24 @@ jobs:
         run: go mod tidy
 
       - name: 安装静态分析工具
+        # goproxy.cn 偶发下载抖动（HTTP/2 INTERNAL_ERROR / 504）：每个工具
+        # 独立重试 3 次，单个失败不拖垮其余工具。
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          go install github.com/kisielk/errcheck@latest
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          install_tool() {
+            local tool="$1"
+            for i in 1 2 3; do
+              if go install "$tool"; then return 0; fi
+              echo "retry $i failed for $tool, retrying..."
+              sleep 5
+            done
+            echo "::error::failed to install $tool after 3 attempts"
+            return 1
+          }
+          install_tool honnef.co/go/tools/cmd/staticcheck@latest
+          install_tool github.com/kisielk/errcheck@latest
+          install_tool github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+          install_tool github.com/securego/gosec/v2/cmd/gosec@latest
+          install_tool golang.org/x/vuln/cmd/govulncheck@latest
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
       - name: gofmt 格式检查
