@@ -980,6 +980,10 @@ type ProcessStage struct {
 	// on_llm_request hooks.
 	subPlugins *plugin.SubprocessManager
 
+	// eventBus re-publishes synthetic events (background-task wakeups).
+	// Optional; nil disables background-result wakeups.
+	eventBus *core.EventBus
+
 	// MCP servers (data/mcp_server.json). Loaded lazily on the first tool
 	// collection; full tool name = "<sanitized_server>.<tool_name>".
 	mcpMu      sync.Mutex
@@ -1054,6 +1058,7 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.cronMgr = ctx.CronManager
 	s.database = ctx.Database
 	s.subPlugins = ctx.SubPlugins
+	s.eventBus = ctx.EventBus
 	// Wire the plugin-activation snapshot for filterSkillsForCurrentConfig
 	// (subprocess plugin ids are the data/plugins root dir names, matching
 	// the plugin skill source_label).
@@ -2861,6 +2866,42 @@ func (s *ProcessStage) collectPluginTools() []map[string]interface{} {
 
 // executePluginTool dispatches a tool call to the subprocess plugin that
 // registered a tool with the given name. Returns (result, handled).
+// wakeMainAgentForBackgroundResult 后台任务完成后唤醒主 Agent：合成一条
+// proactive 事件（CallLLM=true）经 eventBus 重入管线，对齐 Python
+// _wake_main_agent_for_background_result —— LLM 拿到任务结果后自主决定是否
+// 联系用户，回复经 RespondStage 投递回原会话。
+func (s *ProcessStage) wakeMainAgentForBackgroundResult(event *core.Event, taskID, toolName, resultText string, toolArgs map[string]interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("background task wake panic: %v", r)
+		}
+	}()
+	if s.eventBus == nil {
+		logger.Warn("后台任务 %s（%s）完成但 eventBus 不可用，结果丢弃: %s", taskID, toolName, truncateRunes(resultText, 200))
+		return
+	}
+	argsJSON, _ := json.Marshal(toolArgs)
+	prompt := fmt.Sprintf(
+		"[后台任务完成通知]\n后台任务已完成执行，结果如下。\n- task_id: %s\n- tool: %s\n- 参数: %s\n- 结果:\n%s\n\n请基于以上结果继续处理：如需告知用户请直接生成回复内容；若无需联系用户，请回复空内容。",
+		taskID, toolName, string(argsJSON), resultText,
+	)
+	evt := &core.Event{
+		Type:              core.EventMessage,
+		Source:            event.Source,
+		Message:           &message.MessageChain{Chain: []message.Component{&message.Plain{Text: prompt}}},
+		MessageStr:        prompt,
+		PlainText:         prompt,
+		Timestamp:         time.Now(),
+		Metadata:          map[string]interface{}{"proactive": true, "background_task_result": true},
+		IsAtOrWakeCommand: true,
+		CallLLM:           true,
+	}
+	logger.Info("后台任务 %s（%s）完成，唤醒主 Agent", taskID, toolName)
+	if err := s.eventBus.Publish(evt); err != nil {
+		logger.Warn("后台任务 %s 唤醒事件发布失败: %v", taskID, err)
+	}
+}
+
 func (s *ProcessStage) executePluginTool(event *core.Event, name string, args map[string]interface{}) (string, bool) {
 	if s.subPlugins == nil {
 		return "", false
@@ -3703,6 +3744,35 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 	if s.toolPermissionDenied(name, event) {
 		logger.I18nWarn("工具 %s 需要管理员权限，用户 %s 无权调用", name, event.GetSenderID())
 		return fmt.Sprintf("工具 %s 需要管理员权限，当前用户无权调用", name)
+	}
+
+	// Background task tools（对齐 Python astr_agent_tool_exec.execute 的
+	// tool.is_background_task 分支）：立即返回任务标识，实际执行放入后台
+	// goroutine（1h 超时）；完成后合成 proactive 事件经 eventBus 重入管线
+	// 唤醒主 Agent（_wake_main_agent_for_background_result 语义）。
+	if tool := agent.DefaultFuncTools.GetFunc(name); tool != nil && tool.IsBackgroundTask && tool.Handler != nil {
+		taskID := fmt.Sprintf("bgtask-%d", time.Now().UnixNano())
+		argsCopy := make(map[string]interface{}, len(args))
+		for k, v := range args {
+			argsCopy[k] = v
+		}
+		go func() {
+			bgCtx, cancel := context.WithTimeout(context.Background(), time.Hour)
+			defer cancel()
+			res, err := tool.Handler(bgCtx, argsCopy)
+			text := ""
+			if err != nil {
+				text = fmt.Sprintf("error: Background task execution failed, internal error: %v", err)
+			} else if s, ok := res.(string); ok {
+				text = s
+			} else if res != nil {
+				if b, jerr := json.Marshal(res); jerr == nil {
+					text = string(b)
+				}
+			}
+			s.wakeMainAgentForBackgroundResult(event, taskID, name, text, argsCopy)
+		}()
+		return fmt.Sprintf("Background task submitted. task_id=%s", taskID)
 	}
 
 	// Dispatch registered plugins' on_tool_call / on_using_llm_tool hooks before
