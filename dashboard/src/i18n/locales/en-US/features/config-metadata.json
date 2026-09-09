@@ -3,11 +3,33 @@
     "name": "AI",
     "agent_runner": {
       "description": "Agent Runner",
-      "hint": "Select the runner for AI conversations. Switching runners resets the configuration to the new type's defaults.",
+      "hint": "Select the runner for AI conversations. Defaults to AstrBot's built-in Agent runner, which supports knowledge base, persona, and tool calling features. You don't need to modify this section unless you plan to integrate third-party Agent runners like Dify, Coze, or DeerFlow.",
       "provider_settings": {
         "enable": {
           "description": "Enable",
           "hint": "Master switch for AI conversations"
+        },
+        "agent_runner_type": {
+          "description": "Runner",
+          "labels": [
+            "Built-in Agent",
+            "Dify",
+            "Coze",
+            "DashScope App",
+            "DeerFlow"
+          ]
+        },
+        "coze_agent_runner_provider_id": {
+          "description": "Coze Agent Runner Provider ID"
+        },
+        "dashscope_agent_runner_provider_id": {
+          "description": "Alibaba Cloud Bailian Application Agent Runner Provider ID"
+        },
+        "deerflow_agent_runner_provider_id": {
+          "description": "DeerFlow Agent Runner Provider ID"
+        },
+        "dify_agent_runner_provider_id": {
+          "description": "Dify Agent Runner Provider ID"
         }
       },
       "agent_runner": {
@@ -25,7 +47,7 @@
     },
     "ai": {
       "description": "Model",
-      "hint": "Configure the built-in Agent's chat models and shared image caption and speech models.",
+      "hint": "When using non-built-in Agent runners, the default chat model and default image caption model may not take effect, but some plugins rely on these settings to invoke AI capabilities.",
       "agent_runner": {
         "config": {
           "model": {
@@ -46,17 +68,49 @@
       },
       "provider_settings": {
         "default_image_caption_provider_id": {
-          "description": "Image Caption Model",
+          "description": "Default Image Caption Model",
           "hint": "Leave empty to disable; useful for non-multimodal models"
         },
         "image_caption_prompt": {
           "description": "Image Caption Prompt"
+        },
+        "default_provider_id": {
+          "description": "Default Chat Model",
+          "hint": "Uses the first model when left empty"
+        },
+        "fallback_chat_models": {
+          "description": "Fallback chat model IDs",
+          "hint": "When the primary chat model request fails, fallback to these chat models in order."
+        },
+        "request_max_retries": {
+          "description": "Request Max Retries",
+          "hint": "Maximum attempts for a single model request when retryable errors occur."
+        },
+        "request_retry_429_enabled": {
+          "description": "Enable 429 Rate-Limit Retry",
+          "hint": "Whether to retry when the model API returns 429 Too Many Requests. Enabled by default; disable to skip 429 retries."
+        },
+        "request_retry_429_fixed_seconds": {
+          "description": "Fixed Retry Delay (seconds)",
+          "hint": "Seconds to wait before each retry when “Fixed retry” is selected. Defaults to 10."
+        },
+        "request_retry_429_max": {
+          "description": "429 Max Retry Count",
+          "hint": "Maximum retries when receiving 429. Defaults to 5 and cannot be 0 (the backend coerces 0 to 1)."
+        },
+        "request_retry_429_strategy": {
+          "description": "429 Retry Strategy",
+          "hint": "How long to wait between 429 retries: exponential backoff or a fixed per-retry delay.",
+          "labels": [
+            "Exponential backoff",
+            "Fixed interval"
+          ]
         }
       },
       "provider_stt_settings": {
         "enable": {
-          "description": "Speech Recognition",
-          "hint": "Use a speech-to-text model to transcribe user voice messages into text for the model to understand."
+          "description": "Enable Speech-to-Text",
+          "hint": "Master switch for STT"
         },
         "provider_id": {
           "description": "Default Speech-to-Text Model",
@@ -65,8 +119,8 @@
       },
       "provider_tts_settings": {
         "enable": {
-          "description": "Voice Replies",
-          "hint": "Use a text-to-speech model to turn text into voice replies."
+          "description": "Enable Text-to-Speech",
+          "hint": "Master switch for TTS"
         },
         "provider_id": {
           "description": "Default Text-to-Speech Model"
@@ -94,6 +148,11 @@
               "hint": "Select how safety mode is applied."
             }
           }
+        }
+      },
+      "provider_settings": {
+        "default_personality": {
+          "description": "Default Persona"
         }
       }
     },
@@ -155,7 +214,7 @@
         },
         "websearch_anysearch_key": {
           "description": "AnySearch API Key",
-          "hint": "Multiple keys can be added for rotation. Leave empty for anonymous mode (daily free quota). Get a key at https://anysearch.com/console/api-keys"
+          "hint": "Anonymous access supported (daily free quota); configure keys for higher quota. Multiple keys are rotated."
         }
       },
       "hint": "Lets AstrBot access the internet to stay up to date."
@@ -182,7 +241,12 @@
       "provider_settings": {
         "computer_use_runtime": {
           "description": "Computer Use Runtime",
-          "hint": "Environment allowed for Agent usage. `local` means the local machine environment, `sandbox` means the sandbox environment, and `none` means no environment is allowed."
+          "hint": "Environment allowed for Agent usage. `local` means the local machine environment, `sandbox` means the sandbox environment, and `none` means no environment is allowed.",
+          "labels": [
+            "Disabled",
+            "Local",
+            "Sandbox"
+          ]
         },
         "computer_use_require_admin": {
           "description": "Require AstrBot Admin Permission",
@@ -194,7 +258,12 @@
         },
         "sandbox": {
           "booter": {
-            "description": "Sandbox Environment Driver"
+            "description": "Sandbox Environment Driver",
+            "labels": [
+              "Shipyard Neo",
+              "Shipyard",
+              "CUA"
+            ]
           },
           "shipyard_neo_endpoint": {
             "description": "Shipyard Neo API Endpoint",
@@ -218,7 +287,13 @@
           },
           "cua_os_type": {
             "description": "CUA OS Type",
-            "hint": "CUA sandbox operating system type. Defaults to linux."
+            "hint": "CUA sandbox operating system type. Defaults to linux.",
+            "labels": [
+              "Linux",
+              "macOS",
+              "Windows",
+              "Android"
+            ]
           },
           "cua_idle_timeout": {
             "description": "CUA Idle Timeout",
@@ -1242,6 +1317,14 @@
         "description": "Python package index (PyPI) URL",
         "hint": "PyPI index used when installing Python plugin dependencies. Default: https://mirrors.aliyun.com/pypi/simple/"
       },
+      "python_deps_install_mode": {
+        "description": "Python dependency install mode",
+        "hint": "Install on demand: only core gRPC dependencies are pre-installed; missing packages are installed automatically per the mapping table when plugins run (recommended). Full install: pre-install all host dependencies at once, suitable for offline/no-network environments.",
+        "labels": [
+          "Install on demand",
+          "Full install"
+        ]
+      },
       "callback_api_base": {
         "description": "Externally Accessible Callback API Address",
         "hint": "External services may access AstrBot's backend through callback links generated by AstrBot (such as file download links). Since AstrBot cannot automatically determine the externally accessible host address in the deployment environment, this configuration item is needed to explicitly specify how external services should access AstrBot's address. Examples: [http://localhost:6185](http://localhost:6185), [https://example.com](https://example.com), etc."
@@ -1352,6 +1435,14 @@
       "goflags": {
         "description": "Go Build Extra Arguments",
         "hint": "Extra args appended to go build, e.g. -tags xxx"
+      },
+      "github_proxy": {
+        "description": "GitHub proxy",
+        "hint": "Accelerating proxy for GitHub access (plugin marketplace, release downloads). Leave empty for direct connection."
+      },
+      "language": {
+        "description": "Language",
+        "hint": "WebUI display language."
       }
     }
   },

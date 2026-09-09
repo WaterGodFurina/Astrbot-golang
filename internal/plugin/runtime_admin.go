@@ -491,12 +491,15 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		return nil, fmt.Errorf("plugin %s has no install source", id)
 	}
 	carry := InstallOptions{
-		IgnoreRisk:     opts.IgnoreRisk,
-		CCChoice:       opts.CCChoice,
-		GoChoice:       opts.GoChoice,
-		PythonChoice:   opts.PythonChoice,
-		GoMirror:       opts.GoMirror,
-		PythonMirror:   opts.PythonMirror,
+		IgnoreRisk:   opts.IgnoreRisk,
+		CCChoice:     opts.CCChoice,
+		GoChoice:     opts.GoChoice,
+		PythonChoice: opts.PythonChoice,
+		GoMirror:     opts.GoMirror,
+		PythonMirror: opts.PythonMirror,
+		// 依赖分层选择：更新路径同样要透传（config 为空时安装路径会弹
+		// python_deps_prompt，重发请求带的 deps_choice 不能在重装链路丢）。
+		DepsChoice:     opts.DepsChoice,
 		Progress:       opts.Progress,
 		InstallMethod:  entry.InstallMethod,
 		RegistryURL:    entry.RegistryURL,

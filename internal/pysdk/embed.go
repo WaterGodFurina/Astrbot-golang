@@ -967,9 +967,17 @@ func EnsureVenv(dataDir string) string {
 }
 
 // EnsureVenvWithStage is EnsureVenv with a stage callback for install-dialog
-// progress ("创建 venv 并安装宿主 Python 依赖…").
+// progress ("创建 venv 并安装宿主 Python 依赖…"). 依赖按全量清单预装（对齐
+// 旧行为）；分层安装（lazy 核心层）走 EnsureVenvWithDepsMode。
 func EnsureVenvWithStage(dataDir string, stage func(string)) string {
-	venvPython, err := ensureVenvReady(dataDir, stage)
+	return EnsureVenvWithDepsMode(dataDir, stage, depsModeFull)
+}
+
+// EnsureVenvWithDepsMode is EnsureVenvWithStage with a host-deps layering
+// mode（depsMode："lazy" 只预装核心层 coreHostDeps / "full" 全量预装
+// hostBaseDeps，空按 lazy）：决定 venv 供给时的 pip 清单与 import 探测表。
+func EnsureVenvWithDepsMode(dataDir string, stage func(string), depsMode string) string {
+	venvPython, err := ensureVenvReady(dataDir, stage, depsMode)
 	if err != nil {
 		logger.Warn("Python venv 准备失败: %v（插件将无法启动）", err)
 		return ""
@@ -986,8 +994,9 @@ var venvLockTimeout = 10 * time.Minute
 // importable: a cached venv whose markers match is returned without probing;
 // incomplete venvs (marker missing/mismatched, or a legacy venv without
 // environment.json whose deps probe fails) are re-provisioned under the venv
-// lock. 返回 "" 语义由调用方（EnsureVenv）处理。
-func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
+// lock. 返回 "" 语义由调用方（EnsureVenv）处理。depsMode 决定 venv 供给的
+// 预装清单与 import 探测表（lazy 核心层 / full 全量，空按 lazy）。
+func ensureVenvReady(dataDir string, stage func(string), depsMode string) (string, error) {
 	cacheDir := userCacheDir()
 	if cacheDir == "" {
 		cacheDir = filepath.Join(dataDir, SDKRootName)
@@ -1022,8 +1031,9 @@ func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 	if info, err := os.Stat(venvPython); err == nil && !info.IsDir() {
 		venvExists = true
 		// 旧版 venv 迁移：无 environment.json 但有完整依赖 → 补写标记直接复用
-		//（避免已部署环境重新 pip 装一遍）。
-		if _, err := os.Stat(environmentPath(root)); os.IsNotExist(err) && hasHostDeps(venvPython) {
+		//（避免已部署环境重新 pip 装一遍）。探测表按 depsMode 取：lazy 只要求
+		// 核心层可导入（旧全量 venv 必然覆盖核心层，仍可复用）。
+		if _, err := os.Stat(environmentPath(root)); os.IsNotExist(err) && hasHostDeps(venvPython, hostProbesForMode(depsMode)) {
 			if werr := writeVenvMarkers(root, base, SDKVersion, baseDepsVersion); werr != nil {
 				logger.Warn("补写 venv 标记失败: %v", werr)
 			}
@@ -1031,8 +1041,8 @@ func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 		}
 	}
 
-	// 宿主解释器本身已具备全部依赖 → 直接使用（无需 venv）。
-	if !venvExists && hasHostDeps(base) {
+	// 宿主解释器本身已具备 depsMode 所需依赖 → 直接使用（无需 venv）。
+	if !venvExists && hasHostDeps(base, hostProbesForMode(depsMode)) {
 		return base, nil
 	}
 
@@ -1050,7 +1060,7 @@ func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 		if venvMarkersMatch(root, base, SDKVersion, baseDepsVersion) {
 			return venvPython, nil
 		}
-		if _, err := os.Stat(environmentPath(root)); os.IsNotExist(err) && hasHostDeps(venvPython) {
+		if _, err := os.Stat(environmentPath(root)); os.IsNotExist(err) && hasHostDeps(venvPython, hostProbesForMode(depsMode)) {
 			if werr := writeVenvMarkers(root, base, SDKVersion, baseDepsVersion); werr != nil {
 				logger.Warn("补写 venv 标记失败: %v", werr)
 			}
@@ -1077,7 +1087,7 @@ func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 			return "", fmt.Errorf("创建 venv 失败: %w", err)
 		}
 	}
-	if err := installHostDeps(venvPython, stage); err != nil {
+	if err := installHostDeps(venvPython, stage, depsMode); err != nil {
 		// 安装失败：移除 READY，下次启动重试。
 		_ = os.Remove(readyPath(root))
 		return "", fmt.Errorf("venv 安装宿主依赖失败: %w", err)
@@ -1091,7 +1101,8 @@ func ensureVenvReady(dataDir string, stage func(string)) (string, error) {
 // hostBaseDeps 是 Python AstrBot 本体的常驻依赖子集（插件不声明但依赖，
 // 因为在本体中天然存在）：Web 框架 / HTTP 客户端 / 序列化 / 图像 / 通用
 // 工具 / 平台 SDK。安装在宿主 venv 里，使大量 Python 插件开箱可用；安装在
-// 首次创建 venv 时一次性执行（走默认 pip 镜像，见 PyPIIndex）。
+// 首次创建 venv 时一次性执行（走默认 pip 镜像，见 PyPIIndex）。清单含核心
+// 层（coreHostDeps）：depsMode == "full" 时全量预装。
 // 对齐 Python AstrBot requirements.txt：aiocqhttp（OneBot）、apscheduler、
 // tenacity、openai/anthropic/dashscope（LLM）、qq-botpy、python-telegram-bot
 // 等为插件最常 import 的本体常驻库；重型（pandas/faiss/sqlmodel 等）留给
@@ -1115,6 +1126,13 @@ var hostBaseDeps = []string{
 	"tzdata",
 }
 
+// coreHostDeps 是宿主依赖分层安装的核心层：bridge 进程 100% 必需的 gRPC 桥
+// 最小集（grpcio/protobuf）。depsMode == "lazy" 时只预装这一层——扩展层
+// （hostBaseDeps 其余包）由 Python SDK 的 meta_path import 拦截器在插件
+// 首次 import 时按需 pip 安装（SDK 侧实现，宿主不感知），venv 初始化从
+// 1-3 分钟降到 ~10 秒。
+var coreHostDeps = []string{"grpcio", "protobuf"}
+
 // hostDepProbes 是 hostBaseDeps 的关键模块探测表（import 名）：任一缺失即
 // 视为宿主依赖不完整，启动 Python 插件前自动补齐（EnsureVenv 检查用）。
 var hostDepProbes = []string{
@@ -1130,10 +1148,51 @@ var hostDepProbes = []string{
 	"botpy",
 }
 
+// coreHostProbes 是 coreHostDeps 的探测表（import 名）：与核心层安装清单
+// 一一对应，lazy 模式下 hasHostDeps 只查这两项（扩展层由 SDK 懒加载兜底）。
+var coreHostProbes = []string{"grpc", "google.protobuf"}
+
+// 依赖分层模式常量：hostDepsMode 归一化后取值。"lazy"（默认推荐）只预装
+// 核心层，"full" 保持全量预装现状。
+const (
+	depsModeLazy = "lazy"
+	depsModeFull = "full"
+)
+
+// hostDepsMode 归一化依赖分层模式：空/未知值按 lazy（默认推荐层）。
+func hostDepsMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case depsModeFull:
+		return depsModeFull
+	default:
+		return depsModeLazy
+	}
+}
+
+// hostDepsForMode 返回 depsMode 对应的 pip 安装清单：lazy → 核心层，
+// full → 全量清单（含核心）。
+func hostDepsForMode(mode string) []string {
+	if hostDepsMode(mode) == depsModeFull {
+		return hostBaseDeps
+	}
+	return coreHostDeps
+}
+
+// hostProbesForMode 返回 depsMode 对应的 import 探测表：lazy → 核心探测，
+// full → 全量探测。
+func hostProbesForMode(mode string) []string {
+	if hostDepsMode(mode) == depsModeFull {
+		return hostDepProbes
+	}
+	return coreHostProbes
+}
+
 // baseDepsVersion 是宿主依赖清单（hostBaseDeps/hostDepProbes）的版本号：
 // 修改清单内容时手动 +1，触发既有 venv 的 environment.json 不匹配而重新
-// pip 安装（否则 venv 一旦 READY 就永久复用，清单变化不会生效）。
-const baseDepsVersion = 5
+// pip 安装（否则 venv 一旦 READY 就永久复用，清单变化不会生效）。5→6：
+// 依赖分层（lazy 核心层）语义变化——既有全量 venv 标记不再匹配，会按
+// 当前 mode 重新探测/供给（已含核心层的旧 venv 即使重装也只是补 pip 校验）。
+const baseDepsVersion = 6
 
 const (
 	// envFileName 记录 venv 的供给来源（解释器 / SDK 版本 / 依赖清单版本）。
@@ -1202,8 +1261,9 @@ func venvMarkersMatch(venvRoot, interpreter, sdkVersion string, depsVersion int)
 	return env.Interpreter == interpreter && env.SDKVersion == sdkVersion && env.BaseDepsVersion == depsVersion
 }
 
-// hasHostDeps reports whether all key host base dependencies are importable in
-// the given interpreter. Missing ones trigger a venv re-provisioning
+// hasHostDeps reports whether all dependencies in the given probe list are
+// importable in the given interpreter (探测表由调用方按 depsMode 选择：
+// hostProbesForMode). Missing ones trigger a venv re-provisioning
 // (installHostDeps) so Python plugins that rely on Python-AstrBot's resident
 // deps (e.g. aiocqhttp) start without a module-not-found crash.
 //
@@ -1213,9 +1273,9 @@ func venvMarkersMatch(venvRoot, interpreter, sdkVersion string, depsVersion int)
 // nspkg.pth 在 site 处理期 import 了 importlib.util——纯巧合；新建 venv
 // 没有该 .pth，探测必然 AttributeError: module 'importlib' has no attribute
 // 'util'，venv 被误判"依赖不完整"而反复重装（READY 永远写不出来）。
-func hasHostDeps(pythonBin string) bool {
-	script := "import importlib.util; mods=" + strconv.Quote(strings.Join(hostDepProbes, " ")) + "; missing=[m for m in mods.split() if importlib.util.find_spec(m) is None]; import sys; sys.exit(1 if missing else 0)"
-	cmd := exec.Command(pythonBin, "-c", script) // #nosec G204 -- 宿主依赖探测脚本：script 由固定常量 hostDepProbes 拼装并经 strconv.Quote 转义，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+func hasHostDeps(pythonBin string, probes []string) bool {
+	script := "import importlib.util; mods=" + strconv.Quote(strings.Join(probes, " ")) + "; missing=[m for m in mods.split() if importlib.util.find_spec(m) is None]; import sys; sys.exit(1 if missing else 0)"
+	cmd := exec.Command(pythonBin, "-c", script) // #nosec G204 -- 宿主依赖探测脚本：script 由固定常量表（hostDepProbes/coreHostProbes）拼装并经 strconv.Quote 转义，pythonBin 为宿主解析的解释器路径; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	return cmd.Run() == nil
 }
 
@@ -1253,8 +1313,12 @@ func runPipInstall(pythonBin string, args []string) ([]byte, error) {
 	}
 }
 
-func installHostDeps(pythonBin string, stage func(string)) error {
-	deps := hostBaseDeps
+// installHostDeps 按分层模式把宿主依赖装进 venv：depsMode 归一化后 "lazy"
+// 只装核心层（coreHostDeps），"full" 走全量 hostBaseDeps（含核心）。探测
+// 缺失触发重装时同样只装本层（lazy 缺包只补核心，不把扩展层整包拖回来；
+// 扩展层缺失由 Python SDK 运行时懒加载兜底）。
+func installHostDeps(pythonBin string, stage func(string), depsMode string) error {
+	deps := hostDepsForMode(depsMode)
 	if runtime.GOOS == "android" {
 		// Termux：跳过已有预编译系统包的 C 扩展（pkg install 装的
 		// grpcio/cryptography/pillow/psutil 经 --system-site-packages 可见），
@@ -1302,21 +1366,35 @@ func installHostDeps(pythonBin string, stage func(string)) error {
 		logger.Warn("pip install 失败: %v", err)
 		return err
 	}
-	logger.Info("venv 宿主基础依赖安装完成（grpcio/protobuf + 本体常驻依赖）")
+	if hostDepsMode(depsMode) == depsModeLazy {
+		// lazy 层只装 grpcio/protobuf；quart/openai 等扩展依赖由 Python SDK
+		// 运行时 import 拦截器按需安装，这里不预装也不探测。
+		logger.Info("venv 宿主核心依赖安装完成（grpcio/protobuf，扩展依赖由 SDK 运行时按需安装）")
+	} else {
+		logger.Info("venv 宿主基础依赖安装完成（grpcio/protobuf + 本体常驻依赖）")
+	}
 	return nil
 }
 
 // PrepareRuntime resolves the full Python subprocess environment for plugin
 // launch. It must be called lazily (first Python plugin load), not at startup,
-// because it may download packages.
+// because it may download packages. 依赖按全量清单供给（对齐旧行为）；分层
+// 安装走 PrepareRuntimeWithDepsMode。
 func PrepareRuntime(dataDir string) (*RuntimeEnv, error) {
 	return PrepareRuntimeWithStage(dataDir, nil)
 }
 
 // PrepareRuntimeWithStage is PrepareRuntime with a stage callback receiving
 // human-readable phase text (e.g. "下载 Python 解释器…") surfaced to the WebUI
-// install dialog.
+// install dialog. 依赖按全量清单供给（对齐旧行为）。
 func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, error) {
+	return PrepareRuntimeWithDepsMode(dataDir, stage, depsModeFull)
+}
+
+// PrepareRuntimeWithDepsMode is PrepareRuntimeWithStage with a host-deps
+// layering mode（depsMode："lazy" 核心层 / "full" 全量，空按 lazy）：解释器
+// 直接可用性探测与 venv 供给均按该模式取探测表/安装清单。
+func PrepareRuntimeWithDepsMode(dataDir string, stage func(string), depsMode string) (*RuntimeEnv, error) {
 	sdkDir, err := Ensure(dataDir)
 	if err != nil {
 		return nil, err
@@ -1325,8 +1403,8 @@ func PrepareRuntimeWithStage(dataDir string, stage func(string)) (*RuntimeEnv, e
 	if err != nil {
 		return nil, err
 	}
-	if !hasHostDeps(py) {
-		py = EnsureVenvWithStage(dataDir, stage)
+	if !hasHostDeps(py, hostProbesForMode(depsMode)) {
+		py = EnsureVenvWithDepsMode(dataDir, stage, depsMode)
 	}
 	if py == "" {
 		return nil, ErrRuntimeUnavailable

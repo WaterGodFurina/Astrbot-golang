@@ -150,8 +150,8 @@ onMounted(async () => {
   <div>
     <v-card variant="flat" class="sleep-panel">
       <v-card-text>
-        <div class="sleep-warning mb-4">
-          {{ tm("sleep.warning") }}
+        <div class="text-body-2 text-medium-emphasis mb-4">
+          {{ tm("sleep.intro") }}
         </div>
 
         <v-table v-if="plugins.length" class="detail-info-table sleep-table">

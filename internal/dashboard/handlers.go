@@ -2547,7 +2547,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 
 	var source, id, installID string
 	var ignoreRisk bool
-	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror string
+	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror, depsChoice string
 	var installMethod, registryURL, registryName, marketPluginID, repo, downloadURL string
 
 	method := "url"
@@ -2565,6 +2565,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			PythonChoice   string `json:"python_choice"`
 			GoMirror       string `json:"go_mirror"`
 			PythonMirror   string `json:"python_mirror"`
+			DepsChoice     string `json:"deps_choice"`
 			InstallID      string `json:"install_id"`
 			InstallMethod  string `json:"install_method"`
 			RegistryURL    string `json:"registry_url"`
@@ -2584,6 +2585,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		pythonChoice = strings.TrimSpace(body.PythonChoice)
 		goMirror = strings.TrimSpace(body.GoMirror)
 		pythonMirror = strings.TrimSpace(body.PythonMirror)
+		depsChoice = strings.TrimSpace(body.DepsChoice)
 		installID = body.InstallID
 		installMethod = body.InstallMethod
 		registryURL = body.RegistryURL
@@ -2637,6 +2639,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		pythonChoice = strings.TrimSpace(r.FormValue("python_choice"))
 		goMirror = strings.TrimSpace(r.FormValue("go_mirror"))
 		pythonMirror = strings.TrimSpace(r.FormValue("python_mirror"))
+		depsChoice = strings.TrimSpace(r.FormValue("deps_choice"))
 		installID = r.FormValue("install_id")
 		installMethod = r.FormValue("install_method")
 		registryURL = r.FormValue("registry_url")
@@ -2677,6 +2680,23 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
+	// deps_choice（python_deps_prompt 弹窗选择）持久化：写入 config
+	// python_deps_install_mode，使后续安装/更新不再重复弹窗；同时同步
+	// subPluginMgr 运行期值（lifecycle 只在启动时接线，运行期保存需手动刷）。
+	// 持久化失败不阻断安装（下次安装会再次弹窗，仅提示）。
+	switch strings.ToLower(depsChoice) {
+	case "lazy", "full":
+		depsChoice = strings.ToLower(depsChoice)
+		if err := s.setConfigData("python_deps_install_mode", depsChoice); err != nil {
+			logger.I18nWarn("保存 python_deps_install_mode 失败: %v", err)
+		}
+		if s.subPluginMgr != nil {
+			s.subPluginMgr.SetPipDepsMode(depsChoice)
+		}
+	default:
+		depsChoice = ""
+	}
+
 	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{
 		IgnoreRisk:     ignoreRisk,
 		CCChoice:       ccChoice,
@@ -2684,6 +2704,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		PythonChoice:   pythonChoice,
 		GoMirror:       goMirror,
 		PythonMirror:   pythonMirror,
+		DepsChoice:     depsChoice,
 		Progress:       s.installProgressCallback(installID),
 		Stage:          s.installStageCallback(installID),
 		InstallMethod:  installMethod,
@@ -2730,8 +2751,23 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		if errors.As(err, &runtimeErr) {
 			done = false
 			code := "go_sdk_prompt"
-			if runtimeErr.Kind == plugin.RuntimePromptPython {
+			switch runtimeErr.Kind {
+			case plugin.RuntimePromptPython:
 				code = "python_runtime_prompt"
+			case plugin.RuntimePromptPythonDeps:
+				// 依赖分层模式未选择：data 带 config_key 供前端写回提示。
+				s.setInstallProgress(installID, &installStatus{Status: "installing", Text: "等待选择依赖安装模式…"})
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"status":  "error",
+					"code":    "python_deps_prompt",
+					"message": runtimeErr.Error(),
+					"data": map[string]interface{}{
+						"kind":       string(runtimeErr.Kind),
+						"primary":    runtimeErr.Primary,
+						"config_key": "python_deps_install_mode",
+					},
+				})
+				return
 			}
 			s.setInstallProgress(installID, &installStatus{Status: "installing", Text: "需要确认下载运行时…"})
 			writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2781,6 +2817,7 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 	pythonChoice := ""
 	goMirror := ""
 	pythonMirror := ""
+	depsChoice := ""
 	if len(parts) == 1 {
 		ids = append(ids, parts[0])
 		ccChoice = strings.TrimSpace(r.FormValue("cc_choice"))
@@ -2788,6 +2825,7 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 		pythonChoice = strings.TrimSpace(r.FormValue("python_choice"))
 		goMirror = strings.TrimSpace(r.FormValue("go_mirror"))
 		pythonMirror = strings.TrimSpace(r.FormValue("python_mirror"))
+		depsChoice = strings.TrimSpace(r.FormValue("deps_choice"))
 	} else {
 		var body struct {
 			PluginID     string   `json:"plugin_id"`
@@ -2797,6 +2835,7 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			PythonChoice string   `json:"python_choice"`
 			GoMirror     string   `json:"go_mirror"`
 			PythonMirror string   `json:"python_mirror"`
+			DepsChoice   string   `json:"deps_choice"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
@@ -2812,6 +2851,20 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 		pythonChoice = strings.TrimSpace(body.PythonChoice)
 		goMirror = strings.TrimSpace(body.GoMirror)
 		pythonMirror = strings.TrimSpace(body.PythonMirror)
+		depsChoice = strings.TrimSpace(body.DepsChoice)
+	}
+	// deps_choice 持久化（与安装路径同语义：弹窗选择写 config 后不再重复弹）。
+	switch strings.ToLower(depsChoice) {
+	case "lazy", "full":
+		depsChoice = strings.ToLower(depsChoice)
+		if err := s.setConfigData("python_deps_install_mode", depsChoice); err != nil {
+			logger.I18nWarn("保存 python_deps_install_mode 失败: %v", err)
+		}
+		if s.subPluginMgr != nil {
+			s.subPluginMgr.SetPipDepsMode(depsChoice)
+		}
+	default:
+		depsChoice = ""
 	}
 	if len(ids) == 0 {
 		writeJSON(w, http.StatusOK, apiError("缺少要更新的插件"))
@@ -2846,6 +2899,7 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			PythonChoice: pythonChoice,
 			GoMirror:     goMirror,
 			PythonMirror: pythonMirror,
+			DepsChoice:   depsChoice,
 			DownloadURL:  latestDL,
 			Repo:         latestRepo,
 		})
@@ -2858,14 +2912,17 @@ func (s *Server) handlePluginUpdate(w http.ResponseWriter, r *http.Request, part
 			var runtimeErr *plugin.RuntimePromptError
 			if errors.As(err, &runtimeErr) {
 				code := "go_sdk_prompt"
-				if runtimeErr.Kind == plugin.RuntimePromptPython {
+				switch runtimeErr.Kind {
+				case plugin.RuntimePromptPython:
 					code = "python_runtime_prompt"
+				case plugin.RuntimePromptPythonDeps:
+					code = "python_deps_prompt"
 				}
 				results = append(results, result{
 					Name:    name,
 					Status:  "error",
 					Code:    code,
-					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android, "primary": runtimeErr.Primary, "mirrors": runtimeErr.Mirrors, "command": runtimeErr.Command},
+					Data:    map[string]interface{}{"kind": string(runtimeErr.Kind), "android": runtimeErr.Android, "primary": runtimeErr.Primary, "mirrors": runtimeErr.Mirrors, "command": runtimeErr.Command, "config_key": "python_deps_install_mode"},
 					Message: runtimeErr.Error(),
 				})
 				continue

@@ -520,6 +520,11 @@ export type PluginRepositoryInstallRequest = {
     install_method?: string;
     registry_url?: (string) | null;
     market_plugin_id?: string;
+    /**
+     * Python dependency install mode choice (lazy / full).
+     * 宿主后端已支持，待 openapi spec 更新后随 generate:api 重新生成。
+     */
+    deps_choice?: string;
 };
 
 export type PluginSourceBindRequest = {
@@ -553,6 +558,11 @@ export type PluginUrlInstallRequest = {
     install_method?: string;
     registry_url?: (string) | null;
     market_plugin_id?: string;
+    /**
+     * Python dependency install mode choice (lazy / full).
+     * 宿主后端已支持，待 openapi spec 更新后随 generate:api 重新生成。
+     */
+    deps_choice?: string;
 };
 
 export type PluginValidateRepoRequest = {

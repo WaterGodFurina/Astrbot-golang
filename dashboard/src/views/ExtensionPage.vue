@@ -175,6 +175,9 @@ const {
   pythonRuntimeDialog,
   choosePythonDownload,
   cancelPythonDownload,
+  depsModeDialog,
+  chooseDepsMode,
+  cancelDepsMode,
   copyPkgCommand,
   installProgress,
   newExtension,
@@ -924,6 +927,47 @@ const updateDialogPluginLogo = computed(() => {
             {{ tm("dialogs.python_runtime.download") }}
           </v-btn>
         </template>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <!-- Python 依赖安装模式选择对话框 -->
+  <v-dialog v-model="depsModeDialog.show" width="560" persistent>
+    <v-card>
+      <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center">
+        <v-icon color="warning" class="mr-2">mdi-package-variant-closed</v-icon>
+        {{ tm("dialogs.depsMode.title") }}
+      </v-card-title>
+      <v-card-text>
+        <div v-if="depsModeDialog.message" class="mb-2">
+          {{ depsModeDialog.message }}
+        </div>
+        <div class="mb-2 text-medium-emphasis">
+          {{ tm("dialogs.depsMode.desc") }}
+        </div>
+        <div class="text-body-2 text-medium-emphasis">
+          {{ tm("dialogs.depsMode.hint") }}
+        </div>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer></v-spacer>
+        <v-btn color="grey" variant="text" @click="cancelDepsMode">
+          {{ tm("dialogs.depsMode.cancel") }}
+        </v-btn>
+        <v-btn
+          :color="depsModeDialog.primary === 'lazy' ? 'primary' : 'grey'"
+          variant="tonal"
+          @click="chooseDepsMode('lazy')"
+        >
+          {{ tm("dialogs.depsMode.lazyLabel") }}
+        </v-btn>
+        <v-btn
+          :color="depsModeDialog.primary === 'full' ? 'primary' : 'grey'"
+          variant="tonal"
+          @click="chooseDepsMode('full')"
+        >
+          {{ tm("dialogs.depsMode.fullLabel") }}
+        </v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>

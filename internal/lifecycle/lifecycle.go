@@ -305,6 +305,10 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// Python 插件依赖安装的 PyPI 镜像与额外 pip 参数（config pypi_index_url /
 	// pip_install_arg），供插件 requirements.txt 与宿主 venv 基础依赖安装使用。
 	l.subPluginMgr.SetPipConfig(cfg.GetString("pypi_index_url"), cfg.GetString("pip_install_arg"))
+	// Python 宿主依赖分层模式（config python_deps_install_mode："lazy" 只预装
+	// grpcio/protobuf 核心层，"full" 全量预装；空=用户未选择过，首次安装
+	// Python 插件时经 python_deps_prompt 弹窗询问并回写 config）。
+	l.subPluginMgr.SetPipDepsMode(cfg.GetString("python_deps_install_mode"))
 	// Python SDK（非嵌入，从 astrbot-python-sdk 仓库下载）的 GitHub 加速前缀。
 	pysdk.SetSDKGitHubProxy(cfg.GetString("github_proxy"))
 	// pip/venv 安装代理：config http_proxy 优先于系统代理，为空时 pip 才回退

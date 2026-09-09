@@ -20,6 +20,11 @@ type RuntimePromptKind string
 const (
 	RuntimePromptGoSDK  RuntimePromptKind = "go_sdk"
 	RuntimePromptPython RuntimePromptKind = "python"
+	// RuntimePromptPythonDeps 是 Python 宿主依赖分层模式未选择时的提示 Kind
+	//（config python_deps_install_mode 为空且本次安装未带 deps_choice）：
+	// 前端弹窗让用户选 "lazy"（只预装核心层，推荐）/ "full"（全量预装），
+	// 选择经 dashboard 写回 config 并以 deps_choice 重发安装。
+	RuntimePromptPythonDeps RuntimePromptKind = "python_deps_mode"
 )
 
 // goSDKMirrors 是 Go 工具链官方归档的下载镜像列表（base URL 风格：archive
@@ -68,6 +73,9 @@ func (e *RuntimePromptError) Error() string {
 	}
 	if e.Android {
 		switch e.Kind {
+		case RuntimePromptPythonDeps:
+			// Android 上同样可能首次安装：提示文案与常规路径一致。
+			return "首次安装 Python 插件：请选择宿主依赖安装模式（lazy 仅安装核心依赖 / full 全量预装）"
 		case RuntimePromptPython:
 			// Android/Termux 上 Python 运行时准备失败的常见根因：宿主基础
 			// 依赖里的 C 扩展包（grpcio/cryptography/pillow/psutil）在
@@ -81,6 +89,9 @@ func (e *RuntimePromptError) Error() string {
 		}
 	}
 	switch e.Kind {
+	case RuntimePromptPythonDeps:
+		// 依赖分层选择弹窗：首次安装 Python 插件且从未选择过安装模式。
+		return "首次安装 Python 插件：请选择宿主依赖安装模式（lazy 仅安装核心依赖 / full 全量预装）"
 	case RuntimePromptPython:
 		return "无法准备 Python 运行时，需要确认是否自动下载 CPython"
 	default:
@@ -251,8 +262,9 @@ func (m *SubprocessManager) downloadGoSDK(ctx context.Context, opts InstallOptio
 // RuntimePromptError when the runtime cannot be prepared and the user has not
 // yet decided to auto-download CPython. "download" proceeds through the normal
 // prepare path (EnsurePythonBin/EnsureVenv auto-download CPython when the host
-// has no interpreter).
-func (m *SubprocessManager) pythonRuntimeForInstall(opts InstallOptions) (*pysdk.RuntimeEnv, error) {
+// has no interpreter). depsMode 是调用方（installPythonSource）解析好的依赖
+// 分层模式（InstallOptions.DepsChoice 优先，回退 config），透传给 venv 供给。
+func (m *SubprocessManager) pythonRuntimeForInstall(opts InstallOptions, depsMode string) (*pysdk.RuntimeEnv, error) {
 	choice := strings.ToLower(strings.TrimSpace(opts.PythonChoice))
 	switch choice {
 	case "cancel":
@@ -287,7 +299,7 @@ func (m *SubprocessManager) pythonRuntimeForInstall(opts InstallOptions) (*pysdk
 	if opts.PythonMirror != "" {
 		pysdk.SetPythonMirror(opts.PythonMirror)
 	}
-	env, err := m.pythonRuntimeWithStage(opts.Stage)
+	env, err := m.pythonRuntimeWithStage(opts.Stage, depsMode)
 	if err != nil {
 		// 未决定时准备仍失败（宿主基础依赖装不上等）→ 转为下载确认提示。
 		if choice == "" && errors.Is(err, pysdk.ErrRuntimeUnavailable) {

@@ -164,6 +164,11 @@ type SubprocessManager struct {
 	pipIndex string
 	pipArgs  []string
 
+	// pipDepsMode 是宿主 venv 依赖分层模式（config python_deps_install_mode：
+	// "lazy" 只预装核心层 / "full" 全量预装，""=用户未选择过，供给按 lazy）。
+	// 透传给 pysdk 的 venv 供给入口（EnsureVenvWithDepsMode）。
+	pipDepsMode string
+
 	// toolRegMu 保护 toolRegistry：LLM 工具名 → 所属插件 id + 工具描述。
 	// 插件闲置休眠（UnloadIdle）时实例被移出 instances 表，但其工具仍留在
 	// 注册表——LLM 调用该工具时宿主按名查注册表并 EnsureLoaded 唤醒插件；
@@ -546,6 +551,14 @@ func (m *SubprocessManager) SetPipConfig(indexURL, extraArgs string) {
 	}
 }
 
+// SetPipDepsMode 注入宿主 venv 依赖分层模式（config
+// python_deps_install_mode："lazy" 核心层 / "full" 全量 / ""=用户未选择过）。
+// 运行期供给与安装期供给共用；lifecycle 启动接线与 dashboard 弹窗持久化后
+// 各调用一次。空值按 pysdk 侧默认（lazy）。
+func (m *SubprocessManager) SetPipDepsMode(mode string) {
+	m.pipDepsMode = strings.TrimSpace(mode)
+}
+
 // SetHostCapabilities 设置宿主向 Python 插件公开的能力集合（平台适配器 ID
 // + 固定能力）。传入的能力在 Python 插件子进程启动时经
 // ASTRBOT_HOST_CAPABILITIES 环境变量注入，插件侧用 HostBridge.has() 查询。
@@ -673,6 +686,14 @@ type InstallOptions struct {
 	// default/env resolution is used. Applied via pysdk.SetPythonMirror before
 	// the download.
 	PythonMirror string
+
+	// DepsChoice carries the user's answer to the Python host-deps layering
+	// prompt（"lazy" 只预装核心层 / "full" 全量预装）。非空时优先于
+	// SubprocessManager 的 pipDepsMode（config python_deps_install_mode）——
+	// 弹窗选择已经 setConfigData 持久化，本次重发安装直接生效。空表示本次
+	// 请求未带选择，回退 config 值；两者皆空且 config 也为空 → 安装路径
+	// 返回 RuntimePromptError（code=python_deps_prompt）要求前端先弹窗。
+	DepsChoice string
 }
 
 // RiskError is returned by InstallFromSource when the static scan found risky
@@ -878,10 +899,28 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	if opts.Stage != nil {
 		opts.Stage("准备 Python 插件…")
 	}
+	// Python 宿主依赖分层模式解析（python_deps_install_mode）：用户本次
+	// 弹窗选择（DepsChoice，前端随重发请求带回）优先，其次宿主配置现值
+	//（pipDepsMode，lifecycle 启动接线 + dashboard 持久化后同步注入）。
+	// 两者皆空说明用户从未选择过 → 返回 RuntimePromptError
+	//（Kind=RuntimePromptPythonDeps，code=python_deps_prompt），前端弹窗让
+	// 用户选 lazy/full 后写 config 并带 deps_choice 重发安装。放在 venv
+	// 供给（pythonRuntimeForInstall → EnsureVenv）之前：首次供给就按用户
+	// 选定层级走，避免先全量装完再问。
+	depsMode := strings.ToLower(strings.TrimSpace(opts.DepsChoice))
+	switch depsMode {
+	case "lazy", "full":
+		// 用户本次显式选择，优先于配置。
+	default:
+		depsMode = strings.TrimSpace(m.pipDepsMode)
+		if depsMode != "lazy" && depsMode != "full" {
+			return nil, &RuntimePromptError{Kind: RuntimePromptPythonDeps, Primary: "lazy"}
+		}
+	}
 	// 安装路径先解析 Python 运行时（可能触发下载/venv），运行时无法准备且
 	// 用户未决定时返回 RuntimePromptError（前端弹窗询问是否下载 CPython）。
 	// 运行期加载（startInstance）保持 pythonRuntime 原行为，不弹窗。
-	env, err := m.pythonRuntimeForInstall(opts)
+	env, err := m.pythonRuntimeForInstall(opts, depsMode)
 	if err != nil {
 		return nil, err
 	}
@@ -1814,14 +1853,16 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 // pythonRuntime resolves (once) the Python subprocess environment: SDK
 // extraction + venv/grpcio preparation + (optionally) downloading a bundled
 // Python when the system has none. The first Python plugin load may take a
-// while (download / venv creation + pip install).
+// while (download / venv creation + pip install). 供给模式取宿主配置
+// （pipDepsMode：lazy 核心层 / full 全量 / 空按 pysdk 默认 lazy）。
 func (m *SubprocessManager) pythonRuntime() (*pysdk.RuntimeEnv, error) {
-	return m.pythonRuntimeWithStage(nil)
+	return m.pythonRuntimeWithStage(nil, m.pipDepsMode)
 }
 
 // pythonRuntimeWithStage is pythonRuntime with a stage callback surfaced to
-// the WebUI install dialog (e.g. "下载 Python 解释器…").
-func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.RuntimeEnv, error) {
+// the WebUI install dialog (e.g. "下载 Python 解释器…") and an explicit deps
+// layering mode（安装路径用 InstallOptions.DepsChoice 解析出的模式覆盖）。
+func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string), depsMode string) (*pysdk.RuntimeEnv, error) {
 	m.pythonEnvMu.Lock()
 	defer m.pythonEnvMu.Unlock()
 	if m.pythonEnv != nil {
@@ -1836,9 +1877,10 @@ func (m *SubprocessManager) pythonRuntimeWithStage(stage func(string)) (*pysdk.R
 		logger.I18nWarn("Python 运行时缓存失效（解释器/SDK 目录不存在），重新准备…")
 		m.pythonEnv = nil
 	}
-	// 宿主 venv 基础依赖安装（pysdk 内部 pip）也用 config 的 PyPI 镜像。
+	// 宿主 venv 基础依赖安装（pysdk 内部 pip）也用 config 的 PyPI 镜像；
+	// 依赖分层模式（lazy 核心层 / full 全量）随之透传给 venv 供给。
 	pysdk.SetPyPIIndex(m.pipIndex)
-	env, err := pysdk.PrepareRuntimeWithStage(m.dataDir, stage)
+	env, err := pysdk.PrepareRuntimeWithDepsMode(m.dataDir, stage, depsMode)
 	if err != nil {
 		return nil, err
 	}

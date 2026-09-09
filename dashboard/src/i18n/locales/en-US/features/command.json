@@ -108,6 +108,7 @@
     "noPlugins": "No enabled plugins",
     "globalSaved": "New-plugin default idle time saved",
     "pluginSaved": "Plugin sleep policy updated",
-    "listenerRisk": "This plugin has filters/hooks (active event listeners). Once hibernated its process is terminated and it can no longer receive messages/events."
+    "listenerRisk": "This plugin has filters/hooks (active event listeners). Once hibernated its process is terminated and it can no longer receive messages/events.",
+    "intro": "Configure idle auto-sleep per plugin: when enabled, an idle plugin process is reclaimed after the configured minutes to free memory, and is lazily woken on next use (transparent). Resident (off) by default."
   }
 }

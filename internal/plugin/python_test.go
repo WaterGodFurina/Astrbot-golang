@@ -290,7 +290,7 @@ func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
 	m := newTestManager(t)
 	defer m.Shutdown()
 
-	env1, err := m.pythonRuntimeWithStage(nil)
+	env1, err := m.pythonRuntimeWithStage(nil, "")
 	if err != nil {
 		t.Fatalf("首次准备 Python 运行时: %v", err)
 	}
@@ -298,7 +298,7 @@ func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
 		t.Fatalf("首次 PythonBin 不存在: %v", err)
 	}
 	// 缓存命中：再次解析返回同一指针（不重建）。
-	envHit, err := m.pythonRuntimeWithStage(nil)
+	envHit, err := m.pythonRuntimeWithStage(nil, "")
 	if err != nil {
 		t.Fatalf("缓存命中解析失败: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
 	}
 
 	// 关键断言：缓存失效后再次解析必须自愈重建（而非返回失效缓存）。
-	env2, err := m.pythonRuntimeWithStage(nil)
+	env2, err := m.pythonRuntimeWithStage(nil, "")
 	if err != nil {
 		t.Fatalf("缓存失效后重建失败: %v", err)
 	}
@@ -327,7 +327,7 @@ func TestPythonRuntimeCacheSelfHeals(t *testing.T) {
 		t.Fatalf("重建后 PythonBin 仍不存在: %v", err)
 	}
 	// 重建结果再次进入缓存：命中返回同一指针。
-	envHit2, err := m.pythonRuntimeWithStage(nil)
+	envHit2, err := m.pythonRuntimeWithStage(nil, "")
 	if err != nil {
 		t.Fatalf("重建后缓存命中失败: %v", err)
 	}

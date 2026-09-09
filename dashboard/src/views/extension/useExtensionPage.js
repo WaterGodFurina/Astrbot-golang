@@ -1,4 +1,4 @@
-import { commandApi, pluginApi } from "@/api/v1";
+import { commandApi, pluginApi, systemConfigApi } from "@/api/v1";
 import { pluginSidebarState } from "@/composables/usePluginSidebarItems";
 import { useI18n, useModuleI18n } from "@/i18n/composables";
 import { useCommonStore } from "@/stores/common";
@@ -226,6 +226,18 @@ export const useExtensionPage = (initialTab = "installed") => {
   const pythonChoice = ref("");
   // 用户选择的 Python 加速镜像
   const pythonMirror = ref("");
+
+  // Python 依赖安装模式选择对话框（python_deps_prompt：首次供给 venv 且未选择安装模式）
+  const depsModeDialog = reactive({
+    show: false,
+    message: "",
+    // 后端推荐的模式（lazy / full），lazy 为主按钮默认高亮
+    primary: "lazy",
+    // 后端下发的配置键，默认 python_deps_install_mode
+    configKey: "python_deps_install_mode",
+  });
+  // 用户选择的依赖安装模式（lazy / full）
+  const depsChoice = ref("");
 
   // 安装进度轮询状态
   const installProgress = ref({
@@ -2387,6 +2399,22 @@ export const useExtensionPage = (initialTab = "installed") => {
       return false;
     }
 
+    if (
+      resData.status === "error" &&
+      resData.code === "python_deps_prompt"
+    ) {
+      const data = resData.data || {};
+      depsModeDialog.message = resData.message || "";
+      depsModeDialog.primary =
+        String(data.primary || "") === "full" ? "full" : "lazy";
+      depsModeDialog.configKey = String(
+        data.config_key || "python_deps_install_mode",
+      );
+      depsModeDialog.show = true;
+      await refreshExtensionsAfterInstallFailure();
+      return false;
+    }
+
     if (resData.status === "error") {
       stopInstallProgressPolling();
       toast(resData.message, "error");
@@ -2459,6 +2487,32 @@ export const useExtensionPage = (initialTab = "installed") => {
     await newExtension();
   };
 
+  const savePythonDepsInstallMode = async (mode) => {
+    const configKey = depsModeDialog.configKey || "python_deps_install_mode";
+    const res = await systemConfigApi.get();
+    const config = res.data?.data?.config || {};
+    config[configKey] = mode;
+    await systemConfigApi.update(config);
+  };
+
+  const chooseDepsMode = async (mode) => {
+    const choice = mode === "full" ? "full" : "lazy";
+    depsModeDialog.show = false;
+    depsChoice.value = choice;
+    try {
+      await savePythonDepsInstallMode(choice);
+    } catch (error) {
+      // 保存失败不阻塞本次安装：deps_choice 仍随请求下发
+      console.debug("Failed to save python_deps_install_mode:", error);
+    }
+    await newExtension();
+  };
+
+  const cancelDepsMode = () => {
+    depsModeDialog.show = false;
+    depsChoice.value = "";
+  };
+
   const copyPkgCommand = async (cmd) => {
     try {
       await navigator.clipboard.writeText(cmd);
@@ -2480,6 +2534,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     goMirror,
     pythonChoice,
     pythonMirror,
+    depsChoice,
     installId,
   }) => {
     const shouldIgnoreVersionCheck = ignoreVersionCheck === true;
@@ -2494,6 +2549,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       formData.append("go_mirror", goMirror || "");
       formData.append("python_choice", pythonChoice || "");
       formData.append("python_mirror", pythonMirror || "");
+      formData.append("deps_choice", depsChoice || "");
       formData.append("install_id", installId || "");
       return pluginApi.installUpload(formData);
     }
@@ -2511,6 +2567,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       go_mirror: goMirror || "",
       python_choice: pythonChoice || "",
       python_mirror: pythonMirror || "",
+      deps_choice: depsChoice || "",
       install_id: installId || "",
       ...getMarketInstallSourcePayload(),
     };
@@ -2559,6 +2616,8 @@ export const useExtensionPage = (initialTab = "installed") => {
     pythonChoice.value = "";
     const chosenPythonMirror = pythonMirror.value;
     pythonMirror.value = "";
+    const chosenDeps = depsChoice.value;
+    depsChoice.value = "";
     if (extension_url.value === "" && upload_file.value === null) {
       toast(tm("messages.fillUrlOrFile"), "error");
       return;
@@ -2622,6 +2681,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         goMirror: chosenGoMirror,
         pythonChoice: chosenPython,
         pythonMirror: chosenPythonMirror,
+        depsChoice: chosenDeps,
         installId,
       });
       loading_.value = false;
@@ -3082,6 +3142,9 @@ export const useExtensionPage = (initialTab = "installed") => {
     choosePythonDownload,
     cancelPythonDownload,
     pythonMirror,
+    depsModeDialog,
+    chooseDepsMode,
+    cancelDepsMode,
     copyPkgCommand,
     installProgress,
     newExtension,
