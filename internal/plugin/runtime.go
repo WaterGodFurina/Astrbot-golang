@@ -1113,9 +1113,10 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		I18n:             metaI18n,
 		Pages:            metaPages,
 		LogoPath:         metaLogoPath,
-		// 新安装插件默认不开启闲置自动休眠；独立分钟数默认 10（用户开启休眠时生效）。
-		IdleUnload:        false,
-		IdleUnloadMinutes: 10,
+		// 新装插件默认常驻（不开启休眠），独立分钟数 0 = 未设置；
+		// 用户在 WebUI 开启休眠时由前端默认填 10 分钟。
+		IdleUnload:       false,
+		IdleUnloadMinutes: 0,
 		ConfigDir:         filepath.Join("plugins_config", sanitizeID(inst.ID)),
 		DataDir:           filepath.Join("plugins_data", sanitizeID(inst.ID)),
 		DocsDir:           filepath.Join("plugins", sanitizeID(inst.ID)),
