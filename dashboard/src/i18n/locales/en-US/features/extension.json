@@ -276,6 +276,14 @@
       "installed": "I've Installed",
       "primaryLabel": "Source address (official CDN)"
     },
+    "depsMode": {
+      "title": "Choose Python Dependency Install Mode",
+      "desc": "Full install pre-installs all host dependencies (about 3-5 minutes); install on demand only installs core dependencies and automatically installs missing packages at runtime. You can change this anytime in Settings - Network.",
+      "lazyLabel": "Install on demand (recommended)",
+      "fullLabel": "Full install",
+      "hint": "Your choice will be saved to the system config (python_deps_install_mode).",
+      "cancel": "Cancel"
+    },
     "update": {
       "title": "Update Extension",
       "sectionTitle": "Update",

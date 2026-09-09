@@ -276,6 +276,14 @@
       "installed": "我已安装",
       "primaryLabel": "加速地址（官方 CDN）"
     },
+    "depsMode": {
+      "title": "选择 Python 依赖安装方式",
+      "desc": "完整安装将预装全部宿主依赖（约 3-5 分钟）；需要时安装仅装核心依赖，运行缺包时自动补装。可随时在 设置-网络 中修改。",
+      "lazyLabel": "需要时安装（推荐）",
+      "fullLabel": "完整安装",
+      "hint": "选择后此设置将保存到系统配置（python_deps_install_mode）。",
+      "cancel": "取消"
+    },
     "update": {
       "title": "更新插件",
       "sectionTitle": "更新",
