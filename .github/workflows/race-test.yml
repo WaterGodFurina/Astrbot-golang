@@ -87,6 +87,7 @@ jobs:
         timeout-minutes: 45
         env:
           CGO_ENABLED: '1'
+          ASTRBOT_TEST_RACE: '1'
           # GitHub runner 海外直连官方 PyPI（见 test.yml 注释）。
           PIP_INDEX_URL: https://pypi.org/simple
           ASTRBOT_PYPI_INDEX: https://pypi.org/simple
