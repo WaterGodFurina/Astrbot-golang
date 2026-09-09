@@ -689,7 +689,7 @@ func (d *Database) GetFilteredConversations(f ConversationFilter) ([]Conversatio
 		expandWhere := fmt.Sprintf("user_id IN (%s)", placeholders(len(userIDs), &args, userIDs))
 		expandQuery := `SELECT inner_conversation_id, conversation_id, platform_id, user_id, content, title, persona_id, created_at, updated_at
 		 FROM conversations WHERE ` + expandWhere + ` ORDER BY ` + orderBy
-		expandArgs := append(append([]interface{}{}, args...))
+		expandArgs := args
 		expandRows, err := d.db.Query(expandQuery, expandArgs...)
 		if err != nil {
 			return nil, 0, err

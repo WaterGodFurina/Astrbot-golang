@@ -290,7 +290,11 @@ jobs:
           install_tool github.com/kisielk/errcheck@latest
           install_tool github.com/golangci/golangci-lint/cmd/golangci-lint@latest
           install_tool github.com/securego/gosec/v2/cmd/gosec@latest
-          install_tool golang.org/x/vuln/cmd/govulncheck@latest
+          # govulncheck 单独装：goproxy.cn 对该 zip 持续 5xx，runner 在海外
+          # 改走 proxy.golang.org 直连；仍失败则降级为告警不阻塞流水线。
+          if ! GOPROXY=https://proxy.golang.org,direct install_tool golang.org/x/vuln/cmd/govulncheck@latest; then
+            echo "::warning::govulncheck install failed (network), skipping vulnerability check"
+          fi
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
       - name: gofmt 格式检查
