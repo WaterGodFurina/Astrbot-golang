@@ -2696,6 +2696,25 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	default:
 		depsChoice = ""
 	}
+	// 弹窗判定（WebUI API 层专属）：本次请求未带选择且 config 从未保存过
+	// 模式时，返回 python_deps_prompt 让前端弹选择框。runtime 层不再报错
+	// （测试/插件反向安装/headless 静默用 lazy 默认值，不因无 UI 而失败）。
+	if depsChoice == "" {
+		cfgMode, _ := s.getConfigSnapshot()["python_deps_install_mode"].(string)
+		if strings.TrimSpace(cfgMode) != "lazy" && strings.TrimSpace(cfgMode) != "full" {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":  "error",
+				"code":    "python_deps_prompt",
+				"message": "首次安装 Python 插件：请选择宿主依赖安装模式（lazy 仅安装核心依赖 / full 全量预装）",
+				"data": map[string]interface{}{
+					"kind":       "python_deps_mode",
+					"primary":    "lazy",
+					"config_key": "python_deps_install_mode",
+				},
+			})
+			return
+		}
+	}
 
 	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{
 		IgnoreRisk:     ignoreRisk,
