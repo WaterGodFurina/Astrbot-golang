@@ -912,9 +912,13 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	case "lazy", "full":
 		// 用户本次显式选择，优先于配置。
 	default:
-		depsMode = strings.TrimSpace(m.pipDepsMode)
+		depsMode = strings.ToLower(strings.TrimSpace(m.pipDepsMode))
 		if depsMode != "lazy" && depsMode != "full" {
-			return nil, &RuntimePromptError{Kind: RuntimePromptPythonDeps, Primary: "lazy"}
+			// 用户从未选择过：默认按 lazy 供给，不阻塞（弹窗判定在
+			// dashboard API 层做——只有经 WebUI 的安装请求才该被询问；
+			// 测试/插件反向安装/headless 场景静默用默认值，避免因无 UI
+			// 应答而失败）。
+			depsMode = "lazy"
 		}
 	}
 	// 安装路径先解析 Python 运行时（可能触发下载/venv），运行时无法准备且

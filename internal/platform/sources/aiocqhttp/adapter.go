@@ -1367,13 +1367,23 @@ func (a *Adapter) enrichForwardAndQuoted(chain *message.MessageChain, groupID, u
 		}
 	}
 
-	// Fetch quoted reply content (get_msg) — build Reply.Chain.
+	// Fetch quoted reply content (get_msg) — build Reply.Chain and fill
+	// sender metadata (对齐 Python aiocqhttp_platform_adapter 构造 Reply：
+	// id/chain/sender_id/sender_nickname/time/message_str 全量填充)。
 	for _, rid := range replyIDs {
-		quotedChain, _ := a.fetchQuotedContent(rid, groupID, userID)
+		qm := a.fetchQuotedContent(rid, groupID, userID)
+		if qm == nil {
+			continue
+		}
 		for _, comp := range chain.Chain {
 			if reply, ok := comp.(*message.Reply); ok && reply.MessageID == rid {
-				reply.Chain = quotedChain
-				reply.SenderNick = ""
+				reply.Chain = qm.Chain
+				reply.SenderID = qm.SenderID
+				reply.SenderNick = qm.SenderNick
+				reply.MessageStr = qm.MessageStr
+				if qm.Timestamp > 0 {
+					reply.CreatedAt = time.Unix(qm.Timestamp, 0)
+				}
 			}
 		}
 	}

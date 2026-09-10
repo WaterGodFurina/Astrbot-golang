@@ -651,3 +651,97 @@ func TestConvertToCQFormatPlainText(t *testing.T) {
 		t.Error("text must not contain CQ entities")
 	}
 }
+
+// TestEnrichForwardAndQuotedReplySenderMetadata: get_msg 返回的发送者与时间
+// 元数据必须填入 Reply（对齐 Python aiocqhttp_platform_adapter.py:327-338
+// 构造 Reply 的语义：sender_id/sender_nickname/time/message_str/chain），
+// 否则插件侧引用消息缺发送者信息。card 优先、nickname 兜底。
+func TestEnrichForwardAndQuotedReplySenderMetadata(t *testing.T) {
+	a := startTestAdapter(t, func(action string, params map[string]interface{}, echo string) map[string]interface{} {
+		if action == "get_msg" {
+			if params["message_id"] != "r1" {
+				t.Errorf("unexpected get_msg params: %v", params)
+			}
+			return map[string]interface{}{
+				"status": "ok",
+				"data": map[string]interface{}{
+					"time":   float64(1788000123),
+					"sender": map[string]interface{}{"user_id": float64(10001), "card": "阿明", "nickname": "fallback昵称"},
+					"message": []interface{}{
+						map[string]interface{}{"type": "text", "data": map[string]interface{}{"text": "早上好"}},
+						map[string]interface{}{"type": "image", "data": map[string]interface{}{"url": "https://example.com/q.png"}},
+					},
+				},
+			}
+		}
+		return nil
+	})
+
+	chain := &message.MessageChain{Chain: []message.Component{
+		&message.Reply{MessageID: "r1"},
+		&message.Plain{Text: "回复内容"},
+	}}
+	a.enrichForwardAndQuoted(chain, "12345", "")
+
+	reply, ok := chain.Chain[0].(*message.Reply)
+	if !ok {
+		t.Fatalf("component[0] = %T, want Reply", chain.Chain[0])
+	}
+	if reply.SenderID != "10001" {
+		t.Errorf("reply.SenderID = %q, want 10001", reply.SenderID)
+	}
+	if reply.SenderNick != "阿明" {
+		t.Errorf("reply.SenderNick = %q, want 阿明（card 优先）", reply.SenderNick)
+	}
+	if reply.CreatedAt.IsZero() || reply.CreatedAt.Unix() != 1788000123 {
+		t.Errorf("reply.CreatedAt = %v, want unix 1788000123", reply.CreatedAt)
+	}
+	if reply.MessageStr != "早上好" {
+		t.Errorf("reply.MessageStr = %q, want 早上好", reply.MessageStr)
+	}
+	if len(reply.Chain) != 2 {
+		t.Fatalf("reply chain length = %d, want 2", len(reply.Chain))
+	}
+	if p, ok := reply.Chain[0].(*message.Plain); !ok || p.Text != "早上好" {
+		t.Errorf("reply chain[0] = %#v, want Plain(早上好)", reply.Chain[0])
+	}
+	if img, ok := reply.Chain[1].(*message.Image); !ok || img.URL != "https://example.com/q.png" {
+		t.Errorf("reply chain[1] = %#v, want Image(q.png)", reply.Chain[1])
+	}
+}
+
+// TestEnrichForwardAndQuotedReplySenderNickFallback: get_msg sender 无 card
+// 时回退 nickname（对齐 Python `card or nickname`）。
+func TestEnrichForwardAndQuotedReplySenderNickFallback(t *testing.T) {
+	a := startTestAdapter(t, func(action string, params map[string]interface{}, echo string) map[string]interface{} {
+		if action == "get_msg" {
+			return map[string]interface{}{
+				"status": "ok",
+				"data": map[string]interface{}{
+					"time":   float64(1788000456),
+					"sender": map[string]interface{}{"user_id": float64(10002), "card": "", "nickname": "真实昵称"},
+					"message": []interface{}{
+						map[string]interface{}{"type": "text", "data": map[string]interface{}{"text": "晚安"}},
+					},
+				},
+			}
+		}
+		return nil
+	})
+
+	chain := &message.MessageChain{Chain: []message.Component{
+		&message.Reply{MessageID: "r2"},
+	}}
+	a.enrichForwardAndQuoted(chain, "", "")
+
+	reply := chain.Chain[0].(*message.Reply)
+	if reply.SenderID != "10002" {
+		t.Errorf("reply.SenderID = %q, want 10002", reply.SenderID)
+	}
+	if reply.SenderNick != "真实昵称" {
+		t.Errorf("reply.SenderNick = %q, want 真实昵称（nickname 兜底）", reply.SenderNick)
+	}
+	if reply.MessageStr != "晚安" {
+		t.Errorf("reply.MessageStr = %q, want 晚安", reply.MessageStr)
+	}
+}

@@ -629,6 +629,13 @@ message Component {
   string id = 10;
   bytes data_json = 11;      // Json 卡片等动态结构（保留 JSON）
   BinaryPayload payload = 12; // 媒体二进制（inline bytes 或 FileReference）
+  // Reply 引用消息扩展（宿主 → 插件方向；插件发送方向仍只需 id/text）：
+  // 被引用消息的发送者与内容链，对齐 Python Reply 语义
+  // （sender_id/sender_nickname/time/chain/message_str）。
+  string sender_id = 13;             // 被引用消息发送者 ID
+  string sender_name = 14;           // 被引用消息发送者昵称
+  int64 sender_time = 15;            // 被引用消息发送时间（unix 秒）
+  repeated Component chain = 16;     // 被引用消息内容链（嵌套，带深度上限）
 }
 
 message RecallMessageRequest {

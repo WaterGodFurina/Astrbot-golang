@@ -400,6 +400,15 @@ func CoreEventToSDKEvent(e *core.Event) *sdkv1.SDKEvent {
 // messageToProtoComponents 把宿主 message.Component 链直接转为 proto
 // Component（P1 native，跳过 SDK 中间 struct）。
 func messageToProtoComponents(chain []message.Component) []*sdkv1.Component {
+	return messageToProtoComponentsDepth(chain, 0)
+}
+
+// maxProtoComponentDepth 限制组件链的嵌套深度（Reply 引用内容、Forward 节点
+// 等），与 Python SDK _bridge/serialize.py 的 _MAX_NODE_DEPTH 对齐，防御
+// 畸形自嵌套链导致 proto 递归构造过深。
+const maxProtoComponentDepth = 50
+
+func messageToProtoComponentsDepth(chain []message.Component, depth int) []*sdkv1.Component {
 	out := make([]*sdkv1.Component, 0, len(chain))
 	for _, c := range chain {
 		if c == nil {
@@ -441,7 +450,17 @@ func messageToProtoComponents(chain []message.Component) []*sdkv1.Component {
 				}
 			}
 		case *message.Reply:
+			// 引用消息完整传输（对齐 Python Reply：id/chain/sender_id/
+			// sender_nickname/time/message_str）。message_str/text 沿用
+			// 既有字段；被引用内容链与发送者信息走 sender_* / chain 字段。
 			pc.Id, pc.Text = v.MessageID, v.MessageStr
+			pc.SenderId, pc.SenderName = v.SenderID, v.SenderNick
+			if !v.CreatedAt.IsZero() {
+				pc.SenderTime = v.CreatedAt.Unix()
+			}
+			if depth < maxProtoComponentDepth && len(v.Chain) > 0 {
+				pc.Chain = messageToProtoComponentsDepth(v.Chain, depth+1)
+			}
 		}
 		out = append(out, pc)
 	}

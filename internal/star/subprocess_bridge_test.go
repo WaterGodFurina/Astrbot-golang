@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -255,4 +256,79 @@ func TestPythonPluginCommandMatchesInPipeline(t *testing.T) {
 		t.Fatal("box 的中文命令 /盒 必须被匹配并设置 Result（当前直接走 LLM）")
 	}
 	t.Logf("box 回复: %.80s", ev2.Result.GetPlainText())
+}
+
+// TestMessageToProtoComponentsReplyChain：OneBot 引用消息（Reply）经
+// CoreEventToSDKEvent 传输到插件时必须携带被引用内容链与发送者元数据
+// （sender_id/sender_name/sender_time/chain，对齐 Python Reply 语义）。
+// 回归：此前 Reply 只传 id/text，Python 插件侧引用内容全丢。
+func TestMessageToProtoComponentsReplyChain(t *testing.T) {
+	quotedAt := time.Unix(1788000123, 0)
+	ev := &core.Event{
+		Type:   core.EventMessage,
+		Source: core.EventSource{Platform: "aiocqhttp", PlatformID: "default", ConvID: "g1", SenderID: "u1"},
+		Message: &message.MessageChain{Chain: []message.Component{
+			&message.Reply{
+				MessageID:  "r1",
+				SenderID:   "10001",
+				SenderNick: "阿明",
+				MessageStr: "被引用文本",
+				CreatedAt:  quotedAt,
+				Chain: []message.Component{
+					&message.Plain{Text: "被引用文本"},
+					&message.Image{URL: "https://example.com/q.png"},
+				},
+			},
+			&message.Plain{Text: "回复内容"},
+		}},
+		MessageStr: "回复内容",
+	}
+	se := CoreEventToSDKEvent(ev)
+	if len(se.Components) != 2 {
+		t.Fatalf("components length = %d, want 2", len(se.Components))
+	}
+	rc := se.Components[0]
+	if rc.Type != "Reply" || rc.Id != "r1" || rc.Text != "被引用文本" {
+		t.Fatalf("reply base mismatch: %+v", rc)
+	}
+	if rc.SenderId != "10001" || rc.SenderName != "阿明" || rc.SenderTime != quotedAt.Unix() {
+		t.Fatalf("reply sender mismatch: %+v", rc)
+	}
+	if len(rc.Chain) != 2 {
+		t.Fatalf("reply chain length = %d, want 2", len(rc.Chain))
+	}
+	if rc.Chain[0].Type != "Plain" || rc.Chain[0].Text != "被引用文本" {
+		t.Fatalf("reply chain[0] mismatch: %+v", rc.Chain[0])
+	}
+	if rc.Chain[1].Type != "Image" || rc.Chain[1].Url != "https://example.com/q.png" {
+		t.Fatalf("reply chain[1] mismatch: %+v", rc.Chain[1])
+	}
+}
+
+// TestMessageToProtoComponentsReplyChainDepthCap：深层嵌套引用链在 proto
+// 转换时被深度上限截断，不无限递归。
+func TestMessageToProtoComponentsReplyChainDepthCap(t *testing.T) {
+	inner := message.Component(&message.Reply{MessageID: "leaf"})
+	for i := 0; i < maxProtoComponentDepth+10; i++ {
+		inner = &message.Reply{MessageID: "r" + strconv.Itoa(i), Chain: []message.Component{inner}}
+	}
+	ev := &core.Event{
+		Type:    core.EventMessage,
+		Source:  core.EventSource{Platform: "aiocqhttp", ConvID: "g1"},
+		Message: &message.MessageChain{Chain: []message.Component{inner}},
+	}
+	pc := CoreEventToSDKEvent(ev).Components
+	if len(pc) != 1 {
+		t.Fatalf("components length = %d", len(pc))
+	}
+	depth := 0
+	for cur := pc[0]; len(cur.Chain) > 0; cur = cur.Chain[0] {
+		depth++
+		if depth > maxProtoComponentDepth {
+			t.Fatalf("depth cap exceeded: %d", depth)
+		}
+	}
+	if depth != maxProtoComponentDepth {
+		t.Fatalf("depth = %d, want %d", depth, maxProtoComponentDepth)
+	}
 }
