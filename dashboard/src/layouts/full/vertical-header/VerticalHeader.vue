@@ -1408,7 +1408,7 @@ onMounted(async () => {
           <v-icon>mdi-logout</v-icon>
         </template>
         <v-list-item-title>
-          {{ t("core.header.buttons.logout") }}
+          {{ t("core.header.logout") }}
         </v-list-item-title>
       </v-list-item>
       </StyledMenu>

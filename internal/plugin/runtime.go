@@ -1963,11 +1963,14 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		Cmd:              cmd,
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 		Managed:          true,
-		// 与 go-plugin 默认 logger 一致（DefaultOutput/Trace/Name=plugin），
-		// 套一层过滤器吞掉 Python SDK 保活空包（channel=INVALID）的告警刷屏。
+		// 与 go-plugin 默认 logger 一致（DefaultOutput/Name=plugin），套一层
+		// 过滤器吞掉 Python SDK 保活空包（channel=INVALID）的告警刷屏。
+		// 级别用 Debug：go-plugin 的 Trace 会在 SDK stdio 保活流下每秒打
+		// 一条 "waiting for stdio data"（每收到一条 stdio 数据一条），
+		// 多插件时彻底刷屏，且 Trace 信息无排障价值。
 		Logger: stdioFilterLogger{Logger: hclog.New(&hclog.LoggerOptions{
 			Output: hclog.DefaultOutput,
-			Level:  hclog.Trace,
+			Level:  hclog.Debug,
 			Name:   "plugin",
 		})},
 	}
