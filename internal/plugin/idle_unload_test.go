@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	"os"
 	"path/filepath"
 	"testing"
@@ -357,5 +358,51 @@ func TestUnloadIdleSkipsPluginUnloadedBroadcast(t *testing.T) {
 	m.handlerMetaMu.RUnlock()
 	if meta == nil {
 		t.Fatal("idle-unload must keep handler meta for lazy reload")
+	}
+}
+
+// TestPluginIdleWakeModePersisted: 休眠唤醒方式（idle_wake_mode）的设置、
+// 读取与 manifest 持久化；非法值必须被拒绝。
+func TestPluginIdleWakeModePersisted(t *testing.T) {
+	m := newTestManager(t)
+	id := "sleepy_plugin_python"
+	m.manifestMu.Lock()
+	man, _ := LoadManifest(m.manifestPath())
+	if man == nil {
+		man = &Manifest{}
+	}
+	man.Plugins = append(man.Plugins, ManifestEntry{ID: id, Name: "sleepy_plugin", Language: "python"})
+	_ = man.Save(m.manifestPath())
+	m.manifestMu.Unlock()
+
+	// 默认（未配置）= 空 → 仅插件唤醒语义。
+	if got := m.PluginIdleWakeMode(id); got != "" {
+		t.Fatalf("default wake mode = %q, want empty", got)
+	}
+
+	if err := m.SetPluginIdleWakeMode(id, "hook_and_command"); err != nil {
+		t.Fatalf("SetPluginIdleWakeMode: %v", err)
+	}
+	if got := m.PluginIdleWakeMode(id); got != "hook_and_command" {
+		t.Fatalf("wake mode = %q, want hook_and_command", got)
+	}
+
+	// 持久化：重新加载 manifest 后仍可读取（新 manager 指向同一 dataDir）。
+	m2 := NewSubprocessManager(toolchain.New(), m.dataDir)
+	if got := m2.PluginIdleWakeMode(id); got != "hook_and_command" {
+		t.Fatalf("wake mode after reload = %q, want hook_and_command", got)
+	}
+
+	// 切回默认（仅插件唤醒）。
+	if err := m.SetPluginIdleWakeMode(id, "command_only"); err != nil {
+		t.Fatalf("SetPluginIdleWakeMode(command_only): %v", err)
+	}
+	if got := m.PluginIdleWakeMode(id); got != "command_only" {
+		t.Fatalf("wake mode = %q, want command_only", got)
+	}
+
+	// 非法值拒绝。
+	if err := m.SetPluginIdleWakeMode(id, "bogus"); err == nil {
+		t.Fatal("invalid wake mode must be rejected")
 	}
 }

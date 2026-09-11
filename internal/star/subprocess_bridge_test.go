@@ -332,3 +332,58 @@ func TestMessageToProtoComponentsReplyChainDepthCap(t *testing.T) {
 		t.Fatalf("depth = %d, want %d", depth, maxProtoComponentDepth)
 	}
 }
+
+// TestIdleSleepHookWakeMode: 休眠唤醒方式（idle_wake_mode）对过滤器触发的
+// 影响。默认（空/"command_only"，仅插件唤醒）：休眠后过滤器触发不唤醒；
+// "hook_and_command"：过滤器触发懒加载唤醒插件（被动事件可达）。
+func TestIdleSleepHookWakeMode(t *testing.T) {
+	bin := plugin.BuildTestPlugin()
+	if bin == "" {
+		t.Skip("test plugin unavailable (toolchain/SDK missing)")
+	}
+	m := newTestSubprocessManager(t)
+	ctx := context.Background()
+	inst, err := m.InstallFromSource(ctx, "sleepy", filepath.Join("..", "plugin", "testdata", "plugin"), plugin.InstallOptions{GoChoice: "download"})
+	if err != nil {
+		t.Fatalf("InstallFromSource: %v", err)
+	}
+	m.SetIdleUnload(10 * time.Millisecond)
+	if err := m.SetPluginIdleUnload(inst.ID, true); err != nil {
+		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
+	if err := m.SetPluginIdleUnloadMinutes(inst.ID, 1); err != nil {
+		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
+	}
+
+	starMgr := NewManagerSimple()
+	RegisterSubprocessPlugin(starMgr, m, inst)
+
+	// ── 默认模式（仅插件唤醒）：休眠后过滤器触发不唤醒。
+	inst.BackdateIdle(2 * time.Minute)
+	m.SweepIdle()
+	if m.Get(inst.ID) != nil {
+		t.Fatal("idle plugin process must be unloaded")
+	}
+	// 事件文本不匹配任何命令（命令 handler 也是 EventTypeFilter，会被
+	// runFilterHandlers 一并触发并走指令唤醒路径）——纯被动过滤器场景。
+	runFilterHandlers(starMgr, bridgeTestEvent("hello world", false))
+	if m.Get(inst.ID) != nil {
+		t.Fatal("command_only mode: filter event must NOT wake the sleeping plugin")
+	}
+
+	// ── hook_and_command 模式：过滤器触发懒加载唤醒。
+	if err := m.SetPluginIdleWakeMode(inst.ID, "hook_and_command"); err != nil {
+		t.Fatalf("SetPluginIdleWakeMode: %v", err)
+	}
+	runFilterHandlers(starMgr, bridgeTestEvent("hello world", false))
+	if m.Get(inst.ID) == nil {
+		t.Fatal("hook_and_command mode: filter event must wake the sleeping plugin")
+	}
+
+	// 唤醒后插件正常工作（非 admin 事件不被过滤器拦截，命令可回复）。
+	ev := bridgeTestEvent("test hello", false)
+	runFilterHandlers(starMgr, ev)
+	if ev.IsStopped() {
+		t.Error("non-admin event must not be stopped after wake")
+	}
+}

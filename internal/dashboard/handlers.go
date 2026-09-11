@@ -2127,13 +2127,16 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		writeJSON(w, http.StatusOK, apiOKMsg("插件状态已更新", map[string]interface{}{}))
 	case "idle-unload":
 		// 单插件休眠策略：POST {plugin_id, allow_sleep: bool,
-		// idle_unload_minutes?: int}。allow_sleep=true 表示该插件允许闲置自动
-		// 休眠；false = 常驻（不参与清扫）。idle_unload_minutes 为该插件独立
-		// 闲置阈值（分钟），缺省/0 = 回退全局默认。
+		// idle_unload_minutes?: int, idle_wake_mode?: string}。
+		// allow_sleep=true 表示该插件允许闲置自动休眠；false = 常驻（不参与
+		// 清扫）。idle_unload_minutes 为该插件独立闲置阈值（分钟），缺省/0 =
+		// 回退全局默认。idle_wake_mode 为休眠唤醒方式（"hook_and_command" =
+		// 过滤器/钩子+指令唤醒；"command_only" = 仅插件唤醒，默认）。
 		var body struct {
 			PluginID          string `json:"plugin_id"`
 			AllowSleep        bool   `json:"allow_sleep"`
 			IdleUnloadMinutes *int   `json:"idle_unload_minutes"`
+			IdleWakeMode      string `json:"idle_wake_mode"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
@@ -2147,6 +2150,12 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 						minutes = 0
 					}
 					if err := s.subPluginMgr.SetPluginIdleUnloadMinutes(pid, minutes); err != nil {
+						writeJSON(w, http.StatusOK, apiError(err.Error()))
+						return
+					}
+				}
+				if body.IdleWakeMode != "" {
+					if err := s.subPluginMgr.SetPluginIdleWakeMode(pid, body.IdleWakeMode); err != nil {
 						writeJSON(w, http.StatusOK, apiError(err.Error()))
 						return
 					}

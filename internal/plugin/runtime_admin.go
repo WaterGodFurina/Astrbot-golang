@@ -46,6 +46,14 @@ func idleMinutesOf(e *ManifestEntry) int {
 	return e.IdleUnloadMinutes
 }
 
+// idleWakeModeOf returns the plugin's idle wake mode ("" = 默认 command_only).
+func idleWakeModeOf(e *ManifestEntry) string {
+	if e == nil {
+		return ""
+	}
+	return e.IdleWakeMode
+}
+
 func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 	man, err := LoadManifest(m.manifestPath())
 	if err != nil {
@@ -86,6 +94,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"repo":                    "",
 			"idle_unload":             e != nil && e.IdleUnload,
 			"idle_unload_minutes":     idleMinutesOf(e),
+			"idle_wake_mode":          idleWakeModeOf(e),
 			"has_filter":              pluginHasMetaFilters(inst.Meta),
 			"has_hook":                pluginHasMetaHooks(inst.Meta),
 			"active_event_listener":   pluginHasPassiveEvents(inst.Meta),
@@ -158,6 +167,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"repo":                    repo,
 			"idle_unload":             e.IdleUnload,
 			"idle_unload_minutes":     e.IdleUnloadMinutes,
+			"idle_wake_mode":          e.IdleWakeMode,
 			"has_filter":              pluginHasMetaFilters(m.handlerMeta[e.ID]),
 			"has_hook":                pluginHasMetaHooks(m.handlerMeta[e.ID]),
 			"active_event_listener":   pluginHasPassiveEvents(m.handlerMeta[e.ID]),
@@ -753,6 +763,7 @@ func (m *SubprocessManager) Components(id string) map[string]interface{} {
 		"type":                "休眠策略",
 		"idle_unload":         m.PluginIdleUnload(inst.ID),
 		"idle_unload_minutes": m.PluginIdleUnloadMinutes(inst.ID),
+		"idle_wake_mode":      m.PluginIdleWakeMode(inst.ID),
 	}}
 	if len(out) == 0 {
 		return nil

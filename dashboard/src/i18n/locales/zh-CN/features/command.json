@@ -103,12 +103,15 @@
     "columnLanguage": "插件语言",
     "columnAllow": "允许休眠",
     "columnMinutes": "闲置时间（分钟）",
+    "columnWake": "唤醒方式",
+    "wakeCommandOnly": "仅插件唤醒",
+    "wakeHookAndCommand": "钩子/插件指令唤醒",
+    "commandOnlyRisk": "选择仅插件唤醒时，休眠后其进程被终止，无法主动接收消息/事件",
     "columnRisk": "风险",
     "residentLabel": "常驻",
     "noPlugins": "暂无已启用的插件",
     "globalSaved": "已保存新装插件默认休眠时间",
     "pluginSaved": "插件休眠策略已更新",
-    "listenerRisk": "此插件包含过滤器/钩子等主动事件监听，休眠后其进程被终止，无法主动接收消息/事件",
     "intro": "为每个插件单独配置闲置自动休眠：开启后，插件进程在闲置达到设定分钟数时被回收以释放内存，下次触发时自动唤醒（无感恢复）。默认常驻（不开启）。"
   }
 }

@@ -1,11 +1,12 @@
 <script setup lang="ts">
 /**
  * 休眠策略面板 - 组件管理页第三个视图（与"指令/函数工具"按钮同列）。
- * 每插件的"允许休眠"开关 + 独立闲置分钟数（0 = 回退全局默认）+ 过滤器/钩子
- * 风险提示。顶部"新装插件默认休眠时间"仅作为新装插件的默认阈值，不覆盖已
- * 单独配置的插件（也不控制所有插件的开关）。
+ * 每插件的"允许休眠"开关 + 独立闲置分钟数（0 = 回退全局默认）+ 唤醒方式
+ * （仅插件唤醒 / 过滤器钩子+指令唤醒）+ 过滤器/钩子风险提示。顶部"新装
+ * 插件默认休眠时间"仅作为新装插件的默认阈值，不覆盖已单独配置的插件
+ * （也不控制所有插件的开关）。
  */
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { pluginApi } from "@/api/v1";
 import { fetchWithAuth } from "@/api/http";
 import { useModuleI18n } from "@/i18n/composables";
@@ -25,11 +26,22 @@ interface SleepPluginItem {
   enabled: boolean;
   allowSleep: boolean;
   idleUnloadMinutes: number;
+  idleWakeMode: string;
   hasFilter: boolean;
   hasHook: boolean;
   activeEventListener: boolean;
   version: string;
 }
+
+// 休眠唤醒方式选项：command_only = 仅插件唤醒（默认，休眠期间不响应
+// 过滤器/钩子等被动事件）；hook_and_command = 过滤器/钩子+指令唤醒。
+const WAKE_COMMAND_ONLY = "command_only";
+const WAKE_HOOK_AND_COMMAND = "hook_and_command";
+
+const wakeModeItems = computed(() => [
+  { value: WAKE_HOOK_AND_COMMAND, title: tm("sleep.wakeHookAndCommand") },
+  { value: WAKE_COMMAND_ONLY, title: tm("sleep.wakeCommandOnly") },
+]);
 
 // 插件语言从 id 后缀（_go/_python）推断，优先用后端 language 字段。
 const languageOf = (p: Record<string, unknown>) => {
@@ -72,6 +84,7 @@ const fetchData = async () => {
           enabled: Boolean(p.enabled),
           allowSleep: Boolean(p.idle_unload),
           idleUnloadMinutes: Number(p.idle_unload_minutes || 0),
+          idleWakeMode: String(p.idle_wake_mode || WAKE_COMMAND_ONLY),
           hasFilter: Boolean(p.has_filter),
           hasHook: Boolean(p.has_hook),
           activeEventListener: Boolean(p.active_event_listener),
@@ -141,6 +154,32 @@ const savePluginMinutes = async (
   }
 };
 
+const savePluginWakeMode = async (item: SleepPluginItem, mode: string) => {
+  if (saving.value || !item.id) return;
+  saving.value = true;
+  try {
+    const res = await pluginApi.setIdleSleep(
+      item.id,
+      item.allowSleep,
+      item.idleUnloadMinutes,
+      mode,
+    );
+    if (res.data.status === "ok") {
+      item.idleWakeMode = mode;
+      toast(tm("sleep.pluginSaved"));
+    } else {
+      toast(
+        (res.data as any)?.message || tm("messages.operationFailed"),
+        "error",
+      );
+    }
+  } catch (err) {
+    toast((err as any)?.message || String(err), "error");
+  } finally {
+    saving.value = false;
+  }
+};
+
 onMounted(async () => {
   await fetchData();
 });
@@ -161,6 +200,7 @@ onMounted(async () => {
               <th>{{ tm("sleep.columnLanguage") }}</th>
               <th>{{ tm("sleep.columnAllow") }}</th>
               <th>{{ tm("sleep.columnMinutes") }}</th>
+              <th>{{ tm("sleep.columnWake") }}</th>
               <th>{{ tm("sleep.columnRisk") }}</th>
             </tr>
           </thead>
@@ -204,11 +244,28 @@ onMounted(async () => {
                 </span>
               </td>
               <td>
+                <v-select
+                  v-if="item.allowSleep"
+                  :model-value="item.idleWakeMode"
+                  :items="wakeModeItems"
+                  item-title="title"
+                  item-value="value"
+                  density="compact"
+                  hide-details
+                  style="max-width: 180px"
+                  :disabled="saving"
+                  @update:model-value="(v: string) => savePluginWakeMode(item, v)"
+                />
+                <span v-else class="text-caption text-medium-emphasis">
+                  {{ tm("sleep.residentLabel") }}
+                </span>
+              </td>
+              <td>
                 <span
-                  v-if="item.activeEventListener"
+                  v-if="item.allowSleep && item.idleWakeMode !== WAKE_HOOK_AND_COMMAND && item.activeEventListener"
                   class="sleep-warning"
                 >
-                  ⚠️ {{ tm("sleep.listenerRisk") }}
+                  ⚠️ {{ tm("sleep.commandOnlyRisk") }}
                 </span>
               </td>
             </tr>

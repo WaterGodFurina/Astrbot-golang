@@ -103,12 +103,15 @@
     "columnLanguage": "Plugin Language",
     "columnAllow": "Allow sleep",
     "columnMinutes": "Idle time (min)",
+    "columnWake": "Wake-up mode",
+    "wakeCommandOnly": "Plugin commands only",
+    "wakeHookAndCommand": "Hooks & commands",
+    "commandOnlyRisk": "With plugin-commands-only wake-up, the plugin process is terminated while asleep and cannot passively receive messages/events",
     "columnRisk": "Risk",
     "residentLabel": "Resident",
     "noPlugins": "No enabled plugins",
     "globalSaved": "New-plugin default idle time saved",
     "pluginSaved": "Plugin sleep policy updated",
-    "listenerRisk": "This plugin has filters/hooks (active event listeners). Once hibernated its process is terminated and it can no longer receive messages/events.",
     "intro": "Configure idle auto-sleep per plugin: when enabled, an idle plugin process is reclaimed after the configured minutes to free memory, and is lazily woken on next use (transparent). Resident (off) by default."
   }
 }

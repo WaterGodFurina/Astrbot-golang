@@ -1451,6 +1451,46 @@ func (m *SubprocessManager) SetPluginIdleUnloadMinutes(id string, minutes int) e
 	return nil
 }
 
+// SetPluginIdleWakeMode sets how a sleeping plugin is woken up:
+// "hook_and_command"（过滤器/钩子触发也懒加载唤醒）或 "command_only"
+// （仅插件指令/工具唤醒，默认）。空串视为默认。Persisted in the manifest.
+func (m *SubprocessManager) SetPluginIdleWakeMode(id, mode string) error {
+	switch mode {
+	case "hook_and_command", "command_only", "":
+	default:
+		return fmt.Errorf("无效的唤醒方式 %q（可选 hook_and_command / command_only）", mode)
+	}
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return err
+	}
+	e := man.Get(id)
+	if e == nil {
+		return fmt.Errorf("插件 %s 未安装", id)
+	}
+	e.IdleWakeMode = mode
+	if err := man.Save(m.manifestPath()); err != nil {
+		return err
+	}
+	if mode == "hook_and_command" {
+		logger.I18nInfo("插件 %s 休眠唤醒方式已设置为过滤器/钩子+指令唤醒（被动事件可唤醒）", id)
+	} else {
+		logger.I18nInfo("插件 %s 休眠唤醒方式已设置为仅插件唤醒（休眠期间不响应被动事件）", id)
+	}
+	return nil
+}
+
+// PluginIdleWakeMode returns the plugin's idle wake mode ("" = 默认
+// command_only). See SetPluginIdleWakeMode.
+func (m *SubprocessManager) PluginIdleWakeMode(id string) string {
+	if e := m.cachedManifest().Get(id); e != nil {
+		return e.IdleWakeMode
+	}
+	return ""
+}
+
 // idleSweepLoop periodically unloads idle plugin processes.
 func (m *SubprocessManager) idleSweepLoop() {
 	interval := m.scanInterval

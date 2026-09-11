@@ -62,6 +62,10 @@ type ManifestEntry struct {
 	IdleUnload bool `json:"idle_unload,omitempty"`
 	// IdleUnloadMinutes 是该插件独立的闲置休眠阈值（分钟）。
 	IdleUnloadMinutes int `json:"idle_unload_minutes,omitempty"`
+	// IdleWakeMode 是休眠插件的唤醒方式："hook_and_command" = 过滤器/钩子
+	// 触发与插件指令均可懒加载唤醒；"command_only"（默认，空值同此）=
+	// 仅插件指令/工具唤醒（休眠期间不响应过滤器/钩子等被动事件）。
+	IdleWakeMode string `json:"idle_wake_mode,omitempty"`
 }
 
 // LoadManifest reads a manifest file, tolerating absence.
