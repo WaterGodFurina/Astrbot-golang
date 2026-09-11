@@ -189,5 +189,15 @@
     "updateToolPermissionBuiltin": "Встроенные инструменты не поддерживают настройку доступа.",
     "testError": "Ошибка теста связи: {error}",
     "testSuccess": "Тест MCP-сервера пройден ({count} инструментов)"
+  },
+  "syncProvider": {
+    "status": {
+      "selectProvider": "Сначала выберите провайдера",
+      "enterToken": "Введите токен доступа"
+    },
+    "messages": {
+      "syncSuccess": "Синхронизация успешна",
+      "syncError": "Ошибка синхронизации: {error}"
+    }
   }
 }

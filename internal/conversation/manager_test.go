@@ -1,10 +1,25 @@
 package conversation
 
 import (
+	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
 )
+
+// openTestDB 打开临时目录里的 SQLite 库（懒加载回归测试用）。
+func openTestDB(t *testing.T) *db.Database {
+	t.Helper()
+	d, err := db.New(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open test db: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	return d
+}
 
 func TestGetConversationHistoryDeepCopy(t *testing.T) {
 	m := NewManager(nil)
@@ -122,4 +137,64 @@ func TestConcurrentHistoryAccess(t *testing.T) {
 		m.GetConversationByCID(cid)
 	}
 	wg.Wait()
+}
+
+// TestLazyHistoryLoadAndPersist: 启动仅载元数据（history 懒加载）——首次
+// 访问按需补载；AppendHistory/持久化不得以截断历史覆盖 DB 完整历史
+// （内存优化回归）。
+func TestLazyHistoryLoadAndPersist(t *testing.T) {
+	database := openTestDB(t)
+	umo := "aiocqhttp:FriendMessage:lazyuser"
+
+	// 预置：一个带 3 条历史的会话直接写 DB（模拟重启前的旧数据）。
+	seedHist := []map[string]interface{}{
+		{"role": "user", "content": "旧消息1"},
+		{"role": "assistant", "content": "旧回复1"},
+		{"role": "user", "content": "旧消息2"},
+	}
+	b, _ := json.Marshal(seedHist)
+	if err := database.CreateConversation(umo, umo, umo, string(b), "标题", ""); err != nil {
+		t.Fatalf("seed conversation: %v", err)
+	}
+
+	m := NewManager(database)
+	m.loadFromDB()
+
+	// 元数据已载，history 未补载。
+	m.mu.RLock()
+	conv := m.byCID[m.current[umo]]
+	loaded := conv.historyLoaded
+	m.mu.RUnlock()
+	if conv == nil {
+		t.Fatal("conversation metadata must be loaded at startup")
+	}
+	if loaded {
+		t.Fatal("history must NOT be loaded at startup (lazy)")
+	}
+
+	// 首次读取 → 补载完整历史。
+	hist := m.GetConversationHistory(umo)
+	if len(hist) != 3 {
+		t.Fatalf("lazy-loaded history length = %d, want 3", len(hist))
+	}
+	if hist[0]["content"] != "旧消息1" {
+		t.Fatalf("lazy-loaded content mismatch: %v", hist[0])
+	}
+
+	// 追加新消息后持久化，DB 内容 = 3 旧 + 1 新（不得被截断覆盖）。
+	m.AppendHistory(umo, "assistant", "新回复")
+	row, found, err := database.GetConversationByID(m.GetCurrConversationID(umo))
+	if err != nil || !found {
+		t.Fatalf("persisted row missing: %v found=%v", err, found)
+	}
+	var saved []map[string]interface{}
+	if err := json.Unmarshal([]byte(row.Content), &saved); err != nil {
+		t.Fatalf("saved history unmarshal: %v", err)
+	}
+	if len(saved) != 4 {
+		t.Fatalf("saved history length = %d, want 4 (3 old + 1 new)", len(saved))
+	}
+	if saved[3]["content"] != "新回复" {
+		t.Fatalf("saved last entry = %v, want 新回复", saved[3])
+	}
 }

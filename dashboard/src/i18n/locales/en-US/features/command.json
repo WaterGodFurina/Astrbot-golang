@@ -74,7 +74,8 @@
     "renameFailed": "Rename failed",
     "loadFailed": "Failed to load commands",
     "updateSuccess": "Updated successfully",
-    "updateFailed": "Update failed"
+    "updateFailed": "Update failed",
+    "operationFailed": "Operation failed"
   },
   "search": {
     "placeholder": "Search commands..."

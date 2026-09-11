@@ -237,44 +237,16 @@
       "preparing": "Preparing installation…"
     },
     "risk_warning": {
-      "title": "Risky Code Warning",
-      "message": "This plugin source imports forbidden dangerous packages (os/exec, syscall, unsafe, etc.) that can execute arbitrary system commands or access low-level memory.",
-      "hint": "Only choose \"Ignore Risk and Install\" if you fully trust the source of this plugin.",
-      "confirm": "Ignore Risk and Install",
-      "cancel": "Cancel Installation"
+      "message": "Potential risks detected in the plugin source. Please confirm to continue"
     },
     "c_compiler": {
-      "title": "C Compiler",
-      "message": "This plugin declares it needs cgo (a C compiler) to build.",
-      "choose_hint": "It is usually recommended to use GCC on Linux for precompilation, but you can also choose clang (auto-downloads zig cc if clang is missing).",
-      "download_hint": "No usable C compiler was detected. Choosing download will fetch and install Clang for your platform.",
-      "use_gcc": "Use System GCC",
-      "use_clang": "Use Clang",
-      "download": "Download & Install Clang",
-      "cancel": "Cancel Installation"
+      "message": "No usable C compiler detected. Choose a system compiler or download zig automatically"
     },
     "go_sdk": {
-      "title": "Go SDK Required",
-      "message": "This plugin requires the Go toolchain (Go SDK) to build.",
-      "android_hint": "Install the Go SDK in Termux with the following command:",
-      "download_hint": "Automatically download and set up the Go toolchain?",
-      "mirrorLabel": "Download mirror",
-      "download": "Auto Download",
-      "cancel": "Cancel",
-      "copy": "Copy Command",
-      "installed": "I've Installed"
+      "message": "No usable Go toolchain/SDK detected. Confirm whether to download the Go toolchain automatically"
     },
     "python_runtime": {
-      "title": "Python Runtime Required",
-      "message": "This plugin requires the Python runtime to run.",
-      "android_hint": "Run the following command in Termux to install the missing prebuilt dependencies:",
-      "download_hint": "Automatically download CPython?",
-      "mirrorLabel": "Download mirror",
-      "download": "Auto Download",
-      "cancel": "Cancel",
-      "copy": "Copy Command",
-      "installed": "I've Installed",
-      "primaryLabel": "Source address (official CDN)"
+      "message": "Failed to prepare the Python runtime. Confirm whether to download CPython automatically"
     },
     "depsMode": {
       "title": "Choose Python Dependency Install Mode",

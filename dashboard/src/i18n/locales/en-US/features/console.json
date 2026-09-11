@@ -6,7 +6,8 @@
     "label": "Auto-scroll"
   },
   "hideUserChat": {
-    "label": "Hide user chat"
+    "enabled": "User chat hidden",
+    "disabled": "Hide user chat"
   },
   "debugHint": {
     "text": "Debug logs can be enabled in \"Configuration File → System → Console Log Level\""
@@ -18,5 +19,16 @@
     "mirrorLabel": "Force PyPI repository URL (optional)",
     "mirrorHint": "Force PyPI repository URL > Config item `PyPI Repository Address`",
     "cancelButton": "Cancel"
+  },
+  "goInstall": {
+    "button": "Install pip Package",
+    "dialogTitle": "Install Pip Package",
+    "packageLabel": "*Package name, e.g. llmtuner",
+    "mirrorLabel": "Force PyPI repository URL (optional)",
+    "mirrorHint": "Force PyPI repository URL > Config item `PyPI Repository Address`",
+    "installButton": "Install",
+    "installSuccess": "Installation successful.",
+    "installFailed": "Installation failed.",
+    "requestFailed": "Request failed."
   }
 }

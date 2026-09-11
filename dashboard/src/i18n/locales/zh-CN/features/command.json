@@ -74,7 +74,8 @@
     "renameFailed": "重命名失败",
     "loadFailed": "加载指令列表失败",
     "updateSuccess": "更新成功",
-    "updateFailed": "更新失败"
+    "updateFailed": "更新失败",
+    "operationFailed": "操作失败"
   },
   "search": {
     "placeholder": "搜索指令..."

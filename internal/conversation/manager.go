@@ -29,6 +29,11 @@ type Conversation struct {
 	CreatedAt        time.Time                `json:"created_at"`
 	UpdatedAt        time.Time                `json:"updated_at"`
 	IsDeleted        bool                     `json:"is_deleted"`
+
+	// historyLoaded 标记 History 是否已完整载入内存。启动时仅加载会话
+	// 元数据（不含 history JSON），首次访问（读取/追加/持久化）时按需
+	// 从 DB 补载——避免长会话用户的全量历史常驻内存（内存优化）。
+	historyLoaded bool
 }
 
 // NewConversation creates a conversation.
@@ -42,6 +47,7 @@ func NewConversation(unifiedMsgOrigin, platformID string) *Conversation {
 		History:          []map[string]interface{}{},
 		CreatedAt:        now,
 		UpdatedAt:        now,
+		historyLoaded:    true,
 	}
 }
 
@@ -94,6 +100,7 @@ func rowToConversation(row db.ConversationRow) *Conversation {
 		Title:            cleanMentionPrefix(row.Title),
 		Persona:          row.PersonaID,
 		History:          []map[string]interface{}{},
+		historyLoaded:    true,
 	}
 	if row.Content != "" {
 		var hist []map[string]interface{}
@@ -117,8 +124,32 @@ func rowToConversation(row db.ConversationRow) *Conversation {
 // loadFromDB loads all persisted conversations into the in-memory cache and
 // selects the most recently updated conversation per session as current.
 // updated_at has second granularity, so inner_conversation_id breaks ties.
+// ensureHistoryLocked 按需从 DB 补载会话历史（懒加载）。调用方必须持有
+// m.mu 写锁（补载会改写 conv.History / conv.historyLoaded）。DB 无记录时
+// 也标记已载，避免每次访问反复查库。
+func (m *Manager) ensureHistoryLocked(conv *Conversation) {
+	if conv.historyLoaded || m.db == nil {
+		return
+	}
+	if row, found, err := m.db.GetConversationByID(conv.CID); err == nil && found {
+		conv.History = rowToConversation(row).History
+	}
+	conv.historyLoaded = true
+}
+
+// ensureHistory 以写锁保证 conv.History 已完整载入（懒加载入口，供锁外
+// 持有 conv 指针的路径调用，如 persist）。
+func (m *Manager) ensureHistory(conv *Conversation) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureHistoryLocked(conv)
+}
+
 func (m *Manager) loadFromDB() {
-	rows, err := m.db.ListConversations()
+	// 内存优化：启动只加载会话元数据（不含 history JSON）。全量历史
+	// 常驻内存会随使用无限增长；历史在首次访问（读取/追加/持久化）时
+	// 经 ensureHistoryLocked 按需补载。
+	rows, err := m.db.ListConversationMetas()
 	if err != nil {
 		return
 	}
@@ -128,6 +159,8 @@ func (m *Manager) loadFromDB() {
 	for i := range rows {
 		row := &rows[i]
 		conv := rowToConversation(*row)
+		conv.History = []map[string]interface{}{}
+		conv.historyLoaded = false
 		m.byCID[conv.CID] = conv
 		cur := best[conv.UserID]
 		if cur == nil || row.UpdatedAt > cur.UpdatedAt ||
@@ -199,14 +232,15 @@ func (m *Manager) NewConversation(unifiedMsgOrigin, platformID string) *Conversa
 // session, loading it from the database on a cache miss. The copy is safe to
 // read outside the manager lock (same contract as GetConversationSnapshot).
 func (m *Manager) GetConversation(unifiedMsgOrigin string) *Conversation {
-	m.mu.RLock()
+	m.mu.Lock()
 	cid := m.current[unifiedMsgOrigin]
 	conv := m.byCID[cid]
 	var snap *Conversation
 	if conv != nil && !conv.IsDeleted {
+		m.ensureHistoryLocked(conv)
 		snap = copyConversationLocked(conv)
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	if snap != nil || m.db == nil {
 		return snap
 	}
@@ -224,11 +258,12 @@ func (m *Manager) GetConversation(unifiedMsgOrigin string) *Conversation {
 
 // AllConversations returns deep copies of all conversations.
 func (m *Manager) AllConversations() []*Conversation {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	result := make([]*Conversation, 0, len(m.byCID))
 	for _, conv := range m.byCID {
 		if !conv.IsDeleted {
+			m.ensureHistoryLocked(conv)
 			result = append(result, copyConversationLocked(conv))
 		}
 	}
@@ -239,14 +274,15 @@ func (m *Manager) AllConversations() []*Conversation {
 // dashboard WebUI expects (mirrors Python's conversation_service
 // _serialize_conversation), ordered by updated_at desc.
 func (m *Manager) GetAllConversations() []interface{} {
-	m.mu.RLock()
+	m.mu.Lock()
 	convs := make([]*Conversation, 0, len(m.byCID))
 	for _, conv := range m.byCID {
 		if !conv.IsDeleted {
+			m.ensureHistoryLocked(conv)
 			convs = append(convs, copyConversationLocked(conv))
 		}
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	sort.Slice(convs, func(i, j int) bool { return convs[i].UpdatedAt.After(convs[j].UpdatedAt) })
 
 	result := make([]interface{}, 0, len(convs))
@@ -260,13 +296,14 @@ func (m *Manager) GetAllConversations() []interface{} {
 // The serialization happens on a lock-held deep copy so a concurrent
 // AppendHistory can never tear the returned history.
 func (m *Manager) GetConversationByCID(cid string) map[string]interface{} {
-	m.mu.RLock()
+	m.mu.Lock()
 	conv := m.byCID[cid]
 	var snap *Conversation
 	if conv != nil && !conv.IsDeleted {
+		m.ensureHistoryLocked(conv)
 		snap = copyConversationLocked(conv)
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	if snap != nil {
 		return serializeConversation(snap)
 	}
@@ -282,14 +319,15 @@ func (m *Manager) GetConversationByCID(cid string) map[string]interface{} {
 // GetConversationHistory returns a deep copy of a conversation's history by
 // cid, or nil. Safe to read outside the manager lock.
 func (m *Manager) GetConversationHistory(cid string) []map[string]interface{} {
-	m.mu.RLock()
+	m.mu.Lock()
 	conv := m.byCID[cid]
 	if conv != nil && !conv.IsDeleted {
+		m.ensureHistoryLocked(conv)
 		hist := copyHistory(conv.History)
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		return hist
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	if m.db != nil {
 		row, found, err := m.db.GetConversationByID(cid)
 		if err == nil && found {
@@ -302,14 +340,15 @@ func (m *Manager) GetConversationHistory(cid string) []map[string]interface{} {
 // GetConversationSnapshot returns a deep copy of a conversation's core fields
 // by cid, or nil. Safe to read outside the manager lock.
 func (m *Manager) GetConversationSnapshot(cid string) *Conversation {
-	m.mu.RLock()
+	m.mu.Lock()
 	conv := m.byCID[cid]
 	if conv != nil && !conv.IsDeleted {
+		m.ensureHistoryLocked(conv)
 		snap := copyConversationLocked(conv)
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		return snap
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	if m.db != nil {
 		row, found, err := m.db.GetConversationByID(cid)
 		if err == nil && found {
@@ -455,13 +494,14 @@ func (m *Manager) DeleteConversation(unifiedMsgOrigin string) {
 // FindByCID returns a deep copy of a conversation by its cid, or nil.
 // The copy is safe to read outside the manager lock.
 func (m *Manager) FindByCID(cid string) *Conversation {
-	m.mu.RLock()
+	m.mu.Lock()
 	conv := m.byCID[cid]
 	var snap *Conversation
 	if conv != nil && !conv.IsDeleted {
+		m.ensureHistoryLocked(conv)
 		snap = copyConversationLocked(conv)
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	return snap
 }
 
@@ -509,6 +549,7 @@ func (m *Manager) ReplaceHistoryByCID(cid string, history []map[string]interface
 		return false
 	}
 	conv.History = history
+	conv.historyLoaded = true // 调用方给的是完整替换历史
 	conv.UpdatedAt = time.Now()
 	m.mu.Unlock()
 	m.persist(conv)
@@ -561,6 +602,9 @@ func (m *Manager) AppendHistory(unifiedMsgOrigin string, role, content string) {
 		m.byCID[conv.CID] = conv
 		m.current[unifiedMsgOrigin] = conv.CID
 	}
+	// 追加前确保历史已从 DB 补载（懒加载）：否则持久化时会以截断后的
+	// 短历史覆盖完整历史，造成数据丢失。
+	m.ensureHistoryLocked(conv)
 	conv.History = append(conv.History, map[string]interface{}{
 		"role":    role,
 		"content": content,
@@ -629,6 +673,7 @@ func (m *Manager) ClearHistory(unifiedMsgOrigin string) {
 		return
 	}
 	conv.History = []map[string]interface{}{}
+	conv.historyLoaded = true
 	conv.UpdatedAt = time.Now()
 	m.mu.Unlock()
 	if m.db != nil {
@@ -661,6 +706,9 @@ func (m *Manager) persist(conv *Conversation) {
 	if m.db == nil {
 		return
 	}
+	// 懒加载保证：未补载历史的会话必须先补载，否则会以空/截断历史
+	// 覆盖 DB 中的完整历史（丢数据）。
+	m.ensureHistory(conv)
 	m.mu.RLock()
 	if _, dead := m.tombstones[conv.CID]; dead {
 		m.mu.RUnlock()

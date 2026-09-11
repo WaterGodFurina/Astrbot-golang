@@ -2346,7 +2346,7 @@ export const useExtensionPage = (initialTab = "installed") => {
 
     if (resData.status === "error" && resData.code === "plugin_risk") {
       riskDialog.message =
-        resData.message || t("dialogs.risk_warning.message");
+        resData.message || tm("dialogs.risk_warning.message");
       riskDialog.risks = resData.data?.risks || [];
       riskDialog.show = true;
       await refreshExtensionsAfterInstallFailure();
@@ -2356,7 +2356,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     if (resData.status === "error" && resData.code === "c_compiler_prompt") {
       const data = resData.data || {};
       ccDialog.message =
-        resData.message || t("dialogs.c_compiler.message");
+        resData.message || tm("dialogs.c_compiler.message");
       ccDialog.kind = data.kind || "download_clang";
       ccDialog.hasGCC = !!data.has_gcc;
       ccDialog.gccPath = data.gcc_path || "";
@@ -2369,7 +2369,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     if (resData.status === "error" && resData.code === "go_sdk_prompt") {
       const data = resData.data || {};
       goSdkDialog.message =
-        resData.message || t("dialogs.go_sdk.message");
+        resData.message || tm("dialogs.go_sdk.message");
       goSdkDialog.android = !!data.android;
       goSdkDialog.mirrors = Array.isArray(data.mirrors) ? data.mirrors : [];
       goSdkDialog.selectedMirror = goSdkDialog.mirrors[0] || "";
@@ -2384,7 +2384,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     ) {
       const data = resData.data || {};
       pythonRuntimeDialog.message =
-        resData.message || t("dialogs.python_runtime.message");
+        resData.message || tm("dialogs.python_runtime.message");
       pythonRuntimeDialog.android = !!data.android;
       pythonRuntimeDialog.mirrors = Array.isArray(data.mirrors)
         ? data.mirrors

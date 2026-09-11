@@ -146,5 +146,8 @@
     "confirmDeleteButton": "Confirm Delete",
     "confirmAction": "Confirm Action",
     "confirmApplyMessage": "Are you sure you want to save changes to '{name}' and set it as the active template?"
+  },
+  "form": {
+    "rootFolder": "All personas"
   }
 }

@@ -189,5 +189,15 @@
     "updateToolPermissionBuiltin": "内置工具不支持单独配置权限",
     "testError": "测试连接失败: {error}",
     "testSuccess": "MCP 服务器测试通过（{count} 个工具）"
+  },
+  "syncProvider": {
+    "status": {
+      "selectProvider": "请先选择提供商",
+      "enterToken": "请输入访问令牌"
+    },
+    "messages": {
+      "syncSuccess": "同步成功",
+      "syncError": "同步失败：{error}"
+    }
   }
 }

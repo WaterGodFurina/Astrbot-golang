@@ -189,5 +189,15 @@
     "updateToolPermissionBuiltin": "Builtin tools do not support per-tool permission configuration.",
     "testError": "Test connection failed: {error}",
     "testSuccess": "MCP server test passed ({count} tools)"
+  },
+  "syncProvider": {
+    "status": {
+      "selectProvider": "Select a provider first",
+      "enterToken": "Enter an access token"
+    },
+    "messages": {
+      "syncSuccess": "Synced successfully",
+      "syncError": "Sync failed: {error}"
+    }
   }
 }

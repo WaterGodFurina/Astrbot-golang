@@ -74,7 +74,8 @@
     "renameFailed": "Ошибка переименования",
     "loadFailed": "Ошибка загрузки списка команд",
     "updateSuccess": "Обновлено успешно",
-    "updateFailed": "Ошибка обновления"
+    "updateFailed": "Ошибка обновления",
+    "operationFailed": "Операция не удалась"
   },
   "search": {
     "placeholder": "Поиск команд..."

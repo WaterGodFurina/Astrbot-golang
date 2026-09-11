@@ -547,6 +547,28 @@ func (d *Database) ListConversations() ([]ConversationRow, error) {
 	return result, rows.Err()
 }
 
+// ListConversationMetas returns all conversations' metadata WITHOUT the
+// history content column — used by the conversation manager's startup load
+// so full histories are not resident in memory (lazy-loaded on first access).
+func (d *Database) ListConversationMetas() ([]ConversationRow, error) {
+	rows, err := d.db.Query(
+		`SELECT inner_conversation_id, conversation_id, platform_id, user_id, title, persona_id, created_at, updated_at
+		 FROM conversations ORDER BY updated_at DESC, inner_conversation_id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []ConversationRow
+	for rows.Next() {
+		var row ConversationRow
+		if err := rows.Scan(&row.InnerID, &row.ConversationID, &row.PlatformID, &row.UserID, &row.Title, &row.PersonaID, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
 // UpdateConversationContent updates a conversation's history JSON.
 func (d *Database) UpdateConversationContent(convID, content string) error {
 	_, err := d.db.Exec(

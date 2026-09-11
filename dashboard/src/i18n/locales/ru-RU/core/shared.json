@@ -146,5 +146,8 @@
     "confirmDeleteButton": "Удалить",
     "confirmAction": "Подтверждение действия",
     "confirmApplyMessage": "Вы уверены, что хотите сохранить изменения в '{name}' и сделать его активным шаблоном?"
+  },
+  "form": {
+    "rootFolder": "Все персоны"
   }
 }
