@@ -189,7 +189,7 @@ func buildSendComponent(m map[string]interface{}, umo string) (message.Component
 		if path == "" {
 			return "", nil
 		}
-		p, err := resolveLocalPath(path, umo, false)
+		p, err := resolveLocalPath(path, umo, false, true) // 媒体发送恒限白名单：防模型外传任意宿主文件（比 py 更严，保留）
 		if err != nil {
 			return "", fmt.Errorf("媒体文件路径不安全: %v", err)
 		}

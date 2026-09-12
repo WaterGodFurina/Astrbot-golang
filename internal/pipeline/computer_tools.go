@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -101,16 +102,29 @@ func sandboxPython(ctx context.Context, mgr *sandbox.Manager, sessionID, code st
 	return stdout
 }
 
-func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path string) string {
+// sandboxFileRead reads a sandbox file; images are returned as base64 for the multimodal channel (py probe→image: text channel corrupts binary, so both probe and full read ride `base64 -w0`, mirroring py _build_probe_script/_build_image_read_script over a byte-safe transport).
+func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path string) (string, string, string) {
 	path = sandboxResolvePath(path)
 	if path == "" {
-		return "Error reading file: `path` must be a non-empty string."
+		return "Error reading file: `path` must be a non-empty string.", "", ""
+	}
+	q := strings.ReplaceAll(path, "'", "'\\''")
+	probe := "n=$(wc -c < '" + q + "' 2>/dev/null) || exit 1; if [ \"$n\" -le " + fmt.Sprintf("%d", maxToolImageBytes) + " ]; then base64 -w0 '" + q + "'; else echo OVERSIZE; fi"
+	if out, _, code, err := mgr.Exec(ctx, sessionID, "sh", []string{"-c", probe}, sandboxWorkdir); err == nil && code == 0 {
+		out = strings.TrimSpace(out)
+		if out != "OVERSIZE" && out != "" {
+			if raw, derr := base64.StdEncoding.DecodeString(out); derr == nil && len(raw) > 0 {
+				if mime, ok := imageSniffMime(raw); ok {
+					return "", base64.StdEncoding.EncodeToString(raw), mime
+				}
+			}
+		}
 	}
 	content, err := mgr.ReadFile(ctx, sessionID, path)
 	if err != nil {
-		return "Error reading file: " + err.Error()
+		return "Error reading file: " + err.Error(), "", ""
 	}
-	return fmt.Sprintf("Content of %s:\n%s", path, content)
+	return fmt.Sprintf("Content of %s:\n%s", path, content), "", ""
 }
 
 func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, sessionID, path, content string) string {
@@ -333,8 +347,34 @@ func allowedReadRoots(umo string) []string {
 	return append([]string{
 		workspaceRoot(umo),
 		filepath.Join("data", "skills"),
-		filepath.Join("data", "plugins"),
-	}, localTempRoots()...)
+	}, pluginSkillRoots()...)
+}
+
+// pluginSkillRoots lists <plugin>/skills dirs shipped with installed plugins (py _plugin_skill_roots: members may read plugin SKILL.md, not plugin source/config).
+func pluginSkillRoots() []string {
+	var out []string
+	entries, err := os.ReadDir(filepath.Join("data", "plugins"))
+	if err != nil {
+		return out
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		skillsDir := filepath.Join("data", "plugins", e.Name(), "skills")
+		if st, err := os.Stat(skillsDir); err == nil && st.IsDir() {
+			out = append(out, skillsDir)
+		}
+	}
+	return out
+}
+
+// restrictedPathLabels mirrors py _restricted_env_path_labels: human-readable allowed dirs for the denial message.
+func restrictedPathLabels(umo string, write bool) []string {
+	if !write {
+		return []string{"data/skills", "data/plugins/*/skills", workspaceRoot(umo), filepath.Join(os.TempDir(), ".astrbot"), filepath.Join("data", "temp")}
+	}
+	return []string{workspaceRoot(umo), filepath.Join(os.TempDir(), ".astrbot"), filepath.Join("data", "temp")}
 }
 
 // allowedWriteRoots lists directories file tools may write to (workspace and
@@ -361,12 +401,8 @@ func expandHome(path string) string {
 	return path
 }
 
-// resolveLocalPath resolves a tool-supplied path relative to the workspace
-// root, expanding ~ and normalizing to an absolute path, then enforces it
-// stays within the allowed roots. Returning an absolute path (like Python's
-// Path.resolve) lets the model feed the reported path straight back into
-// another tool without it being re-anchored under the workspace again.
-func resolveLocalPath(path, umo string, write bool) (string, error) {
+// resolveLocalPath resolves a tool-supplied path relative to the workspace root, expanding ~ and normalizing to an absolute path. enforce (py _is_restricted_env: local runtime + require_admin + non-admin role) additionally restricts the result to the allowed roots and rejects multi-hardlink aliases; admins keep the unrestricted py behavior.
+func resolveLocalPath(path, umo string, write, enforce bool) (string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return "", fmt.Errorf("`path` must be a non-empty string")
@@ -380,6 +416,9 @@ func resolveLocalPath(path, umo string, write bool) (string, error) {
 		resolved = abs
 	}
 	resolved = filepath.Clean(resolved)
+	if !enforce {
+		return resolved, nil
+	}
 	roots := allowedReadRoots(umo)
 	if write {
 		roots = allowedWriteRoots(umo)
@@ -393,10 +432,29 @@ func resolveLocalPath(path, umo string, write bool) (string, error) {
 			if err := enforceRealPathWithin(resolved, roots); err != nil {
 				return "", err
 			}
+			if err := rejectMultiLinkFile(resolved); err != nil {
+				return "", err
+			}
 			return resolved, nil
 		}
 	}
-	return "", fmt.Errorf("path %q is outside the allowed workspace and skill directories", path)
+	access := "Read"
+	if write {
+		access = "Write"
+	}
+	return "", fmt.Errorf("%s access is restricted for this user. Allowed directories: %s. Blocked path: %s.", access, strings.Join(restrictedPathLabels(umo, write), ", "), resolved)
+}
+
+// rejectMultiLinkFile blocks regular files with nlink>1 in restricted mode: a hardlink could alias content from outside the allowed roots (py _reject_multi_link_file). Platform nlink lookup lives in filelink_{unix,windows}.go.
+func rejectMultiLinkFile(path string) error {
+	nlink, regular, err := fileHardlinks(path)
+	if err != nil {
+		return fmt.Errorf("Access denied: unable to inspect restricted path link count. Blocked path: %s.", path)
+	}
+	if regular && nlink > 1 {
+		return fmt.Errorf("Access denied: file has multiple hard links and may alias content outside allowed directories. Link count: %d. Blocked path: %s.", nlink, path)
+	}
+	return nil
 }
 
 // enforceRealPathWithin resolves symlinks on the given path (falling back to
@@ -1327,29 +1385,40 @@ func executeLocalPython(umo, code string, timeout int) string {
 // at once; larger files must be read in chunks via offset/limit.
 const maxFileReadBytes = 1 << 20
 
-func executeFileRead(path, umo string, offset, limit int) string {
-	resolved, err := resolveLocalPath(path, umo, false)
+func executeFileRead(path, umo string, offset, limit int, restricted bool) (string, string, string) {
+	resolved, err := resolveLocalPath(path, umo, false, restricted)
 	if err != nil {
-		return "Error reading file: " + err.Error()
+		return "Error reading file: " + err.Error(), "", ""
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
-		return "Error reading file: " + err.Error()
+		return "Error reading file: " + err.Error(), "", ""
 	}
 	if info.IsDir() {
 		return fmt.Sprintf("Error: '%s' is a directory, not a file. "+
-			"Use a file path instead, or use 'astrbot_execute_shell' to list directory contents.", resolved)
+			"Use a file path instead, or use 'astrbot_execute_shell' to list directory contents.", resolved), "", ""
+	}
+	// 图片嗅探（py read_file_utils probe→image 分支）：命中则整体读入并以 base64 交给多模态通道。
+	if mime, ok := sniffLocalImage(resolved); ok {
+		if info.Size() > maxToolImageBytes {
+			return fmt.Sprintf("Error reading file: image %s is %d bytes, exceeds the %d-byte image read limit.", resolved, info.Size(), maxToolImageBytes), "", ""
+		}
+		data, err := os.ReadFile(resolved)
+		if err != nil {
+			return "Error reading file: " + err.Error(), "", ""
+		}
+		return "", base64.StdEncoding.EncodeToString(data), mime
 	}
 	// 先 stat 判断大小：超限文件拒绝整体读入内存。带 offset/limit 时走
 	// 分页路径（按行流式读取，不整体载入内存），否则提示用 offset/limit。
 	if info.Size() > maxFileReadBytes {
 		if offset <= 0 && limit <= 0 {
 			return fmt.Sprintf("Error reading file: %s is %d bytes, exceeds the %d-byte read limit. "+
-				"Use offset/limit to read a portion of the file.", resolved, info.Size(), maxFileReadBytes)
+				"Use offset/limit to read a portion of the file.", resolved, info.Size(), maxFileReadBytes), "", ""
 		}
 		f, err := os.Open(resolved)
 		if err != nil {
-			return "Error reading file: " + err.Error()
+			return "Error reading file: " + err.Error(), "", ""
 		}
 		defer f.Close()
 		var lines []string
@@ -1360,11 +1429,11 @@ func executeFileRead(path, umo string, offset, limit int) string {
 				lines = append(lines, sc.Text())
 			}
 		}
-		return fmt.Sprintf("Read %d lines from %s:\n%s", len(lines), resolved, strings.Join(lines, "\n"))
+		return fmt.Sprintf("Read %d lines from %s:\n%s", len(lines), resolved, strings.Join(lines, "\n")), "", ""
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil {
-		return "Error reading file: " + err.Error()
+		return "Error reading file: " + err.Error(), "", ""
 	}
 	content := string(data)
 	if offset > 0 || limit > 0 {
@@ -1381,11 +1450,11 @@ func executeFileRead(path, umo string, offset, limit int) string {
 		}
 		content = strings.Join(lines[offset:end], "\n")
 	}
-	return fmt.Sprintf("Read %d bytes from %s:\n%s", info.Size(), resolved, content)
+	return fmt.Sprintf("Read %d bytes from %s:\n%s", info.Size(), resolved, content), "", ""
 }
 
-func executeFileWrite(path, content, umo string) string {
-	resolved, err := resolveLocalPath(path, umo, true)
+func executeFileWrite(path, content, umo string, restricted bool) string {
+	resolved, err := resolveLocalPath(path, umo, true, restricted)
 	if err != nil {
 		return "Error writing file: " + err.Error()
 	}
@@ -1401,7 +1470,7 @@ func executeFileWrite(path, content, umo string) string {
 // executeLocalUpload copies a host file into the conversation workspace on the
 // local runtime (the workspace IS the host filesystem). Mirrors Python's
 // ast rbot_upload_file for the local computer-use runtime.
-func executeLocalUpload(localPath, umo string) string {
+func executeLocalUpload(localPath, umo string, restricted bool) string {
 	if strings.TrimSpace(localPath) == "" {
 		return "Error uploading file: `local_path` must be a non-empty string."
 	}
@@ -1420,11 +1489,11 @@ func executeLocalUpload(localPath, umo string) string {
 // executeLocalDownload copies a workspace file out to the host temp directory
 // on the local runtime (the workspace IS the host filesystem). Mirrors Python's
 // ast rbot_download_file for the local computer-use runtime.
-func executeLocalDownload(remotePath, umo string) string {
+func executeLocalDownload(remotePath, umo string, restricted bool) string {
 	if strings.TrimSpace(remotePath) == "" {
 		return "Error downloading file: `remote_path` must be a non-empty string."
 	}
-	resolved, err := resolveLocalPath(remotePath, umo, false)
+	resolved, err := resolveLocalPath(remotePath, umo, false, restricted)
 	if err != nil {
 		return "Error downloading file: " + err.Error()
 	}
@@ -1458,8 +1527,8 @@ func copyLocalFile(src, dst string) error {
 	return os.WriteFile(dst, data, 0o600)
 }
 
-func executeFileEdit(path, old, new string, replaceAll bool, umo string) string {
-	resolved, err := resolveLocalPath(path, umo, true)
+func executeFileEdit(path, old, new string, replaceAll bool, umo string, restricted bool) string {
+	resolved, err := resolveLocalPath(path, umo, true, restricted)
 	if err != nil {
 		return "Error editing file: " + err.Error()
 	}
@@ -1493,7 +1562,7 @@ func executeFileEdit(path, old, new string, replaceAll bool, umo string) string 
 	return fmt.Sprintf("Edited %s. Replaced %d occurrence(s) using %s mode.", resolved, replacements, modeText)
 }
 
-func executeGrep(pattern, path, glob string, resultLimit int, umo string) string {
+func executeGrep(pattern, path, glob string, resultLimit int, umo string, restricted bool) string {
 	if strings.TrimSpace(pattern) == "" {
 		return "Error: `pattern` must be a non-empty string."
 	}
@@ -1508,7 +1577,7 @@ func executeGrep(pattern, path, glob string, resultLimit int, umo string) string
 	if searchPath == "" {
 		searchPath = "."
 	}
-	resolved, err := resolveLocalPath(searchPath, umo, false)
+	resolved, err := resolveLocalPath(searchPath, umo, false, restricted)
 	if err != nil {
 		return "Error searching: " + err.Error()
 	}
@@ -1778,4 +1847,144 @@ func neoModePrompt() string {
 		"For stable release, set `sync_to_local=true` to sync `payload.skill_markdown` into local `SKILL.md`.\n" +
 		"Do not treat ad-hoc generated files as reusable Neo skills unless they are captured via payload/candidate/release.\n" +
 		"To update an existing skill, create a new payload/candidate and promote a new release version; avoid patching old local folders directly.\n"
+}
+
+// computerUseRestricted mirrors Python fs._is_restricted_env: local-runtime file tools whitelist enforcement for non-admin users when provider_settings.computer_use_require_admin (default true). Call sites must gate on runtime=="local" themselves.
+func (s *ProcessStage) computerUseRestricted(event *core.Event) bool {
+	requireAdmin := true
+	if s.providerConf != nil && s.providerConf.ComputerUseRequireAdmin != nil {
+		requireAdmin = *s.providerConf.ComputerUseRequireAdmin
+	}
+	return requireAdmin && event.Role != "admin"
+}
+
+// imageSniffMime detects common image formats from magic bytes (py file_read_utils _probe_file subset: image kinds).
+func imageSniffMime(sample []byte) (string, bool) {
+	switch {
+	case len(sample) >= 8 && string(sample[:8]) == "\x89PNG\r\n\x1a\n":
+		return "image/png", true
+	case len(sample) >= 3 && sample[0] == 0xFF && sample[1] == 0xD8 && sample[2] == 0xFF:
+		return "image/jpeg", true
+	case len(sample) >= 6 && (string(sample[:6]) == "GIF87a" || string(sample[:6]) == "GIF89a"):
+		return "image/gif", true
+	case len(sample) >= 12 && string(sample[:4]) == "RIFF" && string(sample[8:12]) == "WEBP":
+		return "image/webp", true
+	case len(sample) >= 2 && string(sample[:2]) == "BM":
+		return "image/bmp", true
+	}
+	return "", false
+}
+
+// toolImageSinkKeys: pending images collected per event during a tool round (mirrors py ToolImageCache + from_cached_image flow).
+const toolImageSinkKey = "tool_images_pending"
+
+type pendingToolImage struct {
+	Mime   string
+	Base64 string
+	Path   string
+}
+
+// registerToolImage caches a tool-produced image (compressed per provider settings) into data/temp/tool_images and stashes it on the event for the agent loop to inject as a follow-up user message; returns the py-compatible tool text.
+func (s *ProcessStage) registerToolImage(event *core.Event, rawB64, mime, toolName string) string {
+	data, err := base64.StdEncoding.DecodeString(rawB64)
+	if err != nil {
+		return "Error reading file: image payload is empty."
+	}
+	dir := filepath.Join("data", "temp", "tool_images")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "Error reading file: failed to cache image: " + err.Error()
+	}
+	path := filepath.Join(dir, fmt.Sprintf("astrbot-toolimg-%d-%s", time.Now().UnixNano(), sanitizeFileName(toolName)))
+	ext := ".img"
+	switch mime {
+	case "image/png":
+		ext = ".png"
+	case "image/jpeg":
+		ext = ".jpg"
+	case "image/gif":
+		ext = ".gif"
+	case "image/webp":
+		ext = ".webp"
+	case "image/bmp":
+		ext = ".bmp"
+	}
+	path += ext
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "Error reading file: failed to cache image: " + err.Error()
+	}
+	if compressed := s.compressImageForProvider(path); compressed != path {
+		if cb, err := os.ReadFile(compressed); err == nil {
+			data = cb
+			mime = "image/jpeg" // compressImageForProvider 统一 JPEG 输出（透明压平白底，与 provider 图片通道同语义）。
+		}
+	}
+	if event.Metadata == nil {
+		event.Metadata = map[string]interface{}{}
+	}
+	pending, _ := event.Metadata[toolImageSinkKey].(*[]pendingToolImage)
+	if pending == nil {
+		pending = &[]pendingToolImage{}
+		event.Metadata[toolImageSinkKey] = pending
+	}
+	*pending = append(*pending, pendingToolImage{Mime: mime, Base64: base64.StdEncoding.EncodeToString(data), Path: path})
+	return fmt.Sprintf("Image returned and cached at path='%s'. Review the image below. Use send_message_to_user to send it to the user if satisfied, with type='image' and path='%s'.", path, path)
+}
+
+// providerSupportsImages mirrors py's modalities gate: empty list = unconfigured = assume image input is supported.
+func providerSupportsImages(providerCfg map[string]interface{}) bool {
+	mods := providerModalities(providerCfg)
+	if len(mods) == 0 {
+		return true
+	}
+	for _, m := range mods {
+		if m == "image" {
+			return true
+		}
+	}
+	return false
+}
+
+// drainToolImages returns and clears the event's pending tool images.
+func drainToolImages(event *core.Event) []pendingToolImage {
+	if event.Metadata == nil {
+		return nil
+	}
+	pending, _ := event.Metadata[toolImageSinkKey].(*[]pendingToolImage)
+	if pending == nil || len(*pending) == 0 {
+		return nil
+	}
+	out := *pending
+	event.Metadata[toolImageSinkKey] = &[]pendingToolImage{}
+	return out
+}
+
+func sanitizeFileName(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			out = append(out, r)
+		}
+	}
+	if len(out) == 0 {
+		return "tool"
+	}
+	return string(out)
+}
+
+// maxToolImageBytes bounds raw image payloads captured from file tools (base64 inflates ~33%).
+const maxToolImageBytes = 20 << 20
+
+// sniffLocalImage reports the mime type when the first bytes of the file look like a supported image.
+func sniffLocalImage(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil && n == 0 {
+		return "", false
+	}
+	return imageSniffMime(buf[:n])
 }

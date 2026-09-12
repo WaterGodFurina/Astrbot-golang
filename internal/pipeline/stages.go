@@ -1863,6 +1863,24 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 			break
 		}
 
+		// Tool-produced images (file_read multimodal, py ToolImageCache flow): append a user message carrying the images so the model can actually see them; tool messages stay text-only per OpenAI protocol.
+		if imgs := drainToolImages(event); len(imgs) > 0 {
+			if providerSupportsImages(ar.providerCfg) {
+				parts := make([]interface{}, 0, len(imgs)*2)
+				for _, img := range imgs {
+					parts = append(parts,
+						map[string]interface{}{"type": "text", "text": fmt.Sprintf("[Image from tool 'astrbot_file_read_tool', path='%s']", img.Path)},
+						map[string]interface{}{"type": "image_url", "image_url": map[string]interface{}{"url": "data:" + img.Mime + ";base64," + img.Base64, "id": img.Path}},
+					)
+				}
+				messages = append(messages, map[string]interface{}{"role": "user", "content": parts})
+			} else {
+				for _, img := range imgs {
+					os.Remove(img.Path)
+				}
+			}
+		}
+
 		// Follow-up request with tool results. Each round gets its own timeout so one slow round does not exhaust the whole tool-loop budget.
 		req.Contexts = messages
 		roundCtx, roundCancel := context.WithTimeout(llmCtx, 120*time.Second)
@@ -3448,7 +3466,7 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		return s.executeNeoLifecycleTool(ctx, event.UnifiedMsgOrigin(), name, args)
 	}
 	if !handled && runtime == "sandbox" {
-		if r, h := s.executeSandboxTool(ctx, event.UnifiedMsgOrigin(), name, args); h {
+		if r, h := s.executeSandboxTool(ctx, event, name, args); h {
 			result, handled = r, true
 		}
 	}
@@ -3479,6 +3497,7 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				// 用户 ACL：本地运行时直接操作宿主机，仅白名单用户可调用。
 				result = fmt.Sprintf("工具 %s 执行失败: computer_use 未授权该用户", name)
 			} else {
+				restrictedLocal := s.computerUseRestricted(event)
 				switch name {
 				case "astrbot_execute_shell":
 					result = executeLocalShell(umo, event.GetSenderID(), argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
@@ -3487,23 +3506,28 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				case "astrbot_execute_python":
 					result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
 				case "astrbot_file_read_tool":
-					result = executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0))
+					rdText, rdImg, rdMime := executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0), restrictedLocal)
+					if rdImg != "" {
+						result = s.registerToolImage(event, rdImg, rdMime, name)
+					} else {
+						result = rdText
+					}
 				case "astrbot_file_write_tool":
 					ws := workspaceRoot(umo)
 					before := gitTreeHash(ws)
-					r := executeFileWrite(argString(args, "path"), argString(args, "content"), umo)
+					r := executeFileWrite(argString(args, "path"), argString(args, "content"), umo, restrictedLocal)
 					result = snapshotFileMutation(ws, before, name, r)
 				case "astrbot_file_edit_tool":
 					ws := workspaceRoot(umo)
 					before := gitTreeHash(ws)
-					r := executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo)
+					r := executeFileEdit(argString(args, "path"), argString(args, "old"), argString(args, "new"), argBool(args, "replace_all"), umo, restrictedLocal)
 					result = snapshotFileMutation(ws, before, name, r)
 				case "astrbot_grep_tool":
-					result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo)
+					result = executeGrep(argString(args, "pattern"), argString(args, "path"), argString(args, "glob"), argInt(args, "result_limit", 100), umo, restrictedLocal)
 				case "astrbot_upload_file":
-					result = executeLocalUpload(argString(args, "local_path"), umo)
+					result = executeLocalUpload(argString(args, "local_path"), umo, restrictedLocal)
 				case "astrbot_download_file":
-					result = executeLocalDownload(argString(args, "remote_path"), umo)
+					result = executeLocalDownload(argString(args, "remote_path"), umo, restrictedLocal)
 				}
 			}
 		case "future_task":
@@ -3553,7 +3577,8 @@ func addCronTools(config map[string]interface{}) bool {
 }
 
 // executeSandboxTool routes computer-use tools into the per-session sandbox runtime. sessionID 是事件的 unified_msg_origin（群/私聊），每个会话独立 沙盒（对齐 Python session_booter 模型），同一会话的沙盒任务天然串行。
-func (s *ProcessStage) executeSandboxTool(ctx context.Context, sessionID, name string, args map[string]interface{}) (string, bool) {
+func (s *ProcessStage) executeSandboxTool(ctx context.Context, event *core.Event, name string, args map[string]interface{}) (string, bool) {
+	sessionID := event.UnifiedMsgOrigin()
 	if s.sandboxMgr == nil {
 		// Only sandbox-only tools are reported as unavailable here; any other name must fall through to the remaining executors so it is not swallowed by the missing sandbox.
 		switch name {
@@ -3592,7 +3617,11 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, sessionID, name s
 		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		return sandboxFileRead(tctx, s.sandboxMgr, sessionID, argString(args, "path")), true
+		rdText, rdImg, rdMime := sandboxFileRead(tctx, s.sandboxMgr, sessionID, argString(args, "path"))
+		if rdImg != "" {
+			return s.registerToolImage(event, rdImg, rdMime, name), true
+		}
+		return rdText, true
 	case "astrbot_file_write_tool":
 		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true

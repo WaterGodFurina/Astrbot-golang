@@ -109,7 +109,7 @@ func TestExecuteSandboxToolUnconfigured(t *testing.T) {
 	if s.sandboxMgr != nil {
 		t.Skip("sandbox manager unexpectedly configured")
 	}
-	result, handled := s.executeSandboxTool(context.Background(), "g:1", "astrbot_execute_shell", map[string]interface{}{})
+	result, handled := s.executeSandboxTool(context.Background(), &core.Event{Source: core.EventSource{Platform: "g", ConvID: "1"}}, "astrbot_execute_shell", map[string]interface{}{})
 	if !handled {
 		t.Fatal("sandbox tool must be marked handled")
 	}
