@@ -33,8 +33,8 @@ interface SleepPluginItem {
   version: string;
 }
 
-// 休眠唤醒方式选项：command_only = 仅插件唤醒（默认，休眠期间不响应
-// 过滤器/钩子等被动事件）；hook_and_command = 过滤器/钩子+指令唤醒。
+// 休眠唤醒方式选项：command_only = 插件指令+工具唤醒（默认；钩子/被动事件不唤醒）；
+// hook_and_command = 插件指令+工具+过滤器唤醒。
 const WAKE_COMMAND_ONLY = "command_only";
 const WAKE_HOOK_AND_COMMAND = "hook_and_command";
 
