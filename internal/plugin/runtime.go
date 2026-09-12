@@ -966,12 +966,23 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		DataDir:           filepath.Join("plugins_data", sanitizeID(inst.ID)),
 		DocsDir:           filepath.Join("plugins", sanitizeID(inst.ID)),
 	})
-	return man.Save(m.manifestPath())
+	return m.saveManifest(man)
 }
 
 // manifestPath returns the persisted install manifest location.
 func (m *SubprocessManager) manifestPath() string {
 	return filepath.Join(m.dataDir, "plugins-manifest.json")
+}
+
+// saveManifest 保存 manifest 并强制使只读缓存失效：mtime 为粗粒度时间戳（同毫秒写读会 Equal），仅靠 mtime 判失效存在「写后读到陈旧缓存」竞态。
+func (m *SubprocessManager) saveManifest(man *Manifest) error {
+	if err := man.Save(m.manifestPath()); err != nil {
+		return err
+	}
+	m.manifestCacheMu.Lock()
+	m.manifestCache, m.manifestCacheAt = nil, time.Time{}
+	m.manifestCacheMu.Unlock()
+	return nil
 }
 
 // cachedManifest 返回 manifest 的只读缓存（mtime 失效：文件变化即重读）。 解析失败时返回空 manifest（调用方按"无插件"处理），与 ListInfo 容错一致。
@@ -1177,7 +1188,7 @@ func (m *SubprocessManager) SetPluginIdleUnload(id string, allow bool) error {
 	if allow && !wasAllow && e.IdleUnloadMinutes <= 0 {
 		e.IdleUnloadMinutes = DefaultIdleUnloadMinutes
 	}
-	if err := man.Save(m.manifestPath()); err != nil {
+	if err := m.saveManifest(man); err != nil {
 		return err
 	}
 	if allow {
@@ -1217,7 +1228,7 @@ func (m *SubprocessManager) SetPluginIdleUnloadMinutes(id string, minutes int) e
 		return fmt.Errorf("插件 %s 未安装", id)
 	}
 	e.IdleUnloadMinutes = minutes
-	if err := man.Save(m.manifestPath()); err != nil {
+	if err := m.saveManifest(man); err != nil {
 		return err
 	}
 	return nil
@@ -1241,7 +1252,7 @@ func (m *SubprocessManager) SetPluginIdleWakeMode(id, mode string) error {
 		return fmt.Errorf("插件 %s 未安装", id)
 	}
 	e.IdleWakeMode = mode
-	if err := man.Save(m.manifestPath()); err != nil {
+	if err := m.saveManifest(man); err != nil {
 		return err
 	}
 	if mode == "hook_and_command" {
@@ -2159,7 +2170,7 @@ func (m *SubprocessManager) migratePluginLayout() {
 		}
 	}
 	if changed {
-		_ = man.Save(m.manifestPath())
+		_ = m.saveManifest(man)
 	}
 	// 清理已空的旧目录（Rename 后 plugins-src 应为空；若有残余仅删空目录）。
 	_ = os.Remove(filepath.Join(m.dataDir, "plugins-src"))

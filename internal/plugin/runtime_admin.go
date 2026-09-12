@@ -418,7 +418,7 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 		}
 		entry.Enabled = false
 	}
-	err = man.Save(m.manifestPath())
+	err = m.saveManifest(man)
 	m.manifestMu.Unlock()
 	return err
 }
@@ -456,7 +456,7 @@ func (m *SubprocessManager) BindSource(id string, method, registryURL, registryN
 	if downloadURL != "" {
 		entry.DownloadURL = downloadURL
 	}
-	return man.Save(m.manifestPath())
+	return m.saveManifest(man)
 }
 
 // ReinstallSource reinstalls a plugin from its persisted source: it unloads
@@ -576,7 +576,7 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 		}
 	}
 	man.Remove(id)
-	if err := man.Save(m.manifestPath()); err != nil {
+	if err := m.saveManifest(man); err != nil {
 		m.manifestMu.Unlock()
 		return err
 	}
