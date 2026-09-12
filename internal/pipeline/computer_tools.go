@@ -123,6 +123,22 @@ func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, sessionID, path
 	return "File written successfully: " + path
 }
 
+// stageFileIntoSandbox 把宿主附件自动复制进沙盒 /workspace（同名复用），返回沙盒路径；非沙盒模式/未配置/任何一步失败返回 ""（调用方回退宿主路径+引导文案）。
+func (s *ProcessStage) stageFileIntoSandbox(ctx context.Context, sessionID, hostPath string, sandboxMode bool) string {
+	if !sandboxMode || s.sandboxMgr == nil || strings.TrimSpace(hostPath) == "" {
+		return ""
+	}
+	data, err := os.ReadFile(hostPath)
+	if err != nil {
+		return ""
+	}
+	dst := sandboxWorkdir + "/" + filepath.Base(hostPath)
+	if err := s.sandboxMgr.WriteFile(ctx, sessionID, dst, string(data)); err != nil {
+		return ""
+	}
+	return dst
+}
+
 // sandboxUploadFile transfers a file FROM the host machine INTO the sandbox
 // workspace so sandbox tools (read/shell/python) can access it. Mirrors
 // astrbot-py's FileUploadTool (astrbot_upload_file): local_path is an absolute

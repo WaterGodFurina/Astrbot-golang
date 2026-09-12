@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"testing"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
@@ -116,7 +117,7 @@ func TestCollectFileAttachments(t *testing.T) {
 			&message.File{Name: "top.txt", URL: "https:///ftn_handler//?fname="}, // invalid host URL
 		}},
 	}
-	parts := collectFileAttachments(ev)
+	parts := (&ProcessStage{}).collectFileAttachments(context.Background(), ev, false)
 	if len(parts) != 2 {
 		t.Fatalf("expected 2 attachment parts, got %d: %v", len(parts), parts)
 	}
