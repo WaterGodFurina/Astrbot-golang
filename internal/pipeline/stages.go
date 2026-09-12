@@ -3617,7 +3617,7 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, event *core.Event
 		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
 			return "Sandbox error: " + err.Error(), true
 		}
-		rdText, rdImg, rdMime := sandboxFileRead(tctx, s.sandboxMgr, sessionID, argString(args, "path"))
+		rdText, rdImg, rdMime := sandboxFileRead(tctx, s.sandboxMgr, sessionID, argString(args, "path"), argInt(args, "offset", 0), argInt(args, "limit", 0))
 		if rdImg != "" {
 			return s.registerToolImage(event, rdImg, rdMime, name), true
 		}

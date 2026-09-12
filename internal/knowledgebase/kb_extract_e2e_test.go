@@ -155,9 +155,12 @@ func TestE2EXlsRejected(t *testing.T) {
 	if err != nil {
 		t.Skipf("测试文档未准备（外部拉取）: %v", err)
 	}
-	_, err = ExtractKBText(content, "test.xls", "")
-	if err == nil || !strings.Contains(err.Error(), "暂不支持") {
-		t.Fatalf("xls 应报暂不支持: %v", err)
+	text, err := ExtractKBText(content, "test.xls", "")
+	if err != nil {
+		t.Fatalf("xls 应可解析: %v", err)
+	}
+	if strings.TrimSpace(text) == "" {
+		t.Fatal("xls 提取为空")
 	}
 }
 

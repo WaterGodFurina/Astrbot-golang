@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 )
@@ -103,19 +105,35 @@ func sandboxPython(ctx context.Context, mgr *sandbox.Manager, sessionID, code st
 }
 
 // sandboxFileRead reads a sandbox file; images are returned as base64 for the multimodal channel (py probe→image: text channel corrupts binary, so both probe and full read ride `base64 -w0`, mirroring py _build_probe_script/_build_image_read_script over a byte-safe transport).
-func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path string) (string, string, string) {
+func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path string, offset, limit int) (string, string, string) {
 	path = sandboxResolvePath(path)
 	if path == "" {
 		return "Error reading file: `path` must be a non-empty string.", "", ""
 	}
 	q := strings.ReplaceAll(path, "'", "'\\''")
-	probe := "n=$(wc -c < '" + q + "' 2>/dev/null) || exit 1; if [ \"$n\" -le " + fmt.Sprintf("%d", maxToolImageBytes) + " ]; then base64 -w0 '" + q + "'; else echo OVERSIZE; fi"
+	isDoc := docExtSet[strings.ToLower(pathExt(path))]
+	maxBytes := int64(maxToolImageBytes)
+	if isDoc {
+		maxBytes = maxDocExtractBytes
+	}
+	probe := "n=$(wc -c < '" + q + "' 2>/dev/null) || exit 1; if [ \"$n\" -le " + fmt.Sprintf("%d", maxBytes) + " ]; then base64 -w0 '" + q + "'; else echo OVERSIZE; fi"
 	if out, _, code, err := mgr.Exec(ctx, sessionID, "sh", []string{"-c", probe}, sandboxWorkdir); err == nil && code == 0 {
 		out = strings.TrimSpace(out)
-		if out != "OVERSIZE" && out != "" {
+		if out == "OVERSIZE" {
+			return fmt.Sprintf("Error reading file: exceeds the %d-byte sandbox read limit. Use the shell tool (head/sed/python) for targeted extraction.", maxBytes), "", ""
+		}
+		if out != "" {
 			if raw, derr := base64.StdEncoding.DecodeString(out); derr == nil && len(raw) > 0 {
 				if mime, ok := imageSniffMime(raw); ok {
 					return "", base64.StdEncoding.EncodeToString(raw), mime
+				}
+				if isDoc {
+					if text, ok := extractDocumentText(raw, pathBase(path)); ok {
+						return formatDocumentRead(text, path, sessionID, offset, limit, raw), "", ""
+					}
+					if looksBinarySample(raw) {
+						return "Error reading file: binary files are not supported by this tool.", "", ""
+					}
 				}
 			}
 		}
@@ -125,6 +143,16 @@ func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path 
 		return "Error reading file: " + err.Error(), "", ""
 	}
 	return fmt.Sprintf("Content of %s:\n%s", path, content), "", ""
+}
+
+// pathExt/pathBase work on POSIX sandbox paths regardless of host OS.
+func pathExt(p string) string { return filepath.Ext(strings.ReplaceAll(p, "\\", "/")) }
+func pathBase(p string) string {
+	p = strings.ReplaceAll(p, "\\", "/")
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 func sandboxFileWrite(ctx context.Context, mgr *sandbox.Manager, sessionID, path, content string) string {
@@ -1409,6 +1437,20 @@ func executeFileRead(path, umo string, offset, limit int, restricted bool) (stri
 		}
 		return "", base64.StdEncoding.EncodeToString(data), mime
 	}
+	// 文档抽取（pdf/docx/xlsx/pptx/epub/xls）复用知识库解析层（py probe→_parse_local_supported_document）。
+	if docExtSet[strings.ToLower(filepath.Ext(resolved))] {
+		if info.Size() > maxDocExtractBytes {
+			return fmt.Sprintf("Error reading file: document %s is %d bytes, exceeds the %d-byte document read limit.", resolved, info.Size(), maxDocExtractBytes), "", ""
+		}
+		data, err := os.ReadFile(resolved)
+		if err != nil {
+			return "Error reading file: " + err.Error(), "", ""
+		}
+		if text, ok := extractDocumentText(data, filepath.Base(resolved)); ok {
+			return formatDocumentRead(text, resolved, umo, offset, limit, data), "", ""
+		}
+		return "Error reading file: binary files are not supported by this tool.", "", ""
+	}
 	// 先 stat 判断大小：超限文件拒绝整体读入内存。带 offset/limit 时走
 	// 分页路径（按行流式读取，不整体载入内存），否则提示用 offset/limit。
 	if info.Size() > maxFileReadBytes {
@@ -1434,6 +1476,9 @@ func executeFileRead(path, umo string, offset, limit int, restricted bool) (stri
 	data, err := os.ReadFile(resolved)
 	if err != nil {
 		return "Error reading file: " + err.Error(), "", ""
+	}
+	if looksBinarySample(data) {
+		return "Error reading file: binary files are not supported by this tool.", "", ""
 	}
 	content := string(data)
 	if offset > 0 || limit > 0 {
@@ -1987,4 +2032,96 @@ func sniffLocalImage(path string) (string, bool) {
 		return "", false
 	}
 	return imageSniffMime(buf[:n])
+}
+
+// docExtSet lists binary document extensions routed through the knowledge-base extractor (py probe → _parse_local_supported_document).
+var docExtSet = map[string]bool{".pdf": true, ".docx": true, ".xlsx": true, ".pptx": true, ".epub": true, ".xls": true}
+
+// maxDocExtractBytes bounds raw document bytes fed to the extractor (converted text is re-checked against maxFileReadBytes).
+const maxDocExtractBytes = 64 << 20
+
+// extractDocumentText reuses knowledgebase.ExtractKBText; false when the extension is not a binary document or extraction yields nothing (py: parse None → fall through to text/binary handling).
+func extractDocumentText(data []byte, name string) (string, bool) {
+	if !docExtSet[strings.ToLower(filepath.Ext(name))] {
+		return "", false
+	}
+	text, err := knowledgebase.ExtractKBText(data, name, "")
+	if err != nil || strings.TrimSpace(text) == "" {
+		return "", false
+	}
+	return text, true
+}
+
+// sliceTextLines returns lines[offset:offset+limit] like py _slice_text_by_lines.
+func sliceTextLines(text string, offset, limit int) string {
+	lines := strings.Split(text, "\n")
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(lines) {
+		return ""
+	}
+	end := len(lines)
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	return strings.Join(lines[offset:end], "\n")
+}
+
+// formatDocumentRead mirrors py _read_local_supported_document_result: text within the read limit is returned (line-sliced by offset/limit); larger text is stored under the workspace converted_files/ directory and a notice with that path is returned so the model can grep/read it in narrow windows.
+func formatDocumentRead(text, resolved, umo string, offset, limit int, rawBytes []byte) string {
+	if int64(len(text)) <= maxFileReadBytes {
+		selected := sliceTextLines(text, offset, limit)
+		if selected == "" {
+			return "No content found at the requested line offset."
+		}
+		if (offset > 0 || limit > 0) && int64(len(selected)) > maxFileReadBytes {
+			return fmt.Sprintf("Error reading file: output exceeds %d bytes. Use `offset`, `limit` to narrow the read window.", maxFileReadBytes)
+		}
+		return fmt.Sprintf("Extracted text from %s:\n%s", resolved, selected)
+	}
+	convertedPath := storeConvertedText(text, resolved, umo, rawBytes)
+	if convertedPath == "" {
+		return "Error reading file: parsed document exceeds the read output limit and no workspace is available for storing converted text."
+	}
+	if offset <= 0 && limit <= 0 {
+		return fmt.Sprintf("Converted text was saved to `%s` because the parsed document is too large to return directly. Read or grep that file with a narrow window.", convertedPath)
+	}
+	selected := sliceTextLines(text, offset, limit)
+	if selected == "" {
+		return "No content found at the requested line offset."
+	}
+	if int64(len(selected)) > maxFileReadBytes {
+		return fmt.Sprintf("Converted text was saved to `%s`. The requested output is still too large to return directly. Read or grep that file with a narrower window.", convertedPath)
+	}
+	return fmt.Sprintf("%s\n\nFull converted text is also available at `%s`. Read or grep that file with a narrow window for additional reads.", selected, convertedPath)
+}
+
+// storeConvertedText writes the extracted document text into <workspace>/converted_files/<name>_<md5[6]>/text.txt (py _store_converted_text_for_workspace).
+func storeConvertedText(text, resolved, umo string, rawBytes []byte) string {
+	sum := md5.Sum(rawBytes)
+	name := fmt.Sprintf("%s_%x", filepath.Base(resolved), sum[len(sum)-6:])
+	dir := filepath.Join(workspaceRoot(umo), "converted_files", name)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return ""
+	}
+	target := filepath.Join(dir, "text.txt")
+	if err := os.WriteFile(target, []byte(text), 0o600); err != nil {
+		return ""
+	}
+	return target
+}
+
+// looksBinarySample rejects NUL-bearing samples from the plain-text read path (py probe kind == binary → "binary files are not supported").
+func looksBinarySample(data []byte) bool {
+	n := len(data)
+	if n > 512 {
+		n = 512
+	}
+	for _, b := range data[:n] {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
 }
