@@ -2129,9 +2129,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		// 单插件休眠策略：POST {plugin_id, allow_sleep: bool,
 		// idle_unload_minutes?: int, idle_wake_mode?: string}。
 		// allow_sleep=true 表示该插件允许闲置自动休眠；false = 常驻（不参与
-		// 清扫）。idle_unload_minutes 为该插件独立闲置阈值（分钟），缺省/0 =
-		// 回退全局默认。idle_wake_mode 为休眠唤醒方式（"hook_and_command" =
-		// 过滤器/钩子+指令唤醒；"command_only" = 仅插件唤醒，默认）。
+		// 清扫）。idle_unload_minutes 为该插件独立闲置阈值（分钟），「关闭→
+		// 开启」翻转时缺省/0 由后端落 plugin.DefaultIdleUnloadMinutes（单一真
+		// 源在前端之外）。idle_wake_mode 为休眠唤醒方式（"hook_and_command" =
+		// 指令+工具+过滤器唤醒；"command_only" = 指令+工具唤醒，默认）。
 		var body struct {
 			PluginID          string `json:"plugin_id"`
 			AllowSleep        bool   `json:"allow_sleep"`
@@ -2164,7 +2165,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 					writeJSON(w, http.StatusOK, apiError(err.Error()))
 					return
 				}
-				writeJSON(w, http.StatusOK, apiOKMsg("休眠策略已更新", map[string]interface{}{}))
+				// 回显生效阈值：开启时后端可能补默认值，前端以此更新显示。
+				writeJSON(w, http.StatusOK, apiOKMsg("休眠策略已更新", map[string]interface{}{
+					"idle_unload_minutes": s.subPluginMgr.PluginIdleUnloadMinutes(pid),
+				}))
 				return
 			}
 		}

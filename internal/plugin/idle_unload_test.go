@@ -117,31 +117,42 @@ func TestIdlePerPluginTimeout(t *testing.T) {
 
 // TestIdleMinutesZeroFallsBackToGlobal: 独立控制模式下，插件未设独立分钟（0）时不回收；
 // 设置独立分钟后才能被回收。
-func TestIdleMinutesZeroFallsBackToGlobal(t *testing.T) {
+// TestIdleEnableBackfillsDefaultMinutes: 「关闭→开启」翻转且未设阈值时后端落
+// DefaultIdleUnloadMinutes（修 API 开了永不休眠 bug）；已开启态显式设 0 不被覆盖。
+func TestIdleEnableBackfillsDefaultMinutes(t *testing.T) {
 	requirePlugin(t)
 	m := newTestManager(t)
 	p := idleTestPlugin(t, m, filepath.Join("testdata", "plugin"), "pzero")
-	// 新装插件 manifest 默认 minutes=10；显式置 0 以验证"0=不休眠"语义。
+	if err := m.SetPluginIdleUnload(p.ID, true); err != nil {
+		t.Fatalf("SetPluginIdleUnload: %v", err)
+	}
+	if got := m.PluginIdleUnloadMinutes(p.ID); got != DefaultIdleUnloadMinutes {
+		t.Fatalf("开启翻转后阈值 = %d, want %d", got, DefaultIdleUnloadMinutes)
+	}
+	// 阈值真实生效（而非旧 bug 的「开了但永不休眠」）。
+	idleNow(t, m, p.ID, time.Hour)
+	m.SweepIdle()
+	if m.Get(p.ID) != nil {
+		t.Fatal("默认阈值下闲置 1 小时应被回收")
+	}
+
+	// 唤醒后进入开启态；显式设 0（常驻意图）不得被后续 SetPluginIdleUnload(true) 覆盖。
+	if _, err := m.EnsureLoaded(context.Background(), p.ID); err != nil {
+		t.Fatalf("EnsureLoaded: %v", err)
+	}
 	if err := m.SetPluginIdleUnloadMinutes(p.ID, 0); err != nil {
 		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
 	}
 	if err := m.SetPluginIdleUnload(p.ID, true); err != nil {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
 	}
-
+	if got := m.PluginIdleUnloadMinutes(p.ID); got != 0 {
+		t.Fatalf("非翻转不得覆盖显式 0, got %d", got)
+	}
 	idleNow(t, m, p.ID, time.Hour)
 	m.SweepIdle()
 	if m.Get(p.ID) == nil {
-		t.Fatal("minutes=0 不应回收")
-	}
-	// 设置独立分钟后，闲置应被回收。
-	if err := m.SetPluginIdleUnloadMinutes(p.ID, 1); err != nil {
-		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
-	}
-	idleNow(t, m, p.ID, time.Hour)
-	m.SweepIdle()
-	if m.Get(p.ID) != nil {
-		t.Fatal("minutes=1 回收")
+		t.Fatal("minutes=0 应常驻不回收")
 	}
 }
 
