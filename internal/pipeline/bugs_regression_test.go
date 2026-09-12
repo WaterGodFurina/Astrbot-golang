@@ -88,6 +88,7 @@ func TestToolCallTimeoutApplies(t *testing.T) {
 	}
 	event := &core.Event{
 		Source: core.EventSource{Platform: "qq", ConvID: "group:1", SenderID: "u1"},
+		Role:   "admin",
 	}
 	start := time.Now()
 	result := s.executeToolWithTimeout(event, "local", "astrbot_execute_shell", map[string]interface{}{

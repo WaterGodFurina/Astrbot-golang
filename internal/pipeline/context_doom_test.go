@@ -324,7 +324,7 @@ func TestWebSearchInjection(t *testing.T) {
 	}
 	s := testProcessStageWithConfig(t, cfg)
 	found := false
-	for _, tool := range s.collectTools("none") {
+	for _, tool := range s.collectTools("none", "g:1") {
 		fn, _ := tool["function"].(map[string]interface{})
 		if fn["name"] == "web_search_tavily" {
 			found = true
@@ -342,7 +342,7 @@ func TestWebSearchInjection(t *testing.T) {
 			"websearch_tavily_key": []interface{}{"tvly-test-key"},
 		},
 	})
-	for _, tool := range s2.collectTools("none") {
+	for _, tool := range s2.collectTools("none", "g:1") {
 		fn, _ := tool["function"].(map[string]interface{})
 		if fn["name"] == "web_search_tavily" {
 			t.Fatal("web search should not be injected when disabled")
@@ -380,7 +380,7 @@ func TestWebSearchProvidersInjection(t *testing.T) {
 		}
 		s := testProcessStageWithConfig(t, cfg)
 		found := false
-		for _, tool := range s.collectTools("none") {
+		for _, tool := range s.collectTools("none", "g:1") {
 			fn, _ := tool["function"].(map[string]interface{})
 			if fn["name"] == "web_search_"+provider {
 				found = true
@@ -396,7 +396,7 @@ func TestWebSearchProvidersInjection(t *testing.T) {
 			},
 		}
 		s2 := testProcessStageWithConfig(t, cfg2)
-		for _, tool := range s2.collectTools("none") {
+		for _, tool := range s2.collectTools("none", "g:1") {
 			fn, _ := tool["function"].(map[string]interface{})
 			if fn["name"] == "web_search_"+provider {
 				t.Fatalf("%s should NOT be injected without key", provider)
@@ -410,7 +410,7 @@ func TestSendAndGroupAndKBInjection(t *testing.T) {
 	cfgOn := map[string]interface{}{"provider_ltm_settings": map[string]interface{}{"group_message_history_enable": true}}
 	sOn := testProcessStageWithConfig(t, cfgOn)
 	var names []string
-	for _, tool := range sOn.collectTools("none") {
+	for _, tool := range sOn.collectTools("none", "g:1") {
 		fn, _ := tool["function"].(map[string]interface{})
 		if n, _ := fn["name"].(string); n != "" {
 			names = append(names, n)
@@ -422,7 +422,7 @@ func TestSendAndGroupAndKBInjection(t *testing.T) {
 	// kb agentic mode.
 	cfgKB := map[string]interface{}{"kb_agentic_mode": true}
 	sKB := testProcessStageWithConfig(t, cfgKB)
-	for _, tool := range sKB.collectTools("none") {
+	for _, tool := range sKB.collectTools("none", "g:1") {
 		fn, _ := tool["function"].(map[string]interface{})
 		if fn["name"] == "astr_kb_search" {
 			goto ok
@@ -432,7 +432,7 @@ func TestSendAndGroupAndKBInjection(t *testing.T) {
 ok:
 	// not injected when kb_agentic_mode false.
 	sNo := testProcessStageWithConfig(t, map[string]interface{}{})
-	for _, tool := range sNo.collectTools("none") {
+	for _, tool := range sNo.collectTools("none", "g:1") {
 		fn, _ := tool["function"].(map[string]interface{})
 		if fn["name"] == "astr_kb_search" {
 			t.Fatal("kb search should not inject when agentic mode off")

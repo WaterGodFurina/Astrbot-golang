@@ -37,7 +37,7 @@ func TestLightAndParamToolSchemas(t *testing.T) {
 		},
 	})
 	// Full tools include get_current_time + transfer_to_translator.
-	full := s.collectTools("none")
+	full := s.collectTools("none", "g:1")
 	if len(full) == 0 {
 		t.Fatal("no full tools")
 	}
@@ -54,7 +54,7 @@ func TestLightAndParamToolSchemas(t *testing.T) {
 	fullNames := names(full)
 
 	// Light tools: same names, but empty parameters.
-	light := s.collectLightTools("none")
+	light := s.collectLightTools("none", "g:1")
 	lightNames := names(light)
 	if len(lightNames) != len(fullNames) {
 		t.Fatalf("light tools %v != full tools %v", lightNames, fullNames)
@@ -72,7 +72,7 @@ func TestLightAndParamToolSchemas(t *testing.T) {
 	}
 
 	// Param-only subset: only requested tools, full parameters preserved.
-	param := s.collectParamToolsFor("none", []string{"get_current_time"})
+	param := s.collectParamToolsFor("none", "g:1", []string{"get_current_time"})
 	if len(param) != 1 {
 		t.Fatalf("expected 1 param tool, got %d", len(param))
 	}
@@ -112,7 +112,7 @@ func TestCollectLightToolsDoesNotPolluteMCPCache(t *testing.T) {
 	}
 	s.mcpMu.Unlock()
 
-	light := s.collectLightTools("none")
+	light := s.collectLightTools("none", "g:1")
 	var found bool
 	for _, tool := range light {
 		fn, _ := tool["function"].(map[string]interface{})

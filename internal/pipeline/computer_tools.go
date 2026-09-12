@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -137,6 +138,44 @@ func (s *ProcessStage) stageFileIntoSandbox(ctx context.Context, sessionID, host
 		return ""
 	}
 	return dst
+}
+
+// sandboxNeoBackend reports whether the sandbox booter config targets shipyard_neo (the only backend with browser/neo-skill APIs). Mirrors py _SHIPYARD_NEO_TOOL_CONFIG matching.
+func sandboxNeoBackend(config map[string]interface{}) bool {
+	ps, _ := config["provider_settings"].(map[string]interface{})
+	sb, _ := ps["sandbox"].(map[string]interface{})
+	bt, _ := sb["booter"].(string)
+	bt = strings.ToLower(strings.TrimSpace(bt))
+	return bt == "" || bt == "shipyard_neo"
+}
+
+// neoToolAvailability decides browser/neo tool exposure (py astr_main_agent conservative rule: capabilities unknown → register browser; shipyard_neo always registers neo lifecycle tools).
+func (s *ProcessStage) neoToolAvailability(umo string) (browser, neo bool) {
+	if s.sandboxMgr == nil || !sandboxNeoBackend(s.config) {
+		return false, false
+	}
+	caps := s.sandboxMgr.SessionCapsNow(umo)
+	if caps == nil {
+		return true, true
+	}
+	for _, c := range caps {
+		if c == "browser" {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+// computerAdminDenied mirrors Python check_admin_permission for computer-use tools: with provider_settings.computer_use_require_admin (default true) only admins may execute them.
+func (s *ProcessStage) computerAdminDenied(event *core.Event, operation string) string {
+	requireAdmin := true
+	if s.providerConf != nil && s.providerConf.ComputerUseRequireAdmin != nil {
+		requireAdmin = *s.providerConf.ComputerUseRequireAdmin
+	}
+	if !requireAdmin || event.Role == "admin" {
+		return ""
+	}
+	return "error: Permission denied. " + operation + " is only allowed for admin users. Tell user to set admins in `AstrBot WebUI -> Config -> General Config` by adding their user ID to the admins list if they need this feature. User's ID is: " + event.GetSenderID() + ". User's ID can be found by using /sid command."
 }
 
 // sandboxUploadFile transfers a file FROM the host machine INTO the sandbox
@@ -471,19 +510,19 @@ func sandboxModePrompt() string {
 }
 
 // collectSandboxTools builds the OpenAI tool schemas for the sandbox runtime.
-func collectSandboxTools() []map[string]interface{} {
-	return collectComputerTools(true)
+func collectSandboxTools(browser, neo bool) []map[string]interface{} {
+	return collectComputerTools(true, browser, neo)
 }
 
 // collectLocalTools builds the OpenAI tool schemas for the local runtime.
 func collectLocalTools() []map[string]interface{} {
-	return collectComputerTools(false)
+	return collectComputerTools(false, false, false)
 }
 
 // collectComputerTools builds the computer-use tool schemas. 沙盒与本地运行时
 // 使用同一组工具但语义不同：沙盒内 shell/python 在隔离容器 /workspace 执行、
 // 且容器有网络可 curl 下载；本地运行时的描述则强调直接操作宿主机需谨慎。
-func collectComputerTools(sandbox bool) []map[string]interface{} {
+func collectComputerTools(sandbox, browser, neo bool) []map[string]interface{} {
 	shellDesc := "The shell command to execute in the current runtime shell (for example, powershell.exe on Windows). Equivalent to `cd {working_dir} && {command}` where {working_dir} is the conversation workspace. Prefer relative paths. 注意：该命令直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。当用户发送或引用了文件消息（上下文里显示为 [File Attachment ...]）时，请先使用 astrbot_upload_file 把文件上传到工作区再处理，而不是自行猜测文件路径。"
 	pythonDesc := "Execute codes in a Python environment. Current OS: " + runtime.GOOS + ". Use system-compatible commands. 注意：该代码直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。"
 	uploadDesc := "Transfer a file FROM the host machine INTO the current runtime so that code can access it. Use this when the user sends/attaches a file and you need to process it. The local_path must point to an existing file on the host filesystem (e.g. a [File Attachment: ...] path shown in the context)."
@@ -708,7 +747,170 @@ func collectComputerTools(sandbox bool) []map[string]interface{} {
 			},
 		},
 	}
+	schemas = append(schemas, browserToolSchemas(browser)...)
+	schemas = append(schemas, neoSkillToolSchemas(neo)...)
 	return schemas
+}
+
+// browserToolSchemas builds the 3 browser automation tool schemas (py shipyard_neo/browser.py), exposed only when the sandbox profile advertises the browser capability (conservatively exposed when capabilities are not yet known).
+func browserToolSchemas(browser bool) []map[string]interface{} {
+	if !browser {
+		return nil
+	}
+	str := func(desc string) map[string]interface{} {
+		return map[string]interface{}{"type": "string", "description": desc}
+	}
+	boolp := func(desc string) map[string]interface{} {
+		return map[string]interface{}{"type": "boolean", "description": desc}
+	}
+	intp := func(desc string) map[string]interface{} {
+		return map[string]interface{}{"type": "integer", "description": desc}
+	}
+	common := map[string]interface{}{
+		"description":   str("Optional execution description."),
+		"tags":          str("Optional tags."),
+		"learn":         boolp("Whether to mark execution as learn evidence."),
+		"include_trace": boolp("Whether to include trace_ref in response."),
+	}
+	wrap := func(name, desc string, props map[string]interface{}, required []string) map[string]interface{} {
+		p := map[string]interface{}{}
+		for k, v := range props {
+			p[k] = v
+		}
+		for k, v := range common {
+			p[k] = v
+		}
+		req := make([]interface{}, 0, len(required))
+		for _, r := range required {
+			req = append(req, r)
+		}
+		return map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":        name,
+				"description": desc,
+				"parameters": map[string]interface{}{
+					"type":       "object",
+					"properties": p,
+					"required":   req,
+				},
+			},
+		}
+	}
+	return []map[string]interface{}{
+		wrap("astrbot_execute_browser", "Execute one browser automation command in the sandbox.", map[string]interface{}{
+			"cmd":     str("Browser command to execute."),
+			"timeout": intp("Execution timeout in seconds (1-300, default 30)."),
+		}, []string{"cmd"}),
+		wrap("astrbot_execute_browser_batch", "Execute a browser command batch in the sandbox.", map[string]interface{}{
+			"commands": map[string]interface{}{
+				"type":        "array",
+				"items":       map[string]interface{}{"type": "string"},
+				"description": "Ordered browser commands.",
+			},
+			"timeout":       intp("Overall timeout in seconds for all commands (default 60)."),
+			"stop_on_error": boolp("Whether to stop on first failure (default true)."),
+		}, []string{"commands"}),
+		wrap("astrbot_run_browser_skill", "Run a released browser skill in the sandbox by skill_key.", map[string]interface{}{
+			"skill_key":     str("Released browser skill key."),
+			"timeout":       intp("Overall timeout in seconds (default 60)."),
+			"stop_on_error": boolp("Whether to stop on first failure (default true)."),
+		}, []string{"skill_key"}),
+	}
+}
+
+// neoSkillToolSchemas builds the 11 Neo skill lifecycle tool schemas (py shipyard_neo/neo_skills.py), exposed only for the shipyard_neo sandbox backend.
+func neoSkillToolSchemas(neo bool) []map[string]interface{} {
+	if !neo {
+		return nil
+	}
+	wrap := func(name, desc string, props map[string]interface{}, required []string) map[string]interface{} {
+		req := make([]interface{}, 0, len(required))
+		for _, r := range required {
+			req = append(req, r)
+		}
+		return map[string]interface{}{
+			"type": "function",
+			"function": map[string]interface{}{
+				"name": name, "description": desc,
+				"parameters": map[string]interface{}{"type": "object", "properties": props, "required": req},
+			},
+		}
+	}
+	str := func(d string) map[string]interface{} {
+		return map[string]interface{}{"type": "string", "description": d}
+	}
+	num := func(d string) map[string]interface{} {
+		return map[string]interface{}{"type": "number", "description": d}
+	}
+	bl := func(d string) map[string]interface{} {
+		return map[string]interface{}{"type": "boolean", "description": d}
+	}
+	obj := func(d string) map[string]interface{} {
+		return map[string]interface{}{"type": "object", "description": d}
+	}
+	return []map[string]interface{}{
+		wrap("astrbot_get_execution_history", "List sandbox execution history records (browser/shell runs) for this session.", map[string]interface{}{
+			"exec_type": str("Filter by execution type (e.g. browser)."),
+			"limit":     map[string]interface{}{"type": "integer", "description": "Page size (default 20)."},
+			"offset":    map[string]interface{}{"type": "integer", "description": "Page offset."},
+			"tags":      str("Filter by tags."),
+		}, []string{}),
+		wrap("astrbot_annotate_execution", "Annotate one execution history record (description/tags/notes) so later skill mining can use it.", map[string]interface{}{
+			"execution_id": str("Execution id from get_execution_history."),
+			"description":  str("Optional description."),
+			"tags":         str("Optional tags."),
+			"notes":        str("Optional notes."),
+		}, []string{"execution_id"}),
+		wrap("astrbot_create_skill_payload", "Store canonical skill payload (JSON with skill_markdown etc.) and return payload_ref.", map[string]interface{}{
+			"payload": obj("The payload object to store."),
+			"kind":    str("Payload kind (default 'skill')."),
+		}, []string{"payload"}),
+		wrap("astrbot_get_skill_payload", "Fetch a stored skill payload by payload_ref.", map[string]interface{}{
+			"payload_ref": str("Payload reference returned by create_skill_payload."),
+		}, []string{"payload_ref"}),
+		wrap("astrbot_create_skill_candidate", "Create a Neo skill candidate from payload + source execution ids.", map[string]interface{}{
+			"skill_key":            str("Stable skill key."),
+			"payload_ref":          str("Optional payload reference."),
+			"source_execution_ids": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}, "description": "Evidence execution ids."},
+			"scenario_key":         str("Optional scenario key."),
+			"summary":              str("Optional candidate summary."),
+			"usage_notes":          str("Optional usage notes."),
+		}, []string{"skill_key"}),
+		wrap("astrbot_list_skill_candidates", "List Neo skill candidates (filter by status/skill_key).", map[string]interface{}{
+			"status":    str("Filter by status (proposed/evaluating/released/rejected)."),
+			"skill_key": str("Filter by skill key."),
+			"limit":     map[string]interface{}{"type": "integer", "description": "Page size (default 20)."},
+			"offset":    map[string]interface{}{"type": "integer", "description": "Page offset."},
+		}, []string{}),
+		wrap("astrbot_evaluate_skill_candidate", "Record an evaluation result (passed/score/report) for a candidate.", map[string]interface{}{
+			"candidate_id": str("Candidate id."),
+			"passed":       bl("Whether the evaluation passed."),
+			"score":        num("Optional numeric score."),
+			"benchmark_id": str("Optional benchmark id."),
+			"report":       str("Optional evaluation report."),
+		}, []string{"candidate_id", "passed"}),
+		wrap("astrbot_promote_skill_candidate", "Promote a candidate to a release (stage canary/stable). For stable set sync_to_local=true to sync SKILL.md.", map[string]interface{}{
+			"candidate_id":  str("Candidate id."),
+			"stage":         str("Release stage: canary or stable (default stable)."),
+			"sync_to_local": bl("Also sync payload skill_markdown into the local skills directory (stable)."),
+		}, []string{"candidate_id"}),
+		wrap("astrbot_list_skill_releases", "List Neo skill releases (filter by skill_key/stage; active_only skips rolled-back).", map[string]interface{}{
+			"skill_key":   str("Filter by skill key."),
+			"stage":       str("Filter by stage (canary/stable)."),
+			"active_only": bl("Only active releases (default true)."),
+			"limit":       map[string]interface{}{"type": "integer", "description": "Page size (default 20)."},
+			"offset":      map[string]interface{}{"type": "integer", "description": "Page offset."},
+		}, []string{}),
+		wrap("astrbot_rollback_skill_release", "Roll back an active skill release.", map[string]interface{}{
+			"release_id": str("Release id."),
+		}, []string{"release_id"}),
+		wrap("astrbot_sync_skill_release", "Re-sync a release to the local skill workspace (by release_id or skill_key; require_stable gates to stable stage).", map[string]interface{}{
+			"release_id":     str("Release id (preferred)."),
+			"skill_key":      str("Skill key when release_id is absent."),
+			"require_stable": bl("Only sync stable-stage releases (default false)."),
+		}, []string{}),
+	}
 }
 
 // --- local tool executors ---
@@ -1348,4 +1550,232 @@ func executeGrep(pattern, path, glob string, resultLimit int, umo string) string
 		return "No matches found."
 	}
 	return strings.Join(matches, "\n")
+}
+
+// argStringOpt returns (value, present) for an optional string arg.
+func argStringOpt(args map[string]interface{}, key string) (string, bool) {
+	v, ok := args[key]
+	if !ok {
+		return "", false
+	}
+	switch t := v.(type) {
+	case string:
+		return t, t != ""
+	case nil:
+		return "", false
+	default:
+		return fmt.Sprint(t), true
+	}
+}
+
+func jsonOrError(data map[string]interface{}, err error) string {
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	b, jerr := json.Marshal(data)
+	if jerr != nil {
+		return fmt.Sprint(data)
+	}
+	return string(b)
+}
+
+func jsonTextOrError(text string, err error) string {
+	if err != nil {
+		return "Error: " + err.Error()
+	}
+	return text
+}
+
+// browserBody builds the Bay browser exec request body (SDK _BrowserExecRequest semantics: omit empty optional strings, always send learn/include_trace/timeout).
+func browserBody(args map[string]interface{}, defaults map[string]interface{}) map[string]interface{} {
+	body := map[string]interface{}{}
+	for k, def := range defaults {
+		body[k] = def
+	}
+	for _, k := range []string{"cmd", "description", "tags"} {
+		if v, ok := argStringOpt(args, k); ok {
+			body[k] = v
+		}
+	}
+	if v, ok := args["timeout"]; ok {
+		body["timeout"] = v
+	} else {
+		body["timeout"] = defaults["timeout"]
+	}
+	for _, k := range []string{"learn", "include_trace", "stop_on_error"} {
+		if v, ok := args[k].(bool); ok {
+			body[k] = v
+		} else if _, exists := defaults[k]; !exists {
+			body[k] = false
+		}
+	}
+	if raw, ok := args["commands"].([]interface{}); ok {
+		cmds := make([]string, 0, len(raw))
+		for _, r := range raw {
+			if cmds2, ok := r.(string); ok && strings.TrimSpace(cmds2) != "" {
+				cmds = append(cmds, cmds2)
+			}
+		}
+		body["commands"] = cmds
+	}
+	return body
+}
+
+// executeNeoLifecycleTool dispatches the 11 Neo skill lifecycle tools: payload/candidate/release go through the host NeoStore (same instance the dashboard API uses), execution history/annotate go through the session's Bay sandbox.
+func (s *ProcessStage) executeNeoLifecycleTool(ctx context.Context, sessionID, name string, args map[string]interface{}) string {
+	switch name {
+	case "astrbot_execute_browser":
+		data, err := s.sandboxMgr.BrowserExec(ctx, sessionID, browserBody(args, map[string]interface{}{"timeout": 30, "learn": false, "include_trace": false}), argInt(args, "timeout", 30))
+		return browserResult("browser command", data, err)
+	case "astrbot_execute_browser_batch":
+		data, err := s.sandboxMgr.BrowserExecBatch(ctx, sessionID, browserBody(args, map[string]interface{}{"timeout": 60, "stop_on_error": true, "learn": false, "include_trace": false}))
+		return browserResult("browser batch", data, err)
+	case "astrbot_run_browser_skill":
+		key := argString(args, "skill_key")
+		if strings.TrimSpace(key) == "" {
+			return "Error running browser skill: `skill_key` is required."
+		}
+		data, err := s.sandboxMgr.BrowserRunSkill(ctx, sessionID, key, browserBody(args, map[string]interface{}{"timeout": 60, "stop_on_error": true, "include_trace": false}))
+		return browserResult("browser skill", data, err)
+	case "astrbot_get_execution_history":
+		params := map[string]string{}
+		for _, k := range []string{"exec_type", "tags"} {
+			if v, ok := argStringOpt(args, k); ok {
+				params[k] = v
+			}
+		}
+		if v := argInt(args, "limit", 0); v > 0 {
+			params["limit"] = strconv.Itoa(v)
+		}
+		if v := argInt(args, "offset", 0); v > 0 {
+			params["offset"] = strconv.Itoa(v)
+		}
+		data, err := s.sandboxMgr.GetExecutionHistory(ctx, sessionID, params)
+		return jsonTextOrError(data, err)
+	case "astrbot_annotate_execution":
+		eid := argString(args, "execution_id")
+		if strings.TrimSpace(eid) == "" {
+			return "Error: `execution_id` is required."
+		}
+		body := map[string]interface{}{}
+		for _, k := range []string{"description", "tags", "notes"} {
+			if v, ok := argStringOpt(args, k); ok {
+				body[k] = v
+			}
+		}
+		if len(body) == 0 {
+			return "Error: provide at least one of description/tags/notes."
+		}
+		data, err := s.sandboxMgr.AnnotateExecution(ctx, sessionID, eid, body)
+		return jsonTextOrError(data, err)
+	}
+	// Host-side lifecycle (payload/candidate/release) — needs the shared NeoStore.
+	if s.neoStore == nil {
+		return "Error: Neo skill lifecycle store is not initialized."
+	}
+	switch name {
+	case "astrbot_create_skill_payload":
+		data, err := s.neoStore.PutPayload(args["payload"], argString(args, "kind"))
+		return jsonOrError(data, err)
+	case "astrbot_get_skill_payload":
+		data, err := s.neoStore.GetPayload(argString(args, "payload_ref"))
+		return jsonOrError(data, err)
+	case "astrbot_create_skill_candidate":
+		ids := []string{}
+		if raw, ok := args["source_execution_ids"].([]interface{}); ok {
+			for _, r := range raw {
+				if sv, ok := r.(string); ok {
+					ids = append(ids, sv)
+				}
+			}
+		}
+		c, err := s.neoStore.AddCandidate(argString(args, "skill_key"), ids, argString(args, "scenario_key"), argString(args, "payload_ref"), argString(args, "summary"), argString(args, "usage_notes"))
+		if err != nil {
+			return "Error: " + err.Error()
+		}
+		b, jerr := json.Marshal(c)
+		if jerr != nil {
+			return fmt.Sprint(c)
+		}
+		return string(b)
+	case "astrbot_list_skill_candidates":
+		return marshalable(s.neoStore.ListCandidates(argString(args, "status"), argString(args, "skill_key"), argInt(args, "limit", 20), argInt(args, "offset", 0)))
+	case "astrbot_evaluate_skill_candidate":
+		var score *float64
+		if f, ok := args["score"].(float64); ok {
+			score = &f
+		}
+		data, err := s.neoStore.EvaluateCandidate(argString(args, "candidate_id"), argBool(args, "passed"), score, argString(args, "benchmark_id"), argString(args, "report"))
+		return jsonOrError(data, err)
+	case "astrbot_promote_skill_candidate":
+		data, err := s.neoStore.PromoteCandidate(argString(args, "candidate_id"), argString(args, "stage"), argBool(args, "sync_to_local"))
+		return jsonOrError(data, err)
+	case "astrbot_list_skill_releases":
+		activeOnly := true
+		if v, ok := args["active_only"].(bool); ok {
+			activeOnly = v
+		}
+		return marshalable(s.neoStore.ListReleases(argString(args, "skill_key"), argString(args, "stage"), activeOnly, argInt(args, "limit", 20), argInt(args, "offset", 0)))
+	case "astrbot_rollback_skill_release":
+		r, err := s.neoStore.RollbackRelease(argString(args, "release_id"))
+		if err != nil {
+			return "Error: " + err.Error()
+		}
+		b, _ := json.Marshal(r)
+		return string(b)
+	case "astrbot_sync_skill_release":
+		data, err := s.neoStore.SyncRelease(argString(args, "release_id"), argString(args, "skill_key"), argBool(args, "require_stable"))
+		return jsonOrError(data, err)
+	}
+	return "Error: unknown neo skill tool " + name
+}
+
+func marshalable(v map[string]interface{}) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprint(v)
+	}
+	return string(b)
+}
+
+func browserResult(kind, data string, err error) string {
+	if err != nil {
+		return "Error executing " + kind + ": " + err.Error()
+	}
+	return data
+}
+
+// neoLifecycleToolSet marks tools dispatched through executeNeoLifecycleTool (host NeoStore + Bay history).
+var neoLifecycleToolSet = map[string]bool{
+	"astrbot_execute_browser": true, "astrbot_execute_browser_batch": true, "astrbot_run_browser_skill": true,
+	"astrbot_get_execution_history": true, "astrbot_annotate_execution": true,
+	"astrbot_create_skill_payload": true, "astrbot_get_skill_payload": true,
+	"astrbot_create_skill_candidate": true, "astrbot_list_skill_candidates": true,
+	"astrbot_evaluate_skill_candidate": true, "astrbot_promote_skill_candidate": true,
+	"astrbot_list_skill_releases": true, "astrbot_rollback_skill_release": true, "astrbot_sync_skill_release": true,
+}
+
+// neoLifecycleHostSet: Bay-independent skill lifecycle tools (host NeoStore only).
+var neoLifecycleHostSet = map[string]bool{
+	"astrbot_create_skill_payload": true, "astrbot_get_skill_payload": true,
+	"astrbot_create_skill_candidate": true, "astrbot_list_skill_candidates": true,
+	"astrbot_evaluate_skill_candidate": true, "astrbot_promote_skill_candidate": true,
+	"astrbot_list_skill_releases": true, "astrbot_rollback_skill_release": true, "astrbot_sync_skill_release": true,
+}
+
+// neoModePrompt mirrors Python's shipyard_neo-only system prompt blocks: workspace-relative path rule + the skill lifecycle workflow guidance.
+func neoModePrompt() string {
+	return "[Shipyard Neo File Path Rule]\n" +
+		"When using sandbox filesystem tools (upload/download/read/write/list/delete), " +
+		"always pass paths relative to the sandbox workspace root. " +
+		"Example: use `baidu_homepage.png` instead of `/workspace/baidu_homepage.png`.\n\n" +
+		"[Neo Skill Lifecycle Workflow]\n" +
+		"When user asks to create/update a reusable skill in Neo mode, use lifecycle tools instead of directly writing local skill folders.\n" +
+		"Preferred sequence:\n" +
+		"1) Use `astrbot_create_skill_payload` to store canonical payload content and get `payload_ref`.\n" +
+		"2) Use `astrbot_create_skill_candidate` with `skill_key` + `source_execution_ids` (and optional `payload_ref`) to create a candidate.\n" +
+		"3) Use `astrbot_promote_skill_candidate` to release: `stage=canary` for trial; `stage=stable` for production.\n" +
+		"For stable release, set `sync_to_local=true` to sync `payload.skill_markdown` into local `SKILL.md`.\n" +
+		"Do not treat ad-hoc generated files as reusable Neo skills unless they are captured via payload/candidate/release.\n" +
+		"To update an existing skill, create a new payload/candidate and promote a new release version; avoid patching old local folders directly.\n"
 }

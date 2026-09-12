@@ -71,7 +71,8 @@ func (m *Manager) PushHostSkills(ctx context.Context, sessionID string) error {
 		return err
 	}
 	if sb.booter == nil || !sb.booter.IsRunning() {
-		return fmt.Errorf("sandbox not running")
+		m.dropSession(sessionID, sb) // race 兜底：确保下一轮 EnsureSession 立即重建。
+		return fmt.Errorf("sandbox not running (will auto-recreate)")
 	}
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
@@ -833,6 +834,93 @@ type sessionBooter struct {
 	booter Booter
 }
 
+// BrowserCapable is implemented by booters whose backend exposes browser automation + execution-history APIs (shipyard_neo). Manager routes the computer-use browser/skill tools through it.
+type BrowserCapable interface {
+	Capabilities() []string
+	BrowserExec(ctx context.Context, body map[string]interface{}, timeoutSec int) (string, error)
+	BrowserExecBatch(ctx context.Context, body map[string]interface{}) (string, error)
+	BrowserRunSkill(ctx context.Context, skillKey string, body map[string]interface{}) (string, error)
+	GetExecutionHistory(ctx context.Context, params map[string]string) (string, error)
+	GetExecution(ctx context.Context, executionID string) (string, error)
+	AnnotateExecution(ctx context.Context, executionID string, body map[string]interface{}) (string, error)
+}
+
+// routeBrowser returns the session's BrowserCapable booter (dead sessions are dropped for auto-rebuild on next use).
+func (m *Manager) routeBrowser(ctx context.Context, sessionID string) (BrowserCapable, error) {
+	sb, err := m.EnsureSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	bc, ok := sb.booter.(BrowserCapable)
+	if !ok {
+		return nil, fmt.Errorf("current sandbox backend does not support browser/neo skill APIs (requires shipyard_neo)")
+	}
+	return bc, nil
+}
+
+// SessionCaps reports the session sandbox's capability list ([] when the backend is not capability-aware).
+func (m *Manager) SessionCaps(ctx context.Context, sessionID string) []string {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return nil
+	}
+	return bc.Capabilities()
+}
+
+// BrowserExec runs a single browser automation command in the session sandbox.
+func (m *Manager) BrowserExec(ctx context.Context, sessionID string, body map[string]interface{}, timeoutSec int) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.BrowserExec(ctx, body, timeoutSec)
+}
+
+// BrowserExecBatch runs ordered browser commands in one round-trip.
+func (m *Manager) BrowserExecBatch(ctx context.Context, sessionID string, body map[string]interface{}) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.BrowserExecBatch(ctx, body)
+}
+
+// BrowserRunSkill replays a released browser skill in the session sandbox.
+func (m *Manager) BrowserRunSkill(ctx context.Context, sessionID, skillKey string, body map[string]interface{}) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.BrowserRunSkill(ctx, skillKey, body)
+}
+
+// GetExecutionHistory lists sandbox execution records for the session.
+func (m *Manager) GetExecutionHistory(ctx context.Context, sessionID string, params map[string]string) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.GetExecutionHistory(ctx, params)
+}
+
+// GetExecution reads one execution record by id.
+func (m *Manager) GetExecution(ctx context.Context, sessionID, executionID string) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.GetExecution(ctx, executionID)
+}
+
+// AnnotateExecution patches one execution record.
+func (m *Manager) AnnotateExecution(ctx context.Context, sessionID, executionID string, body map[string]interface{}) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.AnnotateExecution(ctx, executionID, body)
+}
+
 // Manager manages per-session sandbox booters, mirroring astrbot-py's
 // computer_client.session_booter map: each session (group / private chat) gets
 // its own sandbox (at most one), reused across that session's tool calls. A
@@ -895,10 +983,7 @@ func (m *Manager) SetBooterFactory(fn func() Booter) {
 	}
 }
 
-// EnsureSession returns the session's sandbox booter, creating + booting a new
-// one on first use (mirrors Python get_booter). 宿主不做主动健康检测——沙盒总部
-// （Bay）自行管理沙盒生命周期；若上一次操作已把该会话沙盒标记失效
-// （markDeadIfNeeded 命中 "Sandbox not found"），这里直接拉取一个全新沙盒。
+// EnsureSession returns the session's sandbox booter, creating + booting a new one on first use (mirrors Python get_booter). 宿主不做主动健康检测——沙盒总部（Bay）自行管理沙盒生命周期；若上一次操作已把该会话沙盒标记失效（markDeadIfNeeded 命中 "Sandbox not found"），这里停掉旧 booter 并原地重建（对齐 py get_booter 的 available()→shutdown→reboot 语义）。
 func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*sessionBooter, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return nil, fmt.Errorf("sandbox session id is empty")
@@ -907,7 +992,14 @@ func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*session
 	sb := m.sessions[sessionID]
 	m.mu.RUnlock()
 	if sb != nil {
-		return sb, nil
+		if sb.booter != nil && sb.booter.IsRunning() {
+			return sb, nil
+		}
+		// 死沙盒：先停旧（回收 Bay/容器残留），再丢弃条目进入下方重建。
+		if sb.booter != nil {
+			_ = sb.booter.Stop()
+		}
+		m.dropSession(sessionID, sb)
 	}
 	m.mu.RLock()
 	factory := m.factory
@@ -929,12 +1021,64 @@ func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*session
 	}
 	m.sessions[sessionID] = sb
 	m.mu.Unlock()
-	if m.skillMgr != nil {
-		if entries, err := b.ListSkills(ctx); err == nil {
+	// boot/rebuild 后同步一次技能（对齐 py get_booter 的 boot→_sync_skills_to_sandbox 时机）；后续轮次不再重推，技能变更走 SyncSkillsToActiveSessions。
+	m.syncSessionSkills(ctx, sb)
+	return sb, nil
+}
+
+// syncSessionSkills 推送宿主 active 技能进沙盒并回扫刷新缓存（py _sync_skills_to_sandbox 语义）。/workspace/skills 由 volume 挂载，容器刚就绪时可能尚未挂好（首次扫描 0 技能），带短重试窗口；任何失败只告警，不阻塞会话使用。
+func (m *Manager) syncSessionSkills(ctx context.Context, sb *sessionBooter) {
+	if sb == nil || sb.booter == nil {
+		return
+	}
+	if hostSkillsProvider != nil && sb.booter.IsRunning() {
+		sb.mu.Lock()
+		if err := pushHostSkillsLocked(ctx, sb.booter, hostSkillsProvider(true)); err != nil {
+			logger.Warn("推送宿主技能到沙盒失败: %v", err)
+		}
+		sb.mu.Unlock()
+	}
+	if m.skillMgr == nil {
+		return
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		sb.mu.Lock()
+		entries, err := sb.booter.ListSkills(ctx)
+		sb.mu.Unlock()
+		if err == nil && len(entries) > 0 {
 			m.skillMgr.SetSandboxSkillsCache(entries)
+			return
+		}
+		if err == nil && attempt == 4 {
+			m.skillMgr.SetSandboxSkillsCache(entries)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
 		}
 	}
-	return sb, nil
+}
+
+// SyncSkillsToActiveSessions 对全部运行中的会话沙盒重推宿主技能并刷新缓存（对齐 py sync_skills_to_active_sandboxes）：WebUI 技能增删改/插件装卸后调用，best-effort。
+func (m *Manager) SyncSkillsToActiveSessions(ctx context.Context) {
+	m.mu.RLock()
+	sessions := make(map[string]*sessionBooter, len(m.sessions))
+	for id, sb := range m.sessions {
+		sessions[id] = sb
+	}
+	m.mu.RUnlock()
+	if len(sessions) == 0 {
+		return
+	}
+	logger.Debug("同步技能到 %d 个活跃沙盒", len(sessions))
+	for _, sb := range sessions {
+		if sb == nil || sb.booter == nil || !sb.booter.IsRunning() {
+			continue
+		}
+		m.syncSessionSkills(ctx, sb)
+	}
 }
 
 // Start boots the sandbox for a session (lazily creates it if absent).
@@ -979,7 +1123,8 @@ func (m *Manager) SyncSkills(ctx context.Context, sessionID string) error {
 		return err
 	}
 	if sb.booter == nil || !sb.booter.IsRunning() {
-		return fmt.Errorf("sandbox not running")
+		m.dropSession(sessionID, sb) // race 兜底：确保下一轮 EnsureSession 立即重建。
+		return fmt.Errorf("sandbox not running (will auto-recreate)")
 	}
 	entries, err := sb.booter.ListSkills(ctx)
 	if err != nil {
@@ -1078,4 +1223,27 @@ func (m *Manager) SessionCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.sessions)
+}
+
+// SupportsNeoAPIs reports whether the session's sandbox backend exposes browser + neo-skill lifecycle APIs (shipyard_neo only).
+func (m *Manager) SupportsNeoAPIs(ctx context.Context, sessionID string) bool {
+	_, err := m.routeBrowser(ctx, sessionID)
+	return err == nil
+}
+
+// SessionCapsNow reports an already-booted session's sandbox capabilities WITHOUT creating/booting it (nil when absent or backend-unaware), mirroring Python reading session_booter.get(session_id).capabilities.
+func (m *Manager) SessionCapsNow(sessionID string) []string {
+	m.mu.RLock()
+	sb := m.sessions[sessionID]
+	m.mu.RUnlock()
+	if sb == nil || sb.booter == nil {
+		return nil
+	}
+	if !sb.booter.IsRunning() {
+		return nil
+	}
+	if bc, ok := sb.booter.(BrowserCapable); ok {
+		return bc.Capabilities()
+	}
+	return []string{}
 }

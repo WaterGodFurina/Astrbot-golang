@@ -86,6 +86,8 @@ type PipelineContext struct {
 	SkillManager *skills.SkillManager
 	// SandboxManager routes computer-use tools when the sandbox runtime is active. Optional.
 	SandboxManager *sandbox.Manager
+	// NeoStore is the host-side Neo skill lifecycle store shared with the dashboard (optional).
+	NeoStore *skills.NeoStore
 	// CronManager schedules future tasks (future_task tool). Optional.
 	CronManager *cron.CronJobManager
 	// Database records platform messages / provider calls for statistics. Optional.
@@ -880,6 +882,7 @@ type ProcessStage struct {
 	skillMgr      *skills.SkillManager
 	platformMgr   *platform.PlatformManager
 	sandboxMgr    *sandbox.Manager
+	neoStore      *skills.NeoStore
 	cronMgr       *cron.CronJobManager
 	database      *db.Database
 	providerConf  *ProviderSettings
@@ -947,6 +950,7 @@ func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.skillMgr = ctx.SkillManager
 	s.platformMgr = ctx.PlatformMgr
 	s.sandboxMgr = ctx.SandboxManager
+	s.neoStore = ctx.NeoStore
 	s.cronMgr = ctx.CronManager
 	s.database = ctx.Database
 	s.subPlugins = ctx.SubPlugins
@@ -1591,9 +1595,9 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 
 	// Inject active tools (built-in + MCP servers) so the model can call them. skills_like mode sends light schemas (name/description only) to save tokens; arguments are re-queried once a tool is selected.
 	if s.toolSchemaMode == "skills_like" {
-		req.Tools = s.collectLightTools(ar.computerUseRuntime)
+		req.Tools = s.collectLightTools(ar.computerUseRuntime, event.UnifiedMsgOrigin())
 	} else {
-		req.Tools = s.collectTools(ar.computerUseRuntime)
+		req.Tools = s.collectTools(ar.computerUseRuntime, event.UnifiedMsgOrigin())
 	}
 	toolNames := make([]string, 0, len(req.Tools))
 	for _, t := range req.Tools {
@@ -1611,6 +1615,9 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 		req.SystemPrompt += "\n" + localModePrompt(workspaceRoot(event.UnifiedMsgOrigin())) + "\n"
 	case "sandbox":
 		req.SystemPrompt += "\n" + sandboxModePrompt() + "\n"
+		if _, neoOK := s.neoToolAvailability(event.UnifiedMsgOrigin()); neoOK {
+			req.SystemPrompt += "\n" + neoModePrompt() + "\n"
+		}
 	}
 
 	// Streaming is only supported for providers that implement ChatProvider; the OpenAI-compatible path covers most backends.
@@ -1780,7 +1787,7 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 	s.recordProviderCall(ar.providerCfg, event.UnifiedMsgOrigin(), resp)
 	// skills_like: the main request carried no tool parameters. When the model chose tools, re-query once with the chosen tools' full parameter schemas (minimal context) so the LLM produces proper arguments.
 	if s.toolSchemaMode == "skills_like" && len(resp.ToolsCallName) > 0 {
-		if requery, ok := s.requeryToolArgs(llmCtx, ar.chatInst, req, resp, ar.computerUseRuntime); ok {
+		if requery, ok := s.requeryToolArgs(llmCtx, ar.chatInst, req, resp, ar.computerUseRuntime, event.UnifiedMsgOrigin()); ok {
 			resp = requery
 		}
 	}
@@ -2631,7 +2638,7 @@ func (s *ProcessStage) dispatchPluginTool(inst *plugin.PluginInstance, t *sdkv1.
 }
 
 // collectTools builds the OpenAI tool schema for all active tools (built-in tools + enabled MCP servers + Computer Use local tools).
-func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]interface{} {
+func (s *ProcessStage) collectTools(computerUseRuntime, umo string) []map[string]interface{} {
 	tools := []map[string]interface{}{}
 
 	// Built-in tools with real Go executors
@@ -2641,7 +2648,8 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 	if computerUseRuntime == "local" {
 		tools = append(tools, collectLocalTools()...)
 	} else if computerUseRuntime == "sandbox" {
-		tools = append(tools, collectSandboxTools()...)
+		browserOK, neoOK := s.neoToolAvailability(umo)
+		tools = append(tools, collectSandboxTools(browserOK, neoOK)...)
 	}
 
 	// Proactive capability: future_task tool.
@@ -2712,8 +2720,8 @@ func (s *ProcessStage) collectTools(computerUseRuntime string) []map[string]inte
 }
 
 // collectLightTools returns the tool schemas with empty parameters (only name + description). Used by skills_like mode to reduce token usage; the arguments are filled in by a follow-up re-query when the LLM chooses a tool.
-func (s *ProcessStage) collectLightTools(computerUseRuntime string) []map[string]interface{} {
-	all := s.collectTools(computerUseRuntime)
+func (s *ProcessStage) collectLightTools(computerUseRuntime, umo string) []map[string]interface{} {
+	all := s.collectTools(computerUseRuntime, umo)
 	for i, tool := range all {
 		if _, ok := tool["function"].(map[string]interface{}); !ok {
 			continue
@@ -2757,8 +2765,8 @@ func deepCopyInterface(v interface{}) interface{} {
 }
 
 // collectParamToolsFor returns the full-parameters schemas of the named tools (description kept minimal). Used by the skills_like re-query.
-func (s *ProcessStage) collectParamToolsFor(computerUseRuntime string, names []string) []map[string]interface{} {
-	all := s.collectTools(computerUseRuntime)
+func (s *ProcessStage) collectParamToolsFor(computerUseRuntime, umo string, names []string) []map[string]interface{} {
+	all := s.collectTools(computerUseRuntime, umo)
 	want := make(map[string]bool, len(names))
 	for _, n := range names {
 		want[n] = true
@@ -2779,8 +2787,8 @@ func (s *ProcessStage) collectParamToolsFor(computerUseRuntime string, names []s
 }
 
 // requeryToolArgs re-queries the LLM with the chosen tools' full parameter schemas so it produces concrete arguments (skills_like mode). Unlike the Python reference, the re-query context is minimal (original prompt + an explicit instruction) instead of the full conversation history, which avoids the model re-deciding the tool selection and saves tokens. Returns ok=false when the re-query fails or returns no tool call, in which case the caller keeps the original response.
-func (s *ProcessStage) requeryToolArgs(ctx context.Context, chatInst provider.ChatProvider, req *provider.ProviderRequest, resp *provider.LLMResponse, computerUseRuntime string) (*provider.LLMResponse, bool) {
-	paramTools := s.collectParamToolsFor(computerUseRuntime, resp.ToolsCallName)
+func (s *ProcessStage) requeryToolArgs(ctx context.Context, chatInst provider.ChatProvider, req *provider.ProviderRequest, resp *provider.LLMResponse, computerUseRuntime, umo string) (*provider.LLMResponse, bool) {
+	paramTools := s.collectParamToolsFor(computerUseRuntime, umo, resp.ToolsCallName)
 	if len(paramTools) == 0 {
 		return resp, false
 	}
@@ -3251,31 +3259,45 @@ func htmlToText(body []byte) string {
 
 // executeTool runs a tool call and returns the result text. Dispatches to built-in tools, MCP servers, and the Computer Use local or sandbox executors. coreBuiltinToolSet lists the LLM tools implemented by the host itself (built-ins, Computer Use host tools, web-search/KB/message tools and the proactive future_task). tool_permissions only governs non-builtin tools — the dashboard exposes built-ins as readonly — mirroring Python, where the permission guard is applied to function tools registered by MCP servers and plugins, never to the core's own executors.
 var coreBuiltinToolSet = map[string]bool{
-	"get_current_time":           true,
-	"web_fetch":                  true,
-	"astrbot_execute_shell":      true,
-	"astrbot_shell_session":      true,
-	"astrbot_execute_python":     true,
-	"astrbot_file_read_tool":     true,
-	"astrbot_file_write_tool":    true,
-	"astrbot_file_edit_tool":     true,
-	"astrbot_grep_tool":          true,
-	"astrbot_upload_file":        true,
-	"astrbot_download_file":      true,
-	"web_search_tavily":          true,
-	"web_search_bocha":           true,
-	"web_search_brave":           true,
-	"web_search_firecrawl":       true,
-	"web_search_baidu":           true,
-	"web_search_exa":             true,
-	"web_search_anysearch":       true,
-	"tavily_extract_web_page":    true,
-	"firecrawl_extract_web_page": true,
-	"exa_get_contents":           true,
-	"send_message_to_user":       true,
-	"get_group_message_history":  true,
-	"astr_kb_search":             true,
-	"future_task":                true,
+	"get_current_time":                 true,
+	"web_fetch":                        true,
+	"astrbot_execute_shell":            true,
+	"astrbot_shell_session":            true,
+	"astrbot_execute_python":           true,
+	"astrbot_file_read_tool":           true,
+	"astrbot_file_write_tool":          true,
+	"astrbot_file_edit_tool":           true,
+	"astrbot_grep_tool":                true,
+	"astrbot_upload_file":              true,
+	"astrbot_download_file":            true,
+	"astrbot_execute_browser":          true,
+	"astrbot_execute_browser_batch":    true,
+	"astrbot_run_browser_skill":        true,
+	"astrbot_get_execution_history":    true,
+	"astrbot_annotate_execution":       true,
+	"astrbot_create_skill_payload":     true,
+	"astrbot_get_skill_payload":        true,
+	"astrbot_create_skill_candidate":   true,
+	"astrbot_list_skill_candidates":    true,
+	"astrbot_evaluate_skill_candidate": true,
+	"astrbot_promote_skill_candidate":  true,
+	"astrbot_list_skill_releases":      true,
+	"astrbot_rollback_skill_release":   true,
+	"astrbot_sync_skill_release":       true,
+	"web_search_tavily":                true,
+	"web_search_bocha":                 true,
+	"web_search_brave":                 true,
+	"web_search_firecrawl":             true,
+	"web_search_baidu":                 true,
+	"web_search_exa":                   true,
+	"web_search_anysearch":             true,
+	"tavily_extract_web_page":          true,
+	"firecrawl_extract_web_page":       true,
+	"exa_get_contents":                 true,
+	"send_message_to_user":             true,
+	"get_group_message_history":        true,
+	"astr_kb_search":                   true,
+	"future_task":                      true,
 }
 
 // parseToolPermissions reads config["tool_permissions"] into a tool name -> permission level map. Both the dashboard shape {"<tool>": {"permission": "admin"|"member"}} and a bare "<tool>": "admin" value are accepted (the python-sdk guard parses both shapes too); unknown levels are ignored so a malformed entry never locks a tool out.
@@ -3324,11 +3346,53 @@ func (s *ProcessStage) toolPermissionDenied(name string, event *core.Event) bool
 	return s.adminOnlyTools()[name] == "admin"
 }
 
+// computerToolAdminSet lists Computer-Use runtime tools gated by provider_settings.computer_use_require_admin (mirrors Python check_admin_permission on shell/python/fs/cua/browser/neo tools).
+var computerToolAdminSet = map[string]bool{
+	"astrbot_execute_shell": true, "astrbot_shell_session": true, "astrbot_execute_python": true,
+	"astrbot_file_read_tool": true, "astrbot_file_write_tool": true, "astrbot_file_edit_tool": true,
+	"astrbot_grep_tool": true, "astrbot_upload_file": true, "astrbot_download_file": true,
+	"astrbot_execute_browser": true, "astrbot_execute_browser_batch": true, "astrbot_run_browser_skill": true,
+	"astrbot_get_execution_history": true, "astrbot_annotate_execution": true,
+	"astrbot_create_skill_payload": true, "astrbot_get_skill_payload": true,
+	"astrbot_create_skill_candidate": true, "astrbot_list_skill_candidates": true,
+	"astrbot_evaluate_skill_candidate": true, "astrbot_promote_skill_candidate": true,
+	"astrbot_list_skill_releases": true, "astrbot_rollback_skill_release": true, "astrbot_sync_skill_release": true,
+}
+
+// toolDisplayName returns the operation label used in the admin-denied message (mirrors Python's per-tool operation strings).
+func toolDisplayName(name string) string {
+	switch name {
+	case "astrbot_execute_shell", "astrbot_shell_session":
+		return "Shell execution"
+	case "astrbot_execute_python":
+		return "Python execution"
+	case "astrbot_upload_file":
+		return "File upload/download"
+	case "astrbot_download_file":
+		return "File upload/download"
+	case "astrbot_execute_browser", "astrbot_execute_browser_batch", "astrbot_run_browser_skill":
+		return "Using browser tools"
+	case "astrbot_get_execution_history", "astrbot_annotate_execution", "astrbot_create_skill_payload",
+		"astrbot_get_skill_payload", "astrbot_create_skill_candidate", "astrbot_list_skill_candidates",
+		"astrbot_evaluate_skill_candidate", "astrbot_promote_skill_candidate", "astrbot_list_skill_releases",
+		"astrbot_rollback_skill_release", "astrbot_sync_skill_release":
+		return "Using skill lifecycle tools"
+	default:
+		return "Filesystem access"
+	}
+}
+
 func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runtime, name string, args map[string]interface{}) string {
 	umo := event.UnifiedMsgOrigin()
 	logger.Debug("executeTool: name=%s args=%v", name, args)
 
 	// Host-side tool permission guard: a tool marked admin-only in tool_permissions refuses to run for member events. Checked before any dispatch so neither the executors nor the on_tool_call hooks observe a denied invocation.
+	if computerToolAdminSet[name] {
+		if msg := s.computerAdminDenied(event, toolDisplayName(name)); msg != "" {
+			return msg
+		}
+	}
+
 	if s.toolPermissionDenied(name, event) {
 		logger.I18nWarn("工具 %s 需要管理员权限，用户 %s 无权调用", name, event.GetSenderID())
 		return fmt.Sprintf("工具 %s 需要管理员权限，当前用户无权调用", name)
@@ -3379,6 +3443,9 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		if r, h := s.executeSubAgent(event, name, args); h {
 			result, handled = r, true
 		}
+	}
+	if !handled && runtime == "sandbox" && neoLifecycleHostSet[name] {
+		return s.executeNeoLifecycleTool(ctx, event.UnifiedMsgOrigin(), name, args)
 	}
 	if !handled && runtime == "sandbox" {
 		if r, h := s.executeSandboxTool(ctx, event.UnifiedMsgOrigin(), name, args); h {
@@ -3493,7 +3560,9 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, sessionID, name s
 		case "astrbot_execute_shell", "astrbot_execute_python",
 			"astrbot_file_read_tool", "astrbot_file_write_tool",
 			"astrbot_file_edit_tool", "astrbot_grep_tool",
-			"astrbot_upload_file", "astrbot_download_file":
+			"astrbot_upload_file", "astrbot_download_file",
+			"astrbot_execute_browser", "astrbot_execute_browser_batch", "astrbot_run_browser_skill",
+			"astrbot_get_execution_history", "astrbot_annotate_execution":
 			return "Sandbox manager not configured.", true
 		}
 		return "", false
@@ -3549,41 +3618,20 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, sessionID, name s
 			return "Sandbox error: " + err.Error(), true
 		}
 		return sandboxDownloadFile(tctx, s.sandboxMgr, sessionID, argString(args, "remote_path")), true
+	case "astrbot_execute_browser", "astrbot_execute_browser_batch", "astrbot_run_browser_skill",
+		"astrbot_get_execution_history", "astrbot_annotate_execution":
+		if err := s.ensureSandboxStarted(tctx, sessionID); err != nil {
+			return "Sandbox error: " + err.Error(), true
+		}
+		return s.executeNeoLifecycleTool(tctx, sessionID, name, args), true
 	}
 	return "", false
 }
 
-// ensureSandboxStarted lazily ensures the session's sandbox is booted on first use (per-session, mirroring Python get_booter). 内部会做健康检查：会话沙盒 已失效（404/TTL 到期）时自动重建。
+// ensureSandboxStarted lazily ensures the session's sandbox is booted on first use (per-session, mirroring Python get_booter). 死沙盒（404/TTL）自动重建+重推技能，均由 EnsureSession 内部完成（对齐 py get_booter 的 available→reboot→sync 时机）。
 func (s *ProcessStage) ensureSandboxStarted(ctx context.Context, sessionID string) error {
-	if _, err := s.sandboxMgr.EnsureSession(ctx, sessionID); err != nil {
-		return err
-	}
-	if s.skillMgr != nil {
-		// 先推送宿主 active 技能进 /workspace/skills（对齐 Python computer_client._sync_skills_to_sandbox），再回扫沙盒技能刷新 缓存（含沙盒内置技能——推送后 SyncSkills 才能看到全部条目）。
-		if err := s.sandboxMgr.PushHostSkills(ctx, sessionID); err != nil {
-			logger.Warn("推送宿主技能到沙盒失败: %v", err)
-		}
-		s.syncSandboxSkills(ctx, sessionID)
-	}
-	return nil
-}
-
-// syncSandboxSkills syncs sandbox skill metadata with a short retry window. /workspace/skills 由 cargo volume 挂载，容器刚就绪时可能尚未挂载完成，首次 扫描返回 0 个技能（观察为 "Synced 0 skills from sandbox"），导致 python- sandbox 内置技能丢失。重试直到扫到技能或窗口耗尽。
-func (s *ProcessStage) syncSandboxSkills(ctx context.Context, sessionID string) {
-	for attempt := 0; attempt < 5; attempt++ {
-		if err := s.sandboxMgr.SyncSkills(ctx, sessionID); err == nil {
-			if st := s.skillMgr.GetSandboxSkillsCacheStatus(); st != nil {
-				if ready, _ := st["ready"].(bool); ready {
-					return
-				}
-			}
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
-	}
+	_, err := s.sandboxMgr.EnsureSession(ctx, sessionID)
+	return err
 }
 
 // resolveProvider picks the provider config to use for this chat.

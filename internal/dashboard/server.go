@@ -34,6 +34,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
@@ -66,6 +67,7 @@ type Server struct {
 	conversationMgr interface{} // *conversation.Manager
 	cronMgr         interface{} // *cron.CronJobManager
 	subPluginMgr    *plugin.SubprocessManager
+	sandboxMgr      *sandbox.Manager         // 技能/插件变更后 resync 活跃沙盒（对齐 py sync_skills_to_active_sandboxes）
 	kbMgr           interface{}              // *knowledgebase.Manager
 	kbTasks         map[string]*kbUploadTask // knowledge base upload task states
 	skillMgr        interface{}              // *skills.SkillManager
@@ -302,6 +304,7 @@ func (s *Server) SetOnPluginsChanged(fn func()) {
 
 // notifyPluginsChanged triggers the plugin reload callback if registered.
 func (s *Server) notifyPluginsChanged() {
+	s.resyncSandboxSkills() // 插件自带技能随装卸变化，resync 活跃沙盒（对齐 py plugin_service）。
 	if s.onPluginsChanged != nil {
 		s.onPluginsChanged()
 	}
@@ -406,6 +409,11 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 		if v, ok := managers["plugin_subprocess"]; ok {
 			if pm, ok := v.(*plugin.SubprocessManager); ok {
 				s.subPluginMgr = pm
+			}
+		}
+		if v, ok := managers["sandbox"]; ok {
+			if sm, ok := v.(*sandbox.Manager); ok {
+				s.sandboxMgr = sm
 			}
 		}
 		if v, ok := managers["star"]; ok {
@@ -2627,3 +2635,14 @@ func (s *Server) getSkillList() []interface{} {
 	}
 	return result
 }
+
+// resyncSandboxSkills 技能集合变更后把宿主 active 技能重推向所有运行中的沙盒会话（对齐 py sync_skills_to_active_sandboxes：WebUI 技能编辑/插件装卸触发）。
+func (s *Server) resyncSandboxSkills() {
+	if s.sandboxMgr == nil {
+		return
+	}
+	go s.sandboxMgr.SyncSkillsToActiveSessions(context.Background())
+}
+
+// Neo exposes the host-side Neo skill lifecycle store (candidates/releases/payloads) so the pipeline's Computer-Use tools share the same instance as the dashboard API.
+func (s *Server) Neo() *skills.NeoStore { return s.neo }

@@ -9751,6 +9751,7 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 					writeJSON(w, http.StatusOK, apiError(err.Error()))
 					return
 				}
+				s.resyncSandboxSkills()
 				writeJSON(w, http.StatusOK, apiOKMsg("技能状态已更新", map[string]interface{}{}))
 			} else {
 				writeJSON(w, http.StatusOK, apiOKMsg("技能已更新", map[string]interface{}{}))
@@ -9760,6 +9761,7 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 				writeJSON(w, http.StatusOK, apiError(err.Error()))
 				return
 			}
+			s.resyncSandboxSkills()
 			writeJSON(w, http.StatusOK, apiOKMsg("技能已删除", map[string]interface{}{}))
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -10270,6 +10272,7 @@ func (s *Server) updateSkillFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, apiError(err.Error()))
 		return
 	}
+	s.resyncSandboxSkills()
 	writeJSON(w, http.StatusOK, apiOKMsg("文件已保存", map[string]interface{}{}))
 }
 
@@ -10326,6 +10329,7 @@ func (s *Server) uploadSkillsBatch(w http.ResponseWriter, r *http.Request) {
 		succeeded = append(succeeded, map[string]interface{}{"filename": filename, "name": skillName})
 	}
 
+	s.resyncSandboxSkills()
 	writeJSON(w, http.StatusOK, apiOKMsg("上传成功", map[string]interface{}{
 		"succeeded": succeeded,
 		"failed":    failed,

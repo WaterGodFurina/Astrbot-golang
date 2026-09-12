@@ -412,6 +412,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		"star":              l.starMgr,
 		"knowledgebase":     l.kbMgr,
 		"skills":            l.skillMgr,
+		"sandbox":           l.sandboxMgr,
 		"database":          l.database,
 		"file_tokens":       fileTokens,
 	}
@@ -636,6 +637,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 		UmoAliasResolver:      l.umoAliasResolver,
 		SkillManager:          l.skillMgr,
 		SandboxManager:        l.sandboxMgr,
+		NeoStore:              l.dashboard.Neo(),
 		CronManager:           l.cronMgr,
 		Database:              l.database,
 		EventBus:              l.eventBus,
