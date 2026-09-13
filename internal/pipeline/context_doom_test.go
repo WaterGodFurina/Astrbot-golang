@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -227,29 +228,54 @@ func containsStr(s, sub string) bool {
 }
 
 func TestMaterializeToolResult(t *testing.T) {
+	inTempDir(t)
 	// Small result unchanged.
 	small := "ok"
-	if got := materializeToolResult(small, "c1"); got != small {
+	if got := materializeToolResult(small, "c1", maxOutputBudget, hostSpillForTest); got != small {
 		t.Fatalf("small result should pass through: %q", got)
 	}
 	// Large result -> preview + overflow notice + file on disk.
-	big := make([]rune, maxInlineToolResultChars+1000)
+	big := make([]rune, maxOutputBudget+1000)
 	for i := range big {
 		big[i] = 'x'
 	}
-	out := materializeToolResult(string(big), "tool_call_123")
+	out := materializeToolResult(string(big), "tool_call_123", maxOutputBudget, hostSpillForTest)
 	if len(out) >= len(big) {
 		t.Fatal("large result should be truncated")
 	}
 	if !containsStr(out, "astrbot_file_read_tool") {
 		t.Fatal("missing read-tool hint")
 	}
-	if !containsStr(out, "tool_results") {
-		t.Fatal("missing overflow path")
+	if !containsStr(out, "output was truncated") {
+		t.Fatal("missing truncated banner")
 	}
-	// The overflow file exists.
-	if _, err := os.Stat("data/temp/tool_results"); err != nil {
+	if _, err := os.Stat(filepath.Join("data", "temp", "tool_results")); err != nil {
 		t.Fatalf("overflow dir missing: %v", err)
+	}
+	// Line-count budget: many short lines under the byte budget still spill (opencode MAX_LINES).
+	many := strings.Repeat("line\n", maxOutputLines+10)
+	out2 := materializeToolResult(many, "c2", maxOutputBudget, hostSpillForTest)
+	if !containsStr(out2, "lines truncated") {
+		t.Fatalf("line-overrun result should spill: %q", out2[len(out2)-120:])
+	}
+}
+
+func hostSpillForTest(name, content string) (string, bool) {
+	return spillHostToolResult("test-spill", content)
+}
+
+func TestToolOutputBudget(t *testing.T) {
+	s := &ProcessStage{}
+	if got := s.toolOutputBudget(); got != defaultCtxTokens/5*2 {
+		t.Fatalf("default budget = %d, want %d", got, defaultCtxTokens/5*2)
+	}
+	s.providerConf = &ProviderSettings{MaxContextLength: 200000}
+	if got := s.toolOutputBudget(); got != 80000 {
+		t.Fatalf("200K ctx budget = %d, want 80000", got)
+	}
+	s.providerConf = &ProviderSettings{MaxContextLength: 10000}
+	if got := s.toolOutputBudget(); got != minOutputBudget {
+		t.Fatalf("tiny ctx must clamp to min, got %d", got)
 	}
 }
 

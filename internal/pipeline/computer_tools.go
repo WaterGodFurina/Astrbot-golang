@@ -142,7 +142,7 @@ func sandboxFileRead(ctx context.Context, mgr *sandbox.Manager, sessionID, path 
 	if err != nil {
 		return "Error reading file: " + err.Error(), "", ""
 	}
-	return fmt.Sprintf("Content of %s:\n%s", path, content), "", ""
+	return windowedFileRead(content, fmt.Sprintf("Content of %s:", path), offset, limit), "", ""
 }
 
 // pathExt/pathBase work on POSIX sandbox paths regardless of host OS.
@@ -609,12 +609,12 @@ func collectLocalTools() []map[string]interface{} {
 // 使用同一组工具但语义不同：沙盒内 shell/python 在隔离容器 /workspace 执行、
 // 且容器有网络可 curl 下载；本地运行时的描述则强调直接操作宿主机需谨慎。
 func collectComputerTools(sandbox, browser, neo bool) []map[string]interface{} {
-	shellDesc := "The shell command to execute in the current runtime shell (for example, powershell.exe on Windows). Equivalent to `cd {working_dir} && {command}` where {working_dir} is the conversation workspace. Prefer relative paths. 注意：该命令直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。当用户发送或引用了文件消息（上下文里显示为 [File Attachment ...]）时，请先使用 astrbot_upload_file 把文件上传到工作区再处理，而不是自行猜测文件路径。"
+	shellDesc := "The shell command to execute in the current runtime shell (for example, powershell.exe on Windows). Equivalent to `cd {working_dir} && {command}` where {working_dir} is the conversation workspace. If the output is very large it will be truncated with a preview and the FULL output saved to a file — read that file in windows (astrbot_file_read_tool offset/limit) or grep it, and summarize each segment before continuing. 注意：该命令直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。当用户发送或引用了文件消息（上下文里显示为 [File Attachment ...]）时，请先使用 astrbot_upload_file 把文件上传到工作区再处理，而不是自行猜测文件路径。"
 	pythonDesc := "Execute codes in a Python environment. Current OS: " + runtime.GOOS + ". Use system-compatible commands. 注意：该代码直接在宿主机（运行 AstrBot 的服务器）上执行，未被沙箱隔离，请谨慎使用，避免破坏性或危险操作。"
 	uploadDesc := "Transfer a file FROM the host machine INTO the current runtime so that code can access it. Use this when the user sends/attaches a file and you need to process it. The local_path must point to an existing file on the host filesystem (e.g. a [File Attachment: ...] path shown in the context)."
 	downloadDesc := "Transfer a file OUT of the current runtime to the host machine. Use this only when the user asks to retrieve/export a file that was created or modified inside the runtime."
 	if sandbox {
-		shellDesc = "Execute a shell command inside the sandbox container. Working directory is `/workspace`; relative paths resolve there. The sandbox has network access, so you can download files directly with curl/wget, e.g. `curl -L -o bug.md '<url>'`. 当用户发送或引用了文件消息（上下文显示为 [File Attachment ...]）时，请先用 astrbot_upload_file 把宿主侧的文件路径上传到 /workspace 再读取分析，而不是自行猜测文件路径或到处 ls 找文件。"
+		shellDesc = "Execute a shell command inside the sandbox container. Working directory is `/workspace`; relative paths resolve there. The sandbox has network access, so you can download files directly with curl/wget, e.g. `curl -L -o bug.md '<url>'`. If the output is very large it is truncated with a preview and the FULL output saved in the sandbox workspace — read it in windows with astrbot_file_read_tool (offset/limit) or search with astrbot_grep_tool, digesting each segment before continuing. 当用户发送或引用了文件消息（上下文显示为 [File Attachment ...]）时，请先用 astrbot_upload_file 把宿主侧的文件路径上传到 /workspace 再读取分析，而不是自行猜测文件路径或到处 ls 找文件。"
 		pythonDesc = "Execute Python code inside the sandbox container. An IPython kernel is used and variables/state persist across calls within the same sandbox session. Working directory is `/workspace`."
 		uploadDesc = "Transfer a file FROM the host machine INTO the sandbox so that sandbox code can access it. Use this when the user sends/attaches a file (shown in context as [File Attachment: name X, path Y]) and you need to process it inside the sandbox. The local_path must be the host path from the [File Attachment ...] line."
 		downloadDesc = "Transfer a file FROM the sandbox OUT to the host. Use this ONLY when the user asks to retrieve/export a file that was created or modified inside the sandbox."
@@ -698,7 +698,7 @@ func collectComputerTools(sandbox, browser, neo bool) []map[string]interface{} {
 			"type": "function",
 			"function": map[string]interface{}{
 				"name":        "astrbot_file_read_tool",
-				"description": "read file content. Supports text, image, and PDF (text extraction), docx and epub files.",
+				"description": "read file content. Supports text, image, and PDF (text extraction), docx, xlsx, pptx and epub files. Text reads are windowed: up to 2000 lines / 50 KB per call, output is line-numbered and ends with a continuation hint (use offset=<line> for the next window); do NOT try to read huge files at once — read and digest one window at a time, or use astrbot_grep_tool to locate content first.",
 				"parameters": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
@@ -1044,6 +1044,10 @@ type shellSession struct {
 	Stdin      io.WriteCloser
 	Owner      string
 
+	// pollMu guards the incremental read cursor (py poll_session cursor semantics: every byte is delivered exactly once; nothing is skipped or replayed).
+	pollMu     sync.Mutex
+	pollCursor int64
+
 	// exitMu guards the exit state written by the Wait goroutine and read by
 	// status(); reading Cmd.ProcessState directly would race with cmd.Wait().
 	exitMu   sync.Mutex
@@ -1082,32 +1086,6 @@ func (s *shellSession) status() map[string]interface{} {
 		"owner":       s.Owner,
 	}
 }
-
-// cappedWriter caps buffered output at max bytes, flagging truncation instead
-// of growing without bound.
-type cappedWriter struct {
-	buf       bytes.Buffer
-	max       int
-	truncated bool
-}
-
-func (w *cappedWriter) Write(p []byte) (int, error) {
-	if w.buf.Len() >= w.max {
-		w.truncated = true
-		return len(p), nil
-	}
-	n := len(p)
-	if room := w.max - w.buf.Len(); room < n {
-		n = room
-		w.truncated = true
-	}
-	w.buf.Write(p[:n])
-	return len(p), nil
-}
-
-// Bytes returns the buffered output (a byte slice sharing the underlying
-// buffer; callers must not mutate it).
-func (w *cappedWriter) Bytes() []byte { return w.buf.Bytes() }
 
 // maxShellOutput caps how much of a synchronous shell command's output is
 // buffered in memory.
@@ -1219,10 +1197,9 @@ func executeLocalShell(umo, senderID, command string, background bool, timeout i
 	// inherit the output pipes would keep CombinedOutput blocked and survive as
 	// orphans. Start first so cmd.Process is set before the kill goroutine
 	// reads it, then kill the whole process group the moment the timeout fires.
-	var outCap cappedWriter
-	outCap.max = maxShellOutput
-	cmd.Stdout = &outCap
-	cmd.Stderr = &outCap
+	outCap := &spoolWriter{max: maxShellOutput, dir: filepath.Join(ws, ".astrbot-outputs")}
+	cmd.Stdout = outCap
+	cmd.Stderr = outCap
 	if err := cmd.Start(); err != nil {
 		return "Error executing command: " + err.Error()
 	}
@@ -1236,9 +1213,9 @@ func executeLocalShell(umo, senderID, command string, background bool, timeout i
 	}()
 	err := cmd.Wait()
 	close(groupDone)
-	out := outCap.Bytes()
-	if outCap.truncated {
-		out = append(out, []byte("\n...(output truncated)\n")...)
+	out := outCap.Head()
+	if sp := outCap.Close(); sp != "" {
+		out = append(out, []byte(spoolNotice(sp, outCap.total))...)
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("Command timed out after %d seconds. Output so far:\n%s", timeout, string(out))
@@ -1307,17 +1284,44 @@ func shellSessionPoll(sessionID, umo, senderID string) string {
 	if !sessionOwnedBy(s, umo, senderID) {
 		return "Session " + sessionID + " does not belong to the current user."
 	}
-	tail := ""
-	if data, err := os.ReadFile(s.OutputFile); err == nil {
-		if len(data) > 20000 {
-			data = data[len(data)-20000:]
-			tail = "...(truncated)\n"
+	s.pollMu.Lock()
+	defer s.pollMu.Unlock()
+	chunk := ""
+	size := int64(0)
+	if st, err := os.Stat(s.OutputFile); err == nil {
+		size = st.Size()
+	}
+	if s.pollCursor > size {
+		s.pollCursor = 0 // log rotated/replaced: restart the stream
+	}
+	if size > s.pollCursor {
+		// #nosec G304 -- OutputFile is a host-generated session log path.
+		if f, err := os.Open(s.OutputFile); err == nil {
+			defer f.Close()
+			if _, err := f.Seek(s.pollCursor, io.SeekStart); err == nil {
+				buf := make([]byte, pollWindowBytes)
+				if n, _ := f.Read(buf); n > 0 {
+					if s.pollCursor+int64(n) < size {
+						if li := bytes.LastIndexByte(buf[:n], '\n'); li >= 0 {
+							n = li + 1 // stop at a line boundary so the next poll continues cleanly
+						}
+					}
+					s.pollCursor += int64(n)
+					chunk = string(buf[:n])
+				}
+			}
 		}
-		tail += string(data)
 	}
 	st, _ := json.Marshal(s.status())
-	return string(st) + "\nOutput:\n" + tail
+	out := string(st) + "\nOutput:\n" + chunk
+	if s.pollCursor < size {
+		out += fmt.Sprintf("\n\n(output continues: %d of %d bytes consumed — poll again for the next segment, or read `%s` with astrbot_file_read_tool offset/limit)", s.pollCursor, size, s.OutputFile)
+	}
+	return out
 }
+
+// pollWindowBytes bounds one shell_session poll segment (py max_output_chars=10000, doubled for multibyte safety).
+const pollWindowBytes = 20000
 
 // shellSessionWrite writes raw data to a session's stdin. addNewline appends
 // a real line feed (the write_line action) so the session receives it.
@@ -1384,18 +1388,17 @@ func executeLocalPython(umo, code string, timeout int) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "python3", "-c", code) // #nosec G204 -- astrbot_execute_python 工具核心：执行 AI 指令给定的 Python 代码（host 本地运行，功能明确，前端已警示）
 	cmd.Dir = ws
-	// 与同步 shell 路径一致：输出经 cappedWriter 限幅，防止超时窗口内
-	// print 风暴把宿主进程 OOM。
-	cw := &cappedWriter{max: maxShellOutput}
+	// 与同步 shell 路径一致：输出限幅 + 全量 spool 落盘（超限不丢数据）。
+	cw := &spoolWriter{max: maxShellOutput, dir: filepath.Join(ws, ".astrbot-outputs")}
 	cmd.Stdout = cw
 	cmd.Stderr = cw
 	if err := cmd.Start(); err != nil {
 		return "error: code execution failed to start: " + err.Error()
 	}
 	waitErr := cmd.Wait()
-	out := string(cw.Bytes())
-	if cw.truncated {
-		out += fmt.Sprintf("\n[输出超过 %d 字节已截断]", maxShellOutput)
+	out := string(cw.Head())
+	if sp := cw.Close(); sp != "" {
+		out += spoolNotice(sp, cw.total)
 	}
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Sprintf("Code execution timed out after %d seconds. Output so far:\n%s", timeout, out)
@@ -1451,27 +1454,57 @@ func executeFileRead(path, umo string, offset, limit int, restricted bool) (stri
 		}
 		return "Error reading file: binary files are not supported by this tool.", "", ""
 	}
-	// 先 stat 判断大小：超限文件拒绝整体读入内存。带 offset/limit 时走
-	// 分页路径（按行流式读取，不整体载入内存），否则提示用 offset/limit。
+	// 大文件（>整读上限）流式窗口：只扫到 offset+窗口行数，避免载入全文件。
 	if info.Size() > maxFileReadBytes {
-		if offset <= 0 && limit <= 0 {
-			return fmt.Sprintf("Error reading file: %s is %d bytes, exceeds the %d-byte read limit. "+
-				"Use offset/limit to read a portion of the file.", resolved, info.Size(), maxFileReadBytes), "", ""
+		effLimit := limit
+		if effLimit <= 0 {
+			effLimit = defaultReadLines
 		}
 		f, err := os.Open(resolved)
 		if err != nil {
 			return "Error reading file: " + err.Error(), "", ""
 		}
 		defer f.Close()
-		var lines []string
+		var out []string
+		more := false
+		cut := false
+		bytes := 0
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for i := 0; sc.Scan() && (limit <= 0 || i < offset+limit); i++ {
-			if i >= offset {
-				lines = append(lines, sc.Text())
+		for i := 0; sc.Scan(); i++ {
+			if i < offset {
+				continue
 			}
+			if len(out) >= effLimit {
+				more = true
+				break
+			}
+			line := sc.Text()
+			if r := []rune(line); len(r) > maxReadLineChars {
+				line = string(r[:maxReadLineChars]) + fmt.Sprintf("... (line truncated to %d chars)", maxReadLineChars)
+			}
+			size := len(line) + 3
+			if bytes > 0 {
+				size++
+			}
+			if bytes+size > maxReadWindowBytes {
+				cut = true
+				break
+			}
+			out = append(out, fmt.Sprintf("%d: %s", i+1, line))
+			bytes += size
 		}
-		return fmt.Sprintf("Read %d lines from %s:\n%s", len(lines), resolved, strings.Join(lines, "\n")), "", ""
+		header := fmt.Sprintf("Read %s (%d bytes):", resolved, info.Size())
+		last := offset + len(out)
+		body := strings.Join(out, "\n")
+		switch {
+		case cut:
+			return header + "\n" + body + fmt.Sprintf("\n\n(Output capped at %d KB. Showing lines %d-%d. Use offset=%d to continue.)", maxReadWindowBytes/1024, offset+1, last, last), "", ""
+		case more:
+			return header + "\n" + body + fmt.Sprintf("\n\n(Showing lines %d-%d. Use offset=%d to continue.)", offset+1, last, last), "", ""
+		default:
+			return header + "\n" + body + fmt.Sprintf("\n\n(End of file - total %d lines)", last), "", ""
+		}
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil {
@@ -1480,22 +1513,7 @@ func executeFileRead(path, umo string, offset, limit int, restricted bool) (stri
 	if looksBinarySample(data) {
 		return "Error reading file: binary files are not supported by this tool.", "", ""
 	}
-	content := string(data)
-	if offset > 0 || limit > 0 {
-		lines := strings.Split(content, "\n")
-		if offset < 0 {
-			offset = 0
-		}
-		if offset > len(lines) {
-			offset = len(lines)
-		}
-		end := len(lines)
-		if limit > 0 && offset+limit < end {
-			end = offset + limit
-		}
-		content = strings.Join(lines[offset:end], "\n")
-	}
-	return fmt.Sprintf("Read %d bytes from %s:\n%s", info.Size(), resolved, content), "", ""
+	return windowedFileRead(string(data), fmt.Sprintf("Read %s (%d bytes):", resolved, info.Size()), offset, limit), "", ""
 }
 
 func executeFileWrite(path, content, umo string, restricted bool) string {
@@ -2071,14 +2089,7 @@ func sliceTextLines(text string, offset, limit int) string {
 // formatDocumentRead mirrors py _read_local_supported_document_result: text within the read limit is returned (line-sliced by offset/limit); larger text is stored under the workspace converted_files/ directory and a notice with that path is returned so the model can grep/read it in narrow windows.
 func formatDocumentRead(text, resolved, umo string, offset, limit int, rawBytes []byte) string {
 	if int64(len(text)) <= maxFileReadBytes {
-		selected := sliceTextLines(text, offset, limit)
-		if selected == "" {
-			return "No content found at the requested line offset."
-		}
-		if (offset > 0 || limit > 0) && int64(len(selected)) > maxFileReadBytes {
-			return fmt.Sprintf("Error reading file: output exceeds %d bytes. Use `offset`, `limit` to narrow the read window.", maxFileReadBytes)
-		}
-		return fmt.Sprintf("Extracted text from %s:\n%s", resolved, selected)
+		return windowedFileRead(text, fmt.Sprintf("Extracted text from %s:", resolved), offset, limit)
 	}
 	convertedPath := storeConvertedText(text, resolved, umo, rawBytes)
 	if convertedPath == "" {
@@ -2124,4 +2135,158 @@ func looksBinarySample(data []byte) bool {
 		}
 	}
 	return false
+}
+
+// Windowed file reading ported from opencode tool/read.ts: DEFAULT_READ_LIMIT=2000 lines, MAX_LINE_LENGTH=2000 chars per line, MAX_BYTES=50KB per response, numbered output, and a trailing hint (capped / showing X-Y of N / end of file) so the model continues with offset instead of blindly re-reading whole files.
+const (
+	defaultReadLines   = 2000
+	maxReadLineChars   = 2000
+	maxReadWindowBytes = 50 * 1024
+)
+
+// windowedFileRead renders content in one window. offset is 0-based (tool contract), display line numbers 1-based (opencode style). header is the tool-specific title line.
+func windowedFileRead(content, header string, offset, limit int) string {
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	total := len(lines)
+	if limit <= 0 {
+		limit = defaultReadLines
+	}
+	if offset > 0 && offset >= total && total > 0 {
+		return fmt.Sprintf("Error: offset %d is out of range for this file (%d lines).", offset, total)
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var out []string
+	bytes := 0
+	cut := false
+	more := false
+	for i := offset; i < total; i++ {
+		if len(out) >= limit {
+			more = true
+			break
+		}
+		line := lines[i]
+		if r := []rune(line); len(r) > maxReadLineChars {
+			line = string(r[:maxReadLineChars]) + fmt.Sprintf("... (line truncated to %d chars)", maxReadLineChars)
+		}
+		size := len(line) + 2 + fmtLen(i+offset+1)
+		if bytes > 0 {
+			size++
+		}
+		if bytes+size > maxReadWindowBytes {
+			cut = true
+			break
+		}
+		out = append(out, fmt.Sprintf("%d: %s", i+offset+1, line))
+		bytes += size
+	}
+	if len(out) == 0 && !cut && !more {
+		return header + "\n(End of file - file has no content at this offset.)"
+	}
+	lastShown := offset + len(out)
+	body := strings.Join(out, "\n")
+	var suffix string
+	switch {
+	case cut:
+		suffix = fmt.Sprintf("\n\n(Output capped at %d KB. Showing lines %d-%d%s. Use offset=%d to continue.)",
+			maxReadWindowBytes/1024, offset+1, lastShown, ofTotal(total), lastShown)
+	case more:
+		suffix = fmt.Sprintf("\n\n(Showing lines %d-%d of %d. Use offset=%d to continue.)", offset+1, lastShown, total, lastShown)
+	default:
+		suffix = fmt.Sprintf("\n\n(End of file - total %d lines)", total)
+	}
+	return header + "\n" + body + suffix
+}
+
+func ofTotal(total int) string {
+	return fmt.Sprintf(" of %d", total)
+}
+
+// fmtLen reports the digit count of n (≥1) for width accounting of "N: " prefixes.
+func fmtLen(n int) int {
+	if n < 1 {
+		n = 1
+	}
+	l := 0
+	for n > 0 {
+		n /= 10
+		l++
+	}
+	return l
+}
+
+// spoolWriter caps the in-memory head at max bytes but keeps the FULL output on disk (lazily opened spool file under dir), so oversized command results are never silently lost — the caller reports the spool path with read-window instructions (opencode truncate semantics at the source, where the data actually streams past).
+type spoolWriter struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	headLen int
+	max     int
+	dir     string
+	f       *os.File
+	path    string
+	total   int
+}
+
+func (w *spoolWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.total += len(p)
+	if w.f != nil {
+		_, _ = w.f.Write(p)
+		return len(p), nil
+	}
+	room := w.max - w.headLen
+	if len(p) <= room {
+		w.buf.Write(p)
+		w.headLen += len(p)
+		return len(p), nil
+	}
+	if room > 0 {
+		w.buf.Write(p[:room])
+		w.headLen += room
+	}
+	w.buf.Write(p[room:]) // tail beyond the head cap: buffer == full spool content at open time
+	if err := w.openSpoolLocked(); err != nil {
+		return len(p), nil // spool unavailable: pure head-cap behavior
+	}
+	return len(p), nil
+}
+
+func (w *spoolWriter) openSpoolLocked() error {
+	if err := os.MkdirAll(w.dir, 0o750); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(w.dir, "exec-*.log")
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(w.buf.Bytes()); err != nil {
+		_ = f.Close()
+		return err
+	}
+	w.f = f
+	w.path = f.Name()
+	return nil
+}
+
+func (w *spoolWriter) Close() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.f != nil {
+		_ = w.f.Close()
+		w.f = nil
+	}
+	return w.path
+}
+
+func (w *spoolWriter) Head() []byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Bytes()[:w.headLen]
+}
+
+// spoolNotice renders the tail hint appended when output spilled to disk.
+func spoolNotice(spoolPath string, total int) string {
+	return fmt.Sprintf("\n\n...(output capped at %d bytes of %d total; FULL OUTPUT saved to: %s. Use astrbot_grep_tool to search it or astrbot_file_read_tool with offset/limit to read windows — digest each segment before reading the next)...", maxShellOutput, total, spoolPath)
 }

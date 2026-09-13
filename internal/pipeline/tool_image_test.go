@@ -86,3 +86,83 @@ func TestImageSniffMime(t *testing.T) {
 		t.Fatal("pdf must not match image")
 	}
 }
+
+func TestWindowedFileRead(t *testing.T) {
+	content := strings.Repeat("l\n", 3000)
+	out := windowedFileRead(content, "Read f:", 0, 0)
+	if !strings.Contains(out, "1: l") {
+		t.Fatal("line numbering missing")
+	}
+	if !strings.Contains(out, "Showing lines 1-2000 of 3000. Use offset=2000 to continue.") {
+		t.Fatalf("window hint mismatch: %q", out[len(out)-80:])
+	}
+	out2 := windowedFileRead(content, "Read f:", 2000, 0)
+	if !strings.Contains(out2, "End of file - total 3000 lines") {
+		t.Fatalf("tail window hint mismatch: %q", out2[len(out2)-60:])
+	}
+	if oob := windowedFileRead(content, "Read f:", 5000, 10); !strings.Contains(oob, "out of range") {
+		t.Fatalf("offset guard mismatch: %q", oob)
+	}
+	long := strings.Repeat("x", 2500)
+	if cutline := windowedFileRead(long, "Read f:", 0, 0); !strings.Contains(cutline, "line truncated to 2000 chars") {
+		t.Fatal("long line must be char-capped")
+	}
+	// 小文件一次窗口完结（无 truncated 提示）。
+	if small := windowedFileRead("a\nb", "Read f:", 0, 0); !strings.Contains(small, "End of file - total 2 lines") {
+		t.Fatalf("small file mismatch: %q", small)
+	}
+}
+
+func TestShellSessionPollCursor(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "session.log")
+	s := &shellSession{ID: "sh_test", OutputFile: log, Owner: "t:c\x00u"}
+	shellSessionsMu.Lock()
+	shellSessions["sh_test"] = s
+	shellSessionsMu.Unlock()
+	defer func() {
+		shellSessionsMu.Lock()
+		delete(shellSessions, "sh_test")
+		shellSessionsMu.Unlock()
+	}()
+	os.WriteFile(log, []byte("line1\nline2\nline3\n"), 0o600)
+	out1 := shellSessionPoll("sh_test", "t:c", "u")
+	if !strings.Contains(out1, "line1") || !strings.Contains(out1, "line3") {
+		t.Fatalf("first poll must carry full content: %q", out1)
+	}
+	if strings.Contains(out1, "output continues") {
+		t.Fatalf("fully consumed log must not claim continuation: %q", out1)
+	}
+	// Append more: second poll delivers ONLY the new segment (cursor semantics, no replay).
+	f, _ := os.OpenFile(log, os.O_APPEND|os.O_WRONLY, 0o600)
+	f.WriteString("line4\nline5\n")
+	f.Close()
+	out2 := shellSessionPoll("sh_test", "t:c", "u")
+	if strings.Contains(out2, "line1") || !strings.Contains(out2, "line4") {
+		t.Fatalf("second poll must resume at cursor: %q", out2)
+	}
+}
+
+func TestSpoolWriterFullOutputKept(t *testing.T) {
+	dir := t.TempDir()
+	w := &spoolWriter{max: 10, dir: dir}
+	w.Write([]byte("0123456789abcdefg"))
+	head := string(w.Head())
+	path := w.Close()
+	if head != "0123456789" {
+		t.Fatalf("head cap mismatch: %q", head)
+	}
+	if path == "" {
+		t.Fatal("overflow must have spooled to a file")
+	}
+	full, err := os.ReadFile(path)
+	if err != nil || string(full) != "0123456789abcdefg" {
+		t.Fatalf("spool must contain the FULL output: %q %v", full, err)
+	}
+	// Below cap: no spool file at all.
+	w2 := &spoolWriter{max: 100, dir: dir}
+	w2.Write([]byte("small"))
+	if p := w2.Close(); p != "" {
+		t.Fatalf("small output must not spool, got %q", p)
+	}
+}

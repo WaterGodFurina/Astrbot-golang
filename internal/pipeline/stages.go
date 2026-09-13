@@ -1841,8 +1841,8 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 				Args:   args,
 				Result: result,
 			})
-			// Oversized tool output is spilled to a file with a read hint so the model does not re-run the tool just to see the full result.
-			result = materializeToolResult(result, toolID)
+			// Oversized tool output is spilled to a file with a read hint so the model does not re-run the tool just to see the full result (opencode truncate.ts semantics: preview + ...N lines truncated... + Grep/Read(offset/limit) hint; budget = 1/5 of the model context).
+			result = s.materializeForRuntime(result, toolID, ar.computerUseRuntime, event.UnifiedMsgOrigin())
 			// provider_settings.show_tool_use_status + show_tool_call_result: send a combined "tool called → result" notice.
 			if s.providerConf != nil && s.providerConf.ShowToolUseStatus && s.providerConf.ShowToolCallResult {
 				s.sendToolStatus(event, fmt.Sprintf("%s\n%s", toolStatusCall(name), toolStatusResult(result)))
