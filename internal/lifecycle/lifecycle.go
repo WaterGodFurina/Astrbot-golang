@@ -61,6 +61,7 @@ type Lifecycle struct {
 	toolchain       *toolchain.Toolchain
 	skillMgr        *skills.SkillManager
 	sandboxMgr      *sandbox.Manager
+	neoStore        *skills.NeoStore
 	sandboxSig      string // last booter-selection signature (avoids needless rebuilds)
 	eventBus        *core.EventBus
 	conversationMgr *conversation.Manager
@@ -208,6 +209,8 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.skillMgr = skills.NewSkillManager("data/skills", "data/plugins", "data")
 	logger.I18nInfo("技能管理器已初始化（%d 个技能）", len(l.skillMgr.ListSkills(false, "local")))
 	l.sandboxMgr = sandbox.NewManager(l.skillMgr)
+	// Neo 生命周期存储由 lifecycle 先建（pipeline 首轮构建早于 dashboard 创建，dashboard.Neo() 那时还是 nil），再注入 dashboard 共享同一实例。
+	l.neoStore = skills.NewNeoStore("data")
 	l.syncSandboxBooter()
 	logger.I18nInfo("沙盒管理器已初始化")
 
@@ -413,6 +416,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		"knowledgebase":     l.kbMgr,
 		"skills":            l.skillMgr,
 		"sandbox":           l.sandboxMgr,
+		"neo":               l.neoStore,
 		"database":          l.database,
 		"file_tokens":       fileTokens,
 	}
@@ -637,7 +641,7 @@ func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 		UmoAliasResolver:      l.umoAliasResolver,
 		SkillManager:          l.skillMgr,
 		SandboxManager:        l.sandboxMgr,
-		NeoStore:              l.dashboard.Neo(),
+		NeoStore:              l.neoStore,
 		CronManager:           l.cronMgr,
 		Database:              l.database,
 		EventBus:              l.eventBus,

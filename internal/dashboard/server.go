@@ -453,6 +453,11 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 				})
 			}
 		}
+		if v, ok := managers["neo"]; ok {
+			if injected, ok2 := v.(*skills.NeoStore); ok2 && injected != nil {
+				s.neo = injected // lifecycle owns the shared instance (pipeline + dashboard APIs).
+			}
+		}
 		if v, ok := managers["skills"]; ok {
 			s.skillMgr = v
 			// Neo 技能生命周期 sync 需要把同步出的本地 SKILL.md 标记为
@@ -2645,4 +2650,9 @@ func (s *Server) resyncSandboxSkills() {
 }
 
 // Neo exposes the host-side Neo skill lifecycle store (candidates/releases/payloads) so the pipeline's Computer-Use tools share the same instance as the dashboard API.
-func (s *Server) Neo() *skills.NeoStore { return s.neo }
+func (s *Server) Neo() *skills.NeoStore {
+	if s == nil {
+		return nil
+	}
+	return s.neo
+}
