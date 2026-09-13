@@ -29,8 +29,11 @@ import (
 // logger 供插件运行时与编译相关路径记录日志。
 var logger = log.GetDefault().WithComponent("Plugin")
 
-// startTimeout bounds the go-plugin handshake + first Register call. go-plugin itself does not time out the handshake, so Load enforces one.
+// startTimeout bounds the go-plugin handshake; go-plugin itself does not time out the handshake, so Load enforces one.
 const startTimeout = 15 * time.Second
+
+// registerTimeout bounds the first Register RPC: Python plugins lazily pip-install missing dependencies during import (single-digit seconds per package), which the 15s handshake budget cannot absorb on a cold venv.
+const registerTimeout = 90 * time.Second
 
 // startInstanceMu serializes startInstance: SDK-side hostPluginID is a process-global that gets clobbered across concurrent Loads, breaking identity isolation between plugins.
 var startInstanceMu sync.Mutex
@@ -1764,7 +1767,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: manager shutting down", id))
 	}
 
-	regCtx, cancel := context.WithTimeout(ctx, startTimeout)
+	regCtx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
 	meta, err := pc.Register(regCtx)
 	logger.I18nInfo("startInstance %s: Register meta name=%q version=%q (pid=%d)", id,
