@@ -55,7 +55,9 @@ type Adapter struct {
 	typing *typingManagerAdapter
 
 	// 最近消息缓存（引用回复时间窗匹配，对齐本体 _recent_messages）。
-	recentMu           sync.Mutex
+	recentMu sync.Mutex
+	// recentSeq 会话缓存插入序号（recentMu 保护）：淘汰 tie-break 用。
+	recentSeq          uint64
 	recentMessages     map[string]*recentSessionCache
 	recentCacheSize    int
 	replyMatchWindowMs int64

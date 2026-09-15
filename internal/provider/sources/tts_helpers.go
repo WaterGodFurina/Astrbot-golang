@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // ttsConfigFloat returns the float64 value of key, or the fallback when absent.
@@ -114,11 +113,13 @@ func ttsSaveAudio(r io.Reader, prefix, ext string) (string, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%s_%d.%s", prefix, time.Now().UnixNano(), ext))
-	f, err := os.Create(path)
+	// os.CreateTemp 保证并发唯一：Windows 上 UnixNano 时间戳粒度粗会撞名，
+	// os.Create 同名互相截断 → 读回空文件/共享冲突（TestAzureTTSNativeConcurrentGetAudio 根因）。
+	f, err := os.CreateTemp(dir, fmt.Sprintf("%s_*.%s", prefix, ext))
 	if err != nil {
 		return "", err
 	}
+	path := f.Name()
 	n, err := io.Copy(f, io.LimitReader(r, maxTTSBytes+1))
 	if err != nil {
 		_ = f.Close()

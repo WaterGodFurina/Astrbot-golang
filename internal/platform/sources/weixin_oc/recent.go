@@ -42,6 +42,7 @@ type recentMessage struct {
 type recentSessionCache struct {
 	messages  []recentMessage
 	updatedAt time.Time
+	seq       uint64 // 插入序号：updatedAt 同值（Windows 时钟粒度）时的确定性淘汰序（对齐 py sorted 稳定序）
 }
 
 // replyMatch 引用匹配结果（含匹配元信息，本体 WeixinOCReplyMeta.reply_to）。
@@ -88,7 +89,8 @@ func (a *Adapter) cacheRecentMessage(sessionID string, msg recentMessage) {
 
 	entry, ok := a.recentMessages[sessionID]
 	if !ok {
-		entry = &recentSessionCache{messages: make([]recentMessage, 0, a.recentCacheSize)}
+		a.recentSeq++
+		entry = &recentSessionCache{messages: make([]recentMessage, 0, a.recentCacheSize), seq: a.recentSeq}
 		a.recentMessages[sessionID] = entry
 	}
 	entry.updatedAt = time.Now()
@@ -116,12 +118,13 @@ func (a *Adapter) pruneRecentSessionsLocked(now time.Time) {
 		return
 	}
 	type sessionAge struct {
-		id string
-		at time.Time
+		id  string
+		at  time.Time
+		seq uint64
 	}
 	ages := make([]sessionAge, 0, len(a.recentMessages))
 	for id, entry := range a.recentMessages {
-		ages = append(ages, sessionAge{id: id, at: entry.updatedAt})
+		ages = append(ages, sessionAge{id: id, at: entry.updatedAt, seq: entry.seq})
 	}
 	for i := 0; i < overflow; i++ {
 		oldest := -1
@@ -129,7 +132,8 @@ func (a *Adapter) pruneRecentSessionsLocked(now time.Time) {
 			if ages[j].id == "" {
 				continue
 			}
-			if oldest == -1 || ages[j].at.Before(ages[oldest].at) {
+			if oldest == -1 || ages[j].at.Before(ages[oldest].at) ||
+				(ages[j].at.Equal(ages[oldest].at) && ages[j].seq < ages[oldest].seq) {
 				oldest = j
 			}
 		}

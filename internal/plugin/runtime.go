@@ -1558,7 +1558,7 @@ func waitExeHandleReleased(abs string) {
 	if runtime.GOOS != "windows" || abs == "" {
 		return
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	for {
 		f, err := os.OpenFile(abs, os.O_WRONLY, 0)
 		if err != nil {
@@ -1569,6 +1569,9 @@ func waitExeHandleReleased(abs string) {
 			continue
 		}
 		_ = f.Close()
+		// 句柄已放开：顺手删除产物，让 t.TempDir/换名流程不再依赖"之后没人
+		// 再打开"（Defender 扫新 exe 的共享锁可超过任何合理等待）。删不掉也无妨。
+		_ = os.Remove(abs)
 		return
 	}
 }
