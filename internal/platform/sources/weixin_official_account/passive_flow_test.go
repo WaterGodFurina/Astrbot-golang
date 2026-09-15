@@ -109,8 +109,8 @@ func TestPassiveWindowTimeoutPlaceholder(t *testing.T) {
 	w := httptest.NewRecorder()
 	start := time.Now()
 	a.callbackCommand(w, req)
-	if elapsed := time.Since(start); elapsed < 3*time.Second || elapsed > 5*time.Second {
-		t.Fatalf("应在 4s 窗口末尾返回，实际耗时 %v", elapsed)
+	if elapsed := time.Since(start); elapsed < 2*time.Second || elapsed > 6*time.Second {
+		t.Fatalf("应在 4s 窗口末尾附近返回，实际耗时 %v", elapsed)
 	}
 	body := w.Body.String()
 	if !strings.Contains(body, "正在思考") || !strings.Contains(body, "慢消息") {

@@ -28,7 +28,7 @@ func authedRequest(t *testing.T, s *Server, method, path string, body io.Reader)
 }
 
 func TestHandlersReturnNamedObjects(t *testing.T) {
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	tests := []struct {
@@ -181,7 +181,7 @@ func TestHandlersReturnNamedObjects(t *testing.T) {
 // TestPluginSourceRoutes guards that the per-plugin source/update/reload routes
 // are dispatched to their handlers instead of falling into the uninstall branch.
 func TestPluginSourceRoutes(t *testing.T) {
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	// Bind-source on a non-existent subprocess plugin: must NOT uninstall, and
@@ -227,7 +227,7 @@ func TestPluginSourceRoutes(t *testing.T) {
 // TestMetadataOrderPreserved verifies the served config metadata keeps the
 // Python CONFIG_METADATA_3 group/section order instead of alphabetical order.
 func TestMetadataOrderPreserved(t *testing.T) {
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	for _, path := range []string{"/api/system-config/schema", "/api/system-config/runtime"} {
@@ -324,7 +324,7 @@ func rawKeys(t *testing.T, body []byte, obj map[string]interface{}, key string) 
 // requests are rejected with 401, and the auth/setup endpoint cannot be used to
 // hijack an account whose password change is no longer required.
 func TestAPIAuthGate(t *testing.T) {
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	// An unauthenticated request to a sensitive endpoint must be rejected.
@@ -374,7 +374,7 @@ func TestAPIAuthGate(t *testing.T) {
 // TestConfigSnapshotRedactsSecrets verifies getConfigSnapshot never leaks the
 // plaintext dashboard password, password hash or JWT signing secret.
 func TestConfigSnapshotRedactsSecrets(t *testing.T) {
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 	s.auth.SetPassword("SuperSecret123")
 
@@ -397,7 +397,7 @@ func TestConfigSnapshotRedactsSecrets(t *testing.T) {
 // the same token is rejected afterwards (server-side revocation), while the
 // logout endpoint itself stays reachable.
 func TestJWTLogoutRevokesToken(t *testing.T) {
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	// A valid token passes the auth gate.
@@ -425,7 +425,7 @@ func TestJWTLogoutRevokesToken(t *testing.T) {
 // TestLoginRateLimit verifies the token-bucket login throttle rejects rapid
 // attempts after the burst is exhausted.
 func TestLoginRateLimit(t *testing.T) {
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 	s.auth.SetPassword("CorrectPw123")
 

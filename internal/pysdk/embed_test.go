@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -141,17 +142,22 @@ func setupFakeVenv(t *testing.T, cacheDir string) (fakePy, wantVenvPython string
 	sum := sha256.Sum256([]byte(fakePy))
 	fp := hex.EncodeToString(sum[:6])
 	venvRoot := filepath.Join(cacheDir, "astrbot-go", "python-venv-"+fp)
-	binDir := filepath.Join(venvRoot, "bin")
+	// venv 解释器布局随平台而异（ensureVenvReady 用同一规则），否则 Windows
+	// 快路径永不命中、退化为真建 venv（跑不可运行的假脚本）→ 假红。
+	binDir, pyName := filepath.Join(venvRoot, "bin"), "python"
+	if runtime.GOOS == "windows" {
+		binDir, pyName = filepath.Join(venvRoot, "Scripts"), "python.exe"
+	}
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(binDir, "python"), []byte("fake"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(binDir, pyName), []byte("fake"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeVenvMarkers(venvRoot, fakePy, SDKVersion, baseDepsVersion); err != nil {
 		t.Fatal(err)
 	}
-	return fakePy, filepath.Join(binDir, "python")
+	return fakePy, filepath.Join(binDir, pyName)
 }
 
 // TestVenvReadyMarker: venv 首次创建时写 READY + environment.json；再次

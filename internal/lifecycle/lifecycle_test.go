@@ -78,7 +78,11 @@ func TestDockerAvailableCacheExpiry(t *testing.T) {
 	}()
 
 	dir := t.TempDir()
-	fakeDocker := filepath.Join(dir, "docker")
+	dockerName := "docker"
+	if runtime.GOOS == "windows" {
+		dockerName = "docker.exe" // exec.LookPath 按 PATHEXT 匹配，无扩展名文件不可见
+	}
+	fakeDocker := filepath.Join(dir, dockerName)
 	write := func() {
 		if err := os.WriteFile(fakeDocker, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 			t.Fatal(err)

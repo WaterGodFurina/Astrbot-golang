@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -335,9 +336,14 @@ func (b *LocalBooter) mapPath(path string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("沙盒路径为空")
 	}
-	p := filepath.Clean(filepath.FromSlash(raw))
-	p = strings.TrimPrefix(p, SandboxWorkdir)
-	p = strings.TrimPrefix(p, string(filepath.Separator))
+	// 统一用 slash 形式做 /workspace 前缀剥离（Windows 上 filepath.FromSlash 会把
+	// SandboxWorkdir "/workspace" 变成 "\workspace"，导致 TrimPrefix 失配、绝对与
+	// 相对路径映射到不同落点），剥离后再转 OS 分隔符参与拼接与校验。
+	slash := filepath.ToSlash(raw)
+	slash = pathpkg.Clean(slash)
+	slash = strings.TrimPrefix(slash, SandboxWorkdir)
+	slash = strings.TrimPrefix(slash, "/")
+	p := filepath.Clean(filepath.FromSlash(slash))
 	b.mu.Lock()
 	root := b.root
 	b.mu.Unlock()

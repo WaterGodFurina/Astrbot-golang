@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -54,13 +55,16 @@ func writeFakeServer(t *testing.T) string {
 }
 
 func TestMCPStdioConnectAndCall(t *testing.T) {
-	if _, err := os.Stat("/usr/bin/python3"); err != nil {
-		t.Skip("python3 not available")
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		if py, err = exec.LookPath("python"); err != nil {
+			t.Skip("python3/python not available")
+		}
 	}
 	script := writeFakeServer(t)
 	client := NewMCPClient("fake", map[string]interface{}{
 		"transport": "stdio",
-		"command":   "/usr/bin/python3",
+		"command":   py,
 		"args":      []interface{}{script},
 	})
 	defer client.Cleanup()
@@ -156,13 +160,16 @@ func TestMCPContentToMapCoversResourceLink(t *testing.T) {
 // burst of concurrent failures cannot tear down a freshly rebuilt connection
 // (L-46.9b).
 func TestMCPReconnectSkipsStaleConnection(t *testing.T) {
-	if _, err := os.Stat("/usr/bin/python3"); err != nil {
-		t.Skip("python3 not available")
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		if py, err = exec.LookPath("python"); err != nil {
+			t.Skip("python3/python not available")
+		}
 	}
 	script := writeFakeServer(t)
 	c := NewMCPClient("fake", map[string]interface{}{
 		"transport": "stdio",
-		"command":   "/usr/bin/python3",
+		"command":   py,
 		"args":      []interface{}{script},
 	})
 	defer c.Cleanup()

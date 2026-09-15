@@ -113,8 +113,8 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	m.MaxRestarts = 2
 	m.RestartBaseDelay = 100 * time.Millisecond
 	// 独立端口区间：与真实宿主（10000-25000）隔离，避免握手/端口干扰。
-	m.MinPort = 50100
-	m.MaxPort = 50200
+	m.MinPort = 30100
+	m.MaxPort = 30200
 	t.Cleanup(m.Shutdown)
 
 	// 预置插件配置 + 宿主 HostService（GetConfig/SetConfig 反向调用）
@@ -343,8 +343,8 @@ func TestPythonPluginSendMarksSent(t *testing.T) {
 	// venv/缓存目录由 TestMain 统一共享（见 runtime_test.go TestMain 注释）。
 	m := newTestManager(t)
 	// 独立端口区间：与真实宿主默认范围（10000-25000）及其他测试隔离。
-	m.MinPort = 50900
-	m.MaxPort = 51000
+	m.MinPort = 30900
+	m.MaxPort = 31000
 	ctx := context.Background()
 	inst, err := m.LoadLang(ctx, "pysend", filepath.Join("testdata", "python_plugin"), "python")
 	if err != nil {

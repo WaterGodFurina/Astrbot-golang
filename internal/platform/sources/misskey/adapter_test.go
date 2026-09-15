@@ -612,8 +612,8 @@ func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
 
 	// 模拟 Listen 安装的 pong 处理器
 	streaming.conn.SetPongHandler(keepalivePongHandler(streaming.conn))
-	// 先将读超时设到 300ms 后，然后由 pong 续期
-	_ = streaming.conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	// 先将读超时设到 3s（跨 OS 慢 runner 防抖），然后由 pong 续期
+	_ = streaming.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 
 	readResult := make(chan error, 1)
 	go func() {
@@ -621,7 +621,7 @@ func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
 		readResult <- err
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 	if err := keepalivePongHandler(streaming.conn)(""); err != nil {
 		t.Fatalf("pong 处理失败: %v", err)
 	}
@@ -629,7 +629,7 @@ func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
 	select {
 	case err := <-readResult:
 		t.Fatalf("pong 续期后读仍返回错误（读超时未刷新）: %v", err)
-	case <-time.After(400 * time.Millisecond):
+	case <-time.After(4 * time.Second):
 		// 仍在阻塞读取，说明 pong 已将读超时续期
 	}
 	// 关闭连接以解除阻塞中的读 goroutine

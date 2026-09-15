@@ -317,11 +317,14 @@ func systemCJKFont(explicit string) string {
 		return explicit
 	}
 	candidates := []string{
+		"data/font.ttf",
 		"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
 		"/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
 		"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
 		"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
 		"/System/Library/Fonts/PingFang.ttc",
+		"/System/Library/Fonts/Hiragino Sans GB.ttc",
+		"/Library/Fonts/Arial Unicode.ttf",
 		"C:/Windows/Fonts/msyh.ttc",
 		"C:/Windows/Fonts/simhei.ttf",
 		"/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",

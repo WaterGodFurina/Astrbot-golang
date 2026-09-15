@@ -27,8 +27,8 @@ func TestPythonPluginRelativeDataDir(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chdir(oldWd) })
 
 	m := NewSubprocessManager(nil, "data")
-	m.MinPort = 50700
-	m.MaxPort = 50800
+	m.MinPort = 30700
+	m.MaxPort = 30800
 	m.MaxRestarts = 2
 	t.Cleanup(m.Shutdown)
 
@@ -111,8 +111,8 @@ func TestPythonPluginRelativeCachePath(t *testing.T) {
 	t.Setenv("ASTRBOT_PYTHON_CACHE_DIR", "relcache")
 
 	m := NewSubprocessManager(nil, "data")
-	m.MinPort = 50600
-	m.MaxPort = 50700
+	m.MinPort = 30600
+	m.MaxPort = 30700
 	m.MaxRestarts = 2
 	m.RestartBaseDelay = 100 * time.Millisecond
 	t.Cleanup(m.Shutdown)

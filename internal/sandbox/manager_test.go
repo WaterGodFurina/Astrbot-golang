@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -62,6 +63,9 @@ func TestLocalBooterSymlinkEscapeRejected(t *testing.T) {
 	}
 	defer b.Stop()
 	if err := os.Symlink("/etc", filepath.Join(root, "evil")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink unavailable (needs Developer Mode/admin): %v", err)
+		}
 		t.Fatalf("symlink: %v", err)
 	}
 	if _, err := b.ReadFile(ctx, "evil/passwd"); err == nil {

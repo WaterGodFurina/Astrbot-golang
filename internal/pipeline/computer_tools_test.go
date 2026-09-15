@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -252,6 +253,9 @@ func TestShellSessionSignalOwnership(t *testing.T) {
 }
 
 func TestBackgroundShellSessionStdinWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relies on POSIX `cat` echoing stdin; Get-Content on cmd.exe does not read redirected stdin")
+	}
 	inTempDir(t)
 	umo := "bg:test"
 	out := executeLocalShell(umo, umo, "cat", true, 0)
