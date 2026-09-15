@@ -934,7 +934,7 @@ func TestIdleUnloadAndLazyReload(t *testing.T) {
 	if err := m.SetPluginIdleUnloadMinutes(inst.ID, 1); err != nil {
 		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
 	}
-	inst.lastActiveNano.Store(time.Now().Add(-time.Minute).UnixNano()) // 模拟闲置
+	inst.lastActiveNano.Store(time.Now().Add(-2 * time.Minute).UnixNano()) // 模拟闲置（2×阈值防慢速 runner 边界 flaky）
 	m.sweepIdlePlugins()
 	if m.Get(inst.ID) != nil {
 		t.Fatal("idle plugin must be unloaded by the sweep")

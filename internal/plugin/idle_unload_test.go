@@ -260,8 +260,9 @@ func TestUnloadIdleCheckedSkipsFreshlyWoken(t *testing.T) {
 		t.Fatal("freshly woken instance must survive unloadIdleChecked")
 	}
 
-	// 对照：真实闲置实例仍会被休眠。
-	inst.lastActiveNano.Store(time.Now().Add(-time.Minute).UnixNano())
+	// 对照：真实闲置实例仍会被休眠。余量取 2×阈值，避免 sweepNow 早于本次
+	// time.Now() 导致差值恰好略小于 1 分钟阈值而在慢速 runner 上偶发不卸载。
+	inst.lastActiveNano.Store(time.Now().Add(-2 * time.Minute).UnixNano())
 	if err := m.unloadIdleChecked(inst.ID, time.Minute, sweepNow); err != nil {
 		t.Fatalf("unloadIdleChecked idle: %v", err)
 	}
@@ -351,7 +352,8 @@ func TestUnloadIdleSkipsPluginUnloadedBroadcast(t *testing.T) {
 		t.Fatalf("SetPluginIdleUnload: %v", err)
 	}
 	m.SetIdleUnload(10 * time.Millisecond)
-	inst.lastActiveNano.Store(time.Now().Add(-time.Minute).UnixNano())
+	// 余量取 2×阈值：慢速 runner 上恰好等于阈值会偶发判"未闲置"不卸载。
+	inst.lastActiveNano.Store(time.Now().Add(-2 * time.Minute).UnixNano())
 
 	// 记录广播：TriggerHookPayload 走 hook 注册表，这里直接断言休眠后
 	// 广播链路未被触发的可观察行为——其余插件收到的 EventOnPluginUnloaded
