@@ -1520,7 +1520,13 @@ var (
 	globalPortUsed = map[int]struct{}{}
 )
 
-// allocPluginPort 分配一个全局唯一的握手端口（min=max=单端口），从 base 起向上扫描第一个未使用端口。base<=0 时用 go-plugin 默认起始值 10000。 除进程内已分配记录外，还会检测端口当前是否被监听（孤儿插件进程、其他 服务的残留监听），占用则跳过——否则 SO_REUSEPORT 双绑会让宿主连接被 内核路由到错误的进程（Register 元数据串台）。 端口耗尽（>65535）时返回 0,0，调用方应停止启动并上报错误。
+// allocPluginPort 分配一个握手端口区间起点：从 base 起向上扫描第一个未使用端口 p，返回 [p, p+15]。base<=0 时用 go-plugin 默认起始值 10000。 除进程内已分配记录外，还会检测端口 p 当前是否被监听（孤儿插件进程、其他 服务的残留监听），占用则跳过——否则 SO_REUSEPORT 双绑会让宿主连接被 内核路由到错误的进程（Register 元数据串台）。 端口耗尽（>65535）时返回 0,0，调用方应停止启动并上报错误。
+//
+// 返回 16 端口小区间而非单端口：宿主探测 p 空闲与子进程真正 bind p 之间存在时间窗
+// （上一个实例的僵尸子进程尚未完全释放端口、Windows 动态端口瞬占等），单端口方案
+// 会让子进程 "Couldn't bind plugin TCP listener" 直接失败（Windows CI 实测根因）。
+// 子进程侧（hashicorp plugin.Serve 与 Python 桥）本就在 [min,max] 内逐个尝试并把
+// 实际端口写进握手行，故放宽区间即获得瞬来自愈能力，仍保留独占区间防串台。
 func allocPluginPort(base int) (uint, uint) {
 	globalPortMu.Lock()
 	defer globalPortMu.Unlock()
@@ -1529,20 +1535,30 @@ func allocPluginPort(base int) (uint, uint) {
 	}
 	for p := base; p <= 65535; p++ {
 		if _, used := globalPortUsed[p]; !used && !portInUse(p) {
-			globalPortUsed[p] = struct{}{}
-			return uint(p), uint(p) // #nosec G115 -- 端口从 base(≥1) 起向上扫描，int→uint 不溢出
+			max := p + 15
+			if max > 65535 {
+				max = 65535
+			}
+			// 整个区间登记为已用：避免相邻分配区间重叠导致子进程在区间内
+			// 互相抢端口（防串台语义保持）。
+			for q := p; q <= max; q++ {
+				globalPortUsed[q] = struct{}{}
+			}
+			return uint(p), uint(max) // #nosec G115 -- 端口从 base(≥1) 起向上扫描，int→uint 不溢出
 		}
 	}
 	return 0, 0
 }
 
-// releasePluginPort 归还握手端口（实例 teardown/启动失败时调用；0 = 未分配， 直接忽略）。归还后该端口可被后续插件重新使用。
+// releasePluginPort 归还握手端口区间起点（实例 teardown/启动失败时调用；0 = 未分配， 直接忽略）。按与 allocPluginPort 相同的推导归还 [p, p+15] 整个区间，可被后续插件重新使用。
 func releasePluginPort(p uint) {
 	if p == 0 {
 		return
 	}
 	globalPortMu.Lock()
-	delete(globalPortUsed, int(p))
+	for q := int(p); q <= min(int(p)+15, 65535); q++ {
+		delete(globalPortUsed, q)
+	}
 	globalPortMu.Unlock()
 }
 
