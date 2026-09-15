@@ -1622,7 +1622,9 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 
 	cmd := exec.Command(abs) // #nosec G204 -- 启动 Go 插件可执行文件（插件系统核心）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = pluginDataRoot
-	return m.dispensePlugin(ctx, id, abs, language, cmd, nil)
+	// Go 插件同样接 stderr 采集器：握手失败（Windows CI 上"Unrecognized remote plugin
+	// message"空尾串）时可回吐子进程真实输出定位根因；无 [ASTRBOT] 协议行时按原文诊断。
+	return m.dispensePlugin(ctx, id, abs, language, cmd, newAstrbotStartupParser())
 }
 
 // pythonRuntime resolves (once) the Python subprocess environment: SDK extraction + venv/grpcio preparation + (optionally) downloading a bundled Python when the system has none. The first Python plugin load may take a while (download / venv creation + pip install). 供给模式取宿主配置 （pipDepsMode：lazy 核心层 / full 全量 / 空按 pysdk 默认 lazy）。
@@ -1685,6 +1687,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		})},
 	}
 	if stderrParser != nil {
+		stderrParser.lang = language
 		cfg.Stderr = stderrParser
 	}
 	// 每个插件分配独占握手端口（见 portAllocMu 注释）：避免 SO_REUSEPORT 同端口双绑导致宿主连接路由到错误的插件进程。
@@ -1815,11 +1818,21 @@ func (m *SubprocessManager) wrapStartError(parser *astrbotStartupParser, err err
 	}
 	// go-plugin 在 Kill 时已排空 stderr 管道，STARTUP_ERROR 行通常已落地； 给 1s 兜底等 stderr 转发协程完成，避免竞态丢掉错误行。
 	se := parser.WaitError(1 * time.Second)
+	kind := "Python"
+	switch strings.ToLower(parser.lang) {
+	case "go":
+		kind = "Go"
+	}
 	if se == nil {
+		// 无 [ASTRBOT] 协议错误（Go 插件或早退的 Python）：回吐子进程 stderr 尾部，
+		// 否则 Windows 上只剩 "Unrecognized remote plugin message:" 无线索。
+		if tail := parser.Tail(); tail != "" {
+			return fmt.Errorf("%s 插件启动失败（go-plugin 原始错误: %v）；子进程 stderr 尾部:\n%s", kind, err, tail)
+		}
 		return err
 	}
-	return fmt.Errorf("Python 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
-		se.Phase, se.Plugin, se.Error, err)
+	return fmt.Errorf("%s 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
+		kind, se.Phase, se.Plugin, se.Error, err)
 }
 
 // startWatch polls the child process for exit and triggers crash handling.

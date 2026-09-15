@@ -1143,8 +1143,8 @@ exit 1
 	m.MaxRestarts = 2
 	m.RestartBaseDelay = 100 * time.Millisecond
 	// 独立端口区间，避免与真实宿主（10000-25000）及并发测试互相干扰。
-	m.MinPort = 50300
-	m.MaxPort = 50400
+	m.MinPort = 30300
+	m.MaxPort = 30400
 	t.Cleanup(m.Shutdown)
 
 	_, err := m.LoadLang(context.Background(), "py_broken", filepath.Join("testdata", "python_plugin"), "python")

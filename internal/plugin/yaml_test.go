@@ -15,8 +15,8 @@ func TestInstallPythonPluginYAMLMetadata(t *testing.T) {
 	dataDir := t.TempDir()
 	m := NewSubprocessManager(nil, dataDir)
 	m.MaxRestarts = 2
-	m.MinPort = 50300
-	m.MaxPort = 50400
+	m.MinPort = 30300
+	m.MaxPort = 30400
 	t.Cleanup(m.Shutdown)
 
 	inst, err := m.InstallFromSource(context.Background(), "yaml_demo", filepath.Join("testdata", "yaml_plugin"), InstallOptions{GoChoice: "download"})

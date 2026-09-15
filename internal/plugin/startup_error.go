@@ -42,7 +42,12 @@ type astrbotStartupParser struct {
 	lastPhase  string
 	startupErr *astrbotStartupError
 	errCh      chan struct{} // closed on the first STARTUP_ERROR line
+	tail       []string      // 最近若干行原始 stderr（含非协议行），供无协议错误时回吐诊断
+	lang       string        // 插件语言（Go/Python），仅用于错误前缀措辞
 }
+
+// maxTailLines caps the raw stderr ring so startup failures (especially Go 插件在 Windows 上握手失败——无 [ASTRBOT] 协议行) can surface the child's actual output.
+const maxTailLines = 40
 
 func newAstrbotStartupParser() *astrbotStartupParser {
 	return &astrbotStartupParser{errCh: make(chan struct{})}
@@ -72,8 +77,14 @@ func (p *astrbotStartupParser) Write(b []byte) (int, error) {
 func (p *astrbotStartupParser) handleLine(line string) {
 	const prefix = "[ASTRBOT]"
 	if !strings.HasPrefix(line, prefix) {
-		// 非协议行：原样转发（保持 go-plugin 默认的 stderr 转发语义）。
+		// 非协议行：原样转发（保持 go-plugin 默认的 stderr 转发语义），并入尾部环形缓存。
 		logger.Debug("插件 stderr: %s", line)
+		if strings.TrimSpace(line) != "" {
+			p.tail = append(p.tail, line)
+			if len(p.tail) > maxTailLines {
+				p.tail = p.tail[len(p.tail)-maxTailLines:]
+			}
+		}
 		return
 	}
 	rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
@@ -155,6 +166,24 @@ func truncateLine(s string) string {
 		return s[:maxStartupErrorLen] + "...(截断)"
 	}
 	return s
+}
+
+// Tail returns the last raw stderr lines (non-protocol), joined for error
+// messages ("" when nothing captured).
+func (p *astrbotStartupParser) Tail() string {
+	if p == nil {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.tail) == 0 {
+		return ""
+	}
+	out := strings.Join(p.tail, "\n")
+	if len(out) > maxStartupErrorLen {
+		out = out[len(out)-maxStartupErrorLen:]
+	}
+	return out
 }
 
 // Phases returns the startup phases observed so far, in order.
