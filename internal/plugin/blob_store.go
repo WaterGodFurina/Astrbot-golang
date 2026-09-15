@@ -121,6 +121,11 @@ func (s *BlobStore) blobPath(handle string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Windows 短文件名（RUNNER~1）下 Abs 与 EvalSymlinks 结果不同形：root 必须
+	// 同样解析为长路径再比较，否则合法 handle 被误判 "symlink escapes blob root"。
+	if rr, rerr := filepath.EvalSymlinks(root); rerr == nil {
+		root = rr
+	}
 	// handle 必须与文件名一致（由我们生成的 32hex），不信任任意传入路径。
 	p := filepath.Join(root, filepath.Clean("/"+handle))
 	abs, err := filepath.Abs(p)

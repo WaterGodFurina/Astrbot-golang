@@ -74,7 +74,17 @@ jobs:
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
-        run: go mod tidy
+        shell: bash
+        # goproxy.cn 偶发 HTTP/2 INTERNAL_ERROR（海外 runner 拉大依赖树时）。tidy
+        # 幂等，失败重试 5 次；与 test.yml 同策略，避免 macOS 分支卡在 tidy。
+        run: |
+          for i in 1 2 3 4 5; do
+            if go mod tidy; then exit 0; fi
+            echo "go mod tidy attempt $i failed, retrying..."
+            sleep $((i * 5))
+          done
+          echo "::error::go mod tidy failed after 5 attempts"
+          exit 1
 
       - name: 安装 Python（插件子进程测试需要）
         uses: actions/setup-python@v5

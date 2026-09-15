@@ -505,10 +505,7 @@ func enforceRealPathWithin(resolved string, roots []string) error {
 				if aerr != nil {
 					continue
 				}
-				rootReal := rootAbs
-				if r, rerr := filepath.EvalSymlinks(rootAbs); rerr == nil {
-					rootReal = r
-				}
+				rootReal := evalPathOrExistingAncestor(rootAbs)
 				if within, werr := pathWithin(rootReal, real); werr == nil && within {
 					return nil
 				}
@@ -518,6 +515,28 @@ func enforceRealPathWithin(resolved string, roots []string) error {
 		parent := filepath.Dir(cur)
 		if parent == cur || parent == "." {
 			return nil
+		}
+		tail = append([]string{filepath.Base(cur)}, tail...)
+		cur = parent
+	}
+}
+
+// evalPathOrExistingAncestor 解析路径真实位置；不存在时回退"最深已存在祖先的
+// 解析结果+剩余段"。Windows 短名（RUNNER~1）与 EvalSymlinks 长名异形，允许根
+// 常为未创建的目录（如 data/skills），需同样解析后才能与 resolved 比较。
+func evalPathOrExistingAncestor(p string) string {
+	cur := p
+	var tail []string
+	for {
+		if real, err := filepath.EvalSymlinks(cur); err == nil {
+			for _, c := range tail {
+				real = filepath.Join(real, c)
+			}
+			return real
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur || parent == "." {
+			return p
 		}
 		tail = append([]string{filepath.Base(cur)}, tail...)
 		cur = parent

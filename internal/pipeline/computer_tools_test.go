@@ -79,6 +79,14 @@ func TestResolveLocalPathHomeAndDot(t *testing.T) {
 	}
 }
 
+func hostFileOutsideWorkspace(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return filepath.Join(filepath.VolumeName(t.TempDir()), "Windows", "System32", "config", "SAM")
+	}
+	return "/etc/passwd"
+}
+
 func TestResolveLocalPathRejectsOutside(t *testing.T) {
 	inTempDir(t)
 	umo := "t:c"
@@ -86,7 +94,7 @@ func TestResolveLocalPathRejectsOutside(t *testing.T) {
 	if _, err := resolveLocalPath("../outside.txt", umo, false, true); err == nil {
 		t.Errorf("expected rejection for ../ outside workspace")
 	}
-	if _, err := resolveLocalPath("/etc/passwd", umo, false, true); err == nil {
+	if _, err := resolveLocalPath(hostFileOutsideWorkspace(t), umo, false, true); err == nil {
 		t.Errorf("expected rejection for absolute path outside allowed roots")
 	}
 	if _, err := resolveLocalPath("../../../../tmp/evil.txt", umo, false, true); err == nil {
@@ -149,7 +157,11 @@ func TestExecuteGrepRestrictsToWorkspace(t *testing.T) {
 	dir := inTempDir(t)
 	umo := "t:c"
 
-	if out := executeGrep("x", "/etc", "", 10, umo, true); !strings.Contains(out, "restricted") {
+	outsideDir := "/etc"
+	if runtime.GOOS == "windows" {
+		outsideDir = filepath.Join(filepath.VolumeName(dir), "Windows", "System32", "drivers", "etc")
+	}
+	if out := executeGrep("x", outsideDir, "", 10, umo, true); !strings.Contains(out, "restricted") {
 		t.Errorf("expected absolute path outside workspace rejected, got: %q", out)
 	}
 	if out := executeGrep("x", "../../../etc", "", 10, umo, true); !strings.Contains(out, "restricted") {
