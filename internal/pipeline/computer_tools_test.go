@@ -15,6 +15,12 @@ import (
 func inTempDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	// macOS 上 /var→/private/var 软链：t.TempDir() 给逻辑路径，而 os.Getwd/
+	// filepath.Abs 给物理路径，两者词法不等会让 workspace 内绝对路径被误拒。
+	// 规范化到物理路径与生产一致（Linux/Windows EvalSymlinks 基本恒等）。
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
+	}
 	old, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)

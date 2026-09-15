@@ -70,6 +70,11 @@ func TestSDKInModCacheUsesExplicitGoAndWorkDir(t *testing.T) {
 	}
 
 	workDir := t.TempDir()
+	// macOS /var→/private/var 软链：fake go 里的 `pwd` 返回物理路径，规范化
+	// workDir 与之对齐（Linux/Windows 恒等）。
+	if real, err := filepath.EvalSymlinks(workDir); err == nil {
+		workDir = real
+	}
 	got, err := sdkInModCache(fakeGo, workDir, "v0.0.0")
 	if err != nil {
 		t.Fatalf("sdkInModCache: %v", err)
