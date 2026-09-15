@@ -2211,7 +2211,9 @@ func rewritePluginIDPath(path, oldID, newID string) string {
 		if seg == "" {
 			continue
 		}
-		re := regexp.MustCompile(`(^|/)` + regexp.QuoteMeta(seg) + `(/|$)`)
+		// 分隔符同时认 / 与 \：Windows 上 filepath.Join 写入 manifest 的路径用 \，
+		// 仅匹配 / 会让旧 id 路径段永不改写（TestMigratePluginLayout Windows 红）。
+		re := regexp.MustCompile(`(^|[/\\])` + regexp.QuoteMeta(seg) + `([/\\]|$)`)
 		out = re.ReplaceAllString(out, "${1}"+newID+"${2}")
 	}
 	return out
