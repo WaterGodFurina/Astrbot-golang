@@ -1550,6 +1550,29 @@ func allocPluginPort(base int) (uint, uint) {
 	return 0, 0
 }
 
+// waitExeHandleReleased Windows 上被终止的子进程 exe 文件句柄释放有毫秒~秒级
+// 滞后（TerminateProcess 异步 + 杀软/索引器扫新文件），测试的 t.TempDir 清理
+// 会撞 "Access is denied" 假红。轮询写打开探测直到句柄放开或超时。非 Windows/
+// 路径不存在时快速返回。
+func waitExeHandleReleased(abs string) {
+	if runtime.GOOS != "windows" || abs == "" {
+		return
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		f, err := os.OpenFile(abs, os.O_WRONLY, 0)
+		if err != nil {
+			if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		_ = f.Close()
+		return
+	}
+}
+
 // releasePluginPort 归还握手端口区间起点（实例 teardown/启动失败时调用；0 = 未分配， 直接忽略）。按与 allocPluginPort 相同的推导归还 [p, p+15] 整个区间，可被后续插件重新使用。
 func releasePluginPort(p uint) {
 	if p == 0 {
@@ -1761,6 +1784,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 			releasePluginPort(minp)
 			// 握手失败时直接子进程可能已退出（killProcessGroup 对 ESRCH 视为 完成），但 Python 桥可能已拉起子进程：按组回收兜底。
 			killProcessGroup(&PluginInstance{pgid: res.pid})
+			waitExeHandleReleased(abs)
 			return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: %w", id, res.err))
 		}
 		pc = res.pc
@@ -1774,6 +1798,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		if res.pc != nil {
 			_ = res.pc.Close()
 		}
+		waitExeHandleReleased(abs)
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: handshake timed out after %v", id, startTimeout))
 	case <-m.ctx.Done():
 		raw.Kill()
@@ -1783,6 +1808,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		if res.pc != nil {
 			_ = res.pc.Close()
 		}
+		waitExeHandleReleased(abs)
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: manager shutting down", id))
 	}
 
@@ -1796,6 +1822,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		raw.Kill()
 		releasePluginPort(minp)
 		killProcessGroup(&PluginInstance{pgid: pid})
+		waitExeHandleReleased(abs)
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("plugin %s Register: %w", id, err))
 	}
 	// 用 Register 返回的注册名更新 HostService 连接身份（accept 时只绑定 manifest id，name 与 id 可能不同）。之后插件 GetConfig/SetConfig 传的 name 与连接身份一致，身份隔离校验才能通过。
@@ -2389,6 +2416,7 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	// 先按进程组回收（SIGTERM → 宽限 → SIGKILL，含 Python 桥再拉起的 子进程）；killProcessGroup 返回 false（未记录 pgid / 非 unix 平台） 或进程已被组信号杀死后，raw.Kill() 兜底回收直接子进程并完成 go-plugin 的簿记（reap）。顺序不可反：raw.Kill() 只杀直接子进程， 先组杀保证整棵进程树被回收。
 	killProcessGroup(inst)
 	inst.raw.Kill()
+	waitExeHandleReleased(inst.Binary)
 	if inst.Client != nil {
 		_ = inst.Client.Close()
 	}
