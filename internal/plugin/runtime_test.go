@@ -73,6 +73,10 @@ func newTestManager(t *testing.T) *SubprocessManager {
 	// Fast backoff + polling for tests.
 	m.RestartBaseDelay = 100 * time.Millisecond
 	m.PollInterval = 50 * time.Millisecond
+	// 注册 Shutdown 清理：LIFO 保证先于 t.TempDir 的 RemoveAll 执行，回收全部
+	// 插件子进程；否则 Windows 上残留进程持有 plugins-bin 下 exe 句柄，TempDir
+	// 自动清理撞 "Access is denied" 造成纯 cleanup 期假红（Linux/macOS 无此锁）。
+	t.Cleanup(m.Shutdown)
 	return m
 }
 
