@@ -17,11 +17,17 @@ on:
 
 jobs:
   go-test:
-    name: Go 测试
+    name: Go 测试 (${{ matrix.os }})
     # 依赖前端构建：二进制 //go:embed 嵌入 internal/dashboard/web/dist，必须
     # 等前端构建并同步 dist 到仓库后再编译/测试，保证产物嵌入最新前端。
     needs: frontend
-    runs-on: ubuntu-latest
+    # 多系统矩阵（linux/windows/macOS 全量 go test）。fail-fast: false 即
+    # "error 取并集"：任一系统红灯不中断其余系统，最终收集全部三系的失败。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
@@ -44,7 +50,17 @@ jobs:
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
-        run: go mod tidy
+        shell: bash
+        # goproxy.cn 偶发 HTTP/2 INTERNAL_ERROR / 5xx（尤其海外 runner 拉超大
+        # 依赖树时）。tidy 幂等，失败重试 5 次，退避递增；与 release.yml 同策略。
+        run: |
+          for i in 1 2 3 4 5; do
+            if go mod tidy; then exit 0; fi
+            echo "go mod tidy attempt $i failed, retrying..."
+            sleep $((i * 5))
+          done
+          echo "::error::go mod tidy failed after 5 attempts"
+          exit 1
 
       - name: 安装 Python（插件子进程测试需要）
         uses: actions/setup-python@v5
@@ -54,11 +70,13 @@ jobs:
           cache-dependency-path: 'internal/pysdk/embed.go'
 
       - name: 配置 apt 缓存目录到用户空间（/var/cache/apt root 不可写）
+        if: runner.os == 'Linux'
         run: |
           mkdir -p ~/.apt-cache/partial
           echo 'Dir::Cache::archives "/home/runner/.apt-cache/";' | sudo tee /etc/apt/apt.conf.d/99-astrbot-cache
 
       - name: apt 缓存（字体安装加速）
+        if: runner.os == 'Linux'
         uses: actions/cache@v4
         with:
           path: ~/.apt-cache
@@ -69,6 +87,7 @@ jobs:
       - name: 安装中文字体（t2i 测试需要）
         # runner 在 Azure 云端，azure.archive.ubuntu.com 即本地镜像（最快），
         # 不要切国内源（跨国际网络反而更慢）。加超时+重试防偶发网络抖动。
+        if: runner.os == 'Linux'
         timeout-minutes: 3
         run: |
           sudo apt-get update -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
@@ -87,10 +106,12 @@ jobs:
         run: go build ./...
 
       - name: go vet
+        shell: bash
         run: go vet ./... 2>&1 | grep -v "copies lock value" || true
 
       - name: 运行全部测试
-        timeout-minutes: 30
+        # 三系统矩阵下 windows/macOS runner 普遍慢于 linux，放宽预算。
+        timeout-minutes: 45
         env:
           CGO_ENABLED: '0'
           # GitHub runner 在海外（Azure），直连官方 PyPI 比走阿里云镜像更快且
@@ -98,13 +119,13 @@ jobs:
           # 已缓存 wheel，插件子进程首次装宿主依赖也能命中。
           PIP_INDEX_URL: https://pypi.org/simple
           ASTRBOT_PYPI_INDEX: https://pypi.org/simple
-        run: go test ./... -count=1 -timeout 25m
+        run: go test ./... -count=1 -timeout 40m
 
       - name: 上传失败测试日志
         if: failure()
         uses: actions/upload-artifact@v5
         with:
-          name: test-output
+          name: test-output-${{ matrix.os }}
           path: |
             **/test*.log
             **/TEST-*.xml
@@ -112,6 +133,7 @@ jobs:
 
       - name: 计算版本号（version tag + python version）
         id: ver
+        shell: bash
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             VER="${GITHUB_REF_NAME}"
@@ -124,7 +146,10 @@ jobs:
         env:
           PYTHON_VERSION: ${{ inputs.python_version }}
 
+      # 编译产物仅在 ubuntu 分支生成（与原单系统行为一致），跨编译覆盖
+      # linux/windows 两个目标；其余系统分支只负责编译检查+跑测试。
       - name: 编译 AstrBot（linux amd64 gnu，纯 Go 无 CGO）
+        if: runner.os == 'Linux'
         env:
           CGO_ENABLED: '0'
           GOOS: linux
@@ -132,6 +157,7 @@ jobs:
         run: go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ steps.ver.outputs.version_tag }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ steps.ver.outputs.python_version }}" -o astrbot-linux-amd64 ./cmd/astrbot
 
       - name: 编译 AstrBot（windows amd64，纯 Go 无 CGO）
+        if: runner.os == 'Linux'
         env:
           CGO_ENABLED: '0'
           GOOS: windows
@@ -139,6 +165,8 @@ jobs:
         run: go build -trimpath -ldflags="-s -w -X github.com/WaterGodFurina/Astrbot-golang/internal/version.Version=${{ steps.ver.outputs.version_tag }} -X github.com/WaterGodFurina/Astrbot-golang/internal/version.PythonVersion=${{ steps.ver.outputs.python_version }}" -o astrbot-windows-amd64.exe ./cmd/astrbot
 
       - name: 校验 Windows 编译产物
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
           ls -la astrbot-windows-amd64.exe
           file astrbot-windows-amd64.exe
@@ -146,6 +174,7 @@ jobs:
           head -c 2 astrbot-windows-amd64.exe | xxd | grep "4d5a" || { echo "不是有效的 PE 头"; exit 1; }
 
       - name: 上传 Windows 编译产物
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v5
         with:
           name: astrbot-windows-amd64
@@ -153,6 +182,7 @@ jobs:
           if-no-files-found: error
 
       - name: 校验编译产物
+        if: runner.os == 'Linux'
         run: |
           ls -la astrbot-linux-amd64
           file astrbot-linux-amd64
@@ -165,6 +195,7 @@ jobs:
           grep "AstrBot Go" /tmp/astrbot-ver.txt
 
       - name: 上传编译产物
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v5
         with:
           name: astrbot-linux-amd64

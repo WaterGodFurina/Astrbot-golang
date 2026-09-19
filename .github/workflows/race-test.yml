@@ -16,8 +16,14 @@ on:
 
 jobs:
   race-test:
-    name: Go Race 测试
-    runs-on: ubuntu-latest
+    name: Go Race 测试 (${{ matrix.os }})
+    # 多系统矩阵（linux/windows/macOS 全量 --race）。fail-fast: false 即
+    # "error 取并集"：任一系统红灯不中断其余系统，收集全部三系的失败。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -34,12 +40,14 @@ jobs:
         run: corepack enable
 
       - name: 前端构建（嵌入 dist，供 //go:embed）
+        shell: bash
         run: |
           pnpm install --frozen-lockfile
           pnpm build && pnpm build:t2i-shiki-runtime
         working-directory: dashboard
 
       - name: 同步 dist 到内嵌目录（仅本工作区，不推送）
+        shell: bash
         run: |
           rm -rf internal/dashboard/web/dist
           mkdir -p internal/dashboard/web/dist
@@ -51,12 +59,32 @@ jobs:
           go-version: '1.26.5'
           cache-dependency-path: go.sum
 
+      - name: 准备 Windows C 工具链（race 需 CGO+gcc）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if command -v gcc >/dev/null 2>&1; then gcc --version; exit 0; fi
+          for d in "C:/mingw64/bin" "C:/msys64/mingw64/bin" "C:/MinGW/bin"; do
+            if [ -x "$d/gcc.exe" ]; then echo "$d" >> "$GITHUB_PATH"; exit 0; fi
+          done
+          choco install mingw -y --no-progress
+
       - name: 用 goproxy.cn 重建 go.sum（本地对齐，不提交回仓库）
         env:
           GOPROXY: https://goproxy.cn,direct
           GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
           GOFLAGS: -mod=mod
-        run: go mod tidy
+        shell: bash
+        # goproxy.cn 偶发 HTTP/2 INTERNAL_ERROR（海外 runner 拉大依赖树时）。tidy
+        # 幂等，失败重试 5 次；与 test.yml 同策略，避免 macOS 分支卡在 tidy。
+        run: |
+          for i in 1 2 3 4 5; do
+            if go mod tidy; then exit 0; fi
+            echo "go mod tidy attempt $i failed, retrying..."
+            sleep $((i * 5))
+          done
+          echo "::error::go mod tidy failed after 5 attempts"
+          exit 1
 
       - name: 安装 Python（插件子进程测试需要）
         uses: actions/setup-python@v5
@@ -75,6 +103,7 @@ jobs:
           go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
 
       - name: 安装中文字体（t2i 测试需要）
+        if: runner.os == 'Linux'
         timeout-minutes: 3
         run: |
           sudo apt-get update -q -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
@@ -84,20 +113,21 @@ jobs:
         run: go build ./...
 
       - name: 运行全部测试（race detector，CGO 开启）
-        timeout-minutes: 45
+        # windows/macOS race runner 普遍慢于 linux，放宽预算。
+        timeout-minutes: 75
         env:
           CGO_ENABLED: '1'
           ASTRBOT_TEST_RACE: '1'
           # GitHub runner 海外直连官方 PyPI（见 test.yml 注释）。
           PIP_INDEX_URL: https://pypi.org/simple
           ASTRBOT_PYPI_INDEX: https://pypi.org/simple
-        run: go test --race ./... -count=1 -timeout 40m
+        run: go test --race ./... -count=1 -timeout 70m
 
       - name: 上传失败测试日志
         if: failure()
         uses: actions/upload-artifact@v5
         with:
-          name: race-test-output
+          name: race-test-output-${{ matrix.os }}
           path: |
             **/test*.log
             **/TEST-*.xml
