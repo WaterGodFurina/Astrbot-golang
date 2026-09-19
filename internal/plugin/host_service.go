@@ -298,7 +298,11 @@ func (m *SubprocessManager) pluginConfigID(name string) string {
 			return found
 		}
 	}
-	return ""
+	// 零命中（实例尚未注册进 map，或旧布局/测试无 manifest）：回退注册名作为
+	// 配置目录键（兼容历史行为）。同名多变体歧义已在上面的循环里返回 ""，
+	// 故此处回退不会造成跨变体串读；且 SDK 侧 GetConfig 已按连接身份校验
+	// req.PluginName，插件无法用别人的名字请求配置。
+	return name
 }
 
 // resolvePluginConfig returns the merged plugin config for the HostService

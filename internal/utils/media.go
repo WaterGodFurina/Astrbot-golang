@@ -32,6 +32,17 @@ func IsFileURI(s string) bool {
 //   - Windows 盘符路径 file:///C:/... 去掉前导 '/' 得到 C:/...，
 //     再由 filepath.FromSlash 归一为本地分隔符；非 Windows 保序。
 func FileURIToPathOK(raw string) (string, bool) {
+	if !strings.HasPrefix(raw, "file://") {
+		return "", false
+	}
+	// Windows 盘符形态（file://C:\...、file://C:/...、file:///C:/...）：
+	// url.Parse 会把盘符当作 host，从而被误判为远端主机而拒绝。这里显式
+	// 折叠为本地路径（percent-encoding 仍解码）；仅 Windows 生效。
+	if runtime.GOOS == "windows" {
+		if p, ok := fileURIToPathWindows(raw); ok {
+			return p, true
+		}
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "file" {
 		return "", false
@@ -49,6 +60,23 @@ func FileURIToPathOK(raw string) (string, bool) {
 		p = p[1:]
 	}
 	return filepath.FromSlash(p), true
+}
+
+// fileURIToPathWindows 解析 Windows 盘符形态的 file URI（file://C:\...、
+// file://C:/...、file:///C:/...）。独立成函数以便跨平台单测（生产仅 Windows
+// 调用）。返回 ok=false 表示不是盘符形态，交回通用 url.Parse 路径处理。
+func fileURIToPathWindows(raw string) (string, bool) {
+	r := strings.TrimPrefix(raw, "file://")
+	if strings.HasPrefix(r, "/") {
+		r = r[1:]
+	}
+	if len(r) >= 2 && r[1] == ':' {
+		if dec, err := url.PathUnescape(r); err == nil {
+			r = dec
+		}
+		return filepath.FromSlash(r), true
+	}
+	return "", false
 }
 
 // FileURIToPath converts a file:// URI to a filesystem path. Non-URI inputs and
