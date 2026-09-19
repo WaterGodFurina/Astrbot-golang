@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"runtime"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -88,6 +90,13 @@ type Event struct {
 	MessageStr string
 	Timestamp  time.Time
 	Reply      *Event // quoted reply target
+
+	// Metadata 承载平台附加字段（如 temporary_file_paths、extra_data）与管线
+	// 运行期写入的键。事件发布后管线可能在其它 goroutine 中原地写入该 map，
+	// 读取方（如 Misskey 发送时读取 extra_data）必须经 SetExtra/GetExtra/
+	// MetadataSnapshot 访问，否则与管线写入并发触发 map race。
+	// metadataMu 仅保护 map 的装载与键值访问，不递归保护值内部结构。
+	metadataMu sync.RWMutex
 	Metadata   map[string]interface{}
 
 	// Ctx, when set, is the execution context for this event's pipeline run
@@ -243,17 +252,38 @@ func (e *Event) ClearResult() {
 	e.Result = nil
 }
 
-// SetExtra sets a metadata key.
+// SetExtra sets a metadata key. 加锁以与事件发布后的并发读取（GetExtra /
+// MetadataSnapshot）同步。
 func (e *Event) SetExtra(key string, value interface{}) {
+	e.metadataMu.Lock()
+	defer e.metadataMu.Unlock()
 	if e.Metadata == nil {
 		e.Metadata = make(map[string]interface{})
 	}
 	e.Metadata[key] = value
 }
 
-// GetExtra returns a metadata value.
+// GetExtra returns a metadata value. 加读锁以与 SetExtra 的并发写入同步。
 func (e *Event) GetExtra(key string) interface{} {
+	e.metadataMu.RLock()
+	defer e.metadataMu.RUnlock()
 	return e.Metadata[key]
+}
+
+// MetadataSnapshot 在锁内复制事件 Metadata 的顶层键值，返回给需要在事件
+// 发布后（管线可能仍在原地写 map）安全读取的调用方。返回的 map 为快照，
+// 对其修改不会影响事件本身。
+func (e *Event) MetadataSnapshot() map[string]interface{} {
+	e.metadataMu.RLock()
+	defer e.metadataMu.RUnlock()
+	if e.Metadata == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(e.Metadata))
+	for k, v := range e.Metadata {
+		out[k] = v
+	}
+	return out
 }
 
 // HasSendOper returns whether a send operation was performed.
@@ -284,6 +314,11 @@ type StageResult struct {
 type EventBus struct {
 	mu         sync.RWMutex
 	schedulers map[string]*PipelineScheduler // keyed by config_id
+	// confResolver 按事件的 UMO 解析其归属的配置 ID（多配置/多 abconf 路由）。
+	// 对齐 Python event_bus.py dispatch：get_conf_info(unified_msg_origin) →
+	// pipeline_scheduler_mapping[conf_id]，事件只进入其配置对应的调度器。
+	// 未设置时按单配置模式处理。由 lifecycle 在启动时注入（SetConfResolver）。
+	confResolver atomic.Value
 	// queue is a growable slice guarded by queueMu. It replaces the previous
 	// fixed-capacity channel: Publish never drops events (it blocks once the
 	// queue reaches maxQueueCap) and the queue auto-grows under bursts.
@@ -352,6 +387,23 @@ func (bus *EventBus) GetScheduler(confID string) *PipelineScheduler {
 	bus.mu.RLock()
 	defer bus.mu.RUnlock()
 	return bus.schedulers[confID]
+}
+
+// SetConfResolver injects the UMO → config-ID resolver used by dispatch to
+// route each event to the scheduler of its owning config profile (Python:
+// astrbot_config_mgr.get_conf_info(event.unified_msg_origin)). The resolver
+// is read atomically; passing nil disables routing (single-config mode).
+func (bus *EventBus) SetConfResolver(fn func(umo string) string) {
+	bus.confResolver.Store(fn)
+}
+
+// resolveConfID resolves the config ID for an event UMO. Returns "" when no
+// resolver is wired or the resolver has no opinion (caller falls back).
+func (bus *EventBus) resolveConfID(umo string) string {
+	if fn, ok := bus.confResolver.Load().(func(string) string); ok && fn != nil {
+		return fn(umo)
+	}
+	return ""
 }
 
 // Start begins dispatching events. Events are routed to per-session workers
@@ -484,7 +536,9 @@ func (bus *EventBus) enqueueToWorker(ctx context.Context, event *Event) bool {
 func eventShardKey(event *Event) int {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(event.UnifiedMsgOrigin()))
-	return int(h.Sum32())
+	// 掩码去掉符号位：Sum32 在 32 位平台上 int(uint32) 可能变为负数，
+	// 直接作为索引会越界 panic，这里保证结果恒为非负。
+	return int(h.Sum32() & 0x7fffffff)
 }
 
 // Publish enqueues an event for processing. It never drops events: the queue
@@ -584,28 +638,32 @@ func (bus *EventBus) Stop() {
 // the timeout guards against a permanently stuck stage.
 const eventBusStopTimeout = 30 * time.Second
 
-// dispatch runs the event through every registered scheduler. The scheduler
-// set is snapshotted under a read lock, then Process is invoked outside the
-// lock so a slow pipeline (up to minutes) can never stall RegisterScheduler /
+// dispatch routes the event to the pipeline scheduler of the config profile
+// it belongs to (Python event_bus.py dispatch: get_conf_info(unified_msg_origin)
+// → pipeline_scheduler_mapping[conf_id]). 多配置时按 UMO 路由，避免多个调度器
+// 各自跑一遍同一事件（或 map 随机序首个兜住的错误路由）。无 resolver（单配置）
+// 或解析不到归属时回退到 default 调度器，保持旧行为。The scheduler set is
+// snapshotted under a read lock, then Process is invoked outside the lock so a
+// slow pipeline (up to minutes) can never stall RegisterScheduler /
 // ReloadPipelineScheduler (which need the write lock).
 func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
-	bus.mu.RLock()
-	schedulers := make([]*PipelineScheduler, 0, len(bus.schedulers))
-	for _, scheduler := range bus.schedulers {
-		schedulers = append(schedulers, scheduler)
+	scheduler := bus.pickScheduler(event)
+	if scheduler == nil {
+		logger.Error("EventBus: 事件 %q 未找到可用的管线调度器，已忽略", event.UnifiedMsgOrigin())
+		if event.Metadata != nil {
+			if done, ok := event.Metadata[MetadataPipelineDone].(*PipelineDone); ok {
+				done.Signal()
+			}
+		}
+		return
 	}
-	bus.mu.RUnlock()
-	logger.Debug("EventBus: 正在分发消息 %q（调度器=%d）", event.MessageStr, len(schedulers))
+	logger.Debug("EventBus: 正在分发消息 %q（调度器=%s）", event.MessageStr, scheduler.ConfID())
 
-	for _, scheduler := range schedulers {
-		result, err := scheduler.Process(ctx, event)
-		if err != nil {
-			logger.Error("Pipeline task failed: %v", err)
-			break
-		}
-		if result != nil && !result.Continue {
-			break
-		}
+	result, err := scheduler.Process(ctx, event)
+	if err != nil {
+		logger.Error("Pipeline task failed: %v", err)
+	} else if result != nil && !result.Continue {
+		logger.Debug("EventBus: 调度器 %s 拦截了事件 %q", scheduler.ConfID(), event.MessageStr)
 	}
 	// Signal completion so publishers that enqueued the event (e.g. dashboard
 	// chat) can observe that the pipeline run finished.
@@ -614,6 +672,36 @@ func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
 			done.Signal()
 		}
 	}
+}
+
+// pickScheduler resolves the scheduler for an event: 1) UMO 路由表命中其配置 ID
+// 且该调度器已注册 → 用之；2) 回退 default 调度器；3) 再回退已注册调度器中
+// 稳定序（按配置 ID 排序）的首个，避免 map 迭代随机性。返回 nil 表示没有任何
+// 调度器可用。
+func (bus *EventBus) pickScheduler(event *Event) *PipelineScheduler {
+	bus.mu.RLock()
+	defer bus.mu.RUnlock()
+	if len(bus.schedulers) == 0 {
+		return nil
+	}
+	// 1) UMO → conf_id 路由（Python get_conf_info 语义）。
+	if confID := bus.resolveConfID(event.UnifiedMsgOrigin()); confID != "" {
+		if scheduler, ok := bus.schedulers[confID]; ok {
+			return scheduler
+		}
+		logger.Error("EventBus: UMO %q 路由到配置 %s，但该配置的调度器未注册，回退 default", event.UnifiedMsgOrigin(), confID)
+	}
+	// 2) default 调度器兜底。
+	if scheduler, ok := bus.schedulers["default"]; ok {
+		return scheduler
+	}
+	// 3) 稳定序首个（单配置场景即唯一那个）。
+	ids := make([]string, 0, len(bus.schedulers))
+	for id := range bus.schedulers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return bus.schedulers[ids[0]]
 }
 
 // PipelineDone is a completion signal closed exactly once when an event
@@ -654,6 +742,9 @@ func NewPipelineScheduler(confID string) *PipelineScheduler {
 	return &PipelineScheduler{confID: confID}
 }
 
+// ConfID returns the config profile this scheduler was built for.
+func (s *PipelineScheduler) ConfID() string { return s.confID }
+
 // AddStage appends a processing stage.
 func (s *PipelineScheduler) AddStage(stage PipelineStage) {
 	s.stages = append(s.stages, stage)
@@ -676,6 +767,12 @@ func (s *PipelineScheduler) Process(ctx context.Context, event *Event) (result *
 		if result != nil && !result.Continue {
 			logger.Debug("流水线: 阶段 %s 拦截了事件 %q", stage.Name(), event.MessageStr)
 			return result, nil
+		}
+		// 对齐 Python scheduler.py：每个阶段执行后检查事件是否已被 Stop，
+		// 已停止则不再执行后续阶段（避免 Stop 后仍继续跑完管线并 Respond）。
+		if event.IsStopped() {
+			logger.Debug("阶段 %s 之后事件 %q 已停止传播", stage.Name(), event.MessageStr)
+			return &StageResult{Continue: false}, nil
 		}
 	}
 	logger.I18nInfo("流水线: 事件 %q 已通过所有阶段", event.MessageStr)

@@ -45,6 +45,11 @@ type SlackWebhookServer struct {
 	srv    *http.Server
 	stopCh chan struct{}
 
+	// srvMu 保护 srv 字段以及 stopped 状态：Start 与 Stop 可能来自不同 goroutine
+	// （外部 Stop 可能早于 Start 完成，ctx 取消也会触发 Stop）。
+	srvMu   sync.Mutex
+	stopped bool
+
 	// seenEventIDs 事件去重缓存（event_id -> 时间戳，带 TTL 惰性淘汰）。
 	seenMu       sync.Mutex
 	seenEventIDs map[string]time.Time
@@ -106,13 +111,23 @@ func (s *SlackWebhookServer) Start(ctx context.Context, host string, port int) e
 	if err != nil {
 		return fmt.Errorf("slack webhook 服务器绑定 %s 失败: %w", addr, err)
 	}
-	s.srv = &http.Server{Handler: mux}
+	srv := &http.Server{Handler: mux}
+	s.srvMu.Lock()
+	if s.stopped {
+		// Stop 已在 Start 完成前被调用（例如 ctx 启动前已取消，或外部提前 Stop）：
+		// 直接关闭监听，绝不注册一个永不停止的 HTTP 服务器。
+		s.srvMu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
+	s.srv = srv
+	s.srvMu.Unlock()
 	go func() {
 		<-ctx.Done()
 		s.Stop()
 	}()
 	go func() {
-		if serveErr := s.srv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
+		if serveErr := srv.Serve(ln); serveErr != nil && serveErr != http.ErrServerClosed {
 			webhookServerLogger.I18nWarn("Slack Webhook 服务器退出: %v", serveErr)
 		}
 	}()
@@ -120,14 +135,23 @@ func (s *SlackWebhookServer) Start(ctx context.Context, host string, port int) e
 	return nil
 }
 
-// Stop 停止 Webhook 服务器。
+// Stop 停止 Webhook 服务器。幂等：可被 ctx 取消 goroutine 与外部调用重复触发；
+// 若在 Start 之前调用则记录 stopped 标记，Start 会发现并立即关闭监听。
 func (s *SlackWebhookServer) Stop() {
-	if s.srv == nil {
+	s.srvMu.Lock()
+	if s.stopped {
+		s.srvMu.Unlock()
+		return
+	}
+	s.stopped = true
+	srv := s.srv
+	s.srvMu.Unlock()
+	if srv == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	_ = s.srv.Shutdown(ctx)
+	_ = srv.Shutdown(ctx)
 	webhookServerLogger.I18nInfo("Slack Webhook 服务器已停止")
 }
 

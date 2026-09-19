@@ -42,10 +42,26 @@ const SDKRootName = "python-sdk"
 // sdkRepoBase 是 Python SDK 的发布仓库：下载兜底 URL
 // https://github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk/archive/refs/tags/v<SDKVersion>.tar.gz
 // （模块解析不可用时才走网络下载）。githubProxyOverride 是 config github_proxy
-// 的加速前缀（SetSDKGitHubProxy 注入，与插件安装一致）。
+// 的加速前缀（SetSDKGitHubProxy 注入，与插件安装一致）。代理前缀只改变传输
+// 通道（加速），不保证内容可信：被劫持的代理可替换 tarball 注入任意代码，
+// 而 SDK 与全部 Python 插件同权限运行、可经 HostService 读取 provider API
+// key，因此下载后必须按 sdkTarballSHA256 校验完整性（对齐 pythonArchiveSHA256
+// 的解释器下载校验）。
 const sdkRepoBase = "https://github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
 
 var githubProxyOverride string
+
+// EnvSDKTarballSHA256Override 允许显式指定期望的 SDK tarball sha256（测试/
+// 私有镜像场景），设置后优先于 pin 值比对。
+const EnvSDKTarballSHA256Override = "ASTRBOT_SDK_SHA256_OVERRIDE"
+
+// sdkTarballSHA256 固定 pin 各 SDK 版本官方 tarball 的 sha256（键为 SDK
+// 版本，对应 v<版本> tag 的 GitHub 归档）。map 缺该版本时（官方哈希待登记，
+// CI 有网环境可补 pin）：计算下载内容的 sha256、打警告日志并放行。
+var sdkTarballSHA256 = map[string]string{
+	// v0.9.9 官方归档 sha256（2026-09-19 从 GitHub tag v0.9.9 下载两次核对一致）。
+	"0.9.9": "4b42bce956695847319c5afeb7f372742b9c99d48c4e45f372d2cceb067024d5",
+}
 
 // SetSDKGitHubProxy overrides the GitHub accelerator prefix used for the SDK
 // download (called by the host with config github_proxy; empty restores direct).
@@ -761,6 +777,49 @@ func sdkModuleDir() string {
 	return dir
 }
 
+// verifySDKTarball 在解压前对下载的 SDK tarball 做 sha256 完整性校验：
+// 期望值取 ASTRBOT_SDK_SHA256_OVERRIDE（测试/镜像场景），否则取
+// sdkTarballSHA256 中该版本的 pin 值。map 缺该版本时（官方哈希待登记）
+// 计算实际哈希、打警告日志后放行，不阻塞升级。比对失败返回含期望/实际
+// 哈希前 16 位的错误（避免日志过长），由调用方删除文件并中止。
+func verifySDKTarball(path string) error {
+	want := strings.TrimSpace(os.Getenv(EnvSDKTarballSHA256Override))
+	if want == "" {
+		var ok bool
+		want, ok = sdkTarballSHA256[SDKVersion]
+		if !ok {
+			sum, err := fileSHA256(path)
+			if err != nil {
+				return fmt.Errorf("计算 SDK tarball sha256 失败: %w", err)
+			}
+			logger.Warn("SDK v%s 的 tarball 尚未 pin 官方 sha256（当前下载内容 sha256=%s），跳过校验直接使用；请尽快在 sdkTarballSHA256 登记官方哈希", SDKVersion, sum)
+			return nil
+		}
+	}
+	sum, err := fileSHA256(path)
+	if err != nil {
+		return fmt.Errorf("计算 SDK tarball sha256 失败: %w", err)
+	}
+	if sum != strings.ToLower(want) {
+		return fmt.Errorf("SDK tarball sha256 校验失败（疑似被代理/镜像篡改）: got %s… want %s…", sum[:16], want[:16])
+	}
+	return nil
+}
+
+// fileSHA256 流式计算文件 sha256（不整读进内存）。
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path) // #nosec G304 -- path 是刚下载到临时目录的 SDK 归档
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // Ensure prepares the Python SDK at <dataDir>/python-sdk and returns the SDK
 // root as an ABSOLUTE path (the subprocess cwd may differ, so relative paths
 // in PYTHONPATH would not resolve). Resolution order:
@@ -836,6 +895,15 @@ func Ensure(dataDir string) (string, error) {
 		return "", fmt.Errorf("下载 Python SDK 失败（%s）: %w", url, err)
 	}
 	_ = tmp.Close()
+
+	// sha256 完整性校验：github_proxy 前缀代理只影响传输通道，pin 校验保证
+	// 内容未被劫持/篡改（防代理注入代码 → HostService 凭据泄漏的提权路径）。
+	// 校验失败删除文件并中止，绝不让未验证内容进入解压。
+	if err := verifySDKTarball(tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		_ = os.RemoveAll(root)
+		return "", fmt.Errorf("Python SDK 完整性校验失败: %w", err)
+	}
 
 	if err := extractTarGzStripTop(tmpPath, root); err != nil {
 		_ = os.RemoveAll(root)

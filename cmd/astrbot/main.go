@@ -20,6 +20,7 @@ import (
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/lifecycle"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
@@ -168,8 +169,9 @@ func main() {
 		os.Setenv("ASTRBOT_RESET_DASHBOARD_PASSWORD", "1")
 	}
 
-	// Ensure data directory exists
-	if err := os.MkdirAll("data", 0755); err != nil {
+	// Ensure data directory exists（经 utils 统一解析：ASTRBOT_DATA_PATH /
+	// ASTRBOT_ROOT/data / 绝对化后的 "data"，与 lifecycle 内数据路径一致）。
+	if err := os.MkdirAll(utils.AstrbotDataDir(), 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create data directory: %v\n", err)
 		os.Exit(1)
 	}

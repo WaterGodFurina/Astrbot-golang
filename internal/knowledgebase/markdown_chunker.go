@@ -314,7 +314,7 @@ func mergeShort(chunks []string, opts MarkdownChunkOptions) []string {
 var markdownChunkExtensions = map[string]bool{
 	".adoc": true, ".docx": true, ".epub": true, ".markdown": true,
 	".md": true, ".mdx": true, ".mkd": true, ".rst": true,
-	".xls": true, ".xlsx": true, ".pptx": true,
+	".xls": true, ".xlsx": true,
 }
 
 // ChunkDocument 文档统一分块入口：markdown 族格式走标题感知分块

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -131,6 +133,13 @@ type PlatformAdapter interface {
 	Start(ctx context.Context) error
 	Stop() error
 	Send(sessionID string, chain *message.MessageChain) error
+}
+
+// StatsProvider 是平台适配器的可选能力：返回运行期统计信息，供
+// PlatformManager 聚合（对应 Python Platform.get_stats / manager.get_all_stats）。
+// 未实现该接口的适配器不参与聚合，不影响原有行为。
+type StatsProvider interface {
+	Stats() map[string]interface{}
 }
 
 // Reactor is an optional capability for platforms that support emoji
@@ -273,11 +282,20 @@ func (e *AstrMessageEvent) GetSelfID() string {
 
 // GetSenderID returns the sender's user ID.
 func (e *AstrMessageEvent) GetSenderID() string {
+	// 对齐 Python get_sender_id（astr_message_event.py:203-208）：message_obj
+	// 缺失时返回空串，避免平台事件缺 message_obj 时 panic。
+	if e.MessageObj == nil {
+		return ""
+	}
 	return e.MessageObj.Sender.UserID
 }
 
 // GetSenderName returns the sender's nickname.
 func (e *AstrMessageEvent) GetSenderName() string {
+	// 对齐 Python get_sender_name（astr_message_event.py:210-217）：缺失时返回空串。
+	if e.MessageObj == nil {
+		return ""
+	}
 	return e.MessageObj.Sender.Nickname
 }
 
@@ -376,7 +394,8 @@ func (e *AstrMessageEvent) PlainResult(text string) *message.MessageEventResult 
 // ImageResult creates an image result from URL or path.
 func (e *AstrMessageEvent) ImageResult(urlOrPath string) *message.MessageEventResult {
 	r := message.NewMessageEventResult()
-	if len(urlOrPath) > 4 && urlOrPath[:4] == "http" {
+	// 用显式前缀判断，避免 "httpfoo" 之类既非 http 也非 https 的字符串被误判为 URL。
+	if strings.HasPrefix(urlOrPath, "http://") || strings.HasPrefix(urlOrPath, "https://") {
 		return r.URLImage(urlOrPath)
 	}
 	return r.FileImage(urlOrPath)
@@ -639,11 +658,51 @@ func (pm *PlatformManager) All() []PlatformAdapter {
 	return result
 }
 
+// GetAllStats 聚合所有实现 StatsProvider 的适配器统计信息（对应 py
+// PlatformManager.get_all_stats）：每个条目含适配器 id/type 及其 Stats() 内容。
+// 未实现 StatsProvider 的适配器会被跳过。
+func (pm *PlatformManager) GetAllStats() []map[string]interface{} {
+	pm.mu.RLock()
+	adapters := make([]PlatformAdapter, 0, len(pm.adapters))
+	for _, a := range pm.adapters {
+		adapters = append(adapters, a)
+	}
+	pm.mu.RUnlock()
+	result := make([]map[string]interface{}, 0, len(adapters))
+	for _, a := range adapters {
+		sp, ok := a.(StatsProvider)
+		if !ok {
+			continue
+		}
+		entry := map[string]interface{}{
+			"id":   a.ID(),
+			"type": a.Type(),
+		}
+		for k, v := range sp.Stats() {
+			entry[k] = v
+		}
+		result = append(result, entry)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i]["id"].(string) < result[j]["id"].(string)
+	})
+	return result
+}
+
 // StartAll starts all adapters.
 func (pm *PlatformManager) StartAll(ctx context.Context) error {
+	// 仅在锁内做适配器快照，Start 可能包含网络/长耗时 I/O，
+	// 不能持有平台管理器的锁执行，否则会阻塞注册/查询等操作。
+	// 按 ID 排序保证启动顺序稳定（map 遍历本身随机序），对齐 py
+	// manager.py:91-95 按配置列表顺序逐个加载启动。
 	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-	for _, adapter := range pm.adapters {
+	adapters := make([]PlatformAdapter, 0, len(pm.adapters))
+	for _, a := range pm.adapters {
+		adapters = append(adapters, a)
+	}
+	pm.mu.RUnlock()
+	sort.Slice(adapters, func(i, j int) bool { return adapters[i].ID() < adapters[j].ID() })
+	for _, adapter := range adapters {
 		if err := adapter.Start(ctx); err != nil {
 			return fmt.Errorf("platform %s: %w", adapter.ID(), err)
 		}

@@ -300,15 +300,20 @@ func (a *Adapter) StreamUpdate(sessionID, msgID, text string) error {
 	if ok && sc.cardID == "" {
 		sc.cardID = msgID
 	}
-	a.mu.Unlock()
 	if !ok {
 		sc = &streamCard{cardID: msgID, sequence: 0}
 	}
+	// sequence 的自增与读取必须在同一临界区内完成，避免并发 StreamUpdate
+	// 时序号重排/重复，导致飞书 CardKit 因 sequence 非严格递增而拒绝更新。
 	sc.sequence++
+	seq := sc.sequence
+	a.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := updateStreamingText(ctx, a.client, sc.cardID, text, sc.sequence); err != nil {
+	if err := updateStreamingText(ctx, a.client, sc.cardID, text, seq); err != nil {
+		a.mu.Lock()
 		sc.sequence--
+		a.mu.Unlock()
 		return err
 	}
 	return nil
@@ -324,21 +329,28 @@ func (a *Adapter) StreamEnd(sessionID, msgID, text string) error {
 	if ok {
 		delete(a.streamCards, sessionID)
 	}
-	a.mu.Unlock()
 	if !ok {
 		sc = &streamCard{cardID: msgID}
 	}
+	// 在临界区内一次性预留需要使用的 sequence：先补发最终文本(如有)，
+	// 再关闭流式模式，保证两者严格递增且不与并发更新冲突。
+	var seqUpdate int
+	if text != "" {
+		sc.sequence++
+		seqUpdate = sc.sequence
+	}
+	sc.sequence++
+	seqClose := sc.sequence
+	a.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	// 先补发最终文本，再关闭流式模式（sequence 持续递增）。
 	if text != "" {
-		sc.sequence++
-		if err := updateStreamingText(ctx, a.client, sc.cardID, text, sc.sequence); err != nil {
+		if err := updateStreamingText(ctx, a.client, sc.cardID, text, seqUpdate); err != nil {
 			logger.Debug("飞书流式卡片补发最终文本失败 (ignored): %v", err)
 		}
 	}
-	sc.sequence++
-	if err := closeStreamingMode(ctx, a.client, sc.cardID, sc.sequence); err != nil {
+	if err := closeStreamingMode(ctx, a.client, sc.cardID, seqClose); err != nil {
 		return err
 	}
 	logger.Debug("飞书流式模式已关闭: %s", sc.cardID)

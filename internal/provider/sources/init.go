@@ -17,6 +17,15 @@ func init() {
 		if s.apiBase == "https://api.openai.com/v1" {
 			s.apiBase = "https://openrouter.ai/api/v1"
 		}
+		// 对齐 py ProviderOpenRouter：推理字段名为 "reasoning"，
+		// 并注入 OpenRouter 推荐的标识 headers。
+		s.reasoningKey = "reasoning"
+		if s.extraHeaders == nil {
+			s.extraHeaders = map[string]string{}
+		}
+		s.extraHeaders["HTTP-Referer"] = "https://github.com/AstrBotDevs/AstrBot"
+		s.extraHeaders["X-OpenRouter-Title"] = "AstrBot"
+		s.extraHeaders["X-OpenRouter-Categories"] = "general-chat,personal-agent"
 		return s, nil
 	})
 

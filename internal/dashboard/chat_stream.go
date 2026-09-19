@@ -709,13 +709,18 @@ func (s *Server) registerReplyAttachment(srcPath, attachType, displayName string
 		return "", "", mkErr
 	}
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		// 插件/LLM 输出的远端 URL 由宿主抓取落盘：先过 SSRF 校验，并走统一
+		// 安全出站客户端（钉扎拨号 + 逐跳重定向校验），不得用裸 http.Client。
+		if vErr := validateOutboundURL(src); vErr != nil {
+			return "", "", vErr
+		}
 		tmp, cErr := os.CreateTemp(dir, "dl_*")
 		if cErr != nil {
 			return "", "", cErr
 		}
 		tmpName := tmp.Name()
 		defer func() { _ = os.Remove(tmpName) }()
-		client := &http.Client{Timeout: 60 * time.Second}
+		client := newOutboundClient(60 * time.Second)
 		resp, gErr := client.Get(src)
 		if gErr != nil {
 			return "", "", gErr
@@ -1131,9 +1136,11 @@ func filePartsToMessage(files []interface{}) []map[string]interface{} {
 
 // filesToChainComponents converts a files array (uploaded attachments) into
 // message chain components so the pipeline receives the actual local files
-// (image vision / platform forwarding) instead of dropping them. attachment_id
-// maps to the file under data/webui_files; entries without one fall back to
-// their path/file/url fields. Unresolvable entries are skipped.
+// (image vision / platform forwarding) instead of dropping them. 仅接受
+// attachment_id（解析到 data/webui_files 下的登记文件，对齐 Python 媒体 part
+// 必须携带 attachment_id 的语义）；path/file/url 等任意本地路径回退已删除，
+// 防止 chat-scope API key 借任意路径读取宿主本地文件。无法解析的条目忽略
+// 并记 Debug 日志。
 func (s *Server) filesToChainComponents(files []interface{}) []message.Component {
 	var comps []message.Component
 	for _, f := range files {
@@ -1143,26 +1150,11 @@ func (s *Server) filesToChainComponents(files []interface{}) []message.Component
 		}
 		typ, _ := m["type"].(string)
 		id, _ := m["attachment_id"].(string)
-		path := ""
-		if id != "" && safeAttachmentName(id) {
-			path = filepath.Join(s.webuiFilesDir(), id)
-		}
-		if path == "" {
-			for _, k := range []string{"path", "file"} {
-				if p, ok := m[k].(string); ok && p != "" {
-					path = p
-					break
-				}
-			}
-		}
-		if path == "" {
-			if u, ok := m["url"].(string); ok && u != "" {
-				path = u
-			}
-		}
-		if path == "" {
+		if id == "" || !safeAttachmentName(id) {
+			logger.Debug("chat files: 忽略无 attachment_id 的条目 (type=%s)", typ)
 			continue
 		}
+		path := filepath.Join(s.webuiFilesDir(), id)
 		switch typ {
 		case "image":
 			comps = append(comps, &message.Image{Path: path, File: path, FileID: id})

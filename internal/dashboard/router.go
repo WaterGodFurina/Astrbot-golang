@@ -10,7 +10,13 @@ import (
 // apiHandler dispatches API requests.
 // Supports both /api/xxx and /api/v1/xxx prefixes.
 func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
-	// JSON 请求体统一大小上限（16 MiB），防超大请求体耗尽内存。
+	// 请求体统一大小上限，防超大请求体耗尽内存。此前仅当 Content-Type
+	// 以 application/json 前缀开头时才限制 16 MiB，攻击者改用其他
+	// Content-Type（text/plain、application/x-www-form-urlencoded 等）即可
+	// 绕过得到无界 body。现先对一切请求施加全局硬上限 maxMultipartBodySize
+	// （上传类端点内的 multipart 逻辑同样以此为上限，不会误伤 256 MiB 以内的
+	// 上传），再对 JSON 请求额外收紧到 16 MiB。限制不再只依赖 Content-Type。
+	r.Body = http.MaxBytesReader(w, r.Body, maxMultipartBodySize)
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
 	}
@@ -257,6 +263,14 @@ func (s *Server) apiAuthAllowed(r *http.Request) bool {
 		if len(parts) >= 3 && parts[1] == "platforms" && parts[2] != "" {
 			return true
 		}
+	case "files":
+		// GET /api/v1/files/tokens/{file_token}：公开文件令牌（平台 logo 等
+		// <img src> 预览无法携带 Authorization 头），对齐 Python files.py 中
+		// 该路由未挂 require_file_scope。token 为随机不可枚举值，仅此子路径
+		// 放行；files 的列表/内容/上传/删除仍走全局鉴权。
+		if r.Method == http.MethodGet && len(parts) >= 3 && parts[1] == "tokens" && parts[2] != "" {
+			return true
+		}
 	case "file":
 		// GET /api/file/{token}：公开文件令牌服务（对齐 Python 本体
 		// /api/file/{token}）。token 为随机 uuid4（不可枚举）且带 TTL，
@@ -290,21 +304,17 @@ type endpointScope struct {
 // parts[0]/parts[1]；未列出的端点按默认规则。
 var endpointScopeRules = map[string]endpointScope{
 	// ── system 级管理端点：仅 JWT（Python require_system_scope）──
-	"api-keys":              {systemOnly: true},
-	"auth/account":          {systemOnly: true},
-	"auth/totp":             {systemOnly: true},
-	"system":                {systemOnly: true},
-	"pip":                   {systemOnly: true},
-	"update":                {systemOnly: true},
-	"updates":               {systemOnly: true},
-	"cron":                  {systemOnly: true},
-	"logs":                  {systemOnly: true},
-	"stat/restart-core":     {systemOnly: true},
-	"stats/restart-core":    {systemOnly: true},
-	"stat/storage-cleanup":  {systemOnly: true},
-	"stats/storage-cleanup": {systemOnly: true},
-	"stat/cleanup":          {systemOnly: true},
-	"stats/cleanup":         {systemOnly: true},
+	"api-keys":     {systemOnly: true},
+	"auth/account": {systemOnly: true},
+	"auth/totp":    {systemOnly: true},
+	"system":       {systemOnly: true},
+	"pip":          {systemOnly: true},
+	"update":       {systemOnly: true},
+	"updates":      {systemOnly: true},
+	"cron":         {systemOnly: true},
+	"logs":         {systemOnly: true},
+	"stat":         {systemOnly: true},
+	"stats":        {systemOnly: true},
 
 	// ── provider / bot / config ─────────────────────────────
 	"provider":         {readScope: "provider", writeScope: "provider"},
@@ -324,27 +334,41 @@ var endpointScopeRules = map[string]endpointScope{
 	// ── persona / data / chat / skill / mcp / plugin ─────────
 	"personas":        {readScope: "persona", writeScope: "persona"},
 	"persona-folders": {readScope: "persona", writeScope: "persona"},
-	"knowledge_base":  {readScope: "data", writeScope: "data"},
-	"knowledge-bases": {readScope: "data", writeScope: "data"},
+	// KB 组：py require_scope("kb")，"kb" 不在 ALL_OPEN_API_SCOPES →
+	// API key 必 403，仅 JWT（data-key 可删库/SSRF，必须收紧）。
+	"knowledge_base":  {systemOnly: true},
+	"knowledge-bases": {systemOnly: true},
 	"sessions":        {readScope: "data", writeScope: "data"},
 	"session-groups":  {readScope: "data", writeScope: "data"},
-	"conversations":   {readScope: "data", writeScope: "data"},
-	"chat":            {readScope: "chat", writeScope: "chat"},
-	"tools":           {readScope: "skill", writeScope: "skill"},
-	"skills":          {readScope: "skill", writeScope: "skill"},
-	"mcp":             {readScope: "mcp", writeScope: "mcp"},
-	"plugin-sources":  {readScope: "plugin", writeScope: "plugin"},
-	"plug":            {readScope: "plugin", writeScope: "plugin"},
+	// conversations 与 chat 组统一收为 systemOnly：Go 版 webchat 会话/线程/
+	// 项目/平台对话历史是全局单命名空间（chat_sessions.json 的 Creator 为空、
+	// 线程固定 dashboard），无法按调用者隔离；带 data/chat scope 的 API key
+	// 可经 /conversations 与 /chat/sessions 读删全部历史。Go 只有单一管理员
+	// 账户，JWT 即管理员，收为 systemOnly 后既封死 API key 越权，又保留
+	// 管理员对既有全局数据的访问（与现有数据兼容）。见 s16 说明。
+	"conversations": {systemOnly: true},
+	"chat":          {systemOnly: true},
+	// tools 组：py require_scope("tool")，"tool" 不在 ALL_OPEN_API_SCOPES →
+	// API key 必 403，仅 JWT（chat-key 不得改 tool_permissions）。
+	"tools": {systemOnly: true},
+	// skills 组：py ScopeDependency("skill")，"skill" 在 DEFAULT_OPEN_API_SCOPES，
+	// 可授予 API key，保持 skill scope。
+	"skills":         {readScope: "skill", writeScope: "skill"},
+	"mcp":            {readScope: "mcp", writeScope: "mcp"},
+	"plugin-sources": {readScope: "plugin", writeScope: "plugin"},
+	// legacy /api/plug 插件代理：py require_dashboard_user（仅 JWT）。
+	"plug": {systemOnly: true},
 
 	// ── 默认规则端点（任一默认 scope 即可）──────────────────
-	"stat":       {},
-	"stats":      {},
-	"changelogs": {},
 	"extensions": {},
-	"commands":   {},
-	"trace":      {},
 	"webhooks":   {},
 	"t":          {},
+	// commands：py require_tool_scope（"tool" 不在 ALL_OPEN_API_SCOPES）；
+	// trace：py logs 组 require_system_scope；changelogs：py require_system_scope
+	// → 三组均仅 JWT（chat-key 不得改指令配置/trace 开关）。
+	"commands":   {systemOnly: true},
+	"trace":      {systemOnly: true},
+	"changelogs": {systemOnly: true},
 }
 
 // endpointScopeFor 查表得出端点的 scope 规则：优先 parts[0]+parts[1] 精确
@@ -364,11 +388,6 @@ func (s *Server) endpointScopeFor(parts []string, method string) endpointScope {
 		return fileEndpointRule(parts, method)
 	case "backups":
 		return backupEndpointRule(parts, method)
-	case "stat", "stats":
-		// /stat/storage/cleanup（三段 POST 清理）→ 仅 JWT。
-		if len(parts) >= 3 && parts[1] == "storage" && parts[2] == "cleanup" {
-			return endpointScope{systemOnly: true}
-		}
 	}
 	if rule, ok := endpointScopeRules[first]; ok {
 		return rule

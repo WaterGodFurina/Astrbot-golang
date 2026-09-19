@@ -4,6 +4,7 @@
 package misskey
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -53,21 +54,27 @@ func streamURL(instanceURL, token string) string {
 // Connect 建立 WebSocket 连接；成功返回 true（对应 connect）。
 // 订阅由调用方在每次连接成功后显式进行（Connect 不做自动重订阅，
 // 避免重连时与调用方的 SubscribeChannel 重复订阅导致事件重复分发）。
-func (s *StreamingClient) Connect() bool {
+func (s *StreamingClient) Connect(ctx context.Context) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	url := streamURL(s.instanceURL, s.accessToken)
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	s.mu.Unlock()
+	// Dial 是网络 I/O，必须在锁外执行，并受 ctx 控制，避免连接阻塞时长期
+	// 持有锁、也无法被取消/超时。原实现持锁且用无 ctx 的 Dialer.Dial。
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
 	if err != nil {
 		streamingLogger.Error("Misskey WebSocket 连接失败: %v", err)
+		s.mu.Lock()
 		s.isConnected = false
+		s.mu.Unlock()
 		return false
 	}
+	s.mu.Lock()
 	s.conn = conn
 	s.isConnected = true
 	s.running = true
 	// 清空旧连接的 channel_id 映射，避免跨重连残留陈旧订阅
 	s.channels = make(map[string]string)
+	s.mu.Unlock()
 	streamingLogger.Info("Misskey WebSocket 已连接")
 	return true
 }

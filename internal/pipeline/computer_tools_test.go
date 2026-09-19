@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,12 @@ import (
 func inTempDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	// macOS 上 /var→/private/var 软链：t.TempDir() 给逻辑路径，而 os.Getwd/
+	// filepath.Abs 给物理路径，两者词法不等会让 workspace 内绝对路径被误拒。
+	// 规范化到物理路径与生产一致（Linux/Windows EvalSymlinks 基本恒等）。
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
+	}
 	old, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +36,7 @@ func TestResolveLocalPathRelative(t *testing.T) {
 	dir := inTempDir(t)
 	umo := "test:conv"
 
-	p, err := resolveLocalPath("notes.txt", umo, false)
+	p, err := resolveLocalPath("notes.txt", umo, false, true)
 	if err != nil {
 		t.Fatalf("resolve relative: %v", err)
 	}
@@ -45,7 +52,7 @@ func TestResolveLocalPathAbsoluteWithinWorkspace(t *testing.T) {
 	ws := filepath.Join(dir, "data", "workspaces", "test_conv")
 	abs := filepath.Join(ws, "sub", "a.txt")
 
-	p, err := resolveLocalPath(abs, umo, false)
+	p, err := resolveLocalPath(abs, umo, false, true)
 	if err != nil {
 		t.Fatalf("resolve absolute in workspace: %v", err)
 	}
@@ -60,16 +67,16 @@ func TestResolveLocalPathHomeAndDot(t *testing.T) {
 
 	// ~ expands to an absolute home path which (outside the workspace) must be
 	// rejected, mirroring Python's expanduser + allowed-root check.
-	if _, err := resolveLocalPath("~/file.txt", umo, false); err == nil {
+	if _, err := resolveLocalPath("~/file.txt", umo, false, true); err == nil {
 		t.Errorf("expected rejection for ~/ outside allowed roots")
 	}
 
-	if _, err := resolveLocalPath("./x.txt", umo, false); err != nil {
+	if _, err := resolveLocalPath("./x.txt", umo, false, true); err != nil {
 		t.Errorf("resolve ./ failed: %v", err)
 	}
 	// A relative path keeps resolving under the workspace even with ./ or sub
 	// dirs, never escaping it.
-	p, err := resolveLocalPath("./sub/../x.txt", umo, false)
+	p, err := resolveLocalPath("./sub/../x.txt", umo, false, true)
 	if err != nil {
 		t.Fatalf("resolve with . and ..: %v", err)
 	}
@@ -78,20 +85,28 @@ func TestResolveLocalPathHomeAndDot(t *testing.T) {
 	}
 }
 
+func hostFileOutsideWorkspace(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return filepath.Join(filepath.VolumeName(t.TempDir()), "Windows", "System32", "config", "SAM")
+	}
+	return "/etc/passwd"
+}
+
 func TestResolveLocalPathRejectsOutside(t *testing.T) {
 	inTempDir(t)
 	umo := "t:c"
 
-	if _, err := resolveLocalPath("../outside.txt", umo, false); err == nil {
+	if _, err := resolveLocalPath("../outside.txt", umo, false, true); err == nil {
 		t.Errorf("expected rejection for ../ outside workspace")
 	}
-	if _, err := resolveLocalPath("/etc/passwd", umo, false); err == nil {
+	if _, err := resolveLocalPath(hostFileOutsideWorkspace(t), umo, false, true); err == nil {
 		t.Errorf("expected rejection for absolute path outside allowed roots")
 	}
-	if _, err := resolveLocalPath("../../../../tmp/evil.txt", umo, false); err == nil {
+	if _, err := resolveLocalPath("../../../../tmp/evil.txt", umo, false, true); err == nil {
 		t.Errorf("expected rejection for traversal path")
 	}
-	if _, err := resolveLocalPath("", umo, false); err == nil {
+	if _, err := resolveLocalPath("", umo, false, true); err == nil {
 		t.Errorf("expected rejection for empty path")
 	}
 }
@@ -102,11 +117,11 @@ func TestResolveLocalPathWriteRoots(t *testing.T) {
 	skillsAbs := filepath.Join(dir, "data", "skills", "x.txt")
 
 	// Writing into data/skills (read-only root) must be rejected.
-	if _, err := resolveLocalPath(skillsAbs, umo, true); err == nil {
+	if _, err := resolveLocalPath(skillsAbs, umo, true, true); err == nil {
 		t.Errorf("expected write rejection under data/skills")
 	}
 	// Reading from data/skills is allowed.
-	if _, err := resolveLocalPath(skillsAbs, umo, false); err != nil {
+	if _, err := resolveLocalPath(skillsAbs, umo, false, true); err != nil {
 		t.Errorf("expected read allowed under data/skills: %v", err)
 	}
 }
@@ -128,18 +143,18 @@ func TestResolveLocalPathRejectsSymlinkEscape(t *testing.T) {
 
 	// A lexical path under the workspace that traverses a symlink pointing
 	// outside must be rejected, whether or not the target exists yet.
-	if _, err := resolveLocalPath(filepath.Join(ws, "link", "secret.txt"), umo, false); err == nil {
+	if _, err := resolveLocalPath(filepath.Join(ws, "link", "secret.txt"), umo, false, true); err == nil {
 		t.Errorf("expected rejection for non-existent symlink escape")
 	}
 	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resolveLocalPath(filepath.Join(ws, "link", "secret.txt"), umo, false); err == nil {
+	if _, err := resolveLocalPath(filepath.Join(ws, "link", "secret.txt"), umo, false, true); err == nil {
 		t.Errorf("expected rejection for existing symlink escape")
 	}
 
 	// A plain path inside the workspace still resolves.
-	if _, err := resolveLocalPath(filepath.Join(ws, "sub", "ok.txt"), umo, false); err != nil {
+	if _, err := resolveLocalPath(filepath.Join(ws, "sub", "ok.txt"), umo, false, true); err != nil {
 		t.Errorf("expected normal workspace path allowed: %v", err)
 	}
 }
@@ -148,10 +163,14 @@ func TestExecuteGrepRestrictsToWorkspace(t *testing.T) {
 	dir := inTempDir(t)
 	umo := "t:c"
 
-	if out := executeGrep("x", "/etc", "", 10, umo); !strings.Contains(out, "outside") {
+	outsideDir := "/etc"
+	if runtime.GOOS == "windows" {
+		outsideDir = filepath.Join(filepath.VolumeName(dir), "Windows", "System32", "drivers", "etc")
+	}
+	if out := executeGrep("x", outsideDir, "", 10, umo, true); !strings.Contains(out, "restricted") {
 		t.Errorf("expected absolute path outside workspace rejected, got: %q", out)
 	}
-	if out := executeGrep("x", "../../../etc", "", 10, umo); !strings.Contains(out, "outside") {
+	if out := executeGrep("x", "../../../etc", "", 10, umo, true); !strings.Contains(out, "restricted") {
 		t.Errorf("expected traversal path rejected, got: %q", out)
 	}
 
@@ -159,7 +178,7 @@ func TestExecuteGrepRestrictsToWorkspace(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("hello world\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if out := executeGrep("world", "", "", 10, umo); !strings.Contains(out, "notes.txt") {
+	if out := executeGrep("world", "", "", 10, umo, true); !strings.Contains(out, "notes.txt") {
 		t.Errorf("expected grep within workspace to find match, got: %q", out)
 	}
 }
@@ -252,6 +271,9 @@ func TestShellSessionSignalOwnership(t *testing.T) {
 }
 
 func TestBackgroundShellSessionStdinWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relies on POSIX `cat` echoing stdin; Get-Content on cmd.exe does not read redirected stdin")
+	}
 	inTempDir(t)
 	umo := "bg:test"
 	out := executeLocalShell(umo, umo, "cat", true, 0)

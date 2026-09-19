@@ -370,13 +370,18 @@ func (a *Adapter) WebhookUUID() string {
 // WebhookCallback 是统一 Webhook 的入口（/api/v1/webhooks/platforms/{uuid}）。
 // 对应 Python 的 webhook_callback。
 func (a *Adapter) WebhookCallback(w http.ResponseWriter, r *http.Request) {
-	if a.connectionMode != "webhook" || a.webhook == nil {
+	// a.webhook 由 a.mu 保护（startWebhookMode 写入、Stop 读取），此处加锁快照，
+	// 避免与 Stop 的并发读/写产生数据竞争。
+	a.mu.Lock()
+	webhook := a.webhook
+	a.mu.Unlock()
+	if a.connectionMode != "webhook" || webhook == nil {
 		writeJSONError(w, http.StatusBadRequest, map[string]interface{}{
 			"error": "Slack adapter is not in webhook mode",
 		})
 		return
 	}
-	a.webhook.HandleCallback(w, r)
+	webhook.HandleCallback(w, r)
 }
 
 // convertMessage 将 Slack 事件转换为 AstrBotMessage。
@@ -566,6 +571,24 @@ func (a *Adapter) getFileBase64(ctx context.Context, url string) (string, error)
 	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
+// slackTempCleanupDelay 是 Slack 附件临时文件的清理延迟：消息在事件总线中
+// 异步处理，回复在数十秒内完成，延迟清理保证媒体在消费期间可用（对齐 lark
+// 的 30 分钟 / mattermost 的 1 小时策略）。
+const slackTempCleanupDelay = 30 * time.Minute
+
+// scheduleSlackTempCleanup 在延迟后删除 Slack 附件临时文件，避免每条带附件
+// 的消息都永久泄漏磁盘。
+func scheduleSlackTempCleanup(path string) {
+	if path == "" {
+		return
+	}
+	time.AfterFunc(slackTempCleanupDelay, func() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			logger.Debug("清理 Slack 临时附件失败 %s: %v", path, err)
+		}
+	})
+}
+
 // downloadSlackFile 用鉴权客户端（slack.Client.GetFileContext 自带 Bearer
 // token）把附件下载到本地临时文件，供下游（LLM / file service）无鉴权读取。
 // 私有 url_private 透传会被下游视为无权限，必须真正落地。返回落盘路径，
@@ -596,6 +619,8 @@ func (a *Adapter) downloadSlackFile(ctx context.Context, url, name string) strin
 			path = renamed
 		}
 	}
+	// 延迟清理，避免下载的附件永久占用磁盘。
+	scheduleSlackTempCleanup(path)
 	return path
 }
 

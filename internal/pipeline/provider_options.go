@@ -10,11 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fogleman/gg"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -228,7 +230,7 @@ func (s *ProcessStage) compressImageForProvider(urlOrPath string) string {
 	if !enabled {
 		return urlOrPath
 	}
-	path := strings.TrimPrefix(urlOrPath, "file://")
+	path := utils.FileURIToPath(urlOrPath)
 	if !fileExists(path) {
 		return urlOrPath
 	}
@@ -347,10 +349,24 @@ func (s *ProcessStage) toolCallTimeout() time.Duration {
 	return timeout
 }
 
+// toolCallGuardKey 是携带工具调用“废弃”标记的 context key。超时后标记置真，
+// 工具执行器在回写事件前需检查，避免后台 goroutine 继续修改已超时的事件。
+type toolCallGuardKey struct{}
+
+// toolCallAbandoned 报告当前工具调用是否已超时废弃。无标记（如测试直接调用
+// executeTool）时返回 false。
+func toolCallAbandoned(ctx context.Context) bool {
+	if g, ok := ctx.Value(toolCallGuardKey{}).(*atomic.Bool); ok && g != nil {
+		return g.Load()
+	}
+	return false
+}
+
 // executeToolWithTimeout runs the tool executor under the configured timeout.
 func (s *ProcessStage) executeToolWithTimeout(event *core.Event, runtime, name string, args map[string]interface{}) string {
 	timeout := s.toolCallTimeout()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	abandoned := &atomic.Bool{}
+	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), toolCallGuardKey{}, abandoned), timeout)
 	defer cancel()
 	done := make(chan string, 1)
 	go func() {
@@ -360,9 +376,9 @@ func (s *ProcessStage) executeToolWithTimeout(event *core.Event, runtime, name s
 	case result := <-done:
 		return result
 	case <-ctx.Done():
-		// The timeout context is cancelled so executors honouring ctx (MCP,
-		// sandbox) abort their underlying call; the goroutine is allowed to
-		// drain in the background so the main path is never blocked.
+		// 标记废弃：后台 goroutine 可能仍在运行，执行器据此拒绝任何事件回写
+		// （发送消息/缓存图片/插件钩子等），结果经 channel 直接丢弃。
+		abandoned.Store(true)
 		logger.I18nWarn("工具 %s 调用超时（%v），已中断", name, timeout)
 		return fmt.Sprintf("Error: tool %s call timed out after %v", name, timeout)
 	}

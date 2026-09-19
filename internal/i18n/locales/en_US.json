@@ -520,5 +520,19 @@
   "👀 正在测试提供商可达性...": "👀 Testing provider reachability...",
   "📊 No stats available for this conversation yet.": "📊 No stats available for this conversation yet.",
   "😕 You are not in a conversation. Use /new to create one.": "😕 You are not in a conversation. Use /new to create one.",
-  "😕 会话管理器不可用。": "😕 Session manager unavailable."
+  "😕 会话管理器不可用。": "😕 Session manager unavailable.",
+  "Provider %s (%s) 实例化失败，已跳过: %v": "Failed to instantiate provider %s (%s); skipped: %v",
+  "ProviderManager 已加载 %d 个 provider（插件桥数据源就绪）": "ProviderManager loaded %d providers (plugin bridge data source ready)",
+  "boxlite 沙箱需要 Docker，但当前不可用；请安装 Docker 或改用 shipyard_neo 后端": "The boxlite sandbox requires Docker, which is currently unavailable; install Docker or switch to the shipyard_neo backend",
+  "cron 字段 %q 的区间 %s-%s 起点大于终点，已交换处理（不支持环绕匹配）": "cron field %q range %s-%s has start greater than end; swapped (wrapping ranges are not supported)",
+  "docker start 失败，移除容器 %s: %v": "docker start failed, removing container %s: %v",
+  "persona %s 的 skills 字段类型错误（应为数组），已按禁止全部技能处理": "persona %s has a skills field of the wrong type (expected an array); treating as all skills disabled",
+  "run_once 任务 %s（%s）原定于 %v 执行，已过期，本次重启后丢弃": "run_once job %s (%s) was scheduled for %v and has expired; discarded after this restart",
+  "run_once 任务 %s（%s）缺少 run_at，已禁用以避免立即误触发": "run_once job %s (%s) is missing run_at; disabled to avoid triggering immediately by mistake",
+  "事件总线 UMO→配置 路由已启用（config_route 表）": "Event bus UMO→config routing enabled (config_route table)",
+  "加载配置失败（文件损坏？），已回退到默认配置继续运行: %v": "Failed to load config (corrupted file?); fell back to defaults and continuing: %v",
+  "已为 %s 构建管线调度器（10 个阶段）": "Pipeline scheduler built for %s (10 stages)",
+  "当前未启动任何平台适配器（配置中平台为空或全部禁用），机器人将以无平台模式运行": "No platform adapter is running (platforms are empty or all disabled in config); the bot will run in platform-less mode",
+  "未找到可用的模型提供商，请先配置": "No available model provider found; please configure one first",
+  "重启：已启动新实例（pid %d），正在退出当前进程": "Restart: spawned a new instance (pid %d), exiting the current process"
 }

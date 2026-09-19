@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -352,5 +354,25 @@ func TestEncryptedMessageRoundTrip(t *testing.T) {
 	md.Encrypt = ""
 	if err := md.ShouldDecode(""); err != nil {
 		t.Logf("ShouldDecode(empty) err (expected, no-op): %v", err)
+	}
+}
+
+// TestConvertAudioAlreadyTargetFormat：输入已是目标格式时直接返回原路径，
+// 不触发 ffmpeg、也不产生"输出路径==输入路径"的自覆盖（C-low-7 回归）。
+func TestConvertAudioAlreadyTargetFormat(t *testing.T) {
+	wav := filepath.Join(t.TempDir(), "a.WAV")
+	if err := os.WriteFile(wav, []byte("RIFF....WAVE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := convertAudioToWavPath(wav); got != wav {
+		t.Errorf("已是 wav 应直接返回原路径，got %q want %q", got, wav)
+	}
+
+	amr := filepath.Join(t.TempDir(), "b.amr")
+	if err := os.WriteFile(amr, []byte("#!AMR\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := convertAudioToAmrPath(amr); got != amr {
+		t.Errorf("已是 amr 应直接返回原路径，got %q want %q", got, amr)
 	}
 }

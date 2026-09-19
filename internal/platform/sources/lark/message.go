@@ -600,7 +600,7 @@ func sendFileMessage(ctx context.Context, client *lark.Client, comp *message.Fil
 
 // sendAudioMessage sends a Record component (mirrors _send_audio_message):
 // ffmpeg 转 opus（libopus/单声道/16kHz）→ ffprobe 时长 → file_type=opus 上传
-// → audio 消息发送；转码失败降级按 stream 原样上传 file 消息。
+// → audio 消息发送；转码失败降级时仍以 opus/audio 上传原文件（对齐 py）。
 func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Record, replyMessageID, receiveID, receiveIDType string) error {
 	path := comp.Path
 	if path == "" {
@@ -635,17 +635,21 @@ func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Re
 		return sendImMessage(ctx, client, string(content), "audio", replyMessageID, receiveID, receiveIDType)
 	}
 
-	// 降级：opus 转码不可用时按 stream 上传原文件发送 file 消息（原有回退路径）。
-	key, err := uploadFile(ctx, client, path, "stream")
+	// 降级：opus 转码不可用时直接上传原文件，但 file_type 与 msg_type 仍
+	// 保持 opus/audio（对齐 py lark_event.py:779-800：无论转换是否成功，
+	// 都以上传 file_type="opus"、发送 msg_type="audio"），避免 file_type 与
+	// msg_type 不匹配导致飞书拒收或端上显示异常。
+	key, err := uploadFile(ctx, client, path, "opus", getMediaDuration(path))
 	if err != nil {
 		return err
 	}
 	content, _ := json.Marshal(map[string]string{"file_key": key})
-	return sendImMessage(ctx, client, string(content), "file", replyMessageID, receiveID, receiveIDType)
+	return sendImMessage(ctx, client, string(content), "audio", replyMessageID, receiveID, receiveIDType)
 }
 
 // sendMediaMessage sends a Video component (mirrors _send_media_message):
-// ffmpeg 转 mp4（libx264/aac）→ ffprobe 时长 → file_type=mp4 上传 → media 消息发送。
+// ffmpeg 转 mp4（libx264/aac）→ ffprobe 时长 → file_type=mp4 上传 → media 消息发送；
+// 转码失败降级时仍以 mp4/media 上传原文件（对齐 py）。
 func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Video, replyMessageID, receiveID, receiveIDType string) error {
 	path, tempPath, err := resolveMediaPath(ctx, comp.Path, comp.URL)
 	if err != nil {
@@ -671,9 +675,10 @@ func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Vi
 		return sendImMessage(ctx, client, string(content), "media", replyMessageID, receiveID, receiveIDType)
 	}
 
-	// 降级：mp4 转码不可用时按 stream 上传原文件（保留 media 消息类型，与
-	// 原有回退一致地依赖飞书服务端识别格式）。
-	key, err := uploadFile(ctx, client, path, "stream")
+	// 降级：mp4 转码不可用时直接上传原文件，但 file_type 与 msg_type 仍保持
+	// mp4/media（对齐 py lark_event.py:834-873：无论转换是否成功，都以上传
+	// file_type="mp4"、发送 msg_type="media"，避免类型不匹配）。
+	key, err := uploadFile(ctx, client, path, "mp4", getMediaDuration(path))
 	if err != nil {
 		return err
 	}

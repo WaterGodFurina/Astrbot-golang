@@ -98,22 +98,17 @@ const fetchData = async () => {
   }
 };
 
-/** 开启休眠开关时的默认闲置分钟数（后端不预置，前端交互层给默认值）。 */
-const DEFAULT_IDLE_MINUTES = 10;
-
+/** 开启休眠时不传阈值，由后端落 plugin.DefaultIdleUnloadMinutes（单一真源在后端）。 */
 const togglePlugin = async (item: SleepPluginItem, allowSleep: boolean) => {
   if (saving.value || !item.id) return;
   saving.value = true;
   try {
-    const res = await pluginApi.setIdleSleep(
-      item.id,
-      allowSleep,
-      allowSleep ? (item.idleUnloadMinutes || DEFAULT_IDLE_MINUTES) : undefined,
-    );
+    const res = await pluginApi.setIdleSleep(item.id, allowSleep);
     if (res.data.status === "ok") {
       item.allowSleep = allowSleep;
-      if (allowSleep && !item.idleUnloadMinutes) {
-        item.idleUnloadMinutes = DEFAULT_IDLE_MINUTES;
+      const echo = (res.data as any)?.data?.idle_unload_minutes;
+      if (allowSleep && typeof echo === "number") {
+        item.idleUnloadMinutes = echo;
       }
       toast(tm("sleep.pluginSaved"));
     } else {

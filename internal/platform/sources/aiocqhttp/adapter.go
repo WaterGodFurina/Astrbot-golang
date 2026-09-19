@@ -31,6 +31,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -78,6 +79,12 @@ type Adapter struct {
 
 	pendingMu sync.Mutex
 	pending   map[string]chan map[string]interface{} // echo -> response channel
+
+	// httpEventSem 限制 HTTP 事件入口的并发处理数（容量 maxConcurrentEvents），
+	// 满时丢弃并告警，避免事件洪峰无界 spawn goroutine 耗尽资源。延迟初始化：
+	// 测试中存在 &Adapter{...} 字面量构造，不能依赖 New 赋值。
+	httpEventSem  chan struct{}
+	httpEventOnce sync.Once
 
 	// quotedParser carries quoted_message_parser settings for forward-message
 	// fetching (get_forward_msg / get_msg).
@@ -498,6 +505,22 @@ func (a *Adapter) observeSendAction(action, echo string, ch chan map[string]inte
 	}
 }
 
+// maxConcurrentEvents 是事件处理的并发/队列上限：反向 WS 路径用 64 容量的
+// 事件队列 + 单消费者（见 handleWebSocket），HTTP 路径用同值的并发信号量，
+// 两条入口保持一致的有界策略（满时丢弃 + 告警）。
+const maxConcurrentEvents = 64
+
+// eventSem 返回有界的 HTTP 事件并发信号量，首次调用时创建（延迟初始化以兼容
+// &Adapter{...} 字面量构造）。
+func (a *Adapter) eventSem() chan struct{} {
+	a.httpEventOnce.Do(func() {
+		if a.httpEventSem == nil {
+			a.httpEventSem = make(chan struct{}, maxConcurrentEvents)
+		}
+	})
+	return a.httpEventSem
+}
+
 // handleHTTP handles HTTP POST requests from OneBot v11 implementations.
 func (a *Adapter) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -531,7 +554,19 @@ func (a *Adapter) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go a.handleEvent(event)
+	// 有界并发：与反向 WS 路径一致，事件处理并发上限为 maxConcurrentEvents
+	// （64）。获取不到槽位时立即丢弃并告警，既不无界 spawn goroutine，也不
+	// 阻塞本 handler，保证上游（OneBot 实现）不会因事件洪峰而超时。
+	sem := a.eventSem()
+	select {
+	case sem <- struct{}{}:
+		go func() {
+			defer func() { <-sem }()
+			a.handleEvent(event)
+		}()
+	default:
+		logger.I18nWarn("aiocqhttp: HTTP 事件处理并发已达上限（%d），丢弃一条事件", maxConcurrentEvents)
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -683,7 +718,7 @@ func (a *Adapter) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// Events are handled on a single per-connection goroutine so a slow
 	// handleEvent (quoted-message fetching via CallAction) never blocks this
 	// read loop from consuming the echo frames it waits for.
-	events := make(chan map[string]interface{}, 64)
+	events := make(chan map[string]interface{}, maxConcurrentEvents)
 	defer close(events)
 	go func() {
 		for ev := range events {
@@ -1425,6 +1460,13 @@ func (a *Adapter) resolveForwardPlaceholders(chain *message.MessageChain) {
 	walk(chain.Chain)
 }
 
+// pathToFileURI 把本地绝对路径转换为标准 file:// URI。实现已提取到
+// internal/utils.PathToFileURI，供 pipeline 等其它包的生产端复用，此处保留
+// 薄封装以维持本文件调用点不变。
+func pathToFileURI(path string) string {
+	return utils.PathToFileURI(path)
+}
+
 // convertToCQFormat converts a MessageChain to OneBot v11 message segments.
 func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]interface{} {
 	if mc == nil {
@@ -1490,7 +1532,8 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 			case c.URL != "":
 				ref = c.URL
 			case c.Path != "":
-				ref = "file://" + c.Path
+				// 本地路径转标准 file URI（对齐 Python as_uri），避免 Windows 反斜杠路径裸拼出畸形 URI
+				ref = pathToFileURI(c.Path)
 			case c.File != "":
 				ref = c.File
 			}
@@ -1509,7 +1552,8 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 			case c.URL != "":
 				ref = c.URL
 			case c.Path != "":
-				ref = "file://" + c.Path
+				// 本地路径转标准 file URI（对齐 Python as_uri），避免 Windows 反斜杠路径裸拼出畸形 URI
+				ref = pathToFileURI(c.Path)
 			case c.FileID != "":
 				ref = c.FileID
 			}
@@ -1523,7 +1567,8 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 			case c.URL != "":
 				ref = c.URL
 			case c.Path != "":
-				ref = "file://" + c.Path
+				// 本地路径转标准 file URI（对齐 Python as_uri），避免 Windows 反斜杠路径裸拼出畸形 URI
+				ref = pathToFileURI(c.Path)
 			case c.FileID != "":
 				ref = c.FileID
 			}

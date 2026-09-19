@@ -89,6 +89,12 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
+	// os.CreateTemp 固定以 0600 创建，perm 参数此前被忽略；显式 Chmod 后再
+	// rename，保证目标文件权限符合调用方预期（F-low-6）。
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}

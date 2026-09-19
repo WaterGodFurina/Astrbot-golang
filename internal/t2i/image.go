@@ -309,6 +309,22 @@ func fontFileUsable(path string) bool {
 	return err == nil
 }
 
+// dataFontPath returns the injectable data-dir font candidate
+// `<data>/font.ttf`, mirroring Python FontManager.get_font's first regular
+// candidate `data_dir / "font.ttf"` (see astrbot/core/utils/t2i/local_strategy.py
+// and config/default.py hint "将 ttf 字体命名为 'font.ttf' 放在 data/ 目录下可
+// 自定义字体"). data_dir is ASTRBOT_DATA_PATH when set, else <ASTRBOT_ROOT>/data
+// (Python get_astrbot_data_path), else the process-relative "data".
+func dataFontPath() string {
+	if dp := strings.TrimSpace(os.Getenv("ASTRBOT_DATA_PATH")); dp != "" {
+		return filepath.Join(dp, "font.ttf")
+	}
+	if root := strings.TrimSpace(os.Getenv("ASTRBOT_ROOT")); root != "" {
+		return filepath.Join(root, "data", "font.ttf")
+	}
+	return filepath.Join("data", "font.ttf")
+}
+
 // systemCJKFont returns a usable CJK-capable font file, preferring an explicit
 // path then scanning well-known system locations. Only fonts that actually
 // parse as TrueType are returned (CFF-based candidates are skipped).
@@ -317,11 +333,20 @@ func systemCJKFont(explicit string) string {
 		return explicit
 	}
 	candidates := []string{
+		dataFontPath(),
 		"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
 		"/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
 		"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
 		"/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+		// macOS：PingFang.ttc 是 CFF(OTTO) 轮廓，freetype/truetype 解析失败会自动
+		// 跳过；紧随其后的 Hiragino Sans GB（TrueType）才是真正可用的兜底，
+		// 再补 STHeiti（TrueType）避免 Hiragino 缺失。对齐 py 候选中的
+		// Hiragino Sans GB.ttc（local_strategy.py:92）。
 		"/System/Library/Fonts/PingFang.ttc",
+		"/System/Library/Fonts/Hiragino Sans GB.ttc",
+		"/System/Library/Fonts/STHeiti Light.ttc",
+		"/System/Library/Fonts/STHeiti Medium.ttc",
+		"/Library/Fonts/Arial Unicode.ttf",
 		"C:/Windows/Fonts/msyh.ttc",
 		"C:/Windows/Fonts/simhei.ttf",
 		"/usr/share/fonts/noto/NotoSansCJK-Regular.ttc",

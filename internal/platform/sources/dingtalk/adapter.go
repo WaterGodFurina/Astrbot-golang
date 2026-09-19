@@ -28,11 +28,30 @@ var logger = log.GetDefault().WithComponent("DingTalk")
 // 钉钉会话 id 前缀 (对应 Python dingtalk_adapter.py 的 _id_to_sid: prefix = "$:LWCP_v1:$")。
 const dingtalkIDPrefix = "$:LWCP_v1:$"
 
+// redactAccessToken 脱敏文本中的 access_token（HTTP 客户端错误会带上完整
+// 请求 URL，直接入日志会泄漏凭据）。只替换 token 值，保留参数名便于排查。
+func redactAccessToken(s string) string {
+	const key = "access_token="
+	idx := strings.Index(s, key)
+	if idx < 0 {
+		return s
+	}
+	start := idx + len(key)
+	end := start
+	for end < len(s) && !strings.ContainsRune("& \"\n\r\t", rune(s[end])) {
+		end++
+	}
+	return s[:start] + "***" + s[end:]
+}
+
 // accessTokenCache 缓存钉钉 access_token (对应 Python 中 SDK 的 token 缓存)。
 type accessTokenCache struct {
 	mu       sync.Mutex
 	token    string
 	expireAt time.Time
+	// refresh 串行化 token 刷新：并发请求只让一个 goroutine 真正发起
+	// HTTP 刷新，其余在锁外等待后复用结果，避免刷新风暴。
+	refresh sync.Mutex
 }
 
 // Adapter 实现钉钉机器人官方 API 适配器。
@@ -195,7 +214,11 @@ func (a *Adapter) convertMsg(msg *ChatbotMessage) *platform.AstrBotMessage {
 	abm := platform.NewAstrBotMessage()
 	abm.Message = []message.Component{}
 	abm.MessageStr = ""
-	abm.Timestamp = msg.CreateAt / 1000
+	// 仅在远端带有效时间戳时覆盖；CreateAt 缺失(0)时保留
+	// NewAstrBotMessage 默认的当前时间，避免消息时间戳变成 1970。
+	if msg.CreateAt > 0 {
+		abm.Timestamp = msg.CreateAt / 1000
+	}
 	if msg.ConversationType == "2" {
 		abm.Type = platform.GroupMessage
 	} else {
@@ -455,8 +478,30 @@ func (a *Adapter) persistState() {
 	}
 }
 
+// sanitizeDingExt 净化来自远端的 fileExtension：只保留 ASCII 字母/数字，
+// 长度上限 16。远端可控的扩展名若含 "/"、".." 等会经 filepath.Join 进入
+// 临时文件名，造成路径穿越或非法文件名。所有下载入口共用此处兜底。
+func sanitizeDingExt(ext string) string {
+	ext = strings.TrimPrefix(ext, ".")
+	var b strings.Builder
+	for _, r := range ext {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			if b.Len() >= 16 {
+				break
+			}
+		}
+	}
+	return b.String()
+}
+
 // downloadDingFile 下载钉钉消息中的文件 (对应 Python download_ding_file)。
 func (a *Adapter) downloadDingFile(downloadCode, robotCode, ext string) string {
+	// 统一净化扩展名（远端 fileExtension / fileName 派生值均可能不可信）。
+	ext = sanitizeDingExt(ext)
+	if ext == "" {
+		ext = "file"
+	}
 	accessToken := a.getAccessToken()
 	if accessToken == "" {
 		return ""
@@ -517,11 +562,27 @@ func (a *Adapter) dingtalkCtx() context.Context {
 
 // getAccessToken 获取钉钉 access_token (带缓存, 对应 Python get_access_token)。
 func (a *Adapter) getAccessToken() string {
-	a.tokenCache.mu.Lock()
-	defer a.tokenCache.mu.Unlock()
-	if a.tokenCache.token != "" && time.Now().Before(a.tokenCache.expireAt) {
-		return a.tokenCache.token
+	cached := func() string {
+		a.tokenCache.mu.Lock()
+		defer a.tokenCache.mu.Unlock()
+		if a.tokenCache.token != "" && time.Now().Before(a.tokenCache.expireAt) {
+			return a.tokenCache.token
+		}
+		return ""
 	}
+	if tok := cached(); tok != "" {
+		return tok
+	}
+
+	// 刷新串行化：只有拿到 refresh 锁的 goroutine 真正发 HTTP，其余等它
+	// 完成后直接复用缓存，避免并发刷新风暴。HTTP 调用必须在 tokenCache.mu
+	// 之外进行，不能持有缓存锁做网络 I/O。
+	a.tokenCache.refresh.Lock()
+	defer a.tokenCache.refresh.Unlock()
+	if tok := cached(); tok != "" {
+		return tok
+	}
+
 	payload := map[string]interface{}{
 		"appKey":    a.clientID,
 		"appSecret": a.clientSecret,
@@ -541,7 +602,7 @@ func (a *Adapter) getAccessToken() string {
 		return ""
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
 		logger.I18nError("获取钉钉机器人 access_token 失败: %d, %s", resp.StatusCode, string(respBody))
 		return ""
@@ -568,8 +629,10 @@ func (a *Adapter) getAccessToken() string {
 			expireIn = int(v)
 		}
 	}
+	a.tokenCache.mu.Lock()
 	a.tokenCache.token = token
 	a.tokenCache.expireAt = time.Now().Add(time.Duration(expireIn-300) * time.Second)
+	a.tokenCache.mu.Unlock()
 	return token
 }
 
@@ -607,7 +670,8 @@ func (a *Adapter) uploadMedia(filePath, mediaType string) string {
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		logger.I18nError("钉钉媒体上传失败: %v", err)
+		// HTTP 客户端错误会带完整 URL（含 access_token），日志前必须脱敏。
+		logger.I18nError("钉钉媒体上传失败: %s", redactAccessToken(err.Error()))
 		return ""
 	}
 	defer resp.Body.Close()
@@ -959,12 +1023,17 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.I18nError("发布钉钉消息事件失败: %v", err)
 	}
-	a.removeMsgTempFiles(abm)
+	a.scheduleMsgTempCleanup(abm)
 }
 
-// removeMsgTempFiles 清理本条消息下载到临时目录的媒体文件
-// (downloadDingFile 落盘为 dingtalk_* 文件, 发布后无其他消费方)。
-func (a *Adapter) removeMsgTempFiles(abm *platform.AstrBotMessage) {
+// tempMediaCleanupDelay 是临时媒体文件的清理延迟：消息在事件总线中异步处理，
+// 延迟清理保证管线/ASR 在消费期间可读取媒体（对齐 lark 包的 30 分钟）。
+const tempMediaCleanupDelay = 30 * time.Minute
+
+// scheduleMsgTempCleanup 延迟清理本条消息下载到临时目录的媒体文件
+// (downloadDingFile 落盘为 dingtalk_* 文件, Publish 后不能立即删除，
+// 管线/ASR 可能稍后才读取)。
+func (a *Adapter) scheduleMsgTempCleanup(abm *platform.AstrBotMessage) {
 	for _, comp := range abm.Message {
 		var p string
 		switch c := comp.(type) {
@@ -975,13 +1044,18 @@ func (a *Adapter) removeMsgTempFiles(abm *platform.AstrBotMessage) {
 		case *message.File:
 			p = c.Path
 		}
-		removeDingtalkTemp(p)
+		scheduleDingtalkTempCleanup(p)
 	}
 }
 
-func removeDingtalkTemp(p string) {
+// scheduleDingtalkTempCleanup 在延迟后删除钉钉临时文件 (对齐 lark 包的 scheduleTempCleanup)。
+func scheduleDingtalkTempCleanup(p string) {
 	if p != "" && strings.HasPrefix(filepath.Base(p), "dingtalk_") {
-		_ = os.Remove(p)
+		time.AfterFunc(tempMediaCleanupDelay, func() {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				logger.Debug("清理钉钉临时文件失败 %s: %v", p, err)
+			}
+		})
 	}
 }
 

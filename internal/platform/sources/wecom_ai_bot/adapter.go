@@ -171,6 +171,16 @@ func (a *Adapter) ID() string { return a.id }
 // Type 返回平台类型。
 func (a *Adapter) Type() string { return "wecom_ai_bot" }
 
+// Stats 返回队列运行期统计（对应 py WecomAIBotAdapter.get_stats），
+// 实现 platform.StatsProvider 供 PlatformManager 聚合。
+func (a *Adapter) Stats() map[string]interface{} {
+	return map[string]interface{}{
+		"wecom_ai_bot": map[string]interface{}{
+			"queues": a.queueMgr.GetStats(),
+		},
+	}
+}
+
 // Start 启动适配器：
 //   - 长连接模式：启动长连接客户端 + 队列监听器；
 //   - 统一 webhook 模式：只运行队列监听器；
@@ -436,7 +446,10 @@ func (a *Adapter) processMessage(messageData map[string]interface{}, callbackPar
 		if event == nil {
 			return "", nil
 		}
-		if ev, _ := event["event"].(string); ev == "enter_chat" && a.friendMessageWelcomeText != "" {
+		// 真实字段为 eventtype（对齐长连接分支 wecomai_adapter.py:400-401
+		// 的 event.get("eventtype")）；此前的 event["event"] 永远取不到值，
+		// 导致 webhook 模式欢迎语永不触发。
+		if ev, _ := event["eventtype"].(string); ev == "enter_chat" && a.friendMessageWelcomeText != "" {
 			// 用户进入会话，发送欢迎消息
 			resp := (WecomAIBotStreamMessageBuilder{}).MakeText(a.friendMessageWelcomeText)
 			return a.apiClient.EncryptMessage(resp, callbackParams["nonce"], callbackParams["timestamp"]), nil
@@ -779,6 +792,15 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		}
 		markStreamComplete(streamID, a.queueMgr)
 		return nil
+	}
+
+	// 对齐 Python send_by_session（wecomai_adapter.py:566-585）：无本次用户
+	// 消息对应的待响应上下文时（主动发送），webhook 整链直接发送
+	// （unsupportedOnly=false 等价于 py 的 send_message_chain 全链发送），
+	// 不再落入无人轮询的输出队列导致文本静默丢失；正常回复路径（存在待
+	// 响应上下文，由轮询方消费输出队列）保持不变。
+	if pending == nil && a.webhookClient != nil {
+		return a.webhookClient.SendMessageChain(context.Background(), chain, false)
 	}
 
 	if a.webhookClient != nil {

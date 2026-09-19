@@ -19,9 +19,30 @@ import (
 // OllamaSource is an Ollama local LLM provider.
 type OllamaSource struct {
 	*provider.BaseProvider
-	apiBase      string
-	client       *http.Client
+	apiBase string
+	client  *http.Client
+	// streamClient 供 SSE 流式读取。
 	streamClient *http.Client
+	// disableThinking 对应 ollama_disable_thinking：为 true 时不下发思考
+	// （原生 /api/chat 传 think=false）。
+	disableThinking bool
+}
+
+// ollamaToolCall 为原生 /api/chat 的 message.tool_calls 元素。arguments 在
+// 新版 Ollama 是 JSON 对象，旧版可能是 JSON 字符串，故用 interface{} 承接。
+type ollamaToolCall struct {
+	Function struct {
+		Name      string      `json:"name"`
+		Arguments interface{} `json:"arguments"`
+	} `json:"function"`
+}
+
+// ollamaMessage 为原生 /api/chat 的 message 字段。
+type ollamaMessage struct {
+	Role      string           `json:"role"`
+	Content   string           `json:"content"`
+	Thinking  string           `json:"thinking"`
+	ToolCalls []ollamaToolCall `json:"tool_calls"`
 }
 
 // NewOllamaSource creates an Ollama provider.
@@ -38,7 +59,33 @@ func NewOllamaSource(config, settings map[string]interface{}) *OllamaSource {
 	if s.apiBase == "" {
 		s.apiBase = "http://localhost:11434"
 	}
+	// ollama_disable_thinking（WebUI 模板已提供该键）：读取并生效，为 true 时
+	// 关闭思考模式。
+	s.disableThinking = configBool(config, "ollama_disable_thinking", false)
 	return s
+}
+
+// ollamaArguments 把原生 tool_calls 的 arguments（对象或 JSON 字符串）归一
+// 为 map，供 LLMResponse.ToolsCallArgs 使用。
+func ollamaArguments(v interface{}) map[string]interface{} {
+	switch a := v.(type) {
+	case map[string]interface{}:
+		return a
+	case string:
+		out := map[string]interface{}{}
+		if strings.TrimSpace(a) != "" {
+			_ = json.Unmarshal([]byte(a), &out)
+		}
+		return out
+	case nil:
+		return map[string]interface{}{}
+	default:
+		out := map[string]interface{}{}
+		if b, err := json.Marshal(a); err == nil {
+			_ = json.Unmarshal(b, &out)
+		}
+		return out
+	}
 }
 
 // doRequest sends an HTTP request with retry logic.
@@ -77,25 +124,39 @@ func (s *OllamaSource) TextChat(ctx context.Context, req *provider.ProviderReque
 		}, nil
 	}
 	var result struct {
-		Message struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"message"`
-		PromptEvalCount int `json:"prompt_eval_count"`
-		EvalCount       int `json:"eval_count"`
+		Message         ollamaMessage `json:"message"`
+		PromptEvalCount int           `json:"prompt_eval_count"`
+		EvalCount       int           `json:"eval_count"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
-	logger.Debug("LLM response: text_len=%d", len(result.Message.Content))
-	return &provider.LLMResponse{
-		Role:           result.Message.Role,
-		CompletionText: result.Message.Content,
+	llmResp := &provider.LLMResponse{
+		Role:             result.Message.Role,
+		CompletionText:   result.Message.Content,
+		ReasoningContent: result.Message.Thinking,
+		ToolsCallArgs:    []map[string]interface{}{},
+		ToolsCallName:    []string{},
+		ToolsCallIDs:     []string{},
 		Usage: &provider.TokenUsage{
 			InputOther: result.PromptEvalCount,
 			Output:     result.EvalCount,
 		},
-	}, nil
+	}
+	// 原生 /api/chat 的 message.tool_calls 需回填为 LLMResponse 的工具调用，
+	// 否则 Ollama 的函数调用永不触发（REST tool_calls 为 {"function":{...}}，
+	// 无 id/type 字段）。
+	for _, tc := range result.Message.ToolCalls {
+		llmResp.ToolsCallName = append(llmResp.ToolsCallName, tc.Function.Name)
+		llmResp.ToolsCallArgs = append(llmResp.ToolsCallArgs, ollamaArguments(tc.Function.Arguments))
+		// 原生协议不返回 call id，用函数名占位，保证后续 tool 结果能回填。
+		llmResp.ToolsCallIDs = append(llmResp.ToolsCallIDs, tc.Function.Name)
+	}
+	if len(llmResp.ToolsCallArgs) > 0 {
+		llmResp.Role = "tool"
+	}
+	logger.Debug("LLM response: text_len=%d tools=%d", len(llmResp.CompletionText), len(llmResp.ToolsCallArgs))
+	return llmResp, nil
 }
 
 // TextChatStream sends a streaming chat request.
@@ -117,16 +178,38 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 		decoder := json.NewDecoder(resp.Body)
 		var usage *provider.TokenUsage
 		var content strings.Builder
+		var reasoning strings.Builder
+		var finalToolCalls []ollamaToolCall
 		sawDone := false
+
+		// buildFinal 聚合文本/思考/工具调用/用量为最终响应。
+		buildFinal := func() *provider.LLMResponse {
+			final := &provider.LLMResponse{
+				Role:             "assistant",
+				CompletionText:   content.String(),
+				ReasoningContent: reasoning.String(),
+				Usage:            usage,
+				ToolsCallArgs:    []map[string]interface{}{},
+				ToolsCallName:    []string{},
+				ToolsCallIDs:     []string{},
+			}
+			for _, tc := range finalToolCalls {
+				final.ToolsCallName = append(final.ToolsCallName, tc.Function.Name)
+				final.ToolsCallArgs = append(final.ToolsCallArgs, ollamaArguments(tc.Function.Arguments))
+				final.ToolsCallIDs = append(final.ToolsCallIDs, tc.Function.Name)
+			}
+			if len(final.ToolsCallArgs) > 0 {
+				final.Role = "tool"
+			}
+			return final
+		}
+
 		for decoder.More() {
 			var chunk struct {
-				Message struct {
-					Role    string `json:"role"`
-					Content string `json:"content"`
-				} `json:"message"`
-				PromptEvalCount int  `json:"prompt_eval_count"`
-				EvalCount       int  `json:"eval_count"`
-				Done            bool `json:"done"`
+				Message         ollamaMessage `json:"message"`
+				PromptEvalCount int           `json:"prompt_eval_count"`
+				EvalCount       int           `json:"eval_count"`
+				Done            bool          `json:"done"`
 			}
 			if err := decoder.Decode(&chunk); err != nil {
 				if err == io.EOF {
@@ -143,6 +226,19 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 					CompletionText: chunk.Message.Content,
 				}
 			}
+			// 思考增量（原生 message.thinking）作为 reasoning 片段下发并累积。
+			if chunk.Message.Thinking != "" {
+				reasoning.WriteString(chunk.Message.Thinking)
+				ch <- &provider.LLMResponse{
+					Role:             chunk.Message.Role,
+					IsChunk:          true,
+					ReasoningContent: chunk.Message.Thinking,
+				}
+			}
+			// 工具调用通常在末尾块给出；累积后在最终响应回填。
+			if len(chunk.Message.ToolCalls) > 0 {
+				finalToolCalls = append(finalToolCalls, chunk.Message.ToolCalls...)
+			}
 			if chunk.PromptEvalCount > 0 || chunk.EvalCount > 0 {
 				usage = &provider.TokenUsage{
 					InputOther: chunk.PromptEvalCount,
@@ -150,22 +246,13 @@ func (s *OllamaSource) TextChatStream(ctx context.Context, req *provider.Provide
 				}
 			}
 			if chunk.Done {
-				// Final chunk: emit consolidated response with usage.
 				sawDone = true
-				ch <- &provider.LLMResponse{
-					Role:           "assistant",
-					CompletionText: content.String(),
-					Usage:          usage,
-				}
+				ch <- buildFinal()
 			}
 		}
-		// 流结束但未收到 done 块: 补发最终聚合块, 保证 usage 不丢失。
+		// 流结束但未收到 done 块: 补发最终聚合块, 保证 usage/工具调用不丢失。
 		if !sawDone {
-			ch <- &provider.LLMResponse{
-				Role:           "assistant",
-				CompletionText: content.String(),
-				Usage:          usage,
-			}
+			ch <- buildFinal()
 		}
 		if usage != nil {
 			logger.Debug("LLM stream done, usage=%v", usage)
@@ -222,6 +309,11 @@ func (s *OllamaSource) buildRequestBody(req *provider.ProviderRequest, stream bo
 	// 工具: 透传 OpenAI function schema（Ollama 的 tools 字段与 OpenAI 结构一致）。
 	if len(req.Tools) > 0 {
 		body["tools"] = req.Tools
+	}
+	// ollama_disable_thinking 生效：为 true 时显式传 think=false 关闭思考模式；
+	// 未开启时不下发该字段，交由 Ollama 按模型默认决定。
+	if s.disableThinking {
+		body["think"] = false
 	}
 	return body
 }

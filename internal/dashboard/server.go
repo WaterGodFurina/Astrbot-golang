@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,6 +35,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
@@ -66,6 +68,7 @@ type Server struct {
 	conversationMgr interface{} // *conversation.Manager
 	cronMgr         interface{} // *cron.CronJobManager
 	subPluginMgr    *plugin.SubprocessManager
+	sandboxMgr      *sandbox.Manager         // 技能/插件变更后 resync 活跃沙盒（对齐 py sync_skills_to_active_sandboxes）
 	kbMgr           interface{}              // *knowledgebase.Manager
 	kbTasks         map[string]*kbUploadTask // knowledge base upload task states
 	skillMgr        interface{}              // *skills.SkillManager
@@ -250,6 +253,9 @@ type updateProgress struct {
 	Message        string                        `json:"message"`
 	OverallPercent int                           `json:"overall_percent"`
 	Stages         map[string]*downloadStageInfo `json:"stages"`
+	// UpdatedAt 最近一次进度写入时间（updateProgressSet 维护），用于终态进度
+	// 条目的 TTL GC；不对外序列化。
+	UpdatedAt time.Time `json:"-"`
 }
 
 // downloadStageInfo 单个阶段的下载进度。
@@ -302,6 +308,7 @@ func (s *Server) SetOnPluginsChanged(fn func()) {
 
 // notifyPluginsChanged triggers the plugin reload callback if registered.
 func (s *Server) notifyPluginsChanged() {
+	s.resyncSandboxSkills() // 插件自带技能随装卸变化，resync 活跃沙盒（对齐 py plugin_service）。
 	if s.onPluginsChanged != nil {
 		s.onPluginsChanged()
 	}
@@ -355,7 +362,7 @@ func NewServer(port int, configPath string) *Server {
 	s.setupRoutes()
 	s.srv = &http.Server{
 		Addr:              fmt.Sprintf(":%d", port),
-		Handler:           s.mux,
+		Handler:           s.recoverMiddleware(s.mux),
 		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		// 注意：不设置 WriteTimeout —— 它会在请求开始时设定绝对截止，
@@ -408,6 +415,11 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 				s.subPluginMgr = pm
 			}
 		}
+		if v, ok := managers["sandbox"]; ok {
+			if sm, ok := v.(*sandbox.Manager); ok {
+				s.sandboxMgr = sm
+			}
+		}
 		if v, ok := managers["star"]; ok {
 			s.starMgr = v
 		}
@@ -445,6 +457,11 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 				})
 			}
 		}
+		if v, ok := managers["neo"]; ok {
+			if injected, ok2 := v.(*skills.NeoStore); ok2 && injected != nil {
+				s.neo = injected // lifecycle owns the shared instance (pipeline + dashboard APIs).
+			}
+		}
 		if v, ok := managers["skills"]; ok {
 			s.skillMgr = v
 			// Neo 技能生命周期 sync 需要把同步出的本地 SKILL.md 标记为
@@ -470,12 +487,47 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 	return s
 }
 
+// platformAllStats 聚合平台适配器的运行期统计（对应 py
+// PlatformManager.get_all_stats）。仅实现 platform.StatsProvider 的适配器
+// 会出现在结果里；未接入平台管理器时返回 nil。
+func (s *Server) platformAllStats() []map[string]interface{} {
+	if pm, ok := s.platformMgr.(*platform.PlatformManager); ok {
+		return pm.GetAllStats()
+	}
+	return nil
+}
+
 // setupRoutes registers API endpoints.
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/api/", s.apiHandler)
 	s.mux.HandleFunc("/health", s.healthHandler)
 	// Serve embedded WebUI
 	s.mux.HandleFunc("/", s.serveWebUI)
+}
+
+// recoverMiddleware 全局 panic 兜底：捕获 handler 链中未处理的 panic，
+// 记录堆栈并返回 500，防止单个请求panic 打挂整个 dashboard 进程。
+// 原先 GET /api/v1/t2i（无子路径）的 parts[1:] 越界即属此类。
+func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("dashboard panic: %v\n%s", rec, debug.Stack())
+				// 连接已被写入部分响应时 WriteHeader 会失败，静默即可。
+				_ = tryWritePanicResponse(w)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// tryWritePanicResponse 尽力返回 500 JSON；响应头已发出时返回 false。
+func tryWritePanicResponse(w http.ResponseWriter) bool {
+	defer func() { _ = recover() }()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusInternalServerError)
+	_, err := w.Write([]byte(`{"status":"error","message":"internal server error"}` + "\n"))
+	return err == nil
 }
 
 // healthHandler returns service health.
@@ -626,7 +678,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, apiError("签发会话令牌失败: "+err.Error()))
 			return
 		}
-		// 除 JSON 返回外，同步种下 HttpOnly Cookie（Path=/、SameSite=Lax，
+		// 除 JSON 返回外，同步种下 HttpOnly Cookie（Path=/、SameSite=Strict，
 		// HTTPS 时 Secure），供前端迁移后无需再在 sessionStorage 保存 token；
 		// 现有前端经 Authorization 头鉴权的路径继续可用（Cookie 是新增途径）。
 		s.setSessionCookie(w, token)
@@ -658,17 +710,19 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 // 与 Authorization Bearer / ?token= 并存，互为回退。
 const sessionCookieName = "astrbot_token"
 
-// setSessionCookie 写入会话 Cookie：Path=/、HttpOnly、SameSite=Lax；仅在
+// setSessionCookie 写入会话 Cookie：Path=/、HttpOnly、SameSite=Strict；仅在
 // dashboard.ssl 实际启用 HTTPS（enable + cert_file + key_file 齐备，与
 // Start 的 ServeTLS 分支条件一致）时附加 Secure。HTTP 部署下不加 Secure，
 // 避免本地 HTTP 调试时浏览器静默丢弃 Cookie。
+// SameSite=Strict 对齐 Python _set_dashboard_jwt_cookie（samesite="strict"）：
+// 跨站导航/子请求不会携带会话 Cookie，杜绝 CSRF 触发重启等有副作用端点。
 func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 	c := &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		Expires:  time.Now().Add(tokenTTL),
 	}
 	if enable, cert, key := s.sslConfig(); enable && cert != "" && key != "" {
@@ -684,7 +738,7 @@ func (s *Server) clearSessionCookie(w http.ResponseWriter) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 		Expires:  time.Unix(1, 0),
 	})
@@ -908,6 +962,179 @@ func (s *Server) handleAccountEdit(w http.ResponseWriter, r *http.Request) {
 	}))
 }
 
+// listLocalChangelogVersions 列出 <dataDir>/changelogs/v*.md 的版本号，
+// 按语义版本降序返回（对齐 py stat_service.list_changelog_versions）。F-low-4。
+func (s *Server) listLocalChangelogVersions() []string {
+	dir := filepath.Join(s.kbDataDir(), "changelogs")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return []string{}
+	}
+	versions := make([]string, 0, len(entries))
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".md") || !strings.HasPrefix(name, "v") {
+			continue
+		}
+		ver := strings.TrimSuffix(name[1:], ".md")
+		if changelogVersionRe.MatchString(ver) && !strings.Contains(ver, "..") {
+			versions = append(versions, ver)
+		}
+	}
+	sort.Slice(versions, func(i, j int) bool {
+		return compareSemverish(versions[i], versions[j]) > 0
+	})
+	return versions
+}
+
+// readFirstNotice 读取 FIRST_NOTICE.md（按 locale 优先匹配），对齐 py
+// stat_service.get_first_notice。目录候选覆盖 <dataDir> 与其父目录（仓库根）。
+func (s *Server) readFirstNotice(locale string) (string, bool) {
+	locale = strings.TrimSpace(locale)
+	if !validFirstNoticeLocale(locale) {
+		locale = ""
+	}
+	dataDir := s.kbDataDir()
+	root := filepath.Dir(dataDir)
+	pick := func(name string) string {
+		for _, base := range []string{dataDir, root} {
+			p := filepath.Join(base, name)
+			if b, err := os.ReadFile(p); err == nil && strings.TrimSpace(string(b)) != "" {
+				return string(b)
+			}
+		}
+		return ""
+	}
+	if locale != "" {
+		if c := pick("FIRST_NOTICE." + locale + ".md"); c != "" {
+			return c, true
+		}
+		lower := strings.ToLower(locale)
+		if strings.HasPrefix(lower, "zh") {
+			for _, name := range []string{"FIRST_NOTICE.md", "FIRST_NOTICE.zh-CN.md"} {
+				if c := pick(name); c != "" {
+					return c, true
+				}
+			}
+		} else if strings.HasPrefix(lower, "en") {
+			if c := pick("FIRST_NOTICE.en-US.md"); c != "" {
+				return c, true
+			}
+		}
+	}
+	for _, name := range []string{"FIRST_NOTICE.md", "FIRST_NOTICE.en-US.md"} {
+		if c := pick(name); c != "" {
+			return c, true
+		}
+	}
+	return "", false
+}
+
+// validFirstNoticeLocale 仅允许 [A-Za-z0-9_-]（空字符串视为无 locale）。
+func validFirstNoticeLocale(locale string) bool {
+	for _, r := range locale {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// compareSemverish 比较语义化版本号（忽略 build metadata），返回 -1/0/1。
+func compareSemverish(a, b string) int {
+	pa, prea := splitSemverish(a)
+	pb, preb := splitSemverish(b)
+	n := len(pa)
+	if len(pb) > n {
+		n = len(pb)
+	}
+	for i := 0; i < n; i++ {
+		var x, y int
+		if i < len(pa) {
+			x = pa[i]
+		}
+		if i < len(pb) {
+			y = pb[i]
+		}
+		if x != y {
+			if x > y {
+				return 1
+			}
+			return -1
+		}
+	}
+	switch {
+	case prea == "" && preb == "":
+		return 0
+	case prea == "":
+		return 1 // 无预发布标签的版本更高
+	case preb == "":
+		return -1
+	}
+	sa := strings.Split(prea, ".")
+	sb := strings.Split(preb, ".")
+	m := len(sa)
+	if len(sb) > m {
+		m = len(sb)
+	}
+	for i := 0; i < m; i++ {
+		if i >= len(sa) {
+			return -1
+		}
+		if i >= len(sb) {
+			return 1
+		}
+		na, ea := strconv.Atoi(sa[i])
+		nb, eb := strconv.Atoi(sb[i])
+		switch {
+		case ea == nil && eb == nil:
+			if na != nb {
+				if na > nb {
+					return 1
+				}
+				return -1
+			}
+		case ea == nil:
+			return -1 // 数字标识符优先级低于非数字
+		case eb == nil:
+			return 1
+		default:
+			if sa[i] != sb[i] {
+				if sa[i] > sb[i] {
+					return 1
+				}
+				return -1
+			}
+		}
+	}
+	return 0
+}
+
+// splitSemverish 拆分 "v1.2.3-rc.1+build" → ([1,2,3], "rc.1")。
+func splitSemverish(v string) ([]int, string) {
+	v = strings.ToLower(strings.TrimSpace(v))
+	v = strings.TrimPrefix(v, "v")
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
+	}
+	core, pre := v, ""
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		core, pre = v[:i], v[i+1:]
+	}
+	parts := strings.Split(core, ".")
+	nums := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			break
+		}
+		nums = append(nums, n)
+	}
+	return nums, pre
+}
+
 // handleStat handles stat endpoints.
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []string) {
 	if len(parts) == 0 {
@@ -932,13 +1159,19 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 		}))
 	case "versions":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"versions": []interface{}{},
+			"versions": s.listLocalChangelogVersions(),
 		}))
 	case "start-time":
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"start_time": s.startTime.Unix(),
 		}))
 	case "restart-core":
+		// 对齐 Python @legacy_router.post("/restart-core")：仅 POST。重启是
+		// 有副作用的敏感操作，禁止 GET（避免被跨站导航/预取等 GET 语义触发）。
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, apiError("仅支持 POST"))
+			return
+		}
 		// 对齐 Python stat_service.restart_core：前端"重启"按钮经
 		// /api/stat/restart-core 触发核心自重启。异步执行，先返回响应，
 		// 前端 WaitingForRestart 轮询 start-time 检测重启完成并刷新。
@@ -953,9 +1186,15 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 			}))
 		}
 	case "first-notice":
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"notice": "",
-		}))
+		if content, found := s.readFirstNotice(r.URL.Query().Get("locale")); found {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"content": content,
+			}))
+		} else {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+				"content": nil,
+			}))
+		}
 	case "test-ghproxy-connection", "ghproxy":
 		// 前端 openapi 路径为 /api/v1/stats/ghproxy/test（parts=[ghproxy,test]）；
 		// 旧路径 /api/v1/stat/test-ghproxy-connection 也兼容。
@@ -1175,6 +1414,13 @@ func sumCleanupMetrics(a, b interface{}) interface{} {
 
 // handleGhproxyTest 测 GitHub 加速地址连通性（对齐 Python
 func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
+	// 对齐 Python @router.post("/stats/ghproxy/test")：仅 POST。该端点会以
+	// 调用方给定的 URL 建立出站连接并回传状态/延迟，是典型的 SSRF 探测
+	// oracle，禁止 GET（跨站 <img>/导航无法触发）。
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiError("仅支持 POST"))
+		return
+	}
 	proxyURL := strings.TrimSpace(r.URL.Query().Get("proxy_url"))
 	if proxyURL == "" {
 		var body struct {
@@ -1193,16 +1439,19 @@ func (s *Server) handleGhproxyTest(w http.ResponseWriter, r *http.Request) {
 	testURL := strings.TrimRight(proxyURL, "/") +
 		"/https://github.com/AstrBotDevs/AstrBot/raw/refs/heads/master/.python-version"
 	// 校验出站 URL 防 SSRF：仅 http/https，拒绝内网/回环/元数据地址与
-	// localhost 主机名（对齐 market.go validateOutboundURL）。
-	if err := validateOutboundURL(testURL); err != nil {
+	// localhost 主机名（严格版：ghproxy 可指向任意主机且回传连通性，必须连
+	// 回环也拒绝，避免探测本机服务）。
+	if err := validateOutboundURLStrict(testURL); err != nil {
 		writeJSON(w, http.StatusBadRequest, apiError("proxy_url 校验失败: "+err.Error()))
 		return
 	}
 	start := time.Now()
-	client := newOutboundClient(10 * time.Second)
+	// 钉扎拨号：解析与建连使用同一 IP（DNS-rebinding TOCTOU 防护），并再次
+	// 拒绝回环/内网地址。
+	client := newOutboundClientStrict(10 * time.Second)
 	// #nosec tainted-url-host -- 测速端点需 dashboard 登录鉴权（apiAuthAllowed），仅管理员可调用；
 	// 目标路径固定为 GitHub raw 文件（对齐 Python stat_service.test_ghproxy_connection），
-	// 响应体被丢弃（只上报延迟/状态码），且 testURL 已通过 validateOutboundURL（防 SSRF）。
+	// 响应体被丢弃（只上报延迟/状态码），且 testURL 已通过 validateOutboundURLStrict（防 SSRF）。
 	resp, err := client.Get(testURL) // nosemgrep: go.lang.security.injection.tainted-url-host.tainted-url-host
 	if err != nil {
 		logger.I18nWarn("ghproxy 测速失败 %s: %v", proxyURL, err)
@@ -1464,7 +1713,10 @@ func (s *Server) getProviderTokenStats(days int) map[string]interface{} {
 			totalByBucket[bucket] += tokenTotal
 			rangeTotalTokens += tokenTotal
 			rangeTotalCalls++
-			rangeSuccessCalls++
+			// 仅非 error 状态计为成功（对齐 py stat_service.py:378）。
+			if rec.Status != "error" {
+				rangeSuccessCalls++
+			}
 		}
 
 		if createdLocal.After(todayStart) || createdLocal.Equal(todayStart) {
@@ -2626,4 +2878,20 @@ func (s *Server) getSkillList() []interface{} {
 		result[i] = sk
 	}
 	return result
+}
+
+// resyncSandboxSkills 技能集合变更后把宿主 active 技能重推向所有运行中的沙盒会话（对齐 py sync_skills_to_active_sandboxes：WebUI 技能编辑/插件装卸触发）。
+func (s *Server) resyncSandboxSkills() {
+	if s.sandboxMgr == nil {
+		return
+	}
+	go s.sandboxMgr.SyncSkillsToActiveSessions(context.Background())
+}
+
+// Neo exposes the host-side Neo skill lifecycle store (candidates/releases/payloads) so the pipeline's Computer-Use tools share the same instance as the dashboard API.
+func (s *Server) Neo() *skills.NeoStore {
+	if s == nil {
+		return nil
+	}
+	return s.neo
 }

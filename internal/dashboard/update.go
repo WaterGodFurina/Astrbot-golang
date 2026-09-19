@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/netguard"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
@@ -48,22 +49,42 @@ func (s *Server) githubUpdateProxy(reqProxy string) string {
 	return s.githubProxyForMarket()
 }
 
+// updateProgressTTL 终态（success/error）版本切换进度的保留时长，超过后由
+// updateProgressSet/Get 惰性删除，防止 map 只增不删。进行中的条目不受影响。
+const updateProgressTTL = 10 * time.Minute
+
 // updateProgressSet 记录切换版本进度（供前端轮询）。
 func (s *Server) updateProgressSet(id string, st *updateProgress) {
-	if id == "" {
+	if id == "" || st == nil {
 		return
 	}
+	st.UpdatedAt = time.Now()
 	s.updateProgressMu.Lock()
 	s.updateProgress[id] = st
+	now := time.Now()
+	for k, v := range s.updateProgress {
+		if isTerminalUpdateProgress(v) && !v.UpdatedAt.IsZero() && now.Sub(v.UpdatedAt) > updateProgressTTL {
+			delete(s.updateProgress, k)
+		}
+	}
 	s.updateProgressMu.Unlock()
 }
 
-// updateProgressGet 读取切换版本进度。
+// updateProgressGet 读取切换版本进度；终态且超过 TTL 的条目视为已清理。
 func (s *Server) updateProgressGet(id string) *updateProgress {
 	s.updateProgressMu.Lock()
 	defer s.updateProgressMu.Unlock()
 	st := s.updateProgress[id]
+	if st != nil && isTerminalUpdateProgress(st) && !st.UpdatedAt.IsZero() && time.Since(st.UpdatedAt) > updateProgressTTL {
+		delete(s.updateProgress, id)
+		return nil
+	}
 	return st
+}
+
+// isTerminalUpdateProgress 判断进度是否已到终态（可被 TTL 回收）。
+func isTerminalUpdateProgress(st *updateProgress) bool {
+	return st != nil && (st.Status == "success" || st.Status == "error")
 }
 
 // githubReleasesURL 构造 GitHub Release API 地址（可选 github_proxy 加速前缀）。
@@ -133,7 +154,10 @@ func (s *Server) fetchGithubReleases(proxy string) ([]map[string]interface{}, er
 // 代理出口 IP 被 GitHub 未认证限流(403)时回退本机 IP 检测；超时约 5 分钟
 // （配合后台检测，期间缓存顶替）。SSRF 防护沿用 validateOutboundURL。
 func newDirectOutboundClient(timeout time.Duration) *http.Client {
-	transport := &http.Transport{Proxy: nil}
+	transport := &http.Transport{
+		Proxy:       nil,
+		DialContext: netguard.PinnedDialContext(outboundRejectIP),
+	}
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: transport,

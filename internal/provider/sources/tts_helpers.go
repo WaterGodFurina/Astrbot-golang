@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // ttsConfigFloat returns the float64 value of key, or the fallback when absent.
@@ -106,19 +105,41 @@ func ttsUUID() string {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
 }
 
+// tempDataDir 返回绝对化的 data/temp 目录，避免依赖进程 CWD（D-low-5/E-low-5）。
+// 解析顺序对齐 py get_astrbot_data_path：
+//  1. ASTRBOT_DATA_PATH/temp
+//  2. ASTRBOT_ROOT/data/temp
+//  3. CWD/data/temp
+func tempDataDir() string {
+	var dir string
+	if dp := strings.TrimSpace(os.Getenv("ASTRBOT_DATA_PATH")); dp != "" {
+		dir = filepath.Join(dp, "temp")
+	} else if root := strings.TrimSpace(os.Getenv("ASTRBOT_ROOT")); root != "" {
+		dir = filepath.Join(root, "data", "temp")
+	} else {
+		dir = filepath.Join("data", "temp")
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
+}
+
 // ttsSaveAudio streams an audio response body into data/temp and returns the
 // resulting file path.
 func ttsSaveAudio(r io.Reader, prefix, ext string) (string, error) {
 	const maxTTSBytes = 100 << 20 // 100MB，足够任意长语音
-	dir := filepath.Join("data", "temp")
+	dir := tempDataDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, fmt.Sprintf("%s_%d.%s", prefix, time.Now().UnixNano(), ext))
-	f, err := os.Create(path)
+	// os.CreateTemp 保证并发唯一：Windows 上 UnixNano 时间戳粒度粗会撞名，
+	// os.Create 同名互相截断 → 读回空文件/共享冲突（TestAzureTTSNativeConcurrentGetAudio 根因）。
+	f, err := os.CreateTemp(dir, fmt.Sprintf("%s_*.%s", prefix, ext))
 	if err != nil {
 		return "", err
 	}
+	path := f.Name()
 	n, err := io.Copy(f, io.LimitReader(r, maxTTSBytes+1))
 	if err != nil {
 		_ = f.Close()

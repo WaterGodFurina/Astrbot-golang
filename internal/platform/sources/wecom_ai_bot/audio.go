@@ -37,17 +37,29 @@ func convertAudioToAMR(path string) string {
 	if detectAMRMagic(path) {
 		return path
 	}
-	// 若输入是 SILK 格式，先尝试使用纯 Go 解码转为 WAV，再转 amr
+	// 若输入是 SILK 格式，先尝试使用纯 Go 解码转为 WAV，再转 amr。
+	// silk 中间 wav 只在成功返回 amr 产物时清理；一旦后续 ffmpeg 失败，
+	// 必须返回原始文件并把中间 wav 删掉，绝不能把已删除的 wav 交给调用方上传。
+	originalPath := path
+	silkWavTemp := ""
 	if utils.DetectAudioFormat(path) == "silk" {
 		wavTemp := filepath.Join(os.TempDir(), "astrbot_wecomai_silk_tmp_"+randomHexID()+".wav")
 		if _, err := utils.TencentSilkToWAV(context.Background(), path, wavTemp); err == nil {
-			defer os.Remove(wavTemp)
+			silkWavTemp = wavTemp
 			path = wavTemp
+		} else {
+			_ = os.Remove(wavTemp)
+		}
+	}
+	cleanupSilkWav := func() {
+		if silkWavTemp != "" {
+			_ = os.Remove(silkWavTemp)
 		}
 	}
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		logger.I18nWarn("未检测到 ffmpeg，企业微信智能机器人语音跳过 amr 转码，原样上传。如果没有安装 ffmpeg 请先安装。")
-		return path
+		cleanupSilkWav()
+		return originalPath
 	}
 	// 转码产物以 astrbot_wecomai_ 前缀命名，便于发送后统一清理。
 	outPath := filepath.Join(os.TempDir(), "astrbot_wecomai_audio_"+randomHexID()+".amr")
@@ -64,12 +76,15 @@ func convertAudioToAMR(path string) string {
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		logger.I18nWarn("ffmpeg amr 转码失败: %v: %s", err, truncateFFmpegOutput(out))
-		return path
+		cleanupSilkWav()
+		return originalPath
 	}
 	if _, err := os.Stat(outPath); err != nil {
 		logger.I18nWarn("amr 转码结果不存在: %v", err)
-		return path
+		cleanupSilkWav()
+		return originalPath
 	}
+	cleanupSilkWav()
 	return outPath
 }
 

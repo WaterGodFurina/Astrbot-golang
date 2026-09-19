@@ -11,7 +11,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+// transcodeTimeout 限制单次 ffmpeg 执行时长, 避免坏媒体文件导致子进程无限
+// 挂起 (对齐 lark media.go 的 120s)。
+const transcodeTimeout = 120 * time.Second
 
 // audioExtFromURL 从音频资源 URL 中提取原始格式扩展名 (去除 query 部分);
 // 无法识别时返回 "audio"。
@@ -47,7 +52,9 @@ func convertAudioToWav(inputPath string) string {
 		logger.I18nWarn("[KOOK] 未检测到 ffmpeg, 跳过音频转 wav: %s。如果没有安装 ffmpeg 请先安装。", inputPath)
 		return inputPath
 	}
-	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath, outPath)
+	ctx, cancel := context.WithTimeout(context.Background(), transcodeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", inputPath, outPath)
 	if err := cmd.Run(); err != nil {
 		logger.I18nWarn("[KOOK] ffmpeg 音频转 wav 失败: %v", err)
 		return inputPath

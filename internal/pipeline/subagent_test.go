@@ -92,7 +92,7 @@ func TestCollectToolsIncludesSubagents(t *testing.T) {
 	if err := s.Initialize(ctx); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
-	tools := s.collectTools("none")
+	tools := s.collectTools("none", "g:1")
 	var names []string
 	for _, tool := range tools {
 		if fn, ok := tool["function"].(map[string]interface{}); ok {
@@ -122,7 +122,7 @@ func TestCollectToolsIncludesSubagents(t *testing.T) {
 		},
 	}}
 	_ = s2.Initialize(ctx2)
-	for _, tool := range s2.collectTools("none") {
+	for _, tool := range s2.collectTools("none", "g:1") {
 		if fn, ok := tool["function"].(map[string]interface{}); ok {
 			if n, _ := fn["name"].(string); n == "transfer_to_x" {
 				t.Fatal("handoff tool injected while main_enable=false")

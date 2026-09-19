@@ -495,6 +495,44 @@ func TestSendProactiveWithoutWebhookErrors(t *testing.T) {
 	}
 }
 
+// TestSendProactiveDirectWebhookPush 回归 A4：主动消息（无待响应上下文）配置了
+// 消息推送 webhook 时应整链直接推送（对齐本体 wecomai_adapter.py:566-585 的
+// send_message_chain 全链发送），文本不再落入无人轮询的输出队列静默丢失。
+func TestSendProactiveDirectWebhookPush(t *testing.T) {
+	var mu sync.Mutex
+	var got map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		json.Unmarshal(body, &got)
+		mu.Unlock()
+		w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+	}))
+	defer srv.Close()
+
+	a := newTestAIBotAdapter(t, &fakeEventBus{}, map[string]interface{}{
+		"msg_push_webhook_url": srv.URL + "?key=k",
+	})
+	chain := &message.MessageChain{Chain: []message.Component{
+		&message.Plain{Text: "主动消息文本"},
+	}}
+	if err := a.Send("wecom_ai_bot_wecomai_no_ctx", chain); err != nil {
+		t.Fatalf("主动消息发送失败: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	markdown, _ := got["markdown_v2"].(map[string]interface{})
+	if got["msgtype"] != "markdown_v2" || markdown["content"] != "主动消息文本" {
+		t.Errorf("主动消息应整链推送文本，got: %v", got)
+	}
+	// 不应产生输出队列内容（无人轮询消费）。
+	for _, s := range []string{"wecom_ai_bot_wecomai_no_ctx"} {
+		if a.queueMgr.HasBackQueue(s) {
+			t.Errorf("主动消息不应写入输出队列: %s", s)
+		}
+	}
+}
+
 // TestWebhookClientSend 消息推送 webhook 客户端（httptest）。
 func TestWebhookClientSend(t *testing.T) {
 	var got map[string]interface{}
@@ -680,14 +718,13 @@ func TestCleanupKeepsActiveBackQueue(t *testing.T) {
 // TestBackQueueWriteTimeoutOnFullQueue 回归 L-45.2：满队列写入应在超时后返回
 // false 而不是永久阻塞。
 func TestBackQueueWriteTimeoutOnFullQueue(t *testing.T) {
-	old := queueWriteTimeout
-	queueWriteTimeout = 50 * time.Millisecond
-	defer func() { queueWriteTimeout = old }()
+	mgr := NewWecomAIQueueMgr()
+	mgr.queueWriteTimeout = 50 * time.Millisecond
 
 	q := make(chan *QueueItem, 1)
 	q <- &QueueItem{Type: "plain", Data: "x"}
 	start := time.Now()
-	if trySendBackQueueItem(q, &QueueItem{Type: "end"}) {
+	if mgr.trySendBackQueueItem(q, &QueueItem{Type: "end"}) {
 		t.Error("满队列写入应超时返回 false")
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {

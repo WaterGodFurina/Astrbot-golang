@@ -112,7 +112,13 @@ func (r *RolesRecord) moveToEnd(guildID int64) {
 // 由于需要判断 bot 账号是否属于某个角色才会回复消息, 而同一个频道的消息在首次
 // 查询时会阻塞消息接收, 所以这里特意调低了超时时间, 避免阻塞太久。
 func (r *RolesRecord) fetchRolesByGuildID(ctx context.Context, guildID int64) map[int64]bool {
-	url := fmt.Sprintf("%s?guild_id=%d&user_id=%s", apiUserView, guildID, r.botID)
+	// 快照 botID/token 后再构造请求, 避免持锁做网络 I/O (SetBotID/SetToken 持锁写)
+	r.mu.Lock()
+	botID := r.botID
+	token := r.token
+	r.mu.Unlock()
+
+	url := fmt.Sprintf("%s?guild_id=%d&user_id=%s", apiUserView, guildID, botID)
 	reqCtx, cancel := context.WithTimeout(ctx, userViewRequestTimeout)
 	defer cancel()
 
@@ -121,7 +127,7 @@ func (r *RolesRecord) fetchRolesByGuildID(ctx context.Context, guildID int64) ma
 		logger.I18nError("[KOOK] 获取机器人在频道 %q 的角色id信息时请求异常: %v", fmt.Sprintf("%d", guildID), err)
 		return nil
 	}
-	req.Header.Set("Authorization", "Bot "+r.token)
+	req.Header.Set("Authorization", "Bot "+token)
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
 		logger.I18nError("[KOOK] 获取机器人在频道 %q 的角色id信息时请求异常: %v", fmt.Sprintf("%d", guildID), err)

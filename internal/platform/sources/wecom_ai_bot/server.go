@@ -8,12 +8,16 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"strconv"
 	"time"
 )
+
+// callbackTimestampTolerance 回调时间戳新鲜度窗口。Python 原版
+// （wecomai_server.py:107-120）没有任何时间戳校验，±300s 的硬校验会让宿主
+// 时钟偏差 >5 分钟的部署全部回调 400；这里放宽到 1 小时并对偏差打日志。
+const callbackTimestampTolerance = time.Hour
 
 // WecomAIBotServer 企业微信智能机器人 HTTP 回调服务器。
 type WecomAIBotServer struct {
@@ -85,8 +89,12 @@ func (s *WecomAIBotServer) handleCallback(w http.ResponseWriter, r *http.Request
 		http.Error(w, "缺少必要参数", http.StatusBadRequest)
 		return
 	}
-	// 时间戳新鲜度校验：拒绝与当前时间偏差超过 5 分钟的请求（防重放）。
-	if ts, err := strconv.ParseInt(timestamp, 10, 64); err != nil || math.Abs(float64(time.Now().Unix()-ts)) > 300 {
+	// 时间戳新鲜度校验：对齐 Python（无此校验），窗口放宽到
+	// callbackTimestampTolerance；偏差过大时打日志而非静默拒绝。
+	if ts, err := strconv.ParseInt(timestamp, 10, 64); err != nil {
+		logger.I18nWarn("企业微信智能机器人回调 timestamp 非数字: %q，交由签名校验: %v", timestamp, err)
+	} else if skew := time.Duration(time.Now().Unix()-ts) * time.Second; skew > callbackTimestampTolerance || skew < -callbackTimestampTolerance {
+		logger.I18nWarn("企业微信智能机器人回调 timestamp 偏差过大(%s)，已拒绝: ts=%d", skew, ts)
 		http.Error(w, "timestamp 过期", http.StatusBadRequest)
 		return
 	}

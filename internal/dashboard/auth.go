@@ -48,12 +48,12 @@ type PasswordManager struct {
 	initialPassword        string // 启动生成/重置的初始密码明文（仅内存，供 setup 校验与测试）
 	passwordChangeRequired bool
 	jwtSecret              string
-	tokens                 map[string]bool // active session tokens
-	revoked                map[string]bool // JWT jti blacklist (in-memory, persisted)
-	revokedPath            string          // 持久化 jti 黑名单的 JSON 文件路径
-	totpSecret             string          // TOTP 密钥（base32）
-	totpEnabled            bool            // 是否启用 TOTP 双重认证
-	totpRecoveryCodes      []string        // 恢复码的 SHA-256 哈希列表（不落明文）
+	tokens                 map[string]time.Time // active legacy session tokens (token -> 过期时间)
+	revoked                map[string]time.Time // JWT jti blacklist (jti -> 撤销时间，持久化)
+	revokedPath            string               // 持久化 jti 黑名单的 JSON 文件路径
+	totpSecret             string               // TOTP 密钥（base32）
+	totpEnabled            bool                 // 是否启用 TOTP 双重认证
+	totpRecoveryCodes      []string             // 恢复码的 SHA-256 哈希列表（不落明文）
 }
 
 // NewPasswordManager creates a password manager, generating a random password
@@ -727,7 +727,9 @@ func (s *Server) gcWSTicketsLocked() {
 }
 
 // loadRevoked 从 revokedPath 加载持久化的 jti 黑名单。文件缺失或损坏时忽略
-// （损坏文件视为空黑名单），不阻断启动。
+// （损坏文件视为空黑名单），不阻断启动。兼容旧格式（[]string，仅有 jti）
+// 与新格式（{"<jti>": <撤销 unix 时间>}）；旧格式条目的撤销时间按加载时间计，
+// 从而仍能在 tokenTTL 后被剪枝。
 func (pm *PasswordManager) loadRevoked() {
 	if pm.revokedPath == "" {
 		return
@@ -739,39 +741,62 @@ func (pm *PasswordManager) loadRevoked() {
 		}
 		return
 	}
-	var revoked []string
-	if err := json.Unmarshal(data, &revoked); err != nil {
-		authLogger.Warn("loadRevoked: %s has invalid JSON (%v); ignoring", pm.revokedPath, err)
-		return
+	loaded := map[string]time.Time{}
+	var legacy []string
+	if err := json.Unmarshal(data, &legacy); err == nil {
+		now := time.Now()
+		for _, jti := range legacy {
+			if jti != "" {
+				loaded[jti] = now
+			}
+		}
+	} else {
+		var records map[string]int64
+		if err := json.Unmarshal(data, &records); err != nil {
+			authLogger.Warn("loadRevoked: %s has invalid JSON (%v); ignoring", pm.revokedPath, err)
+			return
+		}
+		for jti, at := range records {
+			if jti != "" {
+				loaded[jti] = time.Unix(at, 0)
+			}
+		}
 	}
-	if len(revoked) == 0 {
+	if len(loaded) == 0 {
 		return
 	}
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	if pm.revoked == nil {
-		pm.revoked = make(map[string]bool, len(revoked))
+		pm.revoked = make(map[string]time.Time, len(loaded))
 	}
-	for _, jti := range revoked {
-		if jti != "" {
-			pm.revoked[jti] = true
-		}
+	for jti, at := range loaded {
+		pm.revoked[jti] = at
 	}
 }
 
-// saveRevoked 把内存中的 jti 黑名单原子写入 revokedPath。失败仅告警，不阻断
-// 撤销流程。
+// saveRevoked 剪掉已过期（撤销时间早于 tokenTTL）的 jti 后，把内存黑名单原子
+// 写入 revokedPath（{"<jti>": <撤销 unix 时间>}）。失败仅告警，不阻断撤销流程。
+// 只保留未过期条目的原因：签发超过 tokenTTL 的 JWT 本身已失效，无需再拉黑。
 func (pm *PasswordManager) saveRevoked() {
 	if pm.revokedPath == "" {
 		return
 	}
-	pm.mu.RLock()
-	revoked := make([]string, 0, len(pm.revoked))
-	for jti := range pm.revoked {
-		revoked = append(revoked, jti)
+	now := time.Now()
+	pm.mu.Lock()
+	records := make(map[string]int64, len(pm.revoked))
+	for jti, at := range pm.revoked {
+		if at.IsZero() {
+			at = now
+		}
+		if now.Sub(at) > tokenTTL {
+			delete(pm.revoked, jti)
+			continue
+		}
+		records[jti] = at.Unix()
 	}
-	pm.mu.RUnlock()
-	data, err := json.Marshal(revoked)
+	pm.mu.Unlock()
+	data, err := json.Marshal(records)
 	if err != nil {
 		authLogger.Warn("saveRevoked: marshal: %v", err)
 		return
@@ -806,9 +831,9 @@ func (pm *PasswordManager) Logout(token string) {
 	delete(pm.tokens, token)
 	if ok && jti != "" {
 		if pm.revoked == nil {
-			pm.revoked = make(map[string]bool)
+			pm.revoked = make(map[string]time.Time)
 		}
-		pm.revoked[jti] = true
+		pm.revoked[jti] = time.Now()
 	}
 	pm.mu.Unlock()
 	pm.saveRevoked()
@@ -828,21 +853,27 @@ func (pm *PasswordManager) IsAuthenticated(token string) bool {
 		}
 		pm.mu.RLock()
 		defer pm.mu.RUnlock()
-		return !pm.revoked[jti]
+		_, isRevoked := pm.revoked[jti]
+		return !isRevoked
 	}
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	return pm.tokens[token]
+	expiresAt, ok := pm.tokens[token]
+	if !ok {
+		return false
+	}
+	// 旧式内存 token 也受 TTL 限制（F-low-1），过期即视为未认证。
+	return time.Now().Before(expiresAt)
 }
 
-// RegisterToken registers a legacy (in-memory) session token.
+// RegisterToken registers a legacy (in-memory) session token with a TTL.
 func (pm *PasswordManager) RegisterToken(token string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	if pm.tokens == nil {
-		pm.tokens = make(map[string]bool)
+		pm.tokens = make(map[string]time.Time)
 	}
-	pm.tokens[token] = true
+	pm.tokens[token] = time.Now().Add(tokenTTL)
 }
 
 // SetUsername updates the dashboard username.
@@ -878,7 +909,7 @@ func (pm *PasswordManager) SetPassword(password string) {
 	pm.hashedPassword = newHash
 	pm.passwordChangeRequired = false
 	pm.jwtSecret = generateRandomToken(32)
-	pm.tokens = make(map[string]bool)
+	pm.tokens = make(map[string]time.Time)
 	pm.mu.Unlock()
 	// Now persist to config file (uses pm.hashedPassword which is already updated).
 	// saveToConfig 的 dashboardAuthFields 会带上 username（默认 admin），
@@ -1220,6 +1251,25 @@ func (pm *PasswordManager) EnableTOTPNoop() {
 	}
 	pm.mu.Unlock()
 	pm.saveTOTPToConfig()
+}
+
+// VerifyTOTPOnly 仅校验认证器 TOTP 验证码，**不接受恢复码**。供敏感配置
+// 写入的二次确认使用（对齐 Python verify_configured_2fa_code(...,
+// allow_recovery=False)：恢复码可绕过丢失验证器的场景，不应被拿来做
+// 配置变更的提权凭证）。未启用 TOTP 或验证码为空一律返回 false。
+func (pm *PasswordManager) VerifyTOTPOnly(code string) bool {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return false
+	}
+	pm.mu.RLock()
+	secret := pm.totpSecret
+	enabled := pm.totpEnabled
+	pm.mu.RUnlock()
+	if !enabled || secret == "" {
+		return false
+	}
+	return totp.Validate(code, secret)
 }
 
 // VerifyTOTP 校验 TOTP 验证码；验证码错误时回退校验恢复码（哈希比对）。

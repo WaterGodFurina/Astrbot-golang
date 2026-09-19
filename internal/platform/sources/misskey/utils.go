@@ -479,19 +479,31 @@ func ProcessAtMention(messageObj *platform.AstrBotMessage, rawText, botUsername,
 // 回复管道 goroutine 读，无锁会导致 concurrent map read and map write）。
 var userCacheMu sync.RWMutex
 
-// maxUserCacheEntries 限制 userCache 最大条目数，超出时淘汰一个任意条目。
+// maxUserCacheEntries 限制 userCache 最大条目数，超出时淘汰最旧条目。
 const maxUserCacheEntries = 1024
+
+// cacheTimestampKey 是缓存条目里记录写入时间的内部键，仅用于容量淘汰时
+// 比较新旧，业务读取方不会使用它。
+const cacheTimestampKey = "_astrbot_cached_at"
 
 // setUserCacheEntry 在写锁内写入缓存条目。
 func setUserCacheEntry(userCache map[string]map[string]interface{}, key string, value map[string]interface{}) {
 	userCacheMu.Lock()
 	defer userCacheMu.Unlock()
 	if len(userCache) >= maxUserCacheEntries {
-		for k := range userCache {
-			delete(userCache, k)
-			break
+		oldestKey := ""
+		var oldest time.Time
+		for k, v := range userCache {
+			ts, _ := v[cacheTimestampKey].(time.Time)
+			if oldestKey == "" || ts.Before(oldest) {
+				oldestKey, oldest = k, ts
+			}
+		}
+		if oldestKey != "" {
+			delete(userCache, oldestKey)
 		}
 	}
+	value[cacheTimestampKey] = time.Now()
 	userCache[key] = value
 }
 

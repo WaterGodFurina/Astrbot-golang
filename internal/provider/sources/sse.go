@@ -16,10 +16,15 @@ type sseReader struct {
 	onData  func(data string) (stop bool)
 }
 
+// maxSSEEventBytes 是单个 SSE 事件行的缓冲上限。原 4MB 上限会让携带大工具
+// 调用参数的合法事件触发 bufio.ErrTooLong 并中断整条流；提升到 64MB（与媒体
+// 下载上限一致）后仍对恶意超长行保留内存边界。
+const maxSSEEventBytes = 64 * 1024 * 1024
+
 // newSSEReader wraps an SSE response body. The caller must close resp.Body.
 func newSSEReader(ctx context.Context, resp *http.Response, onData func(data string) (stop bool)) *sseReader {
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), maxSSEEventBytes)
 	return &sseReader{ctx: ctx, scanner: scanner, onData: onData}
 }
 

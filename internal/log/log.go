@@ -92,7 +92,32 @@ func entrySize(e LogEntry) int {
 var defaultLogger = &Logger{
 	level:    LevelInfo,
 	out:      os.Stdout,
-	useColor: true,
+	useColor: colorEnabled(),
+}
+
+// colorEnabled 探测是否应给控制台日志上色：遵循 NO_COLOR 约定
+// (https://no-color.org/)，非字符设备（管道/重定向/被日志采集器接管）一律
+// 关闭 ANSI，避免把 \033[...m 写进文件；FORCE_COLOR 可显式覆盖。
+// 在包初始化时执行一次（进程启动即确定）。
+func colorEnabled() bool {
+	if v, ok := os.LookupEnv("NO_COLOR"); ok && v != "" {
+		return false
+	}
+	if v := strings.TrimSpace(os.Getenv("FORCE_COLOR")); v != "" && v != "0" {
+		return true
+	}
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// SetColor enables or disables ANSI colors on console output.
+func (l *Logger) SetColor(enabled bool) {
+	l.mu.Lock()
+	l.useColor = enabled
+	l.mu.Unlock()
 }
 
 // GetDefault returns the default logger instance.

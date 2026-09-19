@@ -15,6 +15,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -22,8 +24,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -71,7 +75,8 @@ func (m *Manager) PushHostSkills(ctx context.Context, sessionID string) error {
 		return err
 	}
 	if sb.booter == nil || !sb.booter.IsRunning() {
-		return fmt.Errorf("sandbox not running")
+		m.dropSession(sessionID, sb) // race 兜底：确保下一轮 EnsureSession 立即重建。
+		return fmt.Errorf("sandbox not running (will auto-recreate)")
 	}
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
@@ -82,8 +87,15 @@ func pushHostSkillsLocked(ctx context.Context, b Booter, hostSkills map[string]s
 	// 1. Load the previous managed-skills list (empty when absent).
 	prev := loadManagedList(ctx, b)
 	// 2. Remove previously managed skill dirs (aligned with the apply phase).
+	// 清理失败必须上报（此前被 _ = 吞掉，导致本地沙盒托管技能永远删不掉）。
+	var firstErr error
 	for _, name := range prev {
-		_ = removeSandboxTree(ctx, b, skillsRootName+"/"+name)
+		if err := removeSandboxTree(ctx, b, skillsRootName+"/"+name); err != nil {
+			logger.Warn("清理沙盒旧托管技能 %s 失败: %v", name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
 	// 3. Copy host skill dirs into /workspace/skills.
 	managed := make([]string, 0, len(hostSkills))
@@ -96,6 +108,9 @@ func pushHostSkillsLocked(ctx context.Context, b Booter, hostSkills map[string]s
 		dir := hostSkills[name]
 		if err := copyHostSkillDir(ctx, b, dir, skillsRootName+"/"+name); err != nil {
 			logger.Warn("推送技能 %s 到沙盒失败: %v", name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		managed = append(managed, name)
@@ -104,9 +119,12 @@ func pushHostSkillsLocked(ctx context.Context, b Booter, hostSkills map[string]s
 	payload, _ := json.Marshal(map[string]interface{}{"managed_skills": managed})
 	if err := b.WriteFile(ctx, skillsRootName+"/"+managedSkillsFile, string(payload)); err != nil {
 		logger.Warn("写沙盒托管技能清单失败: %v", err)
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
 	logger.Debug("已推送 %d 个宿主技能到沙盒 %s", len(managed), sessionIDOf(b))
-	return nil
+	return firstErr
 }
 
 // loadManagedList reads the managed-skills list from the sandbox.
@@ -131,9 +149,19 @@ func loadManagedList(ctx context.Context, b Booter) []string {
 	return out
 }
 
-// removeSandboxTree deletes a directory (or file) inside the sandbox workspace
-// via a shell rm -rf guarded by a fixed root prefix.
+// sandboxTreeRemover 是 booter 的内部可信删除能力：绕过面向 LLM 工具调用的
+// 破坏性命令黑名单（黑名单只应约束 sh -c 入口，不应挡住沙盒自身清理托管技能）。
+type sandboxTreeRemover interface {
+	RemoveTree(ctx context.Context, rel string) error
+}
+
+// removeSandboxTree deletes a directory (or file) inside the sandbox workspace.
+// Prefers the booter's internal trusted remover; only falls back to a shell
+// `rm -rf` for backends without one. Errors are returned, never swallowed.
 func removeSandboxTree(ctx context.Context, b Booter, rel string) error {
+	if r, ok := b.(sandboxTreeRemover); ok {
+		return r.RemoveTree(ctx, rel)
+	}
 	// rel 由受控常量与技能名拼出（技能名经 skillNameRe 校验），无路径注入。
 	_, _, _, err := b.Exec(ctx, "sh", []string{"-c", "rm -rf '" + rel + "'"}, SandboxWorkdir)
 	return err
@@ -334,9 +362,14 @@ func (b *LocalBooter) mapPath(path string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("沙盒路径为空")
 	}
-	p := filepath.Clean(filepath.FromSlash(raw))
-	p = strings.TrimPrefix(p, SandboxWorkdir)
-	p = strings.TrimPrefix(p, string(filepath.Separator))
+	// 统一用 slash 形式做 /workspace 前缀剥离（Windows 上 filepath.FromSlash 会把
+	// SandboxWorkdir "/workspace" 变成 "\workspace"，导致 TrimPrefix 失配、绝对与
+	// 相对路径映射到不同落点），剥离后再转 OS 分隔符参与拼接与校验。
+	slash := filepath.ToSlash(raw)
+	slash = pathpkg.Clean(slash)
+	slash = strings.TrimPrefix(slash, SandboxWorkdir)
+	slash = strings.TrimPrefix(slash, "/")
+	p := filepath.Clean(filepath.FromSlash(slash))
 	b.mu.Lock()
 	root := b.root
 	b.mu.Unlock()
@@ -530,6 +563,22 @@ func (b *LocalBooter) WriteFile(ctx context.Context, path, content string) error
 	return os.WriteFile(host, []byte(content), 0o600)
 }
 
+// RemoveTree 在本地沙盒根目录内直接删除目录/文件（内部可信操作，绕过面向
+// LLM 的 sh -c 黑名单；路径经 mapPath 校验仍在沙盒根内）。
+func (b *LocalBooter) RemoveTree(ctx context.Context, rel string) error {
+	b.mu.Lock()
+	running := b.running
+	b.mu.Unlock()
+	if !running {
+		return fmt.Errorf("local sandbox not running")
+	}
+	host, err := b.mapPath(pathpkg.Join(SandboxWorkdir, rel))
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(host)
+}
+
 // SandboxWorkdir is the sandbox workspace directory used as the cwd for
 // shell/python exec and the base for relative file paths.
 const SandboxWorkdir = "/workspace"
@@ -537,15 +586,20 @@ const SandboxWorkdir = "/workspace"
 // DockerBooter executes commands inside a Docker container.
 //
 // Mirrors AstrBot's Docker sandbox logic (computer_tools/booters/boxlite.py
-// and bay_manager.py): a long-lived sandbox container is created once and
-// reused; shell/python/file operations run inside it via `docker exec`, and
-// files are transferred via the Docker CLI.
+// and bay_manager.py): a long-lived sandbox container is created once per
+// session and reused within that session; shell/python/file operations run
+// inside it via `docker exec`, and files are transferred via the Docker CLI.
+// Containers are labeled with the session token so sessions never share a
+// /workspace and StopSession only removes its own container.
 type DockerBooter struct {
 	mu          sync.Mutex
 	running     bool
 	containerID string
 	name        string
 	image       string
+	// sessionID 由 Manager.EnsureSession 注入：容器名与 label 均按会话派生，
+	// 避免不同会话共享同一容器（/workspace 互见）及 StopSession 误杀他人容器。
+	sessionID string
 
 	// 资源/网络隔离参数（可经 ASTRBOT_SANDBOX_* 环境变量覆盖，默认值见
 	// NewDockerBooter）：memory/cpus/pidsLimit 限制容器资源，network 默认
@@ -585,15 +639,30 @@ func sandboxEnv(key, fallback string) string {
 
 func (b *DockerBooter) Type() BooterType { return BooterDocker }
 
+// SetSessionID scopes this booter's container to one session. Called by
+// Manager.EnsureSession right after the factory creates the booter.
+func (b *DockerBooter) SetSessionID(sessionID string) {
+	b.mu.Lock()
+	b.sessionID = sessionID
+	b.mu.Unlock()
+}
+
 func (b *DockerBooter) Start(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.running {
 		return nil
 	}
-	// Reuse an existing managed container if it is still running; a stopped
-	// one (e.g. after a host reboot) is restarted, or discarded and rebuilt.
-	if out, err := dockerOutput(ctx, "ps", "-aq", "--filter", "label=astrbot.sandbox=managed"); err == nil {
+	token := "default"
+	if b.sessionID != "" {
+		sum := sha256.Sum256([]byte(b.sessionID))
+		token = hex.EncodeToString(sum[:8])
+	}
+	b.name = fmt.Sprintf("astrbot-sandbox-%s-%d", token, time.Now().UnixNano())
+	// 只复用属于本会话的容器（session 标签隔离）；否则不同会话会共享同一
+	// /workspace 并互相 StopSession 误杀。
+	sessionFilter := "label=astrbot.sandbox.session=" + token
+	if out, err := dockerOutput(ctx, "ps", "-aq", "--filter", "label=astrbot.sandbox=managed", "--filter", sessionFilter); err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -625,6 +694,7 @@ func (b *DockerBooter) Start(ctx context.Context) error {
 	// skill cannot exhaust the host or reach internal services.
 	args := []string{"run", "-d", "--name", b.name,
 		"--label", "astrbot.sandbox=managed",
+		"--label", "astrbot.sandbox.session=" + token,
 		"--workdir", "/workspace"}
 	if b.memory != "" {
 		args = append(args, "--memory", b.memory)
@@ -739,6 +809,10 @@ func (b *DockerBooter) ListSkills(ctx context.Context) ([]skills.SandboxCacheEnt
 	return entries, nil
 }
 
+// maxSandboxFileBytes 限制单次沙箱文件读取字节数（1MB，与命令输出上限
+// maxSandboxOutput 一致），防止超大文件把宿主内存灌满。
+const maxSandboxFileBytes = 1 << 20
+
 func (b *DockerBooter) ReadFile(ctx context.Context, path string) (string, error) {
 	b.mu.Lock()
 	cid := b.containerID
@@ -746,15 +820,21 @@ func (b *DockerBooter) ReadFile(ctx context.Context, path string) (string, error
 	if cid == "" {
 		return "", fmt.Errorf("docker sandbox not running")
 	}
-	// Use the exit code to detect a missing file instead of grepping stdout
-	// for a sentinel string (which a file's own content could spoof).
+	// 容器内先 realpath 归一，再校验仍位于 /workspace 之下（防 ../ 与符号
+	// 链接逃逸），随后用 head -c 限制读取字节数，避免 cat 超大文件灌满宿主
+	// 内存。path 经位置参数传入，避免手工拼接引号。
+	script := `p="$1"; ` +
+		`real=$(realpath -m -- "$p" 2>/dev/null) || exit 3; ` +
+		`case "$real" in ` + SandboxWorkdir + `|` + SandboxWorkdir + `/*) ;; *) echo "path escapes workspace: $real" >&2; exit 4;; esac; ` +
+		`[ -f "$real" ] || exit 1; ` +
+		`head -c ` + strconv.Itoa(maxSandboxFileBytes) + ` -- "$real"`
 	var stdout, stderr strings.Builder
-	code, err := dockerRun(ctx, []string{"exec", "-w", SandboxWorkdir, cid, "sh", "-c", "cat '" + strings.ReplaceAll(path, "'", "'\\''") + "' 2>/dev/null"}, nil, &stdout, &stderr)
+	code, err := dockerRun(ctx, []string{"exec", "-w", SandboxWorkdir, cid, "sh", "-c", script, "sh", path}, nil, &stdout, &stderr)
 	if err != nil {
 		return "", err
 	}
 	if code != 0 {
-		return "", fmt.Errorf("file not found: %s", path)
+		return "", fmt.Errorf("file not found or outside workspace: %s", path)
 	}
 	return stdout.String(), nil
 }
@@ -766,18 +846,39 @@ func (b *DockerBooter) WriteFile(ctx context.Context, path, content string) erro
 	if cid == "" {
 		return fmt.Errorf("docker sandbox not running")
 	}
-	// mkdir -p parent, then cat > file via stdin.
-	parent := filepath.Dir(path)
-	if _, err := dockerOutput(ctx, "exec", "-w", SandboxWorkdir, cid, "sh", "-c", "mkdir -p '"+strings.ReplaceAll(parent, "'", "'\\''")+"'"); err != nil {
-		return err
-	}
+	// 容器内 realpath 归一后校验仍在 /workspace 下，再 mkdir -p 父目录并
+	// cat 写入（路径经位置参数传入，避免拼接引号）。
+	script := `p="$1"; ` +
+		`real=$(realpath -m -- "$p" 2>/dev/null) || exit 3; ` +
+		`case "$real" in ` + SandboxWorkdir + `|` + SandboxWorkdir + `/*) ;; *) echo "path escapes workspace: $real" >&2; exit 4;; esac; ` +
+		`mkdir -p -- "$(dirname -- "$real")" || exit 5; ` +
+		`cat > -- "$real"`
 	var stdout, stderr strings.Builder
-	code, err := dockerRun(ctx, []string{"exec", "-i", "-w", SandboxWorkdir, cid, "sh", "-c", "cat > '" + strings.ReplaceAll(path, "'", "'\\''") + "'"}, strings.NewReader(content), &stdout, &stderr)
+	code, err := dockerRun(ctx, []string{"exec", "-i", "-w", SandboxWorkdir, cid, "sh", "-c", script, "sh", path}, strings.NewReader(content), &stdout, &stderr)
 	if err != nil {
 		return err
 	}
 	if code != 0 {
 		return fmt.Errorf("write file failed (exit %d): %s", code, stderr.String())
+	}
+	return nil
+}
+
+// RemoveTree 在容器内直接删除目录/文件（不经过 sh -c，内部可信操作）。
+func (b *DockerBooter) RemoveTree(ctx context.Context, rel string) error {
+	b.mu.Lock()
+	cid := b.containerID
+	b.mu.Unlock()
+	if cid == "" {
+		return fmt.Errorf("docker sandbox not running")
+	}
+	var stdout, stderr strings.Builder
+	code, err := dockerRun(ctx, []string{"exec", "-w", SandboxWorkdir, cid, "rm", "-rf", rel}, nil, &stdout, &stderr)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("remove %s failed (exit %d): %s", rel, code, stderr.String())
 	}
 	return nil
 }
@@ -831,6 +932,93 @@ func dockerRun(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 type sessionBooter struct {
 	mu     sync.Mutex
 	booter Booter
+}
+
+// BrowserCapable is implemented by booters whose backend exposes browser automation + execution-history APIs (shipyard_neo). Manager routes the computer-use browser/skill tools through it.
+type BrowserCapable interface {
+	Capabilities() []string
+	BrowserExec(ctx context.Context, body map[string]interface{}, timeoutSec int) (string, error)
+	BrowserExecBatch(ctx context.Context, body map[string]interface{}) (string, error)
+	BrowserRunSkill(ctx context.Context, skillKey string, body map[string]interface{}) (string, error)
+	GetExecutionHistory(ctx context.Context, params map[string]string) (string, error)
+	GetExecution(ctx context.Context, executionID string) (string, error)
+	AnnotateExecution(ctx context.Context, executionID string, body map[string]interface{}) (string, error)
+}
+
+// routeBrowser returns the session's BrowserCapable booter (dead sessions are dropped for auto-rebuild on next use).
+func (m *Manager) routeBrowser(ctx context.Context, sessionID string) (BrowserCapable, error) {
+	sb, err := m.EnsureSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	bc, ok := sb.booter.(BrowserCapable)
+	if !ok {
+		return nil, fmt.Errorf("current sandbox backend does not support browser/neo skill APIs (requires shipyard_neo)")
+	}
+	return bc, nil
+}
+
+// SessionCaps reports the session sandbox's capability list ([] when the backend is not capability-aware).
+func (m *Manager) SessionCaps(ctx context.Context, sessionID string) []string {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return nil
+	}
+	return bc.Capabilities()
+}
+
+// BrowserExec runs a single browser automation command in the session sandbox.
+func (m *Manager) BrowserExec(ctx context.Context, sessionID string, body map[string]interface{}, timeoutSec int) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.BrowserExec(ctx, body, timeoutSec)
+}
+
+// BrowserExecBatch runs ordered browser commands in one round-trip.
+func (m *Manager) BrowserExecBatch(ctx context.Context, sessionID string, body map[string]interface{}) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.BrowserExecBatch(ctx, body)
+}
+
+// BrowserRunSkill replays a released browser skill in the session sandbox.
+func (m *Manager) BrowserRunSkill(ctx context.Context, sessionID, skillKey string, body map[string]interface{}) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.BrowserRunSkill(ctx, skillKey, body)
+}
+
+// GetExecutionHistory lists sandbox execution records for the session.
+func (m *Manager) GetExecutionHistory(ctx context.Context, sessionID string, params map[string]string) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.GetExecutionHistory(ctx, params)
+}
+
+// GetExecution reads one execution record by id.
+func (m *Manager) GetExecution(ctx context.Context, sessionID, executionID string) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.GetExecution(ctx, executionID)
+}
+
+// AnnotateExecution patches one execution record.
+func (m *Manager) AnnotateExecution(ctx context.Context, sessionID, executionID string, body map[string]interface{}) (string, error) {
+	bc, err := m.routeBrowser(ctx, sessionID)
+	if err != nil {
+		return "", err
+	}
+	return bc.AnnotateExecution(ctx, executionID, body)
 }
 
 // Manager manages per-session sandbox booters, mirroring astrbot-py's
@@ -895,10 +1083,7 @@ func (m *Manager) SetBooterFactory(fn func() Booter) {
 	}
 }
 
-// EnsureSession returns the session's sandbox booter, creating + booting a new
-// one on first use (mirrors Python get_booter). 宿主不做主动健康检测——沙盒总部
-// （Bay）自行管理沙盒生命周期；若上一次操作已把该会话沙盒标记失效
-// （markDeadIfNeeded 命中 "Sandbox not found"），这里直接拉取一个全新沙盒。
+// EnsureSession returns the session's sandbox booter, creating + booting a new one on first use (mirrors Python get_booter). 宿主不做主动健康检测——沙盒总部（Bay）自行管理沙盒生命周期；若上一次操作已把该会话沙盒标记失效（markDeadIfNeeded 命中 "Sandbox not found"），这里停掉旧 booter 并原地重建（对齐 py get_booter 的 available()→shutdown→reboot 语义）。
 func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*sessionBooter, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return nil, fmt.Errorf("sandbox session id is empty")
@@ -907,7 +1092,14 @@ func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*session
 	sb := m.sessions[sessionID]
 	m.mu.RUnlock()
 	if sb != nil {
-		return sb, nil
+		if sb.booter != nil && sb.booter.IsRunning() {
+			return sb, nil
+		}
+		// 死沙盒：先停旧（回收 Bay/容器残留），再丢弃条目进入下方重建。
+		if sb.booter != nil {
+			_ = sb.booter.Stop()
+		}
+		m.dropSession(sessionID, sb)
 	}
 	m.mu.RLock()
 	factory := m.factory
@@ -916,6 +1108,11 @@ func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*session
 		return nil, fmt.Errorf("no booter configured")
 	}
 	b := factory()
+	// 会话隔离：需要按会话派生后端资源的 booter（Docker 容器名/标签）在此
+	// 注入 sessionID，确保每会话独立容器，StopSession 只停自己。
+	if ss, ok := b.(interface{ SetSessionID(string) }); ok {
+		ss.SetSessionID(sessionID)
+	}
 	if err := b.Start(ctx); err != nil {
 		return nil, err
 	}
@@ -929,12 +1126,64 @@ func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*session
 	}
 	m.sessions[sessionID] = sb
 	m.mu.Unlock()
-	if m.skillMgr != nil {
-		if entries, err := b.ListSkills(ctx); err == nil {
+	// boot/rebuild 后同步一次技能（对齐 py get_booter 的 boot→_sync_skills_to_sandbox 时机）；后续轮次不再重推，技能变更走 SyncSkillsToActiveSessions。
+	m.syncSessionSkills(ctx, sb)
+	return sb, nil
+}
+
+// syncSessionSkills 推送宿主 active 技能进沙盒并回扫刷新缓存（py _sync_skills_to_sandbox 语义）。/workspace/skills 由 volume 挂载，容器刚就绪时可能尚未挂好（首次扫描 0 技能），带短重试窗口；任何失败只告警，不阻塞会话使用。
+func (m *Manager) syncSessionSkills(ctx context.Context, sb *sessionBooter) {
+	if sb == nil || sb.booter == nil {
+		return
+	}
+	if hostSkillsProvider != nil && sb.booter.IsRunning() {
+		sb.mu.Lock()
+		if err := pushHostSkillsLocked(ctx, sb.booter, hostSkillsProvider(true)); err != nil {
+			logger.Warn("推送宿主技能到沙盒失败: %v", err)
+		}
+		sb.mu.Unlock()
+	}
+	if m.skillMgr == nil {
+		return
+	}
+	for attempt := 0; attempt < 5; attempt++ {
+		sb.mu.Lock()
+		entries, err := sb.booter.ListSkills(ctx)
+		sb.mu.Unlock()
+		if err == nil && len(entries) > 0 {
 			m.skillMgr.SetSandboxSkillsCache(entries)
+			return
+		}
+		if err == nil && attempt == 4 {
+			m.skillMgr.SetSandboxSkillsCache(entries)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
 		}
 	}
-	return sb, nil
+}
+
+// SyncSkillsToActiveSessions 对全部运行中的会话沙盒重推宿主技能并刷新缓存（对齐 py sync_skills_to_active_sandboxes）：WebUI 技能增删改/插件装卸后调用，best-effort。
+func (m *Manager) SyncSkillsToActiveSessions(ctx context.Context) {
+	m.mu.RLock()
+	sessions := make(map[string]*sessionBooter, len(m.sessions))
+	for id, sb := range m.sessions {
+		sessions[id] = sb
+	}
+	m.mu.RUnlock()
+	if len(sessions) == 0 {
+		return
+	}
+	logger.Debug("同步技能到 %d 个活跃沙盒", len(sessions))
+	for _, sb := range sessions {
+		if sb == nil || sb.booter == nil || !sb.booter.IsRunning() {
+			continue
+		}
+		m.syncSessionSkills(ctx, sb)
+	}
 }
 
 // Start boots the sandbox for a session (lazily creates it if absent).
@@ -979,7 +1228,8 @@ func (m *Manager) SyncSkills(ctx context.Context, sessionID string) error {
 		return err
 	}
 	if sb.booter == nil || !sb.booter.IsRunning() {
-		return fmt.Errorf("sandbox not running")
+		m.dropSession(sessionID, sb) // race 兜底：确保下一轮 EnsureSession 立即重建。
+		return fmt.Errorf("sandbox not running (will auto-recreate)")
 	}
 	entries, err := sb.booter.ListSkills(ctx)
 	if err != nil {
@@ -1078,4 +1328,27 @@ func (m *Manager) SessionCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.sessions)
+}
+
+// SupportsNeoAPIs reports whether the session's sandbox backend exposes browser + neo-skill lifecycle APIs (shipyard_neo only).
+func (m *Manager) SupportsNeoAPIs(ctx context.Context, sessionID string) bool {
+	_, err := m.routeBrowser(ctx, sessionID)
+	return err == nil
+}
+
+// SessionCapsNow reports an already-booted session's sandbox capabilities WITHOUT creating/booting it (nil when absent or backend-unaware), mirroring Python reading session_booter.get(session_id).capabilities.
+func (m *Manager) SessionCapsNow(sessionID string) []string {
+	m.mu.RLock()
+	sb := m.sessions[sessionID]
+	m.mu.RUnlock()
+	if sb == nil || sb.booter == nil {
+		return nil
+	}
+	if !sb.booter.IsRunning() {
+		return nil
+	}
+	if bc, ok := sb.booter.(BrowserCapable); ok {
+		return bc.Capabilities()
+	}
+	return []string{}
 }

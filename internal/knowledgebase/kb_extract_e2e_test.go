@@ -99,22 +99,17 @@ func TestE2EXlsxExtractChunk(t *testing.T) {
 	t.Logf("xlsx: %d chunks, text=%.200s", len(chunks), text)
 }
 
-func TestE2EPptxExtractChunk(t *testing.T) {
+func TestE2EPptxRejected(t *testing.T) {
+	// 对齐本体 parsers/util.py select_parser 白名单：.pptx 不在名单内，上传
+	// 必须报"暂时不支持的文件格式"而不是被解析入库。
 	content, err := os.ReadFile(kbDocsDir + "test.pptx")
 	if err != nil {
 		t.Skipf("测试文档未准备（外部拉取）: %v", err)
 	}
-	text, err := ExtractKBText(content, "test.pptx", "")
-	if err != nil {
-		t.Fatalf("pptx: %v", err)
-	}
-	if strings.TrimSpace(text) == "" {
-		t.Fatal("pptx 提取为空")
-	}
-	chunks := ChunkDocument(text, "test.pptx", 1024, 50)
-	t.Logf("pptx: %d 字 → %d chunks, 含 slide 标记=%v", len(text), len(chunks), strings.Contains(text, "<!-- Slide number:"))
-	if len(chunks) == 0 {
-		t.Fatal("pptx 分块为空")
+	if _, err := ExtractKBText(content, "test.pptx", ""); err == nil {
+		t.Fatal("pptx 应被白名单拒绝，但提取成功了")
+	} else if !strings.Contains(err.Error(), "unsupported format") {
+		t.Fatalf("pptx 拒绝错误类型不符: %v", err)
 	}
 }
 
@@ -155,9 +150,12 @@ func TestE2EXlsRejected(t *testing.T) {
 	if err != nil {
 		t.Skipf("测试文档未准备（外部拉取）: %v", err)
 	}
-	_, err = ExtractKBText(content, "test.xls", "")
-	if err == nil || !strings.Contains(err.Error(), "暂不支持") {
-		t.Fatalf("xls 应报暂不支持: %v", err)
+	text, err := ExtractKBText(content, "test.xls", "")
+	if err != nil {
+		t.Fatalf("xls 应可解析: %v", err)
+	}
+	if strings.TrimSpace(text) == "" {
+		t.Fatal("xls 提取为空")
 	}
 }
 

@@ -10,7 +10,7 @@ import (
 // newTestBlobStore 用极短 TTL 便于测试 GC；dir 用临时目录。
 func newTestBlobStore(t *testing.T) *BlobStore {
 	t.Helper()
-	bs, err := NewBlobStore(t.TempDir(), 200*time.Millisecond, 64) // 64B 块便于测分块
+	bs, err := NewBlobStore(t.TempDir(), 200*time.Millisecond, 64, defaultMaxBlobSize, defaultMaxBlobTTL) // 64B 块便于测分块
 	if err != nil {
 		t.Fatalf("NewBlobStore: %v", err)
 	}
@@ -87,5 +87,28 @@ func TestBlobGCRemovesExpired(t *testing.T) {
 	bs.gcOnce()
 	if _, _, _, err := bs.Read(ref.HandleId, 0, 64); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected expired blob gone, got err=%v", err)
+	}
+}
+
+// TestBlobQuotaAndTTLClamp: 单 blob 超过大小上限必须拒绝；ttlSeconds 请求
+// 超过 maxTTL 时必须被钳到上限（不能被插件任意延长）。
+func TestBlobQuotaAndTTLClamp(t *testing.T) {
+	bs, err := NewBlobStore(t.TempDir(), 10*time.Second, 64, 1024, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewBlobStore: %v", err)
+	}
+	t.Cleanup(bs.Stop)
+
+	if _, err := bs.Create(bytes.Repeat([]byte("x"), 2048), "", "big.bin", 0); err == nil {
+		t.Fatal("blob exceeding max size must be rejected")
+	}
+
+	before := time.Now().Unix()
+	ref, err := bs.Create([]byte("ok"), "", "small.bin", 3600)
+	if err != nil {
+		t.Fatalf("Create within limit: %v", err)
+	}
+	if ref.ExpiresAt > before+6 {
+		t.Fatalf("ttlSeconds must be clamped to maxTTL: expires_at=%d", ref.ExpiresAt)
 	}
 }

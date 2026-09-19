@@ -52,17 +52,19 @@ type WecomAIQueueMgr struct {
 
 	queueMaxSize     int
 	backQueueMaxSize int
+
+	// queueWriteTimeout 输出队列写入超时，避免队列满时永久阻塞。
+	// 作为实例字段而非包级变量：不同适配器实例可各自配置/测试，
+	// 避免测试或运行时改全局值相互影响。
+	queueWriteTimeout time.Duration
 }
 
-// queueWriteTimeout 输出队列写入超时，避免队列满时永久阻塞。
-var queueWriteTimeout = 3 * time.Second
-
 // trySendBackQueueItem 尝试向输出队列写入元素，超时返回 false 避免永久阻塞。
-func trySendBackQueueItem(queue chan *QueueItem, item *QueueItem) bool {
+func (m *WecomAIQueueMgr) trySendBackQueueItem(queue chan *QueueItem, item *QueueItem) bool {
 	select {
 	case queue <- item:
 		return true
-	case <-time.After(queueWriteTimeout):
+	case <-time.After(m.queueWriteTimeout):
 		return false
 	}
 }
@@ -79,6 +81,7 @@ func NewWecomAIQueueMgr() *WecomAIQueueMgr {
 		listenerCancels:   make(map[string]func()),
 		queueMaxSize:      128,
 		backQueueMaxSize:  512,
+		queueWriteTimeout: 3 * time.Second,
 	}
 }
 

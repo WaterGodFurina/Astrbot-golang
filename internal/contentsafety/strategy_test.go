@@ -35,10 +35,19 @@ func TestStrategySelectorDisabled(t *testing.T) {
 	}
 }
 
-func TestBaiduAipCheckerFailOpen(t *testing.T) {
+func TestBaiduAipCheckerErrorSemantics(t *testing.T) {
 	c := NewBaiduAipChecker("1", "bad", "bad")
-	// 无网络环境：token 获取失败应 fail-open（返回 ok）
-	if ok, _ := c.Check("hello"); !ok {
-		t.Fatal("baidu aip transport errors should fail open")
+	ok, _ := c.Check("hello")
+	if baiduAipSDKEnabled {
+		// 真实 SDK 构建：传输/鉴权失败必须 fail-closed（对齐 Python
+		// baidu_aip.py：缺少 conclusionType 即判不合规）。
+		if ok {
+			t.Fatal("baidu aip sdk transport/auth errors must fail closed")
+		}
+		return
+	}
+	// 默认构建（未编译 SDK）：占位实现 fail-open 并提示如何启用。
+	if !ok {
+		t.Fatal("baidu aip placeholder should fail open")
 	}
 }

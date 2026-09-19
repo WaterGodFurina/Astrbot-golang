@@ -249,7 +249,8 @@ func (a *Adapter) resolveVideoURL(ctx context.Context, v *message.Video) string 
 // 对应 Python 的 _resolve_video_preview_url：优先 cover 字段，
 // 否则用 ffmpeg 提取首帧生成缩略图。
 func (a *Adapter) resolveVideoPreviewURL(ctx context.Context, v *message.Video) string {
-	cover := strings.TrimSpace(v.URL)
+	// 对齐 py：预览图取 video 组件的 cover 字段，绝不能拿视频 URL 当封面。
+	cover := strings.TrimSpace(v.Cover)
 	if strings.HasPrefix(cover, "https://") {
 		return cover
 	}
@@ -544,10 +545,11 @@ func convertAudioToWavFile(path string) string {
 }
 
 // truncateFFmpegOutput 压缩 ffmpeg 报错输出便于日志查看。
+// 按 rune 截断，避免把多字节 UTF-8 字符切成非法序列。
 func truncateFFmpegOutput(out []byte) string {
 	s := strings.TrimSpace(string(out))
-	if len(s) > 300 {
-		return s[:300]
+	if r := []rune(s); len(r) > 300 {
+		return string(r[:300])
 	}
 	return s
 }

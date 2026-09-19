@@ -177,14 +177,16 @@ func resolveComponentFile(path, file, url, b64, suffix string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("base64 解码媒体失败: %w", err)
 		}
-		tmp := fmt.Sprintf("%s/astrbot_wecom_%d%s", os.TempDir(), time.Now().UnixNano(), suffix)
+		// 用 filepath.Join 统一路径分隔符：Windows 下 os.TempDir() 返回反斜杠，
+		// 裸拼 "/" 会导致 removeWecomTemp 的前缀判断失配、临时文件永不删除。
+		tmp := filepath.Join(os.TempDir(), fmt.Sprintf("astrbot_wecom_%d%s", time.Now().UnixNano(), suffix))
 		if err := os.WriteFile(tmp, raw, 0600); err != nil {
 			return "", err
 		}
 		return tmp, nil
 	}
 	if url != "" {
-		tmp := fmt.Sprintf("%s/astrbot_wecom_%d%s", os.TempDir(), time.Now().UnixNano(), suffix)
+		tmp := filepath.Join(os.TempDir(), fmt.Sprintf("astrbot_wecom_%d%s", time.Now().UnixNano(), suffix))
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := downloadToFile(ctx, url, tmp); err != nil {
@@ -207,8 +209,17 @@ func downloadToFile(ctx context.Context, url, dest string) error {
 // removeWecomTemp 删除发送链路经 resolveComponentFile 创建在临时目录的媒体文件
 // （仅限本模块创建的 astrbot_wecom_* 文件，避免误删调用方自备文件）。
 func removeWecomTemp(p string) {
-	if p != "" && strings.HasPrefix(p, os.TempDir()+string(os.PathSeparator)) &&
-		strings.Contains(filepath.Base(p), "astrbot_wecom_") {
-		_ = os.Remove(p)
+	if p == "" {
+		return
 	}
+	// 用 filepath 语义比较父目录，避免 Windows 下 os.TempDir() 与 p 的
+	// 分隔符不一致（'\\' vs '/'）导致前缀判断失败、临时文件永不删除。
+	clean := filepath.Clean(p)
+	if filepath.Dir(clean) != filepath.Clean(os.TempDir()) {
+		return
+	}
+	if !strings.Contains(filepath.Base(clean), "astrbot_wecom_") {
+		return
+	}
+	_ = os.Remove(clean)
 }

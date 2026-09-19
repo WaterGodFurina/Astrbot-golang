@@ -18,6 +18,7 @@ import (
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/gorilla/websocket"
 )
 
@@ -35,7 +36,8 @@ type KookClient struct {
 	// 事件回调, 用于处理接收到的事件 (对应 Python 的 event_callback)
 	eventCallback func(data *kookMessageEventData)
 
-	// 机器人账号信息
+	// 机器人账号信息 (GetBotInfo 在重连时写入, 消息处理 goroutine 读取, 由 botInfoMu 保护)
+	botInfoMu   sync.RWMutex
 	botID       string
 	botUsername string
 	botNickname string
@@ -78,13 +80,34 @@ func NewKookClient(config *KookConfig, eventCallback func(data *kookMessageEvent
 }
 
 // BotID 返回机器人账号 id。
-func (c *KookClient) BotID() string { return c.botID }
+func (c *KookClient) BotID() string {
+	c.botInfoMu.RLock()
+	defer c.botInfoMu.RUnlock()
+	return c.botID
+}
 
 // BotNickname 返回机器人昵称。
-func (c *KookClient) BotNickname() string { return c.botNickname }
+func (c *KookClient) BotNickname() string {
+	c.botInfoMu.RLock()
+	defer c.botInfoMu.RUnlock()
+	return c.botNickname
+}
 
 // BotUsername 返回机器人名称。
-func (c *KookClient) BotUsername() string { return c.botUsername }
+func (c *KookClient) BotUsername() string {
+	c.botInfoMu.RLock()
+	defer c.botInfoMu.RUnlock()
+	return c.botUsername
+}
+
+// setBotInfo 持写锁整体更新机器人账号信息 (对应 Python get_bot_info 的赋值)。
+func (c *KookClient) setBotInfo(id, nickname, username string) {
+	c.botInfoMu.Lock()
+	defer c.botInfoMu.Unlock()
+	c.botID = id
+	c.botNickname = nickname
+	c.botUsername = username
+}
 
 // IsRunning 返回连接是否存活。
 func (c *KookClient) IsRunning() bool {
@@ -189,11 +212,9 @@ func (c *KookClient) GetBotInfo(ctx context.Context) {
 		logger.I18nError("[KOOK] 获取机器人账号信息失败: %d %s", apiResp.Code, string(body))
 		return
 	}
-	c.botID = apiResp.Data.ID
-	logger.I18nInfo("[KOOK] 获取机器人账号ID成功: %s", c.botID)
-	c.botNickname = apiResp.Data.Nickname
-	c.botUsername = apiResp.Data.Username
-	logger.I18nInfo("[KOOK] 获取机器人名称成功: %s", c.botNickname)
+	c.setBotInfo(apiResp.Data.ID, apiResp.Data.Nickname, apiResp.Data.Username)
+	logger.I18nInfo("[KOOK] 获取机器人账号ID成功: %s", c.BotID())
+	logger.I18nInfo("[KOOK] 获取机器人名称成功: %s", c.BotNickname())
 }
 
 // GetGatewayURL 获取网关连接地址 (对应 Python get_gateway_url)。
@@ -259,6 +280,9 @@ func (c *KookClient) closeWS() {
 // Connect 连接 WebSocket 并阻塞监听, 直到连接断开。
 // 返回 true 表示成功建立过连接 (对应 Python connect)。
 func (c *KookClient) Connect(ctx context.Context) bool {
+	// 每次连接前重建停止通知（对齐 Python clear()）：否则首次 Close/断连后
+	// stopEvent 已关闭、stopOnce 已触发，重连时会立刻被判定为已停止。
+	c.resetStopEvent()
 	c.closeWS()
 	gatewayURL, err := c.GetGatewayURL(ctx, false, c.lastSNValue(), c.sessionIDValue())
 	if err != nil || gatewayURL == "" {
@@ -573,8 +597,18 @@ func (c *KookClient) UploadAsset(ctx context.Context, fileURL string) (string, e
 	if strings.HasPrefix(fileURL, "http://") || strings.HasPrefix(fileURL, "https://") {
 		return fileURL, nil
 	}
-	// 处理 file:// 前缀
-	localPath := strings.TrimPrefix(fileURL, "file://")
+	// 处理 file:// URI：用标准解析取本地路径，兼容 file:///C:/...（Windows
+	// 三斜杠）、file://localhost/path 以及含 percent-encoding 的路径，避免
+	// TrimPrefix 在 Windows 下得到 "/C:/..." 这类错误路径。非 file URI 的裸
+	// 本地路径保持原样。
+	localPath := fileURL
+	if utils.IsFileURI(fileURL) {
+		p, ok := utils.FileURIToPathOK(fileURL)
+		if !ok {
+			return "", fmt.Errorf("上传文件到kook服务器失败: 无法解析本地文件 URI %q", fileURL)
+		}
+		localPath = p
+	}
 	data, err := os.ReadFile(localPath)
 	if err != nil {
 		return "", fmt.Errorf("上传文件到kook服务器失败: %v", err)
@@ -677,6 +711,12 @@ func (c *KookClient) Close() {
 // WaitUntilClosed 返回连接结束通知通道 (对应 Python wait_until_closed)。
 func (c *KookClient) WaitUntilClosed() <-chan struct{} {
 	return c.stopEvent
+}
+
+// resetStopEvent 重建停止通知通道与 once，供每次重连前调用（对齐 py clear()）。
+func (c *KookClient) resetStopEvent() {
+	c.stopOnce = sync.Once{}
+	c.stopEvent = make(chan struct{})
 }
 
 // GetJSON performs a GET request against the KOOK API and decodes the response

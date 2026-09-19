@@ -9,6 +9,9 @@ import (
 )
 
 func TestIsOrphanPluginCmdline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("孤儿扫描仅 Linux（/proc）启用；测试内 /opt 字面量走 POSIX 分隔符")
+	}
 	prefix := filepath.Join("/opt/astrbot/data", "plugins-bin") + string(filepath.Separator)
 
 	// A real plugin child: argv[0] points under the plugins-bin directory.
@@ -78,7 +81,11 @@ func TestDockerAvailableCacheExpiry(t *testing.T) {
 	}()
 
 	dir := t.TempDir()
-	fakeDocker := filepath.Join(dir, "docker")
+	dockerName := "docker"
+	if runtime.GOOS == "windows" {
+		dockerName = "docker.exe" // exec.LookPath 按 PATHEXT 匹配，无扩展名文件不可见
+	}
+	fakeDocker := filepath.Join(dir, dockerName)
 	write := func() {
 		if err := os.WriteFile(fakeDocker, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 			t.Fatal(err)

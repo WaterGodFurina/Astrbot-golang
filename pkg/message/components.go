@@ -177,12 +177,15 @@ type Video struct {
 	URL    string `json:"url,omitempty"`
 	Path   string `json:"path,omitempty"`
 	FileID string `json:"file_id,omitempty"`
+	// Cover 视频预览封面（对应 Python Video.cover）：发送侧优先用它作为
+	// preview image，缺省时再由平台侧从视频抽帧。
+	Cover string `json:"cover,omitempty"`
 }
 
 func (v *Video) Type() ComponentType { return CompVideo }
 func (v *Video) String() string      { return "[视频]" }
 func (v *Video) Clone() Component {
-	return &Video{URL: v.URL, Path: v.Path, FileID: v.FileID}
+	return &Video{URL: v.URL, Path: v.Path, FileID: v.FileID, Cover: v.Cover}
 }
 
 // Face represents a QQ emoji.

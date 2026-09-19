@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/netguard"
 )
 
 // marketCacheTTL controls how long a fetched registry snapshot is served from
@@ -97,21 +99,91 @@ func isBlockedIP(ip net.IP) bool {
 	return ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
 }
 
-// newOutboundClient 构建一个出站 http.Client：除初始 URL 需要调用方先过
-// validateOutboundURL 外，重定向的每一跳都会在此处再次校验，防止恶意服务器把
-// 请求重定向到内网/云元数据端点绕过 SSRF 防护。
+// validateOutboundURLStrict 是 validateOutboundURL 的收紧版：除内网/链路本地
+// 外，额外拒绝回环地址（127.0.0.0/8、::1）。供 ghproxy 测速这类纯管理侧、
+// 用户可指定任意 URL 且会回传连通性结果（SSRF 探测 oracle）的端点的使用，
+// 避免把本机服务当作探测目标。本地插件市场等需要回环的走 validateOutboundURL。
+func validateOutboundURLStrict(rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return fmt.Errorf("无效的 URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("仅允许 http/https URL，当前 scheme 为 %q", u.Scheme)
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" {
+		return fmt.Errorf("URL 缺少主机名")
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+		return fmt.Errorf("禁止访问本地主机 %q", host)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return strictBlockedIPErr(ip)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("域名解析失败 %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if err := strictBlockedIPErr(ip); err != nil {
+			return fmt.Errorf("域名 %s 解析到 %s", host, err)
+		}
+	}
+	return nil
+}
+
+// strictBlockedIPErr 回环/内网/链路本地的统一拒绝判定。
+func strictBlockedIPErr(ip net.IP) error {
+	if ip.IsLoopback() {
+		return fmt.Errorf("禁止访问回环地址 %s", ip)
+	}
+	if isBlockedIP(ip) {
+		return fmt.Errorf("禁止访问内网/保留地址 %s", ip)
+	}
+	return nil
+}
+
+// outboundRejectIP 供钉扎拨号在*建连时*按实际 IP 复校地址策略：拒绝内网/
+// 链路本地/未指定，放行回环（与 validateOutboundURL 一致，兼容本地插件市场）。
+func outboundRejectIP(ip net.IP) error {
+	if isBlockedIP(ip) {
+		return fmt.Errorf("禁止访问内网/保留地址 %s", ip)
+	}
+	return nil
+}
+
+// outboundRejectIPStrict 更严格：额外拒绝回环（配合 validateOutboundURLStrict）。
+func outboundRejectIPStrict(ip net.IP) error {
+	return strictBlockedIPErr(ip)
+}
+
+// newOutboundClient 构建一个出站 http.Client：初始 URL 由调用方先过
+// validateOutboundURL，重定向每一跳再校验，且底层拨号用 netguard 的钉扎
+// DialContext（解析与建连同一 IP，防 DNS-rebinding TOCTOU）。
 func newOutboundClient(timeout time.Duration) *http.Client {
-	// 走环境代理（HTTP_PROXY/HTTPS_PROXY/NO_PROXY）：容器/系统设置了代理时，
-	// GitHub API 等出站请求不再直连（避免被限流/封禁返回 403）。SSRF 防护仍由
-	// validateOutboundURL 在初始 URL 与每一跳重定向上把关。
+	return newOutboundClientWithDial(timeout, netguard.PinnedDialContext(outboundRejectIP), validateOutboundURL)
+}
+
+// newOutboundClientStrict 与 newOutboundClient 相同，但地址策略额外拒绝回环，
+// 供用户可指定任意 URL 的管理端点（如 ghproxy 测速）使用。
+func newOutboundClientStrict(timeout time.Duration) *http.Client {
+	return newOutboundClientWithDial(timeout, netguard.PinnedDialContext(outboundRejectIPStrict), validateOutboundURLStrict)
+}
+
+// newOutboundClientWithDial 组装出站客户端：环境代理 + 钉扎拨号 + 逐跳重定向
+// 校验。走环境代理（HTTP_PROXY/HTTPS_PROXY/NO_PROXY）保证容器/系统设置代理时
+// GitHub API 等不被限流；SSRF 防护由调用方初始校验、拨号校验与逐跳校验三层把关。
+func newOutboundClientWithDial(timeout time.Duration, dial func(ctx context.Context, network, addr string) (net.Conn, error), checkRedirect func(string) error) *http.Client {
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy:       http.ProxyFromEnvironment,
+		DialContext: dial,
 	}
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if err := validateOutboundURL(req.URL.String()); err != nil {
+			if err := checkRedirect(req.URL.String()); err != nil {
 				return fmt.Errorf("重定向目标校验失败 %s: %v", req.URL.Redacted(), err)
 			}
 			return nil

@@ -18,6 +18,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +64,11 @@ const (
 	validationMaxRatePerMin = 5
 	// signatureTimestampSkew 正常事件回调 X-Signature-Timestamp 与当前时间允许的最大偏差
 	signatureTimestampSkew = 5 * time.Minute
+	// webhookSessionTTL 会话相关缓存（sessionScene/sessionLastMsg/sessionLastMsgAt）
+	// 的存活上限；长跑进程会累积大量会话，必须惰性淘汰。
+	webhookSessionTTL = 30 * time.Minute
+	// webhookSessionMax 会话缓存与 extraDataCache 的容量硬上限。
+	webhookSessionMax = 4096
 )
 
 // Adapter 是 QQ 官方 webhook 平台适配器。
@@ -203,8 +209,9 @@ func (a *Adapter) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc(webhookPath, a.WebhookCallback)
 	a.server = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", a.callbackServerHost, a.port),
-		Handler: mux,
+		Addr:              fmt.Sprintf("%s:%d", a.callbackServerHost, a.port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
 		if err := a.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -448,6 +455,7 @@ func (a *Adapter) storeExtraData(messageID string, extra map[string]interface{})
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.extraDataCache[messageID] = extra
+	a.pruneSessionsLocked(time.Now())
 }
 
 // popExtraData 取出并删除消息的附加字段（对齐 Python pop_extra_data）。
@@ -511,6 +519,42 @@ func (a *Adapter) onDirectMessageCreate(d map[string]interface{}) {
 	a.commit(abm)
 }
 
+// pruneSessionsLocked 在持有 a.mu 时淘汰无界会话/附加数据缓存：
+// 会话按 TTL + 容量上限（最旧优先）淘汰，extraDataCache 仅兜底容量。
+func (a *Adapter) pruneSessionsLocked(now time.Time) {
+	for conv, t := range a.sessionLastMsgAt {
+		if now.Sub(t) > webhookSessionTTL {
+			delete(a.sessionLastMsgAt, conv)
+			delete(a.sessionLastMsg, conv)
+			delete(a.sessionScene, conv)
+		}
+	}
+	if n := len(a.sessionLastMsgAt); n > webhookSessionMax {
+		type sess struct {
+			id string
+			t  time.Time
+		}
+		list := make([]sess, 0, n)
+		for id, t := range a.sessionLastMsgAt {
+			list = append(list, sess{id, t})
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].t.Before(list[j].t) })
+		for i := 0; i < n-webhookSessionMax; i++ {
+			delete(a.sessionLastMsgAt, list[i].id)
+			delete(a.sessionLastMsg, list[i].id)
+			delete(a.sessionScene, list[i].id)
+		}
+	}
+	if n := len(a.extraDataCache); n > webhookSessionMax {
+		for id := range a.extraDataCache {
+			delete(a.extraDataCache, id)
+			if len(a.extraDataCache) <= webhookSessionMax/2 {
+				break
+			}
+		}
+	}
+}
+
 // rememberSessionMessageID 记录会话最后一条消息 id 及接收时间（对齐 Python）。
 func (a *Adapter) rememberSessionMessageID(sessionID, messageID string) {
 	if sessionID == "" || messageID == "" {
@@ -519,6 +563,7 @@ func (a *Adapter) rememberSessionMessageID(sessionID, messageID string) {
 	a.mu.Lock()
 	a.sessionLastMsg[sessionID] = messageID
 	a.sessionLastMsgAt[sessionID] = time.Now()
+	a.pruneSessionsLocked(time.Now())
 	a.mu.Unlock()
 }
 
@@ -529,6 +574,7 @@ func (a *Adapter) rememberSessionScene(sessionID, scene string) {
 	}
 	a.mu.Lock()
 	a.sessionScene[sessionID] = scene
+	a.pruneSessionsLocked(time.Now())
 	a.mu.Unlock()
 }
 
@@ -642,6 +688,11 @@ func extractSendParts(chain *message.MessageChain) (plain string, imageRef strin
 		case *message.Plain:
 			plain += comp.Text
 		case *message.Image:
+			// 对齐 py：只取链中第一张图片（qqofficial_message_event.py:911），
+			// 避免最后一张覆盖前面的。
+			if imageRef != "" {
+				continue
+			}
 			if comp.Base64 != "" {
 				imageRef = comp.Base64
 			} else if comp.Path != "" {

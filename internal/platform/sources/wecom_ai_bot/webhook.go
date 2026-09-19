@@ -37,6 +37,19 @@ func newWebhookError(format string, args ...interface{}) error {
 	return &WecomAIBotWebhookError{msg: fmt.Sprintf(format, args...)}
 }
 
+// checkAIBotErr 校验智能机器人接口响应中的 errcode：缺失字段或非 0 都按
+// 失败处理，兼容 errcode 为字符串的响应，避免格式异常被误判为成功。
+func checkAIBotErr(result map[string]interface{}) error {
+	code, present := platform.WeChatErrCode(result)
+	if !present {
+		return newWebhookError("响应缺少 errcode 字段: %v", result)
+	}
+	if code != 0 {
+		return newWebhookError("接口返回错误: %v %v", result["errcode"], result["errmsg"])
+	}
+	return nil
+}
+
 // WecomAIBotWebhookClient 企业微信智能机器人 webhook 消息推送客户端。
 type WecomAIBotWebhookClient struct {
 	webhookURL string
@@ -125,8 +138,8 @@ func (c *WecomAIBotWebhookClient) SendPayload(ctx context.Context, payload map[s
 	if err := json.Unmarshal(text, &result); err != nil {
 		return newWebhookError("Webhook 响应解析失败: %v", err)
 	}
-	if errCode, ok := result["errcode"].(float64); ok && int(errCode) != 0 {
-		return newWebhookError("Webhook 返回错误: %v %v", result["errcode"], result["errmsg"])
+	if err := checkAIBotErr(result); err != nil {
+		return err
 	}
 	logger.Debug("企业微信消息推送成功: %v", payload["msgtype"])
 	return nil
@@ -207,8 +220,8 @@ func (c *WecomAIBotWebhookClient) UploadMedia(ctx context.Context, filePath, med
 	if err := json.Unmarshal(text, &result); err != nil {
 		return "", newWebhookError("上传媒体响应解析失败: %v", err)
 	}
-	if errCode, ok := result["errcode"].(float64); ok && int(errCode) != 0 {
-		return "", newWebhookError("上传媒体失败: %v %v", result["errcode"], result["errmsg"])
+	if err := checkAIBotErr(result); err != nil {
+		return "", err
 	}
 	mediaID, _ := result["media_id"].(string)
 	if mediaID == "" {

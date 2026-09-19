@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net/url"
 	"path"
 	"regexp"
 	"sort"
@@ -69,8 +70,6 @@ func ExtractKBText(content []byte, name, contentType string) (string, error) {
 		// 本体 select_parser 白名单不含 .html（上传 .html 会报错）；
 		// 这里对齐白名单拒绝，URL 导入的 html 已在 contentType 分支处理。
 		return "", fmt.Errorf("%w: %s（本体不支持该格式上传；网页请用 URL 导入）", ErrUnsupportedFormat, ext)
-	case ".pptx":
-		return extractPPTXText(content), nil
 	case ".md", ".txt", ".markdown", ".rst", ".adoc":
 		return DecodeTextBytes(content)
 	case ".xls":
@@ -174,12 +173,14 @@ func HTMLToText(raw string) string {
 		}
 		return m
 	})
-	// 未识别实体经标准解析器兜底
-	raw = strings.Join(strings.Fields(raw), " ")
-	// 恢复换行结构：先按 \n 分行折叠行内空白
-	lines := strings.Split(raw, " ")
-	_ = lines
-	raw = strings.ReplaceAll(raw, " \n", "\n")
+	// 逐行折叠行内空白，保留块级标签引入的 \n：正文的多行结构与 markdown
+	// 标题行不能折叠成单一空格，否则 URL/EPUB 正文单行化、MarkdownChunk
+	// 失去标题识别。
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		lines[i] = strings.Join(strings.Fields(line), " ")
+	}
+	raw = strings.Join(lines, "\n")
 	raw = multiBlankRe.ReplaceAllString(raw, "\n\n")
 	return strings.TrimSpace(raw)
 }
@@ -346,21 +347,11 @@ func extractOOXMLText(content []byte) string {
 	if err != nil || len(files) == 0 {
 		return ""
 	}
-	var out strings.Builder
-	if doc, ok := files["word/document.xml"]; ok {
-		text := ooxmlDocumentText(doc)
-		out.WriteString(text)
+	doc, ok := files["word/document.xml"]
+	if !ok {
+		return ""
 	}
-	if out.Len() == 0 {
-		// Epub：xhtml/html 成员拼接
-		for name, data := range files {
-			if strings.HasSuffix(strings.ToLower(name), ".xhtml") || strings.HasSuffix(strings.ToLower(name), ".html") || strings.HasSuffix(strings.ToLower(name), ".htm") {
-				out.WriteString(HTMLToText(string(data)))
-				out.WriteString("\n\n")
-			}
-		}
-	}
-	return strings.TrimSpace(out.String())
+	return ooxmlDocumentText(doc)
 }
 
 // extractXLSText 提取 .xls（BIFF8）文本（对齐 markitdown XlsConverter：
@@ -386,6 +377,10 @@ func extractXLSText(content []byte) string {
 			if row == nil {
 				continue
 			}
+			// 已核实 extrame/xls 的 Row.LastCol() 返回 BIFF ROW 的 colMac，
+			// 即"末列索引 + 1"（独占上界）：库自带 xls_test.go 用
+			// `index < row.LastCol()` 遍历列；对 Table.xls 实测 colMac=3 而
+			// 实际末列为 2。故循环须用 c < last，改成 <= 会多出空的末列。
 			last := int(row.LastCol())
 			cells := make([]string, 0, last)
 			nonEmpty := 0
@@ -457,29 +452,107 @@ var (
 	xlsxNumVRe  = regexp.MustCompile(`(?s)<v>(.*?)</v>`)
 )
 
+// extractEPUBText 按 OPF spine 顺序提取 EPUB 章节文本（对齐本体 EpubParser
+// 经 MarkItDown 的阅读顺序：spine 才定义章节顺序，manifest 与 zip 成员顺序
+// 都不保证）。无法解析 spine 的普通 zip 退化为按成员名排序，保证结果确定。
 func extractEPUBText(content []byte) string {
-	if t := extractOOXMLText(content); t != "" {
-		return t
-	}
-	// 兜底：普通 zip（无 mimetype 识别）同样按成员扫
 	files, err := zipFiles(content)
-	if err != nil {
+	if err != nil || len(files) == 0 {
 		return ""
 	}
+	if parts := epubSpineParts(files); len(parts) > 0 {
+		return strings.TrimSpace(strings.Join(parts, "\n\n"))
+	}
+	// 兜底：无法解析 OPF/spine 的 epub（或普通 zip）按成员名排序读取，
+	// 避免原先 map 随机序导致的分块结果不确定。
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 	var parts []string
-	for name, data := range files {
+	for _, name := range names {
 		ln := strings.ToLower(name)
-		if strings.HasSuffix(ln, ".xhtml") || strings.HasSuffix(ln, ".html") || strings.HasSuffix(ln, ".htm") || strings.HasSuffix(ln, ".txt") {
-			if strings.HasSuffix(ln, ".txt") {
-				if s, err := DecodeTextBytes(data); err == nil {
-					parts = append(parts, s)
-				}
-			} else {
-				parts = append(parts, HTMLToText(string(data)))
+		data := files[name]
+		switch {
+		case strings.HasSuffix(ln, ".txt"):
+			if s, err := DecodeTextBytes(data); err == nil {
+				parts = append(parts, s)
 			}
+		case strings.HasSuffix(ln, ".xhtml"), strings.HasSuffix(ln, ".html"), strings.HasSuffix(ln, ".htm"):
+			parts = append(parts, HTMLToText(string(data)))
 		}
 	}
 	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+}
+
+// epubSpineParts 解析 META-INF/container.xml → OPF → manifest/spine，按 spine
+// 的 itemref 顺序返回各章节文本。（私有 helper xmlAttrs 见文件末尾。）
+func epubSpineParts(files map[string][]byte) []string {
+	container, ok := files["META-INF/container.xml"]
+	if !ok {
+		return nil
+	}
+	m := rootfileRe.FindSubmatch(container)
+	if m == nil {
+		return nil
+	}
+	opfPath := string(m[1])
+	opf, ok := files[opfPath]
+	if !ok {
+		return nil
+	}
+	opfText := string(opf)
+	// manifest: item id -> href
+	hrefByID := map[string]string{}
+	for _, tag := range itemRe.FindAllString(opfText, -1) {
+		attrs := xmlAttrs(tag)
+		if id, href := attrs["id"], attrs["href"]; id != "" && href != "" {
+			hrefByID[id] = href
+		}
+	}
+	// spine: itemref 的声明顺序即阅读顺序
+	baseDir := path.Dir(opfPath)
+	var parts []string
+	for _, tag := range itemrefRe.FindAllString(opfText, -1) {
+		idref := xmlAttrs(tag)["idref"]
+		if idref == "" {
+			continue
+		}
+		href, ok := hrefByID[idref]
+		if !ok {
+			continue
+		}
+		href = strings.SplitN(href, "#", 2)[0]
+		href = strings.SplitN(href, "?", 2)[0]
+		if unescaped, uerr := url.PathUnescape(href); uerr == nil {
+			href = unescaped
+		}
+		data, ok := files[path.Join(baseDir, href)]
+		if !ok {
+			continue
+		}
+		if s := strings.TrimSpace(HTMLToText(string(data))); s != "" {
+			parts = append(parts, s)
+		}
+	}
+	return parts
+}
+
+var (
+	rootfileRe = regexp.MustCompile(`(?is)<rootfile\b[^>]*\bfull-path="([^"]+)"`)
+	itemRe     = regexp.MustCompile(`(?is)<item\b[^>]*>`)
+	itemrefRe  = regexp.MustCompile(`(?is)<itemref\b[^>]*>`)
+	xmlAttrRe  = regexp.MustCompile(`(?is)([a-zA-Z_:][\w:.-]*)\s*=\s*"([^"]*)"`)
+)
+
+// xmlAttrs 解析 XML 标签内的属性（属性名小写化为 key）。
+func xmlAttrs(tag string) map[string]string {
+	out := map[string]string{}
+	for _, m := range xmlAttrRe.FindAllStringSubmatch(tag, -1) {
+		out[strings.ToLower(m[1])] = m[2]
+	}
+	return out
 }
 
 // ooxmlDocumentText 从 document.xml 提取文本，对齐本体 markitdown 转
@@ -492,18 +565,23 @@ func ooxmlDocumentText(xmlBytes []byte) string {
 	s := string(xmlBytes)
 	var out strings.Builder
 
-	// 先处理表格：w:tbl 整块转文本表格
-	for _, tbl := range tblRe.FindAllString(s, -1) {
-		out.WriteString(renderDocxTable(tbl))
-		out.WriteString("\n")
-	}
-	// 段落（跳过已被表格覆盖的行——表格在 <w:p> 外）
-	for _, para := range paraRe.FindAllString(s, -1) {
-		text := strings.TrimSpace(docxParaText(para))
+	// 单遍顺序扫描：docxBlockRe 同时匹配表格与段落，FindAllString 按出现
+	// 位置返回文档实际顺序；表格分支整体消费 <w:tbl>，其单元格内的 <w:p>
+	// 不会再被段落分支匹配，因此既不重复输出单元格文本，也不丢失顺序
+	//（原实现"先全部表格、再全部段落"导致两者都错）。
+	for _, block := range docxBlockRe.FindAllString(s, -1) {
+		if strings.HasPrefix(block, "<w:tbl") {
+			if tbl := renderDocxTable(block); tbl != "" {
+				out.WriteString(tbl)
+				out.WriteString("\n")
+			}
+			continue
+		}
+		text := strings.TrimSpace(docxParaText(block))
 		if text == "" {
 			continue
 		}
-		out.WriteString(docxParaPrefix(para) + text + "\n")
+		out.WriteString(docxParaPrefix(block) + text + "\n")
 	}
 	return out.String()
 }
@@ -570,11 +648,12 @@ func renderDocxTable(tbl string) string {
 }
 
 var (
-	wtRe   = regexp.MustCompile(`(?s)<w:t(?:\s[^>]*)?>(.*?)</w:t>`)
-	paraRe = regexp.MustCompile(`(?s)<w:p\b[^>]*>.*?</w:p>`)
-	tblRe  = regexp.MustCompile(`(?s)<w:tbl\b[^>]*>.*?</w:tbl>`)
-	trRe   = regexp.MustCompile(`(?s)<w:tr\b[^>]*>.*?</w:tr>`)
-	tcRe   = regexp.MustCompile(`(?s)<w:tc\b[^>]*>.*?</w:tc>`)
+	wtRe = regexp.MustCompile(`(?s)<w:t(?:\s[^>]*)?>(.*?)</w:t>`)
+	trRe = regexp.MustCompile(`(?s)<w:tr\b[^>]*>.*?</w:tr>`)
+	tcRe = regexp.MustCompile(`(?s)<w:tc\b[^>]*>.*?</w:tc>`)
+	// docxBlockRe 一并匹配表格或段落：表格分支在前，命中 <w:tbl> 时整体消费，
+	// 其内部段落不会被第二次匹配（避免单元格重复 + 顺序错乱）。
+	docxBlockRe = regexp.MustCompile(`(?s)<w:tbl\b[^>]*>.*?</w:tbl>|<w:p\b[^>]*>.*?</w:p>`)
 )
 
 var xmlEntityRe = regexp.MustCompile(`&(lt|gt|amp|quot|apos|#\d+);`)

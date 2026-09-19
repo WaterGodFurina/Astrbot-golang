@@ -31,6 +31,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/pbkdf2"
@@ -51,6 +52,51 @@ const (
 //  handleSetup, handleAccountEdit are in server.go)
 
 // ── System config handlers ──────────────────────────────────
+
+// totpProtectedPaths 是敏感配置字段：dashboard.totp 的启用/密钥/恢复码哈希。
+// 对齐 Python ConfigService.PROTECTED_2FA_CONFIG_PATHS。
+var totpProtectedPaths = []string{"enable", "secret", "recovery_code_hash"}
+
+// requireConfigTOTP 判断一次配置写入是否需要 TOTP 二次确认；需要但缺失/错误时
+// 写出 401（data.totp_required=true，前端据此弹二次确认并携带 X-2FA-Code 重试）
+// 并返回 true。语义对齐 Python ConfigService.update_profile：
+//   - 仅当 TOTP 已启用、且提交内容确实改动了受保护的 dashboard.totp 字段时要求；
+//   - Go GET /system-config 会隐去 dashboard.totp（redactDashboardSecrets），
+//     前端回传通常不含该段，缺失视为"未改动"（由 injectAuthFields 回填），避免
+//     普通保存被误判为改 TOTP 而要求二次确认。
+func (s *Server) requireConfigTOTP(w http.ResponseWriter, r *http.Request, incoming map[string]interface{}) bool {
+	if s.auth == nil || !s.auth.TOTPEnabled() {
+		return false
+	}
+	inDash, _ := incoming["dashboard"].(map[string]interface{})
+	if inDash == nil {
+		return false
+	}
+	inTOTP, ok := inDash["totp"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	current := s.auth.TOTPConfig()
+	changed := false
+	for _, key := range totpProtectedPaths {
+		if fmt.Sprint(inTOTP[key]) != fmt.Sprint(current[key]) {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return false
+	}
+	if s.auth.VerifyTOTPOnly(r.Header.Get("X-2FA-Code")) {
+		return false
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+		"status":  "error",
+		"message": "需要 TOTP 验证",
+		"data":    map[string]interface{}{"totp_required": true},
+	})
+	return true
+}
 
 func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
@@ -80,6 +126,11 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request, part
 			}
 			if body.Config == nil {
 				writeJSON(w, http.StatusBadRequest, apiError("缺少 config 配置"))
+				return
+			}
+			// 敏感写入二次确认：TOTP 已启用且本次改动涉及 dashboard.totp 时，
+			// 必须携带有效的 X-2FA-Code（对齐 Python update_profile）。
+			if s.requireConfigTOTP(w, r, body.Config) {
 				return
 			}
 			if err := s.setConfigDataAll(body.Config); err != nil {
@@ -1074,7 +1125,8 @@ func (s *Server) getProviderTemplates() *config.OrderedJSON {
 	template := func(name, provider, providerType, apiBase string) *config.OrderedJSON {
 		return om("id", name, "type", name, "provider", provider,
 			"provider_type", providerType, "enable", false, "api_base", apiBase, "key", []string{},
-			"timeout", 120, "proxy", "", "custom_headers", om())
+			"timeout", 120, "proxy", "", "custom_headers", om(),
+			"image_moderation_error_patterns", []string{})
 	}
 	return om(
 		"openai", template("openai", "openai_chat_completion", "chat_completion", "https://api.openai.com/v1"),
@@ -1107,6 +1159,7 @@ func (s *Server) getProviderTemplates() *config.OrderedJSON {
 			"provider_type", "chat_completion", "enable", false,
 			"api_base", "https://api.x.ai/v1", "key", []string{},
 			"timeout", 120, "proxy", "", "custom_headers", om(),
+			"image_moderation_error_patterns", []string{},
 			"xai_native_search", false),
 		"zhipu", template("zhipu", "zhipu_chat_completion", "chat_completion", "https://open.bigmodel.cn/api/paas/v4"),
 		"longcat", template("longcat", "longcat_chat_completion", "chat_completion", "https://api.longcat.chat/openai/v1"),
@@ -1115,7 +1168,8 @@ func (s *Server) getProviderTemplates() *config.OrderedJSON {
 		"openai_responses", om("id", "openai_responses", "type", "openai_responses", "provider", "openai",
 			"provider_type", "chat_completion", "enable", false,
 			"api_base", "https://api.openai.com/v1", "key", []string{}, "model", "",
-			"timeout", 120, "proxy", "", "custom_headers", om()),
+			"timeout", 120, "proxy", "", "custom_headers", om(),
+			"image_moderation_error_patterns", []string{}),
 		"kimi_code", om("id", "kimi_code", "type", "kimi_code_chat_completion", "provider", "kimi-code",
 			"provider_type", "chat_completion", "enable", false,
 			"api_base", "https://api.kimi.com/coding", "key", []string{}, "model", "kimi-for-coding",
@@ -1864,6 +1918,14 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 		// PlatformManager.get_all_stats). The CronJob "未来计划" page filters
 		// meta.support_proactive_message to pick delivery targets.
 		statsList := make([]interface{}, 0, 4)
+		// 聚合平台适配器自报的运行期统计（wecom_ai_bot 队列、weixin_oc 二维码等），
+		// 按 id 关联到配置条目上，供前端/manager 观测（对应 py get_all_stats）。
+		runtimeStats := map[string]map[string]interface{}{}
+		for _, st := range s.platformAllStats() {
+			if rid, _ := st["id"].(string); rid != "" {
+				runtimeStats[rid] = st
+			}
+		}
 		for _, b := range s.getBotList() {
 			pc, ok := b.(map[string]interface{})
 			if !ok {
@@ -1884,7 +1946,7 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 				"support_streaming_message": streaming,
 				"support_proactive_message": proactive,
 			}
-			statsList = append(statsList, map[string]interface{}{
+			entry := map[string]interface{}{
 				"id":              id,
 				"type":            ptype,
 				"display_name":    platformDisplayName(ptype),
@@ -1893,7 +1955,11 @@ func (s *Server) handleBots(w http.ResponseWriter, r *http.Request, parts []stri
 				"last_error":      nil,
 				"unified_webhook": false,
 				"meta":            meta,
-			})
+			}
+			if rt, ok := runtimeStats[id]; ok {
+				entry["runtime"] = rt
+			}
+			statsList = append(statsList, entry)
 		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"platforms": statsList,
@@ -2129,9 +2195,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		// 单插件休眠策略：POST {plugin_id, allow_sleep: bool,
 		// idle_unload_minutes?: int, idle_wake_mode?: string}。
 		// allow_sleep=true 表示该插件允许闲置自动休眠；false = 常驻（不参与
-		// 清扫）。idle_unload_minutes 为该插件独立闲置阈值（分钟），缺省/0 =
-		// 回退全局默认。idle_wake_mode 为休眠唤醒方式（"hook_and_command" =
-		// 过滤器/钩子+指令唤醒；"command_only" = 仅插件唤醒，默认）。
+		// 清扫）。idle_unload_minutes 为该插件独立闲置阈值（分钟），「关闭→
+		// 开启」翻转时缺省/0 由后端落 plugin.DefaultIdleUnloadMinutes（单一真
+		// 源在前端之外）。idle_wake_mode 为休眠唤醒方式（"hook_and_command" =
+		// 指令+工具+过滤器唤醒；"command_only" = 指令+工具唤醒，默认）。
 		var body struct {
 			PluginID          string `json:"plugin_id"`
 			AllowSleep        bool   `json:"allow_sleep"`
@@ -2164,7 +2231,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 					writeJSON(w, http.StatusOK, apiError(err.Error()))
 					return
 				}
-				writeJSON(w, http.StatusOK, apiOKMsg("休眠策略已更新", map[string]interface{}{}))
+				// 回显生效阈值：开启时后端可能补默认值，前端以此更新显示。
+				writeJSON(w, http.StatusOK, apiOKMsg("休眠策略已更新", map[string]interface{}{
+					"idle_unload_minutes": s.subPluginMgr.PluginIdleUnloadMinutes(pid),
+				}))
 				return
 			}
 		}
@@ -2273,7 +2343,9 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			return
 		}
 		// 插件数据根（= 插件子进程工作目录，插件以相对路径读文件）。
-		pluginRoot := filepath.Join("data", "plugins_data", plugin.SanitizeIDLocal(pluginID))
+		// 必须与插件运行时（SubprocessManager.pluginDataRoot）同源：使用
+		// kbDataDir() 而非硬编码 "data"，否则自定义数据目录/非根启动时读写错位。
+		pluginRoot := filepath.Join(s.kbDataDir(), "plugins_data", plugin.SanitizeIDLocal(pluginID))
 		folder := configKeyToFolder(configKey)
 		targetDir := filepath.Join(pluginRoot, "files", folder)
 
@@ -3076,6 +3148,43 @@ func (s *Server) handlePluginLogo(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
+// pluginProxyBlockedHeader 判定宿主请求头是否禁止转发给插件：Authorization /
+// Cookie / X-API-Key 是宿主鉴权凭据，X-AstrBot-Username 是宿主注入的可信身份
+// （客户端自带的同名头不可信，须剥离后由宿主重新注入）。
+func pluginProxyBlockedHeader(k string) bool {
+	switch k {
+	case "Authorization", "Cookie", "X-Api-Key", "X-AstrBot-Username":
+		return true
+	}
+	return false
+}
+
+// pluginProxyBlockedQuery 判定查询参数（含 multipart 表单字段）是否为宿主
+// 凭据通道，禁止转发：api_key / key 为 API key；token 为遗留 JWT/会话 token。
+func pluginProxyBlockedQuery(k string) bool {
+	return k == "api_key" || k == "key" || k == "token"
+}
+
+// pluginCallerUsername 解析当前 dashboard 请求的调用者身份，对齐 Python
+// AuthContext.username：JWT/会话 → 管理员用户名；API key → "api_key:<key_id>"
+// （AstrBot core.workspace.API_KEY_USERNAME_PREFIX）。返回空串表示无法解析。
+func (s *Server) pluginCallerUsername(r *http.Request) string {
+	if raw := extractAPIKey(r); raw != "" {
+		if s.apiKeys != nil {
+			if rec := s.apiKeys.getByHash(hashAPIKey(raw)); rec != nil {
+				return "api_key:" + rec.KeyID
+			}
+		}
+		return ""
+	}
+	if s.auth != nil {
+		if name := strings.TrimSpace(s.auth.Username()); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
 // handlePluginWebProxy proxies a dashboard HTTP request to the plugin process
 // that registered the route (context.register_web_api). The first path segment
 // is the plugin name/id; the full sub-path (including the plugin segment) is
@@ -3138,17 +3247,26 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 		Path:   "/" + pluginPath,
 	}
 	for k, vs := range r.URL.Query() {
+		// 宿主鉴权凭据不转发给插件（防泄露）：api_key / key / token query 通道剥离。
+		if pluginProxyBlockedQuery(k) {
+			continue
+		}
 		for _, v := range vs {
 			req.Query = append(req.Query, &sdkv1.WebKV{Key: k, Value: v})
 		}
 	}
 	for k, vs := range r.Header {
+		if pluginProxyBlockedHeader(k) {
+			continue
+		}
 		for _, v := range vs {
-			if k == "Authorization" || k == "Cookie" {
-				continue // 内部头不转发
-			}
 			req.Headers = append(req.Headers, &sdkv1.WebKV{Key: k, Value: v})
 		}
+	}
+	// 注入宿主解析出的可信调用者身份（对齐 Python PluginRequest.username /
+	// DashboardRequestState.username）。宿主凭据本身不转发，仅此身份头可信。
+	if caller := s.pluginCallerUsername(r); caller != "" {
+		req.Headers = append(req.Headers, &sdkv1.WebKV{Key: "X-AstrBot-Username", Value: caller})
 	}
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
@@ -3178,6 +3296,11 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 					}
 				}
 				for k, vs := range r.MultipartForm.Value {
+					// multipart 表单字段同样可能承载 api_key/key/token
+					// 凭据，必须与 URL query 一样剥离后再转发。
+					if pluginProxyBlockedQuery(k) {
+						continue
+					}
 					for _, v := range vs {
 						req.Query = append(req.Query, &sdkv1.WebKV{Key: k, Value: v})
 					}
@@ -5566,6 +5689,9 @@ type backupTaskState struct {
 	Current int
 	Total   int
 	Message string
+	// FinishedAt 终态时间（completed/failed 时写入），供 GC 判断是否超过
+	// backupTaskTTL 可删除；零值表示仍在进行中，不清理。
+	FinishedAt time.Time
 }
 
 // validateBackupFilename 校验备份文件名不含路径穿越字符（对齐 Python
@@ -5755,11 +5881,27 @@ func (s *Server) handleBackupsList(w http.ResponseWriter, r *http.Request) {
 	}))
 }
 
+// backupTaskTTL 终态备份任务的保留时长：超过后由 GC 删除，防止 backup_tasks
+// 只增不删。进行中（FinishedAt 为零）的任务永不清理。
+const backupTaskTTL = 10 * time.Minute
+
+// gcBackupTasksLocked 删除终态且超过 backupTaskTTL 的备份任务。调用方需持
+// backupTaskMu。在各访问/创建点惰性触发。
+func (s *Server) gcBackupTasksLocked() {
+	now := time.Now()
+	for id, t := range s.backupTasks {
+		if !t.FinishedAt.IsZero() && now.Sub(t.FinishedAt) > backupTaskTTL {
+			delete(s.backupTasks, id)
+		}
+	}
+}
+
 // handleBackupsTask returns GET /backups/tasks/{task_id} progress (and the
 // task list when no id is given), mirroring Python get_progress.
 func (s *Server) handleBackupsTask(w http.ResponseWriter, r *http.Request, parts []string) {
 	s.backupTaskMu.Lock()
 	defer s.backupTaskMu.Unlock()
+	s.gcBackupTasksLocked()
 	if len(parts) < 2 {
 		tasks := make([]interface{}, 0, len(s.backupTasks))
 		for _, t := range s.backupTasks {
@@ -5828,6 +5970,7 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 				return
 			}
 			s.uploadMu.Lock()
+			staleDirs := s.gcUploadSessionsLocked()
 			s.uploadSessions[uploadID] = &uploadSession{
 				Filename: unique, OriginalFilename: body.Filename,
 				TotalSize: body.TotalSize, TotalChunks: totalChunks,
@@ -5835,6 +5978,7 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 				CreatedAt: time.Now(), LastActivity: time.Now(),
 			}
 			s.uploadMu.Unlock()
+			removeUploadDirs(staleDirs)
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 				"upload_id": uploadID, "chunk_size": chunkSizeBytes,
 				"total_chunks": totalChunks, "filename": unique,
@@ -5854,8 +5998,10 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 				return
 			}
 			s.uploadMu.Lock()
+			staleDirs := s.gcUploadSessionsLocked()
 			session := s.uploadSessions[uploadID]
 			s.uploadMu.Unlock()
+			removeUploadDirs(staleDirs)
 			if session == nil {
 				writeJSON(w, http.StatusBadRequest, apiError("上传会话不存在或已过期"))
 				return
@@ -5890,27 +6036,47 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 				return
 			}
 			s.uploadMu.Lock()
+			staleDirs := s.gcUploadSessionsLocked()
 			session := s.uploadSessions[body.UploadID]
+			// 锁内快照会话字段：解锁后并发分片上传仍会改写 session，
+			// 直接读字段会数据竞争（F-low-7）。
+			var (
+				totalChunks         int
+				receivedLen         int
+				sessionFilename     string
+				sessionOriginalName string
+				sessionChunkDir     string
+				sessionExists       bool
+			)
+			if session != nil {
+				sessionExists = true
+				totalChunks = session.TotalChunks
+				receivedLen = len(session.ReceivedChunks)
+				sessionFilename = session.Filename
+				sessionOriginalName = session.OriginalFilename
+				sessionChunkDir = session.ChunkDir
+			}
 			s.uploadMu.Unlock()
-			if session == nil {
+			removeUploadDirs(staleDirs)
+			if !sessionExists {
 				writeJSON(w, http.StatusBadRequest, apiError("上传会话不存在或已过期"))
 				return
 			}
-			if len(session.ReceivedChunks) != session.TotalChunks {
-				writeJSON(w, http.StatusBadRequest, apiError(fmt.Sprintf("分片不完整，缺少: %d 个分片", session.TotalChunks-len(session.ReceivedChunks))))
+			if receivedLen != totalChunks {
+				writeJSON(w, http.StatusBadRequest, apiError(fmt.Sprintf("分片不完整，缺少: %d 个分片", totalChunks-receivedLen)))
 				return
 			}
 			dir := s.backupDir()
 			_ = os.MkdirAll(dir, 0o755)
-			outputPath := filepath.Join(dir, session.Filename)
+			outputPath := filepath.Join(dir, sessionFilename)
 			file, err := os.Create(outputPath) // #nosec G304 -- filename 已经 secureBackupFilename 净化，会话为服务端生成
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, apiError("合并分片失败: "+err.Error()))
 				return
 			}
 			var mergeErr error
-			for i := 0; i < session.TotalChunks; i++ {
-				chunkPath := filepath.Join(session.ChunkDir, fmt.Sprintf("%d.part", i))
+			for i := 0; i < totalChunks; i++ {
+				chunkPath := filepath.Join(sessionChunkDir, fmt.Sprintf("%d.part", i))
 				cf, err := os.Open(chunkPath) // #nosec G304 -- chunkPath 由服务端 upload_id/索引拼接
 				if err != nil {
 					mergeErr = err
@@ -5950,7 +6116,7 @@ func (s *Server) handleBackupsUpload(w http.ResponseWriter, r *http.Request, par
 			s.markBackupAsUploaded(outputPath)
 			s.cleanupUploadSession(body.UploadID)
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-				"filename": session.Filename, "original_filename": session.OriginalFilename, "size": fileSize,
+				"filename": sessionFilename, "original_filename": sessionOriginalName, "size": fileSize,
 			}))
 		case "abort":
 			var body struct {
@@ -6041,6 +6207,37 @@ func (s *Server) cleanupUploadSession(uploadID string) {
 	s.uploadMu.Unlock()
 	if session != nil && session.ChunkDir != "" {
 		_ = os.RemoveAll(session.ChunkDir)
+	}
+}
+
+// uploadSessionTTL 分片上传会话的空闲上限（对齐 Python UPLOAD_EXPIRE_SECONDS=3600）。
+const uploadSessionTTL = time.Hour
+
+// gcUploadSessionsLocked 惰性清理超过 uploadSessionTTL 未活动的分片上传会话，
+// 返回其临时目录（由调用方在解锁后删除，避免持锁做磁盘 IO）。调用方需持
+// uploadMu。防止未完成的上传会话与 .chunks 临时目录只增不删耗尽内存/磁盘。
+func (s *Server) gcUploadSessionsLocked() []string {
+	now := time.Now()
+	var dirs []string
+	for id, sess := range s.uploadSessions {
+		last := sess.LastActivity
+		if last.IsZero() {
+			last = sess.CreatedAt
+		}
+		if !last.IsZero() && now.Sub(last) > uploadSessionTTL {
+			delete(s.uploadSessions, id)
+			if sess.ChunkDir != "" {
+				dirs = append(dirs, sess.ChunkDir)
+			}
+		}
+	}
+	return dirs
+}
+
+// removeUploadDirs 删除 GC 回收的分片临时目录。
+func removeUploadDirs(dirs []string) {
+	for _, d := range dirs {
+		_ = os.RemoveAll(d)
 	}
 }
 
@@ -6189,8 +6386,10 @@ func (s *Server) checkBackupFile(filename string) *backup.CheckResult {
 
 // handleBackupsImport starts a background restore task (POST
 // /backups/{filename}/import). Restore requires an explicit confirmed flag and
-// extracts the archive into the data dir (zip-slip guarded inside the backup
-// package), mirroring Python import_backup.
+// extracts the archive into a staging dir inside the backup package
+// (zip-slip guarded), then swaps into the data dir after integrity checks.
+// The import hot-swaps astrbot.db, so the task result carries
+// restart_required=true（前端据此提示用户重启）。
 func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request, filename string) {
 	var body struct {
 		Confirmed bool `json:"confirmed"`
@@ -6210,6 +6409,7 @@ func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request, fil
 	}
 	taskID := uuid.NewString()
 	s.backupTaskMu.Lock()
+	s.gcBackupTasksLocked()
 	s.backupTasks[taskID] = &backupTaskState{TaskID: taskID, Type: "import", Status: "processing", Stage: "waiting", Total: 100}
 	s.backupTaskMu.Unlock()
 	go func() {
@@ -6218,13 +6418,20 @@ func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request, fil
 		s.backupTaskMu.Lock()
 		defer s.backupTaskMu.Unlock()
 		task := s.backupTasks[taskID]
+		task.FinishedAt = time.Now()
 		if err != nil {
 			task.Status = "failed"
 			task.Error = err.Error()
 			return
 		}
 		task.Status = "completed"
-		task.Result = map[string]interface{}{"success": true, "warnings": []interface{}{}, "errors": []interface{}{}}
+		// restart_required：导入为主库热替换，Go SQLite 驱动重新打开才读新
+		// 文件，需提示用户重启 AstrBot 后数据完全生效。
+		task.Result = map[string]interface{}{
+			"success": true, "warnings": []interface{}{}, "errors": []interface{}{},
+			"restart_required": true,
+			"message":          "导入完成，需重启 AstrBot 后新数据完全生效",
+		}
 	}()
 	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 		"task_id": taskID, "message": "import task created, processing in background",
@@ -6236,6 +6443,7 @@ func (s *Server) handleBackupsImport(w http.ResponseWriter, r *http.Request, fil
 func (s *Server) handleBackupsCreate(w http.ResponseWriter, r *http.Request) {
 	taskID := uuid.NewString()
 	s.backupTaskMu.Lock()
+	s.gcBackupTasksLocked()
 	s.backupTasks[taskID] = &backupTaskState{TaskID: taskID, Type: "export", Status: "processing", Stage: "waiting", Total: 100}
 	s.backupTaskMu.Unlock()
 	go func() {
@@ -6260,6 +6468,7 @@ func (s *Server) handleBackupsCreate(w http.ResponseWriter, r *http.Request) {
 		task := s.backupTasks[taskID]
 		if task != nil {
 			task.Status = "completed"
+			task.FinishedAt = time.Now()
 			task.Result = map[string]interface{}{
 				"filename": filepath.Base(zipPath), "path": zipPath, "size": size,
 			}
@@ -6277,6 +6486,7 @@ func (s *Server) setBackupTaskError(taskID, msg string) {
 	if task := s.backupTasks[taskID]; task != nil {
 		task.Status = "failed"
 		task.Error = msg
+		task.FinishedAt = time.Now()
 	}
 }
 
@@ -7078,7 +7288,7 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 				"platform_id": session.PlatformID,
 			}))
 		default:
-			writeJSON(w, http.StatusOK, apiOK(s.chat.listSessions()))
+			writeJSON(w, http.StatusMethodNotAllowed, apiError("不支持的请求方法"))
 		}
 		return
 	}
@@ -7146,7 +7356,7 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 						}))
 						return
 					}
-					writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+					writeJSON(w, http.StatusMethodNotAllowed, apiError("不支持的消息操作"))
 				} else {
 					// 返回该会话的真实历史消息（此前为恒空 stub）。
 					detail := s.chat.sessionDetail(sessionID)
@@ -7171,7 +7381,7 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 				}))
 				return
 			default:
-				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+				writeJSON(w, http.StatusNotFound, apiError("未知的会话子资源: "+rest[1]))
 				return
 			}
 		}
@@ -7216,7 +7426,7 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 				"message": "session deleted",
 			}))
 		default:
-			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
+			writeJSON(w, http.StatusMethodNotAllowed, apiError("不支持的请求方法"))
 		}
 	}
 }
@@ -8770,6 +8980,11 @@ func (s *Server) updateConfigProfile(w http.ResponseWriter, r *http.Request, pro
 	if inner, ok := direct["config"].(map[string]interface{}); ok && len(direct) == 1 {
 		direct = inner
 	}
+	// 敏感写入二次确认：与 /system-config PUT 一致（对齐 Python
+	// ConfigService.update_profile 对任意 profile 都校验 X-2FA-Code）。
+	if s.requireConfigTOTP(w, r, direct) {
+		return
+	}
 	if profileID == "default" {
 		if err := s.setConfigDataAll(direct); err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("保存失败: "+err.Error()))
@@ -9193,8 +9408,12 @@ func (s *Server) handleT2I(w http.ResponseWriter, r *http.Request, parts []strin
 		sub = parts[0]
 	}
 	switch sub {
-	case "", "templates":
+	case "templates":
 		s.handleT2ITemplates(w, r, parts[1:])
+	case "":
+		// 裸 /api/v1/t2i（无子路径）：原先 parts[1:] 直接越界 panic，
+		// 这里返回 400（对齐 Python t2i 路由无该路径的 404 语义，仅更明确）。
+		writeJSON(w, http.StatusBadRequest, apiError("missing t2i sub path"))
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
@@ -9709,9 +9928,10 @@ func (s *Server) handleT2ITemplates(w http.ResponseWriter, r *http.Request, part
 		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"name": body.Name}))
 	default:
-		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"templates": s.t2iListTemplates(),
-		}))
+		// 对齐 Python t2i.py list_t2i_templates：ok(service.list_templates())
+		// 的 data 是裸数组，前端 T2ITemplateEditor 直接取 res.data.data 作为
+		// templates。此前包成 {"templates": [...]} 导致列表渲染损坏。
+		writeJSON(w, http.StatusOK, apiOK(s.t2iListTemplates()))
 	}
 }
 
@@ -9747,6 +9967,7 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 					writeJSON(w, http.StatusOK, apiError(err.Error()))
 					return
 				}
+				s.resyncSandboxSkills()
 				writeJSON(w, http.StatusOK, apiOKMsg("技能状态已更新", map[string]interface{}{}))
 			} else {
 				writeJSON(w, http.StatusOK, apiOKMsg("技能已更新", map[string]interface{}{}))
@@ -9756,6 +9977,7 @@ func (s *Server) handleSkills(w http.ResponseWriter, r *http.Request, parts []st
 				writeJSON(w, http.StatusOK, apiError(err.Error()))
 				return
 			}
+			s.resyncSandboxSkills()
 			writeJSON(w, http.StatusOK, apiOKMsg("技能已删除", map[string]interface{}{}))
 		} else {
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
@@ -10266,6 +10488,7 @@ func (s *Server) updateSkillFile(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, apiError(err.Error()))
 		return
 	}
+	s.resyncSandboxSkills()
 	writeJSON(w, http.StatusOK, apiOKMsg("文件已保存", map[string]interface{}{}))
 }
 
@@ -10322,6 +10545,7 @@ func (s *Server) uploadSkillsBatch(w http.ResponseWriter, r *http.Request) {
 		succeeded = append(succeeded, map[string]interface{}{"filename": filename, "name": skillName})
 	}
 
+	s.resyncSandboxSkills()
 	writeJSON(w, http.StatusOK, apiOKMsg("上传成功", map[string]interface{}{
 		"succeeded": succeeded,
 		"failed":    failed,
@@ -10796,6 +11020,12 @@ func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request, parts []st
 	}
 	switch sub {
 	case "restart":
+		// 对齐 Python @router.post("/system/restart")：仅 POST。重启有副作用，
+		// 禁止 GET 以防被跨站导航/预取等 GET 语义触发。
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, apiError("仅支持 POST"))
+			return
+		}
 		if s.restartFunc != nil {
 			// 异步触发重启，先返回成功响应，避免阻塞当前请求
 			go s.restartFunc()
@@ -10813,27 +11043,14 @@ func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request, parts []st
 }
 
 // skillFrontmatterName extracts the "name" field from a SKILL.md frontmatter.
+// 复用 skills 包的 yaml.v3 解析（正确处理 `name: >`/引号/续行），不再按行
+// 朴素匹配，避免值跨行或含引号时解析错误。
 func skillFrontmatterName(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(string(data), "\n")
-	inFrontmatter := false
-	for _, raw := range lines {
-		line := strings.TrimSpace(raw)
-		if strings.HasPrefix(line, "---") {
-			if !inFrontmatter {
-				inFrontmatter = true
-				continue
-			}
-			break
-		}
-		if inFrontmatter && strings.HasPrefix(line, "name:") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "name:"))
-		}
-	}
-	return ""
+	return skills.ParseFrontmatterName(string(data))
 }
 
 // sanitizeSkillDirName keeps skill directory names filesystem-safe.

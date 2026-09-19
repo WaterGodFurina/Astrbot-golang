@@ -71,7 +71,7 @@ func mimoBuildAPIURL(apiBase string) string {
 
 // mimoTempDir creates and returns the shared temp directory.
 func mimoTempDir() string {
-	dir := filepath.Join("data", "temp")
+	dir := tempDataDir()
 	_ = os.MkdirAll(dir, 0755)
 	return dir
 }

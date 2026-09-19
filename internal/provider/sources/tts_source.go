@@ -85,7 +85,7 @@ func (s *OpenAITTSSource) GetAudio(ctx context.Context, text string) (string, er
 		return "", fmt.Errorf("TTS API error %d: %s", resp.StatusCode, string(data))
 	}
 
-	dir := filepath.Join("data", "temp")
+	dir := tempDataDir()
 	_ = os.MkdirAll(dir, 0755)
 	path := filepath.Join(dir, fmt.Sprintf("openai_tts_%d.wav", time.Now().UnixNano()))
 	f, err := os.Create(path)

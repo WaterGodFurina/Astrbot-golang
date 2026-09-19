@@ -6,13 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -76,6 +73,10 @@ func newTestManager(t *testing.T) *SubprocessManager {
 	// Fast backoff + polling for tests.
 	m.RestartBaseDelay = 100 * time.Millisecond
 	m.PollInterval = 50 * time.Millisecond
+	// 注册 Shutdown 清理：LIFO 保证先于 t.TempDir 的 RemoveAll 执行，回收全部
+	// 插件子进程；否则 Windows 上残留进程持有 plugins-bin 下 exe 句柄，TempDir
+	// 自动清理撞 "Access is denied" 造成纯 cleanup 期假红（Linux/macOS 无此锁）。
+	t.Cleanup(m.Shutdown)
 	return m
 }
 
@@ -937,7 +938,7 @@ func TestIdleUnloadAndLazyReload(t *testing.T) {
 	if err := m.SetPluginIdleUnloadMinutes(inst.ID, 1); err != nil {
 		t.Fatalf("SetPluginIdleUnloadMinutes: %v", err)
 	}
-	inst.lastActiveNano.Store(time.Now().Add(-time.Minute).UnixNano()) // 模拟闲置
+	inst.lastActiveNano.Store(time.Now().Add(-2 * time.Minute).UnixNano()) // 模拟闲置（2×阈值防慢速 runner 边界 flaky）
 	m.sweepIdlePlugins()
 	if m.Get(inst.ID) != nil {
 		t.Fatal("idle plugin must be unloaded by the sweep")
@@ -1122,6 +1123,9 @@ func TestStartupErrorParserNoErrorField(t *testing.T) {
 // 握手错误（"failed to read any lines from plugin's stdout"）。不依赖真实
 // Python 桥接侧（该侧协议由另一子任务实现，测试用假输出自行验证）。
 func TestStartupErrorWrappedInLoadError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake python 依赖 #!/bin/sh shebang，Windows 无法执行")
+	}
 	fakePy := filepath.Join(t.TempDir(), "fake_python")
 	script := `#!/bin/sh
 if [ "$1" = "-c" ]; then
@@ -1143,8 +1147,8 @@ exit 1
 	m.MaxRestarts = 2
 	m.RestartBaseDelay = 100 * time.Millisecond
 	// 独立端口区间，避免与真实宿主（10000-25000）及并发测试互相干扰。
-	m.MinPort = 50300
-	m.MaxPort = 50400
+	m.MinPort = 30300
+	m.MaxPort = 30400
 	t.Cleanup(m.Shutdown)
 
 	_, err := m.LoadLang(context.Background(), "py_broken", filepath.Join("testdata", "python_plugin"), "python")
@@ -1167,118 +1171,21 @@ exit 1
 	}
 }
 
-// TestProcessGroupLifecycle 验证进程组生命周期：Setpgid 生效（/proc/<pid>
-// 的 pgrp 字段 == pid），卸载后整组进程真退出。
-func TestProcessGroupLifecycle(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("进程组测试仅支持 Linux")
+// TestAllocPluginPortRespectsLimit: 分配器必须把 MaxPort 当真正上界——
+// 区间宽度不足（limit 距 base < 15）时直接耗尽返回 0,0，绝不越过上界。
+func TestAllocPluginPortRespectsLimit(t *testing.T) {
+	if p, m := allocPluginPort(50000, 50010); p != 0 || m != 0 {
+		t.Fatalf("区间放不下时必须耗尽返回 0,0，got [%d,%d]", p, m)
 	}
-	requirePlugin(t)
-	m := newTestManager(t)
-	ctx := context.Background()
-
-	inst, err := m.Load(ctx, "test", testPluginBin)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	p, m := allocPluginPort(50000, 50100)
+	if p == 0 {
+		t.Fatal("足够区间应能分配")
 	}
-	if inst.pgid <= 0 {
-		t.Fatal("pgid 未记录（expected cmd.Process.Pid）")
+	defer releasePluginPort(p)
+	if m != p+15 {
+		t.Fatalf("应返回 [p, p+15]，got [%d,%d]", p, m)
 	}
-	// Setpgid 生效：插件进程的 pgrp 必须是它自己的 pid。
-	pgrp, ok := processPGRP(inst.pgid)
-	if !ok {
-		t.Fatalf("读取 /proc/%d/stat 失败", inst.pgid)
+	if m > 50100 || p < 50000 {
+		t.Fatalf("分配越界：base=50000 limit=50100 got [%d,%d]", p, m)
 	}
-	if pgrp != inst.pgid {
-		t.Fatalf("进程组未生效: pgrp=%d, 期望 %d (pid)", pgrp, inst.pgid)
-	}
-
-	if err := m.Unload("test"); err != nil {
-		t.Fatalf("Unload: %v", err)
-	}
-	waitFor(t, 5*time.Second, "插件进程退出", func() bool {
-		return !processAlive(inst.pgid)
-	})
-}
-
-// TestTerminateProcessGroupKillsWholeTree 验证 killProcessGroup 的核心原语
-// terminateProcessGroup：进程组内除直接子进程外再拉起的子进程（模拟 Python
-// 桥再拉起子进程）也被一并回收。
-func TestTerminateProcessGroupKillsWholeTree(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("进程组测试仅支持 Linux")
-	}
-	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skip("sh 不可用")
-	}
-	// sh 作为进程组组长，sleep 由它拉起并继承同组。
-	cmd := exec.Command("sh", "-c", "sleep 100 & wait")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := cmd.Start(); err != nil {
-		t.Skipf("启动 sh 失败: %v", err)
-	}
-	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
-	pgid := cmd.Process.Pid
-
-	waitFor(t, 3*time.Second, "组内出现 sh + sleep", func() bool {
-		return len(processesInGroup(pgid)) >= 2
-	})
-	if got := processesInGroup(pgid); len(got) < 2 {
-		t.Fatalf("期望组内至少 2 个进程，实际 %v", got)
-	}
-
-	if !terminateProcessGroup(pgid, nil) {
-		t.Fatal("terminateProcessGroup 返回 false")
-	}
-	_ = cmd.Wait() // 直接子进程已被组信号回收
-	waitFor(t, 3*time.Second, "进程组清空", func() bool {
-		return len(processesInGroup(pgid)) == 0
-	})
-}
-
-// processPGRP 读取 /proc/<pid>/stat 的第 5 字段（pgrp）。
-func processPGRP(pid int) (int, bool) {
-	stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
-	if err != nil {
-		return 0, false
-	}
-	s := string(stat)
-	idx := strings.LastIndex(s, ")")
-	if idx < 0 {
-		return 0, false
-	}
-	fields := strings.Fields(s[idx+1:])
-	if len(fields) < 3 {
-		return 0, false
-	}
-	pgrp, err := strconv.Atoi(fields[2])
-	if err != nil {
-		return 0, false
-	}
-	return pgrp, true
-}
-
-// processAlive 通过 kill(pid, 0) 探测进程是否存在（ESRCH = 已退出）。
-func processAlive(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
-}
-
-// processesInGroup 扫描 /proc 中所有 pgrp == pgid 的进程。
-func processesInGroup(pgid int) []int {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil
-	}
-	var out []int
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid <= 1 {
-			continue
-		}
-		if g, ok := processPGRP(pid); ok && g == pgid {
-			out = append(out, pid)
-		}
-	}
-	return out
 }

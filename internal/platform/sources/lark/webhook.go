@@ -70,10 +70,16 @@ func (s *LarkWebhookServer) decryptEvent(encrypted string) (map[string]interface
 	ct := enc[aes.BlockSize:]
 	pt := make([]byte, len(ct))
 	cipher.NewCBCDecrypter(s.cipher, iv).CryptBlocks(pt, ct)
-	// PKCS7 unpad
+	// PKCS7 unpad：除长度范围外，还必须校验末尾 padLen 个填充字节都等于
+	// padLen，否则接受伪造/损坏的填充（对齐标准 PKCS7 校验）。
 	padLen := int(pt[len(pt)-1])
 	if padLen <= 0 || padLen > aes.BlockSize || padLen > len(pt) {
 		return nil, errBadPadding
+	}
+	for i := len(pt) - padLen; i < len(pt); i++ {
+		if pt[i] != byte(padLen) {
+			return nil, errBadPadding
+		}
 	}
 	pt = pt[:len(pt)-padLen]
 	var data map[string]interface{}
@@ -151,19 +157,21 @@ func (s *LarkWebhookServer) HandleCallback(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
+	// URL verification (challenge) 前置处理：首次配置时可能尚未填写
+	// encrypt_key/verification_token，challenge 本身不含业务数据，直接放行
+	// （对齐 py：无密钥时 challenge 仍返回）。加密事件与回调仍走完整校验。
+	if eventType, _ := eventData["type"].(string); eventType == "url_verification" {
+		challenge, _ := eventData["challenge"].(string)
+		logger.Info("收到飞书 challenge 验证请求: %s", challenge)
+		writeJSON(w, map[string]interface{}{"challenge": challenge})
+		return
+	}
+
 	// 未配置 encrypt_key 与 verification_token 时, 事件无法通过任何签名/令牌校验,
 	// 直接拒绝处理, 避免被伪造的事件进入消息管线。
 	if s.encryptKey == "" && s.verifyToken == "" {
 		logger.Error("飞书 Webhook 未配置 encrypt_key 与 verification_token, 拒绝处理事件")
 		writeWebhookError(w, http.StatusServiceUnavailable, "encrypt_key or verification_token required")
-		return
-	}
-
-	// URL verification (challenge).
-	if eventType, _ := eventData["type"].(string); eventType == "url_verification" {
-		challenge, _ := eventData["challenge"].(string)
-		logger.Info("收到飞书 challenge 验证请求: %s", challenge)
-		writeJSON(w, map[string]interface{}{"challenge": challenge})
 		return
 	}
 

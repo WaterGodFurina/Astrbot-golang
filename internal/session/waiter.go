@@ -99,11 +99,22 @@ func (sc *SessionController) AddHistoryChain(chain *message.MessageChain) {
 	sc.historyChains = append(sc.historyChains, chain.Clone())
 }
 
-// GetHistoryChains returns recorded message chains.
+// GetHistoryChains returns recorded message chains. 返回深拷贝：既复制切片
+// 本身，也 Clone 每个 chain，避免调用方改动内部历史记录（并发下更安全）。
 func (sc *SessionController) GetHistoryChains() []*message.MessageChain {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	return sc.historyChains
+	if len(sc.historyChains) == 0 {
+		return nil
+	}
+	out := make([]*message.MessageChain, len(sc.historyChains))
+	for i, c := range sc.historyChains {
+		if c == nil {
+			continue
+		}
+		out[i] = c.Clone()
+	}
+	return out
 }
 
 func (sc *SessionController) stopLocked(err error) {

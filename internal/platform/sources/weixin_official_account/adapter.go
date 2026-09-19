@@ -39,6 +39,11 @@ import (
 
 var logger = log.GetDefault().WithComponent("WeixinOffAcc")
 
+// callbackTimestampTolerance 回调时间戳新鲜度窗口。Python 原版（wechatpy
+// 回调处理）没有该校验，±300s 的硬校验会让宿主时钟偏差 >5 分钟的部署所有
+// 回调都失败；这里放宽到 1 小时并对偏差打日志，签名校验仍是实际安全边界。
+const callbackTimestampTolerance = time.Hour
+
 // Adapter implements the WeChat Official Account adapter.
 type Adapter struct {
 	config   map[string]interface{}
@@ -46,13 +51,14 @@ type Adapter struct {
 
 	EventBus *core.EventBus
 
-	appid      string
-	secret     string
-	apiBase    string
-	port       int
-	host       string
-	webhookID  string
-	activeSend bool
+	appid              string
+	secret             string
+	apiBase            string
+	port               int
+	host               string
+	unifiedWebhookMode bool
+	webhookID          string
+	activeSend         bool
 
 	account *wx.MpAccount
 
@@ -102,6 +108,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	if a.port == 0 {
 		a.port = 6194
 	}
+	a.unifiedWebhookMode, _ = config["unified_webhook_mode"].(bool)
 	a.webhookID, _ = config["webhook_uuid"].(string)
 	if v, ok := config["active_send_mode"].(bool); ok {
 		a.activeSend = v
@@ -182,8 +189,10 @@ func (a *Adapter) ID() string {
 func (a *Adapter) Type() string { return "weixin_official_account" }
 
 // Start registers the webhook server (or the unified webhook entry).
+// 对齐 Python weixin_offacc_adapter.py:410-419：仅当 unified_webhook_mode
+// 与 webhook_uuid 同时满足时才跳过独立服务器，只有 webhook_uuid 不生效。
 func (a *Adapter) Start(ctx context.Context) error {
-	if a.webhookID != "" {
+	if a.unifiedWebhookMode && a.webhookID != "" {
 		logger.I18nInfo("微信公众号 webhook 模式已启用, webhook_uuid=%s", a.webhookID)
 		return nil
 	}
@@ -321,7 +330,10 @@ func (a *Adapter) handlePassiveReply(msg *wxmp.MessageData, w http.ResponseWrite
 			a.writeReply(w, xml, nonce, timestamp)
 			return
 		}
-		a.writeReply(w, a.maybeEncrypt(textReplyXML(msg.ToUserName, msg.FromUserName, workerTimeoutReply), nonce, timestamp), nonce, timestamp)
+		// 微信协议：回复的 ToUserName=用户 openid（收到的 FromUserName）、
+		// FromUserName=机器人 ID（收到的 ToUserName），与 wechatpy create_reply 方向一致。
+		// writeReply 内部统一过 maybeEncrypt（对齐本体 _reply_text 收口）。
+		a.writeReply(w, textReplyXML(msg.FromUserName, msg.ToUserName, workerTimeoutReply), nonce, timestamp)
 		return
 	}
 
@@ -411,11 +423,19 @@ func (a *Adapter) replyFromState(st *userState, msg *wxmp.MessageData, w http.Re
 func (a *Adapter) writePlaceholder(w http.ResponseWriter, st *userState, msg *wxmp.MessageData, nonce, timestamp string) {
 	elapsed := int(time.Since(st.startedAt).Seconds())
 	placeholder := fmt.Sprintf("【正在思考'%s'中，已思考%ds，回复任意文字尝试获取回复】", st.preview, elapsed)
-	a.writeReply(w, a.maybeEncrypt(textReplyXML(msg.ToUserName, msg.FromUserName, placeholder), nonce, timestamp), nonce, timestamp)
+	// 微信协议：回复的 ToUserName=用户 openid（收到的 FromUserName）、
+	// FromUserName=机器人 ID（收到的 ToUserName），与 wechatpy create_reply 方向一致。
+	// writeReply 内部统一过 maybeEncrypt（对齐本体 _reply_text 收口）。
+	a.writeReply(w, textReplyXML(msg.FromUserName, msg.ToUserName, placeholder), nonce, timestamp)
 }
 
-// writeReply 以 text/xml 输出被动回复（内容已就绪，含加密与否）。
+// writeReply 以 text/xml 输出被动回复。所有被动回复的统一写出出口：
+// 在此统一过 maybeEncrypt（对齐本体 _reply_text 收口 _maybe_encrypt 的语义），
+// 保证 takeReply 弹出的缓存/媒体回复在安全模式下也会加密，避免逐调用点遗漏。
 func (a *Adapter) writeReply(w http.ResponseWriter, replyXML, nonce, timestamp string) {
+	// 统一加密收口（本体 _maybe_encrypt）：空回复回退 success，重复调用幂等
+	// （已含 <Encrypt> 的 XML 不会二次加密），明文模式原样输出。
+	replyXML = a.maybeEncrypt(replyXML, nonce, timestamp)
 	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 	_, _ = io.WriteString(w, replyXML)
 }
@@ -508,15 +528,22 @@ func validateCiphertext(encrypt, encodingAESKey string) error {
 	return nil
 }
 
-// checkTimestampFreshness 校验回调时间戳在 ±5 分钟窗口内（timestamp 为秒）。
+// checkTimestampFreshness 校验回调时间戳在可容忍窗口内（timestamp 为秒）。
+// 对齐 Python（无此校验）：窗口放宽到 callbackTimestampTolerance 以容忍宿主
+// 时钟偏差，非数字/偏差都打日志而不是静默拒绝；签名校验仍是安全边界。
 func checkTimestampFreshness(timestamp string) error {
 	ts, err := strconv.ParseInt(timestamp, 10, 64)
 	if err != nil {
-		return errors.New("无效时间戳")
+		logger.Warn("微信回调 timestamp 非数字: %q，交由签名校验: %v", timestamp, err)
+		return nil
 	}
-	diff := time.Now().Unix() - ts
-	if diff < -300 || diff > 300 {
+	skew := time.Duration(time.Now().Unix()-ts) * time.Second
+	if skew > callbackTimestampTolerance || skew < -callbackTimestampTolerance {
+		logger.Warn("微信回调 timestamp 偏差过大(%s)，已拒绝: ts=%d", skew, ts)
 		return errors.New("时间戳超出新鲜度窗口")
+	}
+	if skew > time.Minute || skew < -time.Minute {
+		logger.Warn("微信回调 timestamp 存在时钟偏差(%s): ts=%d", skew, ts)
 	}
 	return nil
 }
@@ -666,7 +693,8 @@ func (a *Adapter) bufferPassive(sessionID string, chain *message.MessageChain) e
 				continue
 			}
 			// 被动 ImageReply XML（本体 ImageReply(media_id).render() + future.set_result）。
-			st.setFutureXML(imageReplyXML(st.toUser, st.fromUser, mediaID))
+			// 微信协议：回复的 ToUserName=用户 openid（st.fromUser）、FromUserName=机器人 ID（st.toUser）。
+			st.setFutureXML(imageReplyXML(st.fromUser, st.toUser, mediaID))
 		case *message.Record:
 			mediaID, err := a.uploadVoiceComponent(c)
 			if err != nil {
@@ -675,7 +703,8 @@ func (a *Adapter) bufferPassive(sessionID string, chain *message.MessageChain) e
 				continue
 			}
 			// 被动 VoiceReply XML（本体 VoiceReply(media_id).render() + future.set_result）。
-			st.setFutureXML(voiceReplyXML(st.toUser, st.fromUser, mediaID))
+			// 微信协议：回复的 ToUserName=用户 openid（st.fromUser）、FromUserName=机器人 ID（st.toUser）。
+			st.setFutureXML(voiceReplyXML(st.fromUser, st.toUser, mediaID))
 		default:
 			logger.Warn("还没实现这个消息类型的发送逻辑: %T。", comp)
 		}
@@ -795,6 +824,10 @@ func (a *Adapter) uploadVoiceComponent(rec *message.Record) (string, error) {
 		} else {
 			return "", fmt.Errorf("语音转 amr 失败：请确认宿主已安装 ffmpeg")
 		}
+	}
+	// 转码输出为独立临时文件时，上传完清理，避免临时目录堆积。
+	if amrPath != inPath {
+		defer os.Remove(amrPath)
 	}
 	amrData, err := os.ReadFile(amrPath)
 	if err != nil {

@@ -52,6 +52,9 @@ func buildTestPlugin() string {
 	}
 
 	bin := filepath.Join(os.TempDir(), fmt.Sprintf("astrbot-test-plugin-%d", time.Now().UnixNano()))
+	if runtime.GOOS == "windows" {
+		bin += ".exe" // Windows 上无 .exe 的产物 exec 会报 "not found in %PATH%"
+	}
 	// Locate testdata relative to THIS package's source (not the caller's cwd),
 	// so the helper works from any package's tests.
 	var src []byte

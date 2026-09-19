@@ -14,22 +14,27 @@ import (
 	"time"
 )
 
+// 微信被动回复协议的收发件人方向（与 wechatpy create_reply 的 target 语义一致）：
+// ToUserName = 发消息给机器人的用户 openid（即收到消息 XML 里的 FromUserName）；
+// FromUserName = 机器人自身原始 ID（即收到消息 XML 里的 ToUserName）。
+// 以下三个构造函数的参数顺序与 XML 字段顺序一一对应。
+
 // textReplyXML 构建文本被动回复 XML（对应 wechatpy create_reply(text, msg).render()）。
-func textReplyXML(fromUser, toUser, content string) string {
+func textReplyXML(toUser, fromUser, content string) string {
 	return fmt.Sprintf(`<xml><ToUserName><![CDATA[%s]]></ToUserName><FromUserName><![CDATA[%s]]></FromUserName><CreateTime>%d</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[%s]]></Content></xml>`,
-		fromUser, toUser, nowUnix(), content)
+		toUser, fromUser, nowUnix(), content)
 }
 
 // imageReplyXML 构建图片被动回复 XML（对应 wechatpy ImageReply.render()）。
-func imageReplyXML(fromUser, toUser, mediaID string) string {
+func imageReplyXML(toUser, fromUser, mediaID string) string {
 	return fmt.Sprintf(`<xml><ToUserName><![CDATA[%s]]></ToUserName><FromUserName><![CDATA[%s]]></FromUserName><CreateTime>%d</CreateTime><MsgType><![CDATA[image]]></MsgType><Image><MediaId><![CDATA[%s]]></MediaId></Image></xml>`,
-		fromUser, toUser, nowUnix(), mediaID)
+		toUser, fromUser, nowUnix(), mediaID)
 }
 
 // voiceReplyXML 构建语音被动回复 XML（对应 wechatpy VoiceReply.render()）。
-func voiceReplyXML(fromUser, toUser, mediaID string) string {
+func voiceReplyXML(toUser, fromUser, mediaID string) string {
 	return fmt.Sprintf(`<xml><ToUserName><![CDATA[%s]]></ToUserName><FromUserName><![CDATA[%s]]></FromUserName><CreateTime>%d</CreateTime><MsgType><![CDATA[voice]]></MsgType><Voice><MediaId><![CDATA[%s]]></MediaId></Voice></xml>`,
-		fromUser, toUser, nowUnix(), mediaID)
+		toUser, fromUser, nowUnix(), mediaID)
 }
 
 // nowUnix 返回当前秒级时间戳。

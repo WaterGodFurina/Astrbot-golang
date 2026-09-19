@@ -112,10 +112,11 @@ func convertVideoToMp4(ctx context.Context, inputPath string) (string, bool) {
 }
 
 // truncateFFmpegLog 压缩 ffmpeg 报错输出便于日志查看。
+// 按 rune 截断，避免把多字节 UTF-8 字符切成非法序列。
 func truncateFFmpegLog(out []byte) string {
 	s := strings.TrimSpace(string(out))
-	if len(s) > 300 {
-		return s[:300]
+	if r := []rune(s); len(r) > 300 {
+		return string(r[:300])
 	}
 	return s
 }

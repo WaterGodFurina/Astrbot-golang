@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -55,7 +56,9 @@ type Adapter struct {
 	typing *typingManagerAdapter
 
 	// 最近消息缓存（引用回复时间窗匹配，对齐本体 _recent_messages）。
-	recentMu           sync.Mutex
+	recentMu sync.Mutex
+	// recentSeq 会话缓存插入序号（recentMu 保护）：淘汰 tie-break 用。
+	recentSeq          uint64
 	recentMessages     map[string]*recentSessionCache
 	recentCacheSize    int
 	replyMatchWindowMs int64
@@ -82,11 +85,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		a.botType = "3"
 	}
 	// Persistence directory for the iLink SDK (token/context/syncbuf).
-	a.dataDir, _ = config["weixin_oc_data_dir"].(string)
-	if a.dataDir == "" {
-		wd, _ := os.Getwd()
-		a.dataDir = filepath.Join(wd, "data", "weixin_oc")
-	}
+	a.dataDir = resolveDataDir(config)
 	_ = os.MkdirAll(a.dataDir, 0o755)
 
 	baseURL, _ := config["weixin_oc_base_url"].(string)
@@ -117,6 +116,28 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	return a
 }
 
+// resolveDataDir 解析 iLink 持久化目录，优先顺序：
+//  1. 配置 weixin_oc_data_dir；
+//  2. 宿主数据目录 ASTRBOT_DATA_PATH（Python get_astrbot_data_path 语义）；
+//  3. ASTRBOT_ROOT/data；
+//  4. 仅在前两者都缺失时才回退到进程 CWD 下的 data/，并显式告警，
+//     避免服务以不同 CWD 启动时持久化目录漂移、登录态丢失。
+func resolveDataDir(config map[string]interface{}) string {
+	if d, _ := config["weixin_oc_data_dir"].(string); strings.TrimSpace(d) != "" {
+		return d
+	}
+	if dp := strings.TrimSpace(os.Getenv("ASTRBOT_DATA_PATH")); dp != "" {
+		return filepath.Join(dp, "weixin_oc")
+	}
+	if root := strings.TrimSpace(os.Getenv("ASTRBOT_ROOT")); root != "" {
+		return filepath.Join(root, "data", "weixin_oc")
+	}
+	wd, _ := os.Getwd()
+	d := filepath.Join(wd, "data", "weixin_oc")
+	logger.I18nWarn("未配置宿主数据目录(ASTRBOT_DATA_PATH/ASTRBOT_ROOT)，微信开放平台持久化目录回退到 CWD: %s", d)
+	return d
+}
+
 // SetEventBus injects the event bus.
 func (a *Adapter) SetEventBus(bus platform.EventBus) {
 	if eb, ok := bus.(*core.EventBus); ok {
@@ -134,6 +155,24 @@ func (a *Adapter) ID() string {
 
 // Type returns the platform type.
 func (a *Adapter) Type() string { return "weixin_oc" }
+
+// LastQR 返回最近一次扫码登录的二维码内容/URL（此前只写不读，导致登录态
+// 无法被 manager 或仪表盘观测）。加锁读取，保证并发安全。
+func (a *Adapter) LastQR() string {
+	a.lastQRMu.Lock()
+	defer a.lastQRMu.Unlock()
+	return a.lastQR
+}
+
+// Stats 返回微信开放平台运行期信息（对应 py get_stats 的 weixin_oc 段），
+// 实现 platform.StatsProvider 供 PlatformManager 聚合。
+func (a *Adapter) Stats() map[string]interface{} {
+	return map[string]interface{}{
+		"weixin_oc": map[string]interface{}{
+			"qrcode": a.LastQR(),
+		},
+	}
+}
 
 // Start boots the bot: resume from persisted token or QR login, then run.
 func (a *Adapter) Start(ctx context.Context) error {
@@ -245,7 +284,7 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 				if err != nil {
 					a.logMediaError("image", msg.MessageID, err)
 				} else if len(data) > 0 {
-					if path := a.saveMedia(data, "image", ".png"); path != "" {
+					if path := a.saveMedia(data, "image", imageExtFromData(data)); path != "" {
 						components = append(components, &message.Image{Path: path, File: path})
 					}
 				}
@@ -304,7 +343,7 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 		timestamp:   createTimeMs / 1000,
 		timestampMs: createTimeMs,
 		components:  append([]message.Component{}, components...),
-		messageStr:  messageTextOf(components),
+		messageStr:  messageTextFromItemList(msg.ItemList),
 	})
 
 	if a.EventBus == nil {
@@ -328,15 +367,74 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 	}
 }
 
-// messageTextOf 拼接组件中的 Plain 文本。
+// messageTextOf 拼接组件文本：Plain 取原文，媒体组件按类型生成占位文本
+// （对齐本体 _message_text_from_item_list，image/file/video → [图片]/[文件]/[视频]，
+// voice → [语音]）。
 func messageTextOf(components []message.Component) string {
 	text := ""
 	for _, comp := range components {
 		if plain, ok := comp.(*message.Plain); ok {
 			text += plain.Text
+			continue
 		}
+		text += comp.String()
 	}
 	return strings.TrimSpace(text)
+}
+
+// messageTextFromItemList 从 iLink item_list 生成 message_str，对齐本体
+// _message_text_from_item_list（weixin_oc_adapter.py:1157-1198）：
+//   - text 取原文；
+//   - voice 优先取服务端 ASR 转写文本，无转写时用 [语音]；
+//   - image/file/video 分别用 [图片]/[文件]/[视频]；
+//   - 多项以换行拼接（不含引用文本，与 Python include_ref_text=False 一致）。
+func messageTextFromItemList(items []ilink.MessageItem) string {
+	parts := make([]string, 0, len(items))
+	for i := range items {
+		item := &items[i]
+		switch item.Type {
+		case ilink.ItemTypeText:
+			if item.TextItem != nil {
+				if t := strings.TrimSpace(item.TextItem.Text); t != "" {
+					parts = append(parts, t)
+				}
+			}
+		case ilink.ItemTypeImage:
+			parts = append(parts, "[图片]")
+		case ilink.ItemTypeVoice:
+			if item.VoiceItem != nil {
+				if t := strings.TrimSpace(item.VoiceItem.Text); t != "" {
+					parts = append(parts, t)
+					continue
+				}
+			}
+			parts = append(parts, "[语音]")
+		case ilink.ItemTypeFile:
+			parts = append(parts, "[文件]")
+		case ilink.ItemTypeVideo:
+			parts = append(parts, "[视频]")
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+// imageExtFromData 依据图片内容魔数推断扩展名（对齐本体
+// detect_image_mime_type + MEDIA_MIME_EXTENSIONS），无法识别时回退 .jpg
+// （Python default_mime_type=None 再取扩展名默认值 .jpg）。此前固定 .png
+// 会把 jpg/gif/webp 等图片错误标注，导致下游按扩展名读取/转码失败。
+func imageExtFromData(data []byte) string {
+	switch http.DetectContentType(data) {
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/bmp":
+		return ".bmp"
+	default:
+		return ".jpg"
+	}
 }
 
 // resolveRefItemComponents 解析被引用消息内嵌的媒体项为组件
@@ -352,7 +450,7 @@ func (a *Adapter) resolveRefItemComponents(mi *ilink.MessageItem) []message.Comp
 	case ilink.ItemTypeImage:
 		if mi.ImageItem != nil && mi.ImageItem.Media != nil {
 			if data, err := a.bot.DownloadImage(ctx, mi.ImageItem); err == nil && len(data) > 0 {
-				if path := a.saveMedia(data, "image", ".png"); path != "" {
+				if path := a.saveMedia(data, "image", imageExtFromData(data)); path != "" {
 					comps = append(comps, &message.Image{Path: path, File: path})
 				}
 			}
@@ -389,12 +487,9 @@ func (a *Adapter) resolveRefItemComponents(mi *ilink.MessageItem) []message.Comp
 // messageToEvent converts an iLink message to a core.Event (pure function,
 // testable without a bus).
 func messageToEvent(msg *ilink.Message, fromUser string, components []message.Component) *core.Event {
-	text := ""
-	for _, comp := range components {
-		if plain, ok := comp.(*message.Plain); ok {
-			text += plain.Text
-		}
-	}
+	// message_str 由 item_list 生成（含媒体占位与语音转写），与 Python
+	// abm.message_str = _message_text_from_item_list(...) 对齐。
+	text := messageTextFromItemList(msg.ItemList)
 	createTime := time.Now().Unix()
 	if msg.CreateTimeMs > 0 {
 		createTime = msg.CreateTimeMs / 1000

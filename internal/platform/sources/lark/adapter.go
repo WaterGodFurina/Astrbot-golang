@@ -75,9 +75,6 @@ type Adapter struct {
 	// 对齐 Python lark_adapter.py _user_name_cache：成功缓存 1800s，失败缓存 60s，容量 1000。
 	userNameCache   map[string]userNameCacheEntry
 	userNameCacheMu sync.Mutex
-
-	stopCh   chan struct{}
-	stopOnce sync.Once
 }
 
 type userNameCacheEntry struct {
@@ -96,7 +93,6 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		replyIDs:      make(map[string]string),
 		streamCards:   make(map[string]*streamCard),
 		userNameCache: make(map[string]userNameCacheEntry),
-		stopCh:        make(chan struct{}),
 	}
 	a.appID, _ = config["app_id"].(string)
 	a.appSecret, _ = config["app_secret"].(string)
@@ -199,7 +195,6 @@ func (a *Adapter) Start(ctx context.Context) error {
 
 // Stop shuts down the adapter.
 func (a *Adapter) Stop() error {
-	a.stopOnce.Do(func() { close(a.stopCh) })
 	if a.wsClient != nil {
 		a.wsClient.Close()
 	}
@@ -529,10 +524,10 @@ func (a *Adapter) React(sessionID, messageID, emoji string) error {
 	return nil
 }
 
-// isGroupConv reports whether a session id is a group chat (chat ids are
-// 16-digit numeric strings, open ids start with "ou_").
+// isGroupConv 判断会话 id 是否为群聊：群 chat_id 以 "oc_" 开头，私聊 open_id
+// 以 "ou_" 开头，其他前缀按非群处理回退 open_id。
 func (a *Adapter) isGroupConv(sessionID string) bool {
-	return !strings.HasPrefix(sessionID, "ou_") && !strings.HasPrefix(sessionID, "oc_")
+	return strings.HasPrefix(sessionID, "oc_")
 }
 
 // WebhookUUID returns the unified-webhook uuid for webhook mode.
@@ -668,10 +663,16 @@ func (a *Adapter) lookupUserName(senderOpenID string) string {
 		expireAt: time.Now().Add(time.Duration(nameCacheTTL) * time.Second),
 	}
 	if len(a.userNameCache) > userNameCacheMaxSize {
-		for k := range a.userNameCache {
-			delete(a.userNameCache, k)
-			break
+		// 淘汰过期时间最早（即最旧）的条目，而不是 map 随机序里的任意一个，
+		// 保证热用户不会被随机挤掉。
+		oldestKey := ""
+		var oldestExpire time.Time
+		for k, e := range a.userNameCache {
+			if oldestKey == "" || e.expireAt.Before(oldestExpire) {
+				oldestKey, oldestExpire = k, e.expireAt
+			}
 		}
+		delete(a.userNameCache, oldestKey)
 	}
 	a.userNameCacheMu.Unlock()
 	return cachedName

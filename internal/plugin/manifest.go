@@ -57,14 +57,11 @@ type ManifestEntry struct {
 	DataDir   string `json:"data_dir,omitempty"`   // plugins/<name>/data     (插件运行时数据)
 	DocsDir   string `json:"docs_dir,omitempty"`   // plugins/<name>          (README/CHANGELOG 缓存)
 
-	// IdleUnload 表示该插件是否允许闲置自动休眠（WebUI 行为页可配置）。
-	// false（默认）= 常驻，即使闲置也不卸载；true = 允许闲置自动卸载。
+	// IdleUnload 表示该插件是否允许闲置自动休眠（WebUI 行为页可配置）；false（默认）= 常驻。
 	IdleUnload bool `json:"idle_unload,omitempty"`
-	// IdleUnloadMinutes 是该插件独立的闲置休眠阈值（分钟）。
+	// IdleUnloadMinutes 是该插件独立的闲置休眠阈值（分钟）；0 = 未设置，开启休眠翻转时由后端落 DefaultIdleUnloadMinutes。
 	IdleUnloadMinutes int `json:"idle_unload_minutes,omitempty"`
-	// IdleWakeMode 是休眠插件的唤醒方式："hook_and_command" = 过滤器/钩子
-	// 触发与插件指令均可懒加载唤醒；"command_only"（默认，空值同此）=
-	// 仅插件指令/工具唤醒（休眠期间不响应过滤器/钩子等被动事件）。
+	// IdleWakeMode 是休眠插件的唤醒方式："hook_and_command" = 指令/工具/过滤器均可唤醒；"command_only"（默认，空值同此）= 仅指令/工具唤醒（钩子从不唤醒，见 runtime wake 路径）。
 	IdleWakeMode string `json:"idle_wake_mode,omitempty"`
 }
 

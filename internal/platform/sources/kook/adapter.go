@@ -27,6 +27,9 @@ var (
 	atMentionPrefixRegex = regexp.MustCompile(`^@\S+(\s*-\s*\S+)?\s*`)
 )
 
+// maxKookCardDownloadBytes 限制卡片音频等外链媒体的受控下载大小 (64MiB)。
+const maxKookCardDownloadBytes = 64 << 20
+
 // atSelector 对应 KOOK_AT_SELECTOR_REGEX 的一次匹配结果。
 type atSelector struct {
 	tag    string // "met" 或 "rol"
@@ -317,7 +320,10 @@ func (a *Adapter) convertMessage(data *kookMessageEventData) *platform.AstrBotMe
 	}
 	// KOOK 的 msg_timestamp 为毫秒级时间戳, 除以 1000 转为秒
 	// (client.go 按秒 time.Unix(Timestamp, 0) 解释)
-	abm.Timestamp = data.MsgTimestamp / 1000
+	// 仅在时间戳有效时覆盖，缺失(0)时保留默认当前时间，避免变成 1970。
+	if data.MsgTimestamp > 0 {
+		abm.Timestamp = data.MsgTimestamp / 1000
+	}
 
 	switch data.Type {
 	case KookMsgKMarkdown:
@@ -612,10 +618,18 @@ func (a *Adapter) parseCardMessage(data *kookMessageEventData) ([]message.Compon
 			msgComps = append(msgComps, &message.Video{URL: f.src})
 		case ModuleAudio:
 			// 对应 Python kook_adapter.py: MediaResolver(...).to_path(target_format="wav"),
-			// 卡片音频下载后用 ffmpeg 转为 wav, 转换失败时保留原格式
+			// 卡片音频下载后用 ffmpeg 转为 wav, 转换失败时保留原格式。
+			// 卡片 src 完全由发送方控制, 必须走带 SSRF 校验的受控下载
+			// (拒绝 http(s) 之外协议与内网/环回/保留地址), 否则可借转码后的
+			// Record 回显带外探测内网服务。
 			path := utils.TempFilePath("." + audioExtFromURL(f.src))
-			if err := utils.DownloadFile(a.kookCtx(), f.src, path); err != nil {
+			data, err := platform.SafeDownloadBytes(a.kookCtx(), f.src, maxKookCardDownloadBytes)
+			if err != nil {
 				logger.I18nWarn("[KOOK] 下载音频文件失败: %v", err)
+				continue
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				logger.I18nWarn("[KOOK] 写入音频临时文件失败: %v", err)
 				continue
 			}
 			path = convertAudioToWav(path)
@@ -691,12 +705,17 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.I18nError("[KOOK] 发布消息事件失败: %v", err)
 	}
-	a.removeMsgTempFiles(abm)
+	a.scheduleMsgTempCleanup(abm)
 }
 
-// removeMsgTempFiles 清理本条消息转换时下载到临时目录的媒体文件
-// (卡片音频经 utils.TempFilePath 落盘, 发布后无其他消费方)。
-func (a *Adapter) removeMsgTempFiles(abm *platform.AstrBotMessage) {
+// tempMediaCleanupDelay 是临时媒体文件的清理延迟：消息在事件总线中异步处理，
+// 延迟清理保证管线/ASR 在消费期间可读取媒体（对齐 lark 包的 30 分钟）。
+const tempMediaCleanupDelay = 30 * time.Minute
+
+// scheduleMsgTempCleanup 延迟清理本条消息转换时下载到临时目录的媒体文件
+// (卡片音频经 utils.TempFilePath 落盘为 astrbot_* 文件, Publish 后不能立即删除，
+// 管线/ASR 可能稍后才读取)。
+func (a *Adapter) scheduleMsgTempCleanup(abm *platform.AstrBotMessage) {
 	for _, comp := range abm.Message {
 		var p string
 		switch c := comp.(type) {
@@ -707,10 +726,20 @@ func (a *Adapter) removeMsgTempFiles(abm *platform.AstrBotMessage) {
 		case *message.File:
 			p = c.Path
 		}
-		if p != "" && strings.HasPrefix(p, os.TempDir()+string(os.PathSeparator)) &&
-			strings.HasPrefix(filepath.Base(p), "astrbot_") {
-			_ = os.Remove(p)
-		}
+		scheduleKookTempCleanup(p)
+	}
+}
+
+// scheduleKookTempCleanup 在延迟后删除 KOOK 临时文件
+// (仅限 os.TempDir 下的 astrbot_* 文件, 对齐 lark 包的 scheduleTempCleanup)。
+func scheduleKookTempCleanup(p string) {
+	if p != "" && strings.HasPrefix(p, os.TempDir()+string(os.PathSeparator)) &&
+		strings.HasPrefix(filepath.Base(p), "astrbot_") {
+		time.AfterFunc(tempMediaCleanupDelay, func() {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				logger.Debug("清理 KOOK 临时文件失败 %s: %v", p, err)
+			}
+		})
 	}
 }
 

@@ -14,8 +14,8 @@ func TestPythonPluginPackageRelativeImport(t *testing.T) {
 	dataDir := t.TempDir()
 	m := NewSubprocessManager(nil, dataDir)
 	m.MaxRestarts = 2
-	m.MinPort = 50500
-	m.MaxPort = 50600
+	m.MinPort = 30500
+	m.MaxPort = 30600
 	t.Cleanup(m.Shutdown)
 
 	inst, err := m.InstallFromSource(

@@ -28,23 +28,47 @@ func ffmpegAvailable() bool {
 	return err == nil
 }
 
+// newTranscodeOutput 创建唯一的转码输出临时文件（pattern 需含 * 与目标扩展名），
+// 关闭句柄后交由 ffmpeg -y 覆盖写入。输出使用独立路径，避免与输入同名
+// （例如输入已是 foo.wav 时，原实现 outPath 会等于输入路径而被 ffmpeg 自覆盖）。
+func newTranscodeOutput(pattern string) (string, error) {
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	_ = f.Close()
+	return name, nil
+}
+
 // convertAudioToWavPath 将音频文件转为 wav（对齐 media_utils.convert_audio_format
 // 的 wav 分支：ffmpeg -y -i in out.wav，无额外编码参数）。
-// ffmpeg 不可用或转换失败时返回原路径（降级保留原格式）。
+// 已是 wav 时直接返回原路径（对齐 py 的早返回，避免无谓转码）；
+// 输出写入独立临时文件，不覆盖输入；ffmpeg 不可用或转换失败时返回原路径
+// （降级保留原格式）。
 func convertAudioToWavPath(inputPath string) string {
+	if strings.EqualFold(filepath.Ext(inputPath), ".wav") {
+		return inputPath
+	}
 	if !ffmpegAvailable() {
 		logger.Warn("未检测到 ffmpeg，公众号语音跳过 wav 转码，保留原格式: %s", inputPath)
 		return inputPath
 	}
-	outPath := strings.TrimSuffix(inputPath, filepath.Ext(inputPath)) + ".wav"
+	outPath, err := newTranscodeOutput("weixin_offacc_conv_*.wav")
+	if err != nil {
+		logger.Warn("创建 wav 转码临时文件失败，保留原格式: %v", err)
+		return inputPath
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), transcodeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", inputPath, outPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		logger.Warn("ffmpeg wav 转码失败: %v: %s", err, truncateFFmpegOut(out))
+		_ = os.Remove(outPath)
 		return inputPath
 	}
 	if _, err := os.Stat(outPath); err != nil {
+		_ = os.Remove(outPath)
 		return inputPath
 	}
 	return outPath
@@ -52,13 +76,21 @@ func convertAudioToWavPath(inputPath string) string {
 
 // convertAudioToAmrPath 将音频文件转为 amr（公众号语音上传要求 amr/mp3，
 // 对齐本体 convert_audio_to_amr：单声道 8kHz 12.2k + 带通滤波）。
+// 已是 amr 时直接返回原路径；输出写入独立临时文件，不覆盖输入；
 // ffmpeg 不可用或转换失败时返回空串（调用方降级为文本回复）。
 func convertAudioToAmrPath(inputPath string) string {
+	if strings.EqualFold(filepath.Ext(inputPath), ".amr") {
+		return inputPath
+	}
 	if !ffmpegAvailable() {
 		logger.Warn("未检测到 ffmpeg，公众号语音跳过 amr 转码: %s", inputPath)
 		return ""
 	}
-	outPath := strings.TrimSuffix(inputPath, filepath.Ext(inputPath)) + ".amr"
+	outPath, err := newTranscodeOutput("weixin_offacc_conv_*.amr")
+	if err != nil {
+		logger.Warn("创建 amr 转码临时文件失败: %v", err)
+		return ""
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), transcodeTimeout)
 	defer cancel()
 	// 对齐 media_utils.convert_audio_format 的 amr 分支参数。
@@ -68,9 +100,11 @@ func convertAudioToAmrPath(inputPath string) string {
 		outPath)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		logger.Warn("ffmpeg amr 转码失败: %v: %s", err, truncateFFmpegOut(out))
+		_ = os.Remove(outPath)
 		return ""
 	}
 	if _, err := os.Stat(outPath); err != nil {
+		_ = os.Remove(outPath)
 		return ""
 	}
 	return outPath
