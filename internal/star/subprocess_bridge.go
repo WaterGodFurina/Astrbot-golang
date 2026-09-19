@@ -36,6 +36,29 @@ func (f *AlwaysMatchFilter) Match(ctx *FilterContext) bool { return true }
 // FilterType implements HandlerFilter.
 func (f *AlwaysMatchFilter) FilterType() string { return "always" }
 
+// commandArgsFromFilter 按 CommandFilter 命中的完整命令名（含父命令组前缀与
+// 别名）裁剪消息文本，返回其后的参数列表；语义对齐 Python
+// CommandFilter.filter：normalize 空白 → 命中 full_cmd 前缀后裁剪 →
+// strip → 按空白分割。无命中时回退为丢弃首词的旧行为。
+func commandArgsFromFilter(cf *CommandFilter, messageStr string) []string {
+	if cf != nil {
+		msg := strings.Join(strings.Fields(messageStr), " ")
+		for _, name := range cf.GetCompleteCommandNames() {
+			if msg == name {
+				return nil
+			}
+			if strings.HasPrefix(msg, name+" ") {
+				return strings.Fields(strings.TrimSpace(msg[len(name):]))
+			}
+		}
+	}
+	parts := strings.Fields(messageStr)
+	if len(parts) > 1 {
+		return parts[1:]
+	}
+	return nil
+}
+
 // hookEventType maps a hook event name to a star event type.
 func hookEventType(name string) (EventType, bool) {
 	switch name {
@@ -177,6 +200,11 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 
 	for _, cmd := range meta.Commands {
 		cmd := cmd
+		// 命中命令名裁剪 args：组命令 "group sub a b" 的完整命令名是
+		// "group sub"，args 应为 ["a","b"]。对齐 Python CommandFilter.filter：
+		// message_str[len(full_cmd):].strip().split(" ")（先按完整命令名裁剪，
+		// 再分割），而非固定丢弃第一个词（否则组命令会把子命令名当成参数）。
+		cf := NewCommandFilter(cmd.Name, cmd.Aliases, groupFilters[strings.TrimSpace(cmd.ParentGroup)])
 		handler := &StarHandlerMetadata{
 			// 用插件 ID 限定 full name，避免不同插件注册同名指令时互相覆盖
 			// （否则 WebUI 重命名一个指令会连带影响另一个同名指令）。
@@ -197,17 +225,15 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 					return nil
 				}
 				defer cur.RPCGuard()()
-				parts := strings.Fields(e.MessageStr)
-				var args []string
-				if len(parts) > 1 {
-					args = parts[1:]
-				}
+				args := commandArgsFromFilter(cf, e.MessageStr)
 				logger.Debug("plugin RPC HandleCommand: name=%s args=%v", cmd.Name, args)
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 				text, chain, result, err := cur.Client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDKEvent(e))
 				rpcCancel()
 				if err != nil {
-					text = "插件执行失败: " + err.Error()
+					// 对外脱敏：插件错误原文只进日志，避免向用户泄露内部细节（D-low-8）。
+					logger.Error("plugin command %s failed: %v", cmd.Name, err)
+					text = "插件执行失败，请稍后重试"
 					chain = nil
 				} else if result.GetSent() {
 					// 插件在 handler 中主动发送过回复（_has_send_oper 语义）：
@@ -232,13 +258,10 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				e.Result.Chain = []message.Component{&message.Plain{Text: text}}
 				return nil
 			},
-			EventType: EventTypeFilter,
-			EventFilters: func() []HandlerFilter {
-				cf := NewCommandFilter(cmd.Name, cmd.Aliases, groupFilters[strings.TrimSpace(cmd.ParentGroup)])
-				return []HandlerFilter{cf}
-			}(),
-			Desc:    cmd.Description,
-			Enabled: true,
+			EventType:    EventTypeFilter,
+			EventFilters: []HandlerFilter{cf},
+			Desc:         cmd.Description,
+			Enabled:      true,
 		}
 		// 应用 WebUI 持久化重命名：插件重载后指令按 meta 原始名桥接，若不
 		// 恢复重命名，运行时匹配仍用旧名（与另一同名指令真冲突、双触发），

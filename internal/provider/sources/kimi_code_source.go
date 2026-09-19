@@ -214,6 +214,7 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 		var finalToolCalls []*toolAcc
 		content := new(strings.Builder)
 		reasoning := new(strings.Builder)
+		reasoningSignature := ""
 		usage := &provider.TokenUsage{}
 		var responseID string
 
@@ -238,6 +239,7 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 					Type        string `json:"type"`
 					Text        string `json:"text"`
 					Thinking    string `json:"thinking"`
+					Signature   string `json:"signature"`
 					PartialJSON string `json:"partial_json"`
 				} `json:"delta"`
 				Usage *struct {
@@ -293,6 +295,9 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 							ID:               responseID,
 						}
 					}
+				case "signature_delta":
+					// thinking 签名只保留最后一个（对齐 py _query_stream）。
+					reasoningSignature = event.Delta.Signature
 				case "input_json_delta":
 					if acc := toolBuf[event.Index]; acc != nil {
 						acc.inputJSON += event.Delta.PartialJSON
@@ -305,8 +310,16 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 				}
 			case "message_delta":
 				if event.Usage != nil {
-					usage.InputOther = event.Usage.InputTokens
-					usage.InputCached = event.Usage.CacheReadInputTokens
+					// 对齐 anthropic_source / py _update_usage：message_delta 的
+					// usage 通常只携带 output_tokens，input 字段缺失时为 0，不能
+					// 覆盖 message_start 已写入的 input 用量，否则 input tokens
+					// 被清零。
+					if event.Usage.InputTokens > 0 {
+						usage.InputOther = event.Usage.InputTokens
+					}
+					if event.Usage.CacheReadInputTokens > 0 {
+						usage.InputCached = event.Usage.CacheReadInputTokens
+					}
 					usage.Output = event.Usage.OutputTokens
 				}
 			case "message_stop":
@@ -328,14 +341,15 @@ func (s *KimiCodeSource) TextChatStream(ctx context.Context, req *provider.Provi
 		}
 
 		final := &provider.LLMResponse{
-			Role:             "assistant",
-			ID:               responseID,
-			CompletionText:   content.String(),
-			ReasoningContent: reasoning.String(),
-			Usage:            usage,
-			ToolsCallArgs:    []map[string]interface{}{},
-			ToolsCallName:    []string{},
-			ToolsCallIDs:     []string{},
+			Role:               "assistant",
+			ID:                 responseID,
+			CompletionText:     content.String(),
+			ReasoningContent:   reasoning.String(),
+			ReasoningSignature: reasoningSignature,
+			Usage:              usage,
+			ToolsCallArgs:      []map[string]interface{}{},
+			ToolsCallName:      []string{},
+			ToolsCallIDs:       []string{},
 		}
 		for _, tc := range finalToolCalls {
 			argsMap := map[string]interface{}{}
@@ -393,7 +407,9 @@ func (s *KimiCodeSource) buildRequestBody(req *provider.ProviderRequest, stream 
 		messages = append(messages, anthropicMessage(msg))
 	}
 	messages = append(messages, anthropicMessage(req.ToUserMessage()))
-	body["messages"] = messages
+	// 与 Anthropic 共用 sanitize：合并相邻同角色消息、清理孤儿工具块，
+	// 保证并行多工具的 tool_result 合并进同一条 user 消息。
+	body["messages"] = anthropicSanitizeMessages(messages)
 
 	// Convert OpenAI function schema to Anthropic tool definitions.
 	if len(req.Tools) > 0 {

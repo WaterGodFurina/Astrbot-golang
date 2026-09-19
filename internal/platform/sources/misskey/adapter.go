@@ -241,9 +241,13 @@ func (a *Adapter) startWebSocketConnection(ctx context.Context) {
 		}
 
 		streaming := a.api.GetStreamingClient()
+		if streaming == nil {
+			// API 已关闭 (Stop), 退出重连循环, 不再重建 WebSocket 连接
+			return
+		}
 		a.registerEventHandlers(streaming)
 
-		if streaming.Connect() {
+		if streaming.Connect(ctx) {
 			logger.I18nInfo("Misskey WebSocket 已连接 (尝试 #%d)", connectionAttempts)
 			connectionAttempts = 0
 			if _, err := streaming.SubscribeChannel("main", nil); err != nil {
@@ -675,13 +679,19 @@ func (a *Adapter) extractAdditionalFields(sessionID string, chain *message.Messa
 	}
 
 	event := a.sessionEvent(sessionID)
-	if event == nil || event.Metadata == nil {
+	if event == nil {
 		return fields
 	}
-	extra, ok := event.Metadata["extra_data"].(map[string]interface{})
+	// 事件发布后管线可能在其它 goroutine 原地写 event.Metadata，
+	// 直接读该 map 会与之并发触发 map race；改为取锁内快照再读。
+	metadata := event.MetadataSnapshot()
+	if metadata == nil {
+		return fields
+	}
+	extra, ok := metadata["extra_data"].(map[string]interface{})
 	if !ok {
 		// extra_data 键不存在时兼容顶层等价键写法
-		extra = event.Metadata
+		extra = metadata
 	}
 	if poll, ok := extra["poll"].(map[string]interface{}); ok {
 		fields.poll = poll
@@ -871,17 +881,12 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 		if untilID != "" {
 			payload["untilId"] = untilID
 		}
-		pageResp, err := a.api.apiRequest(ctx, "chat/rooms/members", payload, false)
+		// chat/rooms/members 返回 JSON 数组（对应 Python _make_request 返回 list），
+		// 必须按数组解码；此前按对象解会导致请求恒失败、members 恒空。
+		page, err := a.api.apiRequestList(ctx, "chat/rooms/members", payload, false)
 		if err != nil {
+			logger.Debug("[Misskey] chat/rooms/members failed for %s: %v", groupID, err)
 			break
-		}
-		page, ok := pageResp["data"].([]interface{})
-		if !ok {
-			// Might be a direct array response
-			page, _ = pageResp["data"].([]interface{})
-			if len(page) == 0 {
-				break
-			}
 		}
 		for _, item := range page {
 			m, ok := item.(map[string]interface{})

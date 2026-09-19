@@ -15,6 +15,8 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -22,8 +24,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -83,8 +87,15 @@ func pushHostSkillsLocked(ctx context.Context, b Booter, hostSkills map[string]s
 	// 1. Load the previous managed-skills list (empty when absent).
 	prev := loadManagedList(ctx, b)
 	// 2. Remove previously managed skill dirs (aligned with the apply phase).
+	// 清理失败必须上报（此前被 _ = 吞掉，导致本地沙盒托管技能永远删不掉）。
+	var firstErr error
 	for _, name := range prev {
-		_ = removeSandboxTree(ctx, b, skillsRootName+"/"+name)
+		if err := removeSandboxTree(ctx, b, skillsRootName+"/"+name); err != nil {
+			logger.Warn("清理沙盒旧托管技能 %s 失败: %v", name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
 	}
 	// 3. Copy host skill dirs into /workspace/skills.
 	managed := make([]string, 0, len(hostSkills))
@@ -97,6 +108,9 @@ func pushHostSkillsLocked(ctx context.Context, b Booter, hostSkills map[string]s
 		dir := hostSkills[name]
 		if err := copyHostSkillDir(ctx, b, dir, skillsRootName+"/"+name); err != nil {
 			logger.Warn("推送技能 %s 到沙盒失败: %v", name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		managed = append(managed, name)
@@ -105,9 +119,12 @@ func pushHostSkillsLocked(ctx context.Context, b Booter, hostSkills map[string]s
 	payload, _ := json.Marshal(map[string]interface{}{"managed_skills": managed})
 	if err := b.WriteFile(ctx, skillsRootName+"/"+managedSkillsFile, string(payload)); err != nil {
 		logger.Warn("写沙盒托管技能清单失败: %v", err)
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
 	logger.Debug("已推送 %d 个宿主技能到沙盒 %s", len(managed), sessionIDOf(b))
-	return nil
+	return firstErr
 }
 
 // loadManagedList reads the managed-skills list from the sandbox.
@@ -132,9 +149,19 @@ func loadManagedList(ctx context.Context, b Booter) []string {
 	return out
 }
 
-// removeSandboxTree deletes a directory (or file) inside the sandbox workspace
-// via a shell rm -rf guarded by a fixed root prefix.
+// sandboxTreeRemover 是 booter 的内部可信删除能力：绕过面向 LLM 工具调用的
+// 破坏性命令黑名单（黑名单只应约束 sh -c 入口，不应挡住沙盒自身清理托管技能）。
+type sandboxTreeRemover interface {
+	RemoveTree(ctx context.Context, rel string) error
+}
+
+// removeSandboxTree deletes a directory (or file) inside the sandbox workspace.
+// Prefers the booter's internal trusted remover; only falls back to a shell
+// `rm -rf` for backends without one. Errors are returned, never swallowed.
 func removeSandboxTree(ctx context.Context, b Booter, rel string) error {
+	if r, ok := b.(sandboxTreeRemover); ok {
+		return r.RemoveTree(ctx, rel)
+	}
 	// rel 由受控常量与技能名拼出（技能名经 skillNameRe 校验），无路径注入。
 	_, _, _, err := b.Exec(ctx, "sh", []string{"-c", "rm -rf '" + rel + "'"}, SandboxWorkdir)
 	return err
@@ -335,9 +362,14 @@ func (b *LocalBooter) mapPath(path string) (string, error) {
 	if raw == "" {
 		return "", fmt.Errorf("沙盒路径为空")
 	}
-	p := filepath.Clean(filepath.FromSlash(raw))
-	p = strings.TrimPrefix(p, SandboxWorkdir)
-	p = strings.TrimPrefix(p, string(filepath.Separator))
+	// 统一用 slash 形式做 /workspace 前缀剥离（Windows 上 filepath.FromSlash 会把
+	// SandboxWorkdir "/workspace" 变成 "\workspace"，导致 TrimPrefix 失配、绝对与
+	// 相对路径映射到不同落点），剥离后再转 OS 分隔符参与拼接与校验。
+	slash := filepath.ToSlash(raw)
+	slash = pathpkg.Clean(slash)
+	slash = strings.TrimPrefix(slash, SandboxWorkdir)
+	slash = strings.TrimPrefix(slash, "/")
+	p := filepath.Clean(filepath.FromSlash(slash))
 	b.mu.Lock()
 	root := b.root
 	b.mu.Unlock()
@@ -531,6 +563,22 @@ func (b *LocalBooter) WriteFile(ctx context.Context, path, content string) error
 	return os.WriteFile(host, []byte(content), 0o600)
 }
 
+// RemoveTree 在本地沙盒根目录内直接删除目录/文件（内部可信操作，绕过面向
+// LLM 的 sh -c 黑名单；路径经 mapPath 校验仍在沙盒根内）。
+func (b *LocalBooter) RemoveTree(ctx context.Context, rel string) error {
+	b.mu.Lock()
+	running := b.running
+	b.mu.Unlock()
+	if !running {
+		return fmt.Errorf("local sandbox not running")
+	}
+	host, err := b.mapPath(pathpkg.Join(SandboxWorkdir, rel))
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(host)
+}
+
 // SandboxWorkdir is the sandbox workspace directory used as the cwd for
 // shell/python exec and the base for relative file paths.
 const SandboxWorkdir = "/workspace"
@@ -538,15 +586,20 @@ const SandboxWorkdir = "/workspace"
 // DockerBooter executes commands inside a Docker container.
 //
 // Mirrors AstrBot's Docker sandbox logic (computer_tools/booters/boxlite.py
-// and bay_manager.py): a long-lived sandbox container is created once and
-// reused; shell/python/file operations run inside it via `docker exec`, and
-// files are transferred via the Docker CLI.
+// and bay_manager.py): a long-lived sandbox container is created once per
+// session and reused within that session; shell/python/file operations run
+// inside it via `docker exec`, and files are transferred via the Docker CLI.
+// Containers are labeled with the session token so sessions never share a
+// /workspace and StopSession only removes its own container.
 type DockerBooter struct {
 	mu          sync.Mutex
 	running     bool
 	containerID string
 	name        string
 	image       string
+	// sessionID 由 Manager.EnsureSession 注入：容器名与 label 均按会话派生，
+	// 避免不同会话共享同一容器（/workspace 互见）及 StopSession 误杀他人容器。
+	sessionID string
 
 	// 资源/网络隔离参数（可经 ASTRBOT_SANDBOX_* 环境变量覆盖，默认值见
 	// NewDockerBooter）：memory/cpus/pidsLimit 限制容器资源，network 默认
@@ -586,15 +639,30 @@ func sandboxEnv(key, fallback string) string {
 
 func (b *DockerBooter) Type() BooterType { return BooterDocker }
 
+// SetSessionID scopes this booter's container to one session. Called by
+// Manager.EnsureSession right after the factory creates the booter.
+func (b *DockerBooter) SetSessionID(sessionID string) {
+	b.mu.Lock()
+	b.sessionID = sessionID
+	b.mu.Unlock()
+}
+
 func (b *DockerBooter) Start(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.running {
 		return nil
 	}
-	// Reuse an existing managed container if it is still running; a stopped
-	// one (e.g. after a host reboot) is restarted, or discarded and rebuilt.
-	if out, err := dockerOutput(ctx, "ps", "-aq", "--filter", "label=astrbot.sandbox=managed"); err == nil {
+	token := "default"
+	if b.sessionID != "" {
+		sum := sha256.Sum256([]byte(b.sessionID))
+		token = hex.EncodeToString(sum[:8])
+	}
+	b.name = fmt.Sprintf("astrbot-sandbox-%s-%d", token, time.Now().UnixNano())
+	// 只复用属于本会话的容器（session 标签隔离）；否则不同会话会共享同一
+	// /workspace 并互相 StopSession 误杀。
+	sessionFilter := "label=astrbot.sandbox.session=" + token
+	if out, err := dockerOutput(ctx, "ps", "-aq", "--filter", "label=astrbot.sandbox=managed", "--filter", sessionFilter); err == nil {
 		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
@@ -626,6 +694,7 @@ func (b *DockerBooter) Start(ctx context.Context) error {
 	// skill cannot exhaust the host or reach internal services.
 	args := []string{"run", "-d", "--name", b.name,
 		"--label", "astrbot.sandbox=managed",
+		"--label", "astrbot.sandbox.session=" + token,
 		"--workdir", "/workspace"}
 	if b.memory != "" {
 		args = append(args, "--memory", b.memory)
@@ -740,6 +809,10 @@ func (b *DockerBooter) ListSkills(ctx context.Context) ([]skills.SandboxCacheEnt
 	return entries, nil
 }
 
+// maxSandboxFileBytes 限制单次沙箱文件读取字节数（1MB，与命令输出上限
+// maxSandboxOutput 一致），防止超大文件把宿主内存灌满。
+const maxSandboxFileBytes = 1 << 20
+
 func (b *DockerBooter) ReadFile(ctx context.Context, path string) (string, error) {
 	b.mu.Lock()
 	cid := b.containerID
@@ -747,15 +820,21 @@ func (b *DockerBooter) ReadFile(ctx context.Context, path string) (string, error
 	if cid == "" {
 		return "", fmt.Errorf("docker sandbox not running")
 	}
-	// Use the exit code to detect a missing file instead of grepping stdout
-	// for a sentinel string (which a file's own content could spoof).
+	// 容器内先 realpath 归一，再校验仍位于 /workspace 之下（防 ../ 与符号
+	// 链接逃逸），随后用 head -c 限制读取字节数，避免 cat 超大文件灌满宿主
+	// 内存。path 经位置参数传入，避免手工拼接引号。
+	script := `p="$1"; ` +
+		`real=$(realpath -m -- "$p" 2>/dev/null) || exit 3; ` +
+		`case "$real" in ` + SandboxWorkdir + `|` + SandboxWorkdir + `/*) ;; *) echo "path escapes workspace: $real" >&2; exit 4;; esac; ` +
+		`[ -f "$real" ] || exit 1; ` +
+		`head -c ` + strconv.Itoa(maxSandboxFileBytes) + ` -- "$real"`
 	var stdout, stderr strings.Builder
-	code, err := dockerRun(ctx, []string{"exec", "-w", SandboxWorkdir, cid, "sh", "-c", "cat '" + strings.ReplaceAll(path, "'", "'\\''") + "' 2>/dev/null"}, nil, &stdout, &stderr)
+	code, err := dockerRun(ctx, []string{"exec", "-w", SandboxWorkdir, cid, "sh", "-c", script, "sh", path}, nil, &stdout, &stderr)
 	if err != nil {
 		return "", err
 	}
 	if code != 0 {
-		return "", fmt.Errorf("file not found: %s", path)
+		return "", fmt.Errorf("file not found or outside workspace: %s", path)
 	}
 	return stdout.String(), nil
 }
@@ -767,18 +846,39 @@ func (b *DockerBooter) WriteFile(ctx context.Context, path, content string) erro
 	if cid == "" {
 		return fmt.Errorf("docker sandbox not running")
 	}
-	// mkdir -p parent, then cat > file via stdin.
-	parent := filepath.Dir(path)
-	if _, err := dockerOutput(ctx, "exec", "-w", SandboxWorkdir, cid, "sh", "-c", "mkdir -p '"+strings.ReplaceAll(parent, "'", "'\\''")+"'"); err != nil {
-		return err
-	}
+	// 容器内 realpath 归一后校验仍在 /workspace 下，再 mkdir -p 父目录并
+	// cat 写入（路径经位置参数传入，避免拼接引号）。
+	script := `p="$1"; ` +
+		`real=$(realpath -m -- "$p" 2>/dev/null) || exit 3; ` +
+		`case "$real" in ` + SandboxWorkdir + `|` + SandboxWorkdir + `/*) ;; *) echo "path escapes workspace: $real" >&2; exit 4;; esac; ` +
+		`mkdir -p -- "$(dirname -- "$real")" || exit 5; ` +
+		`cat > -- "$real"`
 	var stdout, stderr strings.Builder
-	code, err := dockerRun(ctx, []string{"exec", "-i", "-w", SandboxWorkdir, cid, "sh", "-c", "cat > '" + strings.ReplaceAll(path, "'", "'\\''") + "'"}, strings.NewReader(content), &stdout, &stderr)
+	code, err := dockerRun(ctx, []string{"exec", "-i", "-w", SandboxWorkdir, cid, "sh", "-c", script, "sh", path}, strings.NewReader(content), &stdout, &stderr)
 	if err != nil {
 		return err
 	}
 	if code != 0 {
 		return fmt.Errorf("write file failed (exit %d): %s", code, stderr.String())
+	}
+	return nil
+}
+
+// RemoveTree 在容器内直接删除目录/文件（不经过 sh -c，内部可信操作）。
+func (b *DockerBooter) RemoveTree(ctx context.Context, rel string) error {
+	b.mu.Lock()
+	cid := b.containerID
+	b.mu.Unlock()
+	if cid == "" {
+		return fmt.Errorf("docker sandbox not running")
+	}
+	var stdout, stderr strings.Builder
+	code, err := dockerRun(ctx, []string{"exec", "-w", SandboxWorkdir, cid, "rm", "-rf", rel}, nil, &stdout, &stderr)
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("remove %s failed (exit %d): %s", rel, code, stderr.String())
 	}
 	return nil
 }
@@ -1008,6 +1108,11 @@ func (m *Manager) EnsureSession(ctx context.Context, sessionID string) (*session
 		return nil, fmt.Errorf("no booter configured")
 	}
 	b := factory()
+	// 会话隔离：需要按会话派生后端资源的 booter（Docker 容器名/标签）在此
+	// 注入 sessionID，确保每会话独立容器，StopSession 只停自己。
+	if ss, ok := b.(interface{ SetSessionID(string) }); ok {
+		ss.SetSessionID(sessionID)
+	}
 	if err := b.Start(ctx); err != nil {
 		return nil, err
 	}

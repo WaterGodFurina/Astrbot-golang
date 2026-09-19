@@ -16,7 +16,9 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -44,7 +46,10 @@ type MisskeyAPI struct {
 	chunkSize              int
 	maxDownloadBytes       int64
 
+	// streaming 与 closed 由 mu 保护: Close() 与重连 goroutine (GetStreamingClient) 并发访问
+	mu        sync.Mutex
 	streaming *StreamingClient
+	closed    bool // 置位后 GetStreamingClient 不再创建/返回客户端, 重连 goroutine 据此退出
 }
 
 // NewMisskeyAPI 创建 Misskey API 客户端。
@@ -74,17 +79,32 @@ func NewMisskeyAPI(instanceURL, accessToken string, allowInsecureDownloads bool,
 }
 
 // Close 关闭 streaming 连接与 HTTP 客户端（对应 close）。
+// 幂等：重复调用安全；closed 置位后 GetStreamingClient 不再返回客户端。
 func (a *MisskeyAPI) Close() {
-	if a.streaming != nil {
-		a.streaming.Disconnect()
-		a.streaming = nil
+	a.mu.Lock()
+	if a.closed {
+		a.mu.Unlock()
+		return
+	}
+	a.closed = true
+	streaming := a.streaming
+	a.streaming = nil
+	a.mu.Unlock()
+	if streaming != nil {
+		streaming.Disconnect()
 	}
 	a.httpClient.CloseIdleConnections()
 	apiLogger.Debug("Misskey API 客户端已关闭")
 }
 
 // GetStreamingClient 获取（或创建）streaming 客户端（对应 get_streaming_client）。
+// API 已关闭后返回 nil，重连 goroutine 据此退出，不再重建 WebSocket。
 func (a *MisskeyAPI) GetStreamingClient() *StreamingClient {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		return nil
+	}
 	if a.streaming == nil {
 		a.streaming = NewStreamingClient(a.instanceURL, a.accessToken)
 	}
@@ -108,7 +128,9 @@ func (a *MisskeyAPI) UploadFile(localPath, name, folderID string) (string, error
 	}
 	filename := name
 	if filename == "" {
-		filename = localPath[strings.LastIndex(localPath, "/")+1:]
+		// filepath.Base 同时处理 / 与 Windows \ 分隔符，避免把完整本地路径
+		//（含用户名）当作上传文件名泄漏。
+		filename = filepath.Base(localPath)
 	}
 	req := files.CreateRequest{
 		FolderID: folderID,
@@ -372,10 +394,39 @@ func (a *MisskeyAPI) SendRoomMessage(ctx context.Context, payload map[string]int
 	return result, nil
 }
 
-// apiRequest 通用 API 请求（对应 _make_request + _process_response + _handle_response_status）。
-// payload 会自动带上 i（token）字段。retry=true 时对网络错误/429/5xx 最多重试 3 次；
-// 发消息类端点（create 类）非幂等，重复请求会导致重复发送，必须传 false 禁止重试。
+// apiRequest 通用 API 请求（对应 _make_request + _process_response + _handle_response_status），
+// 用于返回 JSON 对象的端点。payload 会自动带上 i（token）字段。retry=true 时对
+// 网络错误/429/5xx 最多重试 3 次；发消息类端点（create 类）非幂等，重复请求会导致
+// 重复发送，必须传 false 禁止重试。
 func (a *MisskeyAPI) apiRequest(ctx context.Context, endpoint string, data map[string]interface{}, retry bool) (map[string]interface{}, error) {
+	raw, err := a.apiRequestRaw(ctx, endpoint, data, retry)
+	if err != nil {
+		return nil, err
+	}
+	obj, ok := raw.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("Misskey API %s 响应不是 JSON 对象", endpoint)
+	}
+	return obj, nil
+}
+
+// apiRequestList 与 apiRequest 相同，但用于返回 JSON 数组的端点
+// （如 chat/rooms/members，对应 Python _make_request 返回 list 的场景）。
+func (a *MisskeyAPI) apiRequestList(ctx context.Context, endpoint string, data map[string]interface{}, retry bool) ([]interface{}, error) {
+	raw, err := a.apiRequestRaw(ctx, endpoint, data, retry)
+	if err != nil {
+		return nil, err
+	}
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("Misskey API %s 响应不是 JSON 数组", endpoint)
+	}
+	return list, nil
+}
+
+// apiRequestRaw 发起请求并返回解码后的任意 JSON 值（对象或数组），供
+// apiRequest / apiRequestList 按端点预期形状再做类型断言。
+func (a *MisskeyAPI) apiRequestRaw(ctx context.Context, endpoint string, data map[string]interface{}, retry bool) (interface{}, error) {
 	urlStr := a.instanceURL + "/api/" + endpoint
 	payload := map[string]interface{}{"i": a.accessToken}
 	for k, v := range data {
@@ -421,10 +472,11 @@ func (a *MisskeyAPI) apiRequest(ctx context.Context, endpoint string, data map[s
 	return nil, lastErr
 }
 
-// processResponse 处理 API 响应（对应 _process_response），返回解码后的 JSON 对象。
-func (a *MisskeyAPI) processResponse(resp *http.Response, endpoint string) (map[string]interface{}, error) {
+// processResponse 处理 API 响应（对应 _process_response），返回解码后的 JSON 值
+// （对象或数组，由调用方按端点约定断言）。
+func (a *MisskeyAPI) processResponse(resp *http.Response, endpoint string) (interface{}, error) {
 	if resp.StatusCode == http.StatusOK {
-		var result map[string]interface{}
+		var result interface{}
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 			apiLogger.Error("Misskey API 响应格式错误: %v", err)
 			return nil, fmt.Errorf("invalid JSON response")
@@ -432,7 +484,8 @@ func (a *MisskeyAPI) processResponse(resp *http.Response, endpoint string) (map[
 		apiLogger.Debug("Misskey API 请求成功: %s", endpoint)
 		return result, nil
 	}
-	body, _ := io.ReadAll(resp.Body)
+	// 错误响应体仅用于日志，限制读取大小，避免异常大/无限响应耗尽内存。
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	apiLogger.Error("Misskey API 请求失败: %s - HTTP %d, 响应: %s", endpoint, resp.StatusCode, body)
 	return nil, handleResponseStatus(resp.StatusCode, endpoint)
 }

@@ -173,10 +173,13 @@ type ProviderRequest struct {
 	ExtraUserContentParts []map[string]interface{} `json:"extra_user_content_parts,omitempty"`
 	FuncTool              interface{}              `json:"func_tool,omitempty"` // *ToolSet
 	Tools                 []map[string]interface{} `json:"tools,omitempty"`
-	Contexts              []map[string]interface{} `json:"contexts,omitempty"`
-	SystemPrompt          string                   `json:"system_prompt"`
-	Conversation          interface{}              `json:"conversation,omitempty"` // *Conversation
-	Model                 string                   `json:"model,omitempty"`
+	// ToolChoice 对应 py text_chat 的 tool_choice 参数（可为 "auto"/"any"/
+	// "none"/"required"/"tool" 或 dict）；nil 时各 provider 回退到配置/默认值。
+	ToolChoice   interface{}              `json:"tool_choice,omitempty"`
+	Contexts     []map[string]interface{} `json:"contexts,omitempty"`
+	SystemPrompt string                   `json:"system_prompt"`
+	Conversation interface{}              `json:"conversation,omitempty"` // *Conversation
+	Model        string                   `json:"model,omitempty"`
 }
 
 // NewProviderRequest creates a default request.

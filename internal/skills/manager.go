@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"gopkg.in/yaml.v3"
 )
 
 var logger = log.GetDefault().WithComponent("Skills")
@@ -141,36 +142,61 @@ func NormalizeCachedSandboxSkillPath(name, path string) string {
 	return path
 }
 
-// ParseFrontmatterDescription extracts the description from YAML frontmatter.
-func ParseFrontmatterDescription(text string) string {
-	if !strings.HasPrefix(text, "---") {
-		return ""
-	}
+// parseFrontmatterYAML 提取 `---` 包裹的 YAML frontmatter 并解析成 map。
+// 分隔线采用严格匹配（整行恰为 "---"，仅容忍 CRLF 的尾随 \r），避免正文里
+// 缩进的 `  ---` 或 `--- something` 被误判成边界。
+func parseFrontmatterYAML(text string) map[string]any {
 	lines := strings.Split(text, "\n")
-	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
-		return ""
+	if len(lines) == 0 || strings.TrimRight(lines[0], "\r") != "---" {
+		return nil
 	}
 	endIdx := -1
 	for i := 1; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) == "---" {
+		if strings.TrimRight(lines[i], "\r") == "---" {
 			endIdx = i
 			break
 		}
 	}
 	if endIdx == -1 {
-		return ""
+		return nil
 	}
 	frontmatter := strings.Join(lines[1:endIdx], "\n")
-	// Simple YAML parsing for "description: value"
-	for _, line := range strings.Split(frontmatter, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "description:") {
-			val := strings.TrimSpace(strings.TrimPrefix(line, "description:"))
-			val = strings.Trim(val, `"'`)
-			return val
-		}
+	// 用 yaml.v3 解析，正确处理 `description: >` / `|` 续行、引号与转义，
+	// 替代原先按行字符串匹配的朴素扫描（对齐本体 skill_manager.py:141
+	// yaml.safe_load 语义）。
+	var payload map[string]any
+	if err := yaml.Unmarshal([]byte(frontmatter), &payload); err != nil {
+		return nil
 	}
-	return ""
+	return payload
+}
+
+// frontmatterStringField 从解析后的 frontmatter 取字符串字段；字段缺失或
+// 非字符串时返回 ""（对齐本体 isinstance(description, str) 判定）。
+func frontmatterStringField(text, field string) string {
+	payload := parseFrontmatterYAML(text)
+	if payload == nil {
+		return ""
+	}
+	v, ok := payload[field]
+	if !ok {
+		return ""
+	}
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+// ParseFrontmatterDescription extracts the description from YAML frontmatter.
+func ParseFrontmatterDescription(text string) string {
+	return frontmatterStringField(text, "description")
+}
+
+// ParseFrontmatterName extracts the name from YAML frontmatter.
+func ParseFrontmatterName(text string) string {
+	return frontmatterStringField(text, "name")
 }
 
 // NormalizeSkillMarkdownPath finds SKILL.md (or legacy skill.md) in a dir.
@@ -540,13 +566,40 @@ func sanitizeSkillDisplayName(name string) string {
 	return "<invalid_skill_name>"
 }
 
+// shellQuoteExample 对齐 Python shlex.quote：仅当路径全部由 shell 安全字符
+// （字母数字与 _@%+=:,./-）组成时原样返回，否则用单引号包裹，并把内嵌单引号
+// 转义为 '\”（关闭-转义-重开引号的 POSIX 等价写法），防止含空格/元字符的
+// 沙箱路径在示例命令里被 shell 拆分或注入。
+func shellQuoteExample(s string) string {
+	if s == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_' || r == '@' || r == '%' || r == '+' || r == '=' ||
+			r == ':' || r == ',' || r == '.' || r == '/' || r == '-':
+		default:
+			safe = false
+		}
+		if !safe {
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // buildSkillReadCommandExample builds the example shell command used in the
 // "Mandatory grounding" rule.
 func buildSkillReadCommandExample(path string) string {
 	if path == placeholderSkillMd {
 		return "cat " + path
 	}
-	command, pathArg := "cat", path
+	command, pathArg := "cat", shellQuoteExample(path)
 	if isWindowsPromptPath(path) {
 		command = "type"
 		pathArg = `"` + filepath.FromSlash(path) + `"`

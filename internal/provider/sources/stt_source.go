@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 )
 
 // OpenAIWhisperSource transcribes audio into text via the OpenAI-compatible
@@ -124,7 +125,8 @@ func (s *OpenAIWhisperSource) fetchAudio(ctx context.Context, audioURL string) (
 		} else if info.IsDir() {
 			return "", noop, fmt.Errorf("audio path is a directory: %s", audioURL)
 		}
-		return audioURL, noop, nil
+		// 对齐 py MediaResolver(target_format="wav")：上传前确保为 wav。
+		return ensureWavTemp(audioURL, noop)
 	}
 
 	cfg := RetryConfigFromSettings(s.Settings())
@@ -143,7 +145,7 @@ func (s *OpenAIWhisperSource) fetchAudio(ctx context.Context, audioURL string) (
 		return "", noop, fmt.Errorf("download audio: HTTP %d", resp.StatusCode)
 	}
 
-	dir := filepath.Join("data", "temp")
+	dir := tempDataDir()
 	_ = os.MkdirAll(dir, 0755)
 	ext := filepath.Ext(strings.Split(audioURL, "?")[0])
 	if ext == "" {
@@ -164,7 +166,21 @@ func (s *OpenAIWhisperSource) fetchAudio(ctx context.Context, audioURL string) (
 		_ = os.Remove(path)
 		return "", noop, fmt.Errorf("audio exceeds %d bytes", maxAudioBytes)
 	}
-	return path, func() { _ = os.Remove(path) }, nil
+	// 对齐 py MediaResolver(target_format="wav")：上传前确保为 wav，
+	// 转码产生的临时文件随下载文件一起清理。
+	return ensureWavTemp(path, func() { _ = os.Remove(path) })
+}
+
+// ensureWavTemp 调用 utils.EnsureWAV 并在产生新文件时扩展清理函数。
+func ensureWavTemp(path string, cleanup func()) (string, func(), error) {
+	wav, err := utils.EnsureWAV(path)
+	if err != nil || wav == path {
+		return path, cleanup, nil
+	}
+	return wav, func() {
+		cleanup()
+		_ = os.Remove(wav)
+	}, nil
 }
 
 // Test verifies the provider by listing models.

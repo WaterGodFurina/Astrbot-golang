@@ -108,12 +108,15 @@ func (b *BaseProvider) Config() map[string]interface{} {
 
 // ReasoningEffort returns the effective reasoning effort for the provider.
 // 推理配置与供应商配置分离（对齐 4.27.4 #9699）：统一走通用配置读取，供应商
-// 特有配置回退，找不到用默认值。
+// 特有配置回退。
 //
 // 回退顺序：
 //  1. 通用配置 custom_extra_body.reasoning_effort（provider schema 通用模板字段）；
 //  2. 供应商自身配置 reasoning_effort；
-//  3. 默认值 "high"。
+//  3. 默认空字符串——只有用户显式配置时才注入 reasoning 字段，避免对不支持
+//     reasoning 的模型无条件下发 {"effort":"high"} 触发 400（对齐 py
+//     openai_responses_source：extra_body.pop("reasoning_effort", None) 为
+//     None 时不构造 reasoning）。
 func (b *BaseProvider) ReasoningEffort() string {
 	if cfg := b.providerConfig; cfg != nil {
 		if extra, ok := cfg["custom_extra_body"].(map[string]interface{}); ok {
@@ -125,7 +128,7 @@ func (b *BaseProvider) ReasoningEffort() string {
 			return v
 		}
 	}
-	return "high"
+	return ""
 }
 
 // Settings returns the provider settings.
@@ -173,11 +176,12 @@ func NewBaseProvider(config, settings map[string]interface{}) *BaseProvider {
 type ProviderManager struct {
 	mu         sync.RWMutex
 	providers  map[string]AbstractProvider
-	chatProvID string // default chat provider ID
-	sttProvID  string // default STT provider ID
-	ttsProvID  string // default TTS provider ID
-	embProvID  string // default embedding provider ID
-	rerankID   string // default rerank provider ID
+	order      []string // 注册顺序，用于无默认 ID 时稳定地回退到首个可用 provider（对齐 py 有序列表）
+	chatProvID string   // default chat provider ID
+	sttProvID  string   // default STT provider ID
+	ttsProvID  string   // default TTS provider ID
+	embProvID  string   // default embedding provider ID
+	rerankID   string   // default rerank provider ID
 }
 
 // NewProviderManager creates a manager.
@@ -192,6 +196,9 @@ func NewProviderManager() *ProviderManager {
 func (pm *ProviderManager) Register(id string, p AbstractProvider) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	if _, exists := pm.providers[id]; !exists {
+		pm.order = append(pm.order, id)
+	}
 	pm.providers[id] = p
 	logger.I18nInfo("已注册 provider: %s (类型=%s, 模型=%s)", id, p.Meta().Type, p.GetModel())
 }
@@ -200,7 +207,16 @@ func (pm *ProviderManager) Register(id string, p AbstractProvider) {
 func (pm *ProviderManager) Unregister(id string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+	if _, exists := pm.providers[id]; !exists {
+		return
+	}
 	delete(pm.providers, id)
+	for i, existing := range pm.order {
+		if existing == id {
+			pm.order = append(pm.order[:i], pm.order[i+1:]...)
+			break
+		}
+	}
 }
 
 // Get returns a provider by ID.
@@ -223,9 +239,9 @@ func (pm *ProviderManager) GetChatProvider() ChatProvider {
 			return p
 		}
 	}
-	// Fallback: find first chat provider
-	for _, p := range pm.providers {
-		if cp, ok := p.(ChatProvider); ok {
+	// Fallback: find first chat provider in registration order
+	for _, id := range pm.order {
+		if cp, ok := pm.providers[id].(ChatProvider); ok {
 			return cp
 		}
 	}
@@ -243,8 +259,8 @@ func (pm *ProviderManager) GetSTTProvider() STTProvider {
 			return p
 		}
 	}
-	for _, p := range pm.providers {
-		if sp, ok := p.(STTProvider); ok {
+	for _, id := range pm.order {
+		if sp, ok := pm.providers[id].(STTProvider); ok {
 			return sp
 		}
 	}
@@ -262,8 +278,8 @@ func (pm *ProviderManager) GetTTSProvider() TTSProvider {
 			return p
 		}
 	}
-	for _, p := range pm.providers {
-		if tp, ok := p.(TTSProvider); ok {
+	for _, id := range pm.order {
+		if tp, ok := pm.providers[id].(TTSProvider); ok {
 			return tp
 		}
 	}
@@ -281,8 +297,8 @@ func (pm *ProviderManager) GetEmbeddingProvider() EmbeddingProvider {
 			return p
 		}
 	}
-	for _, p := range pm.providers {
-		if ep, ok := p.(EmbeddingProvider); ok {
+	for _, id := range pm.order {
+		if ep, ok := pm.providers[id].(EmbeddingProvider); ok {
 			return ep
 		}
 	}
@@ -300,8 +316,8 @@ func (pm *ProviderManager) GetRerankProvider() RerankProvider {
 			return p
 		}
 	}
-	for _, p := range pm.providers {
-		if rp, ok := p.(RerankProvider); ok {
+	for _, id := range pm.order {
+		if rp, ok := pm.providers[id].(RerankProvider); ok {
 			return rp
 		}
 	}
@@ -353,14 +369,12 @@ func (pm *ProviderManager) SetDefaultRerankProvider(id string) {
 	pm.rerankID = id
 }
 
-// All returns all provider IDs.
+// All returns all provider IDs in registration order.
 func (pm *ProviderManager) All() []string {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	ids := make([]string, 0, len(pm.providers))
-	for id := range pm.providers {
-		ids = append(ids, id)
-	}
+	ids := make([]string, len(pm.order))
+	copy(ids, pm.order)
 	return ids
 }
 

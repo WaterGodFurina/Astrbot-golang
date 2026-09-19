@@ -26,7 +26,7 @@ const (
 
 // typingSession 单个用户的 typing 会话。
 type typingSession struct {
-	ctx       *ilink.Context // 消息上下文（承载 context_token 与 Ctx）
+	ctx       *ilink.Context // 消息上下文（承载 context_token 与 Ctx），由 mu 保护
 	owners    map[string]struct{}
 	startedAt time.Time
 	mu        sync.Mutex
@@ -94,9 +94,6 @@ func (tm *typingManagerAdapter) start(userID string, c *ilink.Context, ownerID s
 		}
 		tm.sessions[userID] = sess
 		isNew = true
-	} else {
-		// 更新为最新消息的 context（ticket 随最新 context_token 刷新）。
-		sess.ctx = c
 	}
 	tm.mu.Unlock()
 
@@ -105,6 +102,11 @@ func (tm *typingManagerAdapter) start(userID string, c *ilink.Context, ownerID s
 		sess.mu.Unlock()
 		return
 	}
+	// sess.ctx 统一由 sess.mu 保护（新建会话也在此赋值最小化竞态窗口），
+	// 与 stop / keepalive 的读取共用同一把锁，消除此前 tm.mu 写、sess.mu 读
+	// 的双锁不一致 race。新建会话必须赋 ctx，否则 keepalive 首轮即退出、
+	// StopTyping 也永远不会发送。
+	sess.ctx = c
 	_, dup := sess.owners[ownerID]
 	sess.owners[ownerID] = struct{}{}
 	firstOwner := len(sess.owners) == 1 && !dup

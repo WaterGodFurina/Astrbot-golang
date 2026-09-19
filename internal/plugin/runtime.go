@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -28,6 +29,11 @@ import (
 
 // logger 供插件运行时与编译相关路径记录日志。
 var logger = log.GetDefault().WithComponent("Plugin")
+
+// ErrPluginNotLoaded 是"目标插件当前未运行"的哨兵错误：调用方（闲置休眠
+// 清扫、失败插件清理）用 errors.Is 判定该预期状态，避免脆弱的错误字符串
+// 比对（曾用 err.Error() == "plugin X not loaded" 与 strings.Contains）。
+var ErrPluginNotLoaded = errors.New("plugin not loaded")
 
 // startTimeout bounds the go-plugin handshake; go-plugin itself does not time out the handshake, so Load enforces one.
 const startTimeout = 15 * time.Second
@@ -598,6 +604,12 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if err != nil {
 		return nil, err
 	}
+	// astrbot_version 兼容校验（对齐 Python StarManager.load：加载即拒）。
+	// metadata 的 astrbot_version 是 PEP 440 specifier；不兼容时直接拒绝安装，
+	// 错误信息包含当前版本与插件要求的范围。
+	if err := CheckAstrbotVersionCompatibility(meta.AstrbotVersion); err != nil {
+		return nil, fmt.Errorf("插件 %s: %w", meta.Name, err)
+	}
 	lang := ResolveLanguage(srcDir)
 
 	// 稳定 id：插件名 + language（PluginIDFromMeta）。来源推导 id（带版本/ commit，如 astrbot-plugin-xxx-4.11.2-<commit>）在更新后变化，导致重装 （不勾清除配置/数据）时数据目录变成全新的。稳定 id 让重装后配置 （按 name）与数据目录（按 id）都能保留。
@@ -655,21 +667,41 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("拷贝插件源码: %w", err)
 	}
-	// 提交制换名交换：后续 Prepare/Vet/Build/加载全部成功才删除旧版本源码； 任一失败则回滚 dest → old，避免更新失败时上一版本源码被销毁。
-	_ = os.Rename(srcDest, old)
+	// 提交制换名交换：后续 Prepare/Vet/Build/加载全部成功才删除旧版本源码；
+	// 任一失败则回滚 dest → old，避免更新失败时上一版本源码被销毁。
+	// 交换前先幂等 RemoveAll(old)：上次崩溃残留的 old 非空目录会让
+	// os.Rename(srcDest, old) 失败，导致该插件此后永久无法重装。
+	if err := os.RemoveAll(old); err != nil {
+		_ = os.RemoveAll(staged)
+		return nil, fmt.Errorf("清理残留旧版本插件源码 %s: %w", old, err)
+	}
+	if err := os.Rename(srcDest, old); err != nil && !os.IsNotExist(err) {
+		_ = os.RemoveAll(staged)
+		return nil, fmt.Errorf("暂存旧版本插件源码: %w", err)
+	}
 	if err := os.Rename(staged, srcDest); err != nil {
-		_ = os.Rename(old, srcDest)
-		return nil, err
+		// 换名错误不得静默吞掉：尽力回滚旧源码，清理 staged 后上抛。
+		if rerr := os.Rename(old, srcDest); rerr != nil {
+			logger.I18nWarn("回滚旧版本插件源码 %s → %s 失败: %v", old, srcDest, rerr)
+		}
+		_ = os.RemoveAll(staged)
+		return nil, fmt.Errorf("提交新版本插件源码: %w", err)
 	}
 	commit := false
 	defer func() {
 		if commit {
-			_ = os.RemoveAll(old)
+			if err := os.RemoveAll(old); err != nil {
+				logger.I18nWarn("清理旧版本插件源码 %s 失败: %v", old, err)
+			}
 			return
 		}
 		// 回滚：新源码挪回 staged 待清理，旧源码归位。
-		_ = os.Rename(srcDest, staged)
-		_ = os.Rename(old, srcDest)
+		if err := os.Rename(srcDest, staged); err != nil {
+			logger.I18nWarn("回滚新版本插件源码 %s → %s 失败: %v", srcDest, staged, err)
+		}
+		if err := os.Rename(old, srcDest); err != nil {
+			logger.I18nWarn("恢复旧版本插件源码 %s → %s 失败: %v", old, srcDest, err)
+		}
 		_ = os.RemoveAll(staged)
 	}()
 	if err := m.compiler.Prepare(srcDest, goModuleNameOf(srcDest, meta)); err != nil {
@@ -704,7 +736,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	unlock := m.lockOp(id)
 	defer unlock()
 
-	inst, err := m.loadLocked(ctx, id, artifact, "go")
+	inst, err := m.loadLocked(ctx, id, artifact, "go", false)
 	if err != nil {
 		return nil, err
 	}
@@ -764,19 +796,37 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 		return nil, fmt.Errorf("拷贝 Python 插件源码: %w", err)
 	}
 	// 提交制换名交换：与 Go 安装路径一致，加载成功才删除旧版本源码； 任一失败回滚 dest → old。
-	_ = os.Rename(dest, old)
+	// 交换前幂等清理崩溃残留的 old，换名错误不静默吞掉（否则残留 old 会让
+	// 该插件永久无法重装）。
+	if err := os.RemoveAll(old); err != nil {
+		_ = os.RemoveAll(staged)
+		return nil, fmt.Errorf("清理残留旧版本 Python 插件源码 %s: %w", old, err)
+	}
+	if err := os.Rename(dest, old); err != nil && !os.IsNotExist(err) {
+		_ = os.RemoveAll(staged)
+		return nil, fmt.Errorf("暂存旧版本 Python 插件源码: %w", err)
+	}
 	if err := os.Rename(staged, dest); err != nil {
-		_ = os.Rename(old, dest)
-		return nil, err
+		if rerr := os.Rename(old, dest); rerr != nil {
+			logger.I18nWarn("回滚旧版本 Python 插件源码 %s → %s 失败: %v", old, dest, rerr)
+		}
+		_ = os.RemoveAll(staged)
+		return nil, fmt.Errorf("提交新版本 Python 插件源码: %w", err)
 	}
 	commit := false
 	defer func() {
 		if commit {
-			_ = os.RemoveAll(old)
+			if err := os.RemoveAll(old); err != nil {
+				logger.I18nWarn("清理旧版本 Python 插件源码 %s 失败: %v", old, err)
+			}
 			return
 		}
-		_ = os.Rename(dest, staged)
-		_ = os.Rename(old, dest)
+		if err := os.Rename(dest, staged); err != nil {
+			logger.I18nWarn("回滚新版本 Python 插件源码 %s → %s 失败: %v", dest, staged, err)
+		}
+		if err := os.Rename(old, dest); err != nil {
+			logger.I18nWarn("恢复旧版本 Python 插件源码 %s → %s 失败: %v", old, dest, err)
+		}
 		_ = os.RemoveAll(staged)
 	}()
 
@@ -794,7 +844,7 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	unlock := m.lockOp(id)
 	defer unlock()
 
-	inst, err := m.loadLocked(ctx, id, dest, "python")
+	inst, err := m.loadLocked(ctx, id, dest, "python", false)
 	if err != nil {
 		return nil, err
 	}
@@ -839,17 +889,44 @@ func (m *SubprocessManager) pipInstall(ctx context.Context, env *pysdk.RuntimeEn
 	args = append(args, "-i", index)
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	cmd := exec.Command(env.PythonBin, args...) // #nosec G204 -- pip 安装插件依赖（参数来自插件配置）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = pluginDir
 	cmd.Env = pysdk.PipEnv()
+	// 进程组隔离（对齐 pysdk installHostDeps 的 setupPipCmd + killPipCmd）：
+	// pip 的 build isolation 会再拉起编译子进程，超时必须杀整组，否则直接
+	// 子进程被杀而孙进程变孤儿继续占用 CPU/文件锁。
+	setupChildProcess(cmd)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
 	logger.Debug("pip install: %s %s", env.PythonBin, strings.Join(args, " "))
-	out, err := cmd.CombinedOutput()
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("启动 pip: %w", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		// 超时/上层取消：SIGTERM → 宽限 → SIGKILL 杀整个进程组；Windows
+		// （killProcessGroup 无组语义返回 false）回退杀直接子进程；等 Wait
+		// 回收避免僵尸。
+		if !killProcessGroup(&PluginInstance{pgid: cmd.Process.Pid}) {
+			_ = cmd.Process.Kill()
+		}
+		<-done
+		err = ctx.Err()
+	}
 	// pip 过程输出统一走 DEBUG（正常安装时的下载/构建细节；失败时错误信息 已包含输出）。
-	if len(strings.TrimSpace(string(out))) > 0 {
-		logger.Debug("pip install 输出: %s", strings.TrimSpace(string(out)))
+	if out := strings.TrimSpace(buf.String()); len(out) > 0 {
+		logger.Debug("pip install 输出: %s", out)
+		if err != nil {
+			return fmt.Errorf("%v: %s", err, out)
+		}
 	}
 	if err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		return err
 	}
 	return nil
 }
@@ -1004,6 +1081,18 @@ func (m *SubprocessManager) cachedManifest() *Manifest {
 	return &Manifest{Version: 1}
 }
 
+// installedAstrbotVersion 返回 manifest 中该插件持久化的 astrbot_version
+// spec（PEP 440；未安装/旧条目无此字段时返回 ""）。加载路径据此做兼容校验。
+func (m *SubprocessManager) installedAstrbotVersion(id string) string {
+	if m == nil || id == "" {
+		return ""
+	}
+	if e := m.cachedManifest().Get(id); e != nil {
+		return strings.TrimSpace(e.AstrbotVersion)
+	}
+	return ""
+}
+
 // Load launches a compiled plugin binary (or Python source tree) as a child process and registers it under id. Already-loaded ids return the existing instance. It holds the per-plugin lifecycle lock so a concurrent Uninstall cannot unload/remove the plugin in the middle of its registration window.
 func (m *SubprocessManager) Load(ctx context.Context, id, binary string) (*PluginInstance, error) {
 	return m.LoadLang(ctx, id, binary, "")
@@ -1011,6 +1100,14 @@ func (m *SubprocessManager) Load(ctx context.Context, id, binary string) (*Plugi
 
 // LoadLang is Load with an explicit language ("go" / "python"; empty means "go").
 func (m *SubprocessManager) LoadLang(ctx context.Context, id, binary, language string) (*PluginInstance, error) {
+	return m.loadLang(ctx, id, binary, language, false)
+}
+
+// loadLang 是 LoadLang 的内部实现；wake=true 表示本次加载是闲置休眠后的
+// 唤醒（EnsureLoaded），而非首次安装/启用。唤醒不广播 on_plugin_loaded，
+// 否则插件每次被唤醒都会向全体重播一次"新插件加载"，与 Python 本体只在
+// 真正加载时触发一次的生命周期语义不符。
+func (m *SubprocessManager) loadLang(ctx context.Context, id, binary, language string, wake bool) (*PluginInstance, error) {
 	if id == "" {
 		return nil, fmt.Errorf("plugin id cannot be empty")
 	}
@@ -1019,11 +1116,11 @@ func (m *SubprocessManager) LoadLang(ctx context.Context, id, binary, language s
 	}
 	unlock := m.lockOp(id)
 	defer unlock()
-	return m.loadLocked(ctx, id, binary, language)
+	return m.loadLocked(ctx, id, binary, language, wake)
 }
 
 // loadLocked is Load's body; the caller must hold the per-plugin lifecycle lock for id (m.lockOp).
-func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language string) (*PluginInstance, error) {
+func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language string, wake bool) (*PluginInstance, error) {
 	m.mu.RLock()
 	if inst, ok := m.instances[id]; ok {
 		m.mu.RUnlock()
@@ -1052,9 +1149,37 @@ func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language
 
 	m.startWatch(inst)
 	logger.I18nInfo("插件 %s 已从 %s 加载 (v%s)", id, inst.Binary, inst.Version)
-	// 通知所有已加载插件：新插件加载完成（on_plugin_loaded）。
-	m.TriggerHookPayload(ctx, pluginsdk.EventOnPluginLoaded, map[string]string{"plugin_name": inst.Name})
+	if !wake {
+		// 通知所有已加载插件：新插件加载完成（on_plugin_loaded）。仅真正
+		// 加载时广播；闲置唤醒（wake=true）不重播，保持与 Python 本体
+		// "加载事件一次性"语义一致。
+		m.TriggerHookPayload(ctx, pluginsdk.EventOnPluginLoaded, pluginLoadedPayload(inst))
+	}
 	return inst, nil
+}
+
+// pluginLoadedPayload 构造 on_plugin_loaded 的可还原 metadata：对齐 Python
+// 本体传入的 StarMetadata 最少字段（name/version/desc/author）。payload 同时
+// 保留历史键 plugin_name（Go SDK payloadString 优先读取它）。
+// 注意：data/python-sdk 的 dispatch 目前对 on_plugin_loaded 不解析 payload
+// （payload 恒为 None），此处仅补齐宿主侧字段，无需（也不应）改动 Python SDK。
+func pluginLoadedPayload(inst *PluginInstance) map[string]string {
+	payload := map[string]string{"plugin_name": inst.Name}
+	if inst.Meta != nil {
+		if inst.Meta.Name != "" {
+			payload["name"] = inst.Meta.Name
+		}
+		payload["version"] = inst.Meta.Version
+		payload["description"] = inst.Meta.Description
+		payload["author"] = inst.Meta.Author
+	}
+	if payload["name"] == "" {
+		payload["name"] = inst.Name
+	}
+	if payload["version"] == "" {
+		payload["version"] = inst.Version
+	}
+	return payload
 }
 
 // Reload restarts a plugin with zero downtime: start the new process first, swap it in, then stop the old one. The per-plugin lifecycle lock serializes it against concurrent crash-restarts and unloads so no instance is orphaned.
@@ -1066,7 +1191,7 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 	old, ok := m.instances[id]
 	m.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("plugin %s not loaded", id)
+		return fmt.Errorf("plugin %s: %w", id, ErrPluginNotLoaded)
 	}
 
 	newInst, err := m.startInstance(ctx, id, old.Binary, old.Language)
@@ -1115,7 +1240,7 @@ func (m *SubprocessManager) unloadCoreLocked(id string, notify bool) error {
 	inst, ok := m.instances[id]
 	if !ok {
 		m.mu.Unlock()
-		return fmt.Errorf("plugin %s not loaded", id)
+		return fmt.Errorf("plugin %s: %w", id, ErrPluginNotLoaded)
 	}
 	delete(m.instances, id)
 	m.mu.Unlock()
@@ -1137,7 +1262,10 @@ func (m *SubprocessManager) unloadCoreLocked(id string, notify bool) error {
 		logger.I18nInfo("插件 %s 已卸载", id)
 		m.notifyChanged()
 	} else {
-		logger.I18nInfo("插件 %s 已休眠（闲置卸载，触发时自动唤醒）", id)
+		// 休眠日志的唯一权威点（锁内、且确认实例真实存在并已停）：附带闲置
+		// 时长。sweep/unloadIdleChecked 不再各自重复打印。
+		logger.I18nInfo("插件 %s 已闲置 %v，自动休眠（内存已回收，下次触发时自动唤醒）",
+			id, time.Since(inst.LastActive()).Round(time.Second))
 	}
 	// 会话等待注销后移：休眠路径不注销——插件唤醒后 Python 侧虽重建不了 旧 SessionWaiter 状态，但保留宿主条目没有意义且会向死进程推送； 休眠的真正防线在 sweep 侧：有活跃 SessionWait 的插件根本不参与 休眠（见 sweepIdlePlugins），因此走到这里的休眠实例无活跃等待， 注销是安全的清理。真实卸载必须注销（进程永久消失）。
 	m.unregisterPluginWaits(inst.Name)
@@ -1355,35 +1483,33 @@ func (m *SubprocessManager) sweepIdlePlugins() {
 		if !idle {
 			continue
 		}
-		logger.I18nInfo("插件 %s 已闲置 %v，自动休眠（内存已回收，下次触发时自动唤醒）",
-			inst.ID, now.Sub(inst.LastActive()).Round(time.Second))
-		if err := m.unloadIdleChecked(inst.ID, timeout, now); err != nil && err.Error() != fmt.Sprintf("plugin %s not loaded", inst.ID) {
+		if _, err := m.unloadIdleChecked(inst.ID, timeout); err != nil && !errors.Is(err, ErrPluginNotLoaded) {
 			logger.I18nWarn("闲置休眠插件 %s 失败: %v", inst.ID, err)
 		}
 	}
 }
 
-// unloadIdleChecked 在 per-plugin 生命周期锁内重验"仍是快照中的同一实例、 无进行中 RPC、且按当前时间仍闲置"后才休眠——封死 sweep 双重检查与 UnloadIdle 拿锁之间被 EnsureLoaded 唤醒的竞态窗口（否则刚唤醒、正在 服务的实例会被锁内拿到并直接停掉，触发进程泄漏与 RPC 打到死实例）。
-func (m *SubprocessManager) unloadIdleChecked(id string, timeout time.Duration, sweepNow time.Time) error {
+// unloadIdleChecked 在 per-plugin 生命周期锁内重验"仍是快照中的同一实例、 无进行中 RPC、且按当前时间仍闲置"后才休眠——封死 sweep 双重检查与 UnloadIdle 拿锁之间被 EnsureLoaded 唤醒的竞态窗口（否则刚唤醒、正在 服务的实例会被锁内拿到并直接停掉，触发进程泄漏与 RPC 打到死实例）。 返回 unloaded 表示本次是否真正执行了休眠（未运行/进行中 RPC/已不再闲置 均为 false）；休眠日志只在 unloadCoreLocked 锁内权威点打印一次。
+func (m *SubprocessManager) unloadIdleChecked(id string, timeout time.Duration) (unloaded bool, err error) {
 	unlock := m.lockOp(id)
 	defer unlock()
 	m.mu.RLock()
 	inst, ok := m.instances[id]
 	m.mu.RUnlock()
 	if !ok {
-		return fmt.Errorf("plugin %s not loaded", id)
+		return false, fmt.Errorf("plugin %s: %w", id, ErrPluginNotLoaded)
 	}
 	if inst.activeRPC.Load() > 0 {
-		return nil // 进行中 RPC：跳过本轮
+		return false, nil // 进行中 RPC：跳过本轮
 	}
 	// 用当前时间重验（新唤醒实例 lastActive=唤醒时刻 > sweep 快照 now， 必然不满足闲置 → 跳过）。
 	if !inst.IsIdle(time.Now(), timeout) {
-		return nil
+		return false, nil
 	}
-	_ = sweepNow // 快照时间仅用于日志
-	logger.I18nInfo("插件 %s 已闲置 %v，自动休眠（内存已回收，下次触发时自动唤醒）",
-		id, time.Since(inst.LastActive()).Round(time.Second))
-	return m.unloadCoreLocked(id, false)
+	if err := m.unloadCoreLocked(id, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // EnsureLoaded returns the running instance for id, lazily re-loading it from the manifest when it was previously unloaded (idle sweep or manual unload). This is the lazy-load half of the process-pool lifecycle: a triggered plugin that is not running is brought back on demand. On success it fires OnInstancesChanged so the host re-bridges the handlers.
@@ -1403,7 +1529,7 @@ func (m *SubprocessManager) EnsureLoaded(ctx context.Context, id string) (*Plugi
 	if lang == "" {
 		lang = "go"
 	}
-	inst, err := m.LoadLang(ctx, id, e.Binary, lang)
+	inst, err := m.loadLang(ctx, id, e.Binary, lang, true)
 	if err != nil {
 		return nil, fmt.Errorf("唤醒插件 %s: %w", id, err)
 	}
@@ -1520,29 +1646,68 @@ var (
 	globalPortUsed = map[int]struct{}{}
 )
 
-// allocPluginPort 分配一个全局唯一的握手端口（min=max=单端口），从 base 起向上扫描第一个未使用端口。base<=0 时用 go-plugin 默认起始值 10000。 除进程内已分配记录外，还会检测端口当前是否被监听（孤儿插件进程、其他 服务的残留监听），占用则跳过——否则 SO_REUSEPORT 双绑会让宿主连接被 内核路由到错误的进程（Register 元数据串台）。 端口耗尽（>65535）时返回 0,0，调用方应停止启动并上报错误。
-func allocPluginPort(base int) (uint, uint) {
+// allocPluginPort 分配一个握手端口区间起点：从 base 起向上扫描第一个未使用端口 p，返回 [p, p+15]。base<=0 时用 go-plugin 默认起始值 10000；limit<=0 或 >65535 时取 65535。扫描要求 p+15 <= limit，保证整个返回区间落在 [base, limit] 内，不会越过配置的 MaxPort 上界。 除进程内已分配记录外，还会检测端口 p 当前是否被监听（孤儿插件进程、其他 服务的残留监听），占用则跳过——否则 SO_REUSEPORT 双绑会让宿主连接被 内核路由到错误的进程（Register 元数据串台）。 端口耗尽（区间放不下）时返回 0,0，调用方应停止启动并上报错误。
+//
+// 返回 16 端口小区间而非单端口：宿主探测 p 空闲与子进程真正 bind p 之间存在时间窗
+// （上一个实例的僵尸子进程尚未完全释放端口、Windows 动态端口瞬占等），单端口方案
+// 会让子进程 "Couldn't bind plugin TCP listener" 直接失败（Windows CI 实测根因）。
+// 子进程侧（hashicorp plugin.Serve 与 Python 桥）本就在 [min,max] 内逐个尝试并把
+// 实际端口写进握手行，故放宽区间即获得瞬来自愈能力，仍保留独占区间防串台。
+func allocPluginPort(base, limit int) (uint, uint) {
 	globalPortMu.Lock()
 	defer globalPortMu.Unlock()
 	if base <= 0 {
 		base = 10000
 	}
-	for p := base; p <= 65535; p++ {
+	if limit <= 0 || limit > 65535 {
+		limit = 65535
+	}
+	for p := base; p+15 <= limit; p++ {
 		if _, used := globalPortUsed[p]; !used && !portInUse(p) {
-			globalPortUsed[p] = struct{}{}
-			return uint(p), uint(p) // #nosec G115 -- 端口从 base(≥1) 起向上扫描，int→uint 不溢出
+			max := p + 15 // 循环条件保证 max <= limit <= 65535
+			// 整个区间登记为已用：避免相邻分配区间重叠导致子进程在区间内
+			// 互相抢端口（防串台语义保持）。
+			for q := p; q <= max; q++ {
+				globalPortUsed[q] = struct{}{}
+			}
+			return uint(p), uint(max) // #nosec G115 -- 端口从 base(≥1) 起向上扫描，int→uint 不溢出
 		}
 	}
 	return 0, 0
 }
 
-// releasePluginPort 归还握手端口（实例 teardown/启动失败时调用；0 = 未分配， 直接忽略）。归还后该端口可被后续插件重新使用。
+// waitExeHandleReleased Windows 上被终止的子进程 exe 文件句柄释放有毫秒~秒级
+// 滞后（TerminateProcess 异步 + 杀软/索引器扫新文件），测试的 t.TempDir 清理
+// 会撞 "Access is denied" 假红。轮询写打开探测直到句柄放开或超时。非 Windows/
+// 路径不存在时快速返回。
+func waitExeHandleReleased(abs string) {
+	if runtime.GOOS != "windows" || abs == "" {
+		return
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		f, err := os.OpenFile(abs, os.O_WRONLY, 0)
+		if err != nil {
+			if time.Now().After(deadline) {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		_ = f.Close()
+		return
+	}
+}
+
+// releasePluginPort 归还握手端口区间起点（实例 teardown/启动失败时调用；0 = 未分配， 直接忽略）。按与 allocPluginPort 相同的推导归还 [p, p+15] 整个区间，可被后续插件重新使用。
 func releasePluginPort(p uint) {
 	if p == 0 {
 		return
 	}
 	globalPortMu.Lock()
-	delete(globalPortUsed, int(p))
+	for q := int(p); q <= min(int(p)+15, 65535); q++ {
+		delete(globalPortUsed, q)
+	}
 	globalPortMu.Unlock()
 }
 
@@ -1556,20 +1721,32 @@ func portInUse(p int) bool {
 	return false
 }
 
-// allocPortRange 从配置的 MinPort 起分配（测试/显式端口范围场景）。
+// allocPortRange 在配置的 [MinPort, MaxPort] 内分配（测试/显式端口范围场景）。
+// MaxPort 作为真正的上界：分配区间必须整段落下，放不下即耗尽返回 0,0。
 func (m *SubprocessManager) allocPortRange() (uint, uint) {
-	return allocPluginPort(m.MinPort)
+	return allocPluginPort(m.MinPort, m.MaxPort)
 }
 
 // allocPortRangeDefault 从默认起始端口（10000）起分配（生产默认）。
 func (m *SubprocessManager) allocPortRangeDefault() (uint, uint) {
-	return allocPluginPort(0)
+	return allocPluginPort(0, 0)
 }
 
 // hostPluginID cannot be clobbered by a concurrently loading plugin.
 func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, language string) (*PluginInstance, error) {
 	startInstanceMu.Lock()
 	defer startInstanceMu.Unlock()
+
+	// astrbot_version 兼容校验（对齐 Python 加载即拒）：所有加载路径
+	//（首次加载 / 启用 / 重启恢复 / 闲置唤醒 / 崩溃重启 / Reload）最终都汇聚
+	// 到 startInstance，从 manifest 读取安装时持久化的 spec 做校验；不满足则
+	// 拒绝启动并给出明确错误。新装插件此时尚未 recordInstall（entry 不存在
+	// 或为旧条目），其 metadata 已在 InstallFromSource 校验。
+	if spec := m.installedAstrbotVersion(id); spec != "" {
+		if err := CheckAstrbotVersionCompatibility(spec); err != nil {
+			return nil, fmt.Errorf("插件 %s 与当前 AstrBot 版本不兼容，已拒绝加载: %w", id, err)
+		}
+	}
 
 	abs, err := filepath.Abs(binary)
 	if err != nil {
@@ -1622,7 +1799,9 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 
 	cmd := exec.Command(abs) // #nosec G204 -- 启动 Go 插件可执行文件（插件系统核心）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	cmd.Dir = pluginDataRoot
-	return m.dispensePlugin(ctx, id, abs, language, cmd, nil)
+	// Go 插件同样接 stderr 采集器：握手失败（Windows CI 上"Unrecognized remote plugin
+	// message"空尾串）时可回吐子进程真实输出定位根因；无 [ASTRBOT] 协议行时按原文诊断。
+	return m.dispensePlugin(ctx, id, abs, language, cmd, newAstrbotStartupParser())
 }
 
 // pythonRuntime resolves (once) the Python subprocess environment: SDK extraction + venv/grpcio preparation + (optionally) downloading a bundled Python when the system has none. The first Python plugin load may take a while (download / venv creation + pip install). 供给模式取宿主配置 （pipDepsMode：lazy 核心层 / full 全量 / 空按 pysdk 默认 lazy）。
@@ -1685,6 +1864,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		})},
 	}
 	if stderrParser != nil {
+		stderrParser.lang = language
 		cfg.Stderr = stderrParser
 	}
 	// 每个插件分配独占握手端口（见 portAllocMu 注释）：避免 SO_REUSEPORT 同端口双绑导致宿主连接路由到错误的插件进程。
@@ -1708,7 +1888,13 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 	}
 	resCh := make(chan dispenseResult, 1)
 	go func() {
-		// 绑定当前插件身份：go-plugin Dispense 时宿主 accept HostService， SDK 据此刻的当前 id 给 per-connection hostServiceServer 绑定插件名， 用于 HostService 反向调用（GetConfig/SetConfig）的身份隔离。这里以 manifest id 为 key（与 acceptHostService 的 hostServers 记录、以及 Register 后的 BindHostServiceName(id, name) 查找 key 一致）；插件 GetConfig/SetConfig 传的是注册名（name），Register 成功后由 BindHostServiceName 把身份更新为注册名，二者对齐后隔离校验才能通过。
+		// 绑定当前插件身份：go-plugin Dispense 时宿主 accept HostService，
+		// SDK 据此刻的当前 id 给 per-connection hostServiceServer 绑定两个身份：
+		//   - connKey = 此处的 manifest id：管理鉴权键（SetPluginAdminList/
+		//     hostAdminAuthorized 按 manifest id 精确匹配），Register 后也不会被改写；
+		//   - pluginID（注册名）：Register 后由 BindHostServiceName 更新，仅用于
+		//     GetConfig/SetConfig 的配置归属校验。
+		// manifest id 由宿主分配、插件无法自报，故注册名重名无法冒充管理员（p11）。
 		pluginsdk.SetCurrentHostPluginID(id)
 		defer pluginsdk.SetCurrentHostPluginID("")
 		var pid int
@@ -1742,6 +1928,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 			releasePluginPort(minp)
 			// 握手失败时直接子进程可能已退出（killProcessGroup 对 ESRCH 视为 完成），但 Python 桥可能已拉起子进程：按组回收兜底。
 			killProcessGroup(&PluginInstance{pgid: res.pid})
+			waitExeHandleReleased(abs)
 			return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: %w", id, res.err))
 		}
 		pc = res.pc
@@ -1755,6 +1942,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		if res.pc != nil {
 			_ = res.pc.Close()
 		}
+		waitExeHandleReleased(abs)
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: handshake timed out after %v", id, startTimeout))
 	case <-m.ctx.Done():
 		raw.Kill()
@@ -1764,6 +1952,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		if res.pc != nil {
 			_ = res.pc.Close()
 		}
+		waitExeHandleReleased(abs)
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: manager shutting down", id))
 	}
 
@@ -1777,9 +1966,14 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		raw.Kill()
 		releasePluginPort(minp)
 		killProcessGroup(&PluginInstance{pgid: pid})
+		waitExeHandleReleased(abs)
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("plugin %s Register: %w", id, err))
 	}
-	// 用 Register 返回的注册名更新 HostService 连接身份（accept 时只绑定 manifest id，name 与 id 可能不同）。之后插件 GetConfig/SetConfig 传的 name 与连接身份一致，身份隔离校验才能通过。
+	// 用 Register 返回的注册名更新 HostService 连接的"配置归属"身份（accept
+	// 时只绑定 manifest id，name 与 id 可能不同）。之后插件 GetConfig/SetConfig
+	// 传的 name 与注册名一致，配置归属校验才能通过。
+	// 注意：BindHostServiceName 只改注册名，不改 connKey——管理鉴权始终以 accept
+	// 时绑定的 manifest id 为准，注册名不得反过来覆盖鉴权键（p11）。
 	if meta != nil && meta.Name != "" {
 		pluginsdk.BindHostServiceName(id, meta.Name)
 	}
@@ -1815,11 +2009,21 @@ func (m *SubprocessManager) wrapStartError(parser *astrbotStartupParser, err err
 	}
 	// go-plugin 在 Kill 时已排空 stderr 管道，STARTUP_ERROR 行通常已落地； 给 1s 兜底等 stderr 转发协程完成，避免竞态丢掉错误行。
 	se := parser.WaitError(1 * time.Second)
+	kind := "Python"
+	switch strings.ToLower(parser.lang) {
+	case "go":
+		kind = "Go"
+	}
 	if se == nil {
+		// 无 [ASTRBOT] 协议错误（Go 插件或早退的 Python）：回吐子进程 stderr 尾部，
+		// 否则 Windows 上只剩 "Unrecognized remote plugin message:" 无线索。
+		if tail := parser.Tail(); tail != "" {
+			return fmt.Errorf("%s 插件启动失败（go-plugin 原始错误: %v）；子进程 stderr 尾部:\n%s", kind, err, tail)
+		}
 		return err
 	}
-	return fmt.Errorf("Python 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
-		se.Phase, se.Plugin, se.Error, err)
+	return fmt.Errorf("%s 插件启动失败: phase=%s plugin=%s error=%s（go-plugin 原始错误: %v）",
+		kind, se.Phase, se.Plugin, se.Error, err)
 }
 
 // startWatch polls the child process for exit and triggers crash handling.
@@ -2211,7 +2415,9 @@ func rewritePluginIDPath(path, oldID, newID string) string {
 		if seg == "" {
 			continue
 		}
-		re := regexp.MustCompile(`(^|/)` + regexp.QuoteMeta(seg) + `(/|$)`)
+		// 分隔符同时认 / 与 \：Windows 上 filepath.Join 写入 manifest 的路径用 \，
+		// 仅匹配 / 会让旧 id 路径段永不改写（TestMigratePluginLayout Windows 红）。
+		re := regexp.MustCompile(`(^|[/\\])` + regexp.QuoteMeta(seg) + `([/\\]|$)`)
 		out = re.ReplaceAllString(out, "${1}"+newID+"${2}")
 	}
 	return out
@@ -2358,6 +2564,7 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	// 先按进程组回收（SIGTERM → 宽限 → SIGKILL，含 Python 桥再拉起的 子进程）；killProcessGroup 返回 false（未记录 pgid / 非 unix 平台） 或进程已被组信号杀死后，raw.Kill() 兜底回收直接子进程并完成 go-plugin 的簿记（reap）。顺序不可反：raw.Kill() 只杀直接子进程， 先组杀保证整棵进程树被回收。
 	killProcessGroup(inst)
 	inst.raw.Kill()
+	waitExeHandleReleased(inst.Binary)
 	if inst.Client != nil {
 		_ = inst.Client.Close()
 	}

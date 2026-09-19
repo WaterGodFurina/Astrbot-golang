@@ -4,7 +4,7 @@
 package contentsafety
 
 import (
-	"strings"
+	"regexp"
 	"sync"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -26,27 +26,46 @@ type Checker interface {
 	Check(text string) (bool, string)
 }
 
-// KeywordChecker blocks text containing banned keywords.
+// KeywordChecker blocks text matching any banned keyword.
+//
+// 对齐 Python keywords.py: `re.search(keyword, content)` —— keyword 是**正则**
+// 且**大小写敏感**（不是子串/忽略大小写）。正则预编译缓存，避免每条消息重复
+// 编译；非法正则时退化为字面量匹配（不静默丢弃关键词，避免漏拦）。
 type KeywordChecker struct {
-	mu       sync.RWMutex
-	keywords []string
+	mu  sync.RWMutex
+	res []*regexp.Regexp
+}
+
+// compileKeywords precompiles each keyword as a Go regexp. Go RE2 不支持
+// Python re 的回溯/环视等语法，这类非法正则降级为 regexp.QuoteMeta 字面量
+// 匹配，保证该关键词仍然生效（fail-closed）而不是被跳过。
+func compileKeywords(keywords []string) []*regexp.Regexp {
+	res := make([]*regexp.Regexp, 0, len(keywords))
+	for _, kw := range keywords {
+		if kw == "" {
+			continue
+		}
+		re, err := regexp.Compile(kw)
+		if err != nil {
+			logger.Error("content_safety 关键词正则 %q 编译失败，回退为字面量匹配: %v", kw, err)
+			re = regexp.MustCompile(regexp.QuoteMeta(kw))
+		}
+		res = append(res, re)
+	}
+	return res
 }
 
 // NewKeywordChecker creates a keyword-based checker.
 func NewKeywordChecker(keywords []string) *KeywordChecker {
-	return &KeywordChecker{keywords: keywords}
+	return &KeywordChecker{res: compileKeywords(keywords)}
 }
 
 // Check returns (ok, info). ok=false if a keyword is found.
 func (c *KeywordChecker) Check(text string) (bool, string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	lower := strings.ToLower(text)
-	for _, kw := range c.keywords {
-		if kw == "" {
-			continue
-		}
-		if strings.Contains(lower, strings.ToLower(kw)) {
+	for _, re := range c.res {
+		if re.MatchString(text) {
 			return false, "content blocked by keyword filter"
 		}
 	}
@@ -55,16 +74,24 @@ func (c *KeywordChecker) Check(text string) (bool, string) {
 
 // AddKeyword adds a banned keyword.
 func (c *KeywordChecker) AddKeyword(kw string) {
+	if kw == "" {
+		return
+	}
+	compiled := compileKeywords([]string{kw})
+	if len(compiled) == 0 {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.keywords = append(c.keywords, kw)
+	c.res = append(c.res, compiled...)
 }
 
 // SetKeywords replaces all keywords.
 func (c *KeywordChecker) SetKeywords(kws []string) {
+	compiled := compileKeywords(kws)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.keywords = kws
+	c.res = compiled
 }
 
 // StrategySelector selects the enabled checkers based on config.

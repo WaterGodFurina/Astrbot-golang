@@ -217,7 +217,7 @@ func TestFetchPluginMarketHTTPErrorReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	if _, err := s.fetchPluginMarket(srv.URL, false); err == nil {
@@ -231,7 +231,7 @@ func TestFetchPluginMarketDecodeErrorReturnsError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	if _, err := s.fetchPluginMarket(srv.URL, false); err == nil {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -102,7 +103,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.startedAt = time.Now()
 
 	// 1. Open database
-	database, err := db.New("data/astrbot.db")
+	database, err := db.New(utils.DataPath("astrbot.db"))
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
@@ -110,7 +111,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	logger.I18nInfo("数据库已打开（连接池 5，WAL 模式）")
 
 	// 2. Load config
-	cfg := config.NewConfig("data/cmd_config.json")
+	cfg := config.NewConfig(utils.DataPath("cmd_config.json"))
 	if err := cfg.Load(); err != nil {
 		logger.I18nWarn("加载配置失败（文件损坏？），已回退到默认配置继续运行: %v", err)
 		cfg.ResetToDefaults()
@@ -206,11 +207,11 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 
 	// 7.2. Initialize skill manager + sandbox manager (must precede pipeline
 	// build so ProcessStage can inject skills into the LLM system prompt).
-	l.skillMgr = skills.NewSkillManager("data/skills", "data/plugins", "data")
+	l.skillMgr = skills.NewSkillManager(utils.DataPath("skills"), utils.DataPath("plugins"), utils.AstrbotDataDir())
 	logger.I18nInfo("技能管理器已初始化（%d 个技能）", len(l.skillMgr.ListSkills(false, "local")))
 	l.sandboxMgr = sandbox.NewManager(l.skillMgr)
 	// Neo 生命周期存储由 lifecycle 先建（pipeline 首轮构建早于 dashboard 创建，dashboard.Neo() 那时还是 nil），再注入 dashboard 共享同一实例。
-	l.neoStore = skills.NewNeoStore("data")
+	l.neoStore = skills.NewNeoStore(utils.AstrbotDataDir())
 	l.syncSandboxBooter()
 	logger.I18nInfo("沙盒管理器已初始化")
 
@@ -229,7 +230,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// 若此时为 nil，collectPluginTools 直接返回空，插件工具不会注入 LLM
 	// （只有后续 ReloadPipelineScheduler 重建管线才恢复）。实例的 LoadInstalled
 	// 仍在 9.6 处（管线之后）执行。
-	l.subPluginMgr = plugin.NewSubprocessManager(l.toolchain, "data")
+	l.subPluginMgr = plugin.NewSubprocessManager(l.toolchain, utils.AstrbotDataDir())
 
 	// 7.5. Build pipeline schedulers
 	for _, confID := range l.configMgr.IDs() {
@@ -239,6 +240,14 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}
 	logger.I18nInfo("管线调度器已构建（%d 个配置）", len(l.pipelineMapping))
 
+	// 7.6. 多配置 UMO 路由（对齐 Python event_bus.py dispatch：事件按
+	// get_conf_info(unified_msg_origin) 路由到其配置对应的调度器）。
+	// Go 侧路由表存 preferences(scope="config_route", key="conf_id")，
+	// 与 dashboard /config-routes API 共用；支持 Python umop 的通配段
+	// （fnmatch 语义，"::" 匹配全部）。
+	l.eventBus.SetConfResolver(l.resolveConfIDForUMO)
+	logger.I18nInfo("事件总线 UMO→配置 路由已启用（config_route 表）")
+
 	// 8. Cron manager
 	l.cronMgr = cron.NewCronJobManager(database)
 	// Fire handler for active_agent jobs: the task note is fed through the
@@ -247,6 +256,12 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.cronMgr.RegisterHandler("active_agent", func(ctx context.Context, job *cron.Job) error {
 		session, _ := job.Payload["session"].(string)
 		note, _ := job.Payload["note"].(string)
+		if note == "" {
+			note = job.Description
+		}
+		if note == "" {
+			note = job.Name
+		}
 		if session == "" {
 			return fmt.Errorf("active_agent job %s has no session", job.ID)
 		}
@@ -262,15 +277,42 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		if senderID == "" {
 			senderID = convID
 		}
+		// 对齐 Python CronJobManager._run_active_agent_job/_woke_main_agent
+		// (manager.py:372-387, 433-442)：给合成事件带上 cron_job 元数据与
+		// cron_payload，供 ProcessStage 注入 PROACTIVE 系统提示；WebUI(API)
+		// 创建的任务 origin=="api"，其发送者被判定为 admin。
+		runStartedAt := time.Now().UTC().Format(time.RFC3339)
+		cronJobMeta := map[string]interface{}{
+			"id":             job.ID,
+			"name":           job.Name,
+			"type":           job.JobType,
+			"run_once":       job.RunOnce,
+			"description":    job.Description,
+			"note":           note,
+			"run_started_at": runStartedAt,
+			"session":        session,
+		}
+		if runAt, ok := job.Payload["run_at"]; ok {
+			cronJobMeta["run_at"] = runAt
+		}
+		isAdmin := false
+		if origin, _ := job.Payload["origin"].(string); origin == "api" {
+			isAdmin = true
+		}
 		chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: note}}}
+		// 对齐 Python CronMessageEvent (events.py:28-51)：保留原 session 的
+		// message_type，使合成事件的 unified_msg_origin 与目标会话一致
+		// （否则 group 任务会退化成 FriendMessage 的 UMO，污染会话路由）。
+		msgType := parts[1]
 		evt := &core.Event{
 			Type:              core.EventMessage,
-			Source:            core.EventSource{Platform: platformID, PlatformID: platformID, ConvID: convID, SenderID: senderID, SenderName: senderID},
+			Source:            core.EventSource{Platform: platformID, PlatformID: platformID, ConvID: convID, SenderID: senderID, SenderName: senderID, IsGroup: msgType == "GroupMessage", IsAdmin: isAdmin},
 			Message:           chain,
 			MessageStr:        note,
 			PlainText:         note,
 			Timestamp:         time.Now(),
-			Metadata:          map[string]interface{}{"proactive": true},
+			MessageObj:        &core.MessageObj{MessageType: msgType, SessionID: convID, Platform: platformID, MessageStr: note, Timestamp: time.Now()},
+			Metadata:          map[string]interface{}{"proactive": true, "cron_job": cronJobMeta, "cron_payload": job.Payload},
 			IsAtOrWakeCommand: true,
 			CallLLM:           true,
 		}
@@ -290,7 +332,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	logger.I18nInfo("计划任务管理器已启动")
 
 	// 10. Initialize backup exporter
-	l.backupExporter = backup.NewExporter("data")
+	l.backupExporter = backup.NewExporter(utils.AstrbotDataDir())
 	logger.I18nInfo("备份导出器已初始化")
 
 	// 9.6b. 文件令牌注册表：RegisterFileToken 反调用登记宿主侧文件，同一
@@ -378,7 +420,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		// RegisterFileToken 反调用（fileTokens 同一实例经 managers map 注入
 		// dashboard 的公开文件路由 GET /api/file/{token}）。
 		CronMgr:    l.cronMgr,
-		McpBridge:  plugin.NewMCPClientPool("data"),
+		McpBridge:  plugin.NewMCPClientPool(utils.AstrbotDataDir()),
 		FileTokens: fileTokens,
 	})
 	// 插件 basic 定时任务（job_type="cron"）到点触发 handler：按 payload
@@ -431,7 +473,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			}
 		}
 	}
-	l.dashboard = dashboard.NewServerWithManagers(dashboardPort, "data/cmd_config.json", managers)
+	l.dashboard = dashboard.NewServerWithManagers(dashboardPort, utils.DataPath("cmd_config.json"), managers)
 	if l.webuiDir != "" {
 		l.dashboard.SetWebUIDir(l.webuiDir)
 	}
@@ -441,12 +483,16 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		go l.ReloadPlatforms(runCtx)
 	})
 	l.dashboard.SetOnPluginsChanged(func() {
+		// 插件集合变化（安装/卸载/启停）会改变注册名与 manifest 条目的对应
+		// 关系：重算管理名单（manifest id 集合），确保重名/同名多变体的歧义
+		// 条目即时从授权名单移除（fail-closed），不给恶意重名插件留下窗口。
+		plugin.RefreshPluginAdminList(l.configMgr, l.subPluginMgr)
 		l.RebridgePlugins()
 	})
 	l.dashboard.SetOnConfigChanged(func() {
 		// 注意：已移除全局 plugin_idle_unload_minutes 同步；
 		// 休眠为单插件独立控制，lifecycle 不再向 runtime 推全局阈值。
-		// 插件管理名单（plugin_admin_list）热更新即时生效。
+		// 插件管理名单（plugin_admin_list）热更新即时生效（解析为 manifest id）。
 		plugin.RefreshPluginAdminList(l.configMgr, l.subPluginMgr)
 		// Rebuild the pipeline so provider/platform settings changes (e.g. the
 		// default chat model) take effect immediately instead of on reload.
@@ -619,6 +665,53 @@ func (l *Lifecycle) chatLLMForPlugins(cmd plugin.ChatLLMCmd) (string, error) {
 		cfgMap = cfg.All()
 	}
 	return pipeline.ChatLLMFromConfig(cfgMap, cmd.Prompt, cmd.SystemPrompt, cmd.ImageURLs, cmd.AudioURLs, cmd.Tools, cmd.Contexts, cmd.ProviderID)
+}
+
+// resolveConfIDForUMO resolves the config profile ID an event UMO belongs to,
+// reading the config_route preference table (scope="config_route",
+// scope_id=pattern, key="conf_id"; maintained by the dashboard /config-routes
+// API). 匹配语义对齐 Python UmopConfigRouter._is_umo_match：pattern 按 ":" 拆
+// 三段，空段匹配任意，其余段走 fnmatch 通配；命中第一条即返回。未命中返回
+// ""（调用方回退 default 调度器）。
+func (l *Lifecycle) resolveConfIDForUMO(umo string) string {
+	if l.database == nil || umo == "" {
+		return ""
+	}
+	rows, err := l.database.ListPreferencesByScope("config_route")
+	if err != nil || len(rows) == 0 {
+		return ""
+	}
+	// 稳定匹配顺序：按 (scope_id, conf_id) 排序（ListPreferencesByScope 已按
+	// scope_id, key 排序，key 恒为 "conf_id"，此处顺序即确定）。
+	for _, row := range rows {
+		if row.Key != "conf_id" || row.Value == "" {
+			continue
+		}
+		if umoPatternMatches(row.ScopeID, umo) {
+			return row.Value
+		}
+	}
+	return ""
+}
+
+// umoPatternMatches 判断 umo 是否逻辑匹配 pattern（Python
+// UmopConfigRouter._is_umo_match 的移植：三段 [platform_id]:[message_type]:
+// [session_id]，段为空匹配任意，非空段支持 fnmatch 通配符）。
+func umoPatternMatches(pattern, umo string) bool {
+	pp := strings.SplitN(pattern, ":", 3)
+	up := strings.SplitN(umo, ":", 3)
+	if len(pp) != 3 || len(up) != 3 {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if pp[i] == "" {
+			continue
+		}
+		if ok, err := path.Match(pp[i], up[i]); err != nil || !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // buildPipelineScheduler assembles the full 10-stage pipeline for a config ID
@@ -830,6 +923,7 @@ type personaCache struct {
 	mu      sync.Mutex
 	parsed  []map[string]interface{}
 	modTime time.Time
+	size    int64
 }
 
 var personaFileCache personaCache
@@ -837,22 +931,47 @@ var personaFileCache personaCache
 // loadPersonas 返回 data/personas.json 解析后的 persona 列表。
 // mtime 未变化时直接返回缓存的解析结果，变化时才重读文件并重新解析。
 func loadPersonas() []map[string]interface{} {
-	info, err := os.Stat("data/personas.json")
+	path := utils.DataPath("personas.json")
+	info, err := os.Stat(path)
 	if err != nil {
 		return nil
 	}
 	personaFileCache.mu.Lock()
 	defer personaFileCache.mu.Unlock()
-	if personaFileCache.parsed != nil && personaFileCache.modTime.Equal(info.ModTime()) {
-		return personaFileCache.parsed
+	// 缓存键必须同时校验 mtime 与 size：仅 mtime 时，同一时间戳内的内容
+	// 改写（或恢复到旧 mtime）会命中陈旧缓存。size 变化即重读，另做深拷贝。
+	if personaFileCache.parsed != nil && personaFileCache.modTime.Equal(info.ModTime()) &&
+		personaFileCache.size == info.Size() {
+		return clonePersonas(personaFileCache.parsed)
 	}
-	data, err := os.ReadFile("data/personas.json")
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
 	personaFileCache.parsed = parsePersonas(data)
 	personaFileCache.modTime = info.ModTime()
-	return personaFileCache.parsed
+	personaFileCache.size = info.Size()
+	return clonePersonas(personaFileCache.parsed)
+}
+
+// clonePersonas 返回 personas 切片的浅拷贝（元素 map 再拷一层），避免调用方
+// 修改缓存内部状态导致后续读取串味。
+func clonePersonas(in []map[string]interface{}) []map[string]interface{} {
+	if in == nil {
+		return nil
+	}
+	out := make([]map[string]interface{}, len(in))
+	for i, m := range in {
+		if m == nil {
+			continue
+		}
+		cp := make(map[string]interface{}, len(m))
+		for k, v := range m {
+			cp[k] = v
+		}
+		out[i] = cp
+	}
+	return out
 }
 
 func parsePersonas(data []byte) []map[string]interface{} {
@@ -1148,7 +1267,7 @@ func cleanupOrphanPlugins() {
 // directory under the data dir (e.g. /abs/path/data/plugins-bin/), or "" when
 // the data dir cannot be resolved to an absolute path.
 func pluginBinaryPrefix() string {
-	abs, err := filepath.Abs("data")
+	abs, err := filepath.Abs(utils.AstrbotDataDir())
 	if err != nil {
 		return ""
 	}

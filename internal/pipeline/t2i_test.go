@@ -86,11 +86,11 @@ func TestT2ILongTextConvertedToImage(t *testing.T) {
 func TestT2IRemoteNoEndpointFallsBackToLocal(t *testing.T) {
 	s := newResultDecorateStage(t, map[string]interface{}{
 		"t2i":                true,
-		"t2i_word_threshold": 5,
+		"t2i_word_threshold": 50,
 		"t2i_strategy":       "remote",
 		"t2i_endpoint":       "",
 	})
-	event := makeEventWithText("足够长的文本来触发转换逻辑，由于没有配置远端地址应该回退到本地渲染生成图片。")
+	event := makeEventWithText(strings.Repeat("足够长的文本来触发转换逻辑，由于没有配置远端地址应该回退到本地渲染生成图片。", 2))
 	if err := s.applyT2I(event); err != nil {
 		t.Fatalf("applyT2I: %v", err)
 	}

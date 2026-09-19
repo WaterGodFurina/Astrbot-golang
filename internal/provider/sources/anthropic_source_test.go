@@ -60,8 +60,10 @@ func TestAnthropicBuildRequestBody(t *testing.T) {
 		t.Fatalf("unexpected tools: %v", tools)
 	}
 	msgs := body["messages"].([]map[string]interface{})
-	if len(msgs) != 3 {
-		t.Fatalf("expected 3 messages (tool_use + tool_result + user), got %d", len(msgs))
+	// 对齐 py _merge_consecutive_anthropic_messages：连续的 user 消息
+	//（tool_result 与最终 prompt）会合并为一条，tool_result 块前移。
+	if len(msgs) != 2 {
+		t.Fatalf("expected 2 messages (tool_use + merged user), got %d", len(msgs))
 	}
 	// assistant message carries a tool_use content block
 	asst := msgs[0]["content"].([]map[string]interface{})
@@ -72,19 +74,25 @@ func TestAnthropicBuildRequestBody(t *testing.T) {
 	if tu["type"] != "tool_use" || tu["id"] != "call_9" || tu["name"] != "lookup" {
 		t.Fatalf("unexpected tool_use block: %v", tu)
 	}
-	// tool message becomes a user/tool_result block
+	// tool message becomes a user/tool_result block（与最终 user prompt 合并）
 	trMsg := msgs[1]
 	if trMsg["role"] != "user" {
 		t.Fatalf("tool message role = %v", trMsg["role"])
 	}
-	tr := trMsg["content"].([]map[string]interface{})[0]
+	trContent := trMsg["content"].([]map[string]interface{})
+	if len(trContent) < 1 {
+		t.Fatalf("merged user message should keep tool_result + prompt, got %d blocks", len(trContent))
+	}
+	tr := trContent[0]
 	if tr["type"] != "tool_result" || tr["tool_use_id"] != "call_9" || tr["content"] != "result-9" {
 		t.Fatalf("unexpected tool_result block: %v", tr)
 	}
-	// final user message (prompt)
-	user := msgs[2]
-	if user["role"] != "user" {
-		t.Fatalf("final message role = %v", user["role"])
+	// 最终 user prompt 合并进同一条消息的后续块。
+	if len(trContent) < 2 {
+		t.Fatalf("expected merged user prompt block, got %v", trContent)
+	}
+	if txt, _ := trContent[1]["text"].(string); trContent[1]["type"] != "text" || txt != "continue" {
+		t.Fatalf("unexpected merged user prompt block: %v", trContent[1])
 	}
 }
 

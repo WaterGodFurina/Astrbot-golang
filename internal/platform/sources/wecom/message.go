@@ -117,7 +117,9 @@ func ExtractWecomMediaFilename(disposition string) string {
 			if strings.HasPrefix(strings.ToLower(value), "utf-8''") {
 				value = value[7:]
 			}
-			if decoded, err := url.QueryUnescape(value); err == nil {
+			// filename* 是 RFC 5987 的百分号编码，不是表单编码：
+			// QueryUnescape 会把 '+' 错误解码成空格，应使用 PathUnescape。
+			if decoded, err := url.PathUnescape(value); err == nil {
 				value = decoded
 			}
 			name := path.Base(strings.ReplaceAll(value, "\\", "/"))

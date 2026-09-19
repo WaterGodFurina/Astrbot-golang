@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/gorilla/websocket"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
@@ -144,6 +145,13 @@ func (a *Adapter) Start(ctx context.Context) error {
 					Proxy: http.ProxyURL(proxyURL),
 				},
 			}
+			// 网关长连接（WebSocket）同样走代理：discordgo v0.26+ 通过
+			// Session.Dialer 拨号，仅改 REST client 对 WS 无效（对齐 py
+			// discord.Client(proxy=...) 双生效）。
+			session.Dialer = &websocket.Dialer{
+				Proxy:            http.ProxyURL(proxyURL),
+				HandshakeTimeout: 30 * time.Second,
+			}
 		}
 	}
 
@@ -222,7 +230,8 @@ func (a *Adapter) Stop() error {
 // handleMessage converts an incoming message into an AstrBot event
 // (mirrors on_received + convert_message + handle_msg).
 func (a *Adapter) handleMessage(s *discordgo.Session, m *discordgo.MessageCreate) {
-	if m.Message == nil {
+	// webhook 消息可能没有 Author（nil），直接依赖会 panic。
+	if m.Message == nil || m.Author == nil {
 		return
 	}
 	// Ignore messages from other bots unless allow_bot_messages.
@@ -294,9 +303,12 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 		}
 	}
 	abm.MessageStr = content
-	abm.Sender = platform.MessageMember{
-		UserID:   msg.Author.ID,
-		Nickname: msg.Author.Username,
+	// 防御 webhook 等无 Author 的消息（调用方已判空，这里再做一层保证）。
+	if msg.Author != nil {
+		abm.Sender = platform.MessageMember{
+			UserID:   msg.Author.ID,
+			Nickname: discordNickname(msg.Member, msg.Author),
+		}
 	}
 
 	chain := []message.Component{}
@@ -321,6 +333,24 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 	abm.SessionID = msg.ChannelID
 	abm.MessageID = msg.ID
 	return abm
+}
+
+// discordNickname 返回发送者的展示名：优先公会昵称（Member.Nick），否则用户名。
+//
+// 有意偏离说明：discord.py 的 display_name 会优先取 global_name。但本项目
+// go.mod 固定的 discordgo v0.26.0 的 User 结构体没有 global_name 字段
+// （见 discordgo@v0.26.0/user.go 的 User 定义，仅有 Username/Discriminator），
+// 无法读取该值；Member.Nick 是该 SDK 中可用的最接近“展示名”的字段，故以其
+// 优先、username 兜底。若后续升级 discordgo（≥v0.27 提供 GlobalName），应改为
+// 在此优先返回 user.GlobalName。
+func discordNickname(member *discordgo.Member, user *discordgo.User) string {
+	if member != nil && member.Nick != "" {
+		return member.Nick
+	}
+	if user != nil && user.Username != "" {
+		return user.Username
+	}
+	return ""
 }
 
 // handleMsg publishes the event with wake detection (mirrors handle_msg:
@@ -563,10 +593,10 @@ func (a *Adapter) handleInteraction(s *discordgo.Session, i *discordgo.Interacti
 	userID, username := "", ""
 	if i.Member != nil && i.Member.User != nil {
 		userID = i.Member.User.ID
-		username = i.Member.User.Username
+		username = discordNickname(i.Member, i.Member.User)
 	} else if i.User != nil {
 		userID = i.User.ID
-		username = i.User.Username
+		username = discordNickname(nil, i.User)
 	}
 	abm.Sender = platform.MessageMember{
 		UserID:   userID,
@@ -902,7 +932,11 @@ func extractCommandInfo(filter star.HandlerFilter, handler *star.StarHandlerMeta
 		desc = "Command: " + cmdName
 	}
 	if len(desc) > 100 {
-		desc = desc[:97] + "..."
+		// Discord 指令描述按字符数限制，按字节截断会切裂中文 UTF-8。
+		runes := []rune(desc)
+		if len(runes) > 100 {
+			desc = string(runes[:97]) + "..."
+		}
 	}
 	return []string{cmdName, desc}
 }

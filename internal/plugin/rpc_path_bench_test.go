@@ -264,7 +264,7 @@ func BenchmarkRpcPathBlobFileRef(b *testing.B) {
 		data := makeBytes(size)
 		b.Run(fmt.Sprintf("blob_%dMB", size>>20), func(b *testing.B) {
 			b.ReportAllocs()
-			bs, err := NewBlobStore(b.TempDir(), 10*time.Minute, 1<<20)
+			bs, err := NewBlobStore(b.TempDir(), 10*time.Minute, 1<<20, defaultMaxBlobSize, defaultMaxBlobTTL)
 			if err != nil {
 				b.Fatal(err)
 			}

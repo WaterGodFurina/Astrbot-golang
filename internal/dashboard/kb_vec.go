@@ -77,6 +77,26 @@ func (s *Server) embedChunk(ep provider.EmbeddingProvider, text string) ([]float
 	return ep.GetEmbedding(ctx, text)
 }
 
+// docTitle 等价 Python Path(file_name).stem.strip()：取文件名（去目录）后去掉
+// 最后一个扩展名。隐藏文件名（如 .env，无 stem）保留原名。
+func docTitle(docName string) string {
+	base := filepath.Base(strings.TrimSpace(docName))
+	title := strings.TrimSuffix(base, filepath.Ext(base))
+	if title == "" {
+		title = base
+	}
+	return strings.TrimSpace(title)
+}
+
+// kbEmbedText 构造嵌入输入："文档标题\n\n" + 分块文本；无标题时退回原文
+// （对齐 kb_helper.py:395-400 的 embedding_contents）。
+func kbEmbedText(documentTitle, chunk string) string {
+	if documentTitle == "" {
+		return chunk
+	}
+	return documentTitle + "\n\n" + chunk
+}
+
 // indexKBFile chunks a document, embeds each chunk, writes to SQLite first
 // (list source of truth) then nanovec (vector index). A nanovec failure does
 // not roll back SQLite — the index can be rebuilt from SQLite later.
@@ -101,9 +121,13 @@ func (s *Server) indexKBFile(kbID, docID, docName string, content []byte, chunkS
 	if len(chunks) == 0 {
 		return 0, fmt.Errorf("文档内容为空")
 	}
+	// 对齐 Python KBHelper.upload_document：嵌入输入带"文档标题\n\n"前缀，
+	// 标题取 Path(file_name).stem.strip()（去掉目录与扩展名）；入库/检索展示
+	// 仍用原始分块文本，避免把标题写进 content（kb_helper.py:395-400）。
+	documentTitle := docTitle(docName)
 	if dim <= 0 {
 		// Try to detect dimension from the first embedding.
-		if v, err := s.embedChunk(ep, chunks[0]); err == nil {
+		if v, err := s.embedChunk(ep, kbEmbedText(documentTitle, chunks[0])); err == nil {
 			dim = len(v)
 		} else {
 			return 0, fmt.Errorf("无法确定向量维度: %w", err)
@@ -145,7 +169,7 @@ func (s *Server) indexKBFile(kbID, docID, docName string, content []byte, chunkS
 		}
 	}()
 	for _, c := range vecChunks {
-		v, err := s.embedChunk(ep, c.Content)
+		v, err := s.embedChunk(ep, kbEmbedText(documentTitle, c.Content))
 		if err != nil {
 			return len(vecChunks), fmt.Errorf("嵌入第 %d 块失败: %w（分块已回滚，可稍后重试）", c.ChunkIdx, err)
 		}
@@ -367,11 +391,20 @@ func (s *Server) RetrieveKBContext(umo, query string) (string, error) {
 		}
 		for _, hit := range results {
 			idx++
+			if idx == 1 {
+				sb.WriteString(kbContextHeader)
+			}
 			writeKBContextBlock(&sb, idx, kbNameByID[kbID], hit)
 		}
 	}
 	return sb.String(), nil
 }
+
+// kbContextHeader 对齐本体 kb_mgr._format_context 的固定开头说明行
+// （kb_mgr.py:352 `lines = ["以下是相关的知识库内容,请参考这些信息回答用户的问题:\n"]`）。
+// 本体随后用 "\n".join(lines) 拼装，等价于该头与首个【知识 N】之间空一行。
+// 缺此头曾使模型无法识别检索片段是"参考资料"而非用户指令。
+const kbContextHeader = "以下是相关的知识库内容,请参考这些信息回答用户的问题:\n\n"
 
 // writeKBContextBlock 按原版 kb_mgr._format_context 的格式写一条知识块：
 // 开头说明行 + 【知识 N】+ 来源（KB 名/文档名）+ 内容 + 相关度。来源与相关度
@@ -461,6 +494,9 @@ func (s *Server) RetrieveKBByNames(query string, kbNames []string, topKFusion, t
 		}
 		for _, hit := range hits {
 			idx++
+			if idx == 1 {
+				sb.WriteString(kbContextHeader)
+			}
 			writeKBContextBlock(&sb, idx, kbName, hit)
 			content := hit.Content
 			results = append(results, map[string]any{

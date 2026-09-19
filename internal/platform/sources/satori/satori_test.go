@@ -674,7 +674,10 @@ func TestRunLoopKeepsReconnectingAfterReady(t *testing.T) {
 	defer cancel()
 	go a.runLoop(ctx)
 
-	deadline := time.After(20 * time.Second)
+	// 11 次重连 × (1s 退避 + 握手) 下限≈11s；windows/macOS 共享 runner 抖动
+	// 大，放宽到约 5 倍预算，避免时序类假红（仍以轮询方式等待，超时即失败，
+	// 保持对重连语义的验证）。
+	deadline := time.After(60 * time.Second)
 	for {
 		mu.Lock()
 		n := connCount

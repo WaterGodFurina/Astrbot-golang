@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
@@ -68,6 +69,7 @@ type OpenAIResponsesSource struct {
 	*provider.BaseProvider
 	apiBase       string
 	apiKey        string
+	keyMu         sync.RWMutex
 	client        *http.Client
 	streamClient  *http.Client
 	customHeaders map[string]string
@@ -96,7 +98,12 @@ func NewOpenAIResponsesSource(config, settings map[string]interface{}) *OpenAIRe
 }
 
 func (s *OpenAIResponsesSource) getKeys() []string {
-	keysRaw, _ := s.Config()["key"].([]interface{})
+	cfg := s.Config()
+	// 兼容单字符串 key 形态（对齐 openai_source.getKeys）。
+	if single, ok := cfg["key"].(string); ok && single != "" {
+		return []string{single}
+	}
+	keysRaw, _ := cfg["key"].([]interface{})
 	if len(keysRaw) == 0 {
 		return []string{""}
 	}
@@ -114,11 +121,15 @@ func (s *OpenAIResponsesSource) getKeys() []string {
 
 // GetCurrentKey returns the current API key.
 func (s *OpenAIResponsesSource) GetCurrentKey() string {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
 	return s.apiKey
 }
 
 // SetKey sets the API key.
 func (s *OpenAIResponsesSource) SetKey(key string) {
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
 	s.apiKey = key
 }
 
@@ -129,7 +140,7 @@ func (s *OpenAIResponsesSource) GetModels(ctx context.Context) ([]string, error)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	req.Header.Set("Authorization", "Bearer "+s.GetCurrentKey())
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -543,7 +554,9 @@ func (s *OpenAIResponsesSource) buildRequestBody(req *provider.ProviderRequest, 
 	if _, has := body["reasoning"]; !has {
 		// Reasoning effort is resolved through ReasoningEffort(): generic
 		// custom_extra_body.reasoning_effort first, then the provider's own
-		// reasoning_effort, then the default "high" (aligned with 4.27.4 #9699).
+		// reasoning_effort. 仅当用户显式配置非空值时才注入 reasoning，缺省不下发
+		// （对齐 py openai_responses_source extra_body.pop("reasoning_effort",
+		// None)，None 不构造 reasoning），否则不支持 reasoning 的模型会 400。
 		// The raw reasoning_effort key is consumed and converted into
 		// reasoning.effort (mirrors 4.27.4 extra_body.pop("reasoning_effort")).
 		if re := s.ReasoningEffort(); re != "" {
@@ -764,7 +777,7 @@ func (s *OpenAIResponsesSource) doRequest(ctx context.Context, body map[string]i
 			return nil, err
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+s.apiKey)
+		httpReq.Header.Set("Authorization", "Bearer "+s.GetCurrentKey())
 		for k, v := range s.customHeaders {
 			httpReq.Header.Set(k, v)
 		}

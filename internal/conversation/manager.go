@@ -539,8 +539,21 @@ func (m *Manager) SetDequeueContextLength(n int) {
 	m.mu.Unlock()
 }
 
-// AppendHistory appends a message to the current conversation of a session. The conversation is lazily created when missing (Python's `_get_session_conv` behavior). When a dequeue context length is configured, the oldest entries are dropped so the stored history and its persisted content stay bounded.
+// AppendHistory appends a plain text message to the current conversation of a
+// session. Kept as a convenience wrapper over AppendHistoryEntry.
 func (m *Manager) AppendHistory(unifiedMsgOrigin string, role, content string) {
+	m.AppendHistoryEntry(unifiedMsgOrigin, map[string]interface{}{
+		"role":    role,
+		"content": content,
+	})
+}
+
+// AppendHistoryEntry appends a full history entry to the current conversation.
+// The entry is a free-form map so structured fields (e.g. think/encrypted
+// content parts for Anthropic extended thinking signatures) survive
+// persistence and can be replayed to the provider on later turns. The
+// conversation is lazily created and dequeued exactly like AppendHistory.
+func (m *Manager) AppendHistoryEntry(unifiedMsgOrigin string, entry map[string]interface{}) {
 	m.mu.Lock()
 	conv := m.byCID[m.current[unifiedMsgOrigin]]
 	if conv == nil {
@@ -550,16 +563,17 @@ func (m *Manager) AppendHistory(unifiedMsgOrigin string, role, content string) {
 	}
 	// 追加前确保历史已从 DB 补载（懒加载）：否则持久化时会以截断后的 短历史覆盖完整历史，造成数据丢失。
 	m.ensureHistoryLocked(conv)
-	conv.History = append(conv.History, map[string]interface{}{
-		"role":    role,
-		"content": content,
-	})
+	conv.History = append(conv.History, entry)
 	if m.dequeueContextLength > 0 && len(conv.History) > m.dequeueContextLength {
 		conv.History = conv.History[len(conv.History)-m.dequeueContextLength:]
 	}
 	conv.UpdatedAt = time.Now()
-	if conv.Title == "" && role == "user" {
-		conv.Title = deriveTitle(content)
+	if conv.Title == "" {
+		if role, _ := entry["role"].(string); role == "user" {
+			if content, _ := entry["content"].(string); content != "" {
+				conv.Title = deriveTitle(content)
+			}
+		}
 	}
 	m.mu.Unlock()
 	m.persistIfAlive(conv)

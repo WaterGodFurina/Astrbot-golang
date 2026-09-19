@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 )
 
 // WeChatClientError 企业微信 API 错误（对应 wechatpy 的 WeChatClientException，
@@ -33,6 +35,21 @@ func (e *WeChatClientError) Error() string {
 	return fmt.Sprintf("企业微信 API 错误: errcode=%d errmsg=%s", e.ErrCode, e.ErrMsg)
 }
 
+// checkWecomErr 校验企业微信响应中的 errcode：企业微信正常响应一定带
+// errcode（成功为 0）。字段缺失或非 0 都按失败处理，兼容 errcode 为字符串的
+// 响应，避免把格式异常的响应误判为成功。
+func checkWecomErr(data map[string]interface{}) error {
+	code, present := platform.WeChatErrCode(data)
+	if !present {
+		return &WeChatClientError{ErrCode: -1, ErrMsg: "响应缺少 errcode 字段"}
+	}
+	if code != 0 {
+		errMsg, _ := data["errmsg"].(string)
+		return &WeChatClientError{ErrCode: code, ErrMsg: errMsg}
+	}
+	return nil
+}
+
 // WeChatClient 企业微信 API 客户端（corpid + secret）。
 type WeChatClient struct {
 	corpID  string
@@ -43,6 +60,13 @@ type WeChatClient struct {
 	mu          sync.Mutex
 	accessToken string
 	tokenExpire time.Time
+	// tokenFetching/tokenFetchDone/tokenFetchErr 实现 GetAccessToken 的
+	// in-flight 去重（singleflight 语义）：token 过期瞬间只允许一个调用者
+	// 发起 gettoken HTTP 请求，其余并发调用者等待并复用其结果，避免 30s
+	// 网络耗时在锁内把全部发送方串行阻塞。HTTP 在锁外执行。
+	tokenFetching  bool
+	tokenFetchDone chan struct{}
+	tokenFetchErr  error
 }
 
 // NewWeChatClient 构造企业微信 API 客户端。
@@ -60,30 +84,78 @@ func NewWeChatClient(corpID, secret, apiBase string) *WeChatClient {
 
 // GetAccessToken 获取 access_token（带缓存，提前 5 分钟过期）。
 // 对应 wechatpy 的 client.get_access_token。
+//
+// 并发去重（self-rolled singleflight）：token 失效瞬间仅一个调用者发起
+// gettoken HTTP，其余调用者通过 tokenFetchDone 等待并复用同一结果；锁内
+// 只做缓存判断与 in-flight 登记，HTTP 请求在锁外执行，不再阻塞其他发送方。
 func (c *WeChatClient) GetAccessToken(ctx context.Context) (string, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.accessToken != "" && time.Now().Before(c.tokenExpire) {
-		return c.accessToken, nil
+		token := c.accessToken
+		c.mu.Unlock()
+		return token, nil
 	}
+	if c.tokenFetching {
+		// 已有刷新在途：等待其完成（或调用方 ctx 取消），再读结果。
+		done := c.tokenFetchDone
+		c.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+		c.mu.Lock()
+		token := c.accessToken
+		err := c.tokenFetchErr
+		c.mu.Unlock()
+		if token != "" {
+			return token, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("gettoken 并发刷新失败")
+		}
+		return "", err
+	}
+	// 登记本次刷新，锁外执行 HTTP。
+	c.tokenFetching = true
+	done := make(chan struct{})
+	c.tokenFetchDone = done
+	c.mu.Unlock()
+
+	token, expiresIn, err := c.fetchAccessToken(ctx)
+
+	c.mu.Lock()
+	if err == nil {
+		c.accessToken = token
+		c.tokenExpire = time.Now().Add(time.Duration(expiresIn-300) * time.Second)
+	}
+	c.tokenFetchErr = err
+	c.tokenFetching = false
+	c.tokenFetchDone = nil
+	close(done)
+	c.mu.Unlock()
+	return token, err
+}
+
+// fetchAccessToken 实际发起 gettoken 请求（不持有 c.mu），返回 token 与
+// 有效期秒数，供 GetAccessToken 的 in-flight 去重逻辑在锁外调用。
+func (c *WeChatClient) fetchAccessToken(ctx context.Context) (string, int, error) {
 	query := url.Values{}
 	query.Set("corpid", c.corpID)
 	query.Set("corpsecret", c.secret)
 	data, err := c.request(ctx, http.MethodGet, "gettoken", query, nil)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	token, _ := data["access_token"].(string)
 	if token == "" {
-		return "", fmt.Errorf("gettoken 响应缺少 access_token: %v", data)
+		return "", 0, fmt.Errorf("gettoken 响应缺少 access_token: %v", data)
 	}
 	expiresIn := 7200
 	if v, ok := data["expires_in"].(float64); ok && int(v) > 0 {
 		expiresIn = int(v)
 	}
-	c.accessToken = token
-	c.tokenExpire = time.Now().Add(time.Duration(expiresIn-300) * time.Second)
-	return token, nil
+	return token, expiresIn, nil
 }
 
 // request 发起企业微信 API 请求并解析 JSON 响应（errcode != 0 时返回 WeChatClientError）。
@@ -154,9 +226,8 @@ func (c *WeChatClient) doRequest(ctx context.Context, method, apiPath string, qu
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return nil, fmt.Errorf("解析企业微信响应失败: %w, body=%s", err, string(raw))
 	}
-	if errCode, ok := data["errcode"].(float64); ok && int(errCode) != 0 {
-		errMsg, _ := data["errmsg"].(string)
-		return nil, &WeChatClientError{ErrCode: int(errCode), ErrMsg: errMsg}
+	if err := checkWecomErr(data); err != nil {
+		return nil, err
 	}
 	return data, nil
 }
@@ -262,9 +333,8 @@ func (c *WeChatClient) UploadMedia(ctx context.Context, mediaType, filePath stri
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return "", fmt.Errorf("解析素材上传响应失败: %w", err)
 	}
-	if errCode, ok := data["errcode"].(float64); ok && int(errCode) != 0 {
-		errMsg, _ := data["errmsg"].(string)
-		return "", &WeChatClientError{ErrCode: int(errCode), ErrMsg: errMsg}
+	if err := checkWecomErr(data); err != nil {
+		return "", err
 	}
 	mediaID, _ := data["media_id"].(string)
 	if mediaID == "" {
@@ -300,9 +370,9 @@ func (c *WeChatClient) DownloadMedia(ctx context.Context, mediaID string) ([]byt
 	if resp.StatusCode != http.StatusOK {
 		var data map[string]interface{}
 		if json.Unmarshal(raw, &data) == nil {
-			if errCode, ok := data["errcode"].(float64); ok && int(errCode) != 0 {
+			if code, present := platform.WeChatErrCode(data); present && code != 0 {
 				errMsg, _ := data["errmsg"].(string)
-				return nil, nil, &WeChatClientError{ErrCode: int(errCode), ErrMsg: errMsg}
+				return nil, nil, &WeChatClientError{ErrCode: code, ErrMsg: errMsg}
 			}
 		}
 		return nil, nil, fmt.Errorf("素材下载失败: HTTP %d", resp.StatusCode)

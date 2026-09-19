@@ -97,3 +97,27 @@ func TestDownloadHTTPStatus(t *testing.T) {
 		t.Error("expected error for HTTP 404")
 	}
 }
+
+// TestFileURIToPathWindows 验证 Windows 盘符形态 file URI 的解析（跨平台可跑，
+// 生产仅在 GOOS=windows 走该分支；修复 CI Windows 上 file://C:\... 被当作远端
+// 主机拒绝的问题）。
+func TestFileURIToPathWindows(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{`file:///C:/Users/x/img.png`, filepath.FromSlash(`C:/Users/x/img.png`), true},
+		{`file://C:/Users/x/img.png`, filepath.FromSlash(`C:/Users/x/img.png`), true},
+		{`file://C:\Users\x\img.png`, filepath.FromSlash(`C:\Users\x\img.png`), true},
+		{`file:///C:/My%20Docs/a.png`, filepath.FromSlash(`C:/My Docs/a.png`), true},
+		{`file://server/share/x.png`, "", false},
+		{`file://localhost/C:/x.png`, "", false},
+	}
+	for _, c := range cases {
+		got, ok := fileURIToPathWindows(c.in)
+		if ok != c.ok || got != c.want {
+			t.Errorf("fileURIToPathWindows(%q) = (%q,%v), want (%q,%v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}

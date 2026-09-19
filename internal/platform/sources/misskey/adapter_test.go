@@ -448,7 +448,7 @@ func TestStreamingSubscribeChannel(t *testing.T) {
 	// 连接后订阅成功并记录 channel_id；重连会清空旧 channel 映射，避免残留
 	server := startTestWSServer(t)
 	streaming.instanceURL = server.URL
-	if !streaming.Connect() {
+	if !streaming.Connect(context.Background()) {
 		t.Fatal("连接失败")
 	}
 	defer streaming.Disconnect()
@@ -605,15 +605,15 @@ func TestNewReadsFloatConfig(t *testing.T) {
 func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
 	server := startTestWSServer(t)
 	streaming := NewStreamingClient(server.URL, "token")
-	if !streaming.Connect() {
+	if !streaming.Connect(context.Background()) {
 		t.Fatal("连接失败")
 	}
 	defer streaming.Disconnect()
 
 	// 模拟 Listen 安装的 pong 处理器
 	streaming.conn.SetPongHandler(keepalivePongHandler(streaming.conn))
-	// 先将读超时设到 300ms 后，然后由 pong 续期
-	_ = streaming.conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	// 先将读超时设到 3s（跨 OS 慢 runner 防抖），然后由 pong 续期
+	_ = streaming.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 
 	readResult := make(chan error, 1)
 	go func() {
@@ -621,7 +621,7 @@ func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
 		readResult <- err
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(1 * time.Second)
 	if err := keepalivePongHandler(streaming.conn)(""); err != nil {
 		t.Fatalf("pong 处理失败: %v", err)
 	}
@@ -629,7 +629,7 @@ func TestKeepalivePongHandlerExtendsReadDeadline(t *testing.T) {
 	select {
 	case err := <-readResult:
 		t.Fatalf("pong 续期后读仍返回错误（读超时未刷新）: %v", err)
-	case <-time.After(400 * time.Millisecond):
+	case <-time.After(4 * time.Second):
 		// 仍在阻塞读取，说明 pong 已将读超时续期
 	}
 	// 关闭连接以解除阻塞中的读 goroutine
@@ -659,7 +659,7 @@ func TestStreamingStaysAliveWithPongs(t *testing.T) {
 	defer server.Close()
 
 	streaming := NewStreamingClient(server.URL, "token")
-	if !streaming.Connect() {
+	if !streaming.Connect(context.Background()) {
 		t.Fatal("连接失败")
 	}
 	defer streaming.Disconnect()
@@ -682,7 +682,7 @@ func TestStreamingStaysAliveWithPongs(t *testing.T) {
 func TestConnectClearsChannels(t *testing.T) {
 	server := startTestWSServer(t)
 	streaming := NewStreamingClient(server.URL, "token")
-	if !streaming.Connect() {
+	if !streaming.Connect(context.Background()) {
 		t.Fatal("连接失败")
 	}
 	defer streaming.Disconnect()
@@ -693,7 +693,7 @@ func TestConnectClearsChannels(t *testing.T) {
 		t.Fatalf("订阅后 channels 数量错误: %d", len(streaming.channels))
 	}
 	// 重连：旧 channel_id 必须被清空
-	if !streaming.Connect() {
+	if !streaming.Connect(context.Background()) {
 		t.Fatal("重连失败")
 	}
 	if len(streaming.channels) != 0 {

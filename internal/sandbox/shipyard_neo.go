@@ -430,7 +430,12 @@ func (b *ShipyardNeoBooter) do(ctx context.Context, client *http.Client, ep, met
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+b.accessToken)
+	// 锁内取 token 快照：Start 可能并发发现并写回 accessToken，直接读会与
+	// b.mu 保护的写形成数据竞争（`go test -race` 可复现）。
+	b.mu.Lock()
+	token := b.accessToken
+	b.mu.Unlock()
+	req.Header.Set("Authorization", "Bearer "+token)
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}

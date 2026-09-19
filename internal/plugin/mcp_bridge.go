@@ -83,12 +83,9 @@ func (p *MCPClientPool) ensureLoadedLocked() {
 			continue
 		}
 		client := agent.NewMCPClient(name, srvCfg)
-		// 连接用独立 context（SSE 传输可能共享它做读循环），超时对齐
-		// ProcessStage.loadMCPTools 的 30s。
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		cerr := client.Connect(ctx)
-		cancel()
-		if cerr != nil {
+		// 连接生命周期由 MCPClient 自管（内部 30s 看门狗限时握手，ctx 存活至
+		// Cleanup），调用方不再 cancel——对齐 ProcessStage.loadMCPTools。
+		if cerr := client.Connect(context.Background()); cerr != nil {
 			continue
 		}
 		clients[name] = client

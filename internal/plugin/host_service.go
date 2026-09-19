@@ -23,6 +23,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -135,9 +136,20 @@ type RecallAdapter interface {
 }
 
 // pluginAdminListFromConfig 从主配置读取插件管理管理员名单（config 键
-// plugin_admin_list，字符串数组），并按 manifest 把 id 与注册名双向展开——
-// 配置写 id 形式（astrbot_plugin_xxx_python）或注册名形式
-// （astrbot_plugin_xxx）都能命中 SDK 侧按注册名的授权校验。缺省返回 nil。
+// plugin_admin_list），解析为 *manifest id 集合* 注入 SDK。
+//
+// 语义（p11/p12 修复）：SDK 的管理鉴权（SetPluginAdminList/hostAdminAuthorized）
+// 以"连接绑定的 manifest id"（hostServiceServer.connectionID）为键。manifest id
+// 由宿主按安装来源分配，插件无法自行声明；而注册名是插件 Register 时自报的，
+// 可被恶意插件冒用。因此宿主必须把配置条目解析为 manifest id 再注入——否则
+// 声明与管理员插件同名的恶意插件即可通过鉴权拿到安装/卸载权（p11）。
+//
+// 解析规则（fail-closed）：
+//   - 条目命中 manifest id 或注册名，且唯一对应同一个 manifest 条目 → 收其 id；
+//   - 同名多变体、id 与他名撞车等命中多个不同条目 → 该条目不注入并 Warn；
+//   - 未安装 / 无法解析 manifest → 一律不注入（宁无管理员，不放权给错插件）。
+//
+// 集合变化时重算名单（见 lifecycle 的 OnPluginsChanged → RefreshPluginAdminList）。
 func pluginAdminListFromConfig(cfgMgr *config.ConfigManager, subMgr *SubprocessManager) []string {
 	if cfgMgr == nil {
 		return nil
@@ -154,84 +166,158 @@ func pluginAdminListFromConfig(cfgMgr *config.ConfigManager, subMgr *SubprocessM
 	if !ok {
 		return nil
 	}
+	seen := map[string]bool{}
 	base := make([]string, 0, len(arr))
 	for _, e := range arr {
-		if s, ok := e.(string); ok && s != "" {
+		s, ok := e.(string)
+		if !ok {
+			continue
+		}
+		s = strings.TrimSpace(s)
+		if s != "" && !seen[s] {
+			seen[s] = true
 			base = append(base, s)
 		}
 	}
 	if len(base) == 0 || subMgr == nil {
-		return base
+		// 无配置条目，或无法解析 manifest（subMgr 缺失）：fail-closed 不注入。
+		return nil
 	}
-	// manifest 展开：id ↔ 注册名同入名单（SDK 授权校验用注册名）。
-	out := make([]string, 0, len(base)*2)
-	seen := map[string]bool{}
-	add := func(s string) {
-		if s != "" && !seen[s] {
-			seen[s] = true
-			out = append(out, s)
+	man := subMgr.cachedManifest()
+	if man == nil {
+		// 无法解析 manifest：fail-closed，不注入任何管理授权。
+		return nil
+	}
+	out := make([]string, 0, len(base))
+	added := map[string]bool{}
+	for _, e := range base {
+		id, ok := resolveAdminManifestID(man, e)
+		if !ok || id == "" {
+			logger.Warn("plugin_admin_list 条目 %q 无法唯一解析为 manifest id"+
+				"（未安装/同名多变体/歧义），已跳过其管理授权（fail-closed）", e)
+			continue
+		}
+		if !added[id] {
+			added[id] = true
+			out = append(out, id)
 		}
 	}
-	if man := subMgr.cachedManifest(); man != nil {
-		byID := map[string]string{}
-		byName := map[string]string{}
-		for i := range man.Plugins {
-			byID[man.Plugins[i].ID] = man.Plugins[i].Name
-			byName[man.Plugins[i].Name] = man.Plugins[i].ID
-		}
-		for _, e := range base {
-			add(e)
-			if n, ok := byID[e]; ok {
-				add(n)
-			}
-			if id, ok := byName[e]; ok {
-				add(id)
-			}
-		}
-		return out
-	}
-	return base
+	return out
 }
 
-// RefreshPluginAdminList 在 config 变更后重新注入插件管理名单（WebUI
-// "管理插件授权"保存后即时生效，无需重启）。
+// resolveAdminManifestID 把 plugin_admin_list 的一个条目解析为唯一 manifest id。
+// 条目可写 manifest id 或注册名；无论按 id 还是按 name 命中，都必须是同一个
+// manifest 条目。命中多个不同条目（同名多变体、或某条目的 id 与另一条目的
+// 注册名撞车）即歧义，返回 ok=false，由调用方 fail-closed 跳过。
+func resolveAdminManifestID(man *Manifest, entry string) (string, bool) {
+	if man == nil || entry == "" {
+		return "", false
+	}
+	matched := ""
+	for i := range man.Plugins {
+		e := &man.Plugins[i]
+		id := strings.TrimSpace(e.ID)
+		if id == "" {
+			continue
+		}
+		if id != entry && strings.TrimSpace(e.Name) != entry {
+			continue
+		}
+		if matched == "" {
+			matched = id
+			continue
+		}
+		if matched != id {
+			return "", false
+		}
+	}
+	if matched == "" {
+		return "", false
+	}
+	return matched, true
+}
+
+// RefreshPluginAdminList 在配置或插件集合变更后重新计算并注入管理名单
+// （manifest id 集合）。WebUI "管理插件授权"保存、安装/卸载/启停插件后即时
+// 生效，无需重启；歧义条目在重算时被剔除（fail-closed）。
 func RefreshPluginAdminList(cfgMgr *config.ConfigManager, subMgr *SubprocessManager) {
 	pluginsdk.SetPluginAdminList(pluginAdminListFromConfig(cfgMgr, subMgr))
 }
 
 // pluginConfigID 把 HostService 反调用携带的插件注册名解析为实例 id
-// （配置目录按 id = name_language 分键）。先查运行中实例（RPC 调用者必然
-// 是运行中的），未命中回退 manifest 首条同名条目；都没有则返回原名作为
-// 目录键兜底（兼容无 manifest 的测试/旧布局）。
+// （配置目录按 id = name_language 分键）。
+//
+// 同名 Go/Python 变体并存时，注册名无法区分调用方：此处按"唯一命中"解析，
+// 精确 id 命中优先；否则要求该注册名只对应一个实例/manifest 条目，命中多个
+// 即返回 ""（fail-closed），由调用方拒绝读写——绝不按 id 字典序猜测，否则
+// 一个变体会读到/写到另一个变体的配置（跨变体串读）。
+//
+// 局限（技术证据，无法在宿主侧彻底闭合）：HostService 回调 hook 的签名只带
+// pluginName（如 Go SDK v1.6.2 HostServiceHooks.GetConfig func(pluginName
+// string)），连接绑定的 manifest id 不传入，宿主无法在同名多变体间精确定位
+// 调用方。彻底修复需 SDK 把连接身份作为参数传给 hook；宿主侧已消除字典序猜测。
 func (m *SubprocessManager) pluginConfigID(name string) string {
-	if m == nil {
-		return name
+	if m == nil || name == "" {
+		return ""
 	}
-	if inst := m.instanceByName(name); inst != nil {
+	// 精确 id 命中（name 本身即实例 id，如休眠占位/测试/旧布局）。
+	if inst := m.Get(name); inst != nil {
 		if inst.ID != "" {
 			return inst.ID
 		}
-		// 实例缺 ID（构造型测试/边缘状态）→ 用 name 作为目录键兜底。
+		// 桩实例/旧数据未写 ID 时，配置目录按查找键（注册名）分键。
 		return name
 	}
+	// 运行中实例按注册名唯一命中。
+	hit := ""
+	for _, inst := range m.List() {
+		if inst.Name != name {
+			continue
+		}
+		if hit != "" && hit != inst.ID {
+			return ""
+		}
+		hit = inst.ID
+	}
+	if hit != "" {
+		return hit
+	}
+	// manifest 兜底（未加载/占位）：同样要求唯一。
 	if man, err := LoadManifest(m.manifestPath()); err == nil {
+		found := ""
 		for _, e := range man.Plugins {
-			if e.Name == name {
-				return e.ID
+			if e.Name != name {
+				continue
 			}
+			if found != "" && found != e.ID {
+				return ""
+			}
+			found = e.ID
+		}
+		if found != "" {
+			return found
 		}
 	}
+	// 零命中（实例尚未注册进 map，或旧布局/测试无 manifest）：回退注册名作为
+	// 配置目录键（兼容历史行为）。同名多变体歧义已在上面的循环里返回 ""，
+	// 故此处回退不会造成跨变体串读；且 SDK 侧 GetConfig 已按连接身份校验
+	// req.PluginName，插件无法用别人的名字请求配置。
 	return name
 }
 
 // resolvePluginConfig returns the merged plugin config for the HostService
-// GetConfig hook (nil manager → empty config). Testable seam: the hook body is
-// kept as a plain function so paths can be verified without an RPC broker.
+// GetConfig hook (nil manager → empty config). 解析不出唯一插件 id（同名多变体
+// 歧义）时返回空配置，避免跨变体串读。Testable seam: the hook body is kept as a
+// plain function so paths can be verified without an RPC broker.
 func resolvePluginConfig(m *SubprocessManager, name string) map[string]any {
 	if m == nil {
 		return map[string]any{}
 	}
-	return m.ConfigResolver().ResolvePluginConfig(m.pluginConfigID(name))
+	id := m.pluginConfigID(name)
+	if id == "" {
+		return map[string]any{}
+	}
+	return m.ConfigResolver().ResolvePluginConfig(id)
 }
 
 // serializeConversation 把会话对象序列化为 SDK 约定的 map（对齐 Python
@@ -262,11 +348,12 @@ func serializeConversation(conv *conversation.Conversation) map[string]any {
 // is_default，由 dashboard 人格存储写入。
 
 // personaFileCache 缓存 data/personas.json 的解析结果，避免每次调用都读盘。
-// 通过文件 mtime 判断内容是否变化，仅在有变更时重新读取。
+// 通过文件 mtime + size 判断内容是否变化，仅在有变更时重新读取。
 type personaFileCache struct {
 	mu      sync.Mutex
 	content []byte
 	modTime time.Time
+	size    int64
 }
 
 var personaCache personaFileCache
@@ -274,10 +361,11 @@ var personaCache personaFileCache
 // personaDataPath 是人格数据文件路径。SetHostService 时按 subMgr.dataDir
 // 对齐 dashboard 的写入路径（filepath.Join(dataDir, "personas.json")），
 // 避免宿主 CWD 非项目根/配置 dataDir 非 "data" 时插件人格 RPC 静默读空。
-var personaDataPath = "data/personas.json"
+// 默认值经 utils 统一解析数据目录，不再依赖相对 CWD 的 "data/"。
+var personaDataPath = utils.DataPath("personas.json")
 
 // loadPersonas 返回 data/personas.json 解析后的 persona 列表。
-// mtime 未变化时直接返回缓存内容，变化时才重读文件。
+// mtime+size 未变化时直接返回缓存内容，变化时才重读文件。
 func loadPersonas() []map[string]any {
 	info, err := os.Stat(personaDataPath)
 	if err != nil {
@@ -285,8 +373,10 @@ func loadPersonas() []map[string]any {
 	}
 	personaCache.mu.Lock()
 	defer personaCache.mu.Unlock()
-	if personaCache.content != nil && personaCache.modTime.Equal(info.ModTime()) {
-		return parsePersonas(personaCache.content)
+	// 同时比对 size：仅 mtime 时，同一时间戳内的等长/变长改写会命中陈旧缓存。
+	if personaCache.content != nil && personaCache.modTime.Equal(info.ModTime()) &&
+		personaCache.size == info.Size() {
+		return clonePersonas(parsePersonas(personaCache.content))
 	}
 	data, err := os.ReadFile(personaDataPath)
 	if err != nil {
@@ -294,7 +384,27 @@ func loadPersonas() []map[string]any {
 	}
 	personaCache.content = data
 	personaCache.modTime = info.ModTime()
-	return parsePersonas(data)
+	personaCache.size = info.Size()
+	return clonePersonas(parsePersonas(data))
+}
+
+// clonePersonas 深拷贝 persona 列表（含元素 map），避免调用方改动缓存内容。
+func clonePersonas(in []map[string]any) []map[string]any {
+	if in == nil {
+		return nil
+	}
+	out := make([]map[string]any, len(in))
+	for i, m := range in {
+		if m == nil {
+			continue
+		}
+		cp := make(map[string]any, len(m))
+		for k, v := range m {
+			cp[k] = v
+		}
+		out[i] = cp
+	}
+	return out
 }
 
 // parsePersonas 解析 personas.json 的 personas 数组。
@@ -503,8 +613,9 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 	}
 	if subMgr != nil && subMgr.dataDir != "" {
 		personaDataPath = filepath.Join(subMgr.dataDir, "personas.json")
-		// 大文件 Blob 存储根目录 data/blobs（P0-2）。启动即初始化，TTL 10min。
-		bs, err := NewBlobStore(filepath.Join(subMgr.dataDir, "blobs"), 10*time.Minute, 1<<20)
+		// 大文件 Blob 存储根目录 data/blobs（P0-2）。启动即初始化：TTL 10min，
+		// 单 blob 大小与存活 TTL 配额显式注入（默认 64MB / 1h）。
+		bs, err := NewBlobStore(filepath.Join(subMgr.dataDir, "blobs"), 10*time.Minute, 1<<20, defaultMaxBlobSize, defaultMaxBlobTTL)
 		if err != nil {
 			logger.I18nWarn("初始化 Blob 存储失败: %v", err)
 		} else {
@@ -513,8 +624,9 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		}
 	}
 	// 插件管理管理员名单：默认无管理插件（插件仅能启停自身）。
-	// config 的 plugin_admin_list 数组可授权指定插件（注册名或 manifest id
-	// 均可，注入时双向展开）执行安装/卸载/操作其他插件。
+	// config 的 plugin_admin_list 条目（历史写法可能是注册名或 manifest id）
+	// 在此解析为 manifest id 集合注入；SDK 以连接绑定的 manifest id 鉴权，
+	// 注册名重名无法冒充；歧义条目 fail-closed 不注入。
 	pluginsdk.SetPluginAdminList(pluginAdminListFromConfig(cfgMgr, subMgr))
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
 		CallAction: func(platformID, api string, params map[string]any) (map[string]any, error) {
@@ -573,17 +685,22 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			// 动态填充 options/labels）。
 			if subMgr != nil {
 				id := subMgr.pluginConfigID(pluginName)
-				// __schema__ 注入**扁平**结构（对齐原版插件期望）：插件侧
-				// self.config.schema 是"配置项名 → 元数据"的 dict，插件
-				// 直接按顶层 key 访问（如 update_manager 的
-				// schema.get("white_plugin_list")）。Register 上报的
-				// ConfigSchemaJson 是 WebUI 用的 {"type","properties"}
-				// 包装（SDK _load_config_schema），需展开 properties。
-				if s := subMgr.ConfigSchema(id); len(s) > 0 {
-					if props, ok := s["properties"].(map[string]any); ok {
-						cfg["__schema__"] = props
-					} else {
-						cfg["__schema__"] = s
+				// id == ""（同名多变体歧义）时不附加 schema：避免把另一个
+				// 变体的 schema 串给调用方（get_config 的默认值合并已在上方
+				// resolvePluginConfig 同样 fail-closed）。
+				if id != "" {
+					// __schema__ 注入**扁平**结构（对齐原版插件期望）：插件侧
+					// self.config.schema 是"配置项名 → 元数据"的 dict，插件
+					// 直接按顶层 key 访问（如 update_manager 的
+					// schema.get("white_plugin_list")）。Register 上报的
+					// ConfigSchemaJson 是 WebUI 用的 {"type","properties"}
+					// 包装（SDK _load_config_schema），需展开 properties。
+					if s := subMgr.ConfigSchema(id); len(s) > 0 {
+						if props, ok := s["properties"].(map[string]any); ok {
+							cfg["__schema__"] = props
+						} else {
+							cfg["__schema__"] = s
+						}
 					}
 				}
 			}
@@ -593,16 +710,20 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			if subMgr == nil {
 				return fmt.Errorf("plugin manager not available")
 			}
-			return subMgr.SaveConfig(subMgr.pluginConfigID(pluginName), cfg)
+			id := subMgr.pluginConfigID(pluginName)
+			if id == "" {
+				return fmt.Errorf("无法唯一定位插件 %q 的配置（可能同名多变体），已拒绝写入以避免跨变体覆盖", pluginName)
+			}
+			return subMgr.SaveConfig(id, cfg)
 		},
 		RegisterBridgeHook: func(pluginName, hookName string) error {
 			if subMgr == nil {
 				return fmt.Errorf("plugin manager not available")
 			}
 			id := subMgr.pluginConfigID(pluginName)
-			if inst := subMgr.Get(id); inst == nil {
-				// 找不到运行实例：不破坏插件启动，告警后忽略。
-				logger.I18nWarn("插件 %s 注册桥接钩子 %s 失败：实例不存在", pluginName, hookName)
+			if id == "" || subMgr.Get(id) == nil {
+				// 找不到唯一运行实例：不破坏插件启动，告警后忽略。
+				logger.I18nWarn("插件 %s 注册桥接钩子 %s 失败：实例不存在或同名多变体歧义", pluginName, hookName)
 				return nil
 			}
 			subMgr.RegisterBridgeHook(id, hookName)
@@ -613,8 +734,8 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				return fmt.Errorf("plugin manager not available")
 			}
 			id := subMgr.pluginConfigID(pluginName)
-			if inst := subMgr.Get(id); inst == nil {
-				logger.I18nWarn("插件 %s 注销桥接钩子 %s 失败：实例不存在", pluginName, hookName)
+			if id == "" || subMgr.Get(id) == nil {
+				logger.I18nWarn("插件 %s 注销桥接钩子 %s 失败：实例不存在或同名多变体歧义", pluginName, hookName)
 				return nil
 			}
 			subMgr.UnregisterBridgeHook(id, hookName)
@@ -1151,6 +1272,9 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				return fmt.Errorf("plugin manager not available")
 			}
 			id := subMgr.pluginConfigID(pluginName)
+			if id == "" {
+				return fmt.Errorf("无法唯一定位插件 %q（可能同名多变体），已拒绝启停以避免误操作其他变体", pluginName)
+			}
 			return subMgr.SetEnabled(id, enabled)
 		},
 		InstallPlugin: func(repo string) error {
@@ -1168,6 +1292,9 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				return fmt.Errorf("plugin manager not available")
 			}
 			id := subMgr.pluginConfigID(pluginName)
+			if id == "" {
+				return fmt.Errorf("无法唯一定位插件 %q（可能同名多变体），已拒绝卸载以避免误删其他变体", pluginName)
+			}
 			return subMgr.Uninstall(id, false, false)
 		},
 		ListPlatforms: func() []map[string]any {

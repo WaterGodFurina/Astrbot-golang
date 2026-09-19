@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,12 @@ import (
 func inTempDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	// macOS 上 /var→/private/var 软链：t.TempDir() 给逻辑路径，而 os.Getwd/
+	// filepath.Abs 给物理路径，两者词法不等会让 workspace 内绝对路径被误拒。
+	// 规范化到物理路径与生产一致（Linux/Windows EvalSymlinks 基本恒等）。
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
+	}
 	old, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
@@ -78,6 +85,14 @@ func TestResolveLocalPathHomeAndDot(t *testing.T) {
 	}
 }
 
+func hostFileOutsideWorkspace(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return filepath.Join(filepath.VolumeName(t.TempDir()), "Windows", "System32", "config", "SAM")
+	}
+	return "/etc/passwd"
+}
+
 func TestResolveLocalPathRejectsOutside(t *testing.T) {
 	inTempDir(t)
 	umo := "t:c"
@@ -85,7 +100,7 @@ func TestResolveLocalPathRejectsOutside(t *testing.T) {
 	if _, err := resolveLocalPath("../outside.txt", umo, false, true); err == nil {
 		t.Errorf("expected rejection for ../ outside workspace")
 	}
-	if _, err := resolveLocalPath("/etc/passwd", umo, false, true); err == nil {
+	if _, err := resolveLocalPath(hostFileOutsideWorkspace(t), umo, false, true); err == nil {
 		t.Errorf("expected rejection for absolute path outside allowed roots")
 	}
 	if _, err := resolveLocalPath("../../../../tmp/evil.txt", umo, false, true); err == nil {
@@ -148,7 +163,11 @@ func TestExecuteGrepRestrictsToWorkspace(t *testing.T) {
 	dir := inTempDir(t)
 	umo := "t:c"
 
-	if out := executeGrep("x", "/etc", "", 10, umo, true); !strings.Contains(out, "restricted") {
+	outsideDir := "/etc"
+	if runtime.GOOS == "windows" {
+		outsideDir = filepath.Join(filepath.VolumeName(dir), "Windows", "System32", "drivers", "etc")
+	}
+	if out := executeGrep("x", outsideDir, "", 10, umo, true); !strings.Contains(out, "restricted") {
 		t.Errorf("expected absolute path outside workspace rejected, got: %q", out)
 	}
 	if out := executeGrep("x", "../../../etc", "", 10, umo, true); !strings.Contains(out, "restricted") {
@@ -252,6 +271,9 @@ func TestShellSessionSignalOwnership(t *testing.T) {
 }
 
 func TestBackgroundShellSessionStdinWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relies on POSIX `cat` echoing stdin; Get-Content on cmd.exe does not read redirected stdin")
+	}
 	inTempDir(t)
 	umo := "bg:test"
 	out := executeLocalShell(umo, umo, "cat", true, 0)

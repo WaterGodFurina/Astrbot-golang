@@ -13,7 +13,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,6 +22,7 @@ import (
 	"github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 )
 
 var lineLogger = log.GetDefault().WithComponent("Line")
@@ -250,13 +250,13 @@ func extractFilenameFromDisposition(disposition string) string {
 
 // guessSuffix 根据 Content-Type 猜测文件后缀，失败时使用 fallback。
 // 对应 Python 的 _guess_suffix（mimetypes.guess_extension）。
+// 使用平台内置固定映射，避免 mime.ExtensionsByType 的跨 OS 差异。
 func guessSuffix(contentType string, fallback string) string {
 	if contentType == "" {
 		return fallback
 	}
-	baseType := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
-	if exts, err := mime.ExtensionsByType(baseType); err == nil && len(exts) > 0 {
-		return exts[0]
+	if ext := platform.ExtensionByMIMEType(contentType); ext != "" {
+		return ext
 	}
 	return fallback
 }

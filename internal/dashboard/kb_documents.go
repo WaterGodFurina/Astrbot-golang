@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -140,7 +141,25 @@ func (s *Server) kbDocImportURL(w http.ResponseWriter, r *http.Request, kbID str
 	})
 
 	// Index asynchronously (chunk → embed → dual write), same as uploads.
+	// 解析畸形文档（PDF/EPUB 等第三方解析库）可能 panic，必须 recover，
+	// 否则会击穿整个进程。recover 后标记任务失败并把错误返回给轮询端。
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("KB URL 导入异步索引 panic (task=%s kb=%s): %v\n%s", taskID, kbID, r, debug.Stack())
+				s.recordKBTask(&kbUploadTask{
+					TaskID:       taskID,
+					KBID:         kbID,
+					Status:       "failed",
+					Stage:        "panic",
+					Current:      100,
+					Total:        100,
+					SuccessCount: 0,
+					FailedCount:  1,
+					Error:        fmt.Sprintf("索引过程发生 panic: %v", r),
+				})
+			}
+		}()
 		if _, err := s.indexKBFile(kbID, docID, name, content, chunkSize, chunkOverlap); err != nil {
 			s.recordKBTask(&kbUploadTask{
 				TaskID:       taskID,
@@ -319,6 +338,27 @@ func (s *Server) kbDocUpload(w http.ResponseWriter, r *http.Request, kbID string
 	go func() {
 		success, failed := 0, 0
 		total := len(docs)
+		// 畸形文件（PDF/EPUB/XLS 等第三方解析库）可能 panic：recover 兜底，
+		// 记录失败任务，绝不击穿进程。
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error("KB 上传异步索引 panic (task=%s kb=%s): %v\n%s", taskID, kbID, r, debug.Stack())
+				// panic 可能发生在某个文档处理途中：该文档既未计入 success 也
+				// 未走到失败的 failed++，故这里 failed+1 补记"正在处理却因
+				// panic 中断"的这一条，语义与常规单条失败计数一致。
+				s.recordKBTask(&kbUploadTask{
+					TaskID:       taskID,
+					KBID:         kbID,
+					Status:       "failed",
+					Stage:        "panic",
+					Current:      total * 100,
+					Total:        total * 100,
+					SuccessCount: success,
+					FailedCount:  failed + 1,
+					Error:        fmt.Sprintf("索引过程发生 panic: %v", r),
+				})
+			}
+		}()
 		for i, d := range docs {
 			s.recordKBTask(&kbUploadTask{
 				TaskID:       taskID,
@@ -345,7 +385,7 @@ func (s *Server) kbDocUpload(w http.ResponseWriter, r *http.Request, kbID string
 					TaskID: taskID, KBID: kbID, Status: "processing",
 					Stage: "extract_failed", FileIndex: i,
 					Current: (i + 1) * 100, Total: total * 100,
-					SuccessCount: success, FailedCount: failed + 1,
+					SuccessCount: success, FailedCount: failed,
 					Error: fmt.Sprintf("解析 %s 失败: %v", d.Name, err),
 				})
 				continue

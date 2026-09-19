@@ -12,6 +12,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,10 +181,19 @@ func (c *MattermostClient) DownloadFile(ctx context.Context, fileID string) ([]b
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return nil, fmt.Errorf("mattermost 下载文件 %s 失败: %d %s", fileID, resp.StatusCode, body)
 	}
-	return io.ReadAll(resp.Body)
+	// 限制单次下载大小，避免远端返回超大/无限响应导致内存耗尽。
+	const maxDownloadBytes = 64 << 20
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxDownloadBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxDownloadBytes {
+		return nil, fmt.Errorf("mattermost 文件 %s 超过大小上限 %d 字节", fileID, maxDownloadBytes)
+	}
+	return data, nil
 }
 
 // UploadFile 以 multipart/form-data 上传文件（POST /api/v4/files），返回 file_id。
@@ -194,7 +204,20 @@ func (c *MattermostClient) UploadFile(ctx context.Context, channelID string, fil
 	if err := writer.WriteField("channel_id", channelID); err != nil {
 		return "", err
 	}
-	part, err := writer.CreateFormFile("files", filename)
+	// 不能使用 writer.CreateFormFile：它把 part 的 Content-Type 硬编码为
+	// application/octet-stream，会忽略探测出的 contentType。手动构造 part
+	// 头，把 content_type 实际传给 Mattermost（对齐 Python aiohttp 的
+	// form.add_field(..., content_type=content_type)）。
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	partHeader := make(textproto.MIMEHeader)
+	partHeader.Set("Content-Disposition", mime.FormatMediaType("form-data", map[string]string{
+		"name":     "files",
+		"filename": filename,
+	}))
+	partHeader.Set("Content-Type", contentType)
+	part, err := writer.CreatePart(partHeader)
 	if err != nil {
 		return "", err
 	}
@@ -289,15 +312,44 @@ func (c *MattermostClient) resolveMedia(ctx context.Context, path, file, base64D
 		return nil, fmt.Errorf("读取媒体 %s 失败: %w", source, err)
 	}
 
-	filename := filepath.Base(source)
+	filename := sanitizeUploadFilename(filepath.Base(source))
 	if fallbackName != "" {
-		filename = fallbackName
+		if cleaned := sanitizeUploadFilename(fallbackName); cleaned != "" {
+			filename = cleaned
+		}
 	}
 	if filename == "." || filename == "/" || filename == "" {
 		filename = "file"
 	}
 	contentType := detectMimeType(data, filename, defaultMime)
 	return &mediaBytes{data: data, filename: filename, contentType: contentType}, nil
+}
+
+// sanitizeUploadFilename 提取安全的文件名：去掉目录部分（含 Windows 反斜杠
+// 路径的盘符/用户名）并剔除控制字符与路径/协议非法字符，避免把完整本地路径
+// 作为上传文件名泄漏给平台（对应 Python Path(path).name）。
+func sanitizeUploadFilename(name string) string {
+	if name == "" {
+		return ""
+	}
+	// Windows 路径可能用 '\'，而本进程可能运行在非 Windows：两种分隔符都处理。
+	if i := strings.LastIndexAny(name, `/\`); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '_'
+		}
+		if strings.ContainsRune(`/\:*?"<>|`, r) {
+			return '_'
+		}
+		return r
+	}, name)
+	name = strings.TrimSpace(name)
+	if name == "." || name == ".." {
+		return ""
+	}
+	return name
 }
 
 // downloadBytes 下载远程内容（经 SSRF 校验，上限 64MiB）。
@@ -313,7 +365,8 @@ func detectMimeType(data []byte, filename, defaultMime string) string {
 	if detected != "" && detected != "text/plain; charset=utf-8" {
 		return detected
 	}
-	if ext := mime.TypeByExtension(strings.ToLower(filepath.Ext(filename))); ext != "" {
+	// 使用平台内置固定映射，避免 mime.TypeByExtension 的跨 OS 差异。
+	if ext := platform.MIMETypeByFilename(filename); ext != "" {
 		return ext
 	}
 	if defaultMime != "" {
@@ -362,12 +415,9 @@ func (c *MattermostClient) SendMessageChain(ctx context.Context, channelID strin
 			var err error
 			switch fileSeg := comp.(type) {
 			case *message.File:
-				// File 组件使用 name 或路径基名作为文件名
-				filename := fileSeg.Name
-				if filename == "" {
-					filename = fileSeg.Path
-				}
-				media, err = c.resolveMedia(ctx, fileSeg.Path, "", "", fileSeg.URL, filename, "application/octet-stream")
+				// File 组件使用 name 作为文件名；name 为空时由 resolveMedia
+				// 从 path 取 basename（绝不把完整本地路径当文件名）。
+				media, err = c.resolveMedia(ctx, fileSeg.Path, "", "", fileSeg.URL, fileSeg.Name, "application/octet-stream")
 			case *message.Record:
 				media, err = c.resolveMedia(ctx, fileSeg.Path, fileSeg.File, fileSeg.Base64, fileSeg.URL, "voice", "application/octet-stream")
 			default:

@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"html"
 	"io"
-	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -925,11 +924,9 @@ func decodeBase64Payload(s string) ([]byte, error) {
 }
 
 // mimeTypeByExt 根据文件扩展名推断 MIME 类型。
+// 使用平台内置固定映射，避免 mime.TypeByExtension 的跨 OS 不一致。
 func mimeTypeByExt(ext string) string {
-	if ext == "" {
-		return ""
-	}
-	return mime.TypeByExtension(strings.ToLower(ext))
+	return platform.MIMETypeByExt(ext)
 }
 
 // sniffImageMIME 通过魔数推断图片 MIME 类型。

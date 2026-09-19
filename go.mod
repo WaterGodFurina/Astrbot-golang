@@ -5,10 +5,10 @@ go 1.26
 require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.2
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.3
 	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.9
 	github.com/blusewang/wx v1.3.3
-	github.com/bwmarrin/discordgo v0.25.1
+	github.com/bwmarrin/discordgo v0.26.0
 	github.com/dobest1024/go-weixin-ilink v0.2.0
 	github.com/fogleman/gg v1.3.0
 	github.com/golang-jwt/jwt/v5 v5.3.1

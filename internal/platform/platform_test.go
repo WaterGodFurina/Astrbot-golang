@@ -91,6 +91,36 @@ func (f *fakeReactor) React(sessionID, messageID, emoji string) error {
 	return nil
 }
 
+// fakeStats implements PlatformAdapter and StatsProvider.
+type fakeStats struct {
+	*fakeAdapter
+	stats map[string]interface{}
+}
+
+func (f *fakeStats) Stats() map[string]interface{} { return f.stats }
+
+// TestGetAllStatsAggregatesProviders verifies that GetAllStats merges the
+// Stats() payload of StatsProvider adapters and skips those without it.
+func TestGetAllStatsAggregatesProviders(t *testing.T) {
+	pm := NewPlatformManager()
+	pm.Register(&fakeStats{
+		fakeAdapter: &fakeAdapter{id: "b_stats", typ: "mock"},
+		stats:       map[string]interface{}{"queues": map[string]int{"input": 1}},
+	})
+	pm.Register(&fakeAdapter{id: "a_plain", typ: "mock"}) // 无 StatsProvider，应被跳过
+
+	got := pm.GetAllStats()
+	if len(got) != 1 {
+		t.Fatalf("期望 1 个带统计的适配器，got %d", len(got))
+	}
+	if got[0]["id"] != "b_stats" || got[0]["type"] != "mock" {
+		t.Errorf("适配器身份字段错误: %v", got[0])
+	}
+	if _, ok := got[0]["queues"]; !ok {
+		t.Errorf("Stats() 内容未合并: %v", got[0])
+	}
+}
+
 // TestReactRoutesToReactor verifies React still works for registered platforms.
 func TestReactRoutesToReactor(t *testing.T) {
 	pm := NewPlatformManager()

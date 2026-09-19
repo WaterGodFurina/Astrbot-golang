@@ -12,7 +12,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -35,6 +34,10 @@ const (
 	defaultAPiBaseURL = "https://qyapi.weixin.qq.com/cgi-bin/"
 	// kfTextDedupTTL 微信客服文本消息去重窗口（对应 WECHAT_KF_TEXT_CONTENT_DEDUP_TTL_SECONDS = 15 秒）
 	kfTextDedupTTL = 15 * time.Second
+	// callbackTimestampTolerance 回调时间戳新鲜度窗口。Python 原版完全没有
+	// 该校验（wecom_adapter.py 直接解密），过严的 ±300s 会让宿主时钟偏差
+	// >5 分钟的部署所有回调都 400；这里放宽到 1 小时并保留签名校验。
+	callbackTimestampTolerance = time.Hour
 )
 
 // Adapter 企业微信（应用 & 微信客服）平台适配器。
@@ -61,22 +64,33 @@ type Adapter struct {
 	crypto *WXBizMsgCrypt
 	server *WecomServer
 
-	mu         sync.Mutex
-	agentID    string // 最近一次收到的消息的 AgentID（用于回复）
-	seenKFText map[string]time.Time
-	seenAppMsg map[string]time.Time
-	stopCh     chan struct{}
+	mu             sync.Mutex
+	agentBySession map[string]agentBinding // 会话 -> 发送方标识（应用 agent_id / 客服 open_kfid）
+	seenKFText     map[string]time.Time
+	seenAppMsg     map[string]time.Time
+	stopCh         chan struct{}
 }
+
+// agentBinding 记录某会话的发送方标识及其最近写入时间。用于按会话精确回复，
+// 避免多会话并发时用"最近一次"的 agent_id 回复到错误的应用/客服账号。
+type agentBinding struct {
+	id string
+	at time.Time
+}
+
+// agentBindingTTL 会话发送方绑定的存活时间：超时后淘汰，防止无界增长。
+const agentBindingTTL = 24 * time.Hour
 
 // New 构造企业微信适配器。
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		config:     config,
-		settings:   settings,
-		EventBus:   eventBus,
-		seenKFText: make(map[string]time.Time),
-		seenAppMsg: make(map[string]time.Time),
-		stopCh:     make(chan struct{}),
+		config:         config,
+		settings:       settings,
+		EventBus:       eventBus,
+		seenKFText:     make(map[string]time.Time),
+		seenAppMsg:     make(map[string]time.Time),
+		agentBySession: make(map[string]agentBinding),
+		stopCh:         make(chan struct{}),
 	}
 	a.id, _ = config["id"].(string)
 	if a.id == "" {
@@ -252,8 +266,13 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 	msgSignature := query.Get("msg_signature")
 	timestamp := query.Get("timestamp")
 	nonce := query.Get("nonce")
-	// 时间戳新鲜度校验：拒绝与当前时间偏差超过 5 分钟的请求（防重放）。
-	if ts, err := strconv.ParseInt(timestamp, 10, 64); err != nil || math.Abs(float64(time.Now().Unix()-ts)) > 300 {
+	// 时间戳新鲜度校验：对齐 Python（原版无此校验），窗口放宽到
+	// callbackTimestampTolerance 以容忍宿主时钟偏差；偏差过大时打日志而非
+	// 静默拒绝。签名校验仍由 DecryptMessage 完成，防重放不依赖此项。
+	if ts, err := strconv.ParseInt(timestamp, 10, 64); err != nil {
+		logger.I18nWarn("企业微信回调 timestamp 非数字: %q，交由签名校验: %v", timestamp, err)
+	} else if skew := time.Duration(time.Now().Unix()-ts) * time.Second; skew > callbackTimestampTolerance || skew < -callbackTimestampTolerance {
+		logger.I18nWarn("企业微信回调 timestamp 偏差过大(%s)，已拒绝: ts=%d", skew, ts)
 		http.Error(w, "timestamp 过期", http.StatusBadRequest)
 		return
 	}
@@ -275,7 +294,15 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.I18nInfo("解析成功: type=%s msgid=%s agent=%s", msg.Type, msg.ID, msg.Agent)
 
-	// 先回包 success（微信要求 5 秒内响应），耗时操作异步执行，避免媒体下载等超时被重推
+	// 先回包 success（微信要求 5 秒内响应），耗时操作异步执行，避免媒体下载等超时被重推。
+	//
+	// 【有意偏离 py，且 Go 行为更正确】证据：
+	//   - py wecom_adapter.py:129-154 handle_callback 在 `await self.callback(msg)`
+	//     完成后才 `return "success"`，即处理完再 ack。
+	//   - 但企业微信回调要求 5s 内返回，否则重试投递；Go 侧消息处理含媒体下载/
+	//     LLM/转码，可能远超 5s。若照搬 py 先处理再 ack，会触发大量重复回调
+	//     （应用消息虽有 MsgId 去重，客服消息仍会重复拉取）。故此处有意改为
+	//     先 ack 再异步处理，配合 isDuplicateAppMessage / kf 去重保证幂等。
 	w.Header().Set("Content-Type", "text/plain")
 	_, _ = io.WriteString(w, "success")
 
@@ -287,6 +314,23 @@ func (a *Adapter) handleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleKFMsgOrEvent 处理 kf_msg_or_event 回调：通过 kf/sync_msg 拉取最新客服消息。
+//
+// 【有意修正性偏离 Python，非等价移植，请勿按 Python 回改】
+// Python 权威参考 wecom_adapter.py:221-239 的 get_latest_msg_item：
+//
+//	has_more = 1
+//	while has_more:
+//	    ret = self.wechat_kf_api.sync_msg(token, kfid)   # cursor 恒为默认 ""
+//	    has_more = ret["has_more"]
+//	msg_list = ret.get("msg_list", [])
+//	return msg_list[-1] if msg_list else None            # 只取最后一页最后一条
+//
+// Python 的缺陷：循环翻页用同一 cursor 反复拉取，翻页结果被丢弃，最终只把
+// 最后一页的末条消息交给 convert_wechat_kf_message，同一回调批次里除末条
+// 之外的客服消息全部丢失（用户连发多条只处理最后一条）。
+// Go 的实现：每轮回传上一轮的 next_cursor 正确翻页，并逐条 convertKFMessage
+// 处理全部消息（adapter.go:302-327），不再丢消息。这是有意修正性偏离，
+// 以“不丢客服消息”为正确基线；仅在明确需要复刻 Python 缺陷时才改动。
 func (a *Adapter) handleKFMsgOrEvent(msg *WecomMessage) {
 	ctx := context.Background()
 	cursor := ""
@@ -358,16 +402,21 @@ func (a *Adapter) convertMessage(msg *WecomMessage) {
 		// 对齐 Python：amr 语音经 ffmpeg 转为 wav（MediaResolver
 		// target_format="wav"），供下游语音识别；转码产物为内存数据后
 		// 落盘为 .wav，其余字段与 Python 一致。
-		wavData := convertAudioToWav(data)
+		// 对齐 Python wecom_adapter.py:396-404：转码失败时记录错误并丢弃
+		// 该语音消息（不投递原 amr），否则 ASR 会对 amr 产生行为漂移。
+		wavData, ok := convertAudioToWav(data)
+		if !ok {
+			logger.I18nError("转换企业微信语音失败，已丢弃该语音消息。如果没有安装 ffmpeg 请先安装。")
+			_ = os.Remove(path)
+			return
+		}
 		wavPath := path + ".wav"
 		if err := os.WriteFile(wavPath, wavData, 0600); err != nil {
 			logger.I18nError("保存企业微信语音 wav 失败: %v", err)
 			return
 		}
-		if string(wavData) != string(data) {
-			// 转码成功后清理原始 amr 临时文件（对齐本体临时目录保留 wav 即可）。
-			_ = os.Remove(path)
-		}
+		// 转码成功后清理原始 amr 临时文件（对齐本体临时目录保留 wav 即可）。
+		_ = os.Remove(path)
 		abm.MessageStr = ""
 		abm.SelfID = msg.Agent
 		abm.Message = []message.Component{&message.Record{File: wavPath, URL: wavPath}}
@@ -382,7 +431,8 @@ func (a *Adapter) convertMessage(msg *WecomMessage) {
 		return
 	}
 
-	a.setAgentID(abm.SelfID)
+	// 按会话记录发送方标识（应用模式为 agent_id），而非全局"最近一次"。
+	a.setAgentID(abm.SessionID, abm.SelfID)
 	logger.I18nInfo("abm: %s", abm.MessageStr)
 	a.handleMsg(abm)
 }
@@ -454,16 +504,20 @@ func (a *Adapter) convertKFMessage(msg map[string]interface{}) {
 			return
 		}
 		// 对齐 Python：amr 语音经 ffmpeg 转 wav 后投递（MediaResolver
-		// target_format="wav"）；转码失败降级保留原 amr。
-		wavData := convertAudioToWav(data)
+		// target_format="wav"）。对齐 wecom_adapter.py:477-484 的 try/except：
+		// 转码失败时记录错误并丢弃该语音消息（不投递原 amr）。
+		wavData, ok := convertAudioToWav(data)
+		if !ok {
+			logger.I18nError("转换微信客服语音失败，已丢弃该语音消息。如果没有安装 ffmpeg 请先安装。")
+			_ = os.Remove(path)
+			return
+		}
 		wavPath := path + ".wav"
 		if err := os.WriteFile(wavPath, wavData, 0600); err != nil {
 			logger.I18nError("保存微信客服语音 wav 失败: %v", err)
 			return
 		}
-		if string(wavData) != string(data) {
-			_ = os.Remove(path)
-		}
+		_ = os.Remove(path)
 		abm.Message = []message.Component{&message.Record{File: wavPath, URL: wavPath}}
 	case "file":
 		mediaID := mapNestedString(msg, "file", "media_id")
@@ -491,7 +545,8 @@ func (a *Adapter) convertKFMessage(msg map[string]interface{}) {
 		return
 	}
 
-	a.setAgentID(abm.SelfID)
+	// 客服模式按会话记录 open_kfid（abm.SelfID），供回复路由使用。
+	a.setAgentID(abm.SessionID, abm.SelfID)
 	a.handleMsg(abm)
 }
 
@@ -519,6 +574,14 @@ func (a *Adapter) isDuplicateKFText(sessionID, text string) bool {
 
 // isDuplicateAppMessage 判断是否为短时间窗口内重复推送的应用消息（按 MsgId 去重，
 // 微信在回调超时或异常时会重推同一条消息）。
+//
+// 【有意偏离 py，且 Go 行为更正确】证据：
+//   - py wecom_adapter.py:415 对应用消息只设置 `abm.message_id = str(msg.id)`，
+//     全文没有按 msg.id/MsgId 去重；去重仅针对客服文本（:441
+//     `_is_duplicate_wechat_kf_text_message`，按 session_id+文本 15s 窗口）。
+//   - 企业微信应用消息回调在应用未及时返回 success 时会重试投递同一条消息。
+//     若按 py 不去重，重推会触发重复的 LLM 调用与重复回复。Go 侧按 MsgId
+//     做 15s 窗口去重可避免该问题，故有意保留并偏离 py。
 func (a *Adapter) isDuplicateAppMessage(msg *WecomMessage) bool {
 	if msg == nil || msg.ID == "" {
 		return false
@@ -538,20 +601,32 @@ func (a *Adapter) isDuplicateAppMessage(msg *WecomMessage) bool {
 	return false
 }
 
-// setAgentID 记录最近一次消息对应的 AgentID（发送回复时使用）。
-func (a *Adapter) setAgentID(agentID string) {
+// setAgentID 记录某会话对应的发送方标识（应用模式为 agent_id，客服模式为
+// open_kfid）。按会话存储而非全局"最近一次"，避免并发会话互相串号。
+func (a *Adapter) setAgentID(sessionID, agentID string) {
+	if sessionID == "" || agentID == "" {
+		return
+	}
+	now := time.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if agentID != "" {
-		a.agentID = agentID
+	for key, b := range a.agentBySession {
+		if now.Sub(b.at) > agentBindingTTL {
+			delete(a.agentBySession, key)
+		}
 	}
+	a.agentBySession[sessionID] = agentBinding{id: agentID, at: now}
 }
 
-// getAgentID 获取最近一次消息的 AgentID。
-func (a *Adapter) getAgentID() string {
+// getAgentID 获取指定会话的发送方标识，未命中或已过期返回空串。
+func (a *Adapter) getAgentID(sessionID string) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.agentID
+	b, ok := a.agentBySession[sessionID]
+	if !ok || time.Since(b.at) > agentBindingTTL {
+		return ""
+	}
+	return b.id
 }
 
 // handleMsg 将 AstrBotMessage 发布为 core.Event（对应 Python commit_event）。
@@ -590,17 +665,31 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 	}
 }
 
-// Send 发送消息到会话（对应 Python send_by_session）：
-//   - 微信客服模式不支持主动发送，返回错误；
+// Send 发送消息到会话（对应 Python send_by_session + 事件 send 的统一入口，
+// 管线回复 RespondStage 与主动发送均经由本方法）：
+//   - 微信客服模式：带会话上下文的发送（含回复）走 kf/send_msg，接收者为
+//     会话 external_userid，发送方为最近一条客服消息的 open_kfid（对齐
+//     Python wecom_event.send 的客服回复路径）；仅禁止无会话上下文的主动
+//     群发，对齐 Python send_by_session 的限制语义（wecom_adapter.py:273-276）；
 //   - 应用模式使用最近一次收到的 AgentID 作为发送方。
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	if chain == nil {
 		return nil
 	}
 	if a.kfName != "" {
-		return fmt.Errorf("企业微信客服模式不支持 send_by_session 主动发送")
+		// 对齐 Python：客服模式仅禁止无会话上下文的主动发送；管线回复携带
+		// 会话 external_userid，必须走客服消息 API 回复，否则客服收到的
+		// 消息将永远无法得到回应。
+		if sessionID == "" {
+			return fmt.Errorf("企业微信客服模式不支持无会话上下文的主动发送")
+		}
+		openKFID := a.getAgentID(sessionID)
+		if openKFID == "" {
+			return fmt.Errorf("send_by_session 失败：无法为会话 %s 推断 open_kfid", sessionID)
+		}
+		return a.sendChain(chain, openKFID, sessionID)
 	}
-	agentID := a.getAgentID()
+	agentID := a.getAgentID(sessionID)
 	if agentID == "" {
 		return fmt.Errorf("send_by_session 失败：无法为会话 %s 推断 agent_id", sessionID)
 	}

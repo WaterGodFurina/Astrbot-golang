@@ -164,17 +164,16 @@ func applyFieldPart(spec *fieldSpec, part string, min, max int, names map[string
 	}
 	if part == "*" {
 		if step > 1 {
-			spec.any = true
+			// `*/step` 不是通配：只命中步进对齐的值，绝不能置 any=true，
+			// 否则 dom/dow 组合时会被当成 `*` 而丢掉步进（APScheduler 语义见
+			// dayMatches）。这里只登记步进并填充 values。
 			spec.hasStep = true
 			spec.step = step
-			for v := min; v <= max; v++ {
-				if (v-min)%step == 0 {
-					spec.values[v] = true
-				}
-			}
 		} else {
 			spec.any = true
-			for v := min; v <= max; v++ {
+		}
+		for v := min; v <= max; v++ {
+			if (v-min)%step == 0 {
 				spec.values[v] = true
 			}
 		}
@@ -248,19 +247,19 @@ func (f *fieldSpec) matches(v int) bool {
 	return f.values[v]
 }
 
-// dayMatches applies cron's day-of-month / day-of-week union-or-and semantics.
+// dayMatches applies the day-of-month / day-of-week intersection (AND) used by
+// APScheduler CronTrigger.from_crontab — NOT the Vixie-cron union (OR).
+//
+// Evidence: apscheduler/triggers/cron/__init__.py get_next_fire_time evaluates
+// the real `day` field first, then the non-real `day_of_week` field; when dow
+// does not match it advances day (or rolls the month), so `15 * mon` fires only
+// on a 15th that is a Monday. Verified against APScheduler 3.11.3:
+// CronTrigger.from_crontab("0 0 15 * mon") -> 2026-06-15, 2027-02-15, ... and
+// "0 0 */2 * mon" -> 2026-01-05, 2026-01-19 (odd day AND Monday). `*` and
+// `*/step` are expanded into values during parse, so a plain AND is exact for
+// every combination (including stepped wildcards — see applyFieldPart).
 func (s *cronSchedule) dayMatches(d int, weekday time.Weekday) bool {
-	domMatch := s.dom.matches(d)
-	dowMatch := s.dow.matches(int(weekday))
-	switch {
-	case s.dom.any && !s.dow.any:
-		return dowMatch
-	case !s.dom.any && s.dow.any:
-		return domMatch
-	case s.dom.any && s.dow.any:
-		return true
-	}
-	return domMatch || dowMatch
+	return s.dom.matches(d) && s.dow.matches(int(weekday))
 }
 
 // Next returns the next time after `after` matching the schedule (in the same

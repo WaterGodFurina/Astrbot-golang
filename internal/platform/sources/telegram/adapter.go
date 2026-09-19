@@ -884,7 +884,7 @@ func (a *Adapter) sendMediaUpload(ctx context.Context, chatID, method, field, fi
 	req, err := http.NewRequestWithContext(ctx, "POST", a.apiBase+"/"+method, pr)
 	if err != nil {
 		_ = pr.Close()
-		return err
+		return fmt.Errorf("telegram %s upload request build failed: %s", method, sanitizeURLErr(err))
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
@@ -1174,6 +1174,13 @@ func (a *Adapter) dispatchUpdate(ctx context.Context, update map[string]interfac
 	if chatID == "" {
 		chatID = "unknown"
 	}
+	// 并发正确性：worker 的存活判定、空闲回收与入队必须落在同一把
+	// workerMu 临界区内。旧实现先持锁取出 channel、解锁后再投递，窗口期
+	// 内 worker 可能已在空闲 tick 里把自己从 map 删除并退出，投递就落进
+	// 没有消费者的孤儿 channel（缓冲 64）而被静默丢弃。现在入队也在
+	// workerMu 内完成：worker 只能持锁摘除自身，故只要 map 中仍存在该
+	// channel，就一定还有存活消费者；反之若 worker 先摘除，本次调用会
+	// 重新建 worker 再入队，不会丢失。
 	a.workerMu.Lock()
 	if a.workers == nil {
 		a.workers = make(map[string]chan map[string]interface{})
@@ -1182,37 +1189,60 @@ func (a *Adapter) dispatchUpdate(ctx context.Context, update map[string]interfac
 	if !ok {
 		ch = make(chan map[string]interface{}, 64)
 		a.workers[chatID] = ch
-		go func(c chan map[string]interface{}) {
-			// 空闲超时自动退出并从 map 删除，避免常驻 goroutine 只增不减。
-			idle := time.NewTicker(workerIdleTimeout)
-			defer idle.Stop()
-			for {
-				select {
-				case <-idle.C:
-					a.workerMu.Lock()
-					if len(c) == 0 {
-						delete(a.workers, chatID)
-						a.workerMu.Unlock()
-						return
-					}
-					a.workerMu.Unlock()
-				case u, ok := <-c:
-					if !ok {
-						return
-					}
-					idle.Reset(workerIdleTimeout)
-					a.handleUpdate(ctx, u)
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(ch)
+		go a.runChatWorker(ctx, chatID, ch)
 	}
-	a.workerMu.Unlock()
 	select {
 	case ch <- update:
 	default:
 		logger.Warn("Telegram chat %s 的 update 队列已满，丢弃 update_id=%v", chatID, update["update_id"])
+	}
+	a.workerMu.Unlock()
+}
+
+// runChatWorker 串行消费单个 chat 的 update 队列。空闲超时或被 ctx 取消
+// 时，它会在 workerMu 内把自己从 workers 摘除后再退出，保证 dispatchUpdate
+// 在同一把锁下要么看到存活的 channel（可安全入队），要么看不到并重建 worker，
+// 不会向已退出 worker 的孤儿 channel 投递（见 dispatchUpdate 注释）。
+func (a *Adapter) runChatWorker(ctx context.Context, chatID string, c chan map[string]interface{}) {
+	// 空闲超时自动退出并从 map 删除，避免常驻 goroutine 只增不减。
+	idle := time.NewTicker(workerIdleTimeout)
+	defer idle.Stop()
+
+	// removeSelf 摘除本 worker 的注册项。判等 cur == c 防止误删同一 chatID
+	// 上后来重建的新 worker（正常时序下不会发生，属防御性校验）。
+	removeSelf := func() {
+		a.workerMu.Lock()
+		if cur, ok := a.workers[chatID]; ok && cur == c {
+			delete(a.workers, chatID)
+		}
+		a.workerMu.Unlock()
+	}
+
+	for {
+		select {
+		case <-idle.C:
+			a.workerMu.Lock()
+			if len(c) == 0 {
+				if cur, ok := a.workers[chatID]; ok && cur == c {
+					delete(a.workers, chatID)
+				}
+				a.workerMu.Unlock()
+				return
+			}
+			a.workerMu.Unlock()
+		case u, ok := <-c:
+			if !ok {
+				removeSelf()
+				return
+			}
+			idle.Reset(workerIdleTimeout)
+			a.handleUpdate(ctx, u)
+		case <-ctx.Done():
+			// 取消路径同样先摘除再退出，否则 map 会残留指向已停 worker 的
+			// channel，后续入队仍会静默丢失。
+			removeSelf()
+			return
+		}
 	}
 }
 
@@ -2012,7 +2042,9 @@ func (a *Adapter) apiCall(ctx context.Context, method string, params map[string]
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bodyReader)
 	if err != nil {
-		return nil, err
+		// 与 Do 失败路径一致脱敏：NewRequest 错误里会带上完整 URL（含
+		// bot token），直接返回会经日志/上层错误泄漏凭据。
+		return nil, fmt.Errorf("telegram %s request build failed: %s", method, sanitizeURLErr(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 

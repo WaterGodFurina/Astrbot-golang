@@ -6,6 +6,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -377,6 +378,9 @@ func TestControlTextPendingLen(t *testing.T) {
 // the direct child.
 
 func TestCommandTimeoutKillsProcessGroup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX sh backgrounding `(cmd) & sleep` + process-group kill; not portable to cmd.exe")
+	}
 	dir := inTempDir(t)
 	marker := filepath.Join(dir, "child.txt")
 	// Foreground sleep keeps sh alive past the 1s timeout; a background

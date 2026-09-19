@@ -3,6 +3,7 @@ package dashboard
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -16,7 +17,7 @@ func TestFetchPluginMarket(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	data, err := s.fetchPluginMarket(srv.URL, false)
@@ -48,7 +49,7 @@ func TestFetchPluginMarketCaching(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	if _, err := s.fetchPluginMarket(srv.URL, false); err != nil {
@@ -88,7 +89,7 @@ func TestFetchPluginMarketFallbackToCache(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	s := NewServer(0, "/tmp/test_pw.json")
+	s := NewServer(0, filepath.Join(t.TempDir(), "test_pw.json"))
 	defer s.Stop()
 
 	if _, err := s.fetchPluginMarket(srv.URL, false); err != nil {

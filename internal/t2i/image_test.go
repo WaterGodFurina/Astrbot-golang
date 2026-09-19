@@ -17,7 +17,7 @@ func TestRenderTextToPNGChinese(t *testing.T) {
 	text := "这是一段用于测试中文字符自动换行的长文本。" +
 		"北京铁路局今天凌晨发布消息称，京沪高铁廊坊至北京南间发生设备故障，导致部分列车晚点。" +
 		"This is an English sentence that should wrap at word boundaries correctly when the line is long enough."
-	data, err := RenderTextToPNG(text, ImageOptions{FontPath: "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"})
+	data, err := RenderTextToPNG(text, ImageOptions{FontPath: mustCJKFont(t)})
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestRenderTextToPNGChinese(t *testing.T) {
 func TestImageRendererMixedContent(t *testing.T) {
 	r, err := NewImageRenderer(ImageOptions{
 		Title:    "测试标题",
-		FontPath: "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+		FontPath: mustCJKFont(t),
 	})
 	if err != nil {
 		t.Fatalf("new renderer: %v", err)
@@ -74,7 +74,7 @@ func TestImageRendererMixedContent(t *testing.T) {
 func TestEmojiWrappingAndCodepoint(t *testing.T) {
 	// Grapheme-level wrapping keeps an emoji sequence on one line and assigns
 	// it a font-size width.
-	r, err := NewImageRenderer(ImageOptions{FontPath: "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"})
+	r, err := NewImageRenderer(ImageOptions{FontPath: mustCJKFont(t)})
 	if err != nil {
 		t.Fatalf("new renderer: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestEmojiWrappingAndCodepoint(t *testing.T) {
 
 func TestRenderTextWithEmoji(t *testing.T) {
 	text := "这是一段包含表情的文本：😂 哈哈 👨\u200d👩\u200d👧 家庭 👋🏻 再见，换行也要正常。"
-	data, err := RenderTextToPNG(text, ImageOptions{FontPath: "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"})
+	data, err := RenderTextToPNG(text, ImageOptions{FontPath: mustCJKFont(t)})
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -129,6 +129,7 @@ func TestRenderTextWithEmoji(t *testing.T) {
 func TestConcurrentRenderNoRace(t *testing.T) {
 	// Rendering must be safe across goroutines: the shared font cache holds a
 	// concurrency-safe *truetype.Font and each render creates its own face.
+	font := mustCJKFont(t)
 	const n = 8
 	var wg sync.WaitGroup
 	errs := make([]error, n)
@@ -136,7 +137,7 @@ func TestConcurrentRenderNoRace(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, err := RenderTextToPNG(fmt.Sprintf("并发渲染测试 %d", i), ImageOptions{FontPath: "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"})
+			_, err := RenderTextToPNG(fmt.Sprintf("并发渲染测试 %d", i), ImageOptions{FontPath: font})
 			errs[i] = err
 		}(i)
 	}
@@ -146,6 +147,15 @@ func TestConcurrentRenderNoRace(t *testing.T) {
 			t.Fatalf("render %d: %v", i, err)
 		}
 	}
+}
+
+func mustCJKFont(t *testing.T) string {
+	t.Helper()
+	f := systemCJKFont("")
+	if f == "" {
+		t.Skip("系统无可用 CJK 字体，跳过 t2i 本地渲染测试")
+	}
+	return f
 }
 
 func hasNonBackgroundPixel(img image.Image, bg color.RGBA) bool {

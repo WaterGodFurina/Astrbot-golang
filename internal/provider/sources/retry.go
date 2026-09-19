@@ -253,7 +253,9 @@ func DoWithRetry(
 				if err != nil {
 					return nil, err
 				}
-				return resp, nil
+				// 429 专用重试期间服务端可能改判为 5xx（如 502）：交回通用
+				// 重试循环继续退避重试，而不是直接返回（E-low-7）。
+				status = resp.StatusCode
 			}
 			retryable := IsRetryableStatus(status)
 			if status == http.StatusOK || status == http.StatusCreated || !retryable {
@@ -338,10 +340,12 @@ func retry429(
 		}
 		resp, err = client.Do(req)
 		if err != nil {
+			// 429 响应体已被消费关闭，网络层再出错时没有可重试的响应对象，
+			// 继续循环会对 nil resp 解引用 panic；直接返回带上下文的错误。
 			if isRetryableError(err) {
 				retryLogger.Debug("[%s] 429-retry HTTP error (attempt %d/%d): %v",
 					providerLabel, attempt+1, cfg.Retry429Max, err)
-				continue
+				return nil, fmt.Errorf("[%s] 429-retry HTTP error (attempt %d/%d): %w", providerLabel, attempt+1, cfg.Retry429Max, err)
 			}
 			return nil, fmt.Errorf("[%s] %w", providerLabel, err)
 		}

@@ -367,15 +367,6 @@ func (d *Database) initSchema() error {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(conflict_key, handler_full_name)
 		)`,
-
-		`CREATE TABLE IF NOT EXISTS dashboard_trusted_devices (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			token_hash TEXT NOT NULL UNIQUE,
-			totp_secret_hash TEXT NOT NULL,
-			expires_at DATETIME NOT NULL,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)`,
 	}
 
 	for _, stmt := range statements {
@@ -1274,6 +1265,7 @@ type ProviderStatRow struct {
 	InputOther  int
 	InputCached int
 	Output      int
+	Status      string
 	CreatedAt   time.Time
 }
 
@@ -1281,7 +1273,7 @@ type ProviderStatRow struct {
 func (d *Database) ProviderStatsSince(since time.Time) ([]ProviderStatRow, error) {
 	rows, err := d.db.Query(
 		`SELECT umo, provider_id, provider_model, token_input_other, token_input_cached,
-		        token_output, created_at FROM provider_stats WHERE created_at >= ?
+		        token_output, status, created_at FROM provider_stats WHERE created_at >= ?
 		 ORDER BY created_at ASC`,
 		since.UTC().Format("2006-01-02 15:04:05"),
 	)
@@ -1293,7 +1285,7 @@ func (d *Database) ProviderStatsSince(since time.Time) ([]ProviderStatRow, error
 	for rows.Next() {
 		var r ProviderStatRow
 		var created string
-		if err := rows.Scan(&r.UMO, &r.ProviderID, &r.Model, &r.InputOther, &r.InputCached, &r.Output, &created); err != nil {
+		if err := rows.Scan(&r.UMO, &r.ProviderID, &r.Model, &r.InputOther, &r.InputCached, &r.Output, &r.Status, &created); err != nil {
 			return nil, fmt.Errorf("ProviderStatsSince: scan row: %w", err)
 		}
 		if t, err := time.Parse(time.RFC3339, created); err == nil {

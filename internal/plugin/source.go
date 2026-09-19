@@ -18,8 +18,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/netguard"
 )
 
 // forbiddenImports are packages plugin source may not import. This is a
@@ -368,43 +369,11 @@ func rejectLocalHost(host string) error {
 // (and each is re-checked by safeRedirect). IPv4 is preferred when a host
 // returns both families, since the pin removes the dialer's multi-address
 // fallback.
+//
+// 实现已提取到 internal/netguard.PinnedDialContext，与 dashboard 的出站客户端
+// 共用同一份钉扎逻辑（避免两处各自维护、逐渐走样）。
 func pinnedDialContext() func(ctx context.Context, network, addr string) (net.Conn, error) {
-	var mu sync.Mutex
-	pinned := map[string]net.IP{}
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		mu.Lock()
-		ip, ok := pinned[host]
-		mu.Unlock()
-		if !ok {
-			ips, err := net.LookupIP(host)
-			if err != nil {
-				return nil, fmt.Errorf("resolve %s: %w", host, err)
-			}
-			if len(ips) == 0 {
-				return nil, fmt.Errorf("resolve %s: no addresses", host)
-			}
-			ip = ips[0]
-			for _, cand := range ips {
-				if cand.To4() != nil {
-					ip = cand
-					break
-				}
-			}
-			mu.Lock()
-			if prev, ok := pinned[host]; ok {
-				ip = prev // a concurrent dial won the pin race; use its result
-			} else {
-				pinned[host] = ip
-			}
-			mu.Unlock()
-		}
-		return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-	}
+	return netguard.PinnedDialContext(nil)
 }
 
 func isHTTP(s string) bool {

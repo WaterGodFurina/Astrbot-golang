@@ -32,15 +32,26 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
+// defaultMaxBlobSize 单 blob 默认上限（64MB）：Create 超过即拒绝，防止插件
+// 经 CreateBlob 把宿主磁盘写爆（配额防线的第一层）。
+const defaultMaxBlobSize int64 = 64 << 20
+
+// defaultMaxBlobTTL 单 blob 默认最长存活（1 小时）：Create 的 ttlSeconds 只能
+// 在此之内下调/顺延，不能任意延长（防插件把大文件变永久占用）。
+const defaultMaxBlobTTL = time.Hour
+
 // BlobStore 管理插件大二进制（handle 制，安全 + TTL + GC）。
 type BlobStore struct {
 	dir       string
 	ttl       time.Duration
 	chunkSize int64
-	mu        sync.Mutex
-	meta      map[string]*blobMeta // handle_id -> meta
-	stop      chan struct{}
-	done      chan struct{}
+	// maxBlobSize 单 blob 大小上限（字节）；maxTTL 单 blob 存活上限。
+	maxBlobSize int64
+	maxTTL      time.Duration
+	mu          sync.Mutex
+	meta        map[string]*blobMeta // handle_id -> meta
+	stop        chan struct{}
+	done        chan struct{}
 }
 
 type blobMeta struct {
@@ -73,8 +84,9 @@ func StopBlobStore() {
 }
 
 // NewBlobStore 创建并启动 blob store。dir 为持久化根目录（data/blobs），
-// ttl<=0 时使用默认 10 分钟；chunkSize<=0 时默认 1MB。
-func NewBlobStore(dir string, ttl time.Duration, chunkSize int64) (*BlobStore, error) {
+// ttl<=0 时使用默认 10 分钟；chunkSize<=0 时默认 1MB；maxBlobSize<=0 时
+// 默认 64MB；maxTTL<=0 时默认 1 小时（且 ttl 不得超过 maxTTL）。
+func NewBlobStore(dir string, ttl time.Duration, chunkSize, maxBlobSize int64, maxTTL time.Duration) (*BlobStore, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("blob dir is empty")
 	}
@@ -84,16 +96,27 @@ func NewBlobStore(dir string, ttl time.Duration, chunkSize int64) (*BlobStore, e
 	if chunkSize <= 0 {
 		chunkSize = 1 << 20
 	}
+	if maxBlobSize <= 0 {
+		maxBlobSize = defaultMaxBlobSize
+	}
+	if maxTTL <= 0 {
+		maxTTL = defaultMaxBlobTTL
+	}
+	if ttl > maxTTL {
+		ttl = maxTTL
+	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("mkdir blob dir: %w", err)
 	}
 	s := &BlobStore{
-		dir:       dir,
-		ttl:       ttl,
-		chunkSize: chunkSize,
-		meta:      make(map[string]*blobMeta),
-		stop:      make(chan struct{}),
-		done:      make(chan struct{}),
+		dir:         dir,
+		ttl:         ttl,
+		chunkSize:   chunkSize,
+		maxBlobSize: maxBlobSize,
+		maxTTL:      maxTTL,
+		meta:        make(map[string]*blobMeta),
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
 	}
 	s.gcStartup()
 	go s.gcLoop()
@@ -121,6 +144,11 @@ func (s *BlobStore) blobPath(handle string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Windows 短文件名（RUNNER~1）下 Abs 与 EvalSymlinks 结果不同形：root 必须
+	// 同样解析为长路径再比较，否则合法 handle 被误判 "symlink escapes blob root"。
+	if rr, rerr := filepath.EvalSymlinks(root); rerr == nil {
+		root = rr
+	}
 	// handle 必须与文件名一致（由我们生成的 32hex），不信任任意传入路径。
 	p := filepath.Join(root, filepath.Clean("/"+handle))
 	abs, err := filepath.Abs(p)
@@ -142,10 +170,14 @@ func (s *BlobStore) blobPath(handle string) (string, error) {
 	return abs, nil
 }
 
-// Create 持久化 data 并返回受控 FileReference handle。
+// Create 持久化 data 并返回受控 FileReference handle。超过单 blob 大小上限
+// 直接拒绝；ttlSeconds 请求被钳制在 maxTTL 内（不能任意延长）。
 func (s *BlobStore) Create(data []byte, mimeType, filename string, ttlSeconds int32) (sdkv1.FileReference, error) {
 	if len(data) == 0 {
 		return sdkv1.FileReference{}, fmt.Errorf("empty blob data")
+	}
+	if int64(len(data)) > s.maxBlobSize {
+		return sdkv1.FileReference{}, fmt.Errorf("blob too large: %d bytes exceeds limit %d", len(data), s.maxBlobSize)
 	}
 	handle, err := randomHandle()
 	if err != nil {
@@ -160,8 +192,14 @@ func (s *BlobStore) Create(data []byte, mimeType, filename string, ttlSeconds in
 	}
 	now := time.Now()
 	ttl := s.ttl
+	if ttl > s.maxTTL {
+		ttl = s.maxTTL
+	}
 	if ttlSeconds > 0 {
 		ttl = time.Duration(ttlSeconds) * time.Second
+		if ttl > s.maxTTL {
+			ttl = s.maxTTL // 钳到上限：插件不能借 ttlSeconds 把 blob 变成永久占用
+		}
 	}
 	s.mu.Lock()
 	s.meta[handle] = &blobMeta{

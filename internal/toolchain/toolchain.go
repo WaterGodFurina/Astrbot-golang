@@ -89,9 +89,18 @@ func (tc *Toolchain) GoBin() (string, error) {
 		// 归档解压产物保留顶层 go/ 目录（GOROOT = root/go），go 二进制在
 		// root/go/bin/go(.exe)——之前漏拼 go/ 子目录导致永远找不到已下载
 		// 的 bundled 工具链（每次重启报 no toolchain、每次插件安装重下）。
-		if bin := filepath.Join(tc.BundledRoot(), "go", "bin", exe("go")); tc.isExecutable(bin) {
-			logger.Info("Using bundled Go toolchain: %s", bin)
-			return bin, nil
+		bin := filepath.Join(tc.BundledRoot(), "go", "bin", exe("go"))
+		if tc.isExecutable(bin) {
+			// 真正探测完整性：解压被中断/被杀软破坏时仅 stat 会命中残缺 go，
+			// 后续 go mod download / go list 才以"SDK 无法解析"失败。这里执行
+			// `go version` 验证；失败则返回错误（而非可疑路径），交给 Ensure
+			// 走重装路径。
+			if goBinaryUsable(bin) {
+				logger.Info("Using bundled Go toolchain: %s", bin)
+				return bin, nil
+			}
+			logger.I18nWarn("bundled Go 工具链存在但 `go version` 失败（残缺），交由 Ensure 重装: %s", bin)
+			return "", fmt.Errorf("bundled Go toolchain at %s is not runnable", bin)
 		}
 	}
 
@@ -122,17 +131,16 @@ func (tc *Toolchain) EnsureWithProgress(progress ProgressFunc) (string, error) {
 	if bin, err := tc.GoBin(); err == nil {
 		return bin, nil
 	}
-	// 残缺工具链自愈：fast path 只 stat 文件存在，解压被中断/被杀软破坏的
-	// go 二进制仍会命中。这里对 bundled go 做一次 `go version` 快速探测
-	//（~100ms），跑不动则删除重装，避免后续 go mod download / go list 以
-	// 残缺工具链失败、报"SDK 无法解析"。
+	// 残缺工具链自愈：GoBin 命中 bundled 时会执行 `go version` 探测，对残缺
+	// 工具链返回错误；这里用正确路径（root/go/bin/go，此前漏了 go/ 层级写成
+	// root/bin/go → 探测从不命中）复核并触发重装。不预先 RemoveAll(root)：
+	// downloadAndExtract 先解压到 staging 并校验 go 可执行，成功后才原子替换
+	// base/go，避免"探测误判（如杀软临时锁文件）→ 删光 → 重下失败"的永久
+	// 循环，也保留仍可用的 archive 供校验后复用。
 	if root := tc.BundledRoot(); root != "" {
-		bin := filepath.Join(root, "bin", exe("go"))
+		bin := filepath.Join(root, "go", "bin", exe("go"))
 		if tc.isExecutable(bin) && !goBinaryUsable(bin) {
-			logger.I18nWarn("检测到 bundled Go 工具链不可用（go version 失败），自动重新下载…")
-			if err := os.RemoveAll(root); err != nil {
-				logger.I18nWarn("清理损坏的 Go 工具链失败: %v", err)
-			}
+			logger.I18nWarn("检测到 bundled Go 工具链不可用（go version 失败），重新下载并原子替换（保留现有文件）…")
 		}
 	}
 	return tc.downloadAndExtract(progress)
@@ -554,6 +562,11 @@ func extractTarGz(src, dir string, progress ProgressFunc) error {
 			return err
 		}
 		total++
+	}
+	// 第一遍计数遍历已把 f 读到 EOF，必须先回卷再 Reset，否则第二遍从 EOF
+	// 开始解压，只解出空目录（Linux/macOS 无系统 Go 时自动下载工具链永远失败）。
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
 	}
 	gz.Reset(f)
 	tr = tar.NewReader(gz)

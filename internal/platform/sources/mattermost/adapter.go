@@ -53,10 +53,6 @@ type Adapter struct {
 	// msgCh 待处理的消息队列（WS 读循环仅入队，由 msgLoop 串行处理，
 	// 避免附件下载等耗时操作阻塞读循环导致连接超时）。
 	msgCh chan *pendingWsMessage
-
-	// lastSenders 记录各频道最近一次消息的发送者，供 GetGroup 填充 members
-	// （对齐本体 MattermostMessageEvent.get_group 的 members=[sender]）。
-	lastSenders map[string]platform.MessageMember
 }
 
 // pendingWsMessage 待处理的消息载荷（post 数据 + 原始 data）。
@@ -98,7 +94,6 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		seenPostIDs:    make(map[string]float64),
 		dedupTTL:       300.0,
 		msgCh:          make(chan *pendingWsMessage, 64),
-		lastSenders:    make(map[string]platform.MessageMember),
 	}
 }
 
@@ -349,7 +344,11 @@ func (a *Adapter) msgLoop(ctx context.Context) {
 }
 
 // isDuplicatePost 检查帖子 ID 是否重复（对应 _is_duplicate_post）。
+// seenPostIDs/seenPostQueue 可能被重连后的多个读循环并发访问，
+// 全程持 a.mu，避免 map 并发读写。
 func (a *Adapter) isDuplicatePost(postID string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	now := float64(time.Now().UnixNano()) / 1e9
 	a.pruneSeenPosts(now)
 	if _, ok := a.seenPostIDs[postID]; ok {
@@ -361,6 +360,7 @@ func (a *Adapter) isDuplicatePost(postID string) bool {
 }
 
 // pruneSeenPosts 清理超过 TTL 的帖子 ID（对应 _prune_seen_posts）。
+// 调用方必须持有 a.mu。
 func (a *Adapter) pruneSeenPosts(now float64) {
 	for len(a.seenPostQueue) > 0 {
 		head := a.seenPostQueue[0]
@@ -436,10 +436,6 @@ func (a *Adapter) convertMessage(ctx context.Context, post, data map[string]inte
 	abm.MessageStr = buildMessageStr(abm.Message, messageText, a.botSelfID)
 	a.mu.Lock()
 	a.lastTempPaths = tempPaths
-	// 记录频道最近发送者（供 GetGroup 使用）。
-	if abm.Sender.UserID != "" {
-		a.lastSenders[channelID] = abm.Sender
-	}
 	a.mu.Unlock()
 	return abm
 }

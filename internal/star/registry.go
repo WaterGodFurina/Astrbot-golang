@@ -208,9 +208,10 @@ func (r *StarHandlerRegistry) Append(h *StarHandlerMetadata) {
 	}
 	r.handlers = append(r.handlers, h)
 	r.handlersMap[h.HandlerFullName] = h
-	// sort by priority (lower first)
+	// 按优先级降序排序：高优先级先执行（对齐 Python star_handler.py:26 的
+	// sort(key=lambda h: -priority) 语义）
 	sort.SliceStable(r.handlers, func(i, j int) bool {
-		return r.handlers[i].Priority() < r.handlers[j].Priority()
+		return r.handlers[i].Priority() > r.handlers[j].Priority()
 	})
 }
 

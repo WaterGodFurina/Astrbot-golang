@@ -7,6 +7,7 @@
 package wecom_ai_bot
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/md5" // #nosec G501 -- md5 用于图片流消息内容指纹（协议要求），非密码学用途
@@ -14,10 +15,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strings"
-	"time"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 )
 
 // WecomAIBotConstants 企业微信智能机器人常量（对应 WecomAIBotConstants）。
@@ -140,21 +140,10 @@ func (c *WecomAIBotAPIClient) ProcessEncryptedImage(imageURL, aesKeyBase64 strin
 // processEncryptedImage 下载并解密加密图片（对应 wecomai_utils.py 的同名函数）。
 func processEncryptedImage(imageURL, aesKeyBase64 string) (bool, string) {
 	logger.I18nInfo("开始下载加密图片: %s", imageURL)
-	httpClient := &http.Client{Timeout: 15 * time.Second}
-	resp, err := httpClient.Get(imageURL)
-	if err != nil {
-		msg := fmt.Sprintf("下载图片失败: %v", err)
-		logger.Error("%s", msg)
-		return false, msg
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg := fmt.Sprintf("下载图片失败: HTTP %d", resp.StatusCode)
-		logger.Error("%s", msg)
-		return false, msg
-	}
-	// 与 webhook.go 的 32MiB 上限对齐, 防止超大图片一次性放大内存
-	encryptedData, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	// 使用宿主统一的安全下载器替代裸 http.Client.Get：仅允许 http(s)、
+	// 拒绝内网/环回/保留地址段（SSRF 防护）并限制 32MiB 大小，
+	// 与 webhook.go 的 32MiB 上限对齐。
+	encryptedData, err := platform.SafeDownloadBytes(context.Background(), imageURL, 32<<20)
 	if err != nil {
 		msg := fmt.Sprintf("下载图片失败: %v", err)
 		logger.Error("%s", msg)

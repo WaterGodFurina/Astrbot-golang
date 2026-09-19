@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -330,8 +331,9 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 				s.scheduleUmoAutoName(event)
 				return &StageResult{Continue: true}, nil
 			}
-			if r, ok := comp.(*message.Reply); ok && !event.Source.IsGroup {
-				// quoting the bot in a private chat wakes it (Python parity)
+			if r, ok := comp.(*message.Reply); ok {
+				// 引用 bot 消息即唤醒（Python waking_check/stage.py 的 Reply 分支
+				// 判 sender_id == self_id，不区分群聊/私聊）
 				if r.SenderID == event.Source.SelfID {
 					event.IsAtOrWakeCommand = true
 					event.SetExtra("llm_wake", true)
@@ -495,6 +497,11 @@ func (s *WhitelistCheckStage) Process(ctx context.Context, event *core.Event) (*
 		return &StageResult{Continue: true}, nil
 	}
 
+	// WebChat 豁免（对齐 Python whitelist_check/stage.py:43：webchat 平台不做白名单检查）
+	if event.GetPlatformID() == "webchat" {
+		return &StageResult{Continue: true}, nil
+	}
+
 	// Admin bypass
 	if event.Role == "admin" {
 		if s.wlIgnoreAdminOnGroup && event.Source.IsGroup {
@@ -584,8 +591,11 @@ func (s *RateLimitStage) Initialize(ctx *PipelineContext) error {
 
 	ps := bindPlatformSettings(ctx.AstrbotConfig)
 	// Nested rate_limit {count,time,strategy} (current config format).
-	if ps.RateLimit.Count > 0 {
-		maxReq = ps.RateLimit.Count
+	// Count 显式配置为 0（或负数）表示不开启限流（Python rate_limit_check/
+	// stage.py:66 `if self.rate_limit_count <= 0: break` 直接放行），只有未配置
+	// 时才回退默认值。指针非 nil 即表示配置里存在该键（含 0）。
+	if ps.RateLimit.Count != nil {
+		maxReq = *ps.RateLimit.Count
 	}
 	if ps.RateLimit.Time > 0 {
 		windowSeconds = ps.RateLimit.Time
@@ -611,27 +621,32 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 	allowed, stall := s.limiter.Allow(sessionID)
 	if !allowed {
 		if stall > 0 {
-			logger.Debug("Session %s rate-limited, stalling for %.2fs", sessionID, stall.Seconds())
-			// Stall strategy: re-publish the event once the window frees up, matching Python's async sleep + resume. This must not block the single-goroutine event bus, so we schedule a delayed re-queue.
-			if s.eventBus != nil {
-				delays := 0
-				if v, ok := event.GetExtra(rateLimitDelaysKey).(int); ok {
-					delays = v
+			logger.I18nInfo("会话 %s 被限流，按限流策略暂停 %.2f 秒", sessionID, (stall + 300*time.Millisecond).Seconds())
+			// Stall 策略：原地等待（sleep 后重试本阶段），对齐 Python
+			// rate_limit_check/stage.py 的 asyncio.sleep(stall) 语义——事件留在
+			// 管线当前位置，从 Stage1 起重跑会导致 Waking/PreProcess 等已完成
+			// 阶段的副作用重复执行（pre-ack 表情、计数等）。带 ctx 取消保护：
+			// 等待期间事件被中断/总线停止时直接终止而不是无限 sleep。
+			for {
+				select {
+				case <-ctx.Done():
+					event.Stop()
+					return &StageResult{Continue: false}, nil
+				case <-time.After(stall + 300*time.Millisecond):
 				}
-				// Bound the re-queues: under sustained traffic an event must not be re-delayed forever (queue starvation/growth).
-				if delays >= rateLimitMaxDelays {
-					logger.I18nWarn("会话 %s 限流: 事件 %q 已延迟重排队 %d 次，超过上限 %d，丢弃",
-						sessionID, event.MessageStr, delays, rateLimitMaxDelays)
+				// Python sleep 后回到 while True 重查窗口（+0.3s 余量），这里
+				// 重试 Allow；仍未放行则继续按新 stall 时长等待。
+				var ok bool
+				if ok, stall = s.limiter.Allow(sessionID); ok {
+					return &StageResult{Continue: true}, nil
+				}
+				if stall <= 0 {
+					// Discard 语义不会走到这里（Allow 对 Discard 返回 stall=0），
+					// stall<=0 视为异常，按丢弃处理防止忙等。
 					event.Stop()
 					return &StageResult{Continue: false}, nil
 				}
-				event.SetExtra(rateLimitDelaysKey, delays+1)
-				s.eventBus.PublishDelayed(event, stall)
-			} else {
-				// No bus reference (tests): fall back to stopping the event.
-				event.Stop()
 			}
-			return &StageResult{Continue: false}, nil
 		}
 		logger.Debug("Session %s rate-limited, discarded", sessionID)
 		event.Stop()
@@ -639,12 +654,6 @@ func (s *RateLimitStage) Process(ctx context.Context, event *core.Event) (*Stage
 	}
 	return &StageResult{Continue: true}, nil
 }
-
-// rateLimitDelaysKey is the Event.Metadata key counting how many times an event has been re-queued by the rate-limit stall strategy.
-const rateLimitDelaysKey = "rate_limit_delays"
-
-// rateLimitMaxDelays bounds how many times a rate-limited event may be re-queued before it is dropped with a notice, so sustained traffic cannot keep a single event (and the queue) alive forever.
-const rateLimitMaxDelays = 5
 
 // --------------------------------------------------------------------------- Stage 5: ContentSafetyCheckStage ---------------------------------------------------------------------------
 
@@ -713,10 +722,11 @@ func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event
 
 // PreProcessStage normalizes media components, maps paths, and runs STT. Ported from astrbot/core/pipeline/preprocess_stage/stage.py
 type PreProcessStage struct {
-	config      map[string]interface{}
-	providerMgr *provider.ProviderManager
-	convMgr     *conversation.Manager
-	platformMgr *platform.PlatformManager
+	config       map[string]interface{}
+	providerMgr  *provider.ProviderManager
+	convMgr      *conversation.Manager
+	platformMgr  *platform.PlatformManager
+	pathMappings []string
 }
 
 func NewPreProcessStage() *PreProcessStage {
@@ -730,6 +740,9 @@ func (s *PreProcessStage) Initialize(ctx *PipelineContext) error {
 	s.providerMgr = ctx.ProviderManager
 	s.convMgr = ctx.ConvManager
 	s.platformMgr = ctx.PlatformMgr
+	if ps, ok := ctx.AstrbotConfig["platform_settings"].(map[string]interface{}); ok {
+		s.pathMappings = toStringList(ps["path_mapping"])
+	}
 	return nil
 }
 
@@ -788,6 +801,24 @@ func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*Stag
 	plainText := extractPlainText(event.Message)
 	event.PlainText = plainText
 
+	// 路径映射：对 Record/Image 的 url 做前缀替换（对齐 py preprocess_stage:77-97）。
+	if len(s.pathMappings) > 0 {
+		for i, comp := range event.Message.Chain {
+			switch c := comp.(type) {
+			case *message.Image:
+				if c.URL != "" {
+					c.URL = pathMapping(s.pathMappings, c.URL)
+				}
+				event.Message.Chain[i] = c
+			case *message.Record:
+				if c.URL != "" {
+					c.URL = pathMapping(s.pathMappings, c.URL)
+				}
+				event.Message.Chain[i] = c
+			}
+		}
+	}
+
 	// Normalize image paths: file:// URIs → local paths
 	for i, comp := range event.Message.Chain {
 		if img, ok := comp.(*message.Image); ok {
@@ -814,6 +845,32 @@ func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*Stag
 			event.Message.Chain[i] = &message.Plain{Text: text}
 			event.PlainText += text
 			event.MessageStr += text
+		}
+
+		// 引用消息链内的 Record 也要递归转写（对齐 py preprocess_stage:223-232）。
+		for i, comp := range event.Message.Chain {
+			reply, ok := comp.(*message.Reply)
+			if !ok || len(reply.Chain) == 0 {
+				continue
+			}
+			for j, rc := range reply.Chain {
+				rec, ok := rc.(*message.Record)
+				if !ok {
+					continue
+				}
+				text, err := s.sttRecord(event, rec)
+				if err != nil {
+					logger.I18nWarn("引用消息 STT 转写失败: %v", err)
+					continue
+				}
+				if text == "" {
+					continue
+				}
+				reply.Chain[j] = &message.Plain{Text: text}
+				event.PlainText += text
+				event.MessageStr += text
+			}
+			event.Message.Chain[i] = reply
 		}
 	}
 
@@ -1145,7 +1202,8 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 			} else {
 				logger.Error("LLM agent call failed: %v", err)
 				event.Result = &message.MessageEventResult{}
-				event.Result.Chain = []message.Component{&message.Plain{Text: "LLM 调用失败: " + err.Error()}}
+				// 对外脱敏：错误原文只进日志，避免向用户泄露内部实现细节（D-low-8）。
+				event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败，请稍后重试"}}
 			}
 		}
 	}
@@ -1357,6 +1415,22 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	return nil
 }
 
+// cronWokeSystemPrompt mirrors Python's PROACTIVE_AGENT_CRON_WOKE_SYSTEM_PROMPT
+// (astrbot/core/astr_main_agent_resources.py:90-102), appended to the system
+// prompt when a cron job wakes the main agent. `{cron_job}` is replaced with the
+// JSON metadata carried on the synthetic event.
+const cronWokeSystemPrompt = "You are an autonomous proactive agent.\n\n" +
+	"You are awakened by a scheduled cron job, not by a user message.\n" +
+	"# IMPORTANT RULES\n" +
+	"1. This is NOT a chat turn. Do NOT greet the user. Do NOT ask the user questions unless strictly necessary.\n" +
+	"2. Use historical conversation and memory to understand you and user's relationship, preferences, and context.\n" +
+	"3. If messaging the user: Explain WHY you are contacting them; Reference the cron task implicitly (not technical details).\n" +
+	"4. Use your available tools and skills to finish the task if needed.\n" +
+	"5. Use `send_message_to_user` tool to send message to user if needed." +
+	"# CRON JOB CONTEXT\n" +
+	"The following object describes the scheduled task that triggered you:\n" +
+	"{cron_job}"
+
 // resolveAgentContext extracts the prompt, resolves the effective provider config and the persona system prompt, and applies the prompt-shaping steps (skills, safety mode, on_llm_request hooks, knowledge base). It returns (nil, nil) when the call is already finished (empty prompt or a plugin hook stopped it) and (nil, err) when a failure reply was written to event.Result.
 func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, error) {
 	// Prefer the adapter's clean message_str (mirrors Python's use of event.message_str). PlainText is the chain-rendered text and may carry a self-mention (e.g. the qq_official adapter prepends At{qq_official} to C2C messages), which would otherwise pollute the prompt and history.
@@ -1464,6 +1538,17 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 	// LLM safety mode: prefix the safety prompt when enabled (mirrors astr_main_agent._apply_llm_safety_mode).
 	systemPrompt = s.applyLLMSafetyMode(systemPrompt)
 
+	// Cron-woken (active_agent) events carry `cron_job` metadata; append the
+	// PROACTIVE prompt with the job context, mirroring Python
+	// CronJobManager._woke_main_agent (manager.py:470-473). The synthetic event
+	// is built in lifecycle.go. Delivery via send_message_to_user is already
+	// available to every LLM call (collectTools adds the schema).
+	if cronJob := event.GetExtra("cron_job"); cronJob != nil {
+		if b, err := json.Marshal(cronJob); err == nil {
+			systemPrompt += "\n" + strings.ReplaceAll(cronWokeSystemPrompt, "{cron_job}", string(b))
+		}
+	}
+
 	// Apply on_llm_request hooks from subprocess plugins: they may modify the system prompt and/or user prompt, or stop the LLM call entirely.
 	if s.subPlugins != nil {
 		sp, up, stop, err := s.applyLLMRequestHooks(event, systemPrompt, prompt)
@@ -1487,7 +1572,10 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 	prompt = s.applyKnowledgeBase(event, prompt)
 
 	// computer_use_runtime drives whether local/sandbox tools are exposed and whether the local-mode hint is appended to the system prompt.
-	computerUseRuntime := "local"
+	// 缺省回退 "none"（不启用）：对齐 Python config/default.py 的 "computer_use_runtime": "none"
+	// 与 astr_main_agent.py:571 语义——只有显式配置 local/sandbox 才暴露宿主 shell/文件等工具，
+	// 配置缺失时不得静默回退到 local 暴露宿主环境。
+	computerUseRuntime := "none"
 	if s.providerConf != nil && s.providerConf.ComputerUseRuntime != "" {
 		computerUseRuntime = s.providerConf.ComputerUseRuntime
 	}
@@ -1580,8 +1668,10 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 
 	inst, err := provider.CreateProvider(providerType, mergedCfg, providerSettings)
 	if err != nil {
+		logger.Error("初始化模型提供商失败: %v", err)
 		event.Result = &message.MessageEventResult{}
-		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 初始化模型提供商失败: " + err.Error()}}
+		// 对外脱敏：错误原文只进日志（D-low-8）。
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 初始化模型提供商失败，请检查提供商配置"}}
 		return nil, err
 	}
 
@@ -1656,7 +1746,7 @@ func collectMediaURLs(event *core.Event) (imageURLs, audioURLs []string) {
 			case c.URL != "":
 				imageURLs = append(imageURLs, c.URL)
 			case c.Path != "":
-				imageURLs = append(imageURLs, "file://"+c.Path)
+				imageURLs = append(imageURLs, utils.PathToFileURI(c.Path))
 			case c.Base64 != "":
 				imageURLs = append(imageURLs, "data:image/png;base64,"+c.Base64)
 			}
@@ -1665,7 +1755,7 @@ func collectMediaURLs(event *core.Event) (imageURLs, audioURLs []string) {
 			case c.URL != "":
 				audioURLs = append(audioURLs, c.URL)
 			case c.Path != "":
-				audioURLs = append(audioURLs, "file://"+c.Path)
+				audioURLs = append(audioURLs, utils.PathToFileURI(c.Path))
 			}
 		}
 	}
@@ -1781,7 +1871,8 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 	if err != nil {
 		logger.Error("LLM call failed: %v", err)
 		event.Result = &message.MessageEventResult{}
-		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
+		// 对外脱敏：错误原文只进日志（D-low-8）。
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败，请稍后重试"}}
 		return nil, false
 	}
 	s.recordProviderCall(ar.providerCfg, event.UnifiedMsgOrigin(), resp)
@@ -1799,10 +1890,23 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 		maxSteps = s.providerConf.MaxAgentStep
 	}
 	for round := 0; round < maxSteps && len(resp.ToolsCallName) > 0; round++ {
-		// Append the assistant tool-call message
+		// Append the assistant tool-call message. 有思考内容/签名时以内容块列表
+		// 回填 think part（对齐 py tool_loop_agent_runner ThinkPart + TextPart），
+		// 否则维持纯文本，保证 Anthropic extended thinking 的 signature 能随历史
+		// 回传给下一轮请求。
+		var assistantContent interface{} = resp.CompletionText
+		if resp.ReasoningContent != "" || resp.ReasoningSignature != "" {
+			parts := []map[string]interface{}{
+				{"type": "think", "think": resp.ReasoningContent, "encrypted": resp.ReasoningSignature},
+			}
+			if resp.CompletionText != "" {
+				parts = append(parts, map[string]interface{}{"type": "text", "text": resp.CompletionText})
+			}
+			assistantContent = parts
+		}
 		assistantMsg := map[string]interface{}{
 			"role":       "assistant",
-			"content":    resp.CompletionText,
+			"content":    assistantContent,
 			"tool_calls": buildToolCallsMessage(resp),
 		}
 		messages = append(messages, assistantMsg)
@@ -1889,7 +1993,8 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 		if err != nil {
 			logger.Error("LLM tool-loop call failed: %v", err)
 			event.Result = &message.MessageEventResult{}
-			event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败: " + err.Error()}}
+			// 对外脱敏：错误原文只进日志（D-low-8）。
+			event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败，请稍后重试"}}
 			return nil, false
 		}
 		s.recordProviderCall(ar.providerCfg, event.UnifiedMsgOrigin(), resp)
@@ -1915,7 +2020,23 @@ func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMRe
 	// Append user + assistant reply to history (Python appends the pair post-completion; the user message is intentionally not in req.Contexts since it is sent as the current prompt).
 	if s.convMgr != nil {
 		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "user", ar.prompt)
-		s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "assistant", resp.CompletionText)
+		// 助手回复带思考内容/签名时以内容块列表持久化（与工具循环内的
+		// think part 同形），使 Anthropic extended thinking 的 signature
+		// 能跨轮回传，保证多轮推理连续性。
+		if resp.ReasoningContent != "" || resp.ReasoningSignature != "" {
+			parts := []map[string]interface{}{
+				{"type": "think", "think": resp.ReasoningContent, "encrypted": resp.ReasoningSignature},
+			}
+			if resp.CompletionText != "" {
+				parts = append(parts, map[string]interface{}{"type": "text", "text": resp.CompletionText})
+			}
+			s.convMgr.AppendHistoryEntry(event.UnifiedMsgOrigin(), map[string]interface{}{
+				"role":    "assistant",
+				"content": parts,
+			})
+		} else {
+			s.convMgr.AppendHistory(event.UnifiedMsgOrigin(), "assistant", resp.CompletionText)
+		}
 	}
 
 	// on_llm_response fires after the LLM reply is produced (e.g. plugins that capture conversation memory). Payload carries the reply text.
@@ -1939,6 +2060,9 @@ func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMRe
 
 	event.Result = &message.MessageEventResult{}
 	event.Result.Chain = []message.Component{&message.Plain{Text: resp.CompletionText}}
+	// 对齐 Python internal.py/third_party.py：LLM 产出的最终回复标记为 LLM_RESULT，
+	// 供 only_llm_result 分段、TTS 等下游判定使用。
+	event.Result.SetResultContentType(message.ResultLLMResult)
 }
 
 // chatRound issues a single LLM request. When streaming is enabled it consumes the stream channel, forwards content deltas to the platform incrementally, and consolidates content + tool calls into a single response.
@@ -2363,7 +2487,7 @@ func filterSkillsForCurrentConfig(list []*skills.SkillInfo, config map[string]in
 			allowedPlugins = names
 		}
 	}
-	registered := activePluginIDs()
+	registered := loadActivePluginIDs()
 	filtered := make([]*skills.SkillInfo, 0, len(list))
 	for _, sk := range list {
 		if sk.SourceType != skills.SourcePlugin {
@@ -2381,7 +2505,14 @@ func filterSkillsForCurrentConfig(list []*skills.SkillInfo, config map[string]in
 }
 
 // activePluginIDs snapshots the activated plugin ids (subprocess plugin registry; mirrors iterating star_registry for plugin.activated). The package-level indirection keeps filterSkillsForCurrentConfig testable without a full ProcessStage.
-var activePluginIDs = func() map[string]bool {
+// 通过 atomic.Value 保存函数值：SetActivePluginIDsProvider 可在运行期重挂（如配置重载重建管线），
+// 与其它 goroutine 的并发读构成 race；整体读整体写的模式适合 atomic.Value（load/store 各一条原子指令）。
+var activePluginIDs atomic.Value // 存储类型：func() map[string]bool
+
+func loadActivePluginIDs() map[string]bool {
+	if fn, ok := activePluginIDs.Load().(func() map[string]bool); ok && fn != nil {
+		return fn()
+	}
 	// Default no-op: without a wired snapshot no plugin id is known, so plugin-sourced skills would be dropped. Pipeline initialization always wires this (see SetActivePluginIDsProvider).
 	return nil
 }
@@ -2391,7 +2522,7 @@ func SetActivePluginIDsProvider(fn func() map[string]bool) {
 	if fn == nil {
 		return
 	}
-	activePluginIDs = fn
+	activePluginIDs.Store(fn)
 }
 
 // buildToolCallsMessage converts LLMResponse tool calls into the OpenAI assistant message tool_calls structure.
@@ -2890,11 +3021,11 @@ func (s *ProcessStage) loadMCPTools() {
 		}
 		safeName := sanitizeToolName(name)
 		client := agent.NewMCPClient(name, cfg)
-		// Use a fresh context for the connection; do NOT cancel it afterwards, because the underlying SSE transport may share it for its read loop.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := client.Connect(ctx)
-		cancel()
-		if err != nil {
+		// 连接生命周期由 MCPClient 自管：内部以 30s 看门狗限时握手（不阻塞
+		// 后续流程），连接 ctx 存活至 Cleanup 才取消。调用方绝不能在 Connect
+		// 返回后 cancel——mcp-go 的 SSE/stdio 传输把该 ctx 绑定为读循环/子进程
+		// 的生命周期，提前取消会立即杀死刚建立的连接。
+		if err := client.Connect(context.Background()); err != nil {
 			logger.I18nWarn("MCP 服务器 %q 连接失败: %v", name, err)
 			continue
 		}
@@ -3442,13 +3573,18 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		return fmt.Sprintf("Background task submitted. task_id=%s", taskID)
 	}
 
+	// 工具调用已超时废弃时，立即停止所有事件回写（D-low-6），
+	// 避免后台 goroutine 在主管线继续推进后仍修改事件。
+	if toolCallAbandoned(ctx) {
+		return fmt.Sprintf("Error: tool %s call timed out", name)
+	}
+
 	// Dispatch registered plugins' on_tool_call / on_using_llm_tool hooks before executing the tool, stashing the tool name/args on the event metadata for them to read and carrying a sdk.ToolCall payload.
 	if s.subPlugins != nil {
-		if event.Metadata == nil {
-			event.Metadata = make(map[string]interface{})
-		}
-		event.Metadata["tool_name"] = name
-		event.Metadata["tool_args"] = args
+		// 经 SetExtra 写入：管线运行期可能与事件发布后的并发读取同时访问
+		// Metadata map（见 core.Event.metadataMu）。
+		event.SetExtra("tool_name", name)
+		event.SetExtra("tool_args", args)
 		call := &pluginsdk.ToolCall{Name: name, Args: args}
 		dispatchSubprocessHooksPayload(s.subPlugins, event, "on_tool_call", call)
 		dispatchSubprocessHooksPayload(s.subPlugins, event, "on_using_llm_tool", call)
@@ -3457,6 +3593,9 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 	result := ""
 	handled := false
 	if strings.HasPrefix(name, "transfer_to_") {
+		if toolCallAbandoned(ctx) {
+			return fmt.Sprintf("Error: tool %s call timed out", name)
+		}
 		// Subagent handoff: run the subagent's persona round and return its reply as the tool result.
 		if r, h := s.executeSubAgent(event, name, args); h {
 			result, handled = r, true
@@ -3466,6 +3605,9 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		return s.executeNeoLifecycleTool(ctx, event.UnifiedMsgOrigin(), name, args)
 	}
 	if !handled && runtime == "sandbox" {
+		if toolCallAbandoned(ctx) {
+			return fmt.Sprintf("Error: tool %s call timed out", name)
+		}
 		if r, h := s.executeSandboxTool(ctx, event, name, args); h {
 			result, handled = r, true
 		}
@@ -3481,11 +3623,17 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		}
 	}
 	if !handled {
+		if toolCallAbandoned(ctx) {
+			return fmt.Sprintf("Error: tool %s call timed out", name)
+		}
 		if r, h := s.executePluginTool(event, name, args); h {
 			result, handled = r, true
 		}
 	}
 	if !handled {
+		if toolCallAbandoned(ctx) {
+			return fmt.Sprintf("Error: tool %s call timed out", name)
+		}
 		// Computer Use host tools (shell/python/file/grep) run only on the "local" runtime. collectTools injects them solely for that runtime, but OpenAI-compatible providers do not validate tool names, so an unregistered name could otherwise reach the host executors while Computer Use is disabled (M-19). The sandbox branch above is gated the same way.
 		switch name {
 		case "astrbot_execute_shell", "astrbot_shell_session", "astrbot_execute_python",
@@ -3508,7 +3656,11 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				case "astrbot_file_read_tool":
 					rdText, rdImg, rdMime := executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0), restrictedLocal)
 					if rdImg != "" {
-						result = s.registerToolImage(event, rdImg, rdMime, name)
+						if toolCallAbandoned(ctx) {
+							result = fmt.Sprintf("Error: tool %s call timed out", name)
+						} else {
+							result = s.registerToolImage(event, rdImg, rdMime, name)
+						}
 					} else {
 						result = rdText
 					}
@@ -3554,7 +3706,11 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		case "exa_get_contents":
 			result = executeExaGetContents(s.config, args)
 		case "send_message_to_user":
-			result = s.executeSendMessage(event, args)
+			if toolCallAbandoned(ctx) {
+				result = fmt.Sprintf("Error: tool %s call timed out", name)
+			} else {
+				result = s.executeSendMessage(event, args)
+			}
 		case "get_group_message_history":
 			result = s.executeGroupHistory(event, args)
 		case "astr_kb_search":
@@ -3619,6 +3775,9 @@ func (s *ProcessStage) executeSandboxTool(ctx context.Context, event *core.Event
 		}
 		rdText, rdImg, rdMime := sandboxFileRead(tctx, s.sandboxMgr, sessionID, argString(args, "path"), argInt(args, "offset", 0), argInt(args, "limit", 0))
 		if rdImg != "" {
+			if toolCallAbandoned(ctx) {
+				return fmt.Sprintf("Error: tool %s call timed out", name), true
+			}
 			return s.registerToolImage(event, rdImg, rdMime, name), true
 		}
 		return rdText, true
@@ -3736,16 +3895,20 @@ func (s *ProcessStage) maybeCompressContext(ctx context.Context, chatInst provid
 	if s.providerConf == nil || len(contexts) == 0 {
 		return contexts
 	}
-	maxCtx := s.providerConf.MaxContextLength
-	if maxCtx <= 0 {
-		return contexts // unlimited
+	// 1) 轮数上限（py enforce_max_turns）：max_context_length 表示"轮数"，
+	//    在压缩之前执行，与 token 预算无关（历史 bug：旧实现把它当 token
+	//    预算用，迁移配置后每请求都触发一次压缩 LLM）。
+	if maxTurns := s.providerConf.MaxContextLength; maxTurns > 0 {
+		contexts = truncateContextToTurns(contexts, maxTurns)
 	}
+	// 2) token 预算触发压缩（py max_context_tokens / fallback_max_context_tokens）。
+	budget := s.contextTokenBudget()
 	curTokens := estimateContextTokens(contexts)
-	if curTokens <= 0 {
+	if budget <= 0 || curTokens <= 0 {
 		return contexts
 	}
 	// Compression threshold 0.82 (Python default).
-	if curTokens <= int(float64(maxCtx)*0.82) {
+	if curTokens <= int(float64(budget)*0.82) {
 		return contexts
 	}
 	if s.providerConf.ContextLimitStrategy == "llm_compress" {
@@ -3753,8 +3916,8 @@ func (s *ProcessStage) maybeCompressContext(ctx context.Context, chatInst provid
 			return compressed
 		}
 	}
-	// Fallback: keep the most recent 2*max_context_length entries on even boundaries (user/assistant pair intact).
-	return truncateContextEntries(contexts, maxCtx)
+	// truncate_by_turns：丢弃最旧的 dequeue_context_length 轮（py truncate_turns）。
+	return truncateContextByDroppingTurns(contexts, s.providerConf.DequeueContextLength)
 }
 
 // estimateContextTokens is a rough token estimate (chars/2 for CJK-heavy text, ~4 chars per token for others) used for overflow detection.
@@ -3853,6 +4016,56 @@ func (s *ProcessStage) llmCompressContext(ctx context.Context, chatInst provider
 }
 
 // splitContextRounds splits a message list into user/assistant rounds.
+// truncateContextToTurns 只保留最近 keepTurns 轮（py enforce_max_turns），
+// 前导 system 消息保持不动；tool 消息随其所属轮一起保留。
+func truncateContextToTurns(contexts []map[string]interface{}, keepTurns int) []map[string]interface{} {
+	if keepTurns <= 0 {
+		return contexts
+	}
+	system, rest := leadingSystemMessages(contexts)
+	rounds := splitContextRounds(rest)
+	if len(rounds) <= keepTurns {
+		return contexts
+	}
+	return append(system, flattenContextRounds(rounds[len(rounds)-keepTurns:])...)
+}
+
+// truncateContextByDroppingTurns 丢弃最旧的 dropTurns 轮（py truncate_turns）。
+func truncateContextByDroppingTurns(contexts []map[string]interface{}, dropTurns int) []map[string]interface{} {
+	if dropTurns < 1 {
+		dropTurns = 1
+	}
+	system, rest := leadingSystemMessages(contexts)
+	rounds := splitContextRounds(rest)
+	if len(rounds) <= dropTurns {
+		return contexts
+	}
+	return append(system, flattenContextRounds(rounds[dropTurns:])...)
+}
+
+// leadingSystemMessages 拆出前导 system 消息与其余消息（各自为新切片）。
+func leadingSystemMessages(contexts []map[string]interface{}) ([]map[string]interface{}, []map[string]interface{}) {
+	i := 0
+	for i < len(contexts) {
+		if role, _ := contexts[i]["role"].(string); role != "system" {
+			break
+		}
+		i++
+	}
+	system := append([]map[string]interface{}{}, contexts[:i]...)
+	rest := append([]map[string]interface{}{}, contexts[i:]...)
+	return system, rest
+}
+
+// flattenContextRounds 将轮次切片拍平为消息切片。
+func flattenContextRounds(rounds [][]map[string]interface{}) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0)
+	for _, r := range rounds {
+		out = append(out, r...)
+	}
+	return out
+}
+
 func splitContextRounds(contexts []map[string]interface{}) [][]map[string]interface{} {
 	var rounds [][]map[string]interface{}
 	var cur []map[string]interface{}
@@ -3996,6 +4209,12 @@ type ResultDecorateStage struct {
 	segWordsPattern       *regexp.Regexp
 	segContentCleanupRule *regexp.Regexp
 	segWordsThreshold     int
+
+	// 回复侧内容安全（content_safety.also_use_in_response，对齐
+	// result_decorate/stage.py: initialize 持有独立的 ContentSafetyCheckStage，
+	// Process 中对 LLM 结果的纯文本做同一套关键词检查）。
+	contentSafeCheckReply bool
+	contentSafeSelector   *contentsafety.StrategySelector
 }
 
 func NewResultDecorateStage() *ResultDecorateStage {
@@ -4080,6 +4299,10 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 			s.t2iWordThreshold = int(v)
 		}
 	}
+	// 对齐 py result_decorate/stage.py:35：阈值下限为 50，避免配置过小导致频繁转图。
+	if s.t2iWordThreshold < 50 {
+		s.t2iWordThreshold = 50
+	}
 	s.t2iStrategy, _ = ctx.AstrbotConfig["t2i_strategy"].(string)
 	s.t2iEndpoint, _ = ctx.AstrbotConfig["t2i_endpoint"].(string)
 	s.t2iTemplate, _ = ctx.AstrbotConfig["t2i_active_template"].(string)
@@ -4098,12 +4321,46 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 	if s.ttsTriggerProb <= 0 {
 		s.ttsTriggerProb = 1.0
 	}
+
+	// 回复侧内容安全（content_safety.also_use_in_response，对齐
+	// result_decorate/stage.py initialize：仅当开关打开时才构建检查器，
+	// 关闭时零开销）。
+	if cs, ok := ctx.AstrbotConfig["content_safety"].(map[string]interface{}); ok {
+		s.contentSafeCheckReply, _ = cs["also_use_in_response"].(bool)
+		if s.contentSafeCheckReply {
+			s.contentSafeSelector = contentsafety.NewStrategySelector(cs)
+		}
+	}
 	return nil
 }
 
 func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*StageResult, error) {
 	if event.Result == nil || len(event.Result.Chain) == 0 {
 		return &StageResult{Continue: true}, nil
+	}
+
+	// 回复侧内容安全（content_safety.also_use_in_response，对齐
+	// result_decorate/stage.py Process 开头的检查：仅对 LLM 结果且非流式的
+	// 回复，拼接 Chain 中的纯文本走与入站同一套策略检查；命中时替换结果为
+	// 阻断提示并停止事件，不再继续装饰/发送）。
+	if s.contentSafeCheckReply && s.contentSafeSelector != nil &&
+		s.contentSafeSelector.IsEnabled() &&
+		event.Result.IsLLMResult() &&
+		event.Result.ResultContentType != message.ResultStreamingResult {
+		text := ""
+		for _, comp := range event.Result.Chain {
+			if plain, ok := comp.(*message.Plain); ok {
+				text += plain.Text
+			}
+		}
+		if ok, info := s.contentSafeSelector.Check(text); !ok {
+			// 对齐 Python：set_result(阻断提示) + stop_event，结果重置为普通
+			// 文本结果（General），调度器短路后不再进入 Respond。
+			event.SetResult(message.NewMessageEventResult().Message("Your message or the model response contains inappropriate content and has been blocked."))
+			event.Stop()
+			logger.Debug("Content safety check failed on response: %s", info)
+			return &StageResult{Continue: false}, nil
+		}
 	}
 
 	// Apply reply prefix
@@ -4152,8 +4409,18 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		}
 	}
 
+	// at 回复 / 引用回复仅适用于纯文本或图文消息（对齐 py result_decorate/stage.py:422-425 的 can_decorate）。
+	canDecorate := true
+	for _, comp := range event.Result.Chain {
+		switch comp.(type) {
+		case *message.Plain, *message.Image:
+		default:
+			canDecorate = false
+		}
+	}
+
 	// Apply @mention (only for group messages)
-	if !forwarded && s.replyWithMention && event.Source.IsGroup {
+	if canDecorate && !forwarded && s.replyWithMention && event.Source.IsGroup {
 		// Insert At component at the beginning
 		at := &message.At{TargetID: event.Source.SenderID, Name: event.Source.SenderName}
 		newChain := make([]message.Component, 0, len(event.Result.Chain)+1)
@@ -4169,7 +4436,7 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 	}
 
 	// Apply reply quote
-	if !forwarded && s.replyWithQuote && event.MessageObj != nil && event.MessageObj.MessageID != "" {
+	if canDecorate && !forwarded && s.replyWithQuote && event.MessageObj != nil && event.MessageObj.MessageID != "" {
 		reply := &message.Reply{MessageID: event.MessageObj.MessageID}
 		newChain := make([]message.Component, 0, len(event.Result.Chain)+1)
 		newChain = append(newChain, reply)
@@ -4541,12 +4808,38 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 		if s.segReplyRequired(event) && len(validChain) > 1 {
 			s.sendSegmented(ctx, event, validChain)
 		} else {
-			chain := event.Result.ToMessageChain()
-			chain.Chain = validChain
-			err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
-			if err != nil {
-				logger.Error("Failed to send message chain: %v", err)
-			} else if s.subPlugins != nil {
+			// 非分段路径：Record 段必须先单独发送，其余段再合并发送
+			// （对齐 py respond/stage.py:302-326 的 need_separately 提取逻辑）。
+			sepComps := make([]message.Component, 0)
+			restComps := make([]message.Component, 0, len(validChain))
+			for _, comp := range validChain {
+				if _, isRecord := comp.(*message.Record); isRecord {
+					sepComps = append(sepComps, comp)
+				} else {
+					restComps = append(restComps, comp)
+				}
+			}
+			sendOne := func(comps []message.Component) error {
+				chain := event.Result.ToMessageChain()
+				chain.Chain = comps
+				return s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
+			}
+			sent := false
+			for _, comp := range sepComps {
+				if err := sendOne([]message.Component{comp}); err != nil {
+					logger.Error("Failed to send record component: %v", err)
+				} else {
+					sent = true
+				}
+			}
+			if len(restComps) > 0 {
+				if err := sendOne(restComps); err != nil {
+					logger.Error("Failed to send message chain: %v", err)
+				} else {
+					sent = true
+				}
+			}
+			if sent && s.subPlugins != nil {
 				// on_after_message_sent fires after a reply is delivered (e.g. plugins that clean up pending state or react to sent messages).
 				dispatchSubprocessHooks(s.subPlugins, event, "on_after_message_sent")
 			}
@@ -4734,7 +5027,75 @@ func normalizeImagePath(img *message.Image) {
 	if img.File == "" {
 		return
 	}
-	img.File = strings.TrimPrefix(img.File, "file://")
+	img.File = utils.FileURIToPath(img.File)
+}
+
+// pathMapping 对齐 astrbot/core/utils/path_util.py 的 path_Mapping：
+// 逐条解析 "from:to" 规则（兼容 Windows 盘符路径），对 srcPath 做前缀替换。
+// 无匹配或规则非法时返回原路径。
+func pathMapping(mappings []string, srcPath string) string {
+	for _, mapping := range mappings {
+		rule := strings.Split(mapping, ":")
+		var from, to string
+		switch {
+		case len(rule) == 1 || len(rule) > 4:
+			logger.Warn("路径映射规则错误: %s", mapping)
+			continue
+		case len(rule) == 2:
+			from, to = rule[0], rule[1]
+		default: // len==3 或 len==4
+			if _, err := os.Stat(rule[0] + ":" + rule[1]); err == nil {
+				// 前两段拼起来存在，说明是 Windows 本地路径。
+				from = rule[0] + ":" + rule[1]
+				if len(rule) == 3 {
+					to = rule[2]
+				} else {
+					to = rule[2] + ":" + rule[3]
+				}
+			} else if len(rule) == 3 {
+				// 前两段不存在，第一段是 Linux 路径。
+				from = rule[0]
+				to = rule[1] + ":" + rule[2]
+			} else {
+				logger.Warn("路径映射规则错误: %s", mapping)
+				continue
+			}
+		}
+		from = strings.TrimRight(from, "/\\")
+		to = strings.TrimRight(to, "/\\")
+
+		url := srcPath
+		if utils.IsFileURI(url) {
+			url = utils.FileURIToPath(url)
+		}
+		if !strings.HasPrefix(url, from) {
+			continue
+		}
+		srcPath = strings.Replace(url, from, to, 1)
+		if strings.Contains(srcPath, ":") {
+			// Windows 路径：统一为反斜杠。
+			srcPath = strings.ReplaceAll(srcPath, "/", "\\")
+		} else if strings.HasPrefix(srcPath, ".") && len(srcPath) > 1 {
+			// 相对路径：依据第二/第三个字符判断分隔符方向。
+			sign := srcPath[1]
+			if sign == '.' && len(srcPath) > 2 {
+				sign = srcPath[2]
+			}
+			switch sign {
+			case '/':
+				srcPath = strings.ReplaceAll(srcPath, "\\", "/")
+			case '\\':
+				srcPath = strings.ReplaceAll(srcPath, "/", "\\")
+			default:
+				srcPath = strings.ReplaceAll(srcPath, "\\", "/")
+			}
+		} else {
+			srcPath = strings.ReplaceAll(srcPath, "\\", "/")
+		}
+		logger.Info("路径映射: %s -> %s", url, srcPath)
+		return srcPath
+	}
+	return srcPath
 }
 
 // DurationFromSeconds creates a duration from seconds.

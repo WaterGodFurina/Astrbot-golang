@@ -1,6 +1,9 @@
 package pipeline
 
 import (
+	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,26 +41,64 @@ const doomTrackerTTL = 30 * time.Minute
 // 顺序执行不同命令的常规工作流而误判。
 var doomWhitelist = map[string]bool{}
 
-// doomLoopKey derives the repetition key for a tool call. For shell execution
-// tools the command text is part of the key: a loop re-issuing the SAME command
-// is caught by the detector, while sequentially running different commands (a
-// normal coding workflow) is not.
+// doomLoopKey derives the repetition key for a tool call. 对齐 Python
+// tool_loop_agent_runner.py 的 _track_tool_call_streak：键 = 工具名 + 完整参数，
+// 只有"同名且同参数"的连续调用才计入重复；同名不同参数的正常多步操作不会误判。
+// shell 会话的只读轮询动作（合法的长任务等待）仍返回空键豁免检测。
 func doomLoopKey(toolName string, args map[string]interface{}) string {
-	switch toolName {
-	case "astrbot_execute_shell":
-		return toolName + "\x00" + argString(args, "command")
-	case "astrbot_shell_session":
-		action := argString(args, "action")
+	if toolName == "astrbot_shell_session" {
 		// 只读动作（list/poll/get/status）是合法的重复轮询（长任务等待），
-		// 返回空键豁免死循环检测；会改变状态的 write/write_line/interrupt/
-		// terminate 按内容计键。
-		switch action {
+		// 返回空键豁免死循环检测。
+		switch argString(args, "action") {
 		case "list", "poll", "get", "status":
 			return ""
 		}
-		return toolName + "\x00" + action + "\x00" + argString(args, "command")
 	}
-	return toolName
+	return toolName + "\x00" + hashDoomArgs(args)
+}
+
+// hashDoomArgs 把工具参数序列化为稳定字符串（键排序 + 嵌套递归），作为重复键的
+// 参数部分。对齐 Python 的 dict 相等比较语义（键与值都相同才算同一调用）。
+func hashDoomArgs(args map[string]interface{}) string {
+	if len(args) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(args))
+	for k := range args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(doomArgValue(args[k]))
+	}
+	return b.String()
+}
+
+// doomArgValue 将单个参数值转为稳定字符串（递归处理嵌套 map/slice）。
+func doomArgValue(v interface{}) string {
+	switch t := v.(type) {
+	case nil:
+		return "null"
+	case string:
+		return strconv.Quote(t)
+	case map[string]interface{}:
+		return "{" + hashDoomArgs(t) + "}"
+	case []interface{}:
+		parts := make([]string, 0, len(t))
+		for _, item := range t {
+			parts = append(parts, doomArgValue(item))
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	default:
+		// 数值/布尔等基础类型直接格式化。
+		return fmt.Sprintf("%v", v)
+	}
 }
 
 // doomTracker tracks per-session tool-call repetition.

@@ -118,7 +118,9 @@ func (m *CronJobManager) Add(job *Job) {
 	snapshot := job.clone()
 	m.mu.Unlock()
 	m.persist(snapshot)
-	logger.Debug("Scheduled job %s (%s) type=%s next=%v", job.ID, job.Name, job.JobType, job.NextRun)
+	// 只读锁内克隆的 snapshot：tick 在持锁状态下写 live job 的 NextRun，解锁后
+	// 再读 job.NextRun 会与该写并发（race）。snapshot 已深拷贝，读取安全。
+	logger.Debug("Scheduled job %s (%s) type=%s next=%v", snapshot.ID, snapshot.Name, snapshot.JobType, snapshot.NextRun)
 }
 
 // SetEnabled enables or disables a job (persisted). Disabled jobs remain in
@@ -287,6 +289,12 @@ func (m *CronJobManager) RunNow(id string) error {
 	job.running = true
 	snap := m.snapshotForFireLocked(job)
 	runCtx := m.ctx
+	// 周期任务：手动触发后立即按表达式重算 NextRun，否则旧 NextRun 仍在过去，
+	// 下一 tick 会把它当作到点任务再跑一次。run_once 任务改在 handler 执行完
+	// 后移除（见下方 defer），与 tick 的一次性语义一致（避免二次触发）。
+	if !job.RunOnce {
+		m.computeNextRunLocked(job, time.Now())
+	}
 	m.mu.Unlock()
 	// 任务挂到 manager 的运行上下文：Start 传入的 ctx 被取消（或 Stop）时，
 	// 在途的 run-now 任务也能随之停止，而不是用无法取消的 Background。
@@ -296,8 +304,17 @@ func (m *CronJobManager) RunNow(id string) error {
 	go func(live, j *Job) {
 		defer func() {
 			m.mu.Lock()
+			// 一次性任务：无论成败都清除，避免下一 tick 再次触发。
+			if j.RunOnce && m.jobs[j.ID] == live {
+				delete(m.jobs, j.ID)
+			}
 			live.running = false
 			m.mu.Unlock()
+			if j.RunOnce && m.db != nil {
+				if err := m.db.DeleteCronJob(j.ID); err != nil {
+					logger.Error("删除已执行的一次性 cron job %s 失败: %v", j.ID, err)
+				}
+			}
 		}()
 		if err := j.Handler(runCtx); err != nil {
 			logger.Error("Cron job %s run-now failed: %v", j.ID, err)

@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,10 @@ func TestChatStoreFilePermission(t *testing.T) {
 		t.Fatal(err)
 	}
 	if perm := info.Mode().Perm(); perm != 0600 {
+		// Windows 无 POSIX 权限位（CreateFile 建出的文件 Perm 恒 0666），非本机语义，跳过。
+		if runtime.GOOS == "windows" {
+			t.Skipf("Windows 不支持 POSIX 0600 权限位（got %o）", perm)
+		}
 		t.Fatalf("chat_sessions.json perm = %o, want 600", perm)
 	}
 }

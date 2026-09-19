@@ -56,8 +56,6 @@ type Adapter struct {
 
 	mediaBaseURL    string
 	callbackAPIBase string
-	stopCh          chan struct{}
-	stopOnce        sync.Once
 
 	// mediaMu 保护 mediaBaseURL 的读写（并发 Send 竞争）。
 	mediaMu sync.Mutex
@@ -77,7 +75,6 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		EventBus:    eventBus,
 		replyTokens: map[string]replyTokenEntry{},
 		evIDTime:    map[string]time.Time{},
-		stopCh:      make(chan struct{}),
 	}
 	channelAccessToken, _ := config["channel_access_token"].(string)
 	channelSecret, _ := config["channel_secret"].(string)
@@ -125,7 +122,6 @@ func (a *Adapter) Start(ctx context.Context) error {
 
 // Stop 关闭适配器。
 func (a *Adapter) Stop() error {
-	a.stopOnce.Do(func() { close(a.stopCh) })
 	lineLogger.I18nInfo("LINE 适配器已关闭")
 	return nil
 }
@@ -346,10 +342,12 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 }
 
 // truncateNick 将昵称截断为前 8 个字符（对应 Python 的 sender_id[:8]）。
+// Python 按码点切片，Go 的 []rune 与之对齐；直接切字节会把多字节
+// UTF-8 字符截断成非法序列。
 func truncateNick(m *platform.MessageMember) {
 	nick := m.UserID
-	if len(nick) > 8 {
-		nick = nick[:8]
+	if r := []rune(nick); len(r) > 8 {
+		nick = string(r[:8])
 	}
 	m.Nickname = nick
 }

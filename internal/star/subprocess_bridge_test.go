@@ -27,7 +27,11 @@ func TestMain(m *testing.M) {
 // tests, using a temp data dir.
 func newTestSubprocessManager(t *testing.T) *plugin.SubprocessManager {
 	t.Helper()
-	return plugin.NewSubprocessManager(toolchain.New(), t.TempDir())
+	m := plugin.NewSubprocessManager(toolchain.New(), t.TempDir())
+	// 同 internal/plugin newTestManager：LIFO 先于 TempDir 删除回收子进程，
+	// 防 Windows 残留进程句柄挡住自动清理（纯 cleanup 期假红）。
+	t.Cleanup(m.Shutdown)
+	return m
 }
 
 func bridgeTestEvent(msg string, admin bool) *core.Event {

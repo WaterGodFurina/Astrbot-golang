@@ -120,7 +120,7 @@ func (s *VolcengineTTSSource) GetAudio(ctx context.Context, text string) (string
 		return "", err
 	}
 
-	dir := filepath.Join("data", "temp")
+	dir := tempDataDir()
 	_ = os.MkdirAll(dir, 0755)
 	path := filepath.Join(dir, fmt.Sprintf("volcengine_tts_%d.mp3", time.Now().UnixNano()))
 	if err := os.WriteFile(path, audioData, 0644); err != nil {

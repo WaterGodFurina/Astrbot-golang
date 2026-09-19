@@ -46,6 +46,12 @@ func (r *RateLimiter) Allow(sessionID string) (bool, time.Duration) {
 
 	timestamps := r.timestamps[sessionID]
 
+	// maxRequests<=0 表示不限流（对齐 Python rate_limit_check/stage.py:66：
+	// `if self.rate_limit_count <= 0: break`），直接放行，不记录也不阻塞。
+	if r.maxRequests <= 0 {
+		return true, 0
+	}
+
 	if len(timestamps) >= r.maxRequests {
 		// Rate limited
 		if r.strategy == StrategyDiscard {

@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -21,16 +23,80 @@ func IsFileURI(s string) bool {
 	return strings.HasPrefix(s, "file://")
 }
 
-// FileURIToPath converts a file:// URI to a filesystem path.
+// FileURIToPathOK 把 file:// URI 解析为文件系统路径，并报告输入是否为合法
+// 的本地 file URI。语义对齐 Python 的
+// urllib.request.url2pathname(urllib.parse.urlparse(raw).path)：
+//   - scheme 必须为 file（为空或其它 scheme 返回 false）；
+//   - host 必须为空或 localhost，指向远端主机的 file URI 不当作本地路径；
+//   - percent-encoding 由 url.Parse 的 Path 字段自动解码（空格 %20、中文等）；
+//   - Windows 盘符路径 file:///C:/... 去掉前导 '/' 得到 C:/...，
+//     再由 filepath.FromSlash 归一为本地分隔符；非 Windows 保序。
+func FileURIToPathOK(raw string) (string, bool) {
+	if !strings.HasPrefix(raw, "file://") {
+		return "", false
+	}
+	// Windows 盘符形态（file://C:\...、file://C:/...、file:///C:/...）：
+	// url.Parse 会把盘符当作 host，从而被误判为远端主机而拒绝。这里显式
+	// 折叠为本地路径（percent-encoding 仍解码）；仅 Windows 生效。
+	if runtime.GOOS == "windows" {
+		if p, ok := fileURIToPathWindows(raw); ok {
+			return p, true
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "file" {
+		return "", false
+	}
+	if u.Host != "" && !strings.EqualFold(u.Host, "localhost") {
+		return "", false
+	}
+	// u.Path 已由 net/url 解码 percent-encoding（RawPath 保留原始形态），
+	// 无需再调用 url.PathUnescape。
+	p := u.Path
+	if p == "" {
+		return "", false
+	}
+	if runtime.GOOS == "windows" && len(p) >= 3 && p[0] == '/' && p[2] == ':' {
+		p = p[1:]
+	}
+	return filepath.FromSlash(p), true
+}
+
+// fileURIToPathWindows 解析 Windows 盘符形态的 file URI（file://C:\...、
+// file://C:/...、file:///C:/...）。独立成函数以便跨平台单测（生产仅 Windows
+// 调用）。返回 ok=false 表示不是盘符形态，交回通用 url.Parse 路径处理。
+func fileURIToPathWindows(raw string) (string, bool) {
+	r := strings.TrimPrefix(raw, "file://")
+	if strings.HasPrefix(r, "/") {
+		r = r[1:]
+	}
+	if len(r) >= 2 && r[1] == ':' {
+		if dec, err := url.PathUnescape(r); err == nil {
+			r = dec
+		}
+		return filepath.FromSlash(r), true
+	}
+	return "", false
+}
+
+// FileURIToPath converts a file:// URI to a filesystem path. Non-URI inputs and
+// malformed URIs are returned unchanged so callers can treat the result as a
+// best-effort path.
 func FileURIToPath(uri string) string {
-	if !IsFileURI(uri) {
-		return uri
+	if p, ok := FileURIToPathOK(uri); ok {
+		return p
 	}
-	u, err := url.Parse(uri)
-	if err != nil {
-		return strings.TrimPrefix(uri, "file://")
-	}
-	return u.Path
+	return uri
+}
+
+// PathToFileURI 把本地绝对路径转换为标准 file:// URI，语义对齐 Python
+// pathlib.Path.as_uri()：路径分隔符统一为 '/'，Windows 盘符路径（如
+// C:\Users\...）会被规范化为 file:///C:/Users/...，空格、中文等特殊字符
+// 由 net/url 自动 percent-encode。直接裸拼 "file://" + 路径在 Windows 上
+// 会产生 file://C:\Users\... 这类畸形 URI，OneBot 端会拒收媒体。
+func PathToFileURI(path string) string {
+	u := &url.URL{Scheme: "file", Path: "/" + filepath.ToSlash(path)}
+	return u.String()
 }
 
 // maxDownloadBytes bounds the response body of remote downloads, protecting
@@ -181,7 +247,28 @@ func EnsureWAV(path string) (string, error) {
 			return outPath, nil
 		}
 	}
+	// 其它格式（mp3/m4a/ogg/amr/flac 等）：对齐 py ensure_wav →
+	// convert_audio_format("wav")，用 ffmpeg 转 wav；失败/未安装则原样返回，
+	// 由上游按支持的格式兜底。
+	outPath := TempFilePath("converted.wav")
+	if err := convertAudioWithFFmpeg(context.Background(), path, outPath); err == nil {
+		return outPath, nil
+	}
 	return path, nil
+}
+
+// convertAudioWithFFmpeg 调用 `ffmpeg -y -i in out` 转码（对齐 py
+// convert_audio_format 的 wav 分支参数）。
+func convertAudioWithFFmpeg(ctx context.Context, in, out string) error {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", in, out)
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(out)
+		return err
+	}
+	return nil
 }
 
 // DescribeMediaRef returns a text description of a media reference.

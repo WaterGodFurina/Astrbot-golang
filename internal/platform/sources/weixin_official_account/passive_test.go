@@ -70,8 +70,8 @@ func TestUserStateTakeReply(t *testing.T) {
 	if !st.exhausted() {
 		t.Error("弹出完毕后应判定耗尽")
 	}
-	// future XML 优先。
-	st.setFutureXML(imageReplyXML("gh", "u", "media-1"))
+	// future XML 优先。参数方向：ToUserName=用户 openid "u"，FromUserName=机器人 "gh"。
+	st.setFutureXML(imageReplyXML("u", "gh", "media-1"))
 	if xml, ok, _ := st.takeReply(); !ok || !strings.Contains(xml, "media-1") {
 		t.Fatalf("future XML 应优先弹出: %q", xml)
 	}
@@ -84,7 +84,8 @@ func TestUserStateTakeReply(t *testing.T) {
 func TestEncryptMessageRoundTrip(t *testing.T) {
 	keyStr := testAESKey(t)
 	a := New(map[string]interface{}{"id": "wx", "token": "tok", "appid": "wxappid", "encoding_aes_key": keyStr}, nil, nil)
-	plain := textReplyXML("gh_app", "o_openid", "加密回复内容")
+	// 参数方向：ToUserName=用户 openid "o_openid"，FromUserName=机器人 "gh_app"。
+	plain := textReplyXML("o_openid", "gh_app", "加密回复内容")
 	enc, err := a.encryptMessage(plain, "nonce1", "1234567890")
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +99,7 @@ func TestEncryptMessageRoundTrip(t *testing.T) {
 	if err := md.ShouldDecode(keyStr); err != nil {
 		t.Fatalf("SDK 解密失败: %v", err)
 	}
-	if md.Content != "加密回复内容" || md.FromUserName != "o_openid" {
+	if md.Content != "加密回复内容" || md.ToUserName != "o_openid" || md.FromUserName != "gh_app" {
 		t.Fatalf("解密内容不符: %+v", md)
 	}
 }
@@ -120,7 +121,8 @@ func encXMLField(encXML, field string) string {
 // TestMaybeEncryptPlaintextFallback: 无 aeskey 时回复保持明文。
 func TestMaybeEncryptPlaintextFallback(t *testing.T) {
 	a := New(map[string]interface{}{"id": "wx", "token": "tok"}, nil, nil)
-	plain := textReplyXML("gh", "u", "hi")
+	// 参数方向：ToUserName=用户 openid "u"，FromUserName=机器人 "gh"。
+	plain := textReplyXML("u", "gh", "hi")
 	if got := a.maybeEncrypt(plain, "n", "1"); got != plain {
 		t.Fatalf("无 aeskey 应返回明文: %q", got)
 	}

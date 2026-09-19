@@ -3,7 +3,9 @@ package sources
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"html"
 	"net/http"
@@ -19,6 +21,11 @@ const (
 	edgeTTSDefaultWSURL = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1"
 	edgeTTSToken        = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
 	edgeTTSDefaultVoice = "zh-CN-XiaoxiaoNeural"
+	// edgeTTSDefaultChromiumVersion 用于 Sec-MS-GEC-Version（1-<chromium 版本>）。
+	// 微软会随 Edge 更新提升该版本号，可通过 edge-tts-sec-ms-gec-version 配置覆盖。
+	edgeTTSDefaultChromiumVersion = "130.0.2849.68"
+	// edgeTTSTicksPer5Min 是 Sec-MS-GEC 时间戳向下取整窗口（5 分钟，单位 100ns）。
+	edgeTTSTicksPer5Min = int64(5 * 60 * 10000000)
 )
 
 // EdgeTTSSource synthesizes speech using the free Microsoft Edge
@@ -28,25 +35,27 @@ const (
 // this Go port saves the mp3 stream directly.
 type EdgeTTSSource struct {
 	*provider.BaseProvider
-	voice   string
-	rate    string
-	volume  string
-	pitch   string
-	wsURL   string
-	timeout time.Duration
+	voice           string
+	rate            string
+	volume          string
+	pitch           string
+	wsURL           string
+	timeout         time.Duration
+	secMSGECVersion string
 }
 
 // NewEdgeTTSSource creates an Edge TTS provider.
 func NewEdgeTTSSource(config, settings map[string]interface{}) *EdgeTTSSource {
 	bp := provider.NewBaseProvider(config, settings)
 	s := &EdgeTTSSource{
-		BaseProvider: bp,
-		voice:        configString(config, "edge-tts-voice", edgeTTSDefaultVoice),
-		rate:         configString(config, "rate", "+0%"),
-		volume:       configString(config, "volume", "+0%"),
-		pitch:        configString(config, "pitch", "+0Hz"),
-		wsURL:        configString(config, "edge-tts-ws-url", edgeTTSDefaultWSURL),
-		timeout:      time.Duration(configInt(config, "timeout", 30)) * time.Second,
+		BaseProvider:    bp,
+		voice:           configString(config, "edge-tts-voice", edgeTTSDefaultVoice),
+		rate:            configString(config, "rate", "+0%"),
+		volume:          configString(config, "volume", "+0%"),
+		pitch:           configString(config, "pitch", "+0Hz"),
+		wsURL:           configString(config, "edge-tts-ws-url", edgeTTSDefaultWSURL),
+		timeout:         time.Duration(configInt(config, "timeout", 30)) * time.Second,
+		secMSGECVersion: configString(config, "edge-tts-sec-ms-gec-version", edgeTTSDefaultChromiumVersion),
 	}
 	if s.rate == "" {
 		s.rate = "+0%"
@@ -62,7 +71,8 @@ func NewEdgeTTSSource(config, settings map[string]interface{}) *EdgeTTSSource {
 	return s
 }
 
-// buildURL appends the TrustedClientToken and ConnectionId query params.
+// buildURL appends the TrustedClientToken, Sec-MS-GEC（DRM 校验）与
+// ConnectionId query params.
 func (s *EdgeTTSSource) buildURL() (string, error) {
 	u, err := url.Parse(s.wsURL)
 	if err != nil {
@@ -70,9 +80,29 @@ func (s *EdgeTTSSource) buildURL() (string, error) {
 	}
 	q := u.Query()
 	q.Set("TrustedClientToken", edgeTTSToken)
+	// 微软 2024 起要求 Sec-MS-GEC/Sec-MS-GEC-Version，缺失会 403。
+	q.Set("Sec-MS-GEC", generateSecMSGEC())
+	q.Set("Sec-MS-GEC-Version", "1-"+s.secMSGECVersion)
 	q.Set("ConnectionId", ttsUUID())
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// generateSecMSGEC 计算 Sec-MS-GEC（对齐 edge-tts DRM.generate_sec_ms_gec）：
+// 当前时间转 Windows FILETIME ticks（100ns），向下取整到 5 分钟，拼接
+// TrustedClientToken 后取 SHA256 大写十六进制。
+func generateSecMSGEC() string {
+	// Unix 纳秒 /100 = 100ns ticks；11644473600s = 1601-01-01 到 1970-01-01。
+	ticks := time.Now().UnixNano()/100 + 11644473600*10000000
+	ticks -= ticks % edgeTTSTicksPer5Min
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d%s", ticks, edgeTTSToken)))
+	return strings.ToUpper(hex.EncodeToString(sum[:]))
+}
+
+// generateEdgeDate 生成 edge-tts 协议使用的 UTC 时间戳字符串
+// （对齐 edge-tts generate_date，必须为 UTC，本地时区会被服务端拒绝）。
+func generateEdgeDate() string {
+	return time.Now().UTC().Format("Mon Jan 02 2006 15:04:05 GMT+0000 (Coordinated Universal Time)")
 }
 
 // GetAudio synthesizes speech over WebSocket and returns the mp3 file path.
@@ -80,21 +110,35 @@ func (s *EdgeTTSSource) GetAudio(ctx context.Context, text string) (string, erro
 	if strings.TrimSpace(text) == "" {
 		return "", fmt.Errorf("text is empty")
 	}
-	wsURL, err := s.buildURL()
-	if err != nil {
-		return "", err
-	}
 	dialer := websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: s.timeout,
 	}
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
-	if err != nil {
+	var conn *websocket.Conn
+	var err error
+	// Sec-MS-GEC 会随时间窗/版本失效导致握手 403：重新生成后重试一次。
+	for attempt := 0; attempt < 2; attempt++ {
+		var wsURL string
+		wsURL, err = s.buildURL()
+		if err != nil {
+			return "", err
+		}
+		conn, _, err = dialer.DialContext(ctx, wsURL, nil)
+		if err == nil {
+			break
+		}
+		if attempt == 0 && strings.Contains(err.Error(), "403") {
+			logger.Warn("edge_tts 握手 403（Sec-MS-GEC 过期或版本不符），重新生成后重试")
+			continue
+		}
+		return "", fmt.Errorf("edge_tts 连接失败: %w", err)
+	}
+	if conn == nil {
 		return "", fmt.Errorf("edge_tts 连接失败: %w", err)
 	}
 	defer conn.Close()
 
-	ts := time.Now().Format(time.RFC3339)
+	ts := generateEdgeDate()
 	reqID := ttsUUID()
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(
 		fmt.Sprintf("X-Timestamp:%s\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n%s",

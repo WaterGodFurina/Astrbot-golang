@@ -7,6 +7,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -131,6 +132,18 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		}
 		result = append(result, info)
 	}
+	// 快照 handlerMeta（handlerMetaMu 读锁内整体拷贝一份指针表）：下方循环
+	// 构建休眠插件信息需读各插件的 Register 元数据，原实现无锁直读
+	// m.handlerMeta 会与 setHandlerMeta/removeHandlerMeta 并发读写
+	//（-race 必报，线上可能 fatal concurrent map read/write）。列表可能
+	// 较大，一次性持锁拷贝指针比逐个 HandlerMetaByID 反复加锁更省；
+	// 元数据本身只读，锁外通过快照访问是安全的。
+	m.handlerMetaMu.RLock()
+	metaSnapshot := make(map[string]*sdkv1.RegisterResponse, len(m.handlerMeta))
+	for mid, meta := range m.handlerMeta {
+		metaSnapshot[mid] = meta
+	}
+	m.handlerMetaMu.RUnlock()
 	// manifest 中已启用但当前未加载的插件：可能是闲置自动卸载（idle sweep）
 	// 后处于休眠状态——插件仍启用，触发时会自动唤醒。
 	for _, e := range man.Plugins {
@@ -168,9 +181,9 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"idle_unload":             e.IdleUnload,
 			"idle_unload_minutes":     e.IdleUnloadMinutes,
 			"idle_wake_mode":          e.IdleWakeMode,
-			"has_filter":              pluginHasMetaFilters(m.handlerMeta[e.ID]),
-			"has_hook":                pluginHasMetaHooks(m.handlerMeta[e.ID]),
-			"active_event_listener":   pluginHasPassiveEvents(m.handlerMeta[e.ID]),
+			"has_filter":              pluginHasMetaFilters(metaSnapshot[e.ID]),
+			"has_hook":                pluginHasMetaHooks(metaSnapshot[e.ID]),
+			"active_event_listener":   pluginHasPassiveEvents(metaSnapshot[e.ID]),
 			"install_source":          e.installSourceMap(),
 			"updates_enabled":         updatesEnabled(e.InstallMethod),
 			"update_disabled_reason":  "",
@@ -346,8 +359,9 @@ func (m *SubprocessManager) RemoveFailedPlugin(id string, deleteConfig, deleteDa
 
 	// 删 manifest 条目与残留目录（复用 Uninstall 的清理逻辑，忽略"实例
 	// 未加载"类错误——失败插件本来就没在运行；残留目录缺失时继续清理
-	// 记录，对齐本体 partial uninstall 语义）。
-	if err := m.Uninstall(id, deleteConfig, deleteData); err != nil && !strings.Contains(err.Error(), "not loaded") && !strings.Contains(err.Error(), "未安装") {
+	// 记录，对齐本体 partial uninstall 语义）。本函数已持 lockOp(id)，
+	// 必须调 uninstallLocked 而非 Uninstall，否则重复取同一把锁自死锁。
+	if err := m.uninstallLocked(id, deleteConfig, deleteData); err != nil && !errors.Is(err, ErrPluginNotLoaded) && !strings.Contains(err.Error(), "未安装") {
 		return err
 	}
 	return nil
@@ -551,6 +565,16 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 	unlock := m.lockOp(id)
 	defer unlock()
 
+	return m.uninstallLocked(id, deleteConfig, deleteData)
+}
+
+// uninstallLocked 是 Uninstall 的主体；调用方必须已持有 lockOp(id) 的
+// per-plugin 生命周期锁（与 loadLocked/unloadCoreLocked 同一约定）。单独
+// 拆出供 RemoveFailedPlugin 复用：后者已持锁，若再调 Uninstall 会重复取
+// 同一把锁而自死锁。清理全程（manifest 删条目 + 磁盘目录删除）无需在锁外
+// 执行的 RPC/生命周期钩子（unloadCoreLocked 的 OnInstancesChanged 回调本
+// 就在 op 锁内运行，与原 Uninstall 锁范围一致），故整体保留在锁内。
+func (m *SubprocessManager) uninstallLocked(id string, deleteConfig, deleteData bool) error {
 	var entry *ManifestEntry
 	// 串行化 manifest 读→改→写：先读取条目，Unload 之后在锁内 Remove+Save。
 	m.manifestMu.Lock()
@@ -573,6 +597,20 @@ func (m *SubprocessManager) Uninstall(id string, deleteConfig, deleteData bool) 
 		if m.Get(id) != nil {
 			m.manifestMu.Unlock()
 			return fmt.Errorf("plugin %s 在卸载期间被重新加载，已中止卸载", id)
+		}
+		// 释放 manifest 锁的窗口内，并发 SetEnabled/recordInstall 可能已写入
+		// 磁盘 manifest（例如同插件的状态翻转或其它插件安装）。必须重新读取
+		// 磁盘快照后再 Remove+Save，否则用卸载前的旧快照回写会覆盖这些更新
+		// （丢 Enabled 翻转、甚至丢刚安装的其它插件条目）。目录足迹 entry 也
+		// 以新快照为准（条目存在时）。
+		fresh, ferr := LoadManifest(m.manifestPath())
+		if ferr != nil {
+			m.manifestMu.Unlock()
+			return ferr
+		}
+		man = fresh
+		if e := fresh.Get(id); e != nil {
+			entry = e
 		}
 	}
 	man.Remove(id)

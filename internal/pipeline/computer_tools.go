@@ -90,11 +90,23 @@ func sandboxShell(ctx context.Context, mgr *sandbox.Manager, sessionID, command 
 	return fmt.Sprintf("Command completed with exit code 0.\nOutput:\n%s", out)
 }
 
+// pythonCommand 返回 Python 解释器命令：优先 PYTHON 环境变量，其次 python3，
+// 最后回退 python（对齐 py local.py:850 的 os.environ.get("PYTHON", sys.executable)）。
+func pythonCommand() string {
+	if p := strings.TrimSpace(os.Getenv("PYTHON")); p != "" {
+		return p
+	}
+	if _, err := exec.LookPath("python3"); err == nil {
+		return "python3"
+	}
+	return "python"
+}
+
 func sandboxPython(ctx context.Context, mgr *sandbox.Manager, sessionID, code string) string {
 	if strings.TrimSpace(code) == "" {
 		return "Error executing code: `code` must be a non-empty string."
 	}
-	stdout, stderr, exitCode, err := mgr.Exec(ctx, sessionID, "python3", []string{"-c", code}, sandboxWorkdir)
+	stdout, stderr, exitCode, err := mgr.Exec(ctx, sessionID, pythonCommand(), []string{"-c", code}, sandboxWorkdir)
 	if err != nil && exitCode < 0 {
 		return "error: code execution failed in sandbox: " + err.Error()
 	}
@@ -505,10 +517,7 @@ func enforceRealPathWithin(resolved string, roots []string) error {
 				if aerr != nil {
 					continue
 				}
-				rootReal := rootAbs
-				if r, rerr := filepath.EvalSymlinks(rootAbs); rerr == nil {
-					rootReal = r
-				}
+				rootReal := evalPathOrExistingAncestor(rootAbs)
 				if within, werr := pathWithin(rootReal, real); werr == nil && within {
 					return nil
 				}
@@ -518,6 +527,28 @@ func enforceRealPathWithin(resolved string, roots []string) error {
 		parent := filepath.Dir(cur)
 		if parent == cur || parent == "." {
 			return nil
+		}
+		tail = append([]string{filepath.Base(cur)}, tail...)
+		cur = parent
+	}
+}
+
+// evalPathOrExistingAncestor 解析路径真实位置；不存在时回退"最深已存在祖先的
+// 解析结果+剩余段"。Windows 短名（RUNNER~1）与 EvalSymlinks 长名异形，允许根
+// 常为未创建的目录（如 data/skills），需同样解析后才能与 resolved 比较。
+func evalPathOrExistingAncestor(p string) string {
+	cur := p
+	var tail []string
+	for {
+		if real, err := filepath.EvalSymlinks(cur); err == nil {
+			for _, c := range tail {
+				real = filepath.Join(real, c)
+			}
+			return real
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur || parent == "." {
+			return p
 		}
 		tail = append([]string{filepath.Base(cur)}, tail...)
 		cur = parent
@@ -1386,7 +1417,7 @@ func executeLocalPython(umo, code string, timeout int) string {
 	ws := workspaceRoot(umo)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "python3", "-c", code) // #nosec G204 -- astrbot_execute_python 工具核心：执行 AI 指令给定的 Python 代码（host 本地运行，功能明确，前端已警示）
+	cmd := exec.CommandContext(ctx, pythonCommand(), "-c", code) // #nosec G204 -- astrbot_execute_python 工具核心：执行 AI 指令给定的 Python 代码（host 本地运行，功能明确，前端已警示）
 	cmd.Dir = ws
 	// 与同步 shell 路径一致：输出限幅 + 全量 spool 落盘（超限不丢数据）。
 	cw := &spoolWriter{max: maxShellOutput, dir: filepath.Join(ws, ".astrbot-outputs")}
@@ -1981,15 +2012,12 @@ func (s *ProcessStage) registerToolImage(event *core.Event, rawB64, mime, toolNa
 			mime = "image/jpeg" // compressImageForProvider 统一 JPEG 输出（透明压平白底，与 provider 图片通道同语义）。
 		}
 	}
-	if event.Metadata == nil {
-		event.Metadata = map[string]interface{}{}
-	}
-	pending, _ := event.Metadata[toolImageSinkKey].(*[]pendingToolImage)
+	pending, _ := event.GetExtra(toolImageSinkKey).(*[]pendingToolImage)
 	if pending == nil {
 		pending = &[]pendingToolImage{}
-		event.Metadata[toolImageSinkKey] = pending
 	}
 	*pending = append(*pending, pendingToolImage{Mime: mime, Base64: base64.StdEncoding.EncodeToString(data), Path: path})
+	event.SetExtra(toolImageSinkKey, pending)
 	return fmt.Sprintf("Image returned and cached at path='%s'. Review the image below. Use send_message_to_user to send it to the user if satisfied, with type='image' and path='%s'.", path, path)
 }
 
@@ -2009,15 +2037,12 @@ func providerSupportsImages(providerCfg map[string]interface{}) bool {
 
 // drainToolImages returns and clears the event's pending tool images.
 func drainToolImages(event *core.Event) []pendingToolImage {
-	if event.Metadata == nil {
-		return nil
-	}
-	pending, _ := event.Metadata[toolImageSinkKey].(*[]pendingToolImage)
+	pending, _ := event.GetExtra(toolImageSinkKey).(*[]pendingToolImage)
 	if pending == nil || len(*pending) == 0 {
 		return nil
 	}
 	out := *pending
-	event.Metadata[toolImageSinkKey] = &[]pendingToolImage{}
+	event.SetExtra(toolImageSinkKey, &[]pendingToolImage{})
 	return out
 }
 

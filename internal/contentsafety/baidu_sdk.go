@@ -47,14 +47,20 @@ func (c *BaiduAipChecker) Check(text string) (bool, string) {
 		ErrorMsg       string `json:"error_msg"`
 	}
 	if err := json.Unmarshal([]byte(resp), &body); err != nil {
-		// 传输/解析失败时 fail open：短暂 API 故障不应阻塞所有消息。
-		return true, "baidu aip decode error: " + err.Error()
+		// 对齐 Python baidu_aip.py：响应缺少 conclusionType 时 return False
+		// （fail-closed）。传输/解析失败同样拦截，绝不静默放行。
+		return false, "baidu aip decode error: " + err.Error()
 	}
 	if body.ErrorCode != 0 {
-		return true, fmt.Sprintf("baidu aip error(%d): %s", body.ErrorCode, body.ErrorMsg)
+		// 对齐 Python：API 返回错误时不会出现合法的 conclusionType==1，
+		// 因此按不合规处理（fail-closed）。
+		return false, fmt.Sprintf("baidu aip error(%d): %s", body.ErrorCode, body.ErrorMsg)
 	}
-	if body.Conclusion == "不合规" || body.ConclusionType == 2 {
-		return false, "baidu aip flagged: " + body.Conclusion
+	// conclusionType: 1=合规；2=不合规；3=疑似；4=审核失败。
+	// Python 仅当 `res["conclusionType"] == 1` 才放行，其余（含缺失/未知）一律
+	// 拦截（baidu_aip.py:21-32）。
+	if body.ConclusionType == 1 {
+		return true, ""
 	}
-	return true, ""
+	return false, "baidu aip flagged: " + body.Conclusion
 }

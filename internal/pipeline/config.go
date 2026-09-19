@@ -11,36 +11,41 @@ import (
 // absent" (nil) from "explicitly false" — matching the original assertion
 // logic which treated absent keys as true/allow.
 type ProviderSettings struct {
-	Enable                       *bool   `mapstructure:"enable"`
-	DefaultProviderID            string  `mapstructure:"default_provider_id"`
-	DefaultPersonality           string  `mapstructure:"default_personality"`
-	Persona                      string  `mapstructure:"persona"`
-	ComputerUseRuntime           string  `mapstructure:"computer_use_runtime"`
-	ComputerUseRequireAdmin      *bool   `mapstructure:"computer_use_require_admin"`
-	ComputerUseMaxSameToolCalls  *int    `mapstructure:"computer_use_max_same_tool_calls"`
-	StreamingResponse            bool    `mapstructure:"streaming_response"`
-	WakePrefix                   string  `mapstructure:"wake_prefix"`
-	Identifier                   bool    `mapstructure:"identifier"`
-	GroupNameDisplay             bool    `mapstructure:"group_name_display"`
-	DatetimeSystemPrompt         bool    `mapstructure:"datetime_system_prompt"`
-	MaxAgentStep                 int     `mapstructure:"max_agent_step"`
-	ToolCallTimeout              int     `mapstructure:"tool_call_timeout"`
-	ToolSchemaMode               string  `mapstructure:"tool_schema_mode"`
-	LLMSafetyMode                bool    `mapstructure:"llm_safety_mode"`
-	SafetyModeStrategy           string  `mapstructure:"safety_mode_strategy"`
-	UnsupportedStreamingStrategy string  `mapstructure:"unsupported_streaming_strategy"`
-	DisplayReasoningText         bool    `mapstructure:"display_reasoning_text"`
-	ShowToolUseStatus            bool    `mapstructure:"show_tool_use_status"`
-	ShowToolCallResult           bool    `mapstructure:"show_tool_call_result"`
-	BufferIntermediateMessages   bool    `mapstructure:"buffer_intermediate_messages"`
-	SanitizeContextByModalities  bool    `mapstructure:"sanitize_context_by_modalities"`
-	MaxContextLength             int     `mapstructure:"max_context_length"`
-	DequeueContextLength         int     `mapstructure:"dequeue_context_length"`
-	ContextLimitStrategy         string  `mapstructure:"context_limit_reached_strategy"`
-	LLMCompressInstruction       string  `mapstructure:"llm_compress_instruction"`
-	LLMCompressKeepRecentRatio   float64 `mapstructure:"llm_compress_keep_recent_ratio"`
-	LLMCompressProviderID        string  `mapstructure:"llm_compress_provider_id"`
-	Proactive                    struct {
+	Enable                       *bool  `mapstructure:"enable"`
+	DefaultProviderID            string `mapstructure:"default_provider_id"`
+	DefaultPersonality           string `mapstructure:"default_personality"`
+	Persona                      string `mapstructure:"persona"`
+	ComputerUseRuntime           string `mapstructure:"computer_use_runtime"`
+	ComputerUseRequireAdmin      *bool  `mapstructure:"computer_use_require_admin"`
+	ComputerUseMaxSameToolCalls  *int   `mapstructure:"computer_use_max_same_tool_calls"`
+	StreamingResponse            bool   `mapstructure:"streaming_response"`
+	WakePrefix                   string `mapstructure:"wake_prefix"`
+	Identifier                   bool   `mapstructure:"identifier"`
+	GroupNameDisplay             bool   `mapstructure:"group_name_display"`
+	DatetimeSystemPrompt         bool   `mapstructure:"datetime_system_prompt"`
+	MaxAgentStep                 int    `mapstructure:"max_agent_step"`
+	ToolCallTimeout              int    `mapstructure:"tool_call_timeout"`
+	ToolSchemaMode               string `mapstructure:"tool_schema_mode"`
+	LLMSafetyMode                bool   `mapstructure:"llm_safety_mode"`
+	SafetyModeStrategy           string `mapstructure:"safety_mode_strategy"`
+	UnsupportedStreamingStrategy string `mapstructure:"unsupported_streaming_strategy"`
+	DisplayReasoningText         bool   `mapstructure:"display_reasoning_text"`
+	ShowToolUseStatus            bool   `mapstructure:"show_tool_use_status"`
+	ShowToolCallResult           bool   `mapstructure:"show_tool_call_result"`
+	BufferIntermediateMessages   bool   `mapstructure:"buffer_intermediate_messages"`
+	SanitizeContextByModalities  bool   `mapstructure:"sanitize_context_by_modalities"`
+	MaxContextLength             int    `mapstructure:"max_context_length"`
+	// max_context_length 是"轮数"上限（py enforce_max_turns）；token 预算
+	// 走下面两个字段（py max_context_tokens / fallback_max_context_tokens），
+	// 两者语义分立，不能混用。
+	MaxContextTokens           int     `mapstructure:"max_context_tokens"`
+	FallbackMaxContextTokens   int     `mapstructure:"fallback_max_context_tokens"`
+	DequeueContextLength       int     `mapstructure:"dequeue_context_length"`
+	ContextLimitStrategy       string  `mapstructure:"context_limit_reached_strategy"`
+	LLMCompressInstruction     string  `mapstructure:"llm_compress_instruction"`
+	LLMCompressKeepRecentRatio float64 `mapstructure:"llm_compress_keep_recent_ratio"`
+	LLMCompressProviderID      string  `mapstructure:"llm_compress_provider_id"`
+	Proactive                  struct {
 		AddCronTools *bool `mapstructure:"add_cron_tools"`
 	} `mapstructure:"proactive_capability"`
 }
@@ -88,9 +93,10 @@ type PlatformSettings struct {
 	// Legacy flat keys used by RateLimitStage.
 	RateLimitTime     float64 `mapstructure:"rate_limit_time"`
 	RateLimitStrategy string  `mapstructure:"rate_limit_strategy"`
-	// Nested rate_limit {count,time,strategy}.
+	// Nested rate_limit {count,time,strategy}. Count 用指针以区分“未配置”
+	// （nil → 默认值）与显式配置的 0（对齐 Python：count<=0 表示不开启限流）。
 	RateLimit struct {
-		Count    int    `mapstructure:"count"`
+		Count    *int   `mapstructure:"count"`
 		Time     int    `mapstructure:"time"`
 		Strategy string `mapstructure:"strategy"`
 	} `mapstructure:"rate_limit"`

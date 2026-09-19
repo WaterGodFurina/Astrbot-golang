@@ -16,6 +16,8 @@ type GroqSource struct {
 // NewGroqSource creates a Groq provider.
 func NewGroqSource(config, settings map[string]interface{}) *GroqSource {
 	s := &GroqSource{OpenAISource: NewOpenAISource(config, settings)}
+	// 对齐 py ProviderGroq：Groq 的推理内容字段名为 "reasoning"。
+	s.reasoningKey = "reasoning"
 	s.postProcessBody = stripAssistantReasoningFields
 	return s
 }

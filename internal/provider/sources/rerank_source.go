@@ -22,6 +22,12 @@ type TEIRerankSource struct {
 	baseURL string
 	apiKey  string
 	client  *http.Client
+	// 对齐 py TEIRerankProvider：可选请求参数（truncate/truncation_direction/
+	// raw_scores/return_text）。top_n 不上送——TEI 会 422，改由本地截断。
+	truncate            bool
+	truncationDirection string
+	rawScores           bool
+	returnText          bool
 }
 
 // NewTEIRerankSource creates a TEI rerank provider.
@@ -36,6 +42,10 @@ func NewTEIRerankSource(config, settings map[string]interface{}) *TEIRerankSourc
 	s.baseURL = configString(config, "rerank_api_base", "http://127.0.0.1:8080")
 	s.baseURL = strings.TrimSuffix(s.baseURL, "/")
 	s.apiKey = configString(config, "rerank_api_key", "")
+	s.truncate = configBool(config, "tei_rerank_truncate", false)
+	s.truncationDirection = strings.ToLower(configString(config, "tei_rerank_truncation_direction", "right"))
+	s.rawScores = configBool(config, "tei_rerank_raw_scores", false)
+	s.returnText = configBool(config, "tei_rerank_return_text", false)
 	if m := configString(config, "model", ""); m != "" {
 		s.SetModel(m)
 	}
@@ -55,8 +65,16 @@ func (s *TEIRerankSource) Rerank(ctx context.Context, query string, documents []
 		"query": query,
 		"texts": documents,
 	}
-	if topN > 0 {
-		payload["top_n"] = topN
+	// 对齐 py：top_n 不发（TEI 返回 422），改为本地截断；其余为可选参数。
+	if s.truncate {
+		payload["truncate"] = true
+		payload["truncation_direction"] = s.truncationDirection
+	}
+	if s.rawScores {
+		payload["raw_scores"] = true
+	}
+	if s.returnText {
+		payload["return_text"] = true
 	}
 	bodyBytes, _ := json.Marshal(payload)
 

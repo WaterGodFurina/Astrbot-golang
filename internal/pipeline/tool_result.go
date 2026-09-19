@@ -13,21 +13,32 @@ import (
 // toolResultIDRe strips characters that would let a provider-supplied tool call id escape the tool_results directory (path traversal via "../" or absolute paths).
 var toolResultIDRe = regexp.MustCompile(`[^A-Za-z0-9_-]`)
 
-// Tool-result inline limits ported from opencode tool/truncate.ts (MAX_LINES/MAX_BYTES + spill-to-file with preview + read hint). The byte budget adapts to the model context (ProcessStage.toolOutputBudget: 1/5 of provider_settings.max_context_length); maxOutputLines mirrors opencode's default MAX_LINES.
+// Tool-result inline limits ported from opencode tool/truncate.ts (MAX_LINES/MAX_BYTES + spill-to-file with preview + read hint). The byte budget adapts to the model context token budget (ProcessStage.toolOutputBudget: 1/5 of the model context window); maxOutputLines mirrors opencode's default MAX_LINES. 注意：provider_settings.max_context_length 是"轮数"上限，不是 token 预算，不要拿它当上下文窗口。
 const (
-	defaultCtxTokens = 32000  // fallback when provider_settings.max_context_length is unset/-1 (auto)
+	defaultCtxTokens = 32000  // fallback when neither max_context_tokens nor fallback_max_context_tokens is set
 	minOutputBudget  = 8000   // runes
-	maxOutputBudget  = 200000 // runes (guards pathological max_context_length values)
+	maxOutputBudget  = 200000 // runes (guards pathological context-window values)
 	maxOutputLines   = 2000   // opencode truncate.MAX_LINES
 	previewRunes     = 14000
 )
 
+// contextTokenBudget 返回模型上下文 token 预算（对齐 py max_context_tokens，
+// 回退 fallback_max_context_tokens，再回退内置默认）。
+func (s *ProcessStage) contextTokenBudget() int {
+	if s.providerConf != nil {
+		if s.providerConf.MaxContextTokens > 0 {
+			return s.providerConf.MaxContextTokens
+		}
+		if s.providerConf.FallbackMaxContextTokens > 0 {
+			return s.providerConf.FallbackMaxContextTokens
+		}
+	}
+	return defaultCtxTokens
+}
+
 // toolOutputBudget returns the inline-output budget in runes: 1/5 of the model context window in tokens, converted with the same ~2-runes/token heuristic as estimateContextTokens.
 func (s *ProcessStage) toolOutputBudget() int {
-	tokens := defaultCtxTokens
-	if s.providerConf != nil && s.providerConf.MaxContextLength > 0 {
-		tokens = s.providerConf.MaxContextLength
-	}
+	tokens := s.contextTokenBudget()
 	budget := tokens / 5 * 2
 	if budget < minOutputBudget {
 		budget = minOutputBudget

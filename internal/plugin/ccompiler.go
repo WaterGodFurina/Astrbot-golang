@@ -411,10 +411,22 @@ var zigArchiveSHA256 = map[string]string{
 // base in order and resuming an existing partial file via HTTP Range requests.
 // A 10-minute per-request timeout keeps a stalled mirror from hanging forever.
 func downloadClangArchive(ctx context.Context, archive, dest string, progress func(downloaded, total int64)) error {
-	// Already fully cached?
+	// Already fully cached? 缓存命中同样必须过 sha256（复用 pin 表）：仅 stat
+	// 大小会被预放的伪造归档绕过 pin 表，直接解压执行被篡改的编译器。
 	if info, err := os.Stat(dest); err == nil && !info.IsDir() && info.Size() > 0 {
-		logger.I18nInfo("Clang 压缩包已缓存: %s", dest)
-		return nil
+		if sum, ok := zigArchiveSHA256[archive]; ok {
+			if verr := verifySHA256(dest, sum); verr == nil {
+				logger.I18nInfo("Clang 压缩包已缓存且 sha256 校验通过: %s", dest)
+				return nil
+			} else {
+				logger.I18nWarn("缓存的 Clang 归档 sha256 校验失败，删除后重新下载: %v", verr)
+				_ = os.Remove(dest)
+			}
+		} else {
+			// 自定义版本/镜像不在 pin 表内（best effort）：保持原缓存行为。
+			logger.I18nInfo("Clang 压缩包已缓存: %s", dest)
+			return nil
+		}
 	}
 	client := &http.Client{
 		Timeout:       30 * time.Minute,
@@ -628,13 +640,23 @@ func extractClangArchive(ctx context.Context, archive, root, triple string) erro
 			return err
 		}
 		defer src.Close()
-		out, err := os.Create(target) // #nosec G304 -- target 经 safeJoin 校验防穿越
+		// 按归档 entry 的权限位落盘，保留可执行位；否则 Linux/macOS 上 zig 无
+		// 执行位，cgo 构建报 permission denied。Windows 上 Chmod 为 no-op。
+		// zip 归档可能不带 unix 权限位（Perm 为 0），此时回退到 0o755。
+		perm := fi.Mode().Perm()
+		if perm == 0 {
+			perm = 0o755
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm) // #nosec G304 -- target 经 safeJoin 校验防穿越
 		if err != nil {
 			return err
 		}
-		defer out.Close()
 		_, err = io.Copy(out, src)
-		return err
+		cerr := out.Close()
+		if err != nil {
+			return err
+		}
+		return cerr
 	})
 	_ = f.Close()
 	if err != nil {
@@ -642,6 +664,30 @@ func extractClangArchive(ctx context.Context, archive, root, triple string) erro
 	}
 	if !topSeen {
 		return fmt.Errorf("zig archive missing expected directory %q", triple)
+	}
+	// 解压后定位 zig 可执行文件并校验/补救执行位：官方归档为 root/zig，
+	// 兼容 root/bin/zig 等布局。umask 或归档缺权限位时补齐，避免 cgo 构建
+	// 阶段才报 permission denied。找不到仅告警（自定义镜像布局可能不同，
+	// 后续会在构建时给出更明确的错误）。Windows 无执行位概念，仅跳过 chmod。
+	candidates := []string{"zig", "zig.exe", filepath.Join("bin", "zig"), filepath.Join("bin", "zig.exe")}
+	found := false
+	for _, cand := range candidates {
+		zigBin := filepath.Join(root, cand)
+		info, statErr := os.Stat(zigBin)
+		if statErr != nil || info.IsDir() {
+			continue
+		}
+		found = true
+		if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
+			if err := os.Chmod(zigBin, info.Mode().Perm()|0o755); err != nil {
+				return fmt.Errorf("修复 zig 可执行权限失败: %w", err)
+			}
+			logger.Warn("zig 缺少可执行权限，已自动修复: %s", zigBin)
+		}
+		break
+	}
+	if !found {
+		logger.Warn("解压后未找到 zig 可执行文件（root=%s），跳过执行位校验", root)
 	}
 	return nil
 }

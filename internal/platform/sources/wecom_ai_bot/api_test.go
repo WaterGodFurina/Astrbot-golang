@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 )
 
 // TestStreamMessageBuilders 流消息构建器 JSON 结构。
@@ -118,6 +120,10 @@ func TestMessageParser(t *testing.T) {
 
 // TestProcessEncryptedImage 加密图片下载解密（httptest 模拟图片服务器）。
 func TestProcessEncryptedImage(t *testing.T) {
+	// httptest 绑定 127.0.0.1，安全下载默认拒绝回环；测试内临时放行。
+	oldAllow := platform.SafeDownloadAllowLoopback
+	platform.SafeDownloadAllowLoopback = true
+	defer func() { platform.SafeDownloadAllowLoopback = oldAllow }()
 	// 构造 AES-256 密钥与 IV（密钥前 16 字节）
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
@@ -158,6 +164,11 @@ func TestProcessEncryptedImage(t *testing.T) {
 // TestProcessEncryptedImageUnpaddedKey 43 位不带 padding 的 AES 密钥（回归 H-01：
 // 旧的 (-len(key))%4 补位在 43 位密钥时负数取模导致 panic）。
 func TestProcessEncryptedImageUnpaddedKey(t *testing.T) {
+	// httptest 绑定 127.0.0.1，安全下载默认拒绝回环；测试内临时放行。
+	oldAllow := platform.SafeDownloadAllowLoopback
+	platform.SafeDownloadAllowLoopback = true
+	defer func() { platform.SafeDownloadAllowLoopback = oldAllow }()
+
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		t.Fatal(err)

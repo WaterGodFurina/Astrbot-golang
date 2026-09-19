@@ -1,15 +1,21 @@
 package dingtalk
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // media utils: 对应 Python media_utils.py 的音频/视频转换与时长获取。
 // 依赖本机 ffmpeg/ffprobe, 不可用时降级处理 (返回原文件/时长 0)。
+
+// transcodeTimeout 限制单次 ffmpeg/ffprobe 执行时长, 避免坏媒体文件导致
+// 子进程无限挂起 (对齐 lark media.go 的 120s)。
+const transcodeTimeout = 120 * time.Second
 
 // ffmpegAvailable 检查 ffmpeg 是否可用。
 func ffmpegAvailable() bool {
@@ -36,9 +42,11 @@ func convertAudioFormat(inputPath, target string) (string, bool) {
 		return inputPath, false
 	}
 	outPath := strings.TrimSuffix(inputPath, filepath.Ext(inputPath)) + "." + target
-	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath, "-acodec", "libopus", "-b:a", "32k", outPath)
+	ctx, cancel := context.WithTimeout(context.Background(), transcodeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", inputPath, "-acodec", "libopus", "-b:a", "32k", outPath)
 	if target == "amr" {
-		cmd = exec.Command("ffmpeg", "-y", "-i", inputPath, "-acodec", "libopencore_amrnb", outPath)
+		cmd = exec.CommandContext(ctx, "ffmpeg", "-y", "-i", inputPath, "-acodec", "libopencore_amrnb", outPath)
 	}
 	if err := cmd.Run(); err != nil {
 		logger.I18nWarn("ffmpeg 音频转换失败 (%s): %v", target, err)
@@ -59,7 +67,9 @@ func convertVideoToMP4(inputPath string) (string, bool) {
 		return inputPath, false
 	}
 	outPath := strings.TrimSuffix(inputPath, filepath.Ext(inputPath)) + ".mp4"
-	cmd := exec.Command("ffmpeg", "-y", "-i", inputPath, "-c:v", "libx264", "-c:a", "aac", "-strict", "experimental", outPath)
+	ctx, cancel := context.WithTimeout(context.Background(), transcodeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", inputPath, "-c:v", "libx264", "-c:a", "aac", "-strict", "experimental", outPath)
 	if err := cmd.Run(); err != nil {
 		logger.I18nWarn("ffmpeg 视频转换失败: %v", err)
 		return inputPath, false
@@ -75,7 +85,9 @@ func extractVideoCover(videoPath string) string {
 		return ""
 	}
 	coverPath := strings.TrimSuffix(videoPath, filepath.Ext(videoPath)) + "_cover.jpg"
-	cmd := exec.Command("ffmpeg", "-y", "-i", videoPath, "-frames:v", "1", coverPath)
+	ctx, cancel := context.WithTimeout(context.Background(), transcodeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", videoPath, "-frames:v", "1", coverPath)
 	if err := cmd.Run(); err != nil {
 		logger.I18nWarn("ffmpeg 提取视频封面失败: %v", err)
 		return ""
@@ -89,7 +101,9 @@ func getMediaDuration(path string) int64 {
 	if !ffprobeAvailable() {
 		return 0
 	}
-	cmd := exec.Command("ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", path)
+	ctx, cancel := context.WithTimeout(context.Background(), transcodeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return 0

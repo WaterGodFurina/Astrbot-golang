@@ -135,7 +135,7 @@ func (s *GeminiTTSSource) GetAudio(ctx context.Context, text string) (string, er
 		return "", fmt.Errorf("no audio content returned from Gemini TTS API")
 	}
 
-	dir := filepath.Join("data", "temp")
+	dir := tempDataDir()
 	_ = os.MkdirAll(dir, 0755)
 	path := filepath.Join(dir, fmt.Sprintf("gemini_tts_%d.wav", time.Now().UnixNano()))
 	if err := writePCMWavFile(path, pcmData, 24000); err != nil {

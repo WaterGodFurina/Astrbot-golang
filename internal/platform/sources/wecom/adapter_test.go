@@ -152,8 +152,8 @@ func TestAdapterCallbackTextMessage(t *testing.T) {
 	if ev.Source.Platform != "wecom" || ev.Source.SelfID != "1000002" {
 		t.Errorf("平台信息异常: %+v", ev.Source)
 	}
-	if a.getAgentID() != "1000002" {
-		t.Errorf("agent_id 应被记录: %q", a.getAgentID())
+	if a.getAgentID("zhangsan") != "1000002" {
+		t.Errorf("agent_id 应被记录: %q", a.getAgentID("zhangsan"))
 	}
 }
 
@@ -448,13 +448,53 @@ func TestHandleKFMsgOrEventCursorAdvance(t *testing.T) {
 	}
 }
 
-// TestSendChainKFModeError 客服模式 Send 返回错误（不支持主动发送）。
+// TestSendChainKFModeError 客服模式无会话上下文的主动发送返回错误
+// （对齐 Python send_by_session 限制；带 sessionID 的回复走 kf/send_msg）。
 func TestSendChainKFModeError(t *testing.T) {
 	bus := &fakeEventBus{}
 	a := newTestAdapter(t, bus, map[string]interface{}{"kf_name": "我的客服"})
 	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: "hi"}}}
-	if err := a.Send("ext_user", chain); err == nil {
-		t.Error("客服模式主动发送应返回错误")
+	if err := a.Send("", chain); err == nil {
+		t.Error("客服模式无会话上下文的主动发送应返回错误")
+	}
+}
+
+// TestSendKFModeRoutesToKFAPI 回归 A3：客服模式带会话上下文的 Send（管线回复）
+// 应走 kf/send_msg 回复用户，而不是一律报错导致客服永远无法收到回复。
+func TestSendKFModeRoutesToKFAPI(t *testing.T) {
+	var mu sync.Mutex
+	var gotBody map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/gettoken"):
+			w.Write([]byte(`{"errcode":0,"errmsg":"ok","access_token":"TOKEN_KF","expires_in":7200}`))
+		case strings.HasSuffix(r.URL.Path, "/kf/send_msg"):
+			json.NewDecoder(r.Body).Decode(&gotBody)
+			w.Write([]byte(`{"errcode":0,"errmsg":"ok"}`))
+		default:
+			w.WriteHeader(404)
+			w.Write([]byte(`{"errcode":404,"errmsg":"not found"}`))
+		}
+	}))
+	defer srv.Close()
+
+	a := newTestAdapter(t, &fakeEventBus{}, map[string]interface{}{"kf_name": "我的客服"})
+	a.client = NewWeChatClient("corpid", "secret", srv.URL+"/cgi-bin/")
+	// 模拟 convertKFMessage 按会话记录 open_kfid。
+	a.setAgentID("ext_user_1", "wkABC")
+	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: "回复"}}}
+	if err := a.Send("ext_user_1", chain); err != nil {
+		t.Fatalf("客服回复发送失败: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotBody["touser"] != "ext_user_1" || gotBody["open_kfid"] != "wkABC" {
+		t.Errorf("kf/send_msg 载荷异常: %v", gotBody)
+	}
+	if text, ok := gotBody["text"].(map[string]interface{}); !ok || text["content"] != "回复" {
+		t.Errorf("kf/send_msg 文本内容异常: %v", gotBody["text"])
 	}
 }
 
@@ -536,7 +576,7 @@ func TestConvertMessageText(t *testing.T) {
 	if ev.MessageStr != "你好" || ev.Source.SelfID != "1000002" {
 		t.Errorf("事件异常: %+v", ev)
 	}
-	if a.getAgentID() != "1000002" {
+	if a.getAgentID("zhangsan") != "1000002" {
 		t.Error("agent_id 未记录")
 	}
 }

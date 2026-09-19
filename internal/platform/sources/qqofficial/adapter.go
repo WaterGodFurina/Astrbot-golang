@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,15 @@ const (
 	fileTypeFile  = 4
 )
 
+// 会话相关缓存（sessionScene/sessionLastMsg/sessionLastMsgAt/memberGroup）
+// 的生命周期上限：长跑进程里会话/成员数量会持续增长，必须惰性淘汰，
+// 否则这些 map 无界增长导致内存泄漏。
+const (
+	sessionMapTTL = 30 * time.Minute
+	sessionMapMax = 4096
+	recentMsgMax  = 4096
+)
+
 // Adapter is the QQ Official Bot adapter.
 type Adapter struct {
 	platform.BaseAdapter
@@ -81,6 +91,7 @@ type Adapter struct {
 	// 时效约 5 分钟，超时后发送应转为主动消息语义（不带 msg_id）。
 	sessionLastMsgAt map[string]time.Time // convID -> msg id received at
 	memberGroup      map[string]string    // member_openid/senderID -> group_openid
+	memberGroupAt    map[string]time.Time // member_openid -> 最近写入时间（用于 TTL/LRU 淘汰）
 	stopCh           chan struct{}
 	stopped          bool
 	httpClient       *http.Client
@@ -105,6 +116,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		sessionLastMsg:          make(map[string]string),
 		sessionLastMsgAt:        make(map[string]time.Time),
 		memberGroup:             make(map[string]string),
+		memberGroupAt:           make(map[string]time.Time),
 		stopCh:                  make(chan struct{}),
 		httpClient:              &http.Client{Timeout: 30 * time.Second},
 		AllowGroupProactiveSend: true, // 对齐 Python _allow_group_proactive_send = True
@@ -665,6 +677,8 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 	if memberOpenID != "" {
 		a.mu.Lock()
 		a.memberGroup[memberOpenID] = groupOpenID
+		a.memberGroupAt[memberOpenID] = time.Now()
+		a.pruneLocked(time.Now())
 		a.mu.Unlock()
 	}
 	groupName, _ := d["group_name"].(string)
@@ -760,6 +774,53 @@ func (a *Adapter) parseAttachments(d map[string]interface{}) []message.Component
 	return result
 }
 
+// pruneLocked 在持有 a.mu 的前提下淘汰会话相关缓存：先按 TTL，再按容量
+// 上限淘汰最旧条目（LRU 近似）。now 由调用方传入以复用同一个时间戳。
+func (a *Adapter) pruneLocked(now time.Time) {
+	type sess struct {
+		id string
+		t  time.Time
+	}
+	// 会话 TTL：sessionLastMsgAt 是会话活跃时间的权威来源。
+	for conv, t := range a.sessionLastMsgAt {
+		if now.Sub(t) > sessionMapTTL {
+			delete(a.sessionLastMsgAt, conv)
+			delete(a.sessionLastMsg, conv)
+			delete(a.sessionScene, conv)
+		}
+	}
+	if n := len(a.sessionLastMsgAt); n > sessionMapMax {
+		list := make([]sess, 0, n)
+		for id, t := range a.sessionLastMsgAt {
+			list = append(list, sess{id, t})
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].t.Before(list[j].t) })
+		for i := 0; i < n-sessionMapMax; i++ {
+			delete(a.sessionLastMsgAt, list[i].id)
+			delete(a.sessionLastMsg, list[i].id)
+			delete(a.sessionScene, list[i].id)
+		}
+	}
+	// memberGroup 独立按写入时间做同样的 TTL + 容量淘汰。
+	for id, t := range a.memberGroupAt {
+		if now.Sub(t) > sessionMapTTL {
+			delete(a.memberGroupAt, id)
+			delete(a.memberGroup, id)
+		}
+	}
+	if n := len(a.memberGroupAt); n > sessionMapMax {
+		list := make([]sess, 0, n)
+		for id, t := range a.memberGroupAt {
+			list = append(list, sess{id, t})
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].t.Before(list[j].t) })
+		for i := 0; i < n-sessionMapMax; i++ {
+			delete(a.memberGroupAt, list[i].id)
+			delete(a.memberGroup, list[i].id)
+		}
+	}
+}
+
 func (a *Adapter) remember(scene, convID, msgID string) {
 	if convID == "" {
 		return
@@ -770,6 +831,7 @@ func (a *Adapter) remember(scene, convID, msgID string) {
 		a.sessionLastMsg[convID] = msgID
 		a.sessionLastMsgAt[convID] = time.Now()
 	}
+	a.pruneLocked(time.Now())
 	a.mu.Unlock()
 }
 
@@ -793,6 +855,15 @@ func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msg
 		for id, t := range a.recentMsg {
 			if time.Since(t) > 60*time.Second {
 				delete(a.recentMsg, id)
+			}
+		}
+		// 兜底容量上限：即使同一时刻涌入大量不同 msg_id，也不无界增长。
+		if len(a.recentMsg) > recentMsgMax {
+			for id := range a.recentMsg {
+				delete(a.recentMsg, id)
+				if len(a.recentMsg) <= recentMsgMax/2 {
+					break
+				}
 			}
 		}
 	}
@@ -898,6 +969,12 @@ func extractSendParts(chain *message.MessageChain) (plain string, imageRef strin
 		case *message.Plain:
 			plain += comp.Text
 		case *message.Image:
+			// 对齐 py _parse_to_qqofficial（qqofficial_message_event.py:911
+			// `isinstance(i, Image) and not image_base64`）：只取链中第一张图片，
+			// 后续图片忽略，而不是让最后一张覆盖前面的。
+			if imageRef != "" {
+				continue
+			}
 			if comp.Base64 != "" {
 				imageRef = comp.Base64
 			} else if comp.Path != "" {

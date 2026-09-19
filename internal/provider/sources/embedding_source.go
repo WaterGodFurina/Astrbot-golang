@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -22,6 +23,9 @@ type OpenAIEmbeddingSource struct {
 	apiKey  string
 	client  *http.Client
 	dim     int
+	// dimensionsMode 控制是否发送 dimensions 参数（对齐 py
+	// embedding_dimensions_mode：auto/always/never，默认 auto）。
+	dimensionsMode string
 }
 
 // NewOpenAIEmbeddingSource creates an OpenAI embedding provider.
@@ -40,6 +44,14 @@ func NewOpenAIEmbeddingSource(config, settings map[string]interface{}) *OpenAIEm
 		s.apiKey = configKey(config, "key")
 	}
 	s.dim = configInt(config, "embedding_dimensions", 0)
+	// 对齐 py embedding_dimensions_mode：非 auto/always/never 时告警并回退 auto。
+	s.dimensionsMode = configString(config, "embedding_dimensions_mode", "auto")
+	switch s.dimensionsMode {
+	case "auto", "always", "never":
+	default:
+		logger.Warn("未知的 embedding_dimensions_mode: %q，回退 auto", s.dimensionsMode)
+		s.dimensionsMode = "auto"
+	}
 	if m := configString(config, "embedding_model", configString(config, "model", "")); m != "" {
 		s.SetModel(m)
 	}
@@ -48,6 +60,35 @@ func NewOpenAIEmbeddingSource(config, settings map[string]interface{}) *OpenAIEm
 	}
 	s.SetCapability(provider.CapEmbedding)
 	return s
+}
+
+// shouldSendDimensions 判定当前端点/模型是否应携带 dimensions 参数
+// （对齐 py _embedding_kwargs 的 auto 门控：仅官方 OpenAI text-embedding-3
+// 与硅基流动 qwen 等明确支持的组合；always/never 直接决定）。
+func (s *OpenAIEmbeddingSource) shouldSendDimensions() bool {
+	switch s.dimensionsMode {
+	case "always":
+		return true
+	case "never":
+		return false
+	}
+	u, err := url.Parse(s.apiBase)
+	if err != nil || u.Scheme != "https" {
+		return false
+	}
+	model := strings.ToLower(s.GetModel())
+	if i := strings.LastIndex(model, "/"); i >= 0 {
+		model = model[i+1:]
+	}
+	host := u.Hostname()
+	path := strings.TrimSuffix(u.Path, "/")
+	if host == "api.openai.com" && path == "/v1" && strings.HasPrefix(model, "text-embedding-3") {
+		return true
+	}
+	if host == "api.siliconflow.cn" && strings.HasPrefix(model, "qwen") {
+		return true
+	}
+	return false
 }
 
 // GetEmbedding returns the embedding vector for a single text.
@@ -75,7 +116,7 @@ func (s *OpenAIEmbeddingSource) embed(ctx context.Context, texts []string) ([][]
 		"input": texts,
 		"model": s.GetModel(),
 	}
-	if s.dim > 0 {
+	if s.dim > 0 && s.shouldSendDimensions() {
 		body["dimensions"] = s.dim
 	}
 	payloadBytes, _ := json.Marshal(body)

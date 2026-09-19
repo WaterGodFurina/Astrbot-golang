@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/gorilla/websocket"
 )
 
@@ -257,7 +258,9 @@ func (c *WecomAIBotLongConnectionClient) subscribe() error {
 	if err := json.Unmarshal(data, &reply); err != nil {
 		return fmt.Errorf("订阅失败: 响应解析错误")
 	}
-	if errCode, ok := reply["errcode"].(float64); ok && int(errCode) != 0 {
+	if code, present := platform.WeChatErrCode(reply); !present {
+		return fmt.Errorf("订阅失败: 响应缺少 errcode 字段")
+	} else if code != 0 {
 		return fmt.Errorf("订阅失败 errcode=%v errmsg=%v", reply["errcode"], reply["errmsg"])
 	}
 	return nil
@@ -297,7 +300,9 @@ func (c *WecomAIBotLongConnectionClient) handleTextMessage(text string, handlerC
 		return
 	}
 
-	if errCode, ok := payload["errcode"].(float64); ok && int(errCode) != 0 {
+	if code, present := platform.WeChatErrCode(payload); !present {
+		logger.I18nWarn("[WecomAI][LongConn] 消息帧缺少 errcode 字段，按失败处理")
+	} else if code != 0 {
 		logger.I18nWarn("[WecomAI][LongConn] 服务端返回错误: errcode=%v errmsg=%v", payload["errcode"], payload["errmsg"])
 	}
 }
@@ -323,14 +328,16 @@ func (c *WecomAIBotLongConnectionClient) SendCommand(cmd, reqID string, body map
 			}
 			return false
 		}
-		errCode, _ := response["errcode"].(float64)
-		if int(errCode) == 0 {
-			if _, ok := response["errcode"]; !ok {
-				return true
-			}
+		code, present := platform.WeChatErrCode(response)
+		if !present {
+			// 命令响应缺少 errcode：按失败处理，不再默认成功。
+			logger.I18nWarn("[WecomAI][LongConn] 命令响应缺少 errcode 字段，按失败处理: cmd=%s req_id=%s", cmd, reqID)
+			return false
+		}
+		if code == 0 {
 			return true
 		}
-		if int(errCode) == 6000 && attempt < maxRetries {
+		if code == 6000 && attempt < maxRetries {
 			// 命令冲突，退避重试
 			d := backoff(attempt)
 			logger.I18nWarn("[WecomAI][LongConn] 命令冲突(errcode=6000)，将重试。cmd=%s req_id=%s attempt=%d", cmd, reqID, attempt+1)

@@ -2,6 +2,9 @@ package pipeline
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -94,11 +97,17 @@ func TestExecuteSendMessageBlocksUnsafeMedia(t *testing.T) {
 		t.Errorf("file:// URL not blocked: %q", out)
 	}
 
-	// 任意文件读取：/etc/passwd 不在允许目录内。
-	if out := send(map[string]interface{}{"type": "image", "path": "/etc/passwd"}); !strings.Contains(out, "不安全") {
+	// 任意文件读取：宿主绝对路径不在允许目录内（跨 OS 取必然存在的宿主文件）。
+	hostPath := "/etc/passwd"
+	hostPath2 := "/etc/shadow"
+	if runtime.GOOS == "windows" {
+		hostPath = filepath.Join(os.Getenv("SystemRoot"), "System32", "config", "SAM")
+		hostPath2 = filepath.Join(os.Getenv("SystemRoot"), "System32", "drivers", "etc", "hosts")
+	}
+	if out := send(map[string]interface{}{"type": "image", "path": hostPath}); !strings.Contains(out, "不安全") {
 		t.Errorf("host path not blocked: %q", out)
 	}
-	if out := send(map[string]interface{}{"type": "file", "path": "/etc/shadow", "name": "x"}); !strings.Contains(out, "不安全") {
+	if out := send(map[string]interface{}{"type": "file", "path": hostPath2, "name": "x"}); !strings.Contains(out, "不安全") {
 		t.Errorf("host file path not blocked: %q", out)
 	}
 }
