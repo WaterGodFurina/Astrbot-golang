@@ -48,6 +48,49 @@ func TestWrapAndParseWAVPCM(t *testing.T) {
 	}
 }
 
+// TestParseWAVMultiChannelDownmix 验证 >2 声道 WAV 会被平均混为单声道
+// （对应 Python wav_to_tencent_silk 只处理 2 声道，Go 扩展支持 N 声道）。
+func TestParseWAVMultiChannelDownmix(t *testing.T) {
+	sampleRate := 16000
+	numChannels := 4
+	numSamples := 3
+	interleaved := make([]byte, numSamples*numChannels*2)
+	values := [][]int16{
+		{100, 200, 300, 400},
+		{-100, 100, -200, 200},
+		{1000, 2000, 3000, 4000},
+	}
+	for i, frame := range values {
+		for ch, v := range frame {
+			off := (i*numChannels + ch) * 2
+			interleaved[off] = byte(v)
+			interleaved[off+1] = byte(v >> 8)
+		}
+	}
+
+	wavBytes, err := WrapPCM16ToWAV(interleaved, sampleRate, numChannels)
+	if err != nil {
+		t.Fatalf("WrapPCM16ToWAV failed: %v", err)
+	}
+	mono, rate, _, err := ParseWAVToPCM16Mono(wavBytes, 24000)
+	if err != nil {
+		t.Fatalf("ParseWAVToPCM16Mono failed: %v", err)
+	}
+	if rate != sampleRate {
+		t.Fatalf("expected rate %d, got %d", sampleRate, rate)
+	}
+	if len(mono) != numSamples*2 {
+		t.Fatalf("expected %d mono bytes, got %d", numSamples*2, len(mono))
+	}
+	want := []int16{250, 0, 2500}
+	for i, w := range want {
+		got := int16(uint16(mono[i*2]) | uint16(mono[i*2+1])<<8)
+		if got != w {
+			t.Errorf("sample %d: got %d, want %d", i, got, w)
+		}
+	}
+}
+
 func TestSilkRoundTrip(t *testing.T) {
 	if silkRaceSkipped {
 		t.Skip("silk-go unsafe 指针运算在 -race(checkptr) 下 fatal（上游缺陷），race 构建跳过")

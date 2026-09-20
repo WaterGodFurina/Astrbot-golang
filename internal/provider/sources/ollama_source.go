@@ -65,6 +65,40 @@ func NewOllamaSource(config, settings map[string]interface{}) *OllamaSource {
 	return s
 }
 
+// GetModels 列出 Ollama 本地模型（GET /api/tags，取 models[].name）。Ollama
+// 原生 API 的模型列表端点，与 dashboard provider_sources 的取法一致。
+func (s *OllamaSource) GetModels(ctx context.Context) ([]string, error) {
+	url := strings.TrimRight(s.apiBase, "/") + "/api/tags"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(body), 1024))
+	}
+	var result struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(result.Models))
+	for _, m := range result.Models {
+		if m.Name != "" {
+			models = append(models, m.Name)
+		}
+	}
+	return models, nil
+}
+
 // ollamaArguments 把原生 tool_calls 的 arguments（对象或 JSON 字符串）归一
 // 为 map，供 LLMResponse.ToolsCallArgs 使用。
 func ollamaArguments(v interface{}) map[string]interface{} {

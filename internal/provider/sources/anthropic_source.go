@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -119,6 +120,43 @@ func (s *AnthropicSource) doRequest(ctx context.Context, body map[string]interfa
 		}
 		return httpReq, nil
 	}, cfg, "Anthropic")
+}
+
+// GetModels 列出 Anthropic 可用模型（对齐 py anthropic_source.get_models：
+// GET /v1/models，取 data[].id 并排序）。
+func (s *AnthropicSource) GetModels(ctx context.Context) ([]string, error) {
+	url := s.apiBase + "/v1/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-api-key", s.apiKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, truncate(string(body), 1024))
+	}
+	var result struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(result.Data))
+	for _, m := range result.Data {
+		if m.ID != "" {
+			models = append(models, m.ID)
+		}
+	}
+	sort.Strings(models)
+	return models, nil
 }
 
 // TextChat sends a non-streaming chat request.

@@ -347,6 +347,8 @@ func (c *WecomAIBotWebhookClient) SendMessageChain(ctx context.Context, chain *m
 				return err
 			}
 		default:
+			// py 同行为：Python wecomai_webhook.py:219-223 对不支持的组件类型
+			// 同样仅告警并跳过。
 			logger.I18nWarn("企业微信消息推送暂不支持组件类型 %s，已跳过", comp.Type())
 		}
 	}

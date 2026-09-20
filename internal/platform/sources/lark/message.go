@@ -477,6 +477,8 @@ func convertToLark(ctx context.Context, client *lark.Client, comps []message.Com
 			flush()
 			ret = append(ret, []map[string]interface{}{{"tag": "img", "image_key": key}})
 		default:
+			// py 同行为：Python lark_event.py:396-397 对不支持的组件同样仅告警。
+			// File/Record/Video 由调用方单独发送，不会走到此分支。
 			logger.Warn("飞书暂时不支持消息段: %T", comp)
 		}
 	}

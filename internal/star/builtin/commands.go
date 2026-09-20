@@ -14,6 +14,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/db"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
@@ -27,6 +28,9 @@ type Deps struct {
 	ConfigMgr       *config.ConfigManager
 	ConversationMgr *conversation.Manager
 	Database        *db.Database
+	// ProviderMgr 提供按能力（chat/tts/stt/embedding）枚举 provider 的能力，
+	// 对齐 Python context.get_all_providers/get_all_tts_providers/get_all_stt_providers。
+	ProviderMgr *provider.ProviderManager
 }
 
 // builtinState holds per-session mutable state (provider selection, variables, umo aliases).
@@ -86,7 +90,12 @@ func RegisterBuiltin(deps Deps) {
 	reg("set", star.PermissionEveryone, i18n.Get("设置会话变量"), func(e *core.Event) { setCmd(e) })
 	reg("unset", star.PermissionEveryone, i18n.Get("移除会话变量"), func(e *core.Event) { unsetCmd(e) })
 	reg("dashboard_update", star.PermissionAdmin, i18n.Get("更新 AstrBot WebUI"), func(e *core.Event) {
-		reply(e, i18n.Get("❌ Go 版暂不支持在线更新 WebUI。"))
+		// Go 版 WebUI 以 go:embed 编译进二进制（internal/dashboard/server.go:
+		// //go:embed web/dist/*），不存在 Python /dashboard_update 那样"下载
+		// 独立 dist 资源替换"的更新模型：WebUI 只能随二进制升级。这里给出
+		// 与 Go 更新模型一致的指引（WebUI 的"版本管理"→切换版本会下载对应
+		// 平台的新二进制并重启）。
+		reply(e, i18n.Get("ℹ️ Go 版 WebUI 已内嵌于程序二进制，随程序版本一同升级。\n请在 WebUI「版本管理」中使用「切换版本」下载对应平台的新版本，或手动替换二进制后重启。"))
 	})
 
 	logger.Info("Built-in commands registered (help, sid, name, reset, new, stop, stats, provider, set, unset)")
@@ -120,6 +129,7 @@ func helpCmd(deps Deps, e *core.Event) {
 		i18n.Get("/new - 创建新对话"),
 		i18n.Get("/stats - 查看当前对话 Token 用量"),
 		i18n.Get("/provider [idx] - 查看或切换 LLM Provider"),
+		i18n.Get("/provider tts|stt <idx> - 切换 TTS/STT Provider"),
 		i18n.Get("/name <name> - 设置当前 UMO 的显示名称"),
 		i18n.Get("/set <key> <value> - 设置会话变量"),
 		i18n.Get("/unset <key> - 移除会话变量"),
@@ -241,6 +251,8 @@ func resetCmd(deps Deps, e *core.Event) {
 		reply(e, i18n.Get("😕 会话管理器不可用。"))
 		return
 	}
+	// 对齐 Python reset：先终止本会话其它活跃事件，再清空上下文。
+	core.ActiveRegistry().StopAll(umo, e)
 	cid := deps.ConversationMgr.GetCurrConversationID(umo)
 	if cid == "" {
 		reply(e, i18n.Get("😕 You are not in a conversation. Use /new to create one."))
@@ -260,6 +272,8 @@ func newCmd(deps Deps, e *core.Event) {
 		reply(e, i18n.Get("😕 会话管理器不可用。"))
 		return
 	}
+	// 对齐 Python new_conv：新建会话前终止本会话其它活跃事件。
+	core.ActiveRegistry().StopAll(umo, e)
 	conv := deps.ConversationMgr.NewConversation(umo, e.Source.Platform)
 	cid := conv.CID
 	if len(cid) > 4 {
@@ -273,9 +287,18 @@ func newCmd(deps Deps, e *core.Event) {
 // ---------------------------------------------------------------------------
 
 func stopCmd(e *core.Event) {
-	// Go 版暂无运行中的 agent 任务注册表，无法真正终止任务；与 dashboard_update
-	// 的处理方式一致，诚实提示不支持。
-	reply(e, i18n.Get("❌ Go 版暂不支持 /stop。"))
+	// 对齐 Python ConversationCommands.stop：终止本 UMO 所有活跃事件中的
+	// Agent 运行（不中断事件传播，历史保存等收尾流程仍可继续）。注意 Go
+	// 事件总线按 UMO 分片串行处理（core/event_bus.go eventShardKey），同一
+	// 平台会话的 /stop 会排在正在运行的 Agent 之后，故平台场景主要用于
+	// 并发 run（dashboard/WebSocket、后台任务）；并发激活的 run 会被取消。
+	umo := e.UnifiedMsgOrigin()
+	stopped := core.ActiveRegistry().RequestAgentStopAll(umo, e)
+	if stopped > 0 {
+		reply(e, i18n.Get("✅ 已请求停止 %d 个正在运行的任务。", stopped))
+		return
+	}
+	reply(e, i18n.Get("✅ 当前会话没有正在运行的任务。"))
 }
 
 // ---------------------------------------------------------------------------
@@ -349,14 +372,66 @@ func providerCmd(deps Deps, e *core.Event) {
 			lines = append(lines, line)
 		}
 		lines = append(lines, i18n.Get("\nUse /provider <idx> to switch LLM providers."))
+
+		// TTS / STT 分区（对齐 Python provider.py：仅在存在对应 provider 时列出）。
+		if ttss := providersForCapability(deps, "text_to_speech"); len(ttss) > 0 {
+			lines = append(lines, i18n.Get("\n## TTS Providers\n"))
+			cur := currentSessionProvider(deps, umo, conversation.RuleProviderTextToSpeech)
+			for i, p := range ttss {
+				line := i18n.Get("%d. %s", i+1, p.ID)
+				if cur == p.ID {
+					line += " 👈"
+				}
+				lines = append(lines, line)
+			}
+			lines = append(lines, i18n.Get("\nUse /provider tts <idx> to switch TTS providers."))
+		}
+		if stts := providersForCapability(deps, "speech_to_text"); len(stts) > 0 {
+			lines = append(lines, i18n.Get("\n## STT Providers\n"))
+			cur := currentSessionProvider(deps, umo, conversation.RuleProviderSpeechToText)
+			for i, p := range stts {
+				line := i18n.Get("%d. %s", i+1, p.ID)
+				if cur == p.ID {
+					line += " 👈"
+				}
+				lines = append(lines, line)
+			}
+			lines = append(lines, i18n.Get("\nUse /provider stt <idx> to switch STT providers."))
+		}
 		reply(e, strings.Join(lines, "\n"))
 		return
 	}
 
+	// /provider tts <idx> / /provider stt <idx>：对齐 Python provider.py 的
+	// 切换分支，写入会话级 provider 规则（管线 TTS/STT 解析优先读该规则）。
 	if al[0] == "tts" || al[0] == "stt" {
-		reply(e, i18n.Get("❌ Go 版暂不支持 TTS/STT Provider 切换。"))
+		capability, ruleKey := "speech_to_text", conversation.RuleProviderSpeechToText
+		if al[0] == "tts" {
+			capability, ruleKey = "text_to_speech", conversation.RuleProviderTextToSpeech
+		}
+		candidates := providersForCapability(deps, capability)
+		if len(al) < 2 {
+			reply(e, i18n.Get("Please enter the index."))
+			return
+		}
+		idx := 0
+		if _, err := fmt.Sscanf(al[1], "%d", &idx); err != nil || idx < 1 || idx > len(candidates) {
+			reply(e, i18n.Get("❌ Invalid provider index."))
+			return
+		}
+		p := candidates[idx-1]
+		if deps.ConversationMgr == nil {
+			reply(e, i18n.Get("😕 会话管理器不可用。"))
+			return
+		}
+		if err := deps.ConversationMgr.SetSessionRule(umo, ruleKey, p.ID); err != nil {
+			reply(e, i18n.Get("⚠️ Provider 切换失败（%v）。", err))
+			return
+		}
+		reply(e, i18n.Get("✅ Successfully switched to %s.", p.ID))
 		return
 	}
+
 	idx := 0
 	if _, err := fmt.Sscanf(al[0], "%d", &idx); err != nil || idx < 1 || idx > len(providers) {
 		reply(e, i18n.Get("❌ Invalid provider index."))
@@ -380,12 +455,66 @@ func providerCmd(deps Deps, e *core.Event) {
 }
 
 type providerInfo struct {
-	ID    string
-	Model string
-	Type  string
+	ID         string
+	Model      string
+	Type       string
+	capability string
 }
 
+// currentSessionProvider 返回会话的 provider 覆盖（无则空），用于列表标记当前项。
+func currentSessionProvider(deps Deps, umo, ruleKey string) string {
+	if deps.ConversationMgr == nil {
+		return ""
+	}
+	rules := deps.ConversationMgr.GetSessionRules(umo)
+	if rules == nil {
+		return ""
+	}
+	id, _ := rules[ruleKey].(string)
+	return id
+}
+
+// providersForCapability 按能力枚举 provider。优先使用 ProviderManager（实例
+// 能力来自具体实现，对齐 Python get_all_*_providers）；无 manager 时回退到
+// config 的 provider 数组并按 provider_type 过滤（缺省视为 chat_completion）。
+func providersForCapability(deps Deps, capability string) []providerInfo {
+	if deps.ProviderMgr != nil {
+		result := []providerInfo{}
+		for _, id := range deps.ProviderMgr.All() {
+			p := deps.ProviderMgr.Get(id)
+			if p == nil {
+				continue
+			}
+			meta := p.Meta()
+			if string(meta.ProviderType) != capability {
+				continue
+			}
+			result = append(result, providerInfo{ID: meta.ID, Model: meta.Model, Type: meta.Type})
+		}
+		return result
+	}
+	result := []providerInfo{}
+	for _, p := range configProviders(deps) {
+		if p.capability == capability {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// listProviders 返回 chat_completion 能力的 provider（对齐 Python get_all_providers）。
 func listProviders(deps Deps) []providerInfo {
+	result := []providerInfo{}
+	for _, p := range configProviders(deps) {
+		if p.capability == "chat_completion" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// configProviders 读取配置中启用且能力明确的 provider（缺省视为 chat_completion）。
+func configProviders(deps Deps) []providerInfo {
 	if deps.ConfigMgr == nil {
 		return nil
 	}
@@ -405,9 +534,16 @@ func listProviders(deps Deps) []providerInfo {
 		if id == "" {
 			continue
 		}
+		if enabled, ok := pc["enable"].(bool); ok && !enabled {
+			continue
+		}
 		model, _ := pc["model"].(string)
 		ptype, _ := pc["type"].(string)
-		result = append(result, providerInfo{ID: id, Model: model, Type: ptype})
+		capability, _ := pc["provider_type"].(string)
+		if capability == "" {
+			capability = "chat_completion"
+		}
+		result = append(result, providerInfo{ID: id, Model: model, Type: ptype, capability: capability})
 	}
 	return result
 }

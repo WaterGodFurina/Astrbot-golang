@@ -2868,6 +2868,21 @@ func (s *ProcessStage) collectTools(computerUseRuntime, umo string) []map[string
 	return tools
 }
 
+// availableToolNames 返回当前运行时注入给模型的工具名（排序），用于未知工具
+// 时给出可读的可用工具列表（对齐 Python not found 结果里的 available_tools）。
+func (s *ProcessStage) availableToolNames(runtime, umo string) []string {
+	tools := s.collectTools(runtime, umo)
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		fn, _ := t["function"].(map[string]interface{})
+		if n, _ := fn["name"].(string); n != "" {
+			names = append(names, n)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // collectLightTools returns the tool schemas with empty parameters (only name + description). Used by skills_like mode to reduce token usage; the arguments are filled in by a follow-up re-query when the LLM chooses a tool.
 func (s *ProcessStage) collectLightTools(computerUseRuntime, umo string) []map[string]interface{} {
 	all := s.collectTools(computerUseRuntime, umo)
@@ -3716,7 +3731,13 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 		case "astr_kb_search":
 			result = s.executeKBSearch(event, args)
 		default:
-			result = fmt.Sprintf("工具 %s 执行失败: 该工具尚未实现 Go 端执行器", name)
+			// 走到这里说明模型请求了一个未注册的工具名（注入的工具集里每个
+			// 工具都有执行器，见 collectTools/executeTool 的分发表）。对齐
+			// Python tool_loop_agent_runner：记录警告并回一条 not found 的
+			// tool 结果，附带当前可用工具列表，帮助模型自我纠正。
+			available := s.availableToolNames(runtime, event.UnifiedMsgOrigin())
+			logger.I18nWarn("模型请求了未知工具 %q，已跳过。可用工具: %s", name, strings.Join(available, ", "))
+			result = fmt.Sprintf("error: Tool %s not found. Available tools are: %s", name, strings.Join(available, ", "))
 		}
 	}
 	logger.Debug("tool %s result: %.200s", name, result)

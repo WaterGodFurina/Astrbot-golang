@@ -244,6 +244,8 @@ func (a *Adapter) onReceived(data *kookMessageEventData) {
 				a.rolesCache.ClearGuildRolesCache(gid)
 			}
 		default:
+			// py 同行为：Python kook_adapter.py:108-111 对非角色更新的系统通知
+			// 同样仅 debug 记录并忽略。
 			logger.Debug("[KOOK] 判断此消息为 %q 类型的系统通知, 因未实现此消息的处理流程而忽略此消息",
 				extraType)
 		}
@@ -891,6 +893,8 @@ func (a *Adapter) buildOrderMessage(index int, comp message.Component) (orderMes
 		// 描述填卡片 json 内容, 故不做模型校验
 		return orderMessage{index: index, text: string(data), msgType: KookMsgCard}, nil
 	default:
+		// py 同行为：Python kook_event.py:148-151 对未知组件抛 NotImplementedError，
+		// 由 send 捕获并作为错误文本发出；Go 返回 error 交给调用方处理。
 		return orderMessage{}, fmt.Errorf("kook适配器尚未实现对 %q 消息类型的支持", string(comp.Type()))
 	}
 }

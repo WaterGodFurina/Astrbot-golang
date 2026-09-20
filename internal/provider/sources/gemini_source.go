@@ -80,6 +80,53 @@ func (s *GeminiSource) doRequest(ctx context.Context, client *http.Client, url s
 	}, cfg, "Gemini")
 }
 
+// GetModels 列出 Gemini 可用模型（对齐 py gemini_source.get_models：GET /models，
+// 仅保留支持 generateContent 的模型名，去掉 "models/" 前缀）。
+func (s *GeminiSource) GetModels(ctx context.Context) ([]string, error) {
+	url := s.apiBase + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-goog-api-key", s.apiKey)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("failed to fetch Gemini model list: API error %d: %s", resp.StatusCode, truncate(string(body), 1024))
+	}
+	var result struct {
+		Models []struct {
+			Name                       string   `json:"name"`
+			SupportedGenerationMethods []string `json:"supportedGenerationMethods"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	models := make([]string, 0, len(result.Models))
+	for _, m := range result.Models {
+		if m.Name == "" {
+			continue
+		}
+		supported := false
+		for _, action := range m.SupportedGenerationMethods {
+			if action == "generateContent" {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			continue
+		}
+		models = append(models, strings.TrimPrefix(m.Name, "models/"))
+	}
+	return models, nil
+}
+
 // TextChat sends a non-streaming chat request.
 func (s *GeminiSource) TextChat(ctx context.Context, req *provider.ProviderRequest) (*provider.LLMResponse, error) {
 	model := s.GetModel()
