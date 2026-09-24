@@ -427,6 +427,8 @@ func (a *Adapter) convertMessage(msg *WecomMessage) {
 		abm.SessionID = msg.Source
 		abm.RawMessage = msg
 	default:
+		// py 同行为：Python wecom_adapter.py:419-421 同样只处理 text/image/voice，
+		// 其它类型仅告警并丢弃（无对应实现）。
 		logger.I18nWarn("暂未实现的事件: %s", msg.Type)
 		return
 	}
@@ -541,6 +543,8 @@ func (a *Adapter) convertKFMessage(msg map[string]interface{}) {
 		}
 		abm.Message = []message.Component{&message.File{Name: fileName, Path: path}}
 	default:
+		// py 同行为：Python wecom_adapter.py:513-515 的微信客服同样只处理
+		// text/image/voice/file，其它 msgtype 仅告警并丢弃。
 		logger.I18nWarn("未实现的微信客服消息事件: %v", msg)
 		return
 	}

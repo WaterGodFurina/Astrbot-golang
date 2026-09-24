@@ -115,6 +115,10 @@ type Manager struct {
 	// uploadFunc 由 dashboard 注入真实实现（下载内容 → 分块 → 嵌入 → 双写）。
 	// 为空时 UploadFromURL 返回明确的"未接线"错误，绝不影响其他 KB 操作。
 	uploadFunc func(h *KBHelper, url string, content []byte, chunkSize, chunkOverlap int) error
+	// retrieveFunc 由 dashboard 注入真实向量检索后端（查询嵌入 → nanovec 检索
+	// → 上下文/结果组装）。为空时 Retrieve 返回明确的"未接线"错误，不会静默
+	// 返回空结果。移植自 Python kb_mgr.retrieve 的 dashboard 后端。
+	retrieveFunc func(query string, kbNames []string, topKFusion, topMFinal int) (*RetrievalResult, error)
 }
 
 // NewManager creates an empty KB manager.
@@ -135,6 +139,21 @@ func (m *Manager) getUploadFunc() func(h *KBHelper, url string, content []byte, 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.uploadFunc
+}
+
+// SetRetrieveFunc 注入真实检索后端（dashboard 提供查询嵌入 + 向量检索实现）。
+// 线程安全。
+func (m *Manager) SetRetrieveFunc(fn func(query string, kbNames []string, topKFusion, topMFinal int) (*RetrievalResult, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.retrieveFunc = fn
+}
+
+// getRetrieveFunc 在读锁下返回当前检索后端，未接线时为 nil。
+func (m *Manager) getRetrieveFunc() func(query string, kbNames []string, topKFusion, topMFinal int) (*RetrievalResult, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.retrieveFunc
 }
 
 // GetKB returns a KB helper by ID.
@@ -175,6 +194,11 @@ func (m *Manager) GetKBByNameOrID(nameOrID string) *KBHelper {
 // kb_names can be either KB names or KB IDs (UUIDs).
 // FIXED #9529: lookup now tries both name and ID.
 func (m *Manager) Retrieve(ctx context.Context, query string, kbNames []string, topKFusion, topMFinal int) (*RetrievalResult, error) {
+	// 真实检索后端（dashboard 注入）优先：查询嵌入 + nanovec 向量检索。
+	if fn := m.getRetrieveFunc(); fn != nil {
+		return fn(query, kbNames, topKFusion, topMFinal)
+	}
+
 	var kbIDs []string
 	var unavailable []string
 

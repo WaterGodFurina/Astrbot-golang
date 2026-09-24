@@ -1071,14 +1071,18 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			return nil
 		},
 		GetProviderModels: func(providerID string) []string {
-			// 复用 provider 源现有的 GetModels(ctx)（openai 家族：Zhipu/GLM、
-			// DashScope、Groq、XAI、Xiaomi、Kimi、OpenAI Responses 等），供
-			// 插件查询模型列表（如群总结插件挑选总结用的模型）。未实现
-			// GetModels 的源（Gemini/Anthropic/Ollama 等）返回空。
+			// 复用 provider 源的 GetModels(ctx)（openai 家族：Zhipu/GLM、Groq、
+			// XAI、Xiaomi、Kimi、OpenAI Responses，以及 Gemini/Anthropic/Ollama
+			// 的原生列表端点），供插件查询模型列表（如群总结插件挑选总结用的
+			// 模型）。源未实现 GetModels 或远程拉取失败时，回退到该 provider
+			// 配置中的当前模型（ProviderManager 的可用模型），不再返回空列表。
 			if providerMgr == nil {
 				return nil
 			}
 			p := providerMgr.Get(providerID)
+			if p == nil {
+				return nil
+			}
 			if gm, ok := p.(interface {
 				GetModels(context.Context) ([]string, error)
 			}); ok {
@@ -1089,6 +1093,9 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				} else {
 					logger.Warn("GetProviderModels(%s) 拉取模型列表失败: %v", providerID, err)
 				}
+			}
+			if model := p.GetModel(); model != "" {
+				return []string{model}
 			}
 			return nil
 		},
@@ -1389,7 +1396,9 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		KBRetrieve: func(query string, kbNames []string, topKFusion, topMFinal int) (string, string, error) {
 			// 真实检索后端（dashboard kbRetrieve：嵌入查询 + nanovec 向量
 			// 检索）由 lifecycle 经 KBRetriever 闭包注入；未接线时回退
-			// KBMgr.Retrieve（当前为显式报错的占位实现，不会静默返回空）。
+			// KBMgr.Retrieve——dashboard 已通过 SetRetrieveFunc 注入同一检索
+			// 后端（不再是占位报错）；两者都未接线时才返回明确错误，不会静默
+			// 返回空结果。
 			if fn := hostExtras.KBRetriever; fn != nil {
 				contextText, results, err := fn(query, kbNames, topKFusion, topMFinal)
 				if err != nil {

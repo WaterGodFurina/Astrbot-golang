@@ -774,13 +774,51 @@ func (a *Adapter) takeReplyToken(sessionID string) string {
 	return entry.token
 }
 
-// GetGroupInfo returns the basic group object with the inbound group name.
-// Full enrichment (group summary, member count, member list) requires the
-// LINE Messaging API group/room endpoints not yet wrapped by line_api.go.
-// ponytail: skeleton only — implement line_api client calls when needed.
+// GetGroupInfo 获取 LINE 群聊/多人聊天信息（对应 Python line_event.py get_group）。
+// 群聊可获取 summary（名称/头像）与成员；多人聊天（room）无 summary 端点，仅成员信息。
+// 成员枚举对未认证账号不可用，此时仍返回已解析到的基础 Group。
 func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
 	if groupID == "" {
 		return nil, nil
 	}
-	return &platform.Group{GroupID: groupID}, nil
+	group := &platform.Group{GroupID: groupID}
+	if a.lineAPI == nil {
+		return group, nil
+	}
+
+	// Python get_group：无法从 raw_message 判定 source 类型时，
+	// group_id 以 "R" 开头视为 room，否则视为 group。
+	chatType := "group"
+	if strings.HasPrefix(groupID, "R") {
+		chatType = "room"
+	}
+
+	if chatType == "group" {
+		if summary, err := a.lineAPI.GetGroupSummary(groupID); err == nil && summary != nil {
+			if name := strings.TrimSpace(summary.GroupName); name != "" {
+				group.GroupName = name
+			}
+			if avatar := strings.TrimSpace(summary.PictureURL); avatar != "" {
+				group.GroupAvatar = avatar
+			}
+		}
+	}
+
+	if count, ok := a.lineAPI.GetChatMemberCount(chatType, groupID); ok {
+		c := count
+		group.MemberCount = &c
+	}
+
+	if memberIDs, ok := a.lineAPI.GetChatMemberIDs(chatType, groupID); ok {
+		members := make([]platform.MessageMember, 0, len(memberIDs))
+		for _, memberID := range memberIDs {
+			nickname := ""
+			if name, ok := a.lineAPI.GetChatMemberProfile(chatType, groupID, memberID); ok {
+				nickname = strings.TrimSpace(name)
+			}
+			members = append(members, platform.MessageMember{UserID: memberID, Nickname: nickname})
+		}
+		group.Members = members
+	}
+	return group, nil
 }

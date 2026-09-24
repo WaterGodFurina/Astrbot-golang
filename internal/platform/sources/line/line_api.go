@@ -122,6 +122,129 @@ func (c *LineAPIClient) PushMessage(ctx context.Context, to string, messages []m
 	return true
 }
 
+// GroupSummaryResult 是 LINE 群聊摘要（对应 Python get_group_summary 响应中的
+// groupName / pictureUrl）。
+type GroupSummaryResult struct {
+	GroupName  string
+	PictureURL string
+}
+
+// GetGroupSummary 获取 LINE 群聊名称与头像（GET /v2/bot/group/{groupId}/summary）。
+// 对应 Python 的 get_group_summary。LINE 仅对群聊（group）提供 summary 接口，
+// 多人聊天（room）没有对应端点，调用方需按 chatType 区分。
+func (c *LineAPIClient) GetGroupSummary(groupID string) (*GroupSummaryResult, error) {
+	resp, err := c.api.GetGroupSummary(groupID)
+	if err != nil {
+		lineLogger.Debug("[LINE] 获取群聊摘要失败: group_id=%s err=%v", groupID, err)
+		return nil, err
+	}
+	return &GroupSummaryResult{GroupName: resp.GroupName, PictureURL: resp.PictureUrl}, nil
+}
+
+// GetChatMemberCount 获取群聊/多人聊天的成员数（不含 LINE 官方账号）。
+// 对应 Python 的 get_chat_member_count：chatType 为 "group" 或 "room"，
+// 端点不可用时返回 ok=false。
+func (c *LineAPIClient) GetChatMemberCount(chatType, chatID string) (int, bool) {
+	switch chatType {
+	case "group":
+		resp, err := c.api.GetGroupMemberCount(chatID)
+		if err != nil {
+			lineLogger.Debug("[LINE] 获取群聊成员数失败: group_id=%s err=%v", chatID, err)
+			return 0, false
+		}
+		return int(resp.Count), true
+	case "room":
+		resp, err := c.api.GetRoomMemberCount(chatID)
+		if err != nil {
+			lineLogger.Debug("[LINE] 获取多人聊天成员数失败: room_id=%s err=%v", chatID, err)
+			return 0, false
+		}
+		return int(resp.Count), true
+	}
+	return 0, false
+}
+
+// GetChatMemberIDs 分页获取群聊/多人聊天全部可访问成员 ID。
+// 对应 Python 的 get_chat_member_ids：LINE 每次最多返回 100 个，跟随 next 令牌翻页，
+// 令牌重复时停止；端点不可用（如未认证账号）返回 ok=false。
+func (c *LineAPIClient) GetChatMemberIDs(chatType, chatID string) ([]string, bool) {
+	ids := make([]string, 0)
+	seenTokens := make(map[string]bool)
+	start := ""
+	for {
+		var pageIDs []string
+		var next string
+		var err error
+		switch chatType {
+		case "group":
+			var resp *messaging_api.MembersIdsResponse
+			resp, err = c.api.GetGroupMembersIds(chatID, start)
+			if err == nil {
+				pageIDs, next = resp.MemberIds, resp.Next
+			}
+		case "room":
+			var resp *messaging_api.MembersIdsResponse
+			resp, err = c.api.GetRoomMembersIds(chatID, start)
+			if err == nil {
+				pageIDs, next = resp.MemberIds, resp.Next
+			}
+		default:
+			return nil, false
+		}
+		if err != nil {
+			lineLogger.Debug("[LINE] 获取成员 ID 失败: type=%s id=%s err=%v", chatType, chatID, err)
+			return nil, false
+		}
+		for _, raw := range pageIDs {
+			if id := strings.TrimSpace(raw); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		next = strings.TrimSpace(next)
+		if next == "" || seenTokens[next] {
+			return dedupeStrings(ids), true
+		}
+		seenTokens[next] = true
+		start = next
+	}
+}
+
+// GetChatMemberProfile 获取群聊/多人聊天成员资料。
+// 对应 Python 的 get_chat_member_profile，返回 displayName 与是否成功。
+func (c *LineAPIClient) GetChatMemberProfile(chatType, chatID, userID string) (string, bool) {
+	switch chatType {
+	case "group":
+		resp, err := c.api.GetGroupMemberProfile(chatID, userID)
+		if err != nil {
+			lineLogger.Debug("[LINE] 获取群成员资料失败: group_id=%s user_id=%s err=%v", chatID, userID, err)
+			return "", false
+		}
+		return resp.DisplayName, true
+	case "room":
+		resp, err := c.api.GetRoomMemberProfile(chatID, userID)
+		if err != nil {
+			lineLogger.Debug("[LINE] 获取多人聊天成员资料失败: room_id=%s user_id=%s err=%v", chatID, userID, err)
+			return "", false
+		}
+		return resp.DisplayName, true
+	}
+	return "", false
+}
+
+// dedupeStrings 按首次出现顺序去重（对应 Python 的 list(dict.fromkeys(...))）。
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
 // ContentResult 表示下载到的消息内容。
 type ContentResult struct {
 	Content     []byte // 文件内容

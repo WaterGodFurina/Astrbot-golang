@@ -212,7 +212,10 @@ func ParseWAVToPCM16Mono(wavData []byte, targetRate int) (pcm []byte, sampleRate
 				return nil, 0, 0, err
 			}
 			if fmtChunk.AudioFormat != 1 {
-				return nil, 0, 0, fmt.Errorf("暂不支持非 PCM WAV 编码 (%d)", fmtChunk.AudioFormat)
+				// pysilk 仅接受 16-bit 线性 PCM（见 py tencent_record_helper.py:80-81
+				// "pysilk only accepts 16-bit linear PCM"），无法在纯 Go 解码非 PCM WAV；
+				// 调用方 WAVToTencentSilk 会回退到 ffmpeg 转码，故此处保留明确错误。
+				return nil, 0, 0, fmt.Errorf("暂不支持非 PCM WAV 编码 (%d)，将由 ffmpeg 回退处理", fmtChunk.AudioFormat)
 			}
 			channels = fmtChunk.NumChannels
 			origRate = fmtChunk.SampleRate
@@ -245,12 +248,14 @@ func ParseWAVToPCM16Mono(wavData []byte, targetRate int) (pcm []byte, sampleRate
 		sampleRate = 24000
 	}
 
-	// 转换为单声道
+	// 转换为单声道。pysilk 只接受单声道 16-bit PCM：Python
+	// wav_to_tencent_silk 仅对 2 声道做 downmix（tencent_record_helper.py:82-83），
+	// >2 声道未处理；Go 统一做 N→1 混音以支持多声道输入。
 	monoPCM := pcmBytes
 	if channels == 2 {
 		monoPCM = stereoToMonoPCM16(pcmBytes)
 	} else if channels > 2 {
-		return nil, 0, 0, fmt.Errorf("暂不支持大于 2 声道的音频转换 (%d channels)", channels)
+		monoPCM = downmixToMonoPCM16(pcmBytes, int(channels))
 	}
 
 	// 重采样判断 (如果 targetRate 指定且当前采样率不在 SILK 允许范围内)
@@ -275,6 +280,25 @@ func stereoToMonoPCM16(stereo []byte) []byte {
 		r := int16(binary.LittleEndian.Uint16(stereo[i*4+2 : i*4+4]))
 		mixed := int16((int32(l) + int32(r)) / 2)
 		binary.LittleEndian.PutUint16(mono[i*2:i*2+2], uint16(mixed))
+	}
+	return mono
+}
+
+// downmixToMonoPCM16 将 N 声道 s16le 交错 PCM 平均混为单声道 s16le。
+// 每个采样点各声道求和后整除声道数，结果不会越界。
+func downmixToMonoPCM16(interleaved []byte, numChannels int) []byte {
+	if numChannels <= 1 {
+		return interleaved
+	}
+	numSamples := len(interleaved) / (2 * numChannels)
+	mono := make([]byte, numSamples*2)
+	for i := 0; i < numSamples; i++ {
+		base := i * numChannels * 2
+		var sum int32
+		for ch := 0; ch < numChannels; ch++ {
+			sum += int32(int16(binary.LittleEndian.Uint16(interleaved[base+ch*2 : base+ch*2+2])))
+		}
+		binary.LittleEndian.PutUint16(mono[i*2:i*2+2], uint16(int16(sum/int32(numChannels))))
 	}
 	return mono
 }

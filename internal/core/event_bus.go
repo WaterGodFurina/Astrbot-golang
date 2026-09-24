@@ -659,6 +659,20 @@ func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
 	}
 	logger.Debug("EventBus: 正在分发消息 %q（调度器=%s）", event.MessageStr, scheduler.ConfID())
 
+	// 登记活跃事件（对齐 Python active_event_registry.register）：/stop、
+	// /reset、/new 等指令经注册表终止本会话正在处理的 Agent。若事件未自带
+	// 可取消 context（平台消息），派生一个并登记取消回调，使
+	// request_agent_stop_all 能真正中断 LLM/工具循环。
+	registry := ActiveRegistry()
+	registry.Register(event)
+	defer registry.Unregister(event)
+	if event.Ctx == nil {
+		eventCtx, eventCancel := context.WithCancel(ctx)
+		event.Ctx = eventCtx
+		registry.RegisterStopCallback(event, eventCancel)
+		defer eventCancel()
+	}
+
 	result, err := scheduler.Process(ctx, event)
 	if err != nil {
 		logger.Error("Pipeline task failed: %v", err)

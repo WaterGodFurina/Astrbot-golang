@@ -322,9 +322,15 @@ func (a *Adapter) convertMsg(msg *ChatbotMessage) *platform.AstrBotMessage {
 			voiceExt = strings.TrimPrefix(voiceExt, ".")
 			fPath := a.downloadDingFile(downloadCode, robotCode, voiceExt)
 			if fPath != "" {
-				// Python 使用 MediaResolver 将语音转为 wav; Go 侧 EnsureWAV 为
-				// 占位实现 (保持原文件), 这里直接使用下载的文件
-				abm.Message = append(abm.Message, &message.Record{File: fPath, URL: fPath})
+				// 对齐 Python dingtalk_adapter.py:291-296：语音经 MediaResolver
+				// 转 wav（target_format="wav"）。utils.EnsureWAV 先尝试纯 Go silk
+				// 解码，其次 ffmpeg 转 24kHz 单声道 wav；失败时原样返回原文件。
+				wavPath, err := utils.EnsureWAV(fPath)
+				if err != nil || wavPath == "" {
+					logger.I18nWarn("钉钉语音转 wav 失败，使用原始文件: %s: %v", fPath, err)
+					wavPath = fPath
+				}
+				abm.Message = append(abm.Message, &message.Record{File: wavPath, URL: wavPath})
 			}
 		}
 	case "file":

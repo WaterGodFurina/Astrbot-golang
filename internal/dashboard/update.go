@@ -278,9 +278,16 @@ func (s *Server) doUpdateCore(w http.ResponseWriter, progressID, tag, proxy stri
 	}
 	resource := resourceForPlatform(runtime.GOOS, runtime.GOARCH)
 	if resource == "" {
-		setErr("当前平台暂不支持自动升级")
+		// Go 与 Python 的更新模型不同：Python 的 AstrBotUpdater 下载与架构
+		// 无关的 core 源码 zip + WebUI 资源（updater.py update/ensure_dashboard），
+		// 因而支持任意平台；Go 版发布二进制必须按 GOOS/GOARCH 匹配预编译资产，
+		// 支持的平台由 .github/workflows/release.yml 的构建矩阵决定
+		//（windows/darwin ×2、linux amd64/arm64/loong64 × gnu/musl、android arm64）。
+		// 当前平台不在矩阵内时无法下载可执行资产，只能手动部署。
+		msg := fmt.Sprintf("当前平台（%s/%s）暂不支持自动升级。支持：windows(amd64/arm64)、macos(amd64/arm64)、linux(amd64/arm64/loong64)、android(arm64)", runtime.GOOS, runtime.GOARCH)
+		setErr(msg)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
-			"status": "error", "message": "当前平台暂不支持自动升级",
+			"status": "error", "message": msg,
 		}))
 		return
 	}

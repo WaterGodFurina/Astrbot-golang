@@ -1,4 +1,5 @@
-// Package main is the AstrBot Go entry point. Ported from main.py
+// Package main is the AstrBot Go entry point.
+// Ported from main.py
 package main
 
 import (
@@ -33,7 +34,12 @@ const logo = `
 
 func init() {
 	applyRuntimeMemoryTuning()
-	// Android 没有 /etc/resolv.conf（/etc 是只读 system 分区），Go 纯 resolver （CGO_ENABLED=0）读不到配置会回退到 [::1]:53；而 Android 的 DNS 由 netd 通过 /dev/socket/dnsproxyd（Bionic getaddrinfo）提供，netd 并不监听 UDP 53，导致 所有域名解析报 "connection refused"。Termux 的 resolv-conf 包把真实 DNS 写在 $PREFIX/etc/resolv.conf，这里改读该文件并直连其中的 nameserver；读不到时 回退公共 DNS。
+	// Android 没有 /etc/resolv.conf（/etc 是只读 system 分区），Go 纯 resolver
+	// （CGO_ENABLED=0）读不到配置会回退到 [::1]:53；而 Android 的 DNS 由 netd 通过
+	// /dev/socket/dnsproxyd（Bionic getaddrinfo）提供，netd 并不监听 UDP 53，导致
+	// 所有域名解析报 "connection refused"。Termux 的 resolv-conf 包把真实 DNS 写在
+	// $PREFIX/etc/resolv.conf，这里改读该文件并直连其中的 nameserver；读不到时
+	// 回退公共 DNS。
 	if runtime.GOOS == "android" {
 		servers, fallback := androidDNSServers()
 		if fallback {
@@ -52,7 +58,14 @@ func init() {
 	}
 }
 
-// applyRuntimeMemoryTuning 调低 Go 运行时的内存水位（内存占用优化）：   - GC 目标从默认 100% 降到 50%：堆增长峰值减半，RSS 显著下降，     代价是 GC 频率升高（小幅 CPU 开销）。   - 软内存上限默认 128MiB（GOMEMLIMIT 语义）：接近上限时 GC 加压回收，     防止低内存设备（Android/Termux）OOM；平时远未触及时无感知。 环境变量覆盖：ASTRBOT_GOGC（GC 百分比）、ASTRBOT_GOMEMLIMIT （字节数或带 KiB/MiB/GiB 后缀；设 0 关闭软限）。
+// applyRuntimeMemoryTuning 调低 Go 运行时的内存水位（内存占用优化）：
+//   - GC 目标从默认 100% 降到 50%：堆增长峰值减半，RSS 显著下降，
+//     代价是 GC 频率升高（小幅 CPU 开销）。
+//   - 软内存上限默认 128MiB（GOMEMLIMIT 语义）：接近上限时 GC 加压回收，
+//     防止低内存设备（Android/Termux）OOM；平时远未触及时无感知。
+//
+// 环境变量覆盖：ASTRBOT_GOGC（GC 百分比）、ASTRBOT_GOMEMLIMIT
+// （字节数或带 KiB/MiB/GiB 后缀；设 0 关闭软限）。
 func applyRuntimeMemoryTuning() {
 	if v := strings.TrimSpace(os.Getenv("ASTRBOT_GOGC")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -73,7 +86,8 @@ func applyRuntimeMemoryTuning() {
 	}
 }
 
-// parseMemorySize 解析内存大小：纯字节数（"268435456"）或带后缀 （"128MiB"/"512KB"/"1GiB"，大小写不敏感，支持 B/KB/MB/GB/KiB/MiB/GiB）。
+// parseMemorySize 解析内存大小：纯字节数（"268435456"）或带后缀
+// （"128MiB"/"512KB"/"1GiB"，大小写不敏感，支持 B/KB/MB/GB/KiB/MiB/GiB）。
 func parseMemorySize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
@@ -99,7 +113,10 @@ func parseMemorySize(s string) (int64, error) {
 	return 0, fmt.Errorf("无效内存大小 %q", s)
 }
 
-// androidDNSServers 返回 Android（Termux）下可用的 DNS 服务器。 依次尝试 $PREFIX/etc/resolv.conf（Termux resolv-conf 包）、常见 Termux 路径、 /etc/resolv.conf（proot/termux-chroot 绑定后存在），最后回退公共 DNS。 第二返回值标记是否发生了回退（未读到任何 resolv.conf）。
+// androidDNSServers 返回 Android（Termux）下可用的 DNS 服务器。
+// 依次尝试 $PREFIX/etc/resolv.conf（Termux resolv-conf 包）、常见 Termux 路径、
+// /etc/resolv.conf（proot/termux-chroot 绑定后存在），最后回退公共 DNS。
+// 第二返回值标记是否发生了回退（未读到任何 resolv.conf）。
 func androidDNSServers() ([]string, bool) {
 	var candidates []string
 	if p := os.Getenv("PREFIX"); p != "" {

@@ -194,6 +194,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		ConfigMgr:       l.configMgr,
 		ConversationMgr: l.conversationMgr,
 		Database:        l.database,
+		ProviderMgr:     l.providerMgr,
 	})
 
 	// 6. Initialize event bus

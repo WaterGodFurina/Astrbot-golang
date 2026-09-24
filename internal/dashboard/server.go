@@ -455,6 +455,41 @@ func NewServerWithManagers(port int, configPath string, managers map[string]inte
 					_, err := s.indexKBFile(kbID, docID, name, content, chunkSize, chunkOverlap)
 					return err
 				})
+				// 接线真实检索后端：host_service 的 KBRetrieve 回退路径与
+				// knowledgebase.Manager.Retrieve 复用同一 dashboard 向量检索
+				// （查询嵌入 → nanovec → 结果组装），不再是占位报错。
+				km.SetRetrieveFunc(func(query string, kbNames []string, topKFusion, topMFinal int) (*knowledgebase.RetrievalResult, error) {
+					_, results, err := s.RetrieveKBByNames(query, kbNames, topKFusion, topMFinal)
+					if err != nil {
+						return nil, err
+					}
+					if len(results) == 0 {
+						return nil, nil
+					}
+					r := results[0]
+					str := func(k string) string { v, _ := r[k].(string); return v }
+					score := 0.0
+					switch v := r["score"].(type) {
+					case float64:
+						score = v
+					case float32:
+						score = float64(v)
+					}
+					chunkIdx := 0
+					if v, ok := r["chunk_index"].(int); ok {
+						chunkIdx = v
+					}
+					return &knowledgebase.RetrievalResult{
+						ChunkID:  str("chunk_id"),
+						DocID:    str("doc_id"),
+						KBID:     str("kb_id"),
+						KBName:   str("kb_name"),
+						DocName:  str("doc_name"),
+						Content:  str("content"),
+						Score:    score,
+						Metadata: map[string]interface{}{"chunk_index": chunkIdx},
+					}, nil
+				})
 			}
 		}
 		if v, ok := managers["neo"]; ok {

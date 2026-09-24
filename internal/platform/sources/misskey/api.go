@@ -145,8 +145,16 @@ func (a *MisskeyAPI) UploadFile(localPath, name, folderID string) (string, error
 	return result.ID, nil
 }
 
-// uploadAndFindFile 简化的文件上传（对应 upload_and_find_file）：
+// uploadAndFindFile 简化的文件上传（对应 Python upload_and_find_file）：
 // 下载 URL 内容后走本地上传，立即获得文件 ID。
+// 与 py 的差异（Go 更严格，刻意保留）：
+//   - Python misskey_api.py:709-726 的 SSL 失败回退不检查 allow_insecure_downloads，
+//     始终以 ssl_verify=False 重试；Go 仅在 misskey_allow_insecure_downloads 开启时
+//     才关闭校验，避免默认降级 TLS 校验。
+//   - Python 未做 SSRF 校验且不限制下载大小；Go 增加 validateDownloadURL 与
+//     maxDownloadBytes。
+//
+// 返回值语义与 py 等价：py 返回 {"id","raw"} 字典，调用方取 id；Go 直接返回 id 字符串。
 func (a *MisskeyAPI) uploadAndFindFile(ctx context.Context, urlStr, name, folderID string) (string, error) {
 	if urlStr == "" {
 		return "", fmt.Errorf("URL不能为空")

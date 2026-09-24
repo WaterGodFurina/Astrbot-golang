@@ -847,14 +847,16 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 	a.rememberSessionEvent(abm.SessionID, event)
 }
 
-// GetGroupInfo enriches Misskey chat room metadata (Python misskey_event.py get_group).
-// ponytail: only implements room (chat rooms); notes use note session type.
+// GetGroupInfo 获取 Misskey 聊天房间信息与成员（对应 Python misskey_event.py get_group）。
+// Misskey 只有聊天房间（room）有群组概念；note 会话不产生 Group（Python get_group 对
+// 无 room 的 note 返回 None）。房间接口不可用时回退到缓存的房间信息。
 func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
 	if groupID == "" {
 		return nil, nil
 	}
+	fallback := a.cachedRoomGroup(groupID)
 	if a.api == nil {
-		return &platform.Group{GroupID: groupID}, nil
+		return fallback, nil
 	}
 
 	group := &platform.Group{GroupID: groupID}
@@ -862,16 +864,25 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 	room, err := a.api.apiRequest(ctx, "chat/rooms/show", map[string]interface{}{"roomId": groupID}, false)
 	if err != nil {
 		logger.Debug("[Misskey] chat/rooms/show failed for %s: %v", groupID, err)
-		return group, nil
+		return fallback, nil
 	}
 
-	if name, ok := room["name"].(string); ok {
-		group.GroupName = name
+	// Python：group_name = room.get("name") or fallback_group.group_name
+	name, _ := room["name"].(string)
+	if name == "" {
+		name = fallback.GroupName
 	}
+	group.GroupName = name
+
 	ownerID, _ := room["ownerId"].(string)
 	if ownerID == "" {
 		ownerID, _ = room["owner_id"].(string)
 	}
+	if ownerID == "" {
+		ownerID = fallback.GroupOwner
+	}
+	// Python get_group：无论房主是否已在成员列表中，group_owner 都要写入。
+	group.GroupOwner = ownerID
 
 	var members []platform.MessageMember
 	seenIDs := make(map[string]bool)
@@ -919,6 +930,7 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 		untilID = nextID
 	}
 
+	// Misskey 不为房主创建 membership 记录，房主不在成员列表时补一条。
 	if ownerID != "" && !seenIDs[ownerID] {
 		ownerData, _ := room["owner"].(map[string]interface{})
 		nick, _ := ownerData["name"].(string)
@@ -926,14 +938,29 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 			nick, _ = ownerData["username"].(string)
 		}
 		members = append(members, platform.MessageMember{UserID: ownerID, Nickname: nick})
-		group.GroupOwner = ownerID
 	}
 
-	if len(members) > 0 {
-		group.Members = members
-		c := len(members)
-		group.MemberCount = &c
-	}
+	// Python：member_count = len(members)（即使为 0 也写入）。
+	group.Members = members
+	c := len(members)
+	group.MemberCount = &c
 
 	return group, nil
+}
+
+// cachedRoomGroup 从 userCache 构造房间兜底 Group
+// （对应 Python get_group 的 fallback_group / cached_room）。
+func (a *Adapter) cachedRoomGroup(roomID string) *platform.Group {
+	group := &platform.Group{GroupID: roomID}
+	entry, ok := getUserCacheEntry(a.userCache, "room:"+roomID)
+	if !ok {
+		return group
+	}
+	if name, _ := entry["room_name"].(string); name != "" {
+		group.GroupName = name
+	}
+	if owner, _ := entry["owner_id"].(string); owner != "" {
+		group.GroupOwner = owner
+	}
+	return group
 }
