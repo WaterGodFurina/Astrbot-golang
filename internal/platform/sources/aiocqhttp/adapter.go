@@ -1207,10 +1207,12 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 		isGroup = true
 		convID = toString(gid)
 	}
-	senderID := toString(raw["operator_id"])
-	if senderID == "<nil>" || senderID == "" {
-		senderID = toString(raw["user_id"])
-	}
+	// 对齐 Python _convert_handle_notice_event：sender 取 user_id，不能用
+	// operator_id。否则当机器人自己执行“同意入群”(set_group_add_request) 时，
+	// group_increase notice 的 operator_id 恰好等于机器人自身，会被
+	// WakingCheckStage 判为“机器人自身消息”丢弃 → 插件收不到该 notice →
+	// 入群欢迎/禁言等功能失效（只有管理员在客户端手动同意时才正常）。
+	senderID := toString(raw["user_id"])
 	if !isGroup {
 		convID = senderID
 	}
