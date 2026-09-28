@@ -100,6 +100,7 @@ const {
   normalizeStr,
   toPinyinText,
   toInitials,
+  getMarketPluginKey,
   pluginHeaders,
   filteredExtensions,
   filteredPlugins,
@@ -237,11 +238,17 @@ const selectedMarketPlugin = computed(() => {
     ? pluginMarketData.value
     : [];
   const installedPlugin = selectedInstalledPlugin.value;
+  // 优先按唯一市场键解析（market_plugin_id → repo → name），name 匹配仅作
+  // 旧版深链回退——多个市场条目可能共用同一个 name（对齐上游语义）。
+  const marketKeyMatch =
+    market.find((item) => getMarketPluginKey(item) === selectedPluginId.value) ||
+    null;
   const marketNameMatch =
     market.find((item) => item.name === selectedPluginId.value) || null;
+  const marketMatch = marketKeyMatch || marketNameMatch;
 
   if (selectedDetailTab.value === "market" || !installedPlugin) {
-    return marketNameMatch;
+    return marketMatch;
   }
 
   const repo = normalizeRepoUrl(installedPlugin.repo);
