@@ -1,6 +1,6 @@
-import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, nextTick, watch } from 'vue'
 import { providerApi } from '@/api/v1'
-import { getProviderIcon } from '@/utils/providerUtils'
+import { getProviderIcon, isMonochromeProviderIcon } from '@/utils/providerUtils'
 import { askForConfirmation as askForConfirmationDialog, useConfirmDialog } from '@/utils/confirmDialog'
 import { normalizeTextInput } from '@/utils/inputValue'
 import { sponsorCatalog, loadSponsorCatalog } from '@/utils/sponsorCatalog'
@@ -12,12 +12,22 @@ export interface UseProviderSourcesOptions {
   showMessage: (message: string, color?: string) => void
 }
 
+interface ProviderSourceType {
+  value: string
+  label: string
+  icon: string
+  isMonochrome: boolean
+  isSponsor?: boolean
+  subtitle?: string
+  website_url?: string
+}
+
+interface ProviderIconSource {
+  provider?: string
+}
+
 export function resolveDefaultTab(value?: string) {
   const normalized = (value || '').toLowerCase()
-
-  if (normalized.startsWith('select_agent_runner_provider') || normalized === 'agent_runner') {
-    return 'agent_runner'
-  }
 
   if (normalized === 'select_provider_stt' || normalized === 'speech_to_text' || normalized.includes('stt')) {
     return 'speech_to_text'
@@ -59,6 +69,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
   const editableProviderSource = ref<any | null>(null)
   const availableModels = ref<any[]>([])
   const modelMetadata = ref<Record<string, any>>({})
+  const loadingSources = ref(true)
   const loadingModels = ref(false)
   const savingSource = ref(false)
   const savingProviderToggles = ref<string[]>([])
@@ -72,20 +83,8 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
   let suppressSourceWatch = false
   const unsavedProviderSourceMarker = Symbol('unsavedProviderSource')
 
-  // 写操作后的全量 schema 刷新做防抖合并，避免一次保存/切换触发多次
-  // providerApi.schema() 全量拉取。
-  let loadConfigTimer: number | null = null
-  function scheduleLoadConfig() {
-    if (loadConfigTimer !== null) return
-    loadConfigTimer = window.setTimeout(() => {
-      loadConfigTimer = null
-      void loadConfig()
-    }, 300)
-  }
-
   const providerTypes = computed(() => [
     { value: 'chat_completion', label: tm('providers.tabs.chatCompletion'), icon: 'mdi-message-text' },
-    { value: 'agent_runner', label: tm('providers.tabs.agentRunner'), icon: 'mdi-robot' },
     { value: 'speech_to_text', label: tm('providers.tabs.speechToText'), icon: 'mdi-microphone-message' },
     { value: 'text_to_speech', label: tm('providers.tabs.textToSpeech'), icon: 'mdi-volume-high' },
     { value: 'embedding', label: tm('providers.tabs.embedding'), icon: 'mdi-code-json' },
@@ -98,14 +97,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       return []
     }
 
-    const types: Array<{
-      value: string
-      label: string
-      icon: string
-      isSponsor?: boolean
-      subtitle?: string
-      website_url?: string
-    }> = []
+    const types: ProviderSourceType[] = []
     const builtInSponsors = ['MiraRouter', 'SSYCloud(胜算云)']
     if (selectedProviderType.value === 'chat_completion' && sponsorCatalog.value) {
       for (const sponsor of sponsorCatalog.value.sponsors) {
@@ -117,6 +109,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
           icon: sponsor.logo,
           website_url: sponsor.website_url,
           subtitle: translation?.subtitle || sponsor.subtitle,
+          isMonochrome: false,
           isSponsor: true
         })
       }
@@ -129,6 +122,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
           value: templateName,
           label: templateName,
           icon: getProviderIcon(template.provider),
+          isMonochrome: isMonochromeProviderIcon(template.provider),
           isSponsor: builtInSponsors.includes(templateName)
         })
       }
@@ -193,7 +187,6 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
     return {
       modalities: { input },
       tool_call: mods.includes('tool_use'),
-      reasoning: Boolean(provider.reasoning),
       limit: { context: provider.max_context_tokens || 0 }
     }
   }
@@ -339,14 +332,19 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
     return type.includes(providerType)
   }
 
-  function resolveSourceIcon(source: any) {
+  function resolveSourceIcon(source: ProviderIconSource | null | undefined) {
     if (!source) return ''
-    return getProviderIcon(source.provider) || ''
+    return getProviderIcon(source.provider || '') || ''
+  }
+
+  function isMonochromeSourceIcon(source: ProviderIconSource | null | undefined) {
+    return Boolean(source && isMonochromeProviderIcon(source.provider || ''))
   }
 
   function getSourceDisplayName(source: any) {
     if (!source) return ''
     if (source.isPlaceholder) return source.templateKey || source.id || ''
+    if (source.id === 'ssycloud') return 'ssycloud(胜算云)'
     return source.id
   }
 
@@ -392,8 +390,6 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       anthropic_chat_completion: 'chat_completion',
       googlegenai_chat_completion: 'chat_completion',
       zhipu_chat_completion: 'chat_completion',
-      dify: 'agent_runner',
-      coze: 'agent_runner',
       dashscope: 'chat_completion',
       openai_whisper_api: 'speech_to_text',
       mimo_stt_api: 'speech_to_text',
@@ -437,49 +433,8 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       return source
     }
 
-    // 补齐通用基础字段（对于缺少 timeout / proxy / custom_headers 的老配置数据）
-    if (source.timeout === undefined) {
-      source.timeout = 120
-    }
-    if (source.proxy === undefined) {
-      source.proxy = ''
-    }
-    if (source.custom_headers === undefined) {
-      source.custom_headers = {}
-    }
-
     if (source.provider === 'ollama' && source.ollama_disable_thinking === undefined) {
       source.ollama_disable_thinking = false
-    }
-
-    if (source.provider === 'xai' || source.type === 'xai_chat_completion') {
-      if (source.xai_native_search === undefined) {
-        source.xai_native_search = false
-      }
-    }
-
-    if (source.provider === 'google' || source.type === 'googlegenai_chat_completion') {
-      if (source.gm_resp_image_modal === undefined) source.gm_resp_image_modal = false
-      if (source.gm_native_search === undefined) source.gm_native_search = false
-      if (source.gm_native_coderunner === undefined) source.gm_native_coderunner = false
-      if (source.gm_url_context === undefined) source.gm_url_context = false
-      if (source.gm_safety_settings === undefined) {
-        source.gm_safety_settings = {
-          harassment: 'BLOCK_MEDIUM_AND_ABOVE',
-          hate_speech: 'BLOCK_MEDIUM_AND_ABOVE',
-          sexually_explicit: 'BLOCK_MEDIUM_AND_ABOVE',
-          dangerous_content: 'BLOCK_MEDIUM_AND_ABOVE'
-        }
-      }
-      if (source.gm_thinking_config === undefined) {
-        source.gm_thinking_config = { budget: 0, level: 'HIGH' }
-      }
-    }
-
-    if (source.provider === 'anthropic' || source.type === 'anthropic_chat_completion' || source.provider === 'kimi-code') {
-      if (source.anth_thinking_config === undefined) {
-        source.anth_thinking_config = { type: '', budget: 0, effort: '' }
-      }
     }
 
     return source
@@ -586,7 +541,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
     } catch (error: any) {
       showMessage(error.message || tm('providerSources.deleteError'), 'error')
     } finally {
-      scheduleLoadConfig()
+      await loadConfig()
     }
   }
 
@@ -633,7 +588,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       return false
     } finally {
       savingSource.value = false
-      scheduleLoadConfig()
+      loadConfig()
     }
   }
 
@@ -708,8 +663,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       model: modelName,
       modalities,
       custom_extra_body: {},
-      max_context_tokens: max_context_tokens,
-      reasoning: supportsReasoning(metadata)
+      max_context_tokens: max_context_tokens
     }
   }
 
@@ -730,7 +684,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
     } catch (error: any) {
       showMessage(error.response?.data?.message || error.message || tm('providerSources.saveError'), 'error')
     } finally {
-      scheduleLoadConfig()
+      await loadConfig()
     }
   }
 
@@ -740,16 +694,18 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
 
   async function deleteProvider(provider: any) {
     const confirmed = await askForConfirmation(tm('models.deleteConfirm', { id: provider.id }))
-    if (!confirmed) return
+    if (!confirmed) return false
 
     try {
       await providerApi.delete(String(provider.id))
       providers.value = providers.value.filter((p) => p.id !== provider.id)
       showMessage(tm('models.deleteSuccess'))
+      return true
     } catch (error: any) {
       showMessage(error.message || tm('models.deleteError'), 'error')
+      return false
     } finally {
-      scheduleLoadConfig()
+      await loadConfig()
     }
   }
 
@@ -773,7 +729,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       showMessage(error.response?.data?.message || error.message || tm('providerSources.saveError'), 'error')
       return false
     } finally {
-      scheduleLoadConfig()
+      await loadConfig()
       savingProviderToggles.value = savingProviderToggles.value.filter((id) => id !== provider.id)
     }
   }
@@ -801,6 +757,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
   }
 
   async function loadProviderTemplate() {
+    loadingSources.value = true
     try {
       const response = await providerApi.schema()
       if (response.data.status === 'ok') {
@@ -814,6 +771,8 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
       }
     } catch (error) {
       console.error('Failed to load provider template:', error)
+    } finally {
+      loadingSources.value = false
     }
   }
 
@@ -824,13 +783,6 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
   onMounted(async () => {
     void loadSponsorCatalog()
     await loadProviderTemplate()
-  })
-
-  onUnmounted(() => {
-    if (loadConfigTimer !== null) {
-      clearTimeout(loadConfigTimer)
-      loadConfigTimer = null
-    }
   })
 
   return {
@@ -845,6 +797,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
     editableProviderSource,
     availableModels,
     modelMetadata,
+    loadingSources,
     loadingModels,
     savingSource,
     savingProviderToggles,
@@ -871,6 +824,7 @@ export function useProviderSources(options: UseProviderSourcesOptions) {
 
     // helpers
     resolveSourceIcon,
+    isMonochromeSourceIcon,
     getSourceDisplayName,
     getModelMetadata,
     supportsImageInput,
