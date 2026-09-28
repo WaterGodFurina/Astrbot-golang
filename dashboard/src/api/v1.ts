@@ -1768,6 +1768,29 @@ export const personaApi = {
 };
 
 export const conversationApi = {
+  // 会话工作台过滤选项：golang 后端以 /api/v1/bots 提供机器人列表，
+  // 这里映射为上游 getConversationFilterOptions 的 { bots: [{id,type}] } 结构；
+  // 端点不可用时静默返回空列表，避免非致命失败阻塞页面。
+  filterOptions() {
+    return typed<{ bots: Array<{ id: string; type: string }> }>(
+      openApiV1.listBots().then((res: any) => {
+        const body = res?.data ?? res ?? {};
+        const raw = body?.data?.bots ?? body?.bots ?? body?.data ?? [];
+        const list = Array.isArray(raw) ? raw : [];
+        return {
+          data: {
+            status: "ok",
+            data: {
+              bots: list.map((b: any) => ({
+                id: String(b?.id ?? b?.name ?? ""),
+                type: String(b?.type ?? "bot"),
+              })),
+            },
+          },
+        };
+      }),
+    );
+  },
   list(params?: ListConversationsQuery, requestConfig?: AxiosRequestConfig) {
     return typed<any>(
       openApiV1.listConversations(
