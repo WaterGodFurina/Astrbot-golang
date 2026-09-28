@@ -1445,6 +1445,12 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	switch agentRunnerType(s.config) {
 	case "dify":
 		resp, err = s.runDifyAgent(ctx, ar, streamer)
+	case "coze":
+		resp, err = s.runCozeAgent(ctx, ar, streamer)
+	case "dashscope":
+		resp, err = s.runDashscopeAgent(ctx, ar, streamer)
+	case "deerflow":
+		resp, err = s.runDeerflowAgent(ctx, ar, streamer)
 	default:
 		resp, err = s.runAgentToolLoop(ctx, ar, streamer)
 	}
@@ -2465,9 +2471,9 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 
 // streamSender emits streamed content. Priority:  1. Native stream-edit messaging (QQ C2C) — deltas are throttled into a     single progressively-updated message. Requires markdown permission on     QQ Open Platform; if the fragment call fails we fall back to #2.  2. Sentence segmentation — complete sentences (。！？!?；;\n) are sent as     separate natural messages as they form. Group chats and unsupported platforms get no incremental sends; the final response is delivered once by RespondStage (matches AstrBot).
 type streamSender struct {
-	stage     *ProcessStage
-	event     *core.Event
-	pending   strings.Builder
+	stage   *ProcessStage
+	event   *core.Event
+	pending strings.Builder
 	// pendingReasoning 独立缓冲流式推理内容：推理与正文互不混流，按
 	// chain_type="reasoning" 分段输出，前端才能在思考块展示（对齐 py
 	// `chain.type == "reasoning"` 的独立链语义）。

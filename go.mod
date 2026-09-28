@@ -26,6 +26,7 @@ require (
 	github.com/pquerna/otp v1.5.0
 	github.com/rivo/uniseg v0.4.7
 	github.com/slack-go/slack v0.27.0
+	github.com/the-open-agent/dashscope-go-sdk v1.1.0
 	github.com/xuri/excelize/v2 v2.11.0
 	github.com/yitsushi/go-misskey v1.1.6
 	golang.org/x/crypto v0.55.0
@@ -38,6 +39,11 @@ require (
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.56.0
+)
+
+require (
+	github.com/gabriel-vasile/mimetype v1.4.3 // indirect
+	go.uber.org/mock v0.4.0 // indirect
 )
 
 require (

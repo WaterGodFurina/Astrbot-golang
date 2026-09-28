@@ -63,7 +63,63 @@ func bindProviderSettings(cfg map[string]interface{}) *ProviderSettings {
 		}
 	}
 	applyContextCompressionConfig(ps, cfg)
+	applyAgentRunnerConfig(ps, cfg)
 	return ps
+}
+
+// applyAgentRunnerConfig 把 agent_runner.config 的 model/persona/misc 叠加到
+// provider_settings 绑定结果上（对齐 Python v4.28.2：启动迁移后这些键已从
+// provider_settings 删除，agent_runner.config 成为权威来源）：
+//
+//	model.provider_id           -> DefaultProviderID
+//	persona.persona_id          -> DefaultPersonality
+//	persona.safety_mode         -> LLMSafetyMode
+//	persona.safety_mode_strategy-> SafetyModeStrategy
+//	misc.max_steps              -> MaxAgentStep
+//	misc.tool_schema_mode       -> ToolSchemaMode
+//	misc.tool_call_timeout      -> ToolCallTimeout
+//	misc.sanitize_context_by_modalities -> SanitizeContextByModalities
+//
+// 仅当 agent_runner.config 存在且对应键存在时才覆盖，缺省保持 provider_settings。
+func applyAgentRunnerConfig(ps *ProviderSettings, cfg map[string]interface{}) {
+	ar, _ := cfg["agent_runner"].(map[string]interface{})
+	if ar == nil {
+		return
+	}
+	arCfg, _ := ar["config"].(map[string]interface{})
+	if arCfg == nil {
+		return
+	}
+	if model, ok := arCfg["model"].(map[string]interface{}); ok {
+		if v, ok := model["provider_id"].(string); ok {
+			ps.DefaultProviderID = v
+		}
+	}
+	if persona, ok := arCfg["persona"].(map[string]interface{}); ok {
+		if v, ok := persona["persona_id"].(string); ok && v != "" {
+			ps.DefaultPersonality = v
+		}
+		if v, ok := persona["safety_mode"].(bool); ok {
+			ps.LLMSafetyMode = v
+		}
+		if v, ok := persona["safety_mode_strategy"].(string); ok {
+			ps.SafetyModeStrategy = v
+		}
+	}
+	if misc, ok := arCfg["misc"].(map[string]interface{}); ok {
+		if v, ok := configIntValue(misc["max_steps"]); ok {
+			ps.MaxAgentStep = v
+		}
+		if v, ok := misc["tool_schema_mode"].(string); ok {
+			ps.ToolSchemaMode = v
+		}
+		if v, ok := configIntValue(misc["tool_call_timeout"]); ok {
+			ps.ToolCallTimeout = v
+		}
+		if v, ok := misc["sanitize_context_by_modalities"].(bool); ok {
+			ps.SanitizeContextByModalities = v
+		}
+	}
 }
 
 // agentRunnerCompressionSection 读取 agent_runner.config.compression

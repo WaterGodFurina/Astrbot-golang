@@ -156,7 +156,6 @@
     "updateFailed": "Failed to update",
     "deleteSuccess": "Deleted",
     "deleteFailed": "Failed to delete",
-    "deleteConfirm": "Delete task {name}? This cannot be undone.",
     "nameRequired": "Task name is required",
     "sessionRequired": "Delivery target is required",
     "noteRequired": "Task requirements are required",
@@ -169,6 +168,7 @@
     "createSuccess": "Created successfully",
     "createFailed": "Failed to create",
     "runStarted": "Started",
-    "runFailed": "Failed to run"
+    "runFailed": "Failed to run",
+    "deleteConfirm": "Delete task {name}? This cannot be undone."
   }
 }

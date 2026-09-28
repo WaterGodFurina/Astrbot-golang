@@ -271,44 +271,15 @@ func (s *Server) getConfigMetadata() *config.OrderedJSON {
 	s.injectPlatformSection(metadata)
 	providerGroup := config.NewOrderedJSON()
 	providerGroup.Set("name", "provider_group.name")
-	providerSettings := config.NewOrderedJSON()
-	providerSettings.Set("description", "provider_group.provider_settings.description")
-	providerSettings.Set("type", "object")
-	settingsItems := config.NewOrderedJSON()
-	for _, item := range []struct {
-		key   string
-		typ   string
-		desc  string
-		extra map[string]interface{}
-	}{
-		{"provider_settings.enable", "bool", "provider_group.provider_settings.enable.description", nil},
-		{"provider_settings.default_provider_id", "string", "provider_group.provider_settings.default_provider_id.description", nil},
-		{"provider_settings.wake_prefix", "string", "provider_group.provider_settings.wake_prefix.description", nil},
-		{"provider_settings.prompt_prefix", "string", "provider_group.provider_settings.prompt_prefix.description", nil},
-		{"provider_settings.identifier", "bool", "provider_group.provider_settings.identifier.description", nil},
-		{"provider_settings.display_reasoning_text", "bool", "provider_group.provider_settings.display_reasoning_text.description", nil},
-		{"provider_settings.max_context_length", "int", "provider_group.provider_settings.max_context_length.description", nil},
-		{"provider_settings.dequeue_context_length", "int", "provider_group.provider_settings.dequeue_context_length.description", nil},
-		{"provider_settings.request_max_retries", "int", "provider_group.provider_settings.request_max_retries.description", nil},
-		{"provider_settings.web_search", "bool", "provider_group.provider_settings.web_search.description", nil},
-		{"provider_settings.streaming_response", "bool", "provider_group.provider_settings.streaming_response.description", nil},
-	} {
-		field := config.NewOrderedJSON()
-		field.Set("description", item.desc)
-		field.Set("type", item.typ)
-		for k, v := range item.extra {
-			field.Set(k, v)
-		}
-		settingsItems.Set(item.key, field)
-	}
-	providerSettings.Set("items", settingsItems)
+	// 对齐 Python CONFIG_METADATA_2：provider_group 只含 provider 段（list），
+	// 不再有 provider_settings 段（相关键已迁移到 agent_runner.config.* /
+	// ai_group，legacy 段引用旧键会误导前端）。
 	providerSection := config.NewOrderedJSON()
 	providerSection.Set("description", "大语言模型提供方")
 	providerSection.Set("type", "list")
 	providerSection.Set("config_template", s.getProviderTemplates())
 	providerSection.Set("items", s.getProviderItems())
 	metadataGroup := config.NewOrderedJSON()
-	metadataGroup.Set("provider_settings", providerSettings)
 	metadataGroup.Set("provider", providerSection)
 	providerGroup.Set("metadata", metadataGroup)
 	metadata.Set("provider_group", providerGroup)
@@ -1256,33 +1227,6 @@ func (s *Server) getProviderTemplates() *config.OrderedJSON {
 		"xinference_rerank", om("id", "xinference_rerank", "type", "xinference_rerank", "provider", "xinference",
 			"provider_type", "rerank", "enable", false,
 			"rerank_api_base", "http://127.0.0.1:8000", "rerank_model", "BAAI/bge-reranker-base"),
-		// Agent runner backends (remote HTTP APIs). Mirrors the Python
-		// templates; the type values match the agent_runner_type config options
-		// so a created source can be selected as an agent runner provider.
-		"dify", om("id", "dify_app_default", "type", "dify", "provider", "dify",
-			"provider_type", "agent_runner", "enable", true,
-			"dify_api_type", "chat", "dify_api_key", "",
-			"dify_api_base", "https://api.dify.ai/v1",
-			"dify_workflow_output_key", "astrbot_wf_output",
-			"dify_query_input_key", "astrbot_text_query",
-			"variables", om(), "timeout", 60, "proxy", ""),
-		"coze", om("id", "coze", "type", "coze", "provider", "coze",
-			"provider_type", "agent_runner", "enable", true,
-			"coze_api_key", "", "bot_id", "", "coze_api_base", "https://api.coze.cn",
-			"timeout", 60, "proxy", ""),
-		"dashscope_agent", om("id", "dashscope", "type", "dashscope", "provider", "dashscope",
-			"provider_type", "agent_runner", "enable", true,
-			"dashscope_app_type", "agent", "dashscope_api_key", "", "dashscope_app_id", "",
-			"rag_options", om("pipeline_ids", []interface{}{}, "file_ids", []interface{}{}, "output_reference", false),
-			"variables", om(), "timeout", 60, "proxy", ""),
-		"deerflow", om("id", "deerflow", "type", "deerflow", "provider", "deerflow",
-			"provider_type", "agent_runner", "enable", true,
-			"deerflow_api_base", "http://127.0.0.1:2026", "deerflow_api_key", "",
-			"deerflow_auth_header", "", "deerflow_assistant_id", "lead_agent",
-			"deerflow_model_name", "", "deerflow_thinking_enabled", false,
-			"deerflow_plan_mode", false, "deerflow_subagent_enabled", false,
-			"deerflow_max_concurrent_subagents", 3, "deerflow_recursion_limit", 1000,
-			"timeout", 300),
 	)
 }
 
@@ -1315,13 +1259,11 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request, parts []st
 // CAPABILITY_TO_PROVIDER_TYPE. Unknown values pass through unchanged.
 func capabilityToProviderType(capability string) string {
 	switch strings.ToLower(strings.TrimSpace(capability)) {
-	case "chat", "chat_completion":
+	case "chat":
 		return "chat_completion"
-	case "agent", "agent_runner":
-		return "agent_runner"
-	case "stt", "speech_to_text":
+	case "stt":
 		return "speech_to_text"
-	case "tts", "text_to_speech":
+	case "tts":
 		return "text_to_speech"
 	case "embedding":
 		return "embedding"
@@ -1331,27 +1273,9 @@ func capabilityToProviderType(capability string) string {
 	return capability
 }
 
-// providerNameToProviderType derives a capability type from a provider name
-// (e.g. "openai_chat_completion" -> "chat_completion"). Used to backfill
-// provider_type on legacy providers that lack the field.
-func providerNameToProviderType(providerName string) string {
-	name := strings.ToLower(strings.TrimSpace(providerName))
-	switch {
-	case strings.Contains(name, "speech_to_text"), strings.Contains(name, "stt"), strings.Contains(name, "whisper"):
-		return "speech_to_text"
-	case strings.Contains(name, "text_to_speech"), strings.Contains(name, "tts"):
-		return "text_to_speech"
-	case strings.Contains(name, "embedding"):
-		return "embedding"
-	case strings.Contains(name, "rerank"):
-		return "rerank"
-	case strings.Contains(name, "dify"), strings.Contains(name, "coze"), strings.Contains(name, "deerflow"), strings.Contains(name, "dashscope"), strings.Contains(name, "agent_runner"), strings.Contains(name, "agent"):
-		return "agent_runner"
-	case strings.Contains(name, "chat_completion"), strings.Contains(name, "chat"):
-		return "chat_completion"
-	}
-	return ""
-}
+// providerNameToProviderType 已移除：对齐 Python，
+// provider_type 只来源于 provider.provider_type 或所关联 source 的 provider_type，
+// 不再从 provider 名称推断（见 handleProviders list 分支）。
 
 func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts []string) {
 	sub := ""
@@ -1384,59 +1308,52 @@ func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request, parts [
 		}
 		cfg := s.getConfigSnapshot()
 		providers, _ := cfg["provider"].([]interface{})
-		// Backfill provider_type for providers created before the field was
-		// stored (or via flows that omit it), so the capability filter and the
-		// WebUI provider selector work. Derive from the linked source first,
-		// then from the provider name.
+		// 对齐 Python list_providers_for_dashboard_types：
+		// - 排除 provider_type == "agent_runner"（runner 已迁到 agent_runner.config.*）
+		// - effective_type 取 provider.provider_type；缺失则回退到其 source 的
+		//   provider_type（source 缺失时按 "chat_completion"）。
 		sources := s.getProviderSources()
 		sourceTypeByID := map[string]string{}
 		for _, src := range sources {
 			if sm, ok := src.(map[string]interface{}); ok {
 				if sid, _ := sm["id"].(string); sid != "" {
-					if pt, _ := sm["provider_type"].(string); pt != "" {
-						sourceTypeByID[sid] = pt
+					pt, _ := sm["provider_type"].(string)
+					if pt == "" {
+						pt = "chat_completion"
 					}
+					sourceTypeByID[sid] = pt
 				}
 			}
 		}
+		capability := strings.TrimSpace(r.URL.Query().Get("capability"))
+		ptype := ""
+		if capability != "" {
+			ptype = capabilityToProviderType(capability)
+		}
+		filtered := make([]interface{}, 0, len(providers))
 		for _, p := range providers {
 			pm, ok := p.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			if pt, _ := pm["provider_type"].(string); pt == "" {
-				derived := ""
+			if pt, _ := pm["provider_type"].(string); pt == "agent_runner" {
+				continue
+			}
+			effective, _ := pm["provider_type"].(string)
+			if effective == "" {
 				if sid, _ := pm["provider_source_id"].(string); sid != "" {
-					derived = sourceTypeByID[sid]
-				}
-				if derived == "" {
-					providerName, _ := pm["provider"].(string)
-					derived = providerNameToProviderType(providerName)
-				}
-				if derived != "" {
-					pm["provider_type"] = derived
+					effective = sourceTypeByID[sid]
 				}
 			}
-		}
-		// The WebUI requests providers by capability (e.g. capability=embedding
-		// for the knowledge-base vector model selector). Filter by provider_type
-		// so the same provider is not returned for every capability.
-		capability := strings.TrimSpace(r.URL.Query().Get("capability"))
-		if capability != "" {
-			ptype := capabilityToProviderType(capability)
-			filtered := make([]interface{}, 0, len(providers))
-			for _, p := range providers {
-				pm, ok := p.(map[string]interface{})
-				if !ok {
-					continue
-				}
-				if pm["provider_type"] != ptype {
-					continue
-				}
-				filtered = append(filtered, pm)
+			if ptype != "" && effective != ptype {
+				continue
 			}
-			providers = filtered
+			if effective != "" {
+				pm["provider_type"] = effective
+			}
+			filtered = append(filtered, pm)
 		}
+		providers = filtered
 		// 推理元数据与供应商配置分离：剔除遗留的 reasoning 字段（对齐 4.27.4 #9699）。
 		stripProvidersReasoningMetadata(providers)
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{

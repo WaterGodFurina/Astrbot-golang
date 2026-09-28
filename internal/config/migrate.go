@@ -342,22 +342,22 @@ func migrateAgentRunnerConfig(config map[string]interface{}, fallback map[string
 			}
 			runnerConfig = agentRunnerConfigDefault("local")
 			runnerConfig["model"] = map[string]interface{}{
-				"provider_id":          defaultProviderID,
+				"provider_id":           defaultProviderID,
 				"fallback_provider_ids": valueOr(providerSettings["fallback_chat_models"], []interface{}{}),
-				"request_max_retries":  valueOr(providerSettings["request_max_retries"], float64(5)),
+				"request_max_retries":   valueOr(providerSettings["request_max_retries"], float64(5)),
 			}
 			runnerConfig["persona"] = map[string]interface{}{
-				"persona_id":            personaID,
-				"safety_mode":           valueOr(providerSettings["llm_safety_mode"], true),
-				"safety_mode_strategy":  valueOr(providerSettings["safety_mode_strategy"], "system_prompt"),
+				"persona_id":           personaID,
+				"safety_mode":          valueOr(providerSettings["llm_safety_mode"], true),
+				"safety_mode_strategy": valueOr(providerSettings["safety_mode_strategy"], "system_prompt"),
 			}
 			runnerConfig["compression"] = map[string]interface{}{
-				"max_turns":          valueOr(providerSettings["max_context_length"], float64(-1)),
-				"trim_turns":         valueOr(providerSettings["dequeue_context_length"], float64(1)),
-				"overflow_strategy":  valueOr(providerSettings["context_limit_reached_strategy"], "llm_compress"),
-				"instruction":        valueOr(providerSettings["llm_compress_instruction"], ""),
-				"keep_recent_ratio":  valueOr(providerSettings["llm_compress_keep_recent_ratio"], 0.15),
-				"provider_id":        valueOr(providerSettings["llm_compress_provider_id"], ""),
+				"max_turns":           valueOr(providerSettings["max_context_length"], float64(-1)),
+				"trim_turns":          valueOr(providerSettings["dequeue_context_length"], float64(1)),
+				"overflow_strategy":   valueOr(providerSettings["context_limit_reached_strategy"], "llm_compress"),
+				"instruction":         valueOr(providerSettings["llm_compress_instruction"], ""),
+				"keep_recent_ratio":   valueOr(providerSettings["llm_compress_keep_recent_ratio"], 0.15),
+				"provider_id":         valueOr(providerSettings["llm_compress_provider_id"], ""),
 				"fallback_max_tokens": valueOr(providerSettings["fallback_max_context_tokens"], float64(128000)),
 			}
 			runnerConfig["misc"] = map[string]interface{}{

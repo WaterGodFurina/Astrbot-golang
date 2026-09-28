@@ -5,9 +5,9 @@
     "disabled": "Auto-scroll: Off"
   },
   "hint": "Currently only recording partial model call paths from AstrBot main Agent. More coverage will be added.",
+  "toggleLabel": "Record traces",
   "recording": "Recording",
   "paused": "Paused",
-  "toggleLabel": "Record traces",
   "table": {
     "time": "Time",
     "eventId": "Event ID",

@@ -106,11 +106,11 @@
     "ttsStatus": "TTS 状态",
     "chatProvider": "聊天模型",
     "ttsProvider": "TTS 模型",
+    "apply": "应用更改",
     "selectSessions": "选择会话",
     "searchSessions": "搜索会话...",
     "selectAll": "全选",
-    "clearAll": "清空",
-    "apply": "应用更改"
+    "clearAll": "清空"
   },
   "groups": {
     "title": "分组管理",

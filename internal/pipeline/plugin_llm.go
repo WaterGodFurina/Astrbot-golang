@@ -80,6 +80,17 @@ func resolveProviderFromConfig(config map[string]interface{}, explicitID string)
 		return nil, nil, fmt.Errorf("未找到指定的模型提供商 %s，请检查配置", explicitID)
 	}
 	selected, _ := providerSettings["default_provider_id"].(string)
+	if selected == "" {
+		// 迁移后 provider_settings.default_provider_id 已移除，
+		// 权威来源是 agent_runner.config.model.provider_id（对齐 Python）。
+		if ar, ok := config["agent_runner"].(map[string]interface{}); ok {
+			if arCfg, ok := ar["config"].(map[string]interface{}); ok {
+				if model, ok := arCfg["model"].(map[string]interface{}); ok {
+					selected, _ = model["provider_id"].(string)
+				}
+			}
+		}
+	}
 	if selected != "" {
 		for _, p := range providers {
 			pc, ok := p.(map[string]interface{})

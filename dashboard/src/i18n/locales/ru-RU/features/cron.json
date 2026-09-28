@@ -1,4 +1,4 @@
-﻿{
+{
   "header": {
     "eyebrow": "Automation",
     "live": "Живая синхронизация"
@@ -156,7 +156,6 @@
     "updateFailed": "Ошибка обновления",
     "deleteSuccess": "Удалено",
     "deleteFailed": "Ошибка удаления",
-    "deleteConfirm": "Удалить задачу {name}? Это действие необратимо.",
     "nameRequired": "Укажите имя задачи",
     "sessionRequired": "Укажите цель доставки",
     "noteRequired": "Заполните требования задачи",
@@ -169,6 +168,7 @@
     "createSuccess": "Задача создана",
     "createFailed": "Ошибка создания",
     "runStarted": "Запущено",
-    "runFailed": "Ошибка запуска"
+    "runFailed": "Ошибка запуска",
+    "deleteConfirm": "Удалить задачу {name}? Это действие необратимо."
   }
 }
