@@ -1,16 +1,14 @@
 {
   "title": "Console",
   "autoScroll": {
+    "label": "Auto-scroll",
     "enabled": "Auto-scroll enabled",
-    "disabled": "Auto-scroll disabled",
-    "label": "Auto-scroll"
+    "disabled": "Auto-scroll disabled"
   },
   "hideUserChat": {
+    "label": "Hide user chat",
     "enabled": "User chat hidden",
     "disabled": "Hide user chat"
-  },
-  "debugHint": {
-    "text": "Debug logs can be enabled in \"Configuration File → System → Console Log Level\""
   },
   "pipInstall": {
     "button": "Install pip Package",
@@ -18,7 +16,14 @@
     "packageLabel": "*Package name, e.g. llmtuner",
     "mirrorLabel": "Force PyPI repository URL (optional)",
     "mirrorHint": "Force PyPI repository URL > Config item `PyPI Repository Address`",
-    "cancelButton": "Cancel"
+    "cancelButton": "Cancel",
+    "installButton": "Install",
+    "installSuccess": "Installation successful.",
+    "installFailed": "Installation failed.",
+    "requestFailed": "Request failed."
+  },
+  "debugHint": {
+    "text": "Debug logs can be enabled in \"Configuration File → System → Console Log Level\""
   },
   "goInstall": {
     "button": "Install pip Package",

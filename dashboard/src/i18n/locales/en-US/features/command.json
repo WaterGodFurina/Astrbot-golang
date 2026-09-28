@@ -30,8 +30,8 @@
   "status": {
     "enabled": "Enabled",
     "disabled": "Disabled",
-    "conflict": "Conflict",
     "pluginDisabled": "Plugin off",
+    "conflict": "Conflict",
     "pluginInactive": "Enable the plugin first"
   },
   "permission": {
@@ -47,7 +47,8 @@
     "enable": "Enable command",
     "disable": "Disable command",
     "rename": "Rename command",
-    "viewDetails": "View details"
+    "viewDetails": "View details",
+    "pluginInactive": "Enable the plugin first"
   },
   "dialogs": {
     "rename": {

@@ -5,15 +5,17 @@
     "title": "模型提供商",
     "settings": "设置",
     "addProvider": "新增模型提供商",
+    "deleteProvider": "删除模型提供商",
+    "selectHint": "请选择一个模型提供商",
     "providerType": "提供商类型",
     "tabs": {
       "all": "全部",
       "chatCompletion": "对话",
-      "agentRunner": "Agent 执行器",
       "speechToText": "语音转文字",
       "textToSpeech": "文字转语音",
-      "embedding": "嵌入(Embedding)",
-      "rerank": "重排序(Rerank)"
+      "embedding": "嵌入",
+      "rerank": "重排序",
+      "agentRunner": "Agent 执行器"
     },
     "empty": {
       "all": "暂无模型提供商，点击 新增模型提供商 添加",
@@ -47,11 +49,11 @@
       "title": "模型提供商",
       "tabs": {
         "basic": "对话",
-        "agentRunner": "Agent 执行器",
         "speechToText": "语音转文字",
         "textToSpeech": "文字转语音",
-        "embedding": "嵌入(Embedding)",
-        "rerank": "重排序(Rerank)"
+        "embedding": "嵌入",
+        "rerank": "重排序",
+        "agentRunner": "Agent 执行器"
       },
       "noTemplates": "暂无该类型的提供商模板"
     },
@@ -91,16 +93,6 @@
   "providerTypes": {
     "title": "提供商类型"
   },
-  "agentRunnerDialog": {
-    "title": "请前往「配置文件」页测试 Agent 执行器",
-    "description": "Agent 执行器的测试请在「配置文件」页进行。",
-    "step1": "找到对应的配置文件并打开。",
-    "step2": "找到 Agent 执行方式部分，修改执行器后点击保存。",
-    "step3": "点击右下角的 💬 聊天按钮进行测试。",
-    "applyHint": "要让机器人应用这个 Agent 执行器，你也需要前往修改 Agent 执行器。",
-    "ok": "好的",
-    "go": "点击前往"
-  },
   "providerSources": {
     "website": "官网",
     "setupGuide": "接入帮助",
@@ -124,6 +116,7 @@
     "save": "保存配置",
     "saveAndFetchModels": "保存并获取模型",
     "fetchModels": "获取模型列表",
+    "getApiKey": "获取 API Key",
     "saveSuccess": "提供商源保存成功",
     "saveError": "提供商源保存失败",
     "deleteConfirm": "确定要删除提供商源 {id} 吗？这将同时删除关联的所有模型配置。",
@@ -163,7 +156,6 @@
     "testError": "模型测试失败",
     "searchPlaceholder": "搜索模型或 ID",
     "manualAddButton": "自定义模型",
-    "manualDialogAddButton": "添加",
     "manualDialogTitle": "添加自定义模型",
     "manualDialogModelLabel": "模型 ID（如 gpt-4.1-mini）",
     "manualDialogPreviewLabel": "显示 ID（自动生成）",
@@ -185,6 +177,17 @@
     "tooltips": {
       "providerId": "提供商 ID",
       "modelId": "模型 ID"
-    }
+    },
+    "manualDialogAddButton": "添加"
+  },
+  "agentRunnerDialog": {
+    "title": "请前往「配置文件」页测试 Agent 执行器",
+    "description": "Agent 执行器的测试请在「配置文件」页进行。",
+    "step1": "找到对应的配置文件并打开。",
+    "step2": "找到 Agent 执行方式部分，修改执行器后点击保存。",
+    "step3": "点击右下角的 💬 聊天按钮进行测试。",
+    "applyHint": "要让机器人应用这个 Agent 执行器，你也需要前往修改 Agent 执行器。",
+    "ok": "好的",
+    "go": "点击前往"
   }
 }
