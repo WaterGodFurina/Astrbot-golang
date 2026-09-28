@@ -346,9 +346,33 @@ func (e *AstrMessageEvent) ClearExtra() {
 
 // TrackTemporaryFile records a file for cleanup after the event.
 func (e *AstrMessageEvent) TrackTemporaryFile(path string) {
+	if path == "" {
+		return
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for _, existing := range e.TemporaryFiles {
+		if existing == path {
+			return
+		}
+	}
 	e.TemporaryFiles = append(e.TemporaryFiles, path)
+}
+
+// UntrackTemporaryFile stops tracking a path so cleanup will not delete it
+// (mirrors py untrack_temporary_local_file).
+func (e *AstrMessageEvent) UntrackTemporaryFile(path string) {
+	if path == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for i, existing := range e.TemporaryFiles {
+		if existing == path {
+			e.TemporaryFiles = append(e.TemporaryFiles[:i], e.TemporaryFiles[i+1:]...)
+			return
+		}
+	}
 }
 
 // CleanupTemporaryFiles removes tracked temporary files.

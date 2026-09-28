@@ -39,6 +39,8 @@
     "noSearchResults": "Нет подходящих плагинов"
   },
   "providerSelector": {
+    "allSources": "Все источники",
+    "filterSource": "Фильтр по источнику провайдера",
     "notSelected": "Не выбрано",
     "buttonText": "Выбрать провайдера...",
     "dialogTitle": "Выбор провайдера",

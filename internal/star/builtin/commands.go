@@ -82,8 +82,10 @@ func RegisterBuiltin(deps Deps) {
 	reg("help", star.PermissionEveryone, i18n.Get("显示帮助"), func(e *core.Event) { helpCmd(deps, e) })
 	reg("sid", star.PermissionEveryone, i18n.Get("获取会话 ID 信息"), func(e *core.Event) { sidCmd(e) })
 	reg("name", star.PermissionAdmin, i18n.Get("设置当前 UMO 的显示名称"), func(e *core.Event) { nameCmd(deps, e) })
-	reg("reset", star.PermissionEveryone, i18n.Get("重置当前会话的 LLM 上下文"), func(e *core.Event) { resetCmd(deps, e) })
-	reg("new", star.PermissionEveryone, i18n.Get("创建新对话"), func(e *core.Event) { newCmd(deps, e) })
+	// /reset 与 /new 统一为同一语义（对齐 py v4.28.2：reset 直接调用 new_conv），
+	// 权限均为 SHARED_GROUP_ADMIN（群聊内管理员，或隔离会话实际生效时放行）。
+	reg("reset", star.PermissionSharedGroupAdmin, i18n.Get("重置当前会话的 LLM 上下文"), func(e *core.Event) { newCmd(deps, e) })
+	reg("new", star.PermissionSharedGroupAdmin, i18n.Get("创建新对话"), func(e *core.Event) { newCmd(deps, e) })
 	reg("stop", star.PermissionEveryone, i18n.Get("停止当前会话正在运行的任务"), func(e *core.Event) { stopCmd(e) })
 	reg("stats", star.PermissionEveryone, i18n.Get("查看当前对话 Token 用量统计"), func(e *core.Event) { statsCmd(deps, e) })
 	reg("provider", star.PermissionAdmin, i18n.Get("查看或切换 LLM Provider"), func(e *core.Event) { providerCmd(deps, e) })
@@ -234,36 +236,8 @@ func persistUmoAlias(deps Deps, umo, alias string) error {
 }
 
 // ---------------------------------------------------------------------------
-// /reset
-// ---------------------------------------------------------------------------
-
-func resetCmd(deps Deps, e *core.Event) {
-	umo := e.UnifiedMsgOrigin()
-	// Admin requirement for group reset (mirrors Python's RstScene default)
-	if e.Source.IsGroup && e.Role != "admin" {
-		reply(e, i18n.Get(
-			"Reset command requires admin permission in group scenario, you (ID %s) are not admin, cannot perform this action.",
-			e.Source.SenderID,
-		))
-		return
-	}
-	if deps.ConversationMgr == nil {
-		reply(e, i18n.Get("😕 会话管理器不可用。"))
-		return
-	}
-	// 对齐 Python reset：先终止本会话其它活跃事件，再清空上下文。
-	core.ActiveRegistry().StopAll(umo, e)
-	cid := deps.ConversationMgr.GetCurrConversationID(umo)
-	if cid == "" {
-		reply(e, i18n.Get("😕 You are not in a conversation. Use /new to create one."))
-		return
-	}
-	deps.ConversationMgr.ClearHistory(umo)
-	reply(e, i18n.Get("✅ Conversation reset successfully."))
-}
-
-// ---------------------------------------------------------------------------
-// /new
+// /reset 与 /new（统一实现，对齐 py v4.28.2 builtin_commands/main.py：
+// reset handler 直接调用 conversation_c.new_conv；旧 RstScene 硬编码已删除）
 // ---------------------------------------------------------------------------
 
 func newCmd(deps Deps, e *core.Event) {
@@ -272,14 +246,24 @@ func newCmd(deps Deps, e *core.Event) {
 		reply(e, i18n.Get("😕 会话管理器不可用。"))
 		return
 	}
-	// 对齐 Python new_conv：新建会话前终止本会话其它活跃事件。
+	// 对齐 Python new_conv：新建会话前终止本会话其它活跃事件（不等待退出）。
 	core.ActiveRegistry().StopAll(umo, e)
+	// 对齐 Python new_conv：新会话继承当前会话人格（_get_current_persona_id）。
+	persona := ""
+	if cur := deps.ConversationMgr.GetConversation(umo); cur != nil {
+		persona = cur.Persona
+	}
 	conv := deps.ConversationMgr.NewConversation(umo, e.Source.Platform)
+	if persona != "" {
+		deps.ConversationMgr.SetPersona(umo, persona)
+	}
+	// 对齐 Python new_conv：标记在回复发送后清理本会话的群聊上下文缓存。
+	e.SetExtra("_clean_group_context_session", true)
 	cid := conv.CID
 	if len(cid) > 4 {
 		cid = cid[:4]
 	}
-	reply(e, i18n.Get("✅ Switched to new conversation: %s。", cid))
+	reply(e, i18n.Get("✅ Switched to new conversation: %s.", cid))
 }
 
 // ---------------------------------------------------------------------------

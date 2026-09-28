@@ -75,6 +75,12 @@ type Adapter struct {
 	// 对齐 Python lark_adapter.py _user_name_cache：成功缓存 1800s，失败缓存 60s，容量 1000。
 	userNameCache   map[string]userNameCacheEntry
 	userNameCacheMu sync.Mutex
+
+	// privateChatMu/privateChat 记录私聊 open_id → chat_id 路由（键为
+	// "private_chat:{open_id}"，对齐 py v4.28.2 lark_adapter.py 的 sp 存储）。
+	// 私聊发送被拒（典型错误码 230101）时用 chat_id 回退重发一次。
+	privateChatMu sync.RWMutex
+	privateChat   map[string]string
 }
 
 type userNameCacheEntry struct {
@@ -93,6 +99,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		replyIDs:      make(map[string]string),
 		streamCards:   make(map[string]*streamCard),
 		userNameCache: make(map[string]userNameCacheEntry),
+		privateChat:   make(map[string]string),
 	}
 	a.appID, _ = config["app_id"].(string)
 	a.appSecret, _ = config["app_secret"].(string)
@@ -107,6 +114,8 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	a.webhookID, _ = config["webhook_uuid"].(string)
 	a.encryptKey, _ = config["lark_encrypt_key"].(string)
 	a.verifyTok, _ = config["lark_verification_token"].(string)
+	// 从 dataDir 加载已持久化的私聊路由（不可用时静默降级为仅内存）。
+	a.loadPrivateChatRoutes()
 	return a
 }
 
@@ -400,6 +409,10 @@ func (a *Adapter) convertMsg(event *larkim.P2MessageReceiveV1) {
 	sessionID := senderOpenID
 	if abm.Type == platform.GroupMessage {
 		sessionID = abm.GroupID()
+	} else if chatType == "p2p" && chatID != "" {
+		// 对齐 py v4.28.2（commit 32a75139）：私聊入站消息记录并持久化
+		// open_id → chat_id 路由，供 open_id 被拒时回退重发。
+		a.savePrivateChatRoute(senderOpenID, chatID)
 	}
 	abm.SessionID = sessionID
 
@@ -475,7 +488,9 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 }
 
 // Send sends a message chain to a Lark session. Group sessions use chat_id,
-// private sessions use open_id (mirrors send_by_session). 对齐本体
+// private sessions use open_id (mirrors send_by_session). 私聊发送优先 open_id，
+// 若被飞书拒绝（典型 230101）且已记录 open_id → chat_id 路由，则复用同一 UUID
+// 以 chat_id 重试一次（对齐 py v4.28.2 commit 32a75139）。对齐本体
 // lark_event.py:551-558：send 始终 reply 原消息——优先取链中显式 Reply 组件的
 // message_id（reply_with_quote 开启时由 pipeline 注入），否则回填最近一次
 // 收到消息的 message_id。
@@ -485,11 +500,15 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	}
 	receiveIDType := "open_id"
 	receiveID := sessionID
+	fallbackChatID := ""
 	if a.isGroupConv(sessionID) {
 		receiveIDType = "chat_id"
 		if strings.Contains(receiveID, "%") {
 			receiveID = receiveID[strings.Index(receiveID, "%")+1:]
 		}
+	} else {
+		// 私聊优先 open_id；仅当发送被拒时才会用到已知 chat_id。
+		fallbackChatID = a.lookupPrivateChatID(receiveID)
 	}
 	replyMessageID := a.lookupReplyID(sessionID)
 	if chain != nil {
@@ -500,7 +519,7 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 			}
 		}
 	}
-	return sendMessageChain(context.Background(), a.client, chain, replyMessageID, receiveID, receiveIDType)
+	return sendMessageChain(context.Background(), a.client, chain, replyMessageID, receiveID, receiveIDType, fallbackChatID)
 }
 
 // React adds an emoji reaction to a message (CreateMessageReaction API).

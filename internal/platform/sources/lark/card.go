@@ -139,8 +139,9 @@ func createCard(ctx context.Context, client *lark.Client, cardJSON map[string]in
 }
 
 // sendInteractiveCard 创建卡片实体并发送 interactive 消息
-// （对齐本体 _send_interactive_card）。
-func sendInteractiveCard(ctx context.Context, client *lark.Client, cardJSON map[string]interface{}, replyMessageID, receiveID, receiveIDType string) error {
+// （对齐本体 _send_interactive_card）。fallbackChatID 透传用于私聊 open_id
+// 被拒时以 chat_id 重试。
+func sendInteractiveCard(ctx context.Context, client *lark.Client, cardJSON map[string]interface{}, replyMessageID, receiveID, receiveIDType, fallbackChatID string) error {
 	cardID, err := createCard(ctx, client, cardJSON)
 	if err != nil {
 		logger.Error("创建飞书卡片失败: %v", err)
@@ -150,17 +151,17 @@ func sendInteractiveCard(ctx context.Context, client *lark.Client, cardJSON map[
 		"type": "card",
 		"data": map[string]string{"card_id": cardID},
 	})
-	return sendImMessage(ctx, client, string(content), "interactive", replyMessageID, receiveID, receiveIDType)
+	return sendImMessage(ctx, client, string(content), "interactive", replyMessageID, receiveID, receiveIDType, fallbackChatID)
 }
 
 // sendCollapsibleReasoningPanel 发送单个折叠面板卡片
 // （对齐本体 _send_collapsible_reasoning_panel）。
-func sendCollapsibleReasoningPanel(ctx context.Context, client *lark.Client, reasoningContent, title, replyMessageID, receiveID, receiveIDType string) error {
+func sendCollapsibleReasoningPanel(ctx context.Context, client *lark.Client, reasoningContent, title, replyMessageID, receiveID, receiveIDType, fallbackChatID string) error {
 	if reasoningContent == "" {
 		return nil
 	}
 	cardJSON := buildReasoningCollapsiblePanel(reasoningContent, title)
-	return sendInteractiveCard(ctx, client, cardJSON, replyMessageID, receiveID, receiveIDType)
+	return sendInteractiveCard(ctx, client, cardJSON, replyMessageID, receiveID, receiveIDType, fallbackChatID)
 }
 
 // createStreamingCard 创建开启流式更新模式的卡片实体，返回 card_id
@@ -239,12 +240,13 @@ func closeStreamingMode(ctx context.Context, client *lark.Client, cardID string,
 }
 
 // sendCardMessage 将卡片实体作为 interactive 消息发送（对齐本体 _send_card_message）。
+// 流式卡片路径不参与私聊 chat_id 回退（对齐 py：_send_card_message 无 fallback_chat_id）。
 func sendCardMessage(ctx context.Context, client *lark.Client, cardID, replyMessageID, receiveID, receiveIDType string) error {
 	content, _ := json.Marshal(map[string]interface{}{
 		"type": "card",
 		"data": map[string]string{"card_id": cardID},
 	})
-	return sendImMessage(ctx, client, string(content), "interactive", replyMessageID, receiveID, receiveIDType)
+	return sendImMessage(ctx, client, string(content), "interactive", replyMessageID, receiveID, receiveIDType, "")
 }
 
 // streamCard 会话级流式卡片状态：card_id + 递增 sequence。

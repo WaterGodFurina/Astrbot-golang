@@ -1227,6 +1227,12 @@ func (a *Adapter) StreamUpdate(sessionID, msgID, text string) error {
 
 // StreamEnd finalizes the C2C streaming message.
 func (a *Adapter) StreamEnd(sessionID, msgID, text string) error {
+	// 防御性对齐 py _close_stream_segment：流已开（msgID 非空）时，空文本也要
+	// 用最小 "\n" 占位发 state=10 收尾帧，否则 QQ 超时会把整段回滚到首包
+	// （#10066）。从未开流（msgID 为空）时保持原样。
+	if text == "" && msgID != "" {
+		text = "\n"
+	}
 	_, err := a.streamFragment(sessionID, 10, msgID, 2, text)
 	return err
 }

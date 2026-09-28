@@ -1,12 +1,17 @@
 package sources
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 )
+
+// testPNGBase64 是 1x1 合法 PNG：v4.28.2 起 assemble_context 会按真实解码
+// 识别图片，伪造字节会被跳过（对齐 py resolve_image_ref_to_base64_data）。
+const testPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 // TestAnthropicMessageToolHistory verifies that OpenAI-format tool_calls / tool
 // messages in tool-loop history are converted to Anthropic tool_use /
@@ -153,7 +158,11 @@ func TestAnthropicImageBlock(t *testing.T) {
 func TestGeminiBuildRequestBodyMedia(t *testing.T) {
 	dir := t.TempDir()
 	img := filepath.Join(dir, "pic.png")
-	if err := os.WriteFile(img, []byte{1, 2, 3}, 0o644); err != nil {
+	pngBytes, err := base64.StdEncoding.DecodeString(testPNGBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(img, pngBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	audio := filepath.Join(dir, "clip.mp3")

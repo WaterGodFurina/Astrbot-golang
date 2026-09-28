@@ -427,16 +427,25 @@ func (m *Manager) SwitchConversation(unifiedMsgOrigin, cid string) error {
 }
 
 // DeleteConversation removes the current conversation of a session (persisted).
+// 对齐 py conversation_mgr.delete_conversation：先经 get_curr_conversation_id
+// 解析当前会话，而非直接读内存指针——内存指针为空（或未命中 byCID）时
+// GetConversation 会回退 DB 中持久化的当前会话，避免持久化的会话删不掉。
 func (m *Manager) DeleteConversation(unifiedMsgOrigin string) {
+	cid := m.GetCurrConversationID(unifiedMsgOrigin)
+	if cid == "" {
+		return
+	}
 	m.mu.Lock()
-	cid := m.current[unifiedMsgOrigin]
 	conv := m.byCID[cid]
 	if conv == nil {
 		m.mu.Unlock()
 		return
 	}
 	delete(m.byCID, cid)
-	delete(m.current, unifiedMsgOrigin)
+	// 对齐 py：仅当会话指针仍指向被删会话时才清理当前会话映射。
+	if m.current[unifiedMsgOrigin] == cid {
+		delete(m.current, unifiedMsgOrigin)
+	}
 	// 标记 tombstone：删除后任何锁外 persist（含在途的 AppendHistory 落库） 都不得把该会话写回数据库，否则重启后会复活。
 	m.tombstones[cid] = struct{}{}
 	m.mu.Unlock()

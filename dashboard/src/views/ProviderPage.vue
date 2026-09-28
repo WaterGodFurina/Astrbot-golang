@@ -59,9 +59,12 @@
               <div class="provider-config-header">
                 <div class="provider-config-headline">
                   <div class="provider-config-title">{{ selectedProviderSource.id }}</div>
-                  <div class="provider-config-subtitle">
-                    {{ selectedProviderSource.api_base || 'N/A' }}
-                  </div>
+                  <ProviderSourceSubtitle
+                    class="provider-config-subtitle"
+                    :api-base="selectedProviderSource.api_base"
+                    :sponsor="selectedSponsor"
+                    :tm="tm"
+                  />
                 </div>
 
                 <div class="provider-config-actions">
@@ -347,6 +350,7 @@ import AstrBotConfig from '@/components/shared/AstrBotConfig.vue'
 import ItemCard from '@/components/shared/ItemCard.vue'
 import AddNewProvider from '@/components/provider/AddNewProvider.vue'
 import ProviderModelsPanel from '@/components/provider/ProviderModelsPanel.vue'
+import ProviderSourceSubtitle from '@/components/provider/ProviderSourceSubtitle.vue'
 import ProviderSourcesPanel from '@/components/provider/ProviderSourcesPanel.vue'
 import { useProviderModelConfigDialog } from '@/composables/useProviderModelConfigDialog'
 import { useProviderSources } from '@/composables/useProviderSources'
@@ -376,6 +380,7 @@ const {
   providers,
   selectedProviderType,
   selectedProviderSource,
+  selectedSponsor,
   availableModels,
   loadingModels,
   savingSource,

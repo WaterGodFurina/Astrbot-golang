@@ -1173,7 +1173,7 @@ func (s *Server) getProviderTemplates() *config.OrderedJSON {
 		"kimi_code", om("id", "kimi_code", "type", "kimi_code_chat_completion", "provider", "kimi-code",
 			"provider_type", "chat_completion", "enable", false,
 			"api_base", "https://api.kimi.com/coding", "key", []string{}, "model", "kimi-for-coding",
-			"timeout", 120, "proxy", "", "custom_headers", om("User-Agent", "claude-code/0.1.0"),
+			"timeout", 120, "proxy", "", "custom_headers", om(),
 			"anth_thinking_config", om("type", "", "budget", 0, "effort", "")),
 		// Non-chat capabilities (STT / TTS / Embedding / Rerank). The type field
 		// must match the provider registered in internal/provider/sources/init.go.
@@ -6678,7 +6678,8 @@ func (s *Server) handleChatThreadCreate(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, apiError("Missing key: selected_text"))
 		return
 	}
-	detail := s.chat.sessionDetail(body.SessionID)
+	// 线程创建需要定位父消息：按默认分页取全量（store 已封顶 1000 条）。
+	detail := s.chat.sessionDetail(body.SessionID, 1, chatHistoryMaxPageSize)
 	if detail == nil {
 		writeJSON(w, http.StatusNotFound, apiError("Session "+body.SessionID+" not found"))
 		return
@@ -6749,7 +6750,8 @@ func (s *Server) handleChatRegenerate(w http.ResponseWriter, r *http.Request, se
 		writeJSON(w, http.StatusMethodNotAllowed, apiError("POST required"))
 		return
 	}
-	detail := s.chat.sessionDetail(sessionID)
+	// 重新生成需要定位目标消息及其之前的历史：按默认分页取全量。
+	detail := s.chat.sessionDetail(sessionID, 1, chatHistoryMaxPageSize)
 	if detail == nil {
 		writeJSON(w, http.StatusNotFound, apiError("Session "+sessionID+" not found"))
 		return
@@ -7266,6 +7268,31 @@ func (s *Server) serializeProjectsWithWorkspaces(projects []map[string]interface
 	return out
 }
 
+// parseChatHistoryPage 解析并校验 /chat/sessions/{id} 的 page/page_size
+// query（对齐 Python chat.py get_chat_session：page 默认 1 且 >=1；
+// page_size 默认 1000 且 1<=page_size<=1000）。校验失败时写出 400 并返回
+// ok=false。
+func parseChatHistoryPage(w http.ResponseWriter, r *http.Request) (page, pageSize int, ok bool) {
+	page, pageSize = 1, chatHistoryMaxPageSize
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeJSON(w, http.StatusBadRequest, apiError("page 必须为不小于 1 的整数"))
+			return 0, 0, false
+		}
+		page = n
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("page_size")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > chatHistoryMaxPageSize {
+			writeJSON(w, http.StatusBadRequest, apiError("page_size 必须为 1 到 1000 之间的整数"))
+			return 0, 0, false
+		}
+		pageSize = n
+	}
+	return page, pageSize, true
+}
+
 // handleChatSessions handles /api/v1/chat/sessions[...] endpoints.
 func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest []string) {
 	if s.chat == nil {
@@ -7358,8 +7385,10 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 					}
 					writeJSON(w, http.StatusMethodNotAllowed, apiError("不支持的消息操作"))
 				} else {
-					// 返回该会话的真实历史消息（此前为恒空 stub）。
-					detail := s.chat.sessionDetail(sessionID)
+					// 返回该会话的真实历史消息（此前为恒空 stub）。该子资源
+					// 是 Go 侧遗留扩展：按默认分页取全量（store 已封顶
+					// maxSessionMessages=1000）。
+					detail := s.chat.sessionDetail(sessionID, 1, chatHistoryMaxPageSize)
 					messages := []interface{}{}
 					if detail != nil {
 						if h, ok := detail["history"].([]map[string]interface{}); ok {
@@ -7387,7 +7416,13 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request, rest
 		}
 		switch r.Method {
 		case http.MethodGet:
-			detail := s.chat.sessionDetail(sessionID)
+			// page/page_size 分页（对齐 Python get_chat_session）：page 1 为
+			// 最新一页，非法 query 返回 400 而不静默取默认值。
+			page, pageSize, ok := parseChatHistoryPage(w, r)
+			if !ok {
+				return
+			}
+			detail := s.chat.sessionDetail(sessionID, page, pageSize)
 			if detail == nil {
 				writeJSON(w, http.StatusNotFound, apiError("会话不存在"))
 				return
@@ -8128,8 +8163,11 @@ func (s *Server) updateCommand(w http.ResponseWriter, r *http.Request, handlerFu
 		}
 		if body.PermissionGroup != nil {
 			perm := strings.TrimSpace(*body.PermissionGroup)
-			if perm != "admin" && perm != "member" {
-				softErr = fmt.Errorf("权限类型必须为 admin 或 member")
+			// 对齐 py command_management.update_command_permission：
+			// 仅接受 COMMAND_PERMISSION_TYPES（admin/member/group_admin/
+			// shared_group_admin），其余报错且不修改任何状态。
+			if _, ok := star.ParsePermissionType(perm); !ok {
+				softErr = fmt.Errorf("权限类型必须为 admin、member、group_admin 或 shared_group_admin")
 				return nil
 			}
 			sm.Handlers().SetHandlerPermission(handlerFullName, perm)
@@ -10681,7 +10719,9 @@ func (s *Server) serializeConversationRow(row db.ConversationRow) map[string]int
 		"cid":         row.ConversationID,
 		"platform_id": row.PlatformID,
 		"user_id":     row.UserID,
-		"title":       row.Title,
+		// WebChat 标题生成在平台会话上，对话行 title 为空时回退会话标题
+		//（对齐 Python _serialize_conversation 的 title or webchat_title）。
+		"title":       s.webchatConversationTitle(row.PlatformID, row.UserID, row.Title),
 		"persona_id":  row.PersonaID,
 		"token_usage": 0,
 		"created_at":  row.CreatedAt,
@@ -10690,6 +10730,28 @@ func (s *Server) serializeConversationRow(row db.ConversationRow) map[string]int
 		"history":     []interface{}{},
 		"is_deleted":  false,
 	}
+}
+
+// webchatConversationTitle 在 platform_id=="webchat" 且对话 title 为空时，
+// 按 user_id 末段取 WebChat 会话（chatStore）的 DisplayName 回退；无回退时
+// 原样返回 title（对齐 Python ConversationService._webchat_session_id /
+// _get_webchat_titles / _serialize_conversation 的
+// `conversation.title or webchat_title or None`）。
+func (s *Server) webchatConversationTitle(platformID, userID, title string) string {
+	if title != "" || platformID != "webchat" || s.chat == nil {
+		return title
+	}
+	// WebChat 统一消息来源形如
+	// webchat:FriendMessage:webchat!<creator>!<session_id>，会话 id 为末段；
+	// 无 "!" 时 Python 视为无会话 id，不做回退。
+	if !strings.Contains(userID, "!") {
+		return title
+	}
+	sessionID := userID[strings.LastIndex(userID, "!")+1:]
+	if sessionID == "" {
+		return title
+	}
+	return s.chat.sessionTitle(sessionID)
 }
 
 // parseUMOInfo splits a unified_msg_origin (platform:message_type:session_id)
@@ -10758,19 +10820,31 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request, par
 		// 对齐 Python v4.28.0 (sqlite.get_filtered_conversations)：
 		// keyword/umo/sort_by/sort_order/group_by_session 过滤参数。
 		groupBySession, _ := strconv.ParseBool(q.Get("group_by_session"))
+		// WebChat 标题回退搜索（对齐 Python _webchat_session_title_match）：
+		// 标题存在 JSON chatStore 而非 conversations 表，先按标题匹配出会话
+		// id，再由 DB 条件按 user_id LIKE '%!<session_id>' 命中对应对话。
+		searchQuery := q.Get("search")
+		keywordQuery := q.Get("keyword")
+		var searchWebchatIDs, keywordWebchatIDs []string
+		if s.chat != nil {
+			searchWebchatIDs = s.chat.sessionIDsByTitle(searchQuery)
+			keywordWebchatIDs = s.chat.sessionIDsByTitle(keywordQuery)
+		}
 		rows, total, err := s.database.GetFilteredConversations(db.ConversationFilter{
-			Platforms:        splitCSV("platforms"),
-			MessageTypes:     splitCSV("message_types"),
-			Search:           q.Get("search"),
-			KeywordQuery:     q.Get("keyword"),
-			UmoQuery:         q.Get("umo"),
-			SortBy:           q.Get("sort_by"),
-			SortOrder:        q.Get("sort_order"),
-			GroupBySession:   groupBySession,
-			ExcludeIDs:       splitCSV("exclude_ids"),
-			ExcludePlatforms: splitCSV("exclude_platforms"),
-			Page:             page,
-			PageSize:         pageSize,
+			Platforms:                splitCSV("platforms"),
+			MessageTypes:             splitCSV("message_types"),
+			Search:                   searchQuery,
+			KeywordQuery:             keywordQuery,
+			SearchWebchatSessionIDs:  searchWebchatIDs,
+			KeywordWebchatSessionIDs: keywordWebchatIDs,
+			UmoQuery:                 q.Get("umo"),
+			SortBy:                   q.Get("sort_by"),
+			SortOrder:                q.Get("sort_order"),
+			GroupBySession:           groupBySession,
+			ExcludeIDs:               splitCSV("exclude_ids"),
+			ExcludePlatforms:         splitCSV("exclude_platforms"),
+			Page:                     page,
+			PageSize:                 pageSize,
 		})
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, apiError("查询对话列表失败: "+err.Error()))
@@ -10935,6 +11009,12 @@ func (s *Server) handleConversationByID(w http.ResponseWriter, r *http.Request, 
 			}))
 			return
 		}
+		// WebChat 标题回退（对齐 Python ConversationService.get_conversation：
+		// conversation.title 为空时用平台会话 display_name）。
+		platformID, _ := detail["platform_id"].(string)
+		userID, _ := detail["user_id"].(string)
+		title, _ := detail["title"].(string)
+		detail["title"] = s.webchatConversationTitle(platformID, userID, title)
 		writeJSON(w, http.StatusOK, apiOK(detail))
 	case http.MethodPatch:
 		var body map[string]interface{}
@@ -11160,11 +11240,14 @@ func (s *Server) handleConversationsExport(w http.ResponseWriter, r *http.Reques
 		if history == nil {
 			history = []map[string]interface{}{}
 		}
+		// 导出同样回退 WebChat 会话标题（对齐 Python export_conversations：
+		// conversation.title or webchat_title or None）。
+		title := s.webchatConversationTitle(conv.PlatformID, conv.UserID, conv.Title)
 		line, err := json.Marshal(map[string]interface{}{
 			"cid":         conv.CID,
 			"user_id":     conv.UserID,
 			"platform_id": conv.PlatformID,
-			"title":       conv.Title,
+			"title":       title,
 			"persona_id":  conv.Persona,
 			"created_at":  conv.CreatedAt,
 			"updated_at":  conv.UpdatedAt,

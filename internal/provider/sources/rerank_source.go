@@ -89,6 +89,12 @@ func (s *TEIRerankSource) Rerank(ctx context.Context, query string, documents []
 		if s.apiKey != "" {
 			req.Header.Set("Authorization", "Bearer "+s.apiKey)
 		}
+		// 统一请求头（对齐 py tei_rerank: h = request_headers.copy() 后补 Authorization）。
+		for k, v := range s.RequestHeaders() {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
 		return req, nil
 	}, cfg, "Rerank-TEI")
 	if err != nil {

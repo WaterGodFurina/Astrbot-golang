@@ -116,6 +116,10 @@ func (s *EdgeTTSSource) GetAudio(ctx context.Context, text string) (string, erro
 	}
 	var conn *websocket.Conn
 	var err error
+	// 对齐 py v4.28.2 edge_tts_source：WSS_HEADERS["User-Agent"] =
+	// DEFAULT_USER_AGENT（固定 astrbot/<version>，不受 custom_headers 影响）。
+	wsHeaders := http.Header{}
+	wsHeaders.Set("User-Agent", provider.DefaultUserAgent)
 	// Sec-MS-GEC 会随时间窗/版本失效导致握手 403：重新生成后重试一次。
 	for attempt := 0; attempt < 2; attempt++ {
 		var wsURL string
@@ -123,7 +127,7 @@ func (s *EdgeTTSSource) GetAudio(ctx context.Context, text string) (string, erro
 		if err != nil {
 			return "", err
 		}
-		conn, _, err = dialer.DialContext(ctx, wsURL, nil)
+		conn, _, err = dialer.DialContext(ctx, wsURL, wsHeaders)
 		if err == nil {
 			break
 		}

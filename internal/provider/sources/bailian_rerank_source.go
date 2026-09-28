@@ -202,6 +202,12 @@ func (s *BailianRerankSource) Rerank(ctx context.Context, query string, document
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	// 统一请求头（对齐 py bailian_rerank: {**request_headers, **headers}）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

@@ -93,6 +93,12 @@ func (s *GeminiTTSSource) GetAudio(ctx context.Context, text string) (string, er
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", s.apiKey)
+	// 统一请求头（对齐 py gemini_tts: HttpOptions(headers=request_headers)）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

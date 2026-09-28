@@ -25,7 +25,8 @@ type AnthropicSource struct {
 	apiKey       string
 	client       *http.Client
 	streamClient *http.Client
-	// extraHeaders 为 custom_headers 配置，注入每个请求（对齐 py default_headers）。
+	// extraHeaders 为额外注入的请求头（保留给子类使用；custom_headers 统一
+	// 由 BaseProvider.RequestHeaders 处理，对齐 py default_headers 语义）。
 	extraHeaders map[string]string
 	// thinkingConfig 为 anth_thinking_config（对齐 py self.thinking_config）。
 	thinkingConfig map[string]interface{}
@@ -74,13 +75,8 @@ func NewAnthropicSource(config, settings map[string]interface{}) *AnthropicSourc
 			s.streamClient.Transport = tr
 		}
 	}
-	// custom_headers（对齐 py _resolve_custom_headers：非空 dict 生效，值 str 强转）。
-	if ch, ok := config["custom_headers"].(map[string]interface{}); ok && len(ch) > 0 {
-		s.extraHeaders = make(map[string]string, len(ch))
-		for k, v := range ch {
-			s.extraHeaders[k] = fmt.Sprint(v)
-		}
-	}
+	// custom_headers 经 NewBaseProvider 统一构建（默认 astrbot/<version> UA），
+	// 请求组装处通过 s.RequestHeaders() 取用（对齐 py v4.28.2 _resolve_custom_headers）。
 	// anth_thinking_config（对齐 py self.thinking_config）。
 	if tc, ok := config["anth_thinking_config"].(map[string]interface{}); ok {
 		s.thinkingConfig = tc
@@ -114,7 +110,10 @@ func (s *AnthropicSource) doRequest(ctx context.Context, body map[string]interfa
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("x-api-key", s.apiKey)
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
-		// custom_headers 注入（对齐 py AsyncAnthropic(default_headers=...)）。
+		// 统一请求头 + extraHeaders 注入（对齐 py AsyncAnthropic(default_headers=...)）。
+		for k, v := range s.RequestHeaders() {
+			httpReq.Header.Set(k, v)
+		}
 		for k, v := range s.extraHeaders {
 			httpReq.Header.Set(k, v)
 		}
@@ -132,6 +131,13 @@ func (s *AnthropicSource) GetModels(ctx context.Context) ([]string, error) {
 	}
 	req.Header.Set("x-api-key", s.apiKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
+	// 统一请求头（对齐 py SDK 对 models.list 同样携带 default_headers）。
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
+	for k, v := range s.extraHeaders {
+		req.Header.Set(k, v)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err

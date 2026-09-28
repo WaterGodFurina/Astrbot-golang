@@ -27,7 +27,45 @@ const (
 	PermissionEveryone PermissionType = iota
 	PermissionMember
 	PermissionAdmin
+	// PermissionGroupAdmin 对齐 py v4.28.2 PermissionType.GROUP_ADMIN：
+	// 群聊内要求 AstrBot 管理员；私聊放行（py filter 仅在存在 group_id 时
+	// 检查 is_admin，私聊落到末尾的 return True）。
+	PermissionGroupAdmin
+	// PermissionSharedGroupAdmin 对齐 py v4.28.2
+	// PermissionType.SHARED_GROUP_ADMIN：群聊内要求 AstrBot 管理员，或该
+	// 事件已实际应用会话隔离（_session_isolated）；私聊放行。
+	PermissionSharedGroupAdmin
 )
+
+// permissionTypes 对齐 py COMMAND_PERMISSION_TYPES（权限字符串 -> 类型）。
+// 指令管理 API 与持久化配置只接受这四种权限名；"everyone" 不在其中
+// （py update_command_permission 同样拒绝 "everyone"）。
+var permissionTypes = map[string]PermissionType{
+	"admin":              PermissionAdmin,
+	"member":             PermissionMember,
+	"group_admin":        PermissionGroupAdmin,
+	"shared_group_admin": PermissionSharedGroupAdmin,
+}
+
+// ParsePermissionType 将指令管理 API/持久化配置中的权限字符串解析为
+// PermissionType。ok=false 表示不在 COMMAND_PERMISSION_TYPES 中，调用方
+// 应保持现有权限不变（对齐 py 对无效权限直接跳过的语义）。
+func ParsePermissionType(name string) (PermissionType, bool) {
+	t, ok := permissionTypes[name]
+	return t, ok
+}
+
+// permissionTypeName 返回权限类型对应的权限字符串。ok=false 表示该类型
+// 不在 COMMAND_PERMISSION_TYPES 中（对齐 py _determine_permission 对
+// 未注册类型回退 "member" 的行为）。
+func permissionTypeName(t PermissionType) (string, bool) {
+	for name, candidate := range permissionTypes {
+		if candidate == t {
+			return name, true
+		}
+	}
+	return "", false
+}
 
 // FilterContext carries the event and config needed for filter evaluation.
 type FilterContext struct {
@@ -40,6 +78,13 @@ type FilterContext struct {
 	// EventMessageType is the platform message type ("GroupMessage" /
 	// "FriendMessage"), used by EventMessageTypeFilter.
 	EventMessageType string
+	// IsGroup 表示事件来自群聊，对齐 py event.get_group_id() 的真值判断，
+	// 供 GROUP_ADMIN / SHARED_GROUP_ADMIN 等群域权限使用。
+	IsGroup bool
+	// SessionIsolated 表示本事件已实际应用会话隔离，对齐 py
+	// event.get_extra("_session_isolated")。只有渠道真正支持并应用了隔离
+	//（waking_check 写入该 extra）时才为 true。
+	SessionIsolated bool
 }
 
 // CommandFilter matches a single command name.

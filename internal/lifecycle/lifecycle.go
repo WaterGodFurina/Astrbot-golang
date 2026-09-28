@@ -317,10 +317,30 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 			IsAtOrWakeCommand: true,
 			CallLLM:           true,
 		}
-		if l.eventBus != nil {
-			return l.eventBus.Publish(evt)
+		if l.eventBus == nil {
+			return fmt.Errorf("event bus not available")
 		}
-		return fmt.Errorf("event bus not available")
+		// 任务终态回传（对齐 py v4.28.2 5f126201 _woke_main_agent）：给合成
+		// 事件挂上管线完成信号，等待整条管线跑完后再读取 agent 终态错误。
+		// 这样 cron 管理器才能把 runner 终态 ERROR（如 LLM 错误响应）与
+		// agent 构建失败记录成 job status=failed / last_error，而不是发布
+		// 成功即当完成。事件被截断（无调度器）或阶段异常时，dispatch 也会
+		// 写入 core.MetadataAgentTerminalError。
+		done := core.NewPipelineDone()
+		evt.Metadata[core.MetadataPipelineDone] = done
+		if err := l.eventBus.Publish(evt); err != nil {
+			return err
+		}
+		select {
+		case <-done.Done():
+		case <-ctx.Done():
+			// 进程关闭/任务取消：不再继续等待（管理器会跳过关闭期间的失败记录）。
+			return ctx.Err()
+		}
+		if v, ok := evt.GetExtra(core.MetadataAgentTerminalError).(string); ok && v != "" {
+			return fmt.Errorf("Cron agent run ended in ERROR state: %s", v)
+		}
+		return nil
 	})
 	l.cronMgr.SetNextRunFn(cronNextRun)
 	l.cronMgr.Load()

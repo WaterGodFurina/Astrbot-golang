@@ -3,7 +3,7 @@
 [![Go Version](https://img.shields.io/badge/Go-1.26+-blue.svg)](https://golang.org/)
 [![License](https://img.shields.io/badge/License-AstrBot-orange.svg)](https://github.com/WaterGodFurina/Astrbot-golang/blob/main/LICENSE)
 
-> 由 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 迁移而来的 Go 语言实现，**核心功能已验证**，当前移植进度 **97%**。
+> 由 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 迁移而来的 Go 语言实现，**核心功能已验证**，当前以版本同步、兼容性修复和稳定性完善为主。
 
 ---
 
@@ -112,7 +112,7 @@ golang 插件通过[独立 module](github.com/WaterGodFurina/astrbot-go-plugin-s
 
 为兼容 AstrBot 生态，Python 插件通过[独立 module](github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk) 桥接进宿主。
 
-- API 对齐：astrbot.api.* 与 astrbot.core.* 对齐 Python AstrBot v4.27.4
+- API 对齐：astrbot.api.* 与 astrbot.core.* 对齐 Python AstrBot v4.28.2
 - 能力桥接：Context.get_all_stars/get_all_providers 等经宿主 RPC 反向调用；session_waiter 跨进程喂入
 
 #### 自带 Python 解释器
@@ -240,11 +240,11 @@ go test ./... -v
 
 ## 代码规模
 
-- Go 文件：354 个（非测试 226，测试 128，58 个包）
-- 代码行数：约 118,715 行（核心 ~90,746 行 + 测试 ~27,969 行）
+- Go 文件：410 个（非测试 226，测试 128，58 个包）
+- 代码行数：约 14万 行 （含**测试代码**）
 - 平台适配器：18 个
 - Provider 能力：Chat 14 / TTS 9 / STT 2 / Embedding 5 / Rerank 5
-- 对齐版本：Python AstrBot v4.27.4
+- 对齐版本：Python AstrBot v4.28.2
 
 ---
 

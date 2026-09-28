@@ -2009,7 +2009,12 @@ func (s *ProcessStage) registerToolImage(event *core.Event, rawB64, mime, toolNa
 	if compressed := s.compressImageForProvider(path); compressed != path {
 		if cb, err := os.ReadFile(compressed); err == nil {
 			data = cb
-			mime = "image/jpeg" // compressImageForProvider 统一 JPEG 输出（透明压平白底，与 provider 图片通道同语义）。
+			// v4.28.2 图片准备链路按内容决定输出：合规图片透传（可能是
+			// JPEG/PNG/WebP），带 alpha 输出 PNG，其余输出 JPEG。按真实内容
+			// 嗅探 MIME，避免把 PNG 标成 JPEG（对齐 py detect_image_mime_type）。
+			if detected := utils.DetectImageMimeType(cb); detected != "" {
+				mime = detected
+			}
 		}
 	}
 	pending, _ := event.GetExtra(toolImageSinkKey).(*[]pendingToolImage)

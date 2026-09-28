@@ -222,15 +222,45 @@ func (cs *chatStore) appendMessage(id string, msg map[string]interface{}) bool {
 	return false
 }
 
+// chatHistoryDefaultPageSize 是 WebChat 历史的默认分页大小（对齐 Python
+// ChatService.get_session / chat.py Query(default=1000)）。
+const chatHistoryDefaultPageSize = 1000
+
+// chatHistoryMaxPageSize 是 WebChat 历史分页大小的上限（对齐 Python
+// chat.py Query(le=1000) 与 ChatService.get_session 的校验）。
+const chatHistoryMaxPageSize = 1000
+
 // sessionDetail returns the session detail payload for GET /chat/sessions/{id}.
-func (cs *chatStore) sessionDetail(id string) map[string]interface{} {
+// page 从 1 开始且第 1 页为最新消息（对齐 Python platform_message_history_mgr
+// .get：DB 倒序取页后 reverse 回正序）；返回 total/page/page_size/has_more
+// 供前端上滑加载更早历史（对齐 Python get_session 返回的字段）。
+func (cs *chatStore) sessionDetail(id string, page, pageSize int) map[string]interface{} {
 	s := cs.getSession(id)
 	if s == nil {
 		return nil
 	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = chatHistoryDefaultPageSize
+	}
+	if pageSize > chatHistoryMaxPageSize {
+		pageSize = chatHistoryMaxPageSize
+	}
 	cs.mu.Lock()
-	messages := make([]map[string]interface{}, len(s.Messages))
-	copy(messages, s.Messages)
+	total := len(s.Messages)
+	// page 1 = 最新一页：以 total 为锚点向前取窗口 [start,end)。
+	end := total - (page-1)*pageSize
+	if end < 0 {
+		end = 0
+	}
+	start := end - pageSize
+	if start < 0 {
+		start = 0
+	}
+	messages := make([]map[string]interface{}, 0, end-start)
+	messages = append(messages, s.Messages[start:end]...)
 	cs.mu.Unlock()
 	return map[string]interface{}{
 		"session_id":  s.SessionID,
@@ -238,7 +268,51 @@ func (cs *chatStore) sessionDetail(id string) map[string]interface{} {
 		"threads":     []interface{}{},
 		"project":     nil,
 		"active_runs": []interface{}{},
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
+		"has_more":    start > 0,
 	}
+}
+
+// sessionTitle 返回会话的展示标题（DisplayName），会话不存在时返回空串。
+// 供对话历史 WebChat 标题回退使用（对齐 Python platform session display_name）。
+func (cs *chatStore) sessionTitle(id string) string {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for _, s := range cs.data.Sessions {
+		if s.SessionID == id {
+			return s.DisplayName
+		}
+	}
+	return ""
+}
+
+// maxWebchatTitleMatches 限制标题匹配返回的会话数：结果会在对话搜索里展开
+// 为 SQL LIKE 参数，需要封顶避免变量数过多。
+const maxWebchatTitleMatches = 200
+
+// sessionIDsByTitle 返回 DisplayName 包含 keyword 的会话 ID 列表（大小写
+// 不敏感，对齐 SQLite LIKE 的 ASCII 大小写不敏感语义；空 keyword 返回 nil）。
+// 供对话搜索匹配 WebChat 会话标题（对齐 Python _webchat_session_title_match）。
+func (cs *chatStore) sessionIDsByTitle(keyword string) []string {
+	keyword = strings.TrimSpace(keyword)
+	if keyword == "" {
+		return nil
+	}
+	lower := strings.ToLower(keyword)
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	var ids []string
+	for _, s := range cs.data.Sessions {
+		if strings.Contains(strings.ToLower(s.DisplayName), lower) {
+			ids = append(ids, s.SessionID)
+			if len(ids) >= maxWebchatTitleMatches {
+				break
+			}
+		}
+	}
+	return ids
 }
 
 // findMessage returns the index of a session message by id.

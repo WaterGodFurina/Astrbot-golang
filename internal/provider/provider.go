@@ -77,6 +77,10 @@ type BaseProvider struct {
 	providerConfig   map[string]interface{}
 	providerSettings map[string]interface{}
 	capability       ProviderCapabilityType
+	// requestHeaders 是统一请求头（默认 astrbot/<version> User-Agent，
+	// custom_headers 可覆盖），对齐 py AbstractProvider.request_headers。
+	// 构造后只读，RequestHeaders 返回副本。
+	requestHeaders map[string]string
 }
 
 // SetCapability records the provider capability reported by Meta(). Defaults
@@ -136,6 +140,18 @@ func (b *BaseProvider) Settings() map[string]interface{} {
 	return b.providerSettings
 }
 
+// RequestHeaders 返回统一请求头的副本（默认 astrbot/<version> User-Agent，
+// custom_headers 覆盖；对齐 py AbstractProvider.request_headers）。
+func (b *BaseProvider) RequestHeaders() map[string]string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make(map[string]string, len(b.requestHeaders))
+	for k, v := range b.requestHeaders {
+		out[k] = v
+	}
+	return out
+}
+
 // Meta returns provider metadata.
 func (b *BaseProvider) Meta() ProviderMeta {
 	id, _ := b.providerConfig["id"].(string)
@@ -169,6 +185,7 @@ func NewBaseProvider(config, settings map[string]interface{}) *BaseProvider {
 		modelName:        model,
 		providerConfig:   config,
 		providerSettings: settings,
+		requestHeaders:   BuildProviderHeaders(customHeadersFromConfig(config)),
 	}
 }
 

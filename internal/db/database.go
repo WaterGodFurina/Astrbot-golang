@@ -544,13 +544,37 @@ type ConversationFilter struct {
 	ExcludeIDs       []string // user_id NOT LIKE '<id>%'
 	ExcludePlatforms []string // platform_id NOT IN (...)
 	// 对齐 Python v4.28.0：keyword_query 对 title/content ilike（content 还要 JSON 转义后的形式）；umo_query 对 user_id ilike；sort_by/sort_order 控制 排序；group_by_session 按 user_id 分组分页。
-	KeywordQuery   string
-	UmoQuery       string
-	SortBy         string // created_at / updated_at
-	SortOrder      string // asc / desc
-	GroupBySession bool
-	Page           int
-	PageSize       int
+	KeywordQuery string
+	UmoQuery     string
+	SortBy       string // created_at / updated_at
+	SortOrder    string // asc / desc
+	// SearchWebchatSessionIDs / KeywordWebchatSessionIDs 是调用方（dashboard）
+	// 从 WebChat 会话（JSON chatStore）按标题预匹配出的 session_id 列表：
+	// conversations 行不带标题，Python 用 PlatformSession 的 EXISTS +
+	// user_id LIKE '%!<session_id>' 匹配，Go 无平台会话表，改由调用方先查
+	// chatStore 再把命中的会话 id 传进来，用同样的 user_id LIKE 条件参与
+	// search/keyword 的 OR。
+	SearchWebchatSessionIDs  []string
+	KeywordWebchatSessionIDs []string
+	GroupBySession           bool
+	Page                     int
+	PageSize                 int
+}
+
+// webchatTitleLikeConds 生成 WebChat 会话标题匹配的 OR 子条件：conversations
+// 的 user_id 形如 platform:message_type:<session_key>，session_key 以
+// '!<session_id>' 结尾（对齐 Python _webchat_session_title_match 的
+// user_id LIKE '%!<session_id>'）。命中的 LIKE 参数追加到 args。
+func webchatTitleLikeConds(sessionIDs []string, args *[]interface{}) []string {
+	conds := make([]string, 0, len(sessionIDs))
+	for _, sid := range sessionIDs {
+		if sid == "" {
+			continue
+		}
+		conds = append(conds, "user_id LIKE ?")
+		*args = append(*args, "%!"+sid)
+	}
+	return conds
 }
 
 // GetFilteredConversations returns a filtered, paginated conversation list plus the total count matching the filter.
@@ -582,10 +606,14 @@ func (d *Database) GetFilteredConversations(f ConversationFilter) ([]Conversatio
 	}
 	if s := strings.TrimSpace(f.Search); s != "" {
 		like := "%" + s + "%"
-		where = append(where, "(title LIKE ? OR user_id LIKE ? OR conversation_id LIKE ? OR content LIKE ?)")
+		conds := []string{"title LIKE ?", "user_id LIKE ?", "conversation_id LIKE ?", "content LIKE ?"}
 		for i := 0; i < 4; i++ {
 			args = append(args, like)
 		}
+		// WebChat 标题回退搜索（对齐 Python search_query 分支里的
+		// _webchat_session_title_match，作为同一 OR 的额外条件）。
+		conds = append(conds, webchatTitleLikeConds(f.SearchWebchatSessionIDs, &args)...)
+		where = append(where, "("+strings.Join(conds, " OR ")+")")
 	}
 	for _, ex := range f.ExcludeIDs {
 		if ex == "" {
@@ -601,10 +629,14 @@ func (d *Database) GetFilteredConversations(f ConversationFilter) ([]Conversatio
 	if kw := strings.TrimSpace(f.KeywordQuery); kw != "" {
 		escaped, _ := json.Marshal(kw)
 		escapedString := string(escaped[1 : len(escaped)-1]) // 去掉首尾双引号
-		where = append(where, "(title LIKE ? OR content LIKE ? OR content LIKE ?)")
+		conds := []string{"title LIKE ?", "content LIKE ?", "content LIKE ?"}
 		whereLike := "%" + kw + "%"
 		whereEscapedLike := "%" + escapedString + "%"
 		args = append(args, whereLike, whereLike, whereEscapedLike)
+		// WebChat 标题回退搜索（对齐 Python keyword_query 分支里的
+		// _webchat_session_title_match）。
+		conds = append(conds, webchatTitleLikeConds(f.KeywordWebchatSessionIDs, &args)...)
+		where = append(where, "("+strings.Join(conds, " OR ")+")")
 	}
 	// umo_query：user_id ilike
 	if uq := strings.TrimSpace(f.UmoQuery); uq != "" {
@@ -859,6 +891,10 @@ type CronJobRow struct {
 	RunOnce        bool
 	Status         string
 	NextRunTime    string
+	// LastRunAt/LastError 为最近一次执行终态（对齐 py _run_job 写入的
+	// last_run_at / last_error，cron_jobs 已有对应列）。
+	LastRunAt string
+	LastError string
 }
 
 // CreateCronJob inserts a new cron job.
@@ -876,7 +912,7 @@ func (d *Database) CreateCronJob(jobID, name, description, jobType, cronExpr, ti
 // ListCronJobs returns all cron jobs ordered by created_at.
 func (d *Database) ListCronJobs() ([]CronJobRow, error) {
 	rows, err := d.db.Query(
-		`SELECT job_id, name, description, job_type, cron_expression, timezone, payload, enabled, persistent, run_once, status, next_run_time
+		`SELECT job_id, name, description, job_type, cron_expression, timezone, payload, enabled, persistent, run_once, status, next_run_time, COALESCE(last_run_at, ''), COALESCE(last_error, '')
 		 FROM cron_jobs ORDER BY id ASC`)
 	if err != nil {
 		return nil, err
@@ -886,7 +922,7 @@ func (d *Database) ListCronJobs() ([]CronJobRow, error) {
 	for rows.Next() {
 		var row CronJobRow
 		var enabled, persistent, runOnce int
-		if err := rows.Scan(&row.JobID, &row.Name, &row.Description, &row.JobType, &row.CronExpression, &row.Timezone, &row.Payload, &enabled, &persistent, &runOnce, &row.Status, &row.NextRunTime); err != nil {
+		if err := rows.Scan(&row.JobID, &row.Name, &row.Description, &row.JobType, &row.CronExpression, &row.Timezone, &row.Payload, &enabled, &persistent, &runOnce, &row.Status, &row.NextRunTime, &row.LastRunAt, &row.LastError); err != nil {
 			return nil, err
 		}
 		row.Enabled = enabled != 0
@@ -902,9 +938,9 @@ func (d *Database) GetCronJob(jobID string) (CronJobRow, bool, error) {
 	var row CronJobRow
 	var enabled, persistent, runOnce int
 	err := d.db.QueryRow(
-		`SELECT job_id, name, description, job_type, cron_expression, timezone, payload, enabled, persistent, run_once, status, next_run_time
+		`SELECT job_id, name, description, job_type, cron_expression, timezone, payload, enabled, persistent, run_once, status, next_run_time, COALESCE(last_run_at, ''), COALESCE(last_error, '')
 		 FROM cron_jobs WHERE job_id = ?`, jobID,
-	).Scan(&row.JobID, &row.Name, &row.Description, &row.JobType, &row.CronExpression, &row.Timezone, &row.Payload, &enabled, &persistent, &runOnce, &row.Status, &row.NextRunTime)
+	).Scan(&row.JobID, &row.Name, &row.Description, &row.JobType, &row.CronExpression, &row.Timezone, &row.Payload, &enabled, &persistent, &runOnce, &row.Status, &row.NextRunTime, &row.LastRunAt, &row.LastError)
 	if err == sql.ErrNoRows {
 		return row, false, nil
 	}
@@ -930,6 +966,9 @@ var cronJobWritableFields = map[string]bool{
 	"enabled":         true,
 	"run_once":        true,
 	"next_run_time":   true,
+	// last_run_at/last_error：记录最近一次执行终态（对齐 py _run_job）。
+	"last_run_at": true,
+	"last_error":  true,
 }
 
 // UpdateCronJob patches a cron job's mutable fields.

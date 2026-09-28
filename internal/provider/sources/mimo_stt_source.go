@@ -111,6 +111,11 @@ func (s *MiMoSTTApiSource) GetText(ctx context.Context, audioURL string) (string
 			req.Header.Set(k, v)
 		}
 	}
+	// 统一请求头（对齐 py mimo_stt: {**build_headers(...), **request_headers}，
+	// request_headers 后合并）。
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

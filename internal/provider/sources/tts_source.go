@@ -74,6 +74,12 @@ func (s *OpenAITTSSource) GetAudio(ctx context.Context, text string) (string, er
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		// 统一请求头（对齐 py openai_tts: default_headers=request_headers）。
+		for k, v := range s.RequestHeaders() {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
 		return req, nil
 	}, cfg, "TTS-OpenAI")
 	if err != nil {
@@ -124,6 +130,11 @@ func (s *OpenAITTSSource) Test(ctx context.Context) error {
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		for k, v := range s.RequestHeaders() {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
 		return req, nil
 	}, cfg, "TTS-OpenAI")
 	if err != nil {

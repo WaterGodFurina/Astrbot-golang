@@ -66,6 +66,12 @@ func (s *FishAudioTTSSource) lookupReferenceID(ctx context.Context) (string, err
 		}
 		req.Header.Set("Authorization", "Bearer "+s.apiKey)
 		req.Header.Set("model", s.GetModel())
+		// 统一请求头（对齐 py fishaudio_tts: headers = {**request_headers, ...}）。
+		for k, v := range s.RequestHeaders() {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
 		q := req.URL.Query()
 		q.Set("title", s.character)
 		q.Set("sort_by", sortBy)
@@ -169,6 +175,11 @@ func (s *FishAudioTTSSource) GetAudio(ctx context.Context, text string) (string,
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("model", s.GetModel())
 	req.Header.Set("Content-Type", "application/msgpack")
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

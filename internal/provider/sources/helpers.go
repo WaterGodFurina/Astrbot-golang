@@ -80,6 +80,21 @@ func cloneMap(m map[string]interface{}) map[string]interface{} {
 	return out
 }
 
+// resolveOpenAIAPIBase 解析 OpenAI 兼容 provider 的 api_base：配置值优先，
+// 为空时按 py 的 AsyncOpenAI(base_url=... or None) 端点解析顺序回退到环境变量
+// OPENAI_BASE_URL，最后落到官方默认地址（对齐 py 7ee03f22）。xiaomi/longcat
+// 等子类会先预填 api_base 默认值，因此不会走到 env 回退，与 py 子类一致。
+func resolveOpenAIAPIBase(config map[string]interface{}, key string) string {
+	base := configString(config, key, "")
+	if base == "" {
+		base = os.Getenv("OPENAI_BASE_URL")
+	}
+	if base == "" {
+		base = "https://api.openai.com/v1"
+	}
+	return base
+}
+
 // configInt returns the int value of key, or the fallback when absent.
 func configInt(config map[string]interface{}, key string, fallback int) int {
 	switch v := config[key].(type) {

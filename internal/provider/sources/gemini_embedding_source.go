@@ -87,6 +87,12 @@ func (s *GeminiEmbeddingSource) GetEmbedding(ctx context.Context, text string) (
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", s.apiKey)
+	// 统一请求头（对齐 py gemini_embedding: HttpOptions(headers=request_headers)）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -144,6 +150,12 @@ func (s *GeminiEmbeddingSource) GetEmbeddings(ctx context.Context, texts []strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-goog-api-key", s.apiKey)
+	// 统一请求头（对齐 py gemini_embedding: HttpOptions(headers=request_headers)）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

@@ -76,6 +76,12 @@ func (s *VLLMRerankSource) Rerank(ctx context.Context, query string, documents [
 	if s.authKey != "" {
 		req.Header.Set("Authorization", "Bearer "+s.authKey)
 	}
+	// 统一请求头（对齐 py vllm_rerank: h = request_headers.copy() 后补 Authorization）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

@@ -132,6 +132,12 @@ func (s *ElevenLabsTTSSource) GetAudio(ctx context.Context, text string) (string
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("xi-api-key", s.apiKey)
+	// 统一请求头（对齐 py elevenlabs: AsyncClient(headers=request_headers)）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 	q := req.URL.Query()
 	q.Set("output_format", s.outputFormat)
 	req.URL.RawQuery = q.Encode()

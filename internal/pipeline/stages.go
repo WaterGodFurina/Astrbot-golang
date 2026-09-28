@@ -229,9 +229,14 @@ func (s *WakingCheckStage) Process(ctx context.Context, event *core.Event) (*Sta
 	}
 
 	// Apply unique session: in group chats each member gets an isolated conversation id (ported from build_unique_session_id).
+	// _session_isolated 对齐 py v4.28.2 waking_check/stage.py：先无条件置 false
+	// （清除上一轮/调用方残留的标记），只有渠道真正应用了隔离才置 true。该标记
+	// 供 SHARED_GROUP_ADMIN 权限判断「隔离是否实际生效」。
+	event.SetExtra("_session_isolated", false)
 	if s.uniqueSession && event.Source.IsGroup {
 		if sid := buildUniqueSessionID(event.Source.Platform, event.Source.SenderID, event.Source.ConvID); sid != "" {
 			event.Source.ConvID = sid
+			event.SetExtra("_session_isolated", true)
 			logger.Debug("WakingCheck: unique session applied, conv=%s", sid)
 		}
 	}
@@ -824,6 +829,12 @@ func (s *PreProcessStage) Process(ctx context.Context, event *core.Event) (*Stag
 		if img, ok := comp.(*message.Image); ok {
 			normalizeImagePath(img)
 			event.Message.Chain[i] = img
+			// 附件引用会跨事件存活，模型副本才归事件所有：原图路径从事件临时
+			// 文件清单中移除（对齐 py preprocess_stage v4.28.2 对
+			// convert_to_file_path 结果调用 untrack_temporary_local_file）。
+			if img.File != "" {
+				event.UntrackTemporaryFile(img.File)
+			}
 		}
 	}
 
@@ -932,6 +943,7 @@ func (s *PreProcessStage) sttRecord(event *core.Event, rec *message.Record) (str
 type ProcessStage struct {
 	pluginMgr     *star.Manager
 	convMgr       *conversation.Manager
+	providerMgr   *provider.ProviderManager
 	config        map[string]interface{}
 	personaPrompt func(umo, personaID string) string
 	personaSkills func(personaID string) []string
@@ -1003,6 +1015,7 @@ func (s *ProcessStage) Name() string { return "process" }
 func (s *ProcessStage) Initialize(ctx *PipelineContext) error {
 	s.pluginMgr = ctx.PluginManager
 	s.convMgr = ctx.ConvManager
+	s.providerMgr = ctx.ProviderManager
 	s.config = ctx.AstrbotConfig
 	s.skillMgr = ctx.SkillManager
 	s.platformMgr = ctx.PlatformMgr
@@ -1201,9 +1214,12 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 				event.Result = nil
 			} else {
 				logger.Error("LLM agent call failed: %v", err)
-				event.Result = &message.MessageEventResult{}
-				// 对外脱敏：错误原文只进日志，避免向用户泄露内部实现细节（D-low-8）。
-				event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败，请稍后重试"}}
+				// 失败回复可能已由 callLLMAgent 内部写入（含更具体的文案），
+				// 仅在尚未写入时补一个对外脱敏的通用失败回复（D-low-8）。
+				if event.Result == nil {
+					event.Result = &message.MessageEventResult{}
+					event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败，请稍后重试"}}
+				}
 			}
 		}
 	}
@@ -1237,12 +1253,17 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 			continue
 		}
 		// Build filter context from event
+		// SessionIsolated 对齐 py event.get_extra("_session_isolated")：
+		// 仅当 waking_check 实际应用了会话隔离时才为 true。
+		sessionIsolated, _ := event.GetExtra("_session_isolated").(bool)
 		fctx := &star.FilterContext{
-			MessageStr:    event.MessageStr,
-			IsAtOrWake:    event.IsAtOrWakeCommand,
-			EventSenderID: event.Source.SenderID,
-			EventPlatform: event.Source.Platform,
-			EventRole:     event.Role,
+			MessageStr:      event.MessageStr,
+			IsAtOrWake:      event.IsAtOrWakeCommand,
+			EventSenderID:   event.Source.SenderID,
+			EventPlatform:   event.Source.Platform,
+			EventRole:       event.Role,
+			IsGroup:         event.Source.IsGroup,
+			SessionIsolated: sessionIsolated,
 		}
 		// All non-permission filters must pass (AND); a failing permission filter marks the event as permission-denied.
 		passed := true
@@ -1382,8 +1403,15 @@ type agentRequest struct {
 	req                *provider.ProviderRequest
 	computerUseRuntime string
 	streaming          bool
-	// cleanup removes image-compress temp files once the whole request completes; nil when there is nothing to clean up.
-	cleanup func()
+	// showReasoning 控制本轮 LLM 推理内容的展示（流式逐块显示 + 非流式由
+	// ResultDecorateStage 前置注入）。默认取 provider_settings.display_reasoning_text，
+	// webchat 请求级 enable_reasoning extra 优先覆盖（对齐 py internal.py）。
+	showReasoning bool
+	// fallbackChatInsts/fallbackProviderCfgs 为主动 agent（cron/后台任务唤醒）
+	// 的会话模型降级候选（对齐 py f2ead292 fallback_provider_ids），主模型
+	// 请求失败或返回 role=err 时依次尝试。普通 chat 为空。
+	fallbackChatInsts    []provider.ChatProvider
+	fallbackProviderCfgs []map[string]interface{}
 }
 
 // callLLMAgent invokes the LLM provider and sets the result. It is a thin orchestrator: prepareAgentRequest resolves the persona/provider and assembles the request, runAgentToolLoop drives the chat + tool-call rounds, and finalizeAgentReply persists the reply and flushes the stream.
@@ -1395,24 +1423,42 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 		}
 	}
 
-	ar, err := s.prepareAgentRequest(event)
-	if err != nil || ar == nil {
-		// A failure reply was already written to event.Result, a plugin hook stopped the call, or the prompt was empty.
-		return nil
+	ar, err := s.prepareAgentRequest(ctx, event)
+	if err != nil {
+		// A failure reply was already written to event.Result. 对齐 py
+		// 5f126201：agent 构建失败是主动任务的终态失败，记录到事件上供
+		// cron 结果回传读取。
+		s.markAgentTerminalError(event, err)
+		return err
 	}
-	if ar.cleanup != nil {
-		defer ar.cleanup()
+	if ar == nil {
+		// A plugin hook stopped the call, or the prompt was empty.
+		return nil
 	}
 
 	streamer := newStreamSender(s, event)
 	defer streamer.flush()
 
-	resp, ok := s.runAgentToolLoop(ctx, ar, streamer)
-	if !ok {
-		return nil
+	resp, err := s.runAgentToolLoop(ctx, ar, streamer)
+	if err != nil {
+		// A failure reply was already written to event.Result; 对齐 py
+		// runner 终态 ERROR：记录终态错误后返回，发布方（cron）据此记 failed。
+		s.markAgentTerminalError(event, err)
+		return err
 	}
 	s.finalizeAgentReply(ar, resp, streamer)
 	return nil
+}
+
+// markAgentTerminalError 记录一次 agent 调用的终态失败（对齐 py v4.28.2
+// 5f126201：build_main_agent 失败 / runner.state == AgentState.ERROR）。
+// cron 等主动任务发布方在管线完成后读取 core.MetadataAgentTerminalError
+// 判定任务失败；普通平台消息事件同样会被记录，但无人消费，无副作用。
+func (s *ProcessStage) markAgentTerminalError(event *core.Event, err error) {
+	if event == nil || err == nil {
+		return
+	}
+	event.SetExtra(core.MetadataAgentTerminalError, err.Error())
 }
 
 // cronWokeSystemPrompt mirrors Python's PROACTIVE_AGENT_CRON_WOKE_SYSTEM_PROMPT
@@ -1591,7 +1637,7 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 }
 
 // prepareAgentRequest resolves the persona/provider for the event (via resolveAgentContext), assembles the ProviderRequest, creates the chat provider instance, and injects the tool schemas / streaming flags. Return conventions match resolveAgentContext: (nil, nil) = already finished, (nil, err) = failure reply written to event.Result.
-func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, error) {
+func (s *ProcessStage) prepareAgentRequest(ctx context.Context, event *core.Event) (*agentRequest, error) {
 	ar, err := s.resolveAgentContext(event)
 	if err != nil || ar == nil {
 		return nil, err
@@ -1600,6 +1646,10 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 	prompt, systemPrompt := ar.prompt, ar.systemPrompt
 
 	imageURLs, audioURLs := collectMediaURLs(event)
+	// 引用/转发图片并入当前请求（对齐 py collect_initial_request 的 quoted
+	// message attachments 分支），随后统一走 prepare_request_images。
+	imageURLs = append(imageURLs, collectQuotedImageURLs(event)...)
+	imageURLs = normalizeAndDedupeStrings(imageURLs)
 	req := &provider.ProviderRequest{
 		Prompt:       prompt,
 		SessionID:    event.UnifiedMsgOrigin(),
@@ -1622,29 +1672,6 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 	if s.providerConf != nil && s.providerConf.SanitizeContextByModalities {
 		if mods := providerModalities(providerCfg); len(mods) > 0 {
 			req.Contexts = sanitizeContextByModalities(req.Contexts, mods)
-		}
-	}
-
-	// Image compression for the provider (provider_settings.image_compress_*).
-	if len(req.ImageURLs) > 0 {
-		compressed := make([]string, 0, len(req.ImageURLs))
-		for _, u := range req.ImageURLs {
-			compressed = append(compressed, s.compressImageForProvider(u))
-		}
-		req.ImageURLs = compressed
-		// Temp files created by compressImageForProvider are consumed by the provider during chatRound; the orchestrator removes them once the whole request completes.
-		tempFiles := []string{}
-		for _, p := range compressed {
-			if isCompressTempFile(p) {
-				tempFiles = append(tempFiles, p)
-			}
-		}
-		if len(tempFiles) > 0 {
-			ar.cleanup = func() {
-				for _, p := range tempFiles {
-					os.Remove(p)
-				}
-			}
 		}
 	}
 
@@ -1683,6 +1710,16 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 	}
 	ar.chatInst = chatInst
 
+	// 主动 agent（cron / 后台任务唤醒）的会话模型降级：只对 proactive 合成
+	// 事件读取 agent_runner.config.model.fallback_provider_ids 并填充请求
+	// （对齐 py f2ead292；普通 chat 在 py 中不传该配置）。见 buildFallbackChatProviders。
+	if isProactiveAgentEvent(event) {
+		req.FallbackProviderIDs = agentRunnerFallbackProviderIDs(s.config)
+	}
+	if len(req.FallbackProviderIDs) > 0 {
+		s.buildFallbackChatProviders(ar, req)
+	}
+
 	// Inject active tools (built-in + MCP servers) so the model can call them. skills_like mode sends light schemas (name/description only) to save tokens; arguments are re-queried once a tool is selected.
 	if s.toolSchemaMode == "skills_like" {
 		req.Tools = s.collectLightTools(ar.computerUseRuntime, event.UnifiedMsgOrigin())
@@ -1715,11 +1752,28 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 	if s.providerConf != nil {
 		streamingEnabled = s.providerConf.StreamingResponse
 	}
+	// webchat 请求级 enable_streaming extra 优先覆盖全局 streaming_response
+	// （对齐 py internal.py:166-168：extra is not None 时 bool(extra) 生效）。
+	if v, ok := event.GetExtra("enable_streaming").(bool); ok {
+		streamingEnabled = v
+	}
 	// unsupported_streaming_strategy=turn_off disables streaming entirely.
 	if streamingEnabled && s.unsupportedStreamingStrategyIsTurnOff() {
 		streamingEnabled = false
 	}
 	ar.streaming = streamingEnabled
+
+	// 推理内容展示开关（对齐 py internal.py）：provider_settings.display_reasoning_text
+	// 为默认值，webchat 请求级 enable_reasoning extra 显式传入时优先覆盖
+	// （webchat 默认 true，见 request_flags）。
+	showReasoning := false
+	if s.providerConf != nil {
+		showReasoning = s.providerConf.DisplayReasoningText
+	}
+	if v, ok := event.GetExtra("enable_reasoning").(bool); ok {
+		showReasoning = v
+	}
+	ar.showReasoning = showReasoning
 
 	// System context reminder (identifier / group name / datetime), appended as an extra user-content part like Python's astr_main_agent.
 	if reminder := s.buildSystemReminder(event); reminder != "" {
@@ -1728,6 +1782,19 @@ func (s *ProcessStage) prepareAgentRequest(event *core.Event) (*agentRequest, er
 			"type": "text",
 			"text": reminder,
 		})
+	}
+
+	// 模型输入图片准备（provider_settings.image_compress_*）：
+	// 覆盖 req.ImageURLs + extra 图片块（含引用/转发图片并入的条目），产出
+	// 文件归属事件、事件结束统一清理（对齐 py v4.28.2 prepare_request_images）。
+	// 放在 system_reminder 之后，保证占位判定能看到全部 extra 文本块。
+	if err := s.prepareRequestImages(ctx, event, req); err != nil {
+		// 非可恢复错误（资源耗尽等）向上传播，同时给出对外脱敏的失败回复
+		// （对齐 py internal.py 外层 except 的 LLM 错误消息发送）。
+		logger.Error("模型图片准备失败: %v", err)
+		event.Result = &message.MessageEventResult{}
+		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 图片处理失败，请稍后重试"}}
+		return nil, err
 	}
 
 	ar.req = req
@@ -1844,8 +1911,8 @@ func downloadFileAttachment(c *message.File) string {
 	return dst
 }
 
-// runAgentToolLoop issues the initial chat round, executes the requested tools (up to provider_settings.max_agent_step rounds) and runs the follow-up rounds with the tool results. It returns ok=false when a failure reply was already written to event.Result (or the provider reported an error role), in which case the caller must not finalize the reply.
-func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, streamer *streamSender) (*provider.LLMResponse, bool) {
+// runAgentToolLoop issues the initial chat round, executes the requested tools (up to provider_settings.max_agent_step rounds) and runs the follow-up rounds with the tool results. It returns a non-nil error when a failure reply was already written to event.Result (or the provider reported an error role), in which case the caller must not finalize the reply.
+func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, streamer *streamSender) (*provider.LLMResponse, error) {
 	event := ar.event
 	req := ar.req
 
@@ -1864,16 +1931,16 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 		logger.Warn("Skipping LLM request because no messages remain after agent/request hooks and context processing.")
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "No messages remain for the LLM request."}}
-		return nil, false
+		return nil, errors.New("no messages remain for the LLM request")
 	}
 
-	resp, err := s.chatRound(llmCtx, ar.chatInst, req, ar.streaming, streamer)
+	resp, err := s.chatRoundWithFallback(llmCtx, ar, req, streamer)
 	if err != nil {
 		logger.Error("LLM call failed: %v", err)
 		event.Result = &message.MessageEventResult{}
 		// 对外脱敏：错误原文只进日志（D-low-8）。
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败，请稍后重试"}}
-		return nil, false
+		return nil, err
 	}
 	s.recordProviderCall(ar.providerCfg, event.UnifiedMsgOrigin(), resp)
 	// skills_like: the main request carried no tool parameters. When the model chose tools, re-query once with the chosen tools' full parameter schemas (minimal context) so the LLM produces proper arguments.
@@ -1988,14 +2055,14 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 		// Follow-up request with tool results. Each round gets its own timeout so one slow round does not exhaust the whole tool-loop budget.
 		req.Contexts = messages
 		roundCtx, roundCancel := context.WithTimeout(llmCtx, 120*time.Second)
-		resp, err = s.chatRound(roundCtx, ar.chatInst, req, ar.streaming, streamer)
+		resp, err = s.chatRoundWithFallback(roundCtx, ar, req, streamer)
 		roundCancel()
 		if err != nil {
 			logger.Error("LLM tool-loop call failed: %v", err)
 			event.Result = &message.MessageEventResult{}
 			// 对外脱敏：错误原文只进日志（D-low-8）。
 			event.Result.Chain = []message.Component{&message.Plain{Text: "😕 LLM 调用失败，请稍后重试"}}
-			return nil, false
+			return nil, err
 		}
 		s.recordProviderCall(ar.providerCfg, event.UnifiedMsgOrigin(), resp)
 	}
@@ -2003,9 +2070,231 @@ func (s *ProcessStage) runAgentToolLoop(ctx context.Context, ar *agentRequest, s
 	if resp.Role == "err" {
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 " + resp.CompletionText}}
-		return nil, false
+		// 对齐 py tool_loop_agent_runner:898：LLM 响应 role=err 时 runner
+		// 转入 AgentState.ERROR，属于终态失败（#9987）。
+		return nil, fmt.Errorf("LLM response error: %s", resp.CompletionText)
 	}
-	return resp, true
+	return resp, nil
+}
+
+// chatRoundWithFallback 对齐 py _iter_llm_responses_with_fallback：按
+// [主模型, ...降级模型] 顺序尝试单轮请求。候选请求报错或返回 role=err 时
+// 切换到下一个候选并告警；最后一个候选的结果/错误原样返回。已经产生流式
+// 输出后不再切换（避免同一回复被拆到多个模型重复输出；py 在异常路径仍会
+// 继续切换，这里取更安全的语义）。切换成功后把 ar.chatInst/providerCfg
+// 更新为命中的候选，后续工具轮沿用。
+func (s *ProcessStage) chatRoundWithFallback(ctx context.Context, ar *agentRequest, req *provider.ProviderRequest, streamer *streamSender) (*provider.LLMResponse, error) {
+	insts := make([]provider.ChatProvider, 0, 1+len(ar.fallbackChatInsts))
+	insts = append(insts, ar.chatInst)
+	insts = append(insts, ar.fallbackChatInsts...)
+	cfgs := make([]map[string]interface{}, 0, 1+len(ar.fallbackProviderCfgs))
+	cfgs = append(cfgs, ar.providerCfg)
+	cfgs = append(cfgs, ar.fallbackProviderCfgs...)
+
+	var lastResp *provider.LLMResponse
+	var lastErr error
+	for i, inst := range insts {
+		if i > 0 {
+			logger.I18nWarn("会话模型 %s 请求失败，已切换降级会话模型: %s", providerCfgLabel(cfgs[0]), providerCfgLabel(cfgs[i]))
+		}
+		resp, err := s.chatRound(ctx, inst, req, ar.streaming, ar.showReasoning, streamer)
+		lastResp, lastErr = resp, err
+		if err == nil && resp != nil && resp.Role != "err" {
+			if i > 0 {
+				ar.chatInst = inst
+				ar.providerCfg = cfgs[i]
+				ar.fallbackChatInsts = insts[i+1:]
+				ar.fallbackProviderCfgs = cfgs[i+1:]
+			}
+			return resp, nil
+		}
+		if streamer != nil && streamer.sentAny() {
+			// 已有流式输出：不再切换，直接返回本次结果，交由原失败路径处理。
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		}
+		if i < len(insts)-1 {
+			if err != nil {
+				// 对齐 py：候选请求异常时记录原因并尝试下一个候选。
+				logger.I18nWarn("降级会话模型 %s 请求失败，尝试下一个候选: %v", providerCfgLabel(cfgs[i]), err)
+			} else if resp != nil {
+				logger.I18nWarn("降级会话模型 %s 返回错误响应，尝试下一个候选: %s", providerCfgLabel(cfgs[i]), resp.CompletionText)
+			}
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return lastResp, nil
+}
+
+// providerCfgLabel 返回 provider 配置的可读标识（id 优先，回退 model）。
+func providerCfgLabel(cfg map[string]interface{}) string {
+	if id, _ := cfg["id"].(string); id != "" {
+		return id
+	}
+	if model, _ := cfg["model"].(string); model != "" {
+		return model
+	}
+	return "<unknown>"
+}
+
+// isProactiveAgentEvent 报告事件是否为主动 agent 唤醒的合成事件（cron
+// active_agent 任务 / 后台任务结果，均带 Metadata proactive=true）。
+func isProactiveAgentEvent(event *core.Event) bool {
+	if event == nil {
+		return false
+	}
+	v, _ := event.GetExtra("proactive").(bool)
+	return v
+}
+
+// agentRunnerFallbackProviderIDs 读取
+// agent_runner.config.model.fallback_provider_ids（对齐 py
+// astrbot/core/config/agent_runner.py:11 默认 []；非列表时忽略并告警）。
+func agentRunnerFallbackProviderIDs(cfg map[string]interface{}) []string {
+	ar, _ := cfg["agent_runner"].(map[string]interface{})
+	if ar == nil {
+		return nil
+	}
+	arCfg, _ := ar["config"].(map[string]interface{})
+	if arCfg == nil {
+		return nil
+	}
+	model, _ := arCfg["model"].(map[string]interface{})
+	if model == nil {
+		return nil
+	}
+	raw, ok := model["fallback_provider_ids"]
+	if !ok || raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []string:
+		out := make([]string, 0, len(v))
+		for _, s := range v {
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		logger.I18nWarn("agent_runner.config.model.fallback_provider_ids 不是列表，已忽略降级模型配置")
+		return nil
+	}
+}
+
+// buildFallbackChatProviders 解析并实例化主动 agent 的降级会话模型（对齐
+// py _get_fallback_chat_providers + _select_image_chat_provider）：
+//   - 去重（含主 provider）；找不到 / 缺 type / 初始化失败 / 非 chat 的候选
+//     记录告警后跳过；
+//   - 请求携带图片而主模型不支持 image 模态时，切换到首个支持图片的降级
+//     模型（主模型会被移出候选列表，避免重复尝试）。
+func (s *ProcessStage) buildFallbackChatProviders(ar *agentRequest, req *provider.ProviderRequest) {
+	primaryID, _ := ar.providerCfg["id"].(string)
+	seen := map[string]bool{}
+	if primaryID != "" {
+		seen[primaryID] = true
+	}
+	for _, id := range req.FallbackProviderIDs {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		pc := findProviderByID(s.config, id)
+		if pc == nil {
+			logger.I18nWarn("降级会话模型 %s 不存在，已跳过", id)
+			continue
+		}
+		providerType, _ := pc["type"].(string)
+		if providerType == "" {
+			providerType, _ = pc["provider"].(string)
+		}
+		if providerType == "" {
+			logger.I18nWarn("降级会话模型 %s 缺少 type 字段，已跳过", id)
+			continue
+		}
+		merged := mergeProviderSource(pc, s.config["provider_sources"])
+		inst, err := provider.CreateProvider(providerType, merged, ar.providerSettings)
+		if err != nil {
+			logger.I18nWarn("初始化降级会话模型 %s 失败，已跳过: %v", id, err)
+			continue
+		}
+		chatInst, ok := inst.(provider.ChatProvider)
+		if !ok {
+			logger.I18nWarn("降级会话模型 %s 不支持聊天能力，已跳过", id)
+			continue
+		}
+		ar.fallbackChatInsts = append(ar.fallbackChatInsts, chatInst)
+		ar.fallbackProviderCfgs = append(ar.fallbackProviderCfgs, pc)
+	}
+
+	// 图片模态选择（py _select_image_chat_provider）。
+	if len(ar.fallbackChatInsts) == 0 || len(req.ImageURLs) == 0 {
+		return
+	}
+	if providerSupportsModality(ar.providerCfg, "image") {
+		return
+	}
+	for i, cfg := range ar.fallbackProviderCfgs {
+		if !providerSupportsModality(cfg, "image") {
+			continue
+		}
+		logger.I18nWarn(
+			"会话模型 %s 不支持图片输入，本次请求切换到降级模型 %s",
+			providerCfgLabel(ar.providerCfg), providerCfgLabel(cfg),
+		)
+		ar.chatInst = ar.fallbackChatInsts[i]
+		ar.providerCfg = cfg
+		ar.fallbackChatInsts = append(ar.fallbackChatInsts[:i], ar.fallbackChatInsts[i+1:]...)
+		ar.fallbackProviderCfgs = append(ar.fallbackProviderCfgs[:i], ar.fallbackProviderCfgs[i+1:]...)
+		return
+	}
+	logger.I18nWarn("会话模型 %s 不支持图片输入，且无支持图片的降级模型可用", providerCfgLabel(ar.providerCfg))
+}
+
+// providerSupportsModality 对齐 py _provider_supports_modality：
+// modalities 缺失 → 不支持；空列表（配置迁移遗留）→ 视为未配置、支持全部；
+// 否则按列表精确判断。与 providerSupportsImages（缺失即视为支持）语义不同，
+// 后者用于工具图片注入，这里用于 py 的降级模型图片选择。
+func providerSupportsModality(providerCfg map[string]interface{}, modality string) bool {
+	if providerCfg == nil {
+		return false
+	}
+	switch raw := providerCfg["modalities"].(type) {
+	case []interface{}:
+		if len(raw) == 0 {
+			return true
+		}
+		for _, m := range raw {
+			if s, ok := m.(string); ok && s == modality {
+				return true
+			}
+		}
+		return false
+	case []string:
+		if len(raw) == 0 {
+			return true
+		}
+		for _, m := range raw {
+			if m == modality {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 // finalizeAgentReply appends the user/assistant pair to the conversation history, fires the on_llm_response hooks, persists the reply for enabled group sessions (group LTM), flushes the stream and sets event.Result.
@@ -2039,6 +2328,13 @@ func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMRe
 		}
 	}
 
+	// 对齐本体 MainAgentHooks.on_agent_done：本轮 LLM 有思考内容时写入事件
+	// extra，供 result_decorate 阶段按 show_reasoning / enable_reasoning
+	// 把思考内容注入最终回复链（非流式路径）。
+	if resp.ReasoningContent != "" {
+		event.SetExtra("_llm_reasoning_content", resp.ReasoningContent)
+	}
+
 	// on_llm_response fires after the LLM reply is produced (e.g. plugins that capture conversation memory). Payload carries the reply text.
 	dispatchSubprocessHooksPayload(s.subPlugins, event, "on_llm_response", &pluginsdk.LLMResponse{
 		Text: resp.CompletionText,
@@ -2066,7 +2362,7 @@ func (s *ProcessStage) finalizeAgentReply(ar *agentRequest, resp *provider.LLMRe
 }
 
 // chatRound issues a single LLM request. When streaming is enabled it consumes the stream channel, forwards content deltas to the platform incrementally, and consolidates content + tool calls into a single response.
-func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider, req *provider.ProviderRequest, streaming bool, streamer *streamSender) (*provider.LLMResponse, error) {
+func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider, req *provider.ProviderRequest, streaming, showReasoning bool, streamer *streamSender) (*provider.LLMResponse, error) {
 	start := time.Now()
 	if !streaming {
 		resp, err := inst.TextChat(ctx, req)
@@ -2118,9 +2414,8 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 					ctrlPending = ctrlPending[safe:]
 				}
 			}
-			// Display the reasoning content when provider_settings. display_reasoning_text is enabled (mirrors the Python `chain.type == "reasoning" and not show_reasoning: continue`). 通过回退取值接口 GetReasoningContent 读取，空值返回空串，不显示。
-			if s.providerConf != nil && s.providerConf.DisplayReasoningText &&
-				chunk.GetReasoningContent() != "" {
+			// Display the reasoning content when showReasoning is enabled (mirrors the Python `chain.type == "reasoning" and not show_reasoning: continue`). 通过回退取值接口 GetReasoningContent 读取，空值返回空串，不显示。showReasoning 由 provider_settings.display_reasoning_text 与 webchat 请求级 enable_reasoning extra 共同决定（对齐 py internal.py）。
+			if showReasoning && chunk.GetReasoningContent() != "" {
 				streamer.push(chunk.GetReasoningContent())
 			}
 			continue
@@ -2205,6 +2500,18 @@ func (ss *streamSender) push(text string) {
 // flushFragment pushes the full accumulated text through the native stream-edit protocol (final=true also emits the state=10 end fragment).
 func (ss *streamSender) flushFragment(final bool) {
 	if ss.pending.Len() == 0 {
+		// 防御性对齐 py _close_stream_segment：流已开（msgID 非空）但尾缓冲
+		// 恰好为空时，最终 flush 仍要补发 state=10 收尾帧，否则 QQ 会在超时
+		// 后把整段回滚到首包（#10066）。从未开流则不发（对齐 py 的 id is None）。
+		if !final || ss.msgID == "" || ss.frag == nil {
+			return
+		}
+		ss.lastFlush = time.Now()
+		// 空文本用最小 "\n" 占位（对齐 py：send_buffer=MessageChain(Plain("\n"))），
+		// 避免发送层拒掉空内容导致收尾帧缺席。
+		if err := ss.frag.StreamEnd(ss.event.Source.ConvID, ss.msgID, "\n"); err != nil {
+			logger.I18nWarn("流式结束发送失败: %v", err)
+		}
 		return
 	}
 	text := ss.pending.String()
@@ -3933,7 +4240,7 @@ func (s *ProcessStage) maybeCompressContext(ctx context.Context, chatInst provid
 		return contexts
 	}
 	if s.providerConf.ContextLimitStrategy == "llm_compress" {
-		if compressed, ok := s.llmCompressContext(ctx, chatInst, systemPrompt, contexts); ok {
+		if compressed, ok := s.llmCompressContext(ctx, s.resolveCompressProvider(chatInst), systemPrompt, contexts); ok {
 			return compressed
 		}
 	}
@@ -3967,6 +4274,25 @@ func truncateContextEntries(contexts []map[string]interface{}, maxCtx int) []map
 		})
 	}
 	return history
+}
+
+// resolveCompressProvider 解析上下文压缩使用的 provider（对齐 py v4.28.2
+// _get_compress_provider）：配置了 llm_compress_provider_id 时经
+// ProviderManager 按 ID 查找；未命中或非聊天 provider 时告警并回退当前会话
+// chatInst（py 的 fallback: get_using_provider_async）。
+func (s *ProcessStage) resolveCompressProvider(chatInst provider.ChatProvider) provider.ChatProvider {
+	if s.providerConf == nil || s.providerConf.LLMCompressProviderID == "" {
+		return chatInst
+	}
+	if s.providerMgr != nil {
+		if p := s.providerMgr.Get(s.providerConf.LLMCompressProviderID); p != nil {
+			if cp, ok := p.(provider.ChatProvider); ok {
+				return cp
+			}
+		}
+	}
+	logger.I18nWarn("指定的上下文压缩模型 %s 不可用", s.providerConf.LLMCompressProviderID)
+	return chatInst
 }
 
 // llmCompressContext summarizes the older rounds via the LLM and keeps the recent rounds exact (mirrors Python LLMSummaryCompressor).
@@ -4217,6 +4543,11 @@ type ResultDecorateStage struct {
 	ttsTriggerProb float64
 	ttsDualOutput  bool
 
+	// showReasoning 是 provider_settings.display_reasoning_text 的配置值；
+	// 非流式回复注入思考内容时，webchat 请求级 enable_reasoning extra 优先
+	// 覆盖（对齐 py result_decorate/stage.py 的 show_reasoning）。
+	showReasoning bool
+
 	// forward_threshold: replies longer than this are sent as a forward message (OneBot node) on the aiocqhttp platform.
 	forwardThreshold int
 
@@ -4332,6 +4663,11 @@ func (s *ResultDecorateStage) Initialize(ctx *PipelineContext) error {
 	// TTS settings from provider_tts_settings.
 	s.providerMgr = ctx.ProviderManager
 	s.convMgr = ctx.ConvManager
+	// provider_settings.display_reasoning_text：非流式思考内容注入的默认开关
+	// （对齐 py result_decorate/stage.py initialize）。
+	if psAI := bindProviderSettings(ctx.AstrbotConfig); psAI != nil {
+		s.showReasoning = psAI.DisplayReasoningText
+	}
 	if ttsCfg, ok := ctx.AstrbotConfig["provider_tts_settings"].(map[string]interface{}); ok {
 		s.ttsEnabled, _ = ttsCfg["enable"].(bool)
 		if v, ok := ttsCfg["trigger_probability"].(float64); ok {
@@ -4465,8 +4801,40 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 		event.Result.Chain = newChain
 	}
 
+	// TTS: 先解析本次是否执行 TTS（概率只掷一次），reasoning 注入依赖
+	// `not should_tts`（对齐 py result_decorate/stage.py）。
+	ttsProvider, shouldTTS := s.resolveTTS(event)
+
+	// 非流式思考内容注入（对齐 py result_decorate/stage.py）：show_reasoning
+	// 默认取 provider_settings.display_reasoning_text，webchat 请求级
+	// enable_reasoning extra 显式传入时优先覆盖；思考内容来自 agent 结束时
+	// 写入的 `_llm_reasoning_content` extra。流式回复已在 chatRound 逐块展示，
+	// 不再重复注入（对齐 py STREAMING_FINISH 提前返回）。
+	showReasoning := s.showReasoning
+	if v, ok := event.GetExtra("enable_reasoning").(bool); ok {
+		showReasoning = v
+	}
+	streamed, _ := event.GetExtra("streamed").(bool)
+	if !shouldTTS && showReasoning && !streamed {
+		if reasoning, ok := event.GetExtra("_llm_reasoning_content").(string); ok && reasoning != "" {
+			// 对齐 py：Lark 前置可折叠面板 JSON，其余平台前置 "🤔 思考: ..." 文本。
+			if event.Source.Platform == "lark" {
+				panel := &message.Json{Data: map[string]interface{}{
+					"type":     "lark_collapsible_panel_reasoning",
+					"title":    "💭 Thinking",
+					"expanded": false,
+					"content":  reasoning,
+				}}
+				event.Result.Chain = append([]message.Component{panel}, event.Result.Chain...)
+			} else {
+				prefix := &message.Plain{Text: fmt.Sprintf("🤔 思考: %s\n\n────\n", reasoning)}
+				event.Result.Chain = append([]message.Component{prefix}, event.Result.Chain...)
+			}
+		}
+	}
+
 	// TTS: convert the reply to voice when enabled (global switch + session tts_enabled + trigger probability + a usable TTS provider).
-	if err := s.applyTTS(event); err != nil {
+	if err := s.applyTTS(event, ttsProvider); err != nil {
 		logger.I18nWarn("TTS 转换失败，回退文本回复: %v", err)
 	}
 
@@ -4562,27 +4930,32 @@ func renderLocalT2I(text, templateName string) ([]byte, error) {
 	return t2i.RenderTextToPNG(text, opts)
 }
 
-// applyTTS converts the reply plain text to a voice Record component when TTS is enabled (mirrors Python result_decorate stage TTS block).
-func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
+// resolveTTS decides whether this reply should go through TTS and resolves the
+// provider to use (mirrors Python result_decorate stage `should_tts`: global
+// switch + session tts_enabled + trigger probability + a usable TTS provider).
+// The probability roll happens exactly once here so the same decision gates
+// both the reasoning injection (`not should_tts`) and the TTS conversion.
+// Returns (nil, false) when TTS must be skipped.
+func (s *ResultDecorateStage) resolveTTS(event *core.Event) (provider.TTSProvider, bool) {
 	if !s.ttsEnabled || s.providerMgr == nil {
-		return nil
+		return nil, false
 	}
 	if event.Result == nil || len(event.Result.Chain) == 0 {
-		return nil
+		return nil, false
 	}
 
 	// Session tts_enabled rule (session_service_config), default true.
 	if rules := sessionRulesMemo(event, s.convMgr); rules != nil {
 		if sc, ok := rules[conversation.RuleServiceConfig].(map[string]interface{}); ok {
 			if enabled, ok := sc["tts_enabled"].(bool); ok && !enabled {
-				return nil
+				return nil, false
 			}
 		}
 	}
 
 	// Trigger probability.
 	if s.ttsTriggerProb < 1.0 && rand.Float64() > s.ttsTriggerProb {
-		return nil
+		return nil, false
 	}
 
 	// Resolve TTS provider: session rule provider_perf_text_to_speech wins.
@@ -4602,7 +4975,16 @@ func (s *ResultDecorateStage) applyTTS(event *core.Event) error {
 		tts = s.providerMgr.GetTTSProvider()
 	}
 	if tts == nil {
-		return fmt.Errorf("未配置 TTS 提供商")
+		logger.I18nWarn("会话 %s 未配置 TTS 提供商，跳过 TTS", event.UnifiedMsgOrigin())
+		return nil, false
+	}
+	return tts, true
+}
+
+// applyTTS converts the reply plain text to a voice Record component when TTS is enabled (mirrors Python result_decorate stage TTS block). tts 由 resolveTTS 预先解析（同一次判定同时用于 reasoning 注入的 not should_tts 条件）。
+func (s *ResultDecorateStage) applyTTS(event *core.Event, tts provider.TTSProvider) error {
+	if tts == nil {
+		return nil
 	}
 
 	newChain := make([]message.Component, 0, len(event.Result.Chain))

@@ -165,7 +165,7 @@ func TestKimiCodeSourceTextChat(t *testing.T) {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
-		if got := r.Header.Get("User-Agent"); got != kimiCodeUserAgent {
+		if got := r.Header.Get("User-Agent"); got != provider.DefaultUserAgent {
 			t.Errorf("unexpected User-Agent: %q", got)
 		}
 		if got := r.Header.Get("x-api-key"); got != "sk-test" {
@@ -209,7 +209,7 @@ func TestKimiCodeSourceDefaults(t *testing.T) {
 	if src.GetModel() != kimiCodeDefaultModel {
 		t.Errorf("unexpected default model: %q", src.GetModel())
 	}
-	if got := src.customHeaders["User-Agent"]; got != kimiCodeUserAgent {
+	if got := src.RequestHeaders()["User-Agent"]; got != provider.DefaultUserAgent {
 		t.Errorf("unexpected default User-Agent: %q", got)
 	}
 }

@@ -295,7 +295,10 @@ func (a *Adapter) buildReplyFromParentID(ctx context.Context, parentMessageID st
 
 // sendMessageChain sends a chain to a Lark session, separating file/audio/
 // video components from the rich-text post (mirrors lark_event.py).
-func sendMessageChain(ctx context.Context, client *lark.Client, chain *message.MessageChain, replyMessageID, receiveID, receiveIDType string) error {
+// fallbackChatID 非空时，私聊 open_id 发送被拒会复用同一 UUID 以该 chat_id
+// 重试一次；主动发送失败立即返回错误终止后续组件（对齐 py send_message_chain
+// 抛 RuntimeError 的行为），reply 路径失败仅记录并继续（对齐 py 返回 False）。
+func sendMessageChain(ctx context.Context, client *lark.Client, chain *message.MessageChain, replyMessageID, receiveID, receiveIDType, fallbackChatID string) error {
 	if client == nil {
 		return fmt.Errorf("lark: client not ready")
 	}
@@ -319,27 +322,40 @@ func sendMessageChain(ctx context.Context, client *lark.Client, chain *message.M
 
 	var errs []error
 	if len(otherComps) > 0 {
-		if err := sendRichText(ctx, client, otherComps, replyMessageID, receiveID, receiveIDType); err != nil {
+		if err := sendRichText(ctx, client, otherComps, replyMessageID, receiveID, receiveIDType, fallbackChatID); err != nil {
 			logger.I18nWarn("发送飞书富文本消息失败: %v", err)
 			errs = append(errs, err)
+			if replyMessageID == "" {
+				// 主动发送失败抛错（对齐 py）。
+				return errors.Join(errs...)
+			}
 		}
 	}
 	for _, f := range fileComps {
-		if err := sendFileMessage(ctx, client, f, replyMessageID, receiveID, receiveIDType); err != nil {
+		if err := sendFileMessage(ctx, client, f, replyMessageID, receiveID, receiveIDType, fallbackChatID); err != nil {
 			logger.I18nWarn("发送飞书文件失败: %v", err)
 			errs = append(errs, err)
+			if replyMessageID == "" {
+				return errors.Join(errs...)
+			}
 		}
 	}
 	for _, rec := range audioComps {
-		if err := sendAudioMessage(ctx, client, rec, replyMessageID, receiveID, receiveIDType); err != nil {
+		if err := sendAudioMessage(ctx, client, rec, replyMessageID, receiveID, receiveIDType, fallbackChatID); err != nil {
 			logger.I18nWarn("发送飞书音频失败: %v", err)
 			errs = append(errs, err)
+			if replyMessageID == "" {
+				return errors.Join(errs...)
+			}
 		}
 	}
 	for _, v := range videoComps {
-		if err := sendMediaMessage(ctx, client, v, replyMessageID, receiveID, receiveIDType); err != nil {
+		if err := sendMediaMessage(ctx, client, v, replyMessageID, receiveID, receiveIDType, fallbackChatID); err != nil {
 			logger.I18nWarn("发送飞书视频失败: %v", err)
 			errs = append(errs, err)
+			if replyMessageID == "" {
+				return errors.Join(errs...)
+			}
 		}
 	}
 	return errors.Join(errs...)
@@ -363,12 +379,19 @@ func hasReasoningMarker(comps []message.Component) bool {
 //     组件可入卡时，合成单张 reasoning 卡片发送（对齐本体 :451-471）；
 //   - 否则逐个标记先 flush 普通内容再发送折叠面板卡片（对齐本体 :507-533）；
 //     卡片发送失败时回退为 "🤔 title: content" 的 Plain 文本继续参与后续 post。
-func sendRichText(ctx context.Context, client *lark.Client, comps []message.Component, replyMessageID, receiveID, receiveIDType string) error {
+//
+// fallbackChatID 透传给 im 发送，用于私聊 open_id 被拒时以 chat_id 重试。
+// 主动发送失败立即返回错误；reply 路径失败回退/记录后继续（对齐 py）。
+func sendRichText(ctx context.Context, client *lark.Client, comps []message.Component, replyMessageID, receiveID, receiveIDType, fallbackChatID string) error {
 	// 单卡片路径（对齐本体 _build_reasoning_card + _send_interactive_card）。
 	if hasReasoningMarker(comps) {
 		if cardJSON := buildReasoningCard(comps); cardJSON != nil {
-			if err := sendInteractiveCard(ctx, client, cardJSON, replyMessageID, receiveID, receiveIDType); err == nil {
+			if err := sendInteractiveCard(ctx, client, cardJSON, replyMessageID, receiveID, receiveIDType, fallbackChatID); err == nil {
 				return nil
+			} else if replyMessageID == "" {
+				// 主动发送失败抛错（对齐 py _send_im_message 主动发送失败抛 RuntimeError）。
+				logger.I18nWarn("发送飞书 reasoning 卡片失败: %v", err)
+				return err
 			} else {
 				logger.I18nWarn("发送飞书 reasoning 卡片失败，回退到逐段发送: %v", err)
 			}
@@ -391,7 +414,7 @@ func sendRichText(ctx context.Context, client *lark.Client, comps []message.Comp
 				"content": postContent,
 			},
 		})
-		return sendImMessage(ctx, client, string(wrapped), "post", replyMessageID, receiveID, receiveIDType)
+		return sendImMessage(ctx, client, string(wrapped), "post", replyMessageID, receiveID, receiveIDType, fallbackChatID)
 	}
 
 	var errs []error
@@ -401,6 +424,9 @@ func sendRichText(ctx context.Context, client *lark.Client, comps []message.Comp
 			if err := flush(); err != nil {
 				logger.I18nWarn("发送飞书富文本消息失败: %v", err)
 				errs = append(errs, err)
+				if replyMessageID == "" {
+					return errors.Join(errs...)
+				}
 			}
 			reasonText := strings.TrimSpace(jsonStrSafe(js.Data, "content"))
 			if reasonText == "" {
@@ -410,7 +436,13 @@ func sendRichText(ctx context.Context, client *lark.Client, comps []message.Comp
 			if panelTitle == "" {
 				panelTitle = "💭 Thinking"
 			}
-			if err := sendCollapsibleReasoningPanel(ctx, client, reasonText, panelTitle, replyMessageID, receiveID, receiveIDType); err != nil {
+			if err := sendCollapsibleReasoningPanel(ctx, client, reasonText, panelTitle, replyMessageID, receiveID, receiveIDType, fallbackChatID); err != nil {
+				if replyMessageID == "" {
+					// 主动发送失败抛错（对齐 py）。
+					logger.I18nWarn("发送飞书折叠面板卡片失败: %v", err)
+					errs = append(errs, err)
+					return errors.Join(errs...)
+				}
 				logger.I18nWarn("发送飞书折叠面板卡片失败: %v", err)
 				// 回退为纯文本（对齐本体 :524-529）。
 				buffered = append(buffered, &message.Plain{Text: "🤔 " + panelTitle + ": " + reasonText})
@@ -422,6 +454,9 @@ func sendRichText(ctx context.Context, client *lark.Client, comps []message.Comp
 	if err := flush(); err != nil {
 		logger.I18nWarn("发送飞书富文本消息失败: %v", err)
 		errs = append(errs, err)
+		if replyMessageID == "" {
+			return errors.Join(errs...)
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -487,7 +522,13 @@ func convertToLark(ctx context.Context, client *lark.Client, comps []message.Com
 }
 
 // sendImMessage sends or replies an im message (mirrors _send_im_message).
-func sendImMessage(ctx context.Context, client *lark.Client, content, msgType, replyMessageID, receiveID, receiveIDType string) error {
+// sendImMessage sends or replies an im message (mirrors _send_im_message).
+// 主动发送失败返回错误（对齐 py 主动发送抛 RuntimeError）；reply 路径失败仅
+// 返回错误由调用方按非致命处理（对齐 py 返回 False 后由调用方忽略）。
+// 当主动发送 receive_id_type == "open_id" 被飞书拒绝（典型错误码 230101）且
+// 已知该私聊的 chat_id 时，复用同一去重 UUID 以 chat_id 重试一次（对齐 py
+// v4.28.2 commit 32a75139）；传输异常不触发回退重试。
+func sendImMessage(ctx context.Context, client *lark.Client, content, msgType, replyMessageID, receiveID, receiveIDType, fallbackChatID string) error {
 	if replyMessageID != "" {
 		req := larkim.NewReplyMessageReqBuilder().
 			MessageId(replyMessageID).
@@ -503,6 +544,7 @@ func sendImMessage(ctx context.Context, client *lark.Client, content, msgType, r
 			return err
 		}
 		if !resp.Success() {
+			logger.Error("发送飞书消息失败(%d): %s", resp.Code, resp.Msg)
 			return fmt.Errorf("lark reply failed(%d): %s", resp.Code, resp.Msg)
 		}
 		return nil
@@ -510,18 +552,36 @@ func sendImMessage(ctx context.Context, client *lark.Client, content, msgType, r
 	if receiveIDType == "" || receiveID == "" {
 		return fmt.Errorf("lark: 主动发送消息时 receive_id 和 receive_id_type 不能为空")
 	}
+	uuid := uuidStr()
 	req := larkim.NewCreateMessageReqBuilder().
 		ReceiveIdType(receiveIDType).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
 			ReceiveId(receiveID).
 			Content(content).
 			MsgType(msgType).
-			Uuid(uuidStr()).
+			Uuid(uuid).
 			Build()).
 		Build()
 	resp, err := client.Im.Message.Create(ctx, req)
 	if err != nil {
 		return err
+	}
+	if !resp.Success() && receiveIDType == "open_id" && fallbackChatID != "" {
+		logger.Warn("[Lark] Open ID send failed (%d): %s; retrying with private chat ID", resp.Code, resp.Msg)
+		// 仅重试被拒的这一条消息，复用同一去重 UUID（对齐 py）。
+		fallbackReq := larkim.NewCreateMessageReqBuilder().
+			ReceiveIdType("chat_id").
+			Body(larkim.NewCreateMessageReqBodyBuilder().
+				ReceiveId(fallbackChatID).
+				Content(content).
+				MsgType(msgType).
+				Uuid(uuid).
+				Build()).
+			Build()
+		resp, err = client.Im.Message.Create(ctx, fallbackReq)
+		if err != nil {
+			return err
+		}
 	}
 	if !resp.Success() {
 		return fmt.Errorf("lark send failed(%d): %s", resp.Code, resp.Msg)
@@ -581,7 +641,7 @@ func uploadImage(ctx context.Context, client *lark.Client, path string) (string,
 }
 
 // sendFileMessage sends a File component (mirrors _send_file_message).
-func sendFileMessage(ctx context.Context, client *lark.Client, comp *message.File, replyMessageID, receiveID, receiveIDType string) error {
+func sendFileMessage(ctx context.Context, client *lark.Client, comp *message.File, replyMessageID, receiveID, receiveIDType, fallbackChatID string) error {
 	path, tempPath, err := resolveMediaPath(ctx, comp.Path, comp.URL)
 	if err != nil {
 		return err
@@ -597,13 +657,13 @@ func sendFileMessage(ctx context.Context, client *lark.Client, comp *message.Fil
 		return err
 	}
 	content, _ := json.Marshal(map[string]string{"file_key": key})
-	return sendImMessage(ctx, client, string(content), "file", replyMessageID, receiveID, receiveIDType)
+	return sendImMessage(ctx, client, string(content), "file", replyMessageID, receiveID, receiveIDType, fallbackChatID)
 }
 
 // sendAudioMessage sends a Record component (mirrors _send_audio_message):
 // ffmpeg 转 opus（libopus/单声道/16kHz）→ ffprobe 时长 → file_type=opus 上传
 // → audio 消息发送；转码失败降级时仍以 opus/audio 上传原文件（对齐 py）。
-func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Record, replyMessageID, receiveID, receiveIDType string) error {
+func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Record, replyMessageID, receiveID, receiveIDType, fallbackChatID string) error {
 	path := comp.Path
 	if path == "" {
 		path = comp.File
@@ -634,7 +694,7 @@ func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Re
 			return err
 		}
 		content, _ := json.Marshal(map[string]string{"file_key": key})
-		return sendImMessage(ctx, client, string(content), "audio", replyMessageID, receiveID, receiveIDType)
+		return sendImMessage(ctx, client, string(content), "audio", replyMessageID, receiveID, receiveIDType, fallbackChatID)
 	}
 
 	// 降级：opus 转码不可用时直接上传原文件，但 file_type 与 msg_type 仍
@@ -646,13 +706,13 @@ func sendAudioMessage(ctx context.Context, client *lark.Client, comp *message.Re
 		return err
 	}
 	content, _ := json.Marshal(map[string]string{"file_key": key})
-	return sendImMessage(ctx, client, string(content), "audio", replyMessageID, receiveID, receiveIDType)
+	return sendImMessage(ctx, client, string(content), "audio", replyMessageID, receiveID, receiveIDType, fallbackChatID)
 }
 
 // sendMediaMessage sends a Video component (mirrors _send_media_message):
 // ffmpeg 转 mp4（libx264/aac）→ ffprobe 时长 → file_type=mp4 上传 → media 消息发送；
 // 转码失败降级时仍以 mp4/media 上传原文件（对齐 py）。
-func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Video, replyMessageID, receiveID, receiveIDType string) error {
+func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Video, replyMessageID, receiveID, receiveIDType, fallbackChatID string) error {
 	path, tempPath, err := resolveMediaPath(ctx, comp.Path, comp.URL)
 	if err != nil {
 		return err
@@ -674,7 +734,7 @@ func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Vi
 			return err
 		}
 		content, _ := json.Marshal(map[string]string{"file_key": key})
-		return sendImMessage(ctx, client, string(content), "media", replyMessageID, receiveID, receiveIDType)
+		return sendImMessage(ctx, client, string(content), "media", replyMessageID, receiveID, receiveIDType, fallbackChatID)
 	}
 
 	// 降级：mp4 转码不可用时直接上传原文件，但 file_type 与 msg_type 仍保持
@@ -685,7 +745,7 @@ func sendMediaMessage(ctx context.Context, client *lark.Client, comp *message.Vi
 		return err
 	}
 	content, _ := json.Marshal(map[string]string{"file_key": key})
-	return sendImMessage(ctx, client, string(content), "media", replyMessageID, receiveID, receiveIDType)
+	return sendImMessage(ctx, client, string(content), "media", replyMessageID, receiveID, receiveIDType, fallbackChatID)
 }
 
 // resolveMediaPath 将组件的本地路径/URL 解析为可上传路径：
