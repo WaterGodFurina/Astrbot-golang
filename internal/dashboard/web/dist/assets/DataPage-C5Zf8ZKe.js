@@ -1,0 +1,11 @@
+import{J as m,u as v,c,d as r,D as t,H as o,F as _,e as k,f as y,am as g,b as i,w as b,n as f,ay as M,t as C,ax as N,a as x,o as s,_ as T}from"./index-B03o5jo4.js";import{c as l}from"./createLucideIcon-CG3Mt5js.js";import{M as w}from"./message-square-text-BelY2SCX.js";import{W as D}from"./waypoints-CPDk5tdK.js";/**
+ * @license @lucide/vue v1.23.0 - ISC
+ *
+ * This source code is licensed under the ISC license.
+ * See the LICENSE file in the root directory of this source tree.
+ */const V=[["path",{d:"M5 21v-6",key:"1hz6c0"}],["path",{d:"M12 21V9",key:"uvy0l4"}],["path",{d:"M19 21V3",key:"11j9sm"}]],z=l("chart-no-axes-column-increasing",V);/**
+ * @license @lucide/vue v1.23.0 - ISC
+ *
+ * This source code is licensed under the ISC license.
+ * See the LICENSE file in the root directory of this source tree.
+ */const B=[["path",{d:"M3 5h1",key:"1mv5vm"}],["path",{d:"M3 12h1",key:"lp3yf2"}],["path",{d:"M3 19h1",key:"w6f3n9"}],["path",{d:"M8 5h1",key:"1nxr5w"}],["path",{d:"M8 12h1",key:"1con00"}],["path",{d:"M8 19h1",key:"k7p10e"}],["path",{d:"M13 5h8",key:"a7qcls"}],["path",{d:"M13 12h8",key:"h98zly"}],["path",{d:"M13 19h8",key:"c3s6r1"}]],I=l("logs",B),L={class:"data-workspace"},S={class:"data-tabs-scroll"},R=["aria-label"],q=["href","aria-selected","onClick"],F=m({__name:"DataPage",setup(P){const{t:e}=v(),d=x(),u=c(()=>[{value:"statistics",label:e("core.navigation.dataTabs.statistics"),routeName:"Stats",icon:z},{value:"conversations",label:e("core.navigation.dataTabs.conversations"),routeName:"Conversation",icon:w},{value:"logs",label:e("core.navigation.dataTabs.logs"),routeName:"Console",icon:I},{value:"trace",label:e("core.navigation.dataTabs.trace"),routeName:"Trace",icon:D}]),n=c(()=>String(d.meta.dataTab||"statistics"));return(W,j)=>(s(),r("div",L,[t("div",S,[t("nav",{class:"data-tabs",role:"tablist","aria-label":o(e)("core.navigation.data")},[(s(!0),r(_,null,k(u.value,a=>(s(),i(o(N),{key:a.value,custom:"",to:{name:a.routeName}},{default:b(({href:h,navigate:p})=>[t("a",{href:h,class:f(["data-tab",{"data-tab--active":n.value===a.value}]),role:"tab","aria-selected":n.value===a.value,onClick:p},[(s(),i(M(a.icon),{size:16,"stroke-width":1.8,"aria-hidden":"true"})),t("span",null,C(a.label),1)],10,q)]),_:2},1032,["to"]))),128))],8,R)]),y(o(g))]))}}),$=T(F,[["__scopeId","data-v-58ea784d"]]);export{$ as default};
