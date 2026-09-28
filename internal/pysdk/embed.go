@@ -61,6 +61,8 @@ const EnvSDKTarballSHA256Override = "ASTRBOT_SDK_SHA256_OVERRIDE"
 var sdkTarballSHA256 = map[string]string{
 	// v0.9.9 官方归档 sha256（2026-09-19 从 GitHub tag v0.9.9 下载两次核对一致）。
 	"0.9.9": "4b42bce956695847319c5afeb7f372742b9c99d48c4e45f372d2cceb067024d5",
+	// v0.9.10 官方归档 sha256（2026-09-28 从 GitHub tag v0.9.10 下载两次核对一致）。
+	"0.9.10": "1ed753c27bc6126ecdc6a1b885710dcff614f04371798fdbb5d366e2fddc193e",
 }
 
 // SetSDKGitHubProxy overrides the GitHub accelerator prefix used for the SDK

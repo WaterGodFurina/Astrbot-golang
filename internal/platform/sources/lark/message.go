@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,8 +19,12 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
+
+// larkAtPattern 匹配 Lark 文本消息中的 @ 占位符（对齐 Python re.split(r"(@_user_\d+)")）。
+var larkAtPattern = regexp.MustCompile(`(@_user_\d+)`)
 
 // parseMessageComponents parses Lark message content into AstrBot components
 // (mirrors lark_adapter.py _parse_message_components).
@@ -29,28 +34,24 @@ func (a *Adapter) parseMessageComponents(ctx context.Context, messageID, message
 	switch messageType {
 	case "text":
 		text, _ := content["text"].(string)
-		parts := strings.Split(text, "@_user_")
+		// 对齐 Python lark_adapter.py:242-252：re.split(r"(@_user_\d+)")，
+		// 占位符段精确匹配（不受后接字符是否为空白影响）。
+		parts := larkAtPattern.Split(text, -1)
 		for i, part := range parts {
 			segment := strings.TrimSpace(part)
-			if i > 0 {
-				// "@_user_<id>" placeholder; reconstruct key
-				key := "@_user_"
-				if idx := strings.IndexAny(segment, " \t\n"); idx >= 0 {
-					key += segment[:idx]
-					segment = strings.TrimSpace(segment[idx:])
-				} else {
-					key += segment
-					segment = ""
-				}
-				if at, ok := atMap[key]; ok {
+			if segment == "" {
+				continue
+			}
+			// 奇数段为捕获的 @_user_<digits> 占位符。
+			if i%2 == 1 {
+				if at, ok := atMap[segment]; ok {
 					components = append(components, at)
-				}
-				if segment != "" {
+				} else {
 					components = append(components, &message.Plain{Text: segment})
 				}
-			} else if segment != "" {
-				components = append(components, &message.Plain{Text: segment})
+				continue
 			}
+			components = append(components, &message.Plain{Text: segment})
 		}
 		return components
 
@@ -137,6 +138,12 @@ func (a *Adapter) parseMessageComponents(ctx context.Context, messageID, message
 		}
 		path := a.downloadFileToTemp(ctx, messageID, fileKey, "audio", "", ".opus")
 		if path != "" {
+			// 对齐 Python lark_adapter.py:339-360：语音经 MediaResolver
+			// (target_format="wav") 转 wav 后投递。utils.EnsureWAV 先尝试纯 Go
+			// silk 解码，其次 ffmpeg；失败时原样返回原文件。
+			if wavPath, err := utils.EnsureWAV(path); err == nil && wavPath != "" {
+				path = wavPath
+			}
 			components = append(components, &message.Record{File: path, URL: path, Path: path})
 		}
 		return components

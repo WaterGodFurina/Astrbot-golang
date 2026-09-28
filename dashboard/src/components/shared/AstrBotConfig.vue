@@ -432,25 +432,6 @@ function hasVisibleItemsAfter(items, currentIndex) {
   margin-right: 4px;
 }
 
-.property-link {
-  color: rgb(var(--v-theme-primary));
-  font-size: 0.75rem;
-  font-weight: 500;
-  text-decoration: none;
-  white-space: nowrap;
-}
-
-.property-link:hover {
-  text-decoration: underline;
-}
-
-.property-hint__content--linked {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  white-space: nowrap;
-}
-
 .object-config, .simple-config {
   width: 100%;
 }
@@ -493,10 +474,29 @@ function hasVisibleItemsAfter(items, currentIndex) {
   color: var(--v-theme-primaryText);
 }
 
+.property-link {
+  color: rgb(var(--v-theme-primary));
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.property-link:hover {
+  text-decoration: underline;
+}
+
 .property-hint {
   font-size: 0.75rem;
   color: var(--v-theme-secondaryText);
   margin-top: 2px;
+}
+
+.property-hint__content--linked {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
 }
 
 .type-indicator {

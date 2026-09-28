@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +41,7 @@ func ComponentsFromSDK(chain []pluginsdk.Component) []message.Component {
 		case pluginsdk.CompAt:
 			out = append(out, &message.At{TargetID: c.TargetID, Name: c.Name})
 		case pluginsdk.CompImage:
-			img := &message.Image{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID}
+			img := &message.Image{URL: c.URL, Path: c.Path, File: c.File, Base64: c.Base64, FileID: c.FileID, Filename: c.Name}
 			// data:image/...;base64,xxx / base64://xxx 形式的图片内容归一化到
 			// Base64 字段（Python 插件 text_to_image/html_render 返回 data URI，
 			// 若不归一化会被当作本地文件路径发送 → OneBot stat ENAMETOOLONG）。
@@ -600,6 +601,59 @@ type HostServiceExtras struct {
 // hostExtras is the active set of optional extras passed to SetHostService.
 var hostExtras HostServiceExtras
 
+// stringifyGroupID 把 RPC 传入的 group_id 归一为字符串：Python SDK 对纯数字 id
+// 发 int（JSON number → float64），其余发字符串。
+func stringifyGroupID(v any) string {
+	switch n := v.(type) {
+	case string:
+		return n
+	case float64:
+		return strconv.FormatInt(int64(n), 10)
+	case int64:
+		return strconv.FormatInt(n, 10)
+	case int:
+		return strconv.Itoa(n)
+	case json.Number:
+		return n.String()
+	default:
+		return ""
+	}
+}
+
+// groupToMap 把平台群信息转为 CallAction 的 JSON 结果。
+// Python 通用 get_group 读取 group_name（或 name），此处兼容两种键并附全量字段。
+func groupToMap(g *platform.Group) map[string]any {
+	m := map[string]any{"group_id": g.GroupID}
+	if g.GroupName != "" {
+		m["group_name"] = g.GroupName
+		m["name"] = g.GroupName
+	}
+	if g.GroupAvatar != "" {
+		m["group_avatar"] = g.GroupAvatar
+	}
+	if g.GroupOwner != "" {
+		m["group_owner"] = g.GroupOwner
+		m["owner_id"] = g.GroupOwner
+	}
+	if len(g.GroupAdmins) > 0 {
+		m["group_admins"] = g.GroupAdmins
+	}
+	if g.MemberCount != nil {
+		m["member_count"] = *g.MemberCount
+	}
+	if len(g.Members) > 0 {
+		members := make([]map[string]any, 0, len(g.Members))
+		for _, mm := range g.Members {
+			members = append(members, map[string]any{
+				"user_id":  mm.UserID,
+				"nickname": mm.Nickname,
+			})
+		}
+		m["members"] = members
+	}
+	return m
+}
+
 // SetHostService installs the HostService hooks (reverse plugin -> host RPCs)
 // backed by the platform manager, the subprocess plugin manager (for config
 // reads/writes), a ChatLLM callback (for plugins calling the LLM directly),
@@ -641,11 +695,32 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				}
 				return nil, fmt.Errorf("platform %q has no adapter supporting CallAction", platformID)
 			}
-			ca, ok := adapter.(CallActionAdapter)
-			if !ok {
-				return nil, fmt.Errorf("platform adapter %q does not support CallAction", platformID)
+			// 实现了通用 CallAction 的平台（如 aiocqhttp 透传 OneBot action）：直接转发。
+			if ca, ok := adapter.(CallActionAdapter); ok {
+				return ca.CallAction(api, params)
 			}
-			return ca.CallAction(api, params)
+			// 非通用 CallAction 平台：把 get_group_info 桥接到 typed GetGroupInfo，
+			// 对齐 Python AstrMessageEvent.get_group → bridge.call_action_async(
+			// platform_id, "get_group_info", {"group_id": ...})。
+			if api == "get_group_info" {
+				if gp, ok := adapter.(platform.GroupInfoProvider); ok {
+					gid := stringifyGroupID(params["group_id"])
+					if gid == "" {
+						return nil, fmt.Errorf("get_group_info: missing group_id")
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					g, err := gp.GetGroupInfo(ctx, gid)
+					if err != nil {
+						return nil, err
+					}
+					if g == nil {
+						return map[string]any{}, nil
+					}
+					return groupToMap(g), nil
+				}
+			}
+			return nil, fmt.Errorf("platform adapter %q does not support CallAction", platformID)
 		},
 		SendMessage: func(platformID, sessionID string, chain []pluginsdk.Component) error {
 			comps := ComponentsFromSDK(chain)

@@ -45,91 +45,6 @@
     "notification": "Notification Settings",
     "moreConfig": "More Settings"
   },
-  "general": {
-    "botName": "Bot Name",
-    "language": "Interface Language",
-    "timezone": "Timezone",
-    "autoSave": "Auto Save",
-    "debugMode": "Debug Mode"
-  },
-  "advanced": {
-    "logLevel": "Log Level",
-    "maxConnections": "Max Connections",
-    "timeout": "Timeout",
-    "retryAttempts": "Retry Attempts",
-    "cacheSize": "Cache Size"
-  },
-  "security": {
-    "apiKey": "API Key",
-    "allowedHosts": "Allowed Hosts",
-    "rateLimit": "Rate Limit",
-    "encryption": "Encryption Settings"
-  },
-  "configSelection": {
-    "selectConfig": "Select Configuration",
-    "normalConfig": "Basic",
-    "systemConfig": "System"
-  },
-  "search": {
-    "placeholder": "Search config items (key/description/hint)",
-    "noResult": "No matching config items found"
-  },
-  "configManagement": {
-    "title": "Configuration Management",
-    "description": "AstrBot supports separate configuration files for different bots. The `default` configuration is used by default.",
-    "newConfig": "New Configuration",
-    "copyConfig": "Copy Configuration",
-    "editConfig": "Edit Configuration",
-    "manageConfigs": "Manage Configurations...",
-    "configName": "Name",
-    "fillConfigName": "Enter configuration name",
-    "confirmDelete": "Are you sure you want to delete the configuration \"{name}\"? This action cannot be undone.",
-    "pleaseEnterName": "Please enter a configuration name",
-    "nameExists": "Configuration name already exists. Please use another name.",
-    "createFailed": "Failed to create new configuration",
-    "copyFailed": "Failed to copy configuration",
-    "deleteFailed": "Failed to delete configuration",
-    "updateFailed": "Failed to update configuration"
-  },
-  "buttons": {
-    "cancel": "Cancel",
-    "create": "Create",
-    "update": "Update"
-  },
-  "codeEditor": {
-    "title": "Edit Configuration File"
-  },
-  "fileUpload": {
-    "button": "Manage Files",
-    "dialogTitle": "Uploaded Files",
-    "dropzone": "Upload new file",
-    "allowedTypes": "Allowed types: {types}",
-    "empty": "No files uploaded",
-    "statusMissing": "Missing file",
-    "statusUnconfigured": "Not in config",
-    "uploadSuccess": "Uploaded {count} files",
-    "uploadFailed": "Upload failed",
-    "loadFailed": "Failed to load file list",
-    "fileTooLarge": "File too large (max {max} MB): {name}",
-    "deleteSuccess": "Deleted file",
-    "deleteFailed": "Delete failed",
-    "addToConfig": "Added to config",
-    "fileCount": "Files: {count}",
-    "done": "Done"
-  },
-  "unsavedChangesWarning": {
-    "dialogTitle": "Unsaved changes",
-    "leavePage": "You have unsaved changes. Do you want to save before leaving?",
-    "switchConfig": "Switching config will discard unsaved changes. Do you want to save first?",
-    "options": {
-      "save": "Save",
-      "saveAndSwitch": "Save and switch",
-      "discardAndSwitch": "Discard changes and switch",
-      "closeCard": "Close the pop-up window",
-      "confirm": "confirm",
-      "cancel": "cancel"
-    }
-  },
   "aiSettings": {
     "title": "AI",
     "enable": "Enable AI",
@@ -186,15 +101,103 @@
         "description": "Connect a Coze Bot and configure its access parameters."
       },
       "dashscope": {
-        "title": "Alibaba Cloud Bailian",
-        "summary": "AI conversations are currently handled by a Bailian application.",
-        "description": "Connect a Bailian application and configure its access parameters."
+        "title": "Alibaba Cloud Model Studio",
+        "summary": "AI conversations are currently handled by a Model Studio application.",
+        "description": "Connect an Alibaba Cloud Model Studio application and configure its access parameters."
       },
       "deerflow": {
         "title": "DeerFlow",
         "summary": "AI conversations are currently handled by DeerFlow.",
-        "description": "Connect DeerFlow and configure its access parameters."
+        "description": "Connect DeerFlow and configure its runtime parameters."
       }
+    }
+  },
+  "general": {
+    "botName": "Bot Name",
+    "language": "Interface Language",
+    "timezone": "Timezone",
+    "autoSave": "Auto Save",
+    "debugMode": "Debug Mode"
+  },
+  "advanced": {
+    "logLevel": "Log Level",
+    "maxConnections": "Max Connections",
+    "timeout": "Timeout",
+    "retryAttempts": "Retry Attempts",
+    "cacheSize": "Cache Size"
+  },
+  "security": {
+    "apiKey": "API Key",
+    "allowedHosts": "Allowed Hosts",
+    "rateLimit": "Rate Limit",
+    "encryption": "Encryption Settings"
+  },
+  "configSelection": {
+    "selectConfig": "Select Configuration",
+    "defaultConfig": "Default Configuration",
+    "search": "Search configurations",
+    "noResults": "No matching configurations",
+    "normalConfig": "Basic",
+    "systemConfig": "System"
+  },
+  "search": {
+    "placeholder": "Search config items (key/description/hint)",
+    "noResult": "No matching config items found"
+  },
+  "configManagement": {
+    "title": "Configuration Management",
+    "description": "AstrBot supports separate configuration files for different bots. The default configuration is used when none is specified.",
+    "newConfig": "New Configuration",
+    "copyConfig": "Copy Configuration",
+    "editConfig": "Edit Configuration",
+    "manageConfigs": "Manage Configurations...",
+    "configName": "Name",
+    "fillConfigName": "Enter configuration name",
+    "confirmDelete": "Are you sure you want to delete the configuration \"{name}\"? This action cannot be undone.",
+    "pleaseEnterName": "Please enter a configuration name",
+    "nameExists": "Configuration name already exists. Please use another name.",
+    "createFailed": "Failed to create new configuration",
+    "copyFailed": "Failed to copy configuration",
+    "deleteFailed": "Failed to delete configuration",
+    "updateFailed": "Failed to update configuration"
+  },
+  "buttons": {
+    "cancel": "Cancel",
+    "create": "Create",
+    "update": "Update"
+  },
+  "codeEditor": {
+    "title": "Edit Configuration File"
+  },
+  "fileUpload": {
+    "button": "Manage Files",
+    "dialogTitle": "Uploaded Files",
+    "dropzone": "Upload new file",
+    "allowedTypes": "Allowed types: {types}",
+    "empty": "No files uploaded",
+    "statusMissing": "Missing file",
+    "statusUnconfigured": "Not in config",
+    "uploadSuccess": "Uploaded {count} files",
+    "uploadFailed": "Upload failed",
+    "loadFailed": "Failed to load file list",
+    "fileTooLarge": "File too large (max {max} MB): {name}",
+    "deleteSuccess": "Deleted file",
+    "deleteFailed": "Delete failed",
+    "addToConfig": "Added to config",
+    "fileCount": "Files: {count}",
+    "done": "Done"
+  },
+  "unsavedChangesWarning": {
+    "dialogTitle": "Unsaved changes",
+    "leavePage": "You have unsaved changes. Do you want to save before leaving?",
+    "switchConfig": "Switching config will discard unsaved changes. Do you want to save first?",
+    "options": {
+      "save": "Save",
+      "saveAndSwitch": "Save and switch",
+      "discardAndSwitch": "Discard changes and switch",
+      "closeCard": "Close the pop-up window",
+      "confirm": "confirm",
+      "cancel": "cancel"
     }
   }
 }

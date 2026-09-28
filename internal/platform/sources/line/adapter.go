@@ -54,6 +54,11 @@ type Adapter struct {
 	evIDTime map[string]time.Time
 	mu       sync.Mutex
 
+	// groupSourceType 缓存群/房间的真实类型（containerID → "group"/"room"），
+	// 供 GetGroupInfo 在缺少事件上下文时推断（对齐 Python 从 raw_message.source
+	// 推断 chat_type 的逻辑）。
+	groupSourceType map[string]string
+
 	mediaBaseURL    string
 	callbackAPIBase string
 
@@ -70,11 +75,12 @@ type replyTokenEntry struct {
 // New 创建 LINE 适配器（config 需要 channel_access_token 与 channel_secret）。
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
-		config:      config,
-		settings:    settings,
-		EventBus:    eventBus,
-		replyTokens: map[string]replyTokenEntry{},
-		evIDTime:    map[string]time.Time{},
+		config:          config,
+		settings:        settings,
+		EventBus:        eventBus,
+		replyTokens:     map[string]replyTokenEntry{},
+		evIDTime:        map[string]time.Time{},
+		groupSourceType: map[string]string{},
 	}
 	channelAccessToken, _ := config["channel_access_token"].(string)
 	channelSecret, _ := config["channel_secret"].(string)
@@ -303,6 +309,10 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 			abm.Sender.UserID = containerID
 		}
 		truncateNick(&abm.Sender)
+		// 缓存群/房间真实类型，供后续 GetGroupInfo 推断 chat_type。
+		a.mu.Lock()
+		a.groupSourceType[containerID] = sourceType
+		a.mu.Unlock()
 	case "user":
 		abm.Type = platform.FriendMessage
 		abm.SessionID = userID
@@ -714,12 +724,20 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		MessageStr: abm.MessageStr,
 		Timestamp:  time.Unix(abm.Timestamp, 0),
 		MessageObj: &core.MessageObj{
-			MessageID: abm.MessageID,
-			SelfID:    abm.SelfID,
-			SessionID: abm.SessionID,
-			Platform:  "line",
+			MessageID:   abm.MessageID,
+			SelfID:      abm.SelfID,
+			SessionID:   abm.SessionID,
+			MessageType: string(abm.Type),
+			Platform:    "line",
+			MessageStr:  abm.MessageStr,
+			RawMessage:  abm.RawMessage,
+			Timestamp:   time.Unix(abm.Timestamp, 0),
+			Group:       abm.Group,
 		},
 		Metadata: map[string]interface{}{},
+	}
+	if abm.Group != nil {
+		event.Source.GroupName = abm.Group.GroupName
 	}
 	if err := a.EventBus.Publish(event); err != nil {
 		lineLogger.I18nError("发布事件失败: %v", err)
@@ -786,11 +804,16 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 		return group, nil
 	}
 
-	// Python get_group：无法从 raw_message 判定 source 类型时，
-	// group_id 以 "R" 开头视为 room，否则视为 group。
-	chatType := "group"
-	if strings.HasPrefix(groupID, "R") {
-		chatType = "room"
+	// 优先用入站事件缓存的真实类型（group/room）；缺失时回退前缀启发：
+	// group_id 以 "R" 开头视为 room，否则视为 group（对齐 Python get_group）。
+	a.mu.Lock()
+	chatType := a.groupSourceType[groupID]
+	a.mu.Unlock()
+	if chatType != "group" && chatType != "room" {
+		chatType = "group"
+		if strings.HasPrefix(groupID, "R") {
+			chatType = "room"
+		}
 	}
 
 	if chatType == "group" {

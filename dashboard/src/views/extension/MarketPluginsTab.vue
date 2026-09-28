@@ -83,6 +83,7 @@ const {
   normalizeStr,
   toPinyinText,
   toInitials,
+  getMarketPluginKey,
   pluginHeaders,
   filteredExtensions,
   filteredPlugins,
@@ -176,10 +177,13 @@ const marketCategorySelectItems = computed(() =>
 );
 
 const openMarketPluginDetail = (plugin) => {
-  if (!plugin?.name) return;
+  // 用唯一市场键导航（market_plugin_id → repo → name），避免同名插件跳错
+  // 详情页（对齐上游 getMarketPluginKey 语义）。
+  const pluginKey = getMarketPluginKey(plugin);
+  if (!pluginKey) return;
   router.push({
     name: "ExtensionMarketDetails",
-    params: { pluginId: plugin.name },
+    params: { pluginId: pluginKey },
   });
 };
 </script>
@@ -340,7 +344,7 @@ const openMarketPluginDetail = (plugin) => {
       <v-row style="min-height: 26rem" dense>
         <v-col
           v-for="plugin in paginatedPlugins"
-          :key="plugin.name"
+          :key="getMarketPluginKey(plugin)"
           cols="12"
           md="6"
           lg="4"
@@ -388,7 +392,7 @@ const openMarketPluginDetail = (plugin) => {
           <v-row class="mb-6" dense>
             <v-col
               v-for="plugin in randomPlugins"
-              :key="`random-${plugin.name}`"
+              :key="getMarketPluginKey(plugin)"
               cols="12"
               md="6"
               lg="4"

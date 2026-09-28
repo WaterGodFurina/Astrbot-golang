@@ -24,9 +24,6 @@ const isCurrentChatRoute = computed(
 const isPluginPageRoute = computed(
   () => route.path.startsWith("/plugin-page/"),
 );
-const isFullScreenRoute = computed(
-  () => isCurrentChatRoute.value || isPluginPageRoute.value,
-);
 const isProviderPageRoute = computed(() => route.path === "/providers");
 const isPlatformPageRoute = computed(() => route.path === "/platforms");
 const isViewportLockedRoute = computed(
@@ -34,6 +31,9 @@ const isViewportLockedRoute = computed(
     isCurrentChatRoute.value ||
     isProviderPageRoute.value ||
     isPlatformPageRoute.value,
+);
+const isFullScreenRoute = computed(
+  () => isCurrentChatRoute.value || isPluginPageRoute.value,
 );
 const shouldMountChat = ref(isCurrentChatRoute.value);
 
@@ -176,6 +176,12 @@ onMounted(() => {
 
 <style scoped>
 .chat-mode-container {
+  min-height: unset !important;
+  height: 100% !important;
+  overflow: hidden !important;
+}
+
+.viewport-locked-container {
   min-height: unset !important;
   height: 100% !important;
   overflow: hidden !important;

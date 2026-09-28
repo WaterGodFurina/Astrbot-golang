@@ -442,14 +442,17 @@ func (a *Adapter) processMessage(messageData map[string]interface{}, callbackPar
 		}
 		return "", nil
 	case "event":
-		event, _ := messageData["event"].(map[string]interface{})
-		if event == nil {
-			return "", nil
+		// 对齐 Python wecomai_adapter.py:343-344：webhook 分支 event 为字符串
+		// （"enter_chat"）；长连接分支为 dict（:400-401，取 eventtype）。
+		// 两种形态都兼容，避免因 payload 形态不同导致欢迎语不触发。
+		ev := ""
+		switch v := messageData["event"].(type) {
+		case string:
+			ev = v
+		case map[string]interface{}:
+			ev, _ = v["eventtype"].(string)
 		}
-		// 真实字段为 eventtype（对齐长连接分支 wecomai_adapter.py:400-401
-		// 的 event.get("eventtype")）；此前的 event["event"] 永远取不到值，
-		// 导致 webhook 模式欢迎语永不触发。
-		if ev, _ := event["eventtype"].(string); ev == "enter_chat" && a.friendMessageWelcomeText != "" {
+		if ev == "enter_chat" && a.friendMessageWelcomeText != "" {
 			// 用户进入会话，发送欢迎消息
 			resp := (WecomAIBotStreamMessageBuilder{}).MakeText(a.friendMessageWelcomeText)
 			return a.apiClient.EncryptMessage(resp, callbackParams["nonce"], callbackParams["timestamp"]), nil
@@ -711,6 +714,9 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		Message:    &message.MessageChain{Chain: abm.Message},
 		MessageStr: abm.MessageStr,
 		Timestamp:  time.Unix(abm.Timestamp, 0),
+		// 对齐 Python create_event：无条件置 is_wake / is_at_or_wake_command = True
+		// （企业微信智能机器人消息默认唤醒 LLM，无需 @）。
+		IsAtOrWakeCommand: true,
 		MessageObj: &core.MessageObj{
 			MessageID:   abm.MessageID,
 			SelfID:      abm.SelfID,
@@ -719,8 +725,12 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 			Platform:    "wecom_ai_bot",
 			MessageStr:  abm.MessageStr,
 			RawMessage:  abm.RawMessage,
+			Group:       abm.Group,
 		},
 		Metadata: map[string]interface{}{},
+	}
+	if abm.Group != nil {
+		event.Source.GroupName = abm.Group.GroupName
 	}
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.I18nError("发布企业微信智能机器人事件失败: %v", err)

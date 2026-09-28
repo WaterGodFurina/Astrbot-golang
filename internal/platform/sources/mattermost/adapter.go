@@ -419,7 +419,9 @@ func (a *Adapter) convertMessage(ctx context.Context, post, data map[string]inte
 	} else {
 		abm.Type = platform.GroupMessage
 		abm.Group = &platform.Group{GroupID: channelID}
-		if displayName := stringVal(data["display_name"]); displayName != "" {
+		// 对齐 Python mattermost_adapter.py:228：
+		// data.get("channel_display_name") or data.get("channel_name") or None。
+		if displayName := stringVal(data["channel_display_name"]); displayName != "" {
 			abm.Group.GroupName = displayName
 		} else if channelName := stringVal(data["channel_name"]); channelName != "" {
 			abm.Group.GroupName = channelName
@@ -440,25 +442,26 @@ func (a *Adapter) convertMessage(ctx context.Context, post, data map[string]inte
 	return abm
 }
 
-// GetGroup enriches Mattermost channel metadata (Python
-// MattermostMessageEvent.get_group, mattermost_event.py:72-88): group_name
-// from display_name/name/channel_id; members from recent sender + paginated
-// channel members; member_count from channel stats.
-func (a *Adapter) GetGroup(groupID string) (*platform.Group, error) {
+// GetGroupInfo enriches Mattermost channel metadata (Python
+// MattermostMessageEvent.get_group, mattermost_event.py:72-181): group_name
+// from channel_display_name/name; members' nicknames via POST /users/ids;
+// admins from membership roles/scheme_admin; member_count from channel stats
+// (fallback len(members)). Lookup failures return the basic group (no error).
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
 	if groupID == "" {
 		return nil, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	group := &platform.Group{GroupID: groupID, GroupName: groupID, GroupAdmins: []string{}}
+	if a.client == nil {
+		return group, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+
 	channel, err := a.client.GetChannel(ctx, groupID)
 	if err != nil {
-		return nil, err
-	}
-	group := &platform.Group{
-		GroupID:     groupID,
-		GroupName:   groupID,
-		GroupOwner:  "",
-		GroupAdmins: []string{},
+		// 对齐 Python：channel 查询失败返回基础 Group（不报错）。
+		return group, nil
 	}
 	if name := stringVal(channel["display_name"]); name != "" {
 		group.GroupName = name
@@ -466,48 +469,93 @@ func (a *Adapter) GetGroup(groupID string) (*platform.Group, error) {
 		group.GroupName = name
 	}
 
-	stats, err := a.client.GetChannelStats(ctx, groupID)
-	if err == nil {
+	if stats, err := a.client.GetChannelStats(ctx, groupID); err == nil {
 		if mc, ok := stats["member_count"].(float64); ok {
 			c := int(mc)
 			group.MemberCount = &c
 		}
 	}
 
-	var members []platform.MessageMember
+	// 分页拉取成员关系（user_id → membership），失败时返回已得信息。
+	memberships := map[string]map[string]interface{}{}
 	page := 0
 	for {
 		items, err := a.client.GetChannelMembers(ctx, groupID, page, 200)
 		if err != nil {
-			break
-		}
-		if len(items) == 0 {
-			break
+			return group, nil
 		}
 		for _, m := range items {
-			uid := stringVal(m["user_id"])
-			if uid == "" {
-				continue
+			if uid := stringVal(m["user_id"]); uid != "" {
+				memberships[uid] = m
 			}
-			displayName := stringVal(m["display_name"])
-			if displayName == "" {
-				displayName = stringVal(m["username"])
-			}
-			if displayName == "" {
-				displayName = uid
-			}
-			members = append(members, platform.MessageMember{UserID: uid, Nickname: displayName})
 		}
 		if len(items) < 200 {
+			break
+		}
+		if group.MemberCount != nil && len(memberships) >= *group.MemberCount {
 			break
 		}
 		page++
 	}
 
+	// 批量取用户昵称（每批 100，对齐 Python get_users_by_ids）。
+	userIDs := make([]string, 0, len(memberships))
+	for uid := range memberships {
+		userIDs = append(userIDs, uid)
+	}
+	usersByID := map[string]map[string]interface{}{}
+	for off := 0; off < len(userIDs); off += 100 {
+		end := off + 100
+		if end > len(userIDs) {
+			end = len(userIDs)
+		}
+		users, err := a.client.GetUsersByIDs(ctx, userIDs[off:end])
+		if err != nil {
+			continue
+		}
+		for _, u := range users {
+			if uid := stringVal(u["id"]); uid != "" {
+				usersByID[uid] = u
+			}
+		}
+	}
+
+	var members []platform.MessageMember
+	var admins []string
+	for uid, membership := range memberships {
+		u := usersByID[uid]
+		nick := stringVal(u["nickname"])
+		if nick == "" {
+			nick = stringVal(u["username"])
+		}
+		if nick == "" {
+			nick = uid
+		}
+		members = append(members, platform.MessageMember{UserID: uid, Nickname: nick})
+
+		isAdmin := false
+		for _, r := range strings.Fields(stringVal(membership["roles"])) {
+			if r == "channel_admin" {
+				isAdmin = true
+				break
+			}
+		}
+		if b, ok := membership["scheme_admin"].(bool); ok && b {
+			isAdmin = true
+		}
+		if isAdmin {
+			admins = append(admins, uid)
+		}
+	}
+
 	if len(members) > 0 {
 		group.Members = members
 	}
-
+	group.GroupAdmins = admins
+	if group.MemberCount == nil {
+		c := len(members)
+		group.MemberCount = &c
+	}
 	return group, nil
 }
 

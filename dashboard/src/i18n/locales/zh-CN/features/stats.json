@@ -26,15 +26,15 @@
     },
     "todayModelCalls": {
       "label": "今日模型调用",
-      "note": "词元（Tokens）"
+      "note": "Tokens"
     },
     "cpu": {
       "label": "CPU",
       "note": "程序 CPU 占用"
     },
     "memory": {
-      "label": "总运存",
-      "note": "进程 {process} · 插件 {plugins} / 系统 {systemMemory}"
+      "label": "进程内存",
+      "note": "系统内存 {systemMemory}"
     },
     "uptime": {
       "label": "运行时间",
@@ -42,20 +42,20 @@
     }
   },
   "messageOverview": {
-    "title": "消息概览",
+    "title": "消息",
     "subtitle": "机器人消息数据统计"
   },
   "messageTrend": {
     "title": "消息趋势",
-    "subtitle": "{range}按小时聚合",
-    "totalMessages": "总消息数"
+    "totalMessages": "总消息数",
+    "subtitle": "{range}按小时聚合"
   },
   "platformRanking": {
     "title": "平台消息排名",
     "subtitle": "{range}按聚合消息总量排序"
   },
   "modelCalls": {
-    "title": "模型调用",
+    "title": "AI 模型",
     "subtitle": "模型调用数据统计"
   },
   "modelTrend": {
@@ -71,11 +71,12 @@
     "successRate": "调用成功率"
   },
   "modelRanking": {
-    "title": "{range}模型调用排名",
+    "title": "模型用量排名",
     "subtitle": "模型调用词元（Tokens）排名"
   },
   "sessionRanking": {
-    "title": "{range}会话词元（Tokens）Top 10",
+    "title": "{range}会话模型用量 Top 10",
+    "openConversation": "查看对话",
     "subtitle": "词元（Tokens）用量最大的会话排名"
   },
   "empty": {
@@ -88,7 +89,7 @@
     "others": "其他"
   },
   "units": {
-    "tokens": "词元（Tokens）",
+    "tokens": "Tokens",
     "tpm": "TPM",
     "gb": "GB",
     "mb": "MB",

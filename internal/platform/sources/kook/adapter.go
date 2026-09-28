@@ -756,6 +756,25 @@ type orderMessage struct {
 // Send 发送消息链到指定会话 (对应 Python KookEvent.send)。
 // sessionID 为频道 id (群聊/广播) 或用户 id (私聊)。
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
+	return a.sendChain(sessionID, chain, "")
+}
+
+// SendByEvent 以事件上下文发送 (对齐 Python send_by_session 依赖
+// session.message_type 选择接口)：群聊用 message/create，私聊用
+// direct-message/create，而不是靠"最近一次入站 channel_type"猜测。
+func (a *Adapter) SendByEvent(sessionID string, chain *message.MessageChain, event *core.Event) error {
+	override := platform.MessageType("")
+	if event != nil {
+		if event.Source.IsGroup {
+			override = platform.GroupMessage
+		} else {
+			override = platform.FriendMessage
+		}
+	}
+	return a.sendChain(sessionID, chain, override)
+}
+
+func (a *Adapter) sendChain(sessionID string, chain *message.MessageChain, overrideType platform.MessageType) error {
 	if chain == nil {
 		return nil
 	}
@@ -779,15 +798,18 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 		}
 	}
 
-	// 按会话最近一次收到消息的 channel_type 选择发送接口 (对应 Python
-	// kook_client.send_text 中 FRIEND_MESSAGE 走 direct-message/create)。
+	// 事件上下文优先用事件类型；主动推送回退"最近一次入站 channel_type"，
 	// 未知会话回退频道消息接口 (message/create) 并告警。
 	msgType := platform.GroupMessage
-	channelType := a.knownChannelType(sessionID)
-	if channelType == KookChannelPerson {
-		msgType = platform.FriendMessage
-	} else if channelType == "" {
-		logger.I18nWarn("[KOOK] 未记录会话 %q 的 channel_type, 回退使用频道消息接口 (message/create) 发送", sessionID)
+	if overrideType != "" {
+		msgType = overrideType
+	} else {
+		channelType := a.knownChannelType(sessionID)
+		if channelType == KookChannelPerson {
+			msgType = platform.FriendMessage
+		} else if channelType == "" {
+			logger.I18nWarn("[KOOK] 未记录会话 %q 的 channel_type, 回退使用频道消息接口 (message/create) 发送", sessionID)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

@@ -6,9 +6,9 @@ require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
 	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.3
-	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.9
+	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.10
 	github.com/blusewang/wx v1.3.3
-	github.com/bwmarrin/discordgo v0.26.0
+	github.com/bwmarrin/discordgo v0.29.0
 	github.com/dobest1024/go-weixin-ilink v0.2.0
 	github.com/fogleman/gg v1.3.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -26,6 +26,7 @@ require (
 	github.com/pquerna/otp v1.5.0
 	github.com/rivo/uniseg v0.4.7
 	github.com/slack-go/slack v0.27.0
+	github.com/the-open-agent/dashscope-go-sdk v1.1.0
 	github.com/xuri/excelize/v2 v2.11.0
 	github.com/yitsushi/go-misskey v1.1.6
 	golang.org/x/crypto v0.55.0
@@ -38,6 +39,11 @@ require (
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.56.0
+)
+
+require (
+	github.com/gabriel-vasile/mimetype v1.4.3 // indirect
+	go.uber.org/mock v0.4.0 // indirect
 )
 
 require (
@@ -99,3 +105,8 @@ require (
 // nanovec 上游未修复 Windows 编译（flat.go 直接用 unix.Mmap 且无 build tag）；
 // 使用 fork（含 Windows mmap 平台封装补丁，内容与上游 956786fcfa80 一致）。
 replace github.com/hungpdn/nanovec => github.com/WaterGodFurina/nanovec v1.0.1
+
+// go-weixin-ilink 上游 Message 结构缺少秒级 create_time 字段（仅有
+// create_time_ms），导致只能收到秒级时间戳的服务端消息回退为当前时间；
+// 使用 fork（新增 Message.CreateTime，模块路径改为 fork 归属）。
+replace github.com/dobest1024/go-weixin-ilink => github.com/WaterGodFurina/go-weixin-ilink v0.2.1

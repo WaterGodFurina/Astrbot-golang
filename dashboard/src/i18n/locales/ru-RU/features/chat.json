@@ -240,13 +240,13 @@
     "createSessionFailed": "Ошибка создания сессии, обновите страницу"
   },
   "batch": {
-    "confirmDelete": "Удалить {count} диалогов? Это действие необратимо.",
-    "delete": "Удалить",
-    "deselectAll": "Снять выделение",
-    "exit": "Выйти",
-    "partialFailure": "{failed} из {total} диалогов не удалось удалить",
-    "requestFailed": "Не удалось удалить диалоги. Попробуйте ещё раз.",
+    "selected": "Выбрано: {count}",
+    "confirmDelete": "Удалить {count} диалогов? Это действие нельзя отменить.",
     "selectAll": "Выбрать все",
-    "selected": "Выбрано: {count}"
+    "deselectAll": "Снять выделение со всех",
+    "delete": "Удалить",
+    "exit": "Выйти",
+    "partialFailure": "Не удалось удалить {failed} из {total} диалогов",
+    "requestFailed": "Не удалось удалить диалоги. Попробуйте ещё раз."
   }
 }

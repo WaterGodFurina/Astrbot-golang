@@ -1023,10 +1023,14 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 			Platform:    "dingtalk",
 			MessageStr:  abm.MessageStr,
 			RawMessage:  abm.RawMessage,
+			Group:       abm.Group,
 		},
 		Metadata: map[string]interface{}{
 			"dingtalk_staff_id": msgStaffID(abm.RawMessage),
 		},
+	}
+	if abm.Group != nil {
+		event.Source.GroupName = abm.Group.GroupName
 	}
 	if err := a.EventBus.Publish(event); err != nil {
 		logger.I18nError("发布钉钉消息事件失败: %v", err)

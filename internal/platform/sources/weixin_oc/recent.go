@@ -220,14 +220,21 @@ func (a *Adapter) buildReplyFromRefMsg(sessionID string, ref *ilink.RefMessage) 
 		refMsgID = mi.MsgID
 	}
 
-	// 1) 内嵌文本直接匹配。
+	// 1) 内嵌文本直接匹配。SDK 的 RefMessage 未暴露 from_user_id，故回退到
+	// 时间窗就近匹配以补齐被引用消息的发送者（对齐 Python
+	// _build_reply_component_from_ref：direct-ref-msg 路径同样填 sender_id）。
 	if quotedText != "" {
-		return &message.Reply{
+		reply := &message.Reply{
 			MessageID:  refMsgID,
 			MessageStr: quotedText,
 			Chain:      []message.Component{&message.Plain{Text: quotedText}},
 			CreatedAt:  time.UnixMilli(refTimeMs),
 		}
+		if m := a.matchRecentReply(sessionID, refTimeMs); m.matched != nil {
+			reply.SenderID = m.matched.senderID
+			reply.SenderNick = m.matched.senderNick
+		}
+		return reply
 	}
 
 	// 2) 时间窗就近匹配：回填被引用消息的完整组件与文本（含媒体）。

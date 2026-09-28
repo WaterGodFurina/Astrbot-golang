@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -135,6 +136,38 @@ func (c *MattermostClient) GetChannel(ctx context.Context, channelID string) (ma
 // GetChannelStats 获取频道统计（GET /api/v4/channels/{id}/stats）。
 func (c *MattermostClient) GetChannelStats(ctx context.Context, channelID string) (map[string]interface{}, error) {
 	return c.getJSON(ctx, "channels/"+channelID+"/stats")
+}
+
+// GetUsersByIDs 批量获取用户信息（POST /api/v4/users/ids，请求体为用户 ID 数组，
+// 对应 Python client.get_users_by_ids）。
+func (c *MattermostClient) GetUsersByIDs(ctx context.Context, ids []string) ([]map[string]interface{}, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	u := c.baseURL + "/api/v4/users/ids"
+	raw, err := json.Marshal(ids)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = c.jsonHeaders()
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("mattermost POST users/ids 失败: %d %s", resp.StatusCode, body)
+	}
+	var users []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&users); err != nil {
+		return nil, err
+	}
+	return users, nil
 }
 
 // GetChannelMembers 获取频道成员（GET /api/v4/channels/{id}/members）。
@@ -492,9 +525,17 @@ func (c *MattermostClient) ParsePostAttachments(ctx context.Context, fileIDs []s
 			// 对应 Image.fromFileSystem
 			components = append(components, &message.Image{Path: filePath, File: filePath})
 		case strings.HasPrefix(mimeType, "audio/"):
-			// Python 在此处会调用 MediaResolver 将音频转为 wav；Go 侧无转码能力，
-			// 直接以 Record 组件引用下载后的文件（扩展名保持原样）。
-			components = append(components, &message.Record{URL: filePath, File: filePath})
+			// 对齐 Python client.py:330-335：音频经 MediaResolver(target_format="wav")
+			// 转 wav 后以 Record 组件引用；失败时降级引用原文件。
+			wavPath := filePath
+			if converted, err := utils.EnsureWAV(filePath); err == nil && converted != "" {
+				wavPath = converted
+			}
+			if wavPath != filePath {
+				scheduleAttachmentCleanup(wavPath)
+				tempPaths = append(tempPaths, wavPath)
+			}
+			components = append(components, &message.Record{URL: wavPath, File: wavPath})
 		case strings.HasPrefix(mimeType, "video/"):
 			components = append(components, &message.Video{URL: filePath, Path: filePath})
 		default:

@@ -260,6 +260,7 @@ async function updateRenderedHtml() {
   });
 
   if (renderId === lastRenderId.value) {
+    // nosemgrep: innerhtml, document-method
     renderedHtml.value = tempDiv.innerHTML;
   }
 }

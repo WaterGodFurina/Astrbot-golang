@@ -33,8 +33,8 @@
       "note": "Использование CPU AstrBot"
     },
     "memory": {
-      "label": "Общая память",
-      "note": "Процесс {process} · Плагины {plugins} / Система {systemMemory}"
+      "label": "Память процесса",
+      "note": "Системная память {systemMemory}"
     },
     "uptime": {
       "label": "Время работы",
@@ -42,20 +42,20 @@
     }
   },
   "messageOverview": {
-    "title": "Обзор сообщений",
+    "title": "Сообщения",
     "subtitle": "Статистика сообщений бота"
   },
   "messageTrend": {
     "title": "Динамика сообщений",
-    "subtitle": "{range}, агрегация по часам",
-    "totalMessages": "Всего сообщений"
+    "totalMessages": "Всего сообщений",
+    "subtitle": "{range}, агрегация по часам"
   },
   "platformRanking": {
     "title": "Рейтинг платформ по сообщениям",
     "subtitle": "{range}, сортировка по общему числу сообщений"
   },
   "modelCalls": {
-    "title": "Вызовы моделей",
+    "title": "Модели ИИ",
     "subtitle": "Статистика вызовов моделей"
   },
   "modelTrend": {
@@ -71,11 +71,12 @@
     "successRate": "Доля успешных вызовов"
   },
   "modelRanking": {
-    "title": "{range} рейтинг вызовов моделей",
+    "title": "Рейтинг использования моделей",
     "subtitle": "Рейтинг по токенам вызовов моделей"
   },
   "sessionRanking": {
-    "title": "{range} топ-10 сессий по токенам",
+    "title": "{range} топ-10 сессий по использованию моделей",
+    "openConversation": "Открыть диалог",
     "subtitle": "Сессии с наибольшим расходом токенов"
   },
   "empty": {

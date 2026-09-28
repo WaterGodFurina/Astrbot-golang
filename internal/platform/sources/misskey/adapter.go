@@ -770,6 +770,16 @@ func (a *Adapter) convertRoomMessage(rawData map[string]interface{}) *platform.A
 	senderInfo := ExtractSenderInfo(rawData, true)
 	roomID, _ := rawData["toRoomId"].(string)
 	abm := CreateBaseMessage(rawData, senderInfo, a.botSelfID, false, roomID)
+	// 对齐 Python misskey_adapter.py:724-730：room 事件用 toRoom 富化 Group
+	// （name / ownerId），而非仅保留 group_id。
+	if roomData, ok := rawData["toRoom"].(map[string]interface{}); ok && abm.Group != nil {
+		if name, _ := roomData["name"].(string); name != "" {
+			abm.Group.GroupName = name
+		}
+		if owner, _ := roomData["ownerId"].(string); owner != "" {
+			abm.Group.GroupOwner = owner
+		}
+	}
 	CacheUserInfo(a.userCache, senderInfo, rawData, a.botSelfID, false)
 	CacheRoomInfo(a.userCache, rawData, a.botSelfID)
 
@@ -813,6 +823,10 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 	}
 	chain := &message.MessageChain{Chain: abm.Message}
 	ts := time.Unix(abm.Timestamp, 0)
+	groupName := ""
+	if abm.Group != nil {
+		groupName = abm.Group.GroupName
+	}
 	event := &core.Event{
 		Type:       core.EventMessage,
 		Message:    chain,
@@ -826,6 +840,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 			MessageStr:  abm.MessageStr,
 			RawMessage:  abm.RawMessage,
 			Timestamp:   ts,
+			Group:       abm.Group,
 		},
 		Source: core.EventSource{
 			Platform:   a.Type(),
@@ -835,6 +850,7 @@ func (a *Adapter) publishMessage(abm *platform.AstrBotMessage) {
 			SenderName: abm.Sender.Nickname,
 			ConvID:     abm.SessionID,
 			IsGroup:    abm.Type == platform.GroupMessage,
+			GroupName:  groupName,
 		},
 		Timestamp: ts,
 		Metadata:  make(map[string]interface{}),

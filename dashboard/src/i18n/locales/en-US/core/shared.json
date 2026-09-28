@@ -14,6 +14,12 @@
     "chunkCount": "{count} chunk(s)"
   },
   "pluginSetSelector": {
+    "title": "Plugins",
+    "subtitle": "Choose which plugins this profile can use.",
+    "preset": "Preset",
+    "searchPlaceholder": "Search plugins",
+    "selectAll": "Select all",
+    "noSearchResults": "No matching plugins",
     "notSelected": "No plugins enabled",
     "allPlugins": "All plugins enabled (*)",
     "selectedCount": "{count} plugin(s) selected",
@@ -30,18 +36,15 @@
     "notActivated": "Not activated",
     "note": "*System plugins and disabled plugins are not shown.",
     "selectedPluginsLabel": "Selected Plugins:",
-    "allPluginsLabel": "All Plugins",
-    "title": "Plugins",
-    "subtitle": "Choose which plugins this profile can use.",
-    "preset": "Preset",
-    "searchPlaceholder": "Search plugins",
-    "selectAll": "Select all",
-    "noSearchResults": "No matching plugins"
+    "allPluginsLabel": "All Plugins"
   },
   "providerSelector": {
     "allSources": "All sources",
     "filterSource": "Filter by provider source",
     "notSelected": "Not selected",
+    "defaultModel": "Default model",
+    "model": "Model",
+    "searchPlaceholder": "Search models",
     "buttonText": "Select Provider...",
     "dialogTitle": "Select Provider",
     "loading": "Loading...",
@@ -54,11 +57,8 @@
     "createProvider": "Create Provider",
     "manageProviders": "Provider Management",
     "selectProviderPool": "Select Provider Pool...",
-    "selectedCount": "{count} provider(s) selected",
-    "defaultModel": "Default model",
-    "model": "Model",
-    "searchPlaceholder": "Search models",
-    "selectedModelCount": "{count} model(s) selected"
+    "selectedModelCount": "{count} model(s) selected",
+    "selectedCount": "{count} provider(s) selected"
   },
   "personaSelector": {
     "notSelected": "Not selected",

@@ -714,7 +714,7 @@ func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event
 		// 与 ProcessStage 的 no_permission_reply 相同：调度器对 Continue:false 直接短路，写 event.Result 的提示不会被 RespondStage 送达，必须直接经平台发送。
 		if event.IsAtOrWakeCommand && s.platformMgr != nil {
 			chain := message.NewMessageChain(&message.Plain{Text: "Your message or the model response contains inappropriate content and has been blocked."})
-			_ = s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
+			_ = s.platformMgr.SendByEvent(event, chain)
 		}
 		event.Stop()
 		logger.Debug("Content safety check failed: %s", info)
@@ -1439,7 +1439,21 @@ func (s *ProcessStage) callLLMAgent(ctx context.Context, event *core.Event) erro
 	streamer := newStreamSender(s, event)
 	defer streamer.flush()
 
-	resp, err := s.runAgentToolLoop(ctx, ar, streamer)
+	// 按 agent_runner.runner_type 分发：local 走内置 agent loop，其余走第三方 runner
+	// （对齐 Python third_party.py）。
+	var resp *provider.LLMResponse
+	switch agentRunnerType(s.config) {
+	case "dify":
+		resp, err = s.runDifyAgent(ctx, ar, streamer)
+	case "coze":
+		resp, err = s.runCozeAgent(ctx, ar, streamer)
+	case "dashscope":
+		resp, err = s.runDashscopeAgent(ctx, ar, streamer)
+	case "deerflow":
+		resp, err = s.runDeerflowAgent(ctx, ar, streamer)
+	default:
+		resp, err = s.runAgentToolLoop(ctx, ar, streamer)
+	}
 	if err != nil {
 		// A failure reply was already written to event.Result; 对齐 py
 		// runner 终态 ERROR：记录终态错误后返回，发布方（cron）据此记 failed。
@@ -2414,9 +2428,9 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 					ctrlPending = ctrlPending[safe:]
 				}
 			}
-			// Display the reasoning content when showReasoning is enabled (mirrors the Python `chain.type == "reasoning" and not show_reasoning: continue`). 通过回退取值接口 GetReasoningContent 读取，空值返回空串，不显示。showReasoning 由 provider_settings.display_reasoning_text 与 webchat 请求级 enable_reasoning extra 共同决定（对齐 py internal.py）。
+			// Display the reasoning content when showReasoning is enabled (mirrors the Python `chain.type == "reasoning" and not show_reasoning: continue`). 通过回退取值接口 GetReasoningContent 读取，空值返回空串，不显示。showReasoning 由 provider_settings.display_reasoning_text 与 webchat 请求级 enable_reasoning extra 共同决定（对齐 py internal.py）。推理走独立 reasoning 链（pushReasoning），不混入正文流。
 			if showReasoning && chunk.GetReasoningContent() != "" {
-				streamer.push(chunk.GetReasoningContent())
+				streamer.pushReasoning(chunk.GetReasoningContent())
 			}
 			continue
 		}
@@ -2457,16 +2471,20 @@ func (s *ProcessStage) chatRound(ctx context.Context, inst provider.ChatProvider
 
 // streamSender emits streamed content. Priority:  1. Native stream-edit messaging (QQ C2C) — deltas are throttled into a     single progressively-updated message. Requires markdown permission on     QQ Open Platform; if the fragment call fails we fall back to #2.  2. Sentence segmentation — complete sentences (。！？!?；;\n) are sent as     separate natural messages as they form. Group chats and unsupported platforms get no incremental sends; the final response is delivered once by RespondStage (matches AstrBot).
 type streamSender struct {
-	stage     *ProcessStage
-	event     *core.Event
-	pending   strings.Builder
-	lastFlush time.Time
-	frag      platform.StreamFragmenter
-	msgID     string
-	sent      bool
-	done      bool
-	segMode   bool
-	fragWarn  bool
+	stage   *ProcessStage
+	event   *core.Event
+	pending strings.Builder
+	// pendingReasoning 独立缓冲流式推理内容：推理与正文互不混流，按
+	// chain_type="reasoning" 分段输出，前端才能在思考块展示（对齐 py
+	// `chain.type == "reasoning"` 的独立链语义）。
+	pendingReasoning strings.Builder
+	lastFlush        time.Time
+	frag             platform.StreamFragmenter
+	msgID            string
+	sent             bool
+	done             bool
+	segMode          bool
+	fragWarn         bool
 }
 
 func newStreamSender(stage *ProcessStage, event *core.Event) *streamSender {
@@ -2495,6 +2513,60 @@ func (ss *streamSender) push(text string) {
 	if ss.segMode {
 		ss.flushSentences()
 	}
+}
+
+// pushReasoning accumulates streamed reasoning content and flushes it as
+// reasoning-tagged segments (MessageChain.Type="reasoning" → dashboard
+// chain_type="reasoning" 思考块）。推理不混入正文缓冲，也不进入 QQ 原生
+// 流式编辑消息（避免推理被编进最终可编辑消息）。
+func (ss *streamSender) pushReasoning(text string) {
+	if text == "" {
+		return
+	}
+	ss.pendingReasoning.WriteString(text)
+	ss.flushReasoningSentences()
+}
+
+// flushReasoningSentences 按句切分推理缓冲，逐段以 reasoning 链发送。
+func (ss *streamSender) flushReasoningSentences() {
+	for {
+		s := ss.pendingReasoning.String()
+		if len(s) > sentenceMaxLen {
+			seg, rest := cutUTF8(s, sentenceMaxLen)
+			if seg != "" {
+				ss.sendReasoningSegment(seg)
+				ss.pendingReasoning.Reset()
+				ss.pendingReasoning.WriteString(rest)
+				continue
+			}
+		}
+		seg, rest := cutAtSentenceBoundary(s)
+		if seg == "" {
+			return
+		}
+		ss.sendReasoningSegment(seg)
+		ss.pendingReasoning.Reset()
+		ss.pendingReasoning.WriteString(rest)
+	}
+}
+
+// sendReasoningSegment 发送单段推理链（Type="reasoning"），普通平台按原样
+// 渲染文本（行为不变），dashboard 据 Type 区分思考块。
+func (ss *streamSender) sendReasoningSegment(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" || ss.stage.platformMgr == nil {
+		return
+	}
+	logger.Debug("stream reasoning segment send: %.300s", text)
+	chain := &message.MessageChain{
+		Type:  "reasoning",
+		Chain: []message.Component{&message.Plain{Text: text}},
+	}
+	if err := ss.stage.platformMgr.SendByEvent(ss.event, chain); err != nil {
+		logger.I18nWarn("流式推理片段发送失败: %v", err)
+		return
+	}
+	ss.sent = true
 }
 
 // flushFragment pushes the full accumulated text through the native stream-edit protocol (final=true also emits the state=10 end fragment).
@@ -2578,7 +2650,7 @@ func (ss *streamSender) sendSegment(text string) {
 	}
 	logger.Debug("stream segment send: %.300s", text)
 	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: text}}}
-	if err := ss.stage.platformMgr.Send(ss.event.Source.Platform, ss.event.Source.ConvID, chain); err != nil {
+	if err := ss.stage.platformMgr.SendByEvent(ss.event, chain); err != nil {
 		logger.I18nWarn("流式片段发送失败: %v", err)
 		return
 	}
@@ -2633,6 +2705,11 @@ func (ss *streamSender) flush() {
 			ss.sendSegment(ss.pending.String())
 			ss.pending.Reset()
 		}
+	}
+	// 推理尾缓冲（末尾无句读符的残段）单独收尾，避免推理内容漏发。
+	if ss.pendingReasoning.Len() > 0 {
+		ss.sendReasoningSegment(ss.pendingReasoning.String())
+		ss.pendingReasoning.Reset()
 	}
 }
 
@@ -5171,7 +5248,7 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 			if len(media) > 0 {
 				chain := event.Result.ToMessageChain()
 				chain.Chain = media
-				if err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain); err != nil {
+				if err := s.platformMgr.SendByEvent(event, chain); err != nil {
 					logger.Error("Failed to send streamed media chain: %v", err)
 				}
 			}
@@ -5225,7 +5302,7 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 			sendOne := func(comps []message.Component) error {
 				chain := event.Result.ToMessageChain()
 				chain.Chain = comps
-				return s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
+				return s.platformMgr.SendByEvent(event, chain)
 			}
 			sent := false
 			for _, comp := range sepComps {
@@ -5288,7 +5365,7 @@ func (s *RespondStage) sendSegmented(ctx context.Context, event *core.Event, cha
 	sendOne := func(comps []message.Component) {
 		chain := event.Result.ToMessageChain()
 		chain.Chain = comps
-		if err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain); err != nil {
+		if err := s.platformMgr.SendByEvent(event, chain); err != nil {
 			logger.Error("Failed to send segmented message chain: %v", err)
 		}
 	}

@@ -179,14 +179,22 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		// 链路模式），解码后按形态分流。
 		Message json.RawMessage `json:"message"`
 		// SenderID / Flags 同本体队列 payload 字段。
-		SenderID string                 `json:"sender_id"`
-		Flags    map[string]interface{} `json:"flags"`
+		SenderID  string                 `json:"sender_id"`
+		MessageID string                 `json:"message_id"`
+		Flags     map[string]interface{} `json:"flags"`
 		// 遗留顶层 flag 字段：flags.* 未传时回退（对齐本体
 		// resolve_webchat_request_flags 的 payload 顶层字段语义）。
 		EnableInlineGenui         *bool `json:"enable_inline_genui"`
 		EnableDefaultSystemPrompt *bool `json:"enable_default_system_prompt"`
 		EnableStreaming           *bool `json:"enable_streaming"`
 		EnableReasoning           *bool `json:"enable_reasoning"`
+		// 对齐本体 webchat_adapter.create_event 注入的 extra 字段。
+		SelectedProvider     string `json:"selected_provider"`
+		SelectedModel        string `json:"selected_model"`
+		ActionType           string `json:"action_type"`
+		LLMCheckpointID      string `json:"llm_checkpoint_id"`
+		ThreadSelectedText   string `json:"thread_selected_text"`
+		APIKeyAllowAdminRole *bool  `json:"_api_key_allow_admin_role"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
@@ -247,7 +255,19 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		Message:    chain,
 		MessageStr: messageText,
 		Timestamp:  time.Now(),
-		Metadata:   make(map[string]interface{}),
+		// 对齐 Python webchat_adapter.py:204-226：补全 message_obj（此前 Go
+		// 只构造 Source，子进程 SDK 读到的 message_id 为空）。
+		MessageObj: &core.MessageObj{
+			MessageID:   req.MessageID,
+			SelfID:      "webchat",
+			SessionID:   req.SessionID,
+			MessageType: "FriendMessage",
+			Platform:    "webchat",
+			MessageStr:  messageText,
+			RawMessage:  req,
+			Timestamp:   time.Now(),
+		},
+		Metadata: make(map[string]interface{}),
 	}
 	// flags 未传默认 true（对齐本体 request_flags.resolve_webchat_request_flags：
 	// flags.* 优先，其次请求体顶层遗留字段）。
@@ -257,7 +277,27 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 	event.Metadata["flags"] = flags
 	applyRequestFlagsExtras(event, flags)
 	// 对齐本体 webchat_adapter.create_event 注入 extra 的字段。
+	// action_type / llm_checkpoint_id / thread_selected_text /
+	// selected_provider / selected_model（请求体显式携带时覆盖）+ 管理员角色开关。
 	event.Metadata["action_type"] = "chat"
+	if req.ActionType != "" {
+		event.Metadata["action_type"] = req.ActionType
+	}
+	if req.SelectedProvider != "" {
+		event.Metadata["selected_provider"] = req.SelectedProvider
+	}
+	if req.SelectedModel != "" {
+		event.Metadata["selected_model"] = req.SelectedModel
+	}
+	if req.LLMCheckpointID != "" {
+		event.Metadata["llm_checkpoint_id"] = req.LLMCheckpointID
+	}
+	if req.ThreadSelectedText != "" {
+		event.Metadata["thread_selected_text"] = req.ThreadSelectedText
+	}
+	if req.APIKeyAllowAdminRole != nil {
+		event.Metadata["_api_key_allow_admin_role"] = *req.APIKeyAllowAdminRole
+	}
 
 	// typing 信号（对齐本体 send_typing）：发布事件前向等待中的 /poll
 	// 投递哨兵，客户端感知"开始处理"。

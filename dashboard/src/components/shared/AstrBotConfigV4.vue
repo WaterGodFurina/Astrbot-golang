@@ -268,7 +268,6 @@ function getSpecialSubtype(value) {
       </v-list-item-title>
       <v-list-item-subtitle class="config-hint">
         <span v-if="metadata[metadataKey]?.obvious_hint && metadata[metadataKey]?.hint" class="important-hint">‼️</span>
-        <!-- nosemgrep: avoid-v-html -->
         <span v-html="renderHint(metadata[metadataKey]?.hint)"></span>
       </v-list-item-subtitle>
     </v-card-text>
@@ -290,7 +289,6 @@ function getSpecialSubtype(value) {
 
               <v-list-item-subtitle class="property-hint">
                 <span v-if="itemMeta?.obvious_hint && itemMeta?.hint" class="important-hint">‼️</span>
-                <!-- nosemgrep: avoid-v-html -->
                 <span v-html="renderHint(getItemHint(itemKey, itemMeta))"></span>
               </v-list-item-subtitle>
             </v-list-item>
@@ -378,7 +376,6 @@ function getSpecialSubtype(value) {
 
                     <v-list-item-subtitle class="property-hint">
                       <span v-if="itemMeta?.obvious_hint && itemMeta?.hint" class="important-hint">‼️</span>
-                      <!-- nosemgrep: avoid-v-html -->
                       <span v-html="renderHint(getItemHint(itemKey, itemMeta))"></span>
                     </v-list-item-subtitle>
                   </v-list-item>
@@ -426,7 +423,7 @@ function getSpecialSubtype(value) {
               </v-row>
 
               <v-row
-                v-if="!itemMeta?.invisible && itemMeta?._special === 'select_persona' && itemKey === 'provider_settings.default_personality'"
+                v-if="!itemMeta?.invisible && itemMeta?._special === 'select_persona'"
                 class="persona-preview-row"
               >
                 <v-col cols="12" class="persona-preview-display">

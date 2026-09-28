@@ -307,8 +307,6 @@ const openWebui = () => {
                             ? tm('buttons.stop')
                             : tm('buttons.load')
                         "
-                        :disabled="extension.__toggle_pending"
-                        :loading="extension.__toggle_pending"
                         color="success"
                         density="compact"
                         hide-details

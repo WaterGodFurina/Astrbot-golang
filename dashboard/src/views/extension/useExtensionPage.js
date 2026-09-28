@@ -808,6 +808,16 @@ export const useExtensionPage = (initialTab = "installed") => {
     return String(plugin?.market_plugin_id || "").trim();
   };
 
+  // 市场条目的唯一标识：metadata name 并不唯一（不同作者可能发布同名插件），
+  // 因此回退到 repo，最后才是 name（对齐上游 getMarketPluginKey 语义）。
+  const getMarketPluginKey = (plugin) => {
+    return (
+      getMarketPluginId(plugin) ||
+      String(plugin?.repo || "").trim() ||
+      String(plugin?.name || "").trim()
+    );
+  };
+
   const getMarketInstallSourcePayload = () => {
     const plugin = selectedMarketInstallPlugin.value;
     if (
@@ -3060,6 +3070,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     normalizeStr,
     toPinyinText,
     toInitials,
+    getMarketPluginKey,
     filteredExtensions,
     filteredPlugins,
     filteredMarketPlugins,

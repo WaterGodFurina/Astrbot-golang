@@ -268,7 +268,7 @@ func (s *ProcessStage) replyText(event *core.Event, text string) {
 		return
 	}
 	chain := message.NewMessageChain(&message.Plain{Text: text})
-	_ = s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
+	_ = s.platformMgr.SendByEvent(event, chain)
 }
 
 func itoa(n int) string {

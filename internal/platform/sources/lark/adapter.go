@@ -301,9 +301,10 @@ func (a *Adapter) convertMsg(event *larkim.P2MessageReceiveV1) {
 	if msg.ChatType != nil && *msg.ChatType == "group" {
 		abm.Type = platform.GroupMessage
 	}
-	abm.Group = &platform.Group{GroupID: ""}
+	// 对齐 Python lark_adapter.py:574：仅群聊设置 group_id，且不设 group_name
+	// （Go 此前把 chat_id 当群名，属偏差）。私聊不构造 Group。
 	if abm.Type == platform.GroupMessage && chatID != "" {
-		abm.Group = &platform.Group{GroupID: chatID, GroupName: chatID}
+		abm.Group = &platform.Group{GroupID: chatID}
 	}
 	abm.SelfID = a.botOpenID
 	if a.botOpenID == "" {
@@ -458,6 +459,15 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		return
 	}
 	chatID := abm.GroupID()
+	// IsAtBot 反映消息链中是否真的 @ 了本机器人（对齐 Python：由链中 At 判定，
+	// 而非"非群即真"）。
+	isAtBot := false
+	for _, comp := range abm.Message {
+		if at, ok := comp.(*message.At); ok && at.TargetID != "" && at.TargetID == abm.SelfID {
+			isAtBot = true
+			break
+		}
+	}
 	event := &core.Event{
 		Type: core.EventMessage,
 		Source: core.EventSource{
@@ -468,14 +478,21 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 			SenderName: abm.Sender.Nickname,
 			ConvID:     abm.SessionID,
 			IsGroup:    abm.Type == platform.GroupMessage,
-			IsAtBot:    abm.Type != platform.GroupMessage,
+			IsAtBot:    isAtBot,
 		},
 		Message:    &message.MessageChain{Chain: abm.Message},
 		MessageStr: abm.MessageStr,
 		Timestamp:  time.Unix(abm.Timestamp, 0),
 		MessageObj: &core.MessageObj{
-			MessageID: abm.MessageID,
-			SelfID:    abm.SelfID,
+			MessageID:   abm.MessageID,
+			SelfID:      abm.SelfID,
+			SessionID:   abm.SessionID,
+			MessageType: string(abm.Type),
+			Platform:    "lark",
+			MessageStr:  abm.MessageStr,
+			RawMessage:  abm.RawMessage,
+			Timestamp:   time.Unix(abm.Timestamp, 0),
+			Group:       abm.Group,
 		},
 		Metadata: map[string]interface{}{},
 	}
@@ -487,14 +504,36 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 	}
 }
 
-// Send sends a message chain to a Lark session. Group sessions use chat_id,
-// private sessions use open_id (mirrors send_by_session). 私聊发送优先 open_id，
-// 若被飞书拒绝（典型 230101）且已记录 open_id → chat_id 路由，则复用同一 UUID
-// 以 chat_id 重试一次（对齐 py v4.28.2 commit 32a75139）。对齐本体
-// lark_event.py:551-558：send 始终 reply 原消息——优先取链中显式 Reply 组件的
-// message_id（reply_with_quote 开启时由 pipeline 注入），否则回填最近一次
-// 收到消息的 message_id。
+// Send sends a message chain to a Lark session (active push / send_by_session):
+// 群会话用 chat_id，私聊用 open_id，**不引用**上一条消息。
 func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
+	return a.sendChain(sessionID, chain, "")
+}
+
+// SendByEvent sends a chain as a response to the triggering event (Python
+// LarkMessageEvent.send): 引用触发消息（reply_with_quote 注入的 Reply 组件优先，
+// 否则回填事件 MessageObj.MessageID），对齐 lark_event.py:751-757。
+func (a *Adapter) SendByEvent(sessionID string, chain *message.MessageChain, event *core.Event) error {
+	replyMessageID := ""
+	if event != nil && event.MessageObj != nil {
+		replyMessageID = event.MessageObj.MessageID
+	}
+	if chain != nil {
+		for _, comp := range chain.Chain {
+			if reply, ok := comp.(*message.Reply); ok && reply.MessageID != "" {
+				replyMessageID = reply.MessageID
+				break
+			}
+		}
+	}
+	return a.sendChain(sessionID, chain, replyMessageID)
+}
+
+// sendChain sends a message chain, optionally quoting replyMessageID. Group
+// sessions use chat_id, private sessions use open_id (mirrors send_by_session).
+// 私聊发送优先 open_id，若被飞书拒绝（典型 230101）且已记录 open_id → chat_id
+// 路由，则复用同一 UUID 以 chat_id 重试一次（对齐 py v4.28.2 commit 32a75139）。
+func (a *Adapter) sendChain(sessionID string, chain *message.MessageChain, replyMessageID string) error {
 	if a.client == nil {
 		return fmt.Errorf("lark: client not ready")
 	}
@@ -509,15 +548,6 @@ func (a *Adapter) Send(sessionID string, chain *message.MessageChain) error {
 	} else {
 		// 私聊优先 open_id；仅当发送被拒时才会用到已知 chat_id。
 		fallbackChatID = a.lookupPrivateChatID(receiveID)
-	}
-	replyMessageID := a.lookupReplyID(sessionID)
-	if chain != nil {
-		for _, comp := range chain.Chain {
-			if reply, ok := comp.(*message.Reply); ok && reply.MessageID != "" {
-				replyMessageID = reply.MessageID
-				break
-			}
-		}
 	}
 	return sendMessageChain(context.Background(), a.client, chain, replyMessageID, receiveID, receiveIDType, fallbackChatID)
 }
@@ -544,9 +574,18 @@ func (a *Adapter) React(sessionID, messageID, emoji string) error {
 }
 
 // isGroupConv 判断会话 id 是否为群聊：群 chat_id 以 "oc_" 开头，私聊 open_id
-// 以 "ou_" 开头，其他前缀按非群处理回退 open_id。
+// 以 "ou_" 开头。开启 unique_session 后群会话 id 为 "sender%group"
+// （buildUniqueSessionID: lark → senderID + "%" + groupID），此时也不能只看前缀，
+// 需看 "%" 之后的 group 段（对齐 Python send_by_session 用 session.message_type 判群）。
 func (a *Adapter) isGroupConv(sessionID string) bool {
-	return strings.HasPrefix(sessionID, "oc_")
+	if strings.HasPrefix(sessionID, "oc_") {
+		return true
+	}
+	if idx := strings.Index(sessionID, "%"); idx >= 0 {
+		groupID := sessionID[idx+1:]
+		return strings.HasPrefix(groupID, "oc_")
+	}
+	return false
 }
 
 // WebhookUUID returns the unified-webhook uuid for webhook mode.

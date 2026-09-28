@@ -132,7 +132,12 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	if v, ok := config["enable_guild_direct_message"].(bool); ok {
 		a.EnableGuildDM = v
 	}
-	a.Intents = intentPublicGuildMessages | intentPublicMessages
+	// 对齐 Python：public_messages（群 C2C）意图仅在 enable_group_c2c=true 时开启，
+	// 否则只订阅 public_guild_messages（+ 可选的 direct_message）。
+	a.Intents = intentPublicGuildMessages
+	if a.EnableGroupC2C {
+		a.Intents |= intentPublicMessages
+	}
 	if a.EnableGuildDM {
 		a.Intents |= intentDirectMessage
 	}
@@ -588,7 +593,9 @@ func (a *Adapter) handleMessage(d map[string]interface{}, scene string) {
 
 	chain := []message.Component{}
 	if int(msgType) == 103 {
-		chain = append(chain, a.buildQuotedReply(d))
+		if r := a.buildQuotedReply(d); r != nil {
+			chain = append(chain, r)
+		}
 	}
 	plain := parseFaceMessage(strings.TrimSpace(content))
 	chain = append(chain, &message.At{TargetID: "qq_official"})
@@ -596,7 +603,7 @@ func (a *Adapter) handleMessage(d map[string]interface{}, scene string) {
 	chain = append(chain, a.parseAttachments(d)...)
 
 	a.remember(scene, senderOpenID, msgID)
-	a.publish(senderOpenID, senderName, senderOpenID, false, plain, msgID, chain, d, "", "")
+	a.publish(senderOpenID, senderName, senderOpenID, false, plain, msgID, chain, d, "", "", "unknown_selfid")
 }
 
 // handleGroupMessage parses and publishes a group message.
@@ -618,6 +625,7 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 
 	// extract bot mentions
 	botMentionIDs := []string{}
+	botMentionName := ""
 	mentions, _ := d["mentions"].([]interface{})
 	for _, m := range mentions {
 		mm, ok := m.(map[string]interface{})
@@ -628,6 +636,10 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 		mid, _ := mm["id"].(string)
 		if isYou && mid != "" {
 			botMentionIDs = append(botMentionIDs, mid)
+			// 对齐 Python：At.name 取按 is_you 过滤后的 bot_mentions[0].username。
+			if botMentionName == "" {
+				botMentionName, _ = mm["username"].(string)
+			}
 		}
 	}
 	mentioned := forceMention || len(botMentionIDs) > 0
@@ -641,16 +653,13 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 
 	chain := []message.Component{}
 	if int(msgType) == 103 {
-		chain = append(chain, a.buildQuotedReply(d))
+		if r := a.buildQuotedReply(d); r != nil {
+			chain = append(chain, r)
+		}
 	}
-	a.mu.Lock()
-	selfID := a.SelfID
-	a.mu.Unlock()
-	if selfID == "" {
-		// 尚未从 READY 事件拿到 bot openid：回退固定类型名（与历史行为
-		// 一致，仅影响 @ 组件展示，不影响唤醒）。
-		selfID = "qq_official"
-	}
+	// 对齐 Python qqofficial_platform_adapter.py:869：群 self_id =
+	// bot_mention_ids[0] if bot_mention_ids else "qq_official"（不用 READY 真实 id）。
+	selfID := "qq_official"
 	if len(botMentionIDs) > 0 {
 		selfID = botMentionIDs[0]
 		a.mu.Lock()
@@ -658,13 +667,7 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 		a.mu.Unlock()
 	}
 	if mentioned {
-		name := ""
-		if len(botMentionIDs) > 0 {
-			if mm, ok := mentions[0].(map[string]interface{}); ok {
-				name, _ = mm["username"].(string)
-			}
-		}
-		chain = append(chain, &message.At{TargetID: selfID, Name: name})
+		chain = append(chain, &message.At{TargetID: selfID, Name: botMentionName})
 	}
 	chain = append(chain, &message.Plain{Text: plain})
 	chain = append(chain, a.parseAttachments(d)...)
@@ -682,7 +685,7 @@ func (a *Adapter) handleGroupMessage(d map[string]interface{}, forceMention bool
 		a.mu.Unlock()
 	}
 	groupName, _ := d["group_name"].(string)
-	a.publish(memberOpenID, senderName, groupOpenID, true, plain, msgID, chain, d, memberRole, groupName)
+	a.publish(memberOpenID, senderName, groupOpenID, true, plain, msgID, chain, d, memberRole, groupName, selfID)
 }
 
 // handleChannelMessage parses and publishes a guild (@) message.
@@ -711,7 +714,7 @@ func (a *Adapter) handleChannelMessage(d map[string]interface{}) {
 
 	a.remember("channel", channelID, msgID)
 	channelName, _ := d["channel_name"].(string)
-	a.publish(authorID, authorName, channelID, true, plain, msgID, chain, d, "", channelName)
+	a.publish(authorID, authorName, channelID, true, plain, msgID, chain, d, "", channelName, selfID)
 }
 
 // handleDirectMessage parses and publishes a direct (DM) message.
@@ -730,16 +733,29 @@ func (a *Adapter) handleDirectMessage(d map[string]interface{}) {
 	chain = append(chain, &message.Plain{Text: plain})
 
 	a.remember("friend", authorID, msgID)
-	a.publish(authorID, authorName, authorID, false, plain, msgID, chain, d, "", "")
+	a.publish(authorID, authorName, authorID, false, plain, msgID, chain, d, "", "", "qq_official")
 }
 
 // buildQuotedReply builds a Reply component from a quoted message (message_type 103).
-func (a *Adapter) buildQuotedReply(d map[string]interface{}) message.Component {
+// 对齐 Python：仅当取到 message_reference.message_id / msg_elements[0].id 或
+// 引用链内容时才返回 Reply，否则返回 nil（避免产出空 Reply）。
+func (a *Adapter) buildQuotedReply(d map[string]interface{}) *message.Reply {
 	reply := &message.Reply{}
+	// 对齐 Python qqofficial_platform_adapter.py:773-819：引用消息 id 优先取
+	// message_reference.message_id，其次取 msg_elements[0] 的 id / message_id。
+	if ref, ok := d["message_reference"].(map[string]interface{}); ok {
+		if id, ok := ref["message_id"].(string); ok {
+			reply.MessageID = id
+		}
+	}
 	if elems, ok := d["msg_elements"].([]interface{}); ok && len(elems) > 0 {
 		if e, ok := elems[0].(map[string]interface{}); ok {
-			if id, ok := e["id"].(string); ok {
-				reply.MessageID = id
+			if reply.MessageID == "" {
+				if id, ok := e["id"].(string); ok {
+					reply.MessageID = id
+				} else if id, ok := e["message_id"].(string); ok {
+					reply.MessageID = id
+				}
 			}
 			if content, ok := e["content"].(string); ok {
 				reply.MessageStr = parseFaceMessage(strings.TrimSpace(content))
@@ -755,6 +771,9 @@ func (a *Adapter) buildQuotedReply(d map[string]interface{}) message.Component {
 				}
 			}
 		}
+	}
+	if reply.MessageID == "" && reply.MessageStr == "" && len(reply.Chain) == 0 {
+		return nil
 	}
 	return reply
 }
@@ -835,12 +854,17 @@ func (a *Adapter) remember(scene, convID, msgID string) {
 	a.mu.Unlock()
 }
 
-func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}, role, groupName string) {
+func (a *Adapter) publish(senderID, senderName, convID string, isGroup bool, msgStr, msgID string, chain []message.Component, raw interface{}, role, groupName, selfIDOverride string) {
 	logger.I18nInfo("[QQOfficial] 收到来自 %s 的消息 (群聊=%v): %q", convID, isGroup, msgStr)
 	// Deduplicate identical msg_id re-deliveries within a short window (the QQ
 	// official WS may redeliver the same event after a reconnect/retry).
 	a.mu.Lock()
 	selfID := a.SelfID
+	// 分场景 self_id 覆盖（对齐 Python convert_msg）：C2C="unknown_selfid"、
+	// DM="qq_official"、频道=mentions[0].id、群=bot mention 或 "qq_official"。
+	if selfIDOverride != "" {
+		selfID = selfIDOverride
+	}
 	if msgID != "" {
 		if a.recentMsg == nil {
 			a.recentMsg = make(map[string]time.Time)

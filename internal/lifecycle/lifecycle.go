@@ -739,6 +739,47 @@ func umoPatternMatches(pattern, umo string) bool {
 // and registers it with the event bus.
 func (l *Lifecycle) buildPipelineScheduler(confID string) error {
 	scheduler := core.NewPipelineScheduler(confID)
+	// 群信息按需解析桥：事件 → 平台适配器 typed GetGroupInfo
+	// （对齐 Python AstrMessageEvent.get_group 的异步平台 API 获取）。
+	// core 不能 import platform（导入环），故以函数值注入。
+	scheduler.SetGroupInfoResolver(func(ctx context.Context, platformID, platformType, groupID string) (*core.Group, error) {
+		if l.platformMgr == nil {
+			return nil, fmt.Errorf("platform manager not available")
+		}
+		adapter := l.platformMgr.Get(platformID)
+		if adapter == nil {
+			for _, a := range l.platformMgr.All() {
+				if a.Type() == platformType {
+					adapter = a
+					break
+				}
+			}
+		}
+		if adapter == nil {
+			return nil, fmt.Errorf("no platform adapter for %q/%q", platformID, platformType)
+		}
+		gp, ok := adapter.(platform.GroupInfoProvider)
+		if !ok {
+			return nil, fmt.Errorf("platform adapter %q does not support GetGroupInfo", platformID)
+		}
+		g, err := gp.GetGroupInfo(ctx, groupID)
+		if err != nil || g == nil {
+			return nil, err
+		}
+		members := make([]core.MessageMember, 0, len(g.Members))
+		for _, mm := range g.Members {
+			members = append(members, core.MessageMember{UserID: mm.UserID, Nickname: mm.Nickname})
+		}
+		return &core.Group{
+			GroupID:     g.GroupID,
+			GroupName:   g.GroupName,
+			GroupAvatar: g.GroupAvatar,
+			GroupOwner:  g.GroupOwner,
+			GroupAdmins: g.GroupAdmins,
+			Members:     members,
+			MemberCount: g.MemberCount,
+		}, nil
+	})
 
 	cfg := l.configMgr.Get(confID)
 	cfgMap := map[string]interface{}{}

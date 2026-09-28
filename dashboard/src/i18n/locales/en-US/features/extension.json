@@ -166,7 +166,6 @@
     "sourceName": "Source Name",
     "sourceUrl": "Source URL",
     "defaultSource": "Default Source",
-    "defaultSourceHint": "Built-in market (default)",
     "removeSource": "Remove Source",
     "confirmRemoveSource": "Are you sure you want to remove this source?",
     "sourceAdded": "Source added successfully",
@@ -182,6 +181,7 @@
     "installPlugin": "Install Plugin",
     "randomPlugins": "🎲 Random Plugins",
     "sourceSafetyWarning": "Even with the default source, plugin stability and security cannot be fully guaranteed. Please verify carefully before use.",
+    "defaultSourceHint": "Built-in market (default)",
     "sourceTypeHint": "Choose the plugin type of this source: Golang sources list Go plugins (compatibility checked against the Go version); Python sources list Python plugins (checked against the tracked Python version). This affects the install method (direct zip download vs git clone) and version compatibility checks."
   },
   "sort": {
@@ -236,26 +236,6 @@
       "repositorySecurityWarning": "AstrBot cannot guarantee the safety of plugins downloaded from a code repository. Install only if you trust the plugin source.",
       "preparing": "Preparing installation…"
     },
-    "risk_warning": {
-      "message": "Potential risks detected in the plugin source. Please confirm to continue"
-    },
-    "c_compiler": {
-      "message": "No usable C compiler detected. Choose a system compiler or download zig automatically"
-    },
-    "go_sdk": {
-      "message": "No usable Go toolchain/SDK detected. Confirm whether to download the Go toolchain automatically"
-    },
-    "python_runtime": {
-      "message": "Failed to prepare the Python runtime. Confirm whether to download CPython automatically"
-    },
-    "depsMode": {
-      "title": "Choose Python Dependency Install Mode",
-      "desc": "Full install pre-installs all host dependencies (about 3-5 minutes); install on demand only installs core dependencies and automatically installs missing packages at runtime. You can change this anytime in Settings - Network.",
-      "lazyLabel": "Install on demand (recommended)",
-      "fullLabel": "Full install",
-      "hint": "Your choice will be saved to the system config (python_deps_install_mode).",
-      "cancel": "Cancel"
-    },
     "update": {
       "title": "Update Extension",
       "sectionTitle": "Update",
@@ -293,6 +273,26 @@
       "installDestination": "Install destination",
       "confirm": "Use This Source",
       "confirmAndContinue": "Use and Continue"
+    },
+    "risk_warning": {
+      "message": "Potential risks detected in the plugin source. Please confirm to continue"
+    },
+    "c_compiler": {
+      "message": "No usable C compiler detected. Choose a system compiler or download zig automatically"
+    },
+    "go_sdk": {
+      "message": "No usable Go toolchain/SDK detected. Confirm whether to download the Go toolchain automatically"
+    },
+    "python_runtime": {
+      "message": "Failed to prepare the Python runtime. Confirm whether to download CPython automatically"
+    },
+    "depsMode": {
+      "title": "Choose Python Dependency Install Mode",
+      "desc": "Full install pre-installs all host dependencies (about 3-5 minutes); install on demand only installs core dependencies and automatically installs missing packages at runtime. You can change this anytime in Settings - Network.",
+      "lazyLabel": "Install on demand (recommended)",
+      "fullLabel": "Full install",
+      "hint": "Your choice will be saved to the system config (python_deps_install_mode).",
+      "cancel": "Cancel"
     }
   },
   "messages": {
@@ -317,8 +317,6 @@
     "fillUrlOrFile": "Please fill in extension URL or upload extension file",
     "dontFillBoth": "Please don't fill in both extension URL and upload file",
     "supportedFormats": "Supports .zip extension files",
-    "pkgCommandCopied": "Command copied, please run it in the terminal",
-    "pkgCommandCopyFailed": "Copy failed, please copy the command manually",
     "updateAllSuccess": "All upgradable extensions have been updated!",
     "updateAllFailed": "{failed} of {total} extensions failed to update:",
     "noUpdatesAvailable": "No extensions have updates available",
@@ -339,7 +337,9 @@
     "sourceBindSuccess": "Plugin source updated",
     "validatingPlugin": "Validating plugin...",
     "pluginValidateSuccess": "Plugin validation passed",
-    "pluginValidateFailed": "Plugin validation failed"
+    "pluginValidateFailed": "Plugin validation failed",
+    "pkgCommandCopied": "Command copied, please run it in the terminal",
+    "pkgCommandCopyFailed": "Copy failed, please copy the command manually"
   },
   "upload": {
     "fromFile": "Install from File",
@@ -409,6 +409,16 @@
     "deleteMessage": "Are you sure you want to delete this Skill?",
     "deleteSuccess": "Deleted successfully",
     "deleteFailed": "Delete failed",
+    "select": "Select",
+    "selectSkill": "Select Skill {name}",
+    "selectAll": "Select all",
+    "clearSelection": "Clear selection",
+    "deleteSelected": "Delete selected ({count})",
+    "batchDeleteTitle": "Delete selected Skills",
+    "batchDeleteMessage": "Are you sure you want to delete these {count} Skills? This action cannot be undone.",
+    "batchDeleteConfirm": "Delete {count}",
+    "batchDeleteSuccess": "All {count} skill(s) deleted successfully.",
+    "batchDeletePartial": "Deleted {succeeded}; failed to delete {failed}",
     "neoSkillKey": "Filter by skill_key",
     "neoStatus": "Candidate Status",
     "neoStage": "Release Stage",
@@ -448,16 +458,6 @@
     "sandboxPresetReadonly": "Sandbox preset skills are read-only here. You cannot delete or enable/disable them from Local Skills.",
     "pluginReadonly": "Plugin-provided skills are managed by their plugin. They cannot be deleted or downloaded from Local Skills.",
     "pluginDisabled": "Plugin disabled",
-    "select": "Select",
-    "selectSkill": "Select Skill {name}",
-    "selectAll": "Select all",
-    "clearSelection": "Clear selection",
-    "deleteSelected": "Delete selected ({count})",
-    "batchDeleteTitle": "Delete selected Skills",
-    "batchDeleteMessage": "Are you sure you want to delete these {count} Skills? This action cannot be undone.",
-    "batchDeleteConfirm": "Delete {count}",
-    "batchDeleteSuccess": "All {count} skill(s) deleted successfully.",
-    "batchDeletePartial": "Deleted {succeeded}; failed to delete {failed}",
     "openEditor": "View/Edit",
     "editorTitle": "Edit Skill",
     "editorLoadFailed": "Failed to load Skill file",

@@ -576,7 +576,13 @@ func (c *AstrBotConfig) Load() error {
 	if err := json.Unmarshal(raw, &conf); err != nil {
 		return fmt.Errorf("parse config JSON: %w", err)
 	}
+	// 对齐 Python migrate_config_on_load：在完整性检查前把旧 Agent Runner
+	// 配置迁移为新结构（provider_settings.* → agent_runner.config.*）。
+	migrated := migrateAgentRunnerConfig(conf, nil)
 	hasNew := checkConfigIntegrity(c.defaultConf, conf, "")
+	if migrated {
+		hasNew = true
+	}
 	c.mu.Lock()
 	c.data = conf
 	c.mu.Unlock()

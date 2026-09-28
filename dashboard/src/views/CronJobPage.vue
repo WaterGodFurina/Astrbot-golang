@@ -440,14 +440,12 @@ import { computed, onMounted, ref } from "vue";
 import { useTheme } from "vuetify";
 import { botApi, cronApi, sessionApi } from "@/api/v1";
 import { useModuleI18n } from "@/i18n/composables";
-import { askForConfirmation, useConfirmDialog } from "@/utils/confirmDialog";
 import OutlinedActionListItem from "@/components/shared/OutlinedActionListItem.vue";
 import StyledMenu from "@/components/shared/StyledMenu.vue";
 import UmoDisplay from "@/components/shared/UmoDisplay.vue";
 
 const { tm } = useModuleI18n("features/cron");
 const theme = useTheme();
-const confirmDialog = useConfirmDialog();
 
 const isDark = computed(() => theme.global.current.value.dark);
 const loading = ref(false);
@@ -519,10 +517,8 @@ const jobUmoFilterOptions = computed(() => [
 ]);
 
 const filteredJobs = computed(() => {
-  // clearable 搜索框清除时 v-model 可能是 null/undefined 而非空串，
-  // 直接 .trim() 会让整个 computed 抛错导致列表空白。
-  const query = String(taskSearch.value ?? "").trim().toLowerCase();
-  const umo = String(selectedUmoFilter.value ?? "");
+  const query = taskSearch.value.trim().toLowerCase();
+  const umo = selectedUmoFilter.value;
   return jobs.value.filter((job) => {
     const session = getJobSession(job);
     if (umo === NO_DELIVERY_TARGET_FILTER && session) {
@@ -552,9 +548,8 @@ const sortedJobs = computed(() =>
     const nextB = parseTimeValue(b.next_run_time ?? b.run_at);
 
     if (nextA !== nextB) {
-      // 无时间（null）的任务单独归组排最后，过去时间按时间戳正常排序
-      if (nextA === null) return 1;
-      if (nextB === null) return -1;
+      if (!nextA) return 1;
+      if (!nextB) return -1;
       return nextA - nextB;
     }
 
@@ -599,10 +594,10 @@ function toast(
   snackbar.value = { show: true, message, color };
 }
 
-function parseTimeValue(value: any): number | null {
-  if (!value) return null;
+function parseTimeValue(value: any): number {
+  if (!value) return 0;
   const ts = new Date(value).getTime();
-  return Number.isNaN(ts) ? null : ts;
+  return Number.isNaN(ts) ? 0 : ts;
 }
 
 function formatTime(val: any, fallback = tm("table.notAvailable")): string {
@@ -880,11 +875,6 @@ async function toggleJob(job: any) {
 }
 
 async function deleteJob(job: any) {
-  const confirmed = await askForConfirmation(
-    tm("messages.deleteConfirm", { name: job.name || job.job_id }),
-    confirmDialog,
-  );
-  if (!confirmed) return;
   try {
     const res = await cronApi.delete(job.job_id);
     if (res.data.status === "ok") {

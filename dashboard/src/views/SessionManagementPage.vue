@@ -183,47 +183,6 @@
               </v-select>
             </v-col>
           </v-row>
-          <v-row dense v-if="batchScope === 'selected'" class="mt-3">
-            <v-col cols="12">
-              <v-card variant="outlined" class="pa-3">
-                <div class="d-flex align-center mb-2">
-                  <span class="text-subtitle-2">
-                    {{ tm('batchOperations.selectSessions') }}
-                    ({{ batchSelectedUmos.length }}/{{ allSessions.length }})
-                  </span>
-                  <v-spacer></v-spacer>
-                  <v-btn size="small" variant="text" class="mr-1" @click="batchSelectedUmos = allSessions.map((s) => s)">
-                    {{ tm('batchOperations.selectAll') }}
-                  </v-btn>
-                  <v-btn size="small" variant="text" @click="batchSelectedUmos = []">
-                    {{ tm('batchOperations.clearAll') }}
-                  </v-btn>
-                </div>
-                <v-text-field
-                  v-model="batchSessionSearch"
-                  :placeholder="tm('batchOperations.searchSessions')"
-                  variant="outlined"
-                  density="compact"
-                  hide-details
-                  clearable
-                  prepend-inner-icon="mdi-magnify"
-                  class="mb-2"
-                ></v-text-field>
-                <div class="session-checkbox-list">
-                  <v-checkbox
-                    v-for="s in filteredAllSessions"
-                    :key="s"
-                    :label="getUmoDisplayText(s)"
-                    :value="s"
-                    v-model="batchSelectedUmos"
-                    density="compact"
-                    hide-details
-                    class="session-checkbox"
-                  ></v-checkbox>
-                </div>
-              </v-card>
-            </v-col>
-          </v-row>
           <v-row dense class="mt-3">
             <v-col cols="12" class="d-flex justify-end">
               <v-btn color="primary" variant="tonal" size="large" @click="applyBatchChanges" :disabled="!canApplyBatch" :loading="batchUpdating" prepend-icon="mdi-check-all">
@@ -753,8 +712,6 @@ export default {
       itemsPerPage: 10,
       totalItems: 0,
       searchTimeout: null,
-      // loadData 请求序号，丢弃过期响应（防竞态）
-      listRequestId: 0,
 
       // 可用选项
       availablePersonas: [],
@@ -824,9 +781,6 @@ export default {
       batchChatProvider: null,
       batchTtsProvider: null,
       batchUpdating: false,
-      batchSelectedUmos: [],
-      allSessions: [],
-      batchSessionSearch: '',
 
       // 分组管理
       groups: [],
@@ -999,20 +953,9 @@ export default {
     canApplyBatch() {
       const hasChanges = this.batchLlmStatus !== null || this.batchTtsStatus !== null || this.batchChatProvider !== null || this.batchTtsProvider !== null
       if (this.batchScope === 'selected') {
-        return hasChanges && this.batchSelectedUmos.length > 0
+        return hasChanges && this.selectedItems.length > 0
       }
       return hasChanges
-    },
-
-    filteredAllSessions() {
-      if (!this.batchSessionSearch) return this.allSessions
-      const search = this.batchSessionSearch.toLowerCase()
-      return this.allSessions.filter((umo) => {
-        if (umo.toLowerCase().includes(search)) return true
-        const info = this.getAvailableUmoInfo(umo)
-        const name = info.user_alias || info.auto_name || info.display_name || ''
-        return name.toLowerCase().includes(search)
-      })
     },
 
     // 穿梭框：未选中的UMO列表
@@ -1053,7 +996,6 @@ export default {
   mounted() {
     this.loadData()
     this.loadGroups()
-    this.loadAllSessions()
   },
 
   beforeUnmount() {
@@ -1064,7 +1006,6 @@ export default {
 
   methods: {
     async loadData() {
-      const requestId = ++this.listRequestId
       this.loading = true
       try {
         const response = await sessionApi.listRules({
@@ -1072,7 +1013,6 @@ export default {
           page_size: this.itemsPerPage,
           search: this.searchQuery || '',
         })
-        if (requestId !== this.listRequestId) return // 过期响应直接丢弃
         if (response.data.status === 'ok') {
           const data = response.data.data
           this.rulesList = data.rules
@@ -1085,16 +1025,12 @@ export default {
           this.availablePlugins = data.available_plugins || []
           this.availableKbs = data.available_kbs || []
         } else {
-          if (requestId !== this.listRequestId) return
           this.showError(response.data.message || this.tm('messages.loadError'))
         }
       } catch (error) {
-        if (requestId !== this.listRequestId) return
         this.showError(error.response?.data?.message || this.tm('messages.loadError'))
       }
-      if (requestId === this.listRequestId) {
-        this.loading = false
-      }
+      this.loading = false
     },
 
     onTableOptionsUpdate(options) {
@@ -1286,7 +1222,6 @@ export default {
 
     async saveServiceConfig() {
       if (!this.selectedUmo) return
-      const targetUmo = this.selectedUmo.umo // 提前缓存
 
       this.saving = true
       try {
@@ -1296,28 +1231,27 @@ export default {
         if (config.persona_id === null) delete config.persona_id
 
         const response = await sessionApi.upsertRule({
-          umo: targetUmo,
+          umo: this.selectedUmo.umo,
           rule_key: 'session_service_config',
           rule_value: config,
         })
 
         if (response.data.status === 'ok') {
+          this.showSuccess(this.tm('messages.saveSuccess'))
           this.editingRules.session_service_config = config
 
           // 更新或添加到列表
-          const item = this.rulesList.find((u) => u.umo === targetUmo)
+          let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
           if (item) {
             item.rules = { ...item.rules, session_service_config: config }
           } else {
             // 新规则，添加到列表
             this.rulesList.push(
-              this.buildUmoItem(targetUmo, {
+              this.buildUmoItem(this.selectedUmo.umo, {
                 session_service_config: config,
               }),
             )
           }
-          this.showSuccess(this.tm('messages.saveSuccess'))
-          this.closeRuleEditor() // 最后再关闭
         } else {
           this.showError(response.data.message || this.tm('messages.saveError'))
         }
@@ -1329,7 +1263,6 @@ export default {
 
     async saveProviderConfig() {
       if (!this.selectedUmo) return
-      const targetUmo = this.selectedUmo.umo // 提前缓存
 
       this.saving = true
       try {
@@ -1343,7 +1276,7 @@ export default {
             // 有值时更新
             updateTasks.push(
               sessionApi.upsertRule({
-                umo: targetUmo,
+                umo: this.selectedUmo.umo,
                 rule_key: `provider_perf_${type}`,
                 rule_value: value,
               }),
@@ -1352,7 +1285,7 @@ export default {
             // 选择了"跟随配置文件" (__astrbot_follow_config__) 且之前有配置，则删除
             deleteTasks.push(
               sessionApi.deleteRules({
-                umo: targetUmo,
+                umo: this.selectedUmo.umo,
                 rule_key: `provider_perf_${type}`,
               }),
             )
@@ -1365,9 +1298,9 @@ export default {
           this.showSuccess(this.tm('messages.saveSuccess'))
 
           // 更新或添加到列表
-          let item = this.rulesList.find((u) => u.umo === targetUmo)
+          let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
           if (!item) {
-            item = this.buildUmoItem(targetUmo)
+            item = this.buildUmoItem(this.selectedUmo.umo)
             this.rulesList.push(item)
           }
           for (const type of providerTypes) {
@@ -1381,7 +1314,6 @@ export default {
               delete this.editingRules[`provider_perf_${type}`]
             }
           }
-          this.closeRuleEditor() // 最后再关闭
         } else {
           this.showSuccess(this.tm('messages.noChanges'))
         }
@@ -1393,7 +1325,6 @@ export default {
 
     async savePluginConfig() {
       if (!this.selectedUmo) return
-      const targetUmo = this.selectedUmo.umo // 提前缓存
 
       this.saving = true
       try {
@@ -1406,37 +1337,35 @@ export default {
         if (config.enabled_plugins.length === 0 && config.disabled_plugins.length === 0) {
           if (this.editingRules.session_plugin_config) {
             await sessionApi.deleteRules({
-              umo: targetUmo,
+              umo: this.selectedUmo.umo,
               rule_key: 'session_plugin_config',
             })
             delete this.editingRules.session_plugin_config
-            let item = this.rulesList.find((u) => u.umo === targetUmo)
+            let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
             if (item) delete item.rules.session_plugin_config
           }
           this.showSuccess(this.tm('messages.saveSuccess'))
-          this.closeRuleEditor()
         } else {
           const response = await sessionApi.upsertRule({
-            umo: targetUmo,
+            umo: this.selectedUmo.umo,
             rule_key: 'session_plugin_config',
             rule_value: config,
           })
 
           if (response.data.status === 'ok') {
+            this.showSuccess(this.tm('messages.saveSuccess'))
             this.editingRules.session_plugin_config = config
 
-            let item = this.rulesList.find((u) => u.umo === targetUmo)
+            let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
             if (item) {
               item.rules.session_plugin_config = config
             } else {
               this.rulesList.push(
-                this.buildUmoItem(targetUmo, {
+                this.buildUmoItem(this.selectedUmo.umo, {
                   session_plugin_config: config,
                 }),
               )
             }
-            this.showSuccess(this.tm('messages.saveSuccess'))
-            this.closeRuleEditor() // 最后再关闭
           } else {
             this.showError(response.data.message || this.tm('messages.saveError'))
           }
@@ -1449,7 +1378,6 @@ export default {
 
     async saveKbConfig() {
       if (!this.selectedUmo) return
-      const targetUmo = this.selectedUmo.umo // 提前缓存
 
       this.saving = true
       try {
@@ -1463,37 +1391,35 @@ export default {
         if (config.kb_ids.length === 0) {
           if (this.editingRules.kb_config) {
             await sessionApi.deleteRules({
-              umo: targetUmo,
+              umo: this.selectedUmo.umo,
               rule_key: 'kb_config',
             })
             delete this.editingRules.kb_config
-            let item = this.rulesList.find((u) => u.umo === targetUmo)
+            let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
             if (item) delete item.rules.kb_config
           }
           this.showSuccess(this.tm('messages.saveSuccess'))
-          this.closeRuleEditor()
         } else {
           const response = await sessionApi.upsertRule({
-            umo: targetUmo,
+            umo: this.selectedUmo.umo,
             rule_key: 'kb_config',
             rule_value: config,
           })
 
           if (response.data.status === 'ok') {
+            this.showSuccess(this.tm('messages.saveSuccess'))
             this.editingRules.kb_config = config
 
-            let item = this.rulesList.find((u) => u.umo === targetUmo)
+            let item = this.rulesList.find((u) => u.umo === this.selectedUmo.umo)
             if (item) {
               item.rules.kb_config = config
             } else {
               this.rulesList.push(
-                this.buildUmoItem(targetUmo, {
+                this.buildUmoItem(this.selectedUmo.umo, {
                   kb_config: config,
                 }),
               )
             }
-            this.showSuccess(this.tm('messages.saveSuccess'))
-            this.closeRuleEditor() // 最后再关闭
           } else {
             this.showError(response.data.message || this.tm('messages.saveError'))
           }
@@ -1657,7 +1583,7 @@ export default {
         }
 
         if (scope === 'selected') {
-          umos = this.batchSelectedUmos
+          umos = this.selectedItems.map((item) => item.umo)
           if (umos.length === 0) {
             this.showError(this.tm('messages.selectSessionsFirst'))
             this.batchUpdating = false
@@ -1760,7 +1686,6 @@ export default {
         }
       } catch (error) {
         console.error('加载分组失败:', error)
-        this.showError(error.response?.data?.message || this.tm('messages.loadError'))
       }
       this.groupsLoading = false
     },
@@ -1776,26 +1701,8 @@ export default {
         }
       } catch (error) {
         console.error('加载会话列表失败:', error)
-        this.showError(error.response?.data?.message || this.tm('messages.loadError'))
       }
       this.loadingUmos = false
-    },
-
-    async loadAllSessions() {
-      try {
-        const response = await sessionApi.activeUmos()
-        if (response.data.status === 'ok') {
-          this.mergeUmoInfos(response.data.data.umo_infos || [])
-          this.allSessions = response.data.data.umos || []
-          // 首屏共享同一次 activeUmos() 结果，避免重复请求
-          if (this.availableUmos.length === 0) {
-            this.availableUmos = response.data.data.umos || []
-          }
-        }
-      } catch (error) {
-        console.error('加载全部会话失败:', error)
-        this.showError(error.response?.data?.message || this.tm('messages.loadError'))
-      }
     },
 
     openCreateGroupDialog() {
@@ -1926,18 +1833,6 @@ export default {
 .v-data-table :deep(.v-data-table__td) {
   padding: 8px 16px !important;
   vertical-align: middle !important;
-}
-
-.session-checkbox-list {
-  max-height: 240px;
-  overflow-y: auto;
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 2px;
-}
-
-.session-checkbox {
-  margin: 0;
 }
 
 code {

@@ -485,10 +485,18 @@ func (s *Server) emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full 
 	if chain == nil {
 		return
 	}
+	// 推理链（streamSender.sendReasoningSegment 置 Type="reasoning"）单独成帧，
+	// 前端以 chain_type="reasoning" 渲染为思考块；正文（full/sink）不掺入推理。
+	reasoning := chain.Type == "reasoning"
 	for _, comp := range chain.Chain {
 		switch c := comp.(type) {
 		case *message.Plain:
 			if c.Text == "" {
+				continue
+			}
+			if reasoning {
+				sink.absorbThink(c.Text)
+				sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": c.Text, "chain_type": "reasoning"})
 				continue
 			}
 			full.WriteString(c.Text)
@@ -497,6 +505,11 @@ func (s *Server) emitChainSSE(w http.ResponseWriter, flusher http.Flusher, full 
 		case *message.Json:
 			// 对齐本体：Json 组件序列化为 plain 帧输出。
 			if b, err := json.Marshal(c.Data); err == nil && len(b) > 0 {
+				if reasoning {
+					sink.absorbThink(string(b))
+					sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": string(b), "chain_type": "reasoning"})
+					continue
+				}
 				full.WriteString(string(b))
 				sink.absorbPlain(string(b))
 				sendSSE(w, flusher, map[string]interface{}{"type": "plain", "data": string(b), "chain_type": "text"})
@@ -865,6 +878,27 @@ func (sink *chainPartsSink) absorbAttachment(attachType, attachmentID, filename,
 		part["stored_filename"] = storedFilename
 	}
 	sink.parts = append(sink.parts, part)
+	sink.lastPlainIndex = -1
+}
+
+// absorbThink 追加一段推理内容为 think part（与 plain 分开，前端思考块
+// 展示；持久化回放时同样以 think part 呈现）。相邻推理片段合并进同一
+// think part，并重置 plain 合并锚点。
+func (sink *chainPartsSink) absorbThink(text string) {
+	if text == "" {
+		return
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if n := len(sink.parts); n > 0 {
+		if last, ok := sink.parts[n-1]["type"].(string); ok && last == "think" {
+			if cur, ok := sink.parts[n-1]["think"].(string); ok {
+				sink.parts[n-1]["think"] = cur + text
+				return
+			}
+		}
+	}
+	sink.parts = append(sink.parts, map[string]interface{}{"type": "think", "think": text})
 	sink.lastPlainIndex = -1
 }
 
@@ -1524,10 +1558,16 @@ func (s *Server) emitChainWS(c *wsClient, full *strings.Builder, chain *message.
 	if chain == nil {
 		return
 	}
+	reasoning := chain.Type == "reasoning"
 	for _, comp := range chain.Chain {
 		switch cc := comp.(type) {
 		case *message.Plain:
 			if cc.Text == "" {
+				continue
+			}
+			if reasoning {
+				sink.absorbThink(cc.Text)
+				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "reasoning", "data": cc.Text, "message_id": messageID})
 				continue
 			}
 			full.WriteString(cc.Text)
@@ -1535,6 +1575,11 @@ func (s *Server) emitChainWS(c *wsClient, full *strings.Builder, chain *message.
 			s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": cc.Text, "message_id": messageID})
 		case *message.Json:
 			if b, err := json.Marshal(cc.Data); err == nil && len(b) > 0 {
+				if reasoning {
+					sink.absorbThink(string(b))
+					s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "reasoning", "data": string(b), "message_id": messageID})
+					continue
+				}
 				full.WriteString(string(b))
 				sink.absorbPlain(string(b))
 				s.wsSend(c, map[string]interface{}{"ct": "chat", "type": "plain", "chain_type": "text", "data": string(b), "message_id": messageID})

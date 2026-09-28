@@ -41,18 +41,18 @@
       <!-- Add new item section - moved to top -->
       <v-card-text class="pa-4 pb-2">
         <div class="d-flex align-center ga-2">
-          <v-text-field
-            v-model="newItem"
-            :label="t('core.common.list.addItemPlaceholder')"
-            @keyup.enter="addItem"
+          <v-text-field 
+            v-model="newItem" 
             :type="secretInputType"
             :append-inner-icon="secretToggleIcon"
             :autocomplete="secret ? 'new-password' : undefined"
             @click:append-inner="secretVisible = !secretVisible"
-            clearable
+            :label="t('core.common.list.addItemPlaceholder')" 
+            @keyup.enter="addItem" 
+            clearable 
             hide-details
-            variant="outlined"
-            density="compact"
+            variant="outlined" 
+            density="compact" 
             :placeholder="t('core.common.list.inputPlaceholder')"
             class="flex-grow-1">
           </v-text-field>
@@ -86,17 +86,17 @@
             <v-list-item-title v-if="editIndex !== index" class="item-text">
               {{ secret && !secretVisible ? '••••••••' : item }}
             </v-list-item-title>
-            <v-text-field
+            <v-text-field 
               v-else
-              v-model="editItem"
-              hide-details
-              variant="outlined"
-              density="compact"
+              v-model="editItem" 
               :type="secretInputType"
               :append-inner-icon="secretToggleIcon"
               :autocomplete="secret ? 'new-password' : undefined"
               @click:append-inner="secretVisible = !secretVisible"
-              @keyup.enter="saveEdit"
+              hide-details 
+              variant="outlined" 
+              density="compact"
+              @keyup.enter="saveEdit" 
               @keyup.esc="cancelEdit"
               @click.stop
               autofocus
@@ -150,6 +150,10 @@
       <v-card-text>
         <v-textarea
           v-model="batchImportText"
+          :class="{ 'secret-textarea': secret && !secretVisible }"
+          :append-inner-icon="secretToggleIcon"
+          :autocomplete="secret ? 'new-password' : undefined"
+          @click:append-inner="secretVisible = !secretVisible"
           :label="t('core.common.list.batchImportLabel')"
           :placeholder="t('core.common.list.batchImportPlaceholder')"
           rows="10"
@@ -217,8 +221,8 @@ const editIndex = ref(-1)
 const editItem = ref('')
 const showBatchImport = ref(false)
 const batchImportText = ref('')
-const isSingleItemMode = computed(() => (props.modelValue?.length ?? 0) <= 1 && props.preferSingleItem)
 const secretVisible = ref(false)
+const isSingleItemMode = computed(() => (props.modelValue?.length ?? 0) <= 1 && props.preferSingleItem)
 const secretInputType = computed(() => props.secret && !secretVisible.value ? 'password' : 'text')
 const secretToggleIcon = computed(() => {
   if (!props.secret) return undefined
@@ -366,5 +370,9 @@ function cancelBatchImport() {
 
 .v-chip {
   margin: 2px;
+}
+
+.secret-textarea :deep(textarea) {
+  -webkit-text-security: disc;
 }
 </style>

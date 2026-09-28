@@ -33,6 +33,9 @@ func convertAudioToWav(data []byte) []byte {
 	if len(data) == 0 {
 		return data
 	}
+	if len(data) < 4 {
+		return data
+	}
 	// RIFF/WAV 魔数：无需转码。
 	if bytes.Equal(data[:4], []byte("RIFF")) {
 		return data

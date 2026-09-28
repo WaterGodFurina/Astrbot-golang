@@ -7,6 +7,7 @@
 package slack
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/slack-go/slack"
 
+	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -103,23 +105,51 @@ func fromSegmentToSlackBlock(ctx context.Context, comp message.Component, client
 			AltText: "图片",
 		}
 	case *message.File:
-		// 本地路径优先（materialize 已把远程 URL 下载到 Path），
-		// 避免把 URL 字符串直接喂给 os.Stat。
-		if c.Path == "" || !fileExists(c.Path) {
-			return blockSection("文件上传失败（无本地文件）")
-		}
 		name := c.Name
 		if name == "" {
 			name = "file"
 		}
-		permalink, ok := uploadAndGetPermalink(ctx, client, c.Path, name)
-		if !ok {
-			return blockSection("文件上传失败")
+		// 本地路径优先（materialize 已把远程 URL 下载到 Path）。
+		if c.Path != "" && fileExists(c.Path) {
+			permalink, ok := uploadAndGetPermalink(ctx, client, c.Path, name)
+			if !ok {
+				return blockSection("文件上传失败")
+			}
+			return blockSection(fmt.Sprintf("文件: <%s|%s>", permalink, name))
 		}
-		// 对应 Python 的 "文件: <url|name>"
-		return blockSection(fmt.Sprintf("文件: <%s|%s>", permalink, name))
+		// 仅 URL 的 File 组件：下载后上传（对齐 Python
+		// `url = segment.url or segment.file` 传给 files_upload_v2）。
+		if url := c.URL; url != "" {
+			if permalink, ok := uploadURLAndGetPermalink(ctx, client, url, name); ok {
+				return blockSection(fmt.Sprintf("文件: <%s|%s>", permalink, name))
+			}
+		}
+		return blockSection("文件上传失败（无本地文件）")
 	}
 	return nil
+}
+
+// uploadURLAndGetPermalink 下载远程文件并上传到 Slack，返回 permalink。
+func uploadURLAndGetPermalink(ctx context.Context, client *slack.Client, url, filename string) (string, bool) {
+	data, err := platform.SafeDownloadBytes(ctx, url, 64<<20)
+	if err != nil || len(data) == 0 {
+		logger.I18nWarn("Slack 下载文件失败: %s: %v", url, err)
+		return "", false
+	}
+	summary, err := client.UploadFileContext(ctx, slack.UploadFileParameters{
+		Reader:   bytes.NewReader(data),
+		Filename: filename,
+		FileSize: len(data),
+	})
+	if err != nil {
+		logger.I18nError("Slack 文件上传失败: %v", err)
+		return "", false
+	}
+	file, _, _, err := client.GetFileInfoContext(ctx, summary.ID, 0, 1)
+	if err != nil || file == nil || file.Permalink == "" {
+		return "", false
+	}
+	return file.Permalink, true
 }
 
 // fileExists 判断路径是否为本地存在的常规文件。

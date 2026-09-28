@@ -90,7 +90,9 @@ func (a *Adapter) parseOneBotSegments(segments []interface{}, depth int, groupID
 			qq := toString(data["qq"])
 			name, _ := data["name"].(string)
 			if qq == "all" {
-				chain = append(chain, &message.AtAll{})
+				// 对齐 Python adapter.py:350-353：@全体成员生成 At(qq="all", name="全体成员")，
+				// 而非 AtAll 组件（AtAll 的唤醒分支对 @全体不成立）。
+				chain = append(chain, &message.At{TargetID: "all", Name: "全体成员"})
 			} else {
 				// 事件段通常不带昵称，经 get_group_member_info 拉取
 				// card/nickname（对齐 Python adapter.py:344-397；同步调用，

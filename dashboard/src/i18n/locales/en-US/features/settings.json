@@ -293,7 +293,6 @@
     },
     "messages": {
       "loadFailed": "Failed to load API keys",
-      "nameRequired": "Please enter a key name",
       "scopeRequired": "Please select at least one scope",
       "createSuccess": "API key created",
       "createFailed": "Failed to create API key",
@@ -302,7 +301,8 @@
       "deleteSuccess": "API key deleted",
       "deleteFailed": "Failed to delete API key",
       "copySuccess": "API key copied",
-      "copyFailed": "Failed to copy API key"
+      "copyFailed": "Failed to copy API key",
+      "nameRequired": "Please enter a key name"
     }
   }
 }

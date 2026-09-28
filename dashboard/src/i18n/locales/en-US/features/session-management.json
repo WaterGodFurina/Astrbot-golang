@@ -106,11 +106,11 @@
     "ttsStatus": "TTS Status",
     "chatProvider": "Chat Model",
     "ttsProvider": "TTS Model",
+    "apply": "Apply Changes",
     "selectSessions": "Select sessions",
     "searchSessions": "Search sessions...",
     "selectAll": "Select all",
-    "clearAll": "Clear",
-    "apply": "Apply Changes"
+    "clearAll": "Clear"
   },
   "groups": {
     "title": "Group Management",

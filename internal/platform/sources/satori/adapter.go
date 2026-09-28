@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -60,10 +61,14 @@ type Adapter struct {
 	heartbeatInterval int    // satori_heartbeat_interval
 	reconnectDelay    int    // satori_reconnect_delay
 
-	mu            sync.Mutex
-	running       bool
-	sequence      int64             // 事件序列号（断线重连时用于增量续传）
-	logins        []satorilib.Login // 连接成功后的登录信息（logins[0] 用于发送路由）
+	mu       sync.Mutex
+	running  bool
+	sequence int64             // 事件序列号（断线重连时用于增量续传）
+	logins   []satorilib.Login // 连接成功后的登录信息（logins[0] 用于发送路由）
+	// loginFeatures 记录各登录的 features（键 "platform\x00userID"）。SDK 的
+	// Login 类型不带 features，这里从 READY 原始 body 解析；未出现该键的登录
+	// 不在 map 中（对应 Python features is None）。
+	loginFeatures map[string][]string
 	readyReceived bool
 	ws            *websocket.Conn
 	httpClient    *http.Client
@@ -378,8 +383,30 @@ func (a *Adapter) handleReady(body map[string]interface{}) {
 		rawJSON, _ := json.Marshal(raw)
 		var logins []satorilib.Login
 		if json.Unmarshal(rawJSON, &logins) == nil {
+			feats := map[string][]string{}
+			for _, li := range raw {
+				lm, ok := li.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				plat, _ := lm["platform"].(string)
+				uid := ""
+				if u, ok := lm["user"].(map[string]interface{}); ok {
+					uid, _ = u["id"].(string)
+				}
+				if arr, ok := lm["features"].([]interface{}); ok {
+					fs := []string{}
+					for _, f := range arr {
+						if s, ok := f.(string); ok {
+							fs = append(fs, s)
+						}
+					}
+					feats[plat+"\x00"+uid] = fs
+				}
+			}
 			a.mu.Lock()
 			a.logins = logins
+			a.loginFeatures = feats
 			a.mu.Unlock()
 			// 输出连接成功的 bot 信息
 			for i, login := range logins {
@@ -497,6 +524,16 @@ func (a *Adapter) currentLogin() (platformName, userID string) {
 	return platformName, userID
 }
 
+// currentFeatures 返回当前登录的 features 及其是否存在
+// （键 "platform\x00userID"；Python features is None 对应 present=false）。
+func (a *Adapter) currentFeatures() ([]string, bool) {
+	platformName, userID := a.currentLogin()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	fs, ok := a.loginFeatures[platformName+"\x00"+userID]
+	return fs, ok
+}
+
 // sendHTTPRequest 发起 Satori HTTP API 请求（对齐 Python send_http_request）。
 // 返回 200 时解析 JSON 响应；其他情况返回空 map。
 func (a *Adapter) sendHTTPRequest(method, path string, data map[string]interface{}, platformName, userID string) map[string]interface{} {
@@ -554,20 +591,30 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 	platformName, userID := a.currentLogin()
 	group := &platform.Group{GroupID: groupID}
 
-	guildResp := a.sendHTTPRequest(http.MethodPost, "/guild.get", map[string]interface{}{"guild_id": groupID}, platformName, userID)
-	if name, ok := guildResp["name"].(string); ok {
-		group.GroupName = name
+	features, haveFeatures := a.currentFeatures()
+	if !haveFeatures || slices.Contains(features, "guild.get") {
+		guildResp := a.sendHTTPRequest(http.MethodPost, "/guild.get", map[string]interface{}{"guild_id": groupID}, platformName, userID)
+		if name, ok := guildResp["name"].(string); ok {
+			group.GroupName = name
+		}
+		if avatar, ok := guildResp["avatar"].(string); ok {
+			group.GroupAvatar = avatar
+		}
 	}
-	if avatar, ok := guildResp["avatar"].(string); ok {
-		group.GroupAvatar = avatar
+	// 对齐 Python：登录信息带 features 且不含 guild.member.list 时，直接返回。
+	if haveFeatures && !slices.Contains(features, "guild.member.list") {
+		return group, nil
 	}
 
 	var members []platform.MessageMember
-	page := 0
+	// Python 用响应返回的不透明 next token 作为下一页游标（而非整数页号），
+	// 并用 seen 集合防止服务端重复返回同一 token 导致死循环。
+	nextToken := ""
+	seenTokens := map[string]bool{}
 	for {
 		data := map[string]interface{}{"guild_id": groupID}
-		if page > 0 {
-			data["next"] = fmt.Sprintf("%d", page)
+		if nextToken != "" {
+			data["next"] = nextToken
 		}
 		resp := a.sendHTTPRequest(http.MethodPost, "/guild.member.list", data, platformName, userID)
 		items, _ := resp["data"].([]interface{})
@@ -597,10 +644,11 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 		if next == "" {
 			break
 		}
-		page++
-		if page > 1000 {
+		if seenTokens[next] {
 			break
 		}
+		seenTokens[next] = true
+		nextToken = next
 	}
 	if len(members) > 0 {
 		group.Members = members

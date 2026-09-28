@@ -79,6 +79,15 @@ type MessageObj struct {
 	// Group carries inbound group metadata (aligned with Python
 	// AstrBotMessage.group); adapters fill what the platform provides.
 	Group *Group
+
+	// Reply metadata（对齐 Python AstrBotMessage.is_reply/ref_msg/reply_kind/
+	// quoted_item_type/quoted_text/reply_to）。目前仅 weixin_oc 填充。
+	IsReply        bool
+	RefMsg         interface{}
+	ReplyKind      string
+	QuotedItemType *int
+	QuotedText     string
+	ReplyTo        map[string]interface{}
 }
 
 // Event represents an incoming message event.
@@ -124,7 +133,21 @@ type Event struct {
 	// （对齐 py AstrMessageEvent.track/untrack/cleanup_temporary_local_files）。
 	temporaryMu    sync.Mutex
 	temporaryFiles []string
+
+	// groupResolver, when set, resolves group metadata from the platform adapter
+	// on demand (attached per event by the pipeline scheduler from the
+	// PlatformManager). Nil when no platform bridge is available.
+	groupResolver GroupInfoResolver
 }
+
+// GroupInfoResolver resolves group metadata from the owning platform adapter
+// (on-demand, as opposed to the inbound metadata already on Event.MessageObj).
+// core cannot import the platform package (import cycle), so the resolver is
+// injected as a function value by the pipeline scheduler.
+type GroupInfoResolver func(ctx context.Context, platformID, platformType, groupID string) (*Group, error)
+
+// SetGroupInfoResolver attaches an on-demand group info resolver to the event.
+func (e *Event) SetGroupInfoResolver(r GroupInfoResolver) { e.groupResolver = r }
 
 // TrackTemporaryFile records a temp file for cleanup after the event finishes.
 // 与 py track_temporary_local_file 一致：重复路径只记录一次。
@@ -267,6 +290,28 @@ func (e *Event) GetGroup(groupID string) *Group {
 	resolved = toStringValue(resolved)
 	if e.MessageObj != nil && e.MessageObj.Group != nil && e.MessageObj.Group.GroupID == resolved {
 		return e.MessageObj.Group
+	}
+	return &Group{GroupID: resolved}
+}
+
+// ResolveGroup returns group metadata like GetGroup, but falls back to the
+// injected platform-API resolver when the inbound event carries no matching
+// group metadata (async equivalent of Python AstrMessageEvent.get_group).
+func (e *Event) ResolveGroup(ctx context.Context, groupID string) *Group {
+	resolved := groupID
+	if resolved == "" {
+		resolved = e.GetGroupID()
+	}
+	if resolved == "" {
+		return nil
+	}
+	if e.MessageObj != nil && e.MessageObj.Group != nil && e.MessageObj.Group.GroupID == resolved {
+		return e.MessageObj.Group
+	}
+	if e.groupResolver != nil {
+		if g, err := e.groupResolver(ctx, e.Source.PlatformID, e.Source.Platform, resolved); err == nil && g != nil {
+			return g
+		}
 	}
 	return &Group{GroupID: resolved}
 }
@@ -817,8 +862,9 @@ const MetadataAgentTerminalError = "__agent_terminal_error"
 
 // PipelineScheduler runs events through a chain of stages.
 type PipelineScheduler struct {
-	confID string
-	stages []PipelineStage
+	confID        string
+	stages        []PipelineStage
+	groupResolver GroupInfoResolver
 }
 
 // NewPipelineScheduler creates a scheduler.
@@ -834,6 +880,12 @@ func (s *PipelineScheduler) AddStage(stage PipelineStage) {
 	s.stages = append(s.stages, stage)
 }
 
+// SetGroupInfoResolver installs an on-demand group info resolver that is
+// attached to every event processed by this scheduler.
+func (s *PipelineScheduler) SetGroupInfoResolver(r GroupInfoResolver) {
+	s.groupResolver = r
+}
+
 // Process runs the event through all stages.
 func (s *PipelineScheduler) Process(ctx context.Context, event *Event) (result *StageResult, err error) {
 	// 对齐 py scheduler.execute 的 finally：流水线结束（含提前 Stop / panic）
@@ -846,6 +898,9 @@ func (s *PipelineScheduler) Process(ctx context.Context, event *Event) (result *
 			err = nil
 		}
 	}()
+	if s.groupResolver != nil {
+		event.SetGroupInfoResolver(s.groupResolver)
+	}
 	for _, stage := range s.stages {
 		result, err = stage.Process(ctx, event)
 		if err != nil {
