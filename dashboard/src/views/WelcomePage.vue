@@ -105,7 +105,7 @@
               <v-col cols="12" sm="4">
                 <!-- GitHub Card -->
                 <v-card variant="outlined" class="h-100 pa-4 d-flex flex-column"
-                  href="https://github.com/WaterGodFurina/Astrbot-golang/" target="_blank">
+                  href="https://github.com/WaterGodFurina/Astrbot-golang/" target="_blank" rel="noopener noreferrer">
                   <div class="d-flex align-center mb-3">
                     <v-icon size="32" class="mr-3">mdi-github</v-icon>
                     <span class="text-h6 font-weight-bold">GitHub</span>
@@ -380,13 +380,15 @@ async function syncDefaultConfigProviderIfNeeded() {
   if (!targetProviderId) return;
 
   const configData = await fetchDefaultConfig();
-  if (!configData.provider_settings) {
-    configData.provider_settings = {};
+  if (configData?.agent_runner?.runner_type !== 'local') {
+    return;
   }
+  const modelConfig = configData.agent_runner.config?.model;
+  if (!modelConfig) return;
 
-  if (configData.provider_settings.default_provider_id === targetProviderId) return;
+  if (modelConfig.provider_id === targetProviderId) return;
 
-  configData.provider_settings.default_provider_id = targetProviderId;
+  modelConfig.provider_id = targetProviderId;
 
   const updateRes = await configProfileApi.update('default', configData);
   if (updateRes.data.status !== 'ok') {
