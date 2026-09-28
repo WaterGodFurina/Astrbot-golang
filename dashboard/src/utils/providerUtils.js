@@ -5,6 +5,35 @@ import mirarouterIcon from '@/assets/images/provider_logos/mirarouter.svg?no-inl
  */
 
 /**
+ * 归一化 provider 类型名。
+ *
+ * Go 端 config 持久化的 provider 为全名（如 "openai_chat_completion"、
+ * "googlegenai_chat_completion"），而图标映射以短名（"openai"/"google"）
+ * 为键，因此这里去掉能力后缀并归并若干别名，语义与
+ * internal/provider/register.go 的 providerTypeAliases 保持一致。
+ *
+ * @param {string} type - 提供商类型
+ * @returns {string} 归一化后的短名
+ */
+export function normalizeProviderType(type) {
+  if (!type) return '';
+  return String(type)
+    .trim()
+    .replace(/_chat_completion$/, '')
+    .replace(/_speech_to_text$/, '')
+    .replace(/_text_to_speech$/, '')
+    .replace(/_embedding$/, '')
+    .replace(/_rerank$/, '')
+    .replace(/_tts$/, '')
+    .replace(/_stt$/, '')
+    .replace(/_api$/, '')
+    .replace(/^googlegenai$/, 'google')
+    .replace(/^openai_responses$/, 'openai')
+    .replace(/^openai_whisper$/, 'openai')
+    .replace(/^kimi-code$/, 'kimi');
+}
+
+/**
  * 获取提供商类型对应的图标
  * @param {string} type - 提供商类型
  * @returns {string} 图标 URL
@@ -54,7 +83,7 @@ export function getProviderIcon(type) {
     "volcengine": 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/volcengine-color.svg',
     'huggingface': 'https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@latest/icons/huggingface.svg',
   };
-  return icons[type] || '';
+  return icons[normalizeProviderType(type)] || '';
 }
 
 /**
@@ -89,7 +118,7 @@ export function isMonochromeProviderIcon(type) {
     'xiaomi-token-plan',
     'openrouter',
     'groq'
-  ].includes(type);
+  ].includes(normalizeProviderType(type));
 }
 
 /**
