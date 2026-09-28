@@ -1014,7 +1014,7 @@ export default {
         },
 
         openUrl(url) {
-            window.open(url, '_blank');
+            window.open(url, '_blank', 'noopener,noreferrer');
         },
 
         // URL导入相关方法

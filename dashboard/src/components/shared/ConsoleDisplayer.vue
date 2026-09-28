@@ -305,6 +305,7 @@ export default {
       const termElement = document.getElementById("term");
       if (!termElement) return;
 
+      // nosemgrep: innerhtml, document-method
       termElement.innerHTML = "";
       if (!this.localLogCache || this.localLogCache.length === 0) return;
 

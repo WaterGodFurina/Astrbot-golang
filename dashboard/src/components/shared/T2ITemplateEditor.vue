@@ -160,6 +160,7 @@
               <iframe
                 ref="previewFrame"
                 :srcdoc="previewContent"
+                sandbox="allow-scripts allow-popups"
                 style="width: 100%; height: 100%; border: none; zoom: 0.6;"
               />
             </div>

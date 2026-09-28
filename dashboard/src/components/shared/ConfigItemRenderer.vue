@@ -18,6 +18,14 @@
         :multiple="true"
       />
     </template>
+    <template v-else-if="getSpecialName(itemMeta?._special) === 'select_agent_runner_provider'">
+      <ProviderSelector
+        :model-value="modelValue"
+        @update:model-value="emitUpdate"
+        :provider-type="'agent_runner'"
+        :provider-subtype="getSpecialSubtype(itemMeta?._special)"
+      />
+    </template>
     <template v-else-if="itemMeta?._special === 'provider_pool'">
       <ProviderSelector :model-value="modelValue" @update:model-value="emitUpdate" :provider-type="'chat_completion'"
         :button-text="t('core.shared.providerSelector.selectProviderPool')" />
@@ -152,14 +160,14 @@
         </span>
 
         <v-slider :model-value="toNumber(numericTemp ?? modelValue)"
-          @update:model-value="val => { numericTemp = val; emitUpdate(toNumber(val)) }" 
+          @update:model-value="val => { numericTemp = val; emitUpdate(toNumber(val)) }"
           @end="numericTemp = null"
-          :min="itemMeta?.slider?.min ?? 0" 
-          :max="itemMeta?.slider?.max ?? 100" 
+          :min="itemMeta?.slider?.min ?? 0"
+          :max="itemMeta?.slider?.max ?? 100"
           :step="itemMeta?.slider?.step ?? 1"
-          color="primary" 
-          density="compact" 
-          hide-details 
+          color="primary"
+          density="compact"
+          hide-details
           style="flex: 1"></v-slider>
 
         <span style="min-width: 5px; text-align: left;">
@@ -406,6 +414,24 @@ function getSelectItems(itemMeta) {
   return itemMeta.options || []
 }
 
+function parseSpecialValue(value) {
+  if (!value || typeof value !== 'string') {
+    return { name: '', subtype: '' }
+  }
+  const [name, ...rest] = value.split(':')
+  return {
+    name,
+    subtype: rest.join(':') || ''
+  }
+}
+
+function getSpecialName(value) {
+  return parseSpecialValue(value).name
+}
+
+function getSpecialSubtype(value) {
+  return parseSpecialValue(value).subtype
+}
 </script>
 
 <style scoped>
