@@ -48,7 +48,7 @@ jobs:
       - name: 用 goproxy.cn 重建 go.sum（本地对齐，不提交回仓库）
         env:
           GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
           GOFLAGS: -mod=mod
         shell: bash
         # goproxy.cn 偶发 HTTP/2 INTERNAL_ERROR / 5xx（尤其海外 runner 拉超大
@@ -96,11 +96,11 @@ jobs:
       - name: 配置 Go 环境（代理与模块）
         env:
           GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
           GOFLAGS: -mod=mod
         run: |
           go env -w GOPROXY="https://goproxy.cn,direct"
-          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
 
       - name: 编译检查
         run: go build ./...
@@ -294,11 +294,11 @@ jobs:
       - name: 配置 Go 环境（代理与模块）
         env:
           GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
           GOFLAGS: -mod=mod
         run: |
           go env -w GOPROXY="https://goproxy.cn,direct"
-          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
 
       - name: 重建 go.sum（引用最新 Go SDK，与 go.mod 对齐）
         run: go mod tidy
@@ -370,7 +370,7 @@ jobs:
       security-events: write
     env:
       GOPROXY: https://goproxy.cn,direct
-      GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+      GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
       GOFLAGS: -mod=mod
     steps:
       - name: Checkout repository
@@ -388,14 +388,14 @@ jobs:
       - name: 重建 go.sum（引用最新 Go SDK，CodeQL autobuild 依赖）
         env:
           GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
           GOFLAGS: -mod=mod
         run: go mod tidy
 
       - name: 预热模块缓存（tracer 用缓存不再下载，避免 go-querystruct 歧义模块校验和不匹配）
         run: |
           go env -w GOPROXY="https://goproxy.cn,direct"
-          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
           go env -w GOFLAGS="-mod=mod"
           go mod download
 

@@ -72,7 +72,7 @@ jobs:
       - name: 用 goproxy.cn 重建 go.sum（本地对齐，不提交回仓库）
         env:
           GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
           GOFLAGS: -mod=mod
         shell: bash
         # goproxy.cn 偶发 HTTP/2 INTERNAL_ERROR（海外 runner 拉大依赖树时）。tidy
@@ -96,11 +96,11 @@ jobs:
       - name: 配置 Go 环境（代理与模块）
         env:
           GOPROXY: https://goproxy.cn,direct
-          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
           GOFLAGS: -mod=mod
         run: |
           go env -w GOPROXY="https://goproxy.cn,direct"
-          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
 
       - name: 安装中文字体（t2i 测试需要）
         if: runner.os == 'Linux'
