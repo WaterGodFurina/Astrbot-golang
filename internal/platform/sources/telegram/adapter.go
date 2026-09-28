@@ -46,6 +46,9 @@ type Adapter struct {
 
 	// config 保存平台配置（start_message / telegram_command_register 等）。
 	config map[string]interface{}
+	// mediaGroupTimeout 是相册合并 debounce 窗口（对齐本体
+	// telegram_media_group_timeout，默认 2.5s）。
+	mediaGroupTimeout time.Duration
 	// selfUsername 是 getMe 返回的 bot 用户名（不带 @），用于 /cmd@bot 命令
 	// 剥离、@bot 唤醒识别与指令注册。
 	selfUsername string
@@ -71,6 +74,16 @@ type Adapter struct {
 	// lastTyping 记录流式输出期间各会话上次发送 typing 的时间（节流）。
 	streamMu   sync.Mutex
 	lastTyping map[string]time.Time
+
+	// sessionGroup 记录会话是否为群聊（ConvID → isGroup），供流式输出判断
+	// 能否使用 sendMessageDraft（仅私聊，本体 tg_event.py:606-614）。
+	sessionMu    sync.Mutex
+	sessionGroup map[string]bool
+
+	// drafts 记录进行中的私聊草稿流（合成 msgID → 草稿信息）。
+	draftsMu    sync.Mutex
+	drafts      map[string]*tgDraft
+	nextDraftID int
 
 	// workerMu 保护 workers；workers 按 chat_id 串行处理 update 的队列
 	//（见 dispatchUpdate）。
@@ -116,6 +129,12 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		a.enableCmdRefresh = v
 	}
 	a.startMessage, _ = config["start_message"].(string)
+	// 相册合并 debounce（本体 tg_adapter.py:129-130：telegram_media_group_timeout,
+	// 默认 2.5s）。
+	a.mediaGroupTimeout = 2500 * time.Millisecond
+	if v, ok := config["telegram_media_group_timeout"].(float64); ok && v > 0 {
+		a.mediaGroupTimeout = time.Duration(v * float64(time.Second))
+	}
 	return a
 }
 
@@ -390,20 +409,36 @@ func (a *Adapter) getFileFilePath(ctx context.Context, fileID string) string {
 
 // ---------- 流式输出（审计项 12） ----------
 
-// StreamStart 发送一条真实消息作为流式载体并返回其 message_id。
-// 对齐本体 tg_event.py:633-713 _send_streaming_edit（send_message +
-// edit_message_text 节流编辑）：首片段 sendMessage，后续片段由宿主
-// streamSender 以 ~2x/s 的频率调用 StreamUpdate 编辑同一条消息。
-// 本体私聊用的 sendMessageDraft 为 Bot API 非公开接口，Go 侧统一采用
-// edit_message_text 方案（宿主已做 500ms 节流，效果对齐）。
+// StreamStart 开始流式输出。私聊优先用 sendMessageDraft（草稿动画，对齐
+// 本体 tg_event.py:606-713）；群聊或草稿失败时回退 sendMessage + 后续
+// edit_message_text（对齐 _send_streaming_edit）。返回流式消息的标识（真实
+// message_id 或合成草稿 id）。
 func (a *Adapter) StreamStart(sessionID, text string) (string, error) {
 	chatID, threadID := splitThreadID(sessionID)
 	a.sendChatAction(chatID, threadID, chatActionTyping)
+	if !a.sessionIsGroup(sessionID) {
+		if id, err := a.startDraft(chatID, threadID, text); err == nil {
+			return id, nil
+		}
+		// 草稿失败 → 回退真实消息 edit 方案。
+	}
+	return a.startEditStream(chatID, threadID, text)
+}
+
+// startEditStream 发送真实消息作为流式载体（群聊 / 草稿回退路径）。
+func (a *Adapter) startEditStream(chatID, threadID, text string) (string, error) {
 	payload := a.sendPayload(chatID, threadID, "")
-	payload["text"] = truncateRunes(text, maxMessageLength)
+	payload["text"] = telegramifyMarkdown(truncateRunes(text, maxMessageLength))
+	payload["parse_mode"] = "MarkdownV2"
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	resp, err := a.apiCall(ctx, "sendMessage", payload)
+	if err != nil {
+		// 回退纯文本。
+		plain := a.sendPayload(chatID, threadID, "")
+		plain["text"] = truncateRunes(text, maxMessageLength)
+		resp, err = a.apiCall(ctx, "sendMessage", plain)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -415,18 +450,105 @@ func (a *Adapter) StreamStart(sessionID, text string) (string, error) {
 	return msgID, nil
 }
 
-// StreamUpdate edits an in-progress streaming message（edit_message_text）。
+// StreamUpdate 更新进行中的流式消息（草稿或 edit）。
 func (a *Adapter) StreamUpdate(sessionID, msgID, text string) error {
 	chatID, threadID := splitThreadID(sessionID)
 	// typing 状态节流重发（本体 chat_action_interval=0.5s，:687-689）。
 	a.throttledTyping(chatID, threadID)
+	if d := a.getDraft(msgID); d != nil {
+		return a.sendMessageDraft(d.chatID, d.threadID, d.draftID, text)
+	}
 	return a.editStreamText(chatID, threadID, msgID, text)
 }
 
-// StreamEnd finalizes the streaming message with its final text.
+// StreamEnd 结束流式输出：草稿流发送一条真实消息保留最终内容
+// （草稿是临时的，对齐本体），其它情况编辑载体消息。
 func (a *Adapter) StreamEnd(sessionID, msgID, text string) error {
 	chatID, threadID := splitThreadID(sessionID)
+	if d := a.takeDraft(msgID); d != nil {
+		return a.sendTextChunks(d.chatID, d.threadID, "", text)
+	}
 	return a.editStreamText(chatID, threadID, msgID, text)
+}
+
+// sessionIsGroup 返回会话是否为群聊（未知默认按群聊处理，走更稳妥的 edit）。
+func (a *Adapter) sessionIsGroup(sessionID string) bool {
+	a.sessionMu.Lock()
+	defer a.sessionMu.Unlock()
+	isGroup, ok := a.sessionGroup[sessionID]
+	if !ok {
+		return true
+	}
+	return isGroup
+}
+
+// tgDraft 记录进行中的私聊草稿流。
+type tgDraft struct {
+	chatID   string
+	threadID string
+	draftID  int
+}
+
+const tgDraftIDMax = 1<<31 - 1
+
+// startDraft 分配 draft_id、登记映射并发送首帧草稿。
+func (a *Adapter) startDraft(chatID, threadID, text string) (string, error) {
+	a.draftsMu.Lock()
+	if a.drafts == nil {
+		a.drafts = map[string]*tgDraft{}
+	}
+	a.nextDraftID++
+	if a.nextDraftID <= 0 || a.nextDraftID > tgDraftIDMax {
+		a.nextDraftID = 1
+	}
+	draftID := a.nextDraftID
+	msgID := fmt.Sprintf("tg-draft-%d", draftID)
+	d := &tgDraft{chatID: chatID, threadID: threadID, draftID: draftID}
+	a.drafts[msgID] = d
+	a.draftsMu.Unlock()
+
+	if err := a.sendMessageDraft(chatID, threadID, draftID, text); err != nil {
+		a.draftsMu.Lock()
+		delete(a.drafts, msgID)
+		a.draftsMu.Unlock()
+		return "", err
+	}
+	return msgID, nil
+}
+
+func (a *Adapter) getDraft(msgID string) *tgDraft {
+	a.draftsMu.Lock()
+	defer a.draftsMu.Unlock()
+	return a.drafts[msgID]
+}
+
+func (a *Adapter) takeDraft(msgID string) *tgDraft {
+	a.draftsMu.Lock()
+	defer a.draftsMu.Unlock()
+	d := a.drafts[msgID]
+	if d != nil {
+		delete(a.drafts, msgID)
+	}
+	return d
+}
+
+// sendMessageDraft 调用 Bot API sendMessageDraft 发送私聊草稿（MarkdownV2，
+// 失败回退纯文本）。
+func (a *Adapter) sendMessageDraft(chatID, threadID string, draftID int, text string) error {
+	payload := a.sendPayload(chatID, threadID, "")
+	payload["draft_id"] = draftID
+	payload["text"] = telegramifyMarkdown(truncateRunes(text, maxMessageLength))
+	payload["parse_mode"] = "MarkdownV2"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := a.apiCall(ctx, "sendMessageDraft", payload)
+	if err != nil {
+		plain := a.sendPayload(chatID, threadID, "")
+		plain["draft_id"] = draftID
+		plain["text"] = truncateRunes(text, maxMessageLength)
+		_, err = a.apiCall(ctx, "sendMessageDraft", plain)
+	}
+	return err
 }
 
 // editStreamText edits the streaming carrier message with the accumulated text.
@@ -438,11 +560,19 @@ func (a *Adapter) editStreamText(chatID, threadID, msgID, text string) error {
 		return nil
 	}
 	payload := a.sendPayload(chatID, threadID, "")
-	payload["text"] = truncateRunes(text, maxMessageLength)
+	payload["text"] = telegramifyMarkdown(truncateRunes(text, maxMessageLength))
+	payload["parse_mode"] = "MarkdownV2"
 	payload["message_id"] = msgID
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := a.apiCall(ctx, "edit_message_text", payload)
+	if err != nil {
+		// Markdown 转换失败回退普通文本（对齐 Python :814-823）。
+		plain := a.sendPayload(chatID, threadID, "")
+		plain["text"] = truncateRunes(text, maxMessageLength)
+		plain["message_id"] = msgID
+		_, err = a.apiCall(ctx, "edit_message_text", plain)
+	}
 	return err
 }
 
@@ -601,18 +731,24 @@ func (a *Adapter) sendPayload(chatID, threadID, replyID string) map[string]inter
 }
 
 // sendTextChunks 按 Telegram 4096 长度限制切分文本后逐段发送。
-// 对齐本体 _send_text_chunks（:108-130）；Go 侧无 telegramify_markdown
-// 等价物，直接以纯文本发送（对齐本体的 Markdown 失败回退路径）。
+// 对齐本体 _send_text_chunks（:108-130）：先转 MarkdownV2 发送，失败回退纯文本。
 func (a *Adapter) sendTextChunks(chatID, threadID, replyID, text string) error {
 	if text == "" {
 		return nil
 	}
 	for _, chunk := range splitMessage(text) {
-		payload := a.sendPayload(chatID, threadID, replyID)
-		payload["text"] = chunk
 		// 用带超时的上下文发送，避免网络卡死时 sendMessage 无限期挂起。
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		payload := a.sendPayload(chatID, threadID, replyID)
+		payload["text"] = telegramifyMarkdown(chunk)
+		payload["parse_mode"] = "MarkdownV2"
 		_, err := a.apiCall(ctx, "sendMessage", payload)
+		if err != nil {
+			// 回退纯文本（对齐 Python telegramify 失败回退路径）。
+			plain := a.sendPayload(chatID, threadID, replyID)
+			plain["text"] = chunk
+			_, err = a.apiCall(ctx, "sendMessage", plain)
+		}
 		cancel()
 		if err != nil {
 			return err
@@ -1279,6 +1415,14 @@ func (a *Adapter) publishMsg(m *tgMsg) {
 	_, threadID := splitThreadID(m.SessionID)
 	a.sendChatAction(m.ChatID, threadID, chatActionForChain(m.Chain))
 
+	// 记录会话类型，供流式输出判断是否可用 sendMessageDraft（仅私聊）。
+	a.sessionMu.Lock()
+	if a.sessionGroup == nil {
+		a.sessionGroup = map[string]bool{}
+	}
+	a.sessionGroup[m.SessionID] = m.IsGroup
+	a.sessionMu.Unlock()
+
 	rawJSONStr := ""
 	if b, err := json.Marshal(m.RawMessage); err == nil {
 		rawJSONStr = string(b)
@@ -1289,7 +1433,7 @@ func (a *Adapter) publishMsg(m *tgMsg) {
 		Source: core.EventSource{
 			Platform:   "telegram",
 			PlatformID: a.ID(),
-			SelfID:     a.SelfID,
+			SelfID:     a.eventSelfID(),
 			SenderID:   m.SenderID,
 			SenderName: m.SenderName,
 			ConvID:     m.SessionID,
@@ -1306,7 +1450,7 @@ func (a *Adapter) publishMsg(m *tgMsg) {
 		// message_id/self_id/session_id/group_id/type/sender/message_str）。
 		MessageObj: &core.MessageObj{
 			MessageID:   m.MessageID,
-			SelfID:      a.SelfID,
+			SelfID:      a.eventSelfID(),
 			SessionID:   m.SessionID,
 			MessageType: msgType,
 			Platform:    "telegram",
@@ -1394,7 +1538,8 @@ func (a *Adapter) convertMessage(ctx context.Context, msg map[string]interface{}
 	}
 	if username, _ := from["username"].(string); username != "" {
 		m.SenderName = username
-	} else if m.SenderName = joinName(from); m.SenderName == "" {
+	} else {
+		// 对齐 Python：`_from_user.username or "Unknown"`。
 		m.SenderName = "Unknown"
 	}
 
@@ -1528,7 +1673,7 @@ func (a *Adapter) appendReplyComponent(ctx context.Context, msg map[string]inter
 
 // applyCaption 处理媒体 caption（本体 _apply_caption，tg_adapter.py:455-467）：
 // caption 文本作为 message_str 与 Plain 追加；caption_entities 中的
-// mention/text_mention 追加为 At 组件（不移除文本）。
+// mention 追加为 At 组件（不移除文本）。
 func (a *Adapter) applyCaption(msg map[string]interface{}, m *tgMsg) {
 	caption, _ := msg["caption"].(string)
 	if caption != "" {
@@ -1538,9 +1683,9 @@ func (a *Adapter) applyCaption(msg map[string]interface{}, m *tgMsg) {
 	a.appendEntityComponents(msg["caption_entities"], caption, &m.Chain, false)
 }
 
-// appendEntityComponents 将消息 entities 中的 mention/text_mention 解析为
-// At 组件（审计项 4；对齐本体 tg_adapter.py:461-467, 552-564，text_mention
-// 为审计项 4 补齐的能力面）。removeBotMention 为 true 时（文本消息场景），
+// appendEntityComponents 将消息 entities 中的 mention 解析为 At 组件
+// （对齐本体 tg_adapter.py:461-467, 552-564；Python 不处理 text_mention）。
+// removeBotMention 为 true 时（文本消息场景），
 // 指向当前 bot 的 @mention 从文本中移除（本体 :559-564）。
 // entity.offset/length 以 UTF-16 code units 计，需换算为 Go 字符串字节下标。
 func (a *Adapter) appendEntityComponents(entities interface{}, text string, chain *[]message.Component, removeBotMention bool) string {
@@ -1576,24 +1721,6 @@ func (a *Adapter) appendEntityComponents(entities interface{}, text string, chai
 				strings.EqualFold(name, a.selfUsername) {
 				text = text[:start] + text[end:]
 			}
-		case "text_mention": // 内联用户提及（无 @username 的用户）
-			user, _ := em["user"].(map[string]interface{})
-			if user == nil {
-				continue
-			}
-			at := &message.At{}
-			if id := int64FromAny(user["id"]); id != 0 {
-				at.TargetID = fmt.Sprintf("%d", id)
-			}
-			if uname, _ := user["username"].(string); uname != "" {
-				at.Name = uname
-			} else {
-				at.Name = joinName(user)
-			}
-			if at.TargetID == "" && at.Name == "" {
-				continue
-			}
-			*chain = append(*chain, at)
 		}
 	}
 	return text
@@ -1610,6 +1737,16 @@ func (a *Adapter) isReplyToBot(msg map[string]interface{}) bool {
 		return false
 	}
 	return a.SelfID != "" && fmt.Sprintf("%d", int64FromAny(from["id"])) == a.SelfID
+}
+
+// eventSelfID 返回事件 self_id：对齐 Python convert_msg 的
+// `message.self_id = str(context.bot.username)`（bot @用户名），未拿到用户名时
+// 回退数字 id（a.SelfID 仍保留数字 id，供 isReplyToBot 等内部判定使用）。
+func (a *Adapter) eventSelfID() string {
+	if a.selfUsername != "" {
+		return a.selfUsername
+	}
+	return a.SelfID
 }
 
 // stripCommandTarget 剥离 "/cmd@botname" 命令中的 @bot 后缀（审计项 9，
@@ -1652,11 +1789,6 @@ func (a *Adapter) sendStartMessage(chatID string) {
 
 // ---------- 相册合并（审计项 7，本体 tg_adapter.py:424-437, 672-782） ----------
 
-// mediaGroupDebounce 是相册合并的 debounce 窗口：首图到达后启动计时，
-// 窗口内到达的后续图片并入同一事件。本体默认 2.5s debounce（media_group_timeout），
-// Telegram 相册消息几乎同时到达，按审计要求取 500ms 更快完成合并。
-const mediaGroupDebounce = 500 * time.Millisecond
-
 // mediaGroupMaxWait 是相册合并的硬上限，防止无限延迟
 // （对齐本体 media_group_max_wait，:708-714 达到上限立即处理）。
 const mediaGroupMaxWait = 10 * time.Second
@@ -1677,8 +1809,12 @@ func (a *Adapter) enqueueMediaGroup(mediaGroupID string, msg map[string]interfac
 	}
 	entry, ok := a.mediaGroups[mediaGroupID]
 	if !ok {
+		timeout := a.mediaGroupTimeout
+		if timeout <= 0 {
+			timeout = 2500 * time.Millisecond
+		}
 		entry = &mediaGroupEntry{createdAt: time.Now()}
-		entry.timer = time.AfterFunc(mediaGroupDebounce, func() {
+		entry.timer = time.AfterFunc(timeout, func() {
 			a.processMediaGroup(mediaGroupID)
 		})
 		a.mediaGroups[mediaGroupID] = entry

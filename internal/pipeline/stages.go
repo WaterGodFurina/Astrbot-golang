@@ -714,7 +714,7 @@ func (s *ContentSafetyCheckStage) Process(ctx context.Context, event *core.Event
 		// 与 ProcessStage 的 no_permission_reply 相同：调度器对 Continue:false 直接短路，写 event.Result 的提示不会被 RespondStage 送达，必须直接经平台发送。
 		if event.IsAtOrWakeCommand && s.platformMgr != nil {
 			chain := message.NewMessageChain(&message.Plain{Text: "Your message or the model response contains inappropriate content and has been blocked."})
-			_ = s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
+			_ = s.platformMgr.SendByEvent(event, chain)
 		}
 		event.Stop()
 		logger.Debug("Content safety check failed: %s", info)
@@ -2562,7 +2562,7 @@ func (ss *streamSender) sendReasoningSegment(text string) {
 		Type:  "reasoning",
 		Chain: []message.Component{&message.Plain{Text: text}},
 	}
-	if err := ss.stage.platformMgr.Send(ss.event.Source.Platform, ss.event.Source.ConvID, chain); err != nil {
+	if err := ss.stage.platformMgr.SendByEvent(ss.event, chain); err != nil {
 		logger.I18nWarn("流式推理片段发送失败: %v", err)
 		return
 	}
@@ -2650,7 +2650,7 @@ func (ss *streamSender) sendSegment(text string) {
 	}
 	logger.Debug("stream segment send: %.300s", text)
 	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: text}}}
-	if err := ss.stage.platformMgr.Send(ss.event.Source.Platform, ss.event.Source.ConvID, chain); err != nil {
+	if err := ss.stage.platformMgr.SendByEvent(ss.event, chain); err != nil {
 		logger.I18nWarn("流式片段发送失败: %v", err)
 		return
 	}
@@ -5248,7 +5248,7 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 			if len(media) > 0 {
 				chain := event.Result.ToMessageChain()
 				chain.Chain = media
-				if err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain); err != nil {
+				if err := s.platformMgr.SendByEvent(event, chain); err != nil {
 					logger.Error("Failed to send streamed media chain: %v", err)
 				}
 			}
@@ -5302,7 +5302,7 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 			sendOne := func(comps []message.Component) error {
 				chain := event.Result.ToMessageChain()
 				chain.Chain = comps
-				return s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain)
+				return s.platformMgr.SendByEvent(event, chain)
 			}
 			sent := false
 			for _, comp := range sepComps {
@@ -5365,7 +5365,7 @@ func (s *RespondStage) sendSegmented(ctx context.Context, event *core.Event, cha
 	sendOne := func(comps []message.Component) {
 		chain := event.Result.ToMessageChain()
 		chain.Chain = comps
-		if err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain); err != nil {
+		if err := s.platformMgr.SendByEvent(event, chain); err != nil {
 			logger.Error("Failed to send segmented message chain: %v", err)
 		}
 	}

@@ -458,6 +458,11 @@ func messageToProtoComponentsDepth(chain []message.Component, depth int) []*sdkv
 			pc.Name = v.Name
 		case *message.Image:
 			pc.Url, pc.Path, pc.File, pc.FileId = v.URL, v.Path, v.File, v.FileID
+			// 借用 proto Component.name 承载图片文件名（proto 无独立 filename
+			// 字段；Python SDK 侧 filename 目前不经过桥接，宿主原生/未来扩展用）。
+			if v.Filename != "" {
+				pc.Name = v.Filename
+			}
 			if v.Base64 != "" {
 				if b, err := base64.StdEncoding.DecodeString(v.Base64); err == nil {
 					pc.Base64Data = b

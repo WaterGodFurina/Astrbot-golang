@@ -577,7 +577,9 @@ func (a *Adapter) convertMessage(msg *wxmp.MessageData) *platform.AstrBotMessage
 		abm.Message = []message.Component{&message.Plain{Text: msg.Content}}
 	case "image":
 		abm.MessageStr = "[图片]"
-		abm.Message = []message.Component{&message.Image{URL: msg.PicUrl, File: msg.MediaId}}
+		// 对齐 Python weixin_offacc_adapter.py:451：Image(file=msg.image, url=msg.image)，
+		// 即 file 与 url 都取图片 URL（PicUrl），而非 MediaId。
+		abm.Message = []message.Component{&message.Image{URL: msg.PicUrl, File: msg.PicUrl}}
 	case "voice":
 		// 语音接收：下载临时素材并用宿主 ffmpeg 转 wav（本体 :460-484）。
 		// 转换失败时跳过该消息（本体转换失败直接 return，不进入管线）。
@@ -587,20 +589,11 @@ func (a *Adapter) convertMessage(msg *wxmp.MessageData) *platform.AstrBotMessage
 		}
 		abm.MessageStr = ""
 		abm.Message = []message.Component{&message.Record{File: path, URL: path}}
-	case "video", "shortvideo":
-		abm.MessageStr = "[视频]"
-		abm.Message = []message.Component{&message.Video{FileID: msg.MediaId, Path: msg.ThumbMediaId}}
-	case "link":
-		text := strings.Join([]string{msg.Title, msg.Description, msg.Url}, " ")
-		abm.MessageStr = text
-		abm.Message = []message.Component{&message.Plain{Text: text}}
-	case "location":
-		text := fmt.Sprintf("位置: %s, %d (经度 %v, 纬度 %v)", msg.Label, msg.Scale, msg.LocationX, msg.LocationY)
-		abm.MessageStr = text
-		abm.Message = []message.Component{&message.Plain{Text: text}}
 	default:
-		abm.MessageStr = "[" + msg.MsgType + "]"
-		abm.Message = []message.Component{&message.Plain{Text: abm.MessageStr}}
+		// 对齐 Python :497-501：video/shortvideo/link/location 及其它未实现类型
+		// 仅告警并丢弃，不产出事件。
+		logger.I18nWarn("暂未实现的微信公众号消息类型: %s，已丢弃", msg.MsgType)
+		return nil
 	}
 	return abm
 }
@@ -650,8 +643,24 @@ func (a *Adapter) publishEvent(abm *platform.AstrBotMessage, done *core.Pipeline
 		Message:    &message.MessageChain{Chain: abm.Message},
 		MessageStr: abm.MessageStr,
 		Timestamp:  time.Unix(abm.Timestamp, 0),
-		MessageObj: &core.MessageObj{MessageID: abm.MessageID, SelfID: abm.SelfID},
-		Metadata:   map[string]interface{}{},
+		MessageObj: &core.MessageObj{
+			MessageID:   abm.MessageID,
+			SelfID:      abm.SelfID,
+			SessionID:   abm.SessionID,
+			MessageType: string(abm.Type),
+			Platform:    "weixin_official_account",
+			MessageStr:  abm.MessageStr,
+			RawMessage: map[string]interface{}{
+				// 对齐 Python weixin_offacc_adapter.py:503-507：
+				// raw_message = {"message": msg, "future": future, "active_send_mode": ...}
+				"message":          abm.RawMessage,
+				"future":           done,
+				"active_send_mode": a.activeSend,
+			},
+			Timestamp: time.Unix(abm.Timestamp, 0),
+			Group:     abm.Group,
+		},
+		Metadata: map[string]interface{}{},
 	}
 	if done != nil {
 		event.Metadata[core.MetadataPipelineDone] = done

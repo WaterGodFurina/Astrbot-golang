@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -49,6 +50,10 @@ func convertSatoriMessage(msg, user, channel, guild, login map[string]interface{
 	if abm.Group != nil {
 		if guildName := strField(guild, "name"); guildName != "" {
 			abm.Group.GroupName = guildName
+		}
+		// 对齐 Python satori_adapter.py:336-343：同时写入群头像。
+		if guildAvatar := strField(guild, "avatar"); guildAvatar != "" {
+			abm.Group.GroupAvatar = guildAvatar
 		}
 	}
 	abm.SessionID, _ = channel["id"].(string)
@@ -441,8 +446,13 @@ func handleSatoriElement(d *xml.Decoder, start xml.StartElement, elements *[]mes
 		if src == "" {
 			return skipElement(d)
 		}
-		// Python 会下载并转换为 wav；Go 直接保留 URL
-		*elements = append(*elements, &message.Record{URL: src})
+		// 对齐 Python satori_adapter.py:681-686：音频经 MediaResolver(target_format="wav")
+		// 下载并转 wav 后引用本地文件；失败时降级保留 URL。
+		if wavPath := materializeAudioWav(src); wavPath != "" {
+			*elements = append(*elements, &message.Record{URL: wavPath, File: wavPath, Path: wavPath})
+		} else {
+			*elements = append(*elements, &message.Record{URL: src})
+		}
 		return skipElement(d)
 	case "quote":
 		// quote 标签已经被特殊处理
@@ -872,6 +882,42 @@ func imageToDataURL(img *message.Image) (string, error) {
 		mimeType = "image/jpeg" // 对齐 Python 默认 image/jpeg
 	}
 	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+// materializeAudioWav 下载远程音频并转 wav，返回本地 wav 路径；
+// 下载/转码失败返回空字符串（调用方降级为原 URL）。
+func materializeAudioWav(src string) string {
+	if src == "" {
+		return ""
+	}
+	data, _, err := fetchMedia(src)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	tmp, err := os.CreateTemp("", "astrbot_satori_voice_*")
+	if err != nil {
+		return ""
+	}
+	inPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(inPath)
+		return ""
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(inPath)
+		return ""
+	}
+	wavPath, err := utils.EnsureWAV(inPath)
+	if err != nil || wavPath == "" {
+		_ = os.Remove(inPath)
+		return ""
+	}
+	if wavPath == inPath {
+		return wavPath
+	}
+	_ = os.Remove(inPath)
+	return wavPath
 }
 
 // recordToBase64 将语音组件解析为 base64 字符串。

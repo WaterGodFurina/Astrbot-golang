@@ -112,13 +112,14 @@ func (r *Reply) Clone() Component {
 
 // Image represents an image component.
 type Image struct {
-	URL    string `json:"url,omitempty"`
-	Path   string `json:"path,omitempty"`
-	File   string `json:"file,omitempty"`
-	Base64 string `json:"base64,omitempty"`
-	FileID string `json:"file_id,omitempty"`
-	Width  int    `json:"width,omitempty"`
-	Height int    `json:"height,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Path     string `json:"path,omitempty"`
+	File     string `json:"file,omitempty"`
+	Base64   string `json:"base64,omitempty"`
+	FileID   string `json:"file_id,omitempty"`
+	Filename string `json:"filename,omitempty"`
+	Width    int    `json:"width,omitempty"`
+	Height   int    `json:"height,omitempty"`
 }
 
 func (img *Image) Type() ComponentType { return CompImage }
@@ -126,7 +127,7 @@ func (img *Image) String() string      { return "[图片]" }
 func (img *Image) Clone() Component {
 	return &Image{
 		URL: img.URL, Path: img.Path, File: img.File, Base64: img.Base64,
-		FileID: img.FileID, Width: img.Width, Height: img.Height,
+		FileID: img.FileID, Filename: img.Filename, Width: img.Width, Height: img.Height,
 	}
 }
 

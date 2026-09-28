@@ -139,8 +139,6 @@ func (s *ProcessStage) executeSendMessage(event *core.Event, args map[string]int
 	if len(raw) == 0 {
 		return "Error: send_message_to_user requires a non-empty `messages` array."
 	}
-	platform := event.Source.Platform
-	sessionID := event.Source.ConvID
 	if sess, ok := args["session"].(string); ok && strings.TrimSpace(sess) != "" {
 		parts := strings.SplitN(sess, ":", 3)
 		// Only the current event's platform and session may be targeted; the
@@ -170,7 +168,7 @@ func (s *ProcessStage) executeSendMessage(event *core.Event, args map[string]int
 	if len(chain.Chain) == 0 {
 		return "Error: no valid message components in `messages`."
 	}
-	if err := s.platformMgr.Send(platform, sessionID, chain); err != nil {
+	if err := s.platformMgr.SendByEvent(event, chain); err != nil {
 		return "Error sending message: " + err.Error()
 	}
 	return "消息已发送。"

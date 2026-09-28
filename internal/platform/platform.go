@@ -180,6 +180,24 @@ type StreamFragmenter interface {
 	StreamEnd(sessionID, msgID, text string) error
 }
 
+// GroupInfoProvider is an optional capability for adapters that can fetch
+// group metadata from the platform API on demand. It backs Python
+// AstrMessageEvent.get_group → host bridge CallAction("get_group_info") for
+// platforms that have no generic CallAction (everything except aiocqhttp).
+type GroupInfoProvider interface {
+	GetGroupInfo(ctx context.Context, groupID string) (*Group, error)
+}
+
+// MessageEventSender is an optional capability for adapters that must
+// distinguish an event response (Python AstrMessageEvent.send, e.g. lark
+// replies to the triggering message) from an active push (Python
+// send_by_session, e.g. cron/dashboard notifications). Adapters that need the
+// originating event implement it; PlatformManager.SendByEvent passes it
+// through, while the plain Send remains the active-push path.
+type MessageEventSender interface {
+	SendByEvent(sessionID string, chain *message.MessageChain, event *core.Event) error
+}
+
 // AstrMessageEvent is the core event object flowing through the pipeline.
 // Ported from astrbot/core/platform/astr_message_event.py
 type AstrMessageEvent struct {
@@ -763,6 +781,25 @@ func (pm *PlatformManager) Send(platformID, sessionID string, chain *message.Mes
 	cleanup := materializeRemoteMedia(chain)
 	defer cleanup()
 	return adapter.Send(sessionID, chain)
+}
+
+// SendByEvent sends a message chain as a response to the given event
+// (Python AstrMessageEvent.send). Adapters implementing MessageEventSender
+// receive the originating event; others fall back to Send (send_by_session).
+func (pm *PlatformManager) SendByEvent(event *core.Event, chain *message.MessageChain) error {
+	if event == nil {
+		return fmt.Errorf("SendByEvent: nil event")
+	}
+	adapter := pm.resolveAdapter(event.Source.Platform)
+	if adapter == nil {
+		return fmt.Errorf("platform %q not found", event.Source.Platform)
+	}
+	cleanup := materializeRemoteMedia(chain)
+	defer cleanup()
+	if es, ok := adapter.(MessageEventSender); ok {
+		return es.SendByEvent(event.Source.ConvID, chain, event)
+	}
+	return adapter.Send(event.Source.ConvID, chain)
 }
 
 // GetFragmenter returns a platform's native stream-edit capability, or nil.

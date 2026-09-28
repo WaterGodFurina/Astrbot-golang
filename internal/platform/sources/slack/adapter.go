@@ -406,8 +406,8 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 	// 判断消息类型（群组/私聊）
 	channelID, _ := event["channel"].(string)
 	abm.Type = platform.GroupMessage
-	if !a.isIMChannel(ctx, channelID) {
-		abm.Group = &platform.Group{GroupID: channelID, GroupName: channelID}
+	if isIM, channelName := a.conversationInfo(ctx, channelID); !isIM {
+		abm.Group = &platform.Group{GroupID: channelID, GroupName: channelName}
 		abm.SessionID = channelID
 	} else {
 		abm.Type = platform.FriendMessage
@@ -444,13 +444,9 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 		// 处理传统文本消息（<@USER> 提及）
 		if strings.Contains(messageText, "<@") {
 			mentions := mentionRegex.FindAllStringSubmatch(messageText, -1)
-			seen := map[string]bool{}
 			for _, m := range mentions {
 				mid := m[1]
-				if seen[mid] {
-					continue
-				}
-				seen[mid] = true
+				// 对齐 Python slack_adapter.py:178-189：每次出现都追加 At（不去重）。
 				name := a.fetchUserName(ctx, mid)
 				abm.Message = append(abm.Message, &message.At{TargetID: mid, Name: name})
 			}
@@ -542,19 +538,20 @@ func (a *Adapter) fetchUserName(ctx context.Context, userID string) string {
 	return name
 }
 
-// isIMChannel 判断频道是否为私聊（conversations.info 的 is_im）。
-// 对应 Python convert_message 中的 conversations_info 调用。
-func (a *Adapter) isIMChannel(ctx context.Context, channelID string) bool {
+// conversationInfo 返回频道是否私聊（conversations.info 的 is_im）与频道名。
+// 对应 Python convert_message 中的 conversations_info 调用：群聊时
+// group_name 取 channel_data.get("name")，而非频道 id。
+func (a *Adapter) conversationInfo(ctx context.Context, channelID string) (bool, string) {
 	if channelID == "" || a.client == nil {
-		return false
+		return false, ""
 	}
 	info, err := a.client.GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
 		ChannelID: channelID,
 	})
 	if err != nil || info == nil {
-		return false
+		return false, ""
 	}
-	return info.IsIM
+	return info.IsIM, info.Name
 }
 
 // getFileBase64 下载 Slack 文件并返回 Base64 编码的内容。
@@ -877,7 +874,8 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 	group := &platform.Group{GroupID: groupID}
 
 	info, err := a.client.GetConversationInfoContext(ctx, &slack.GetConversationInfoInput{
-		ChannelID: groupID,
+		ChannelID:         groupID,
+		IncludeNumMembers: true,
 	})
 	if err != nil {
 		logger.Debug("[Slack] conversations.info failed for %s: %v", groupID, err)
@@ -890,6 +888,11 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 		if group.GroupName == "" {
 			group.GroupName = info.Purpose.Value
 		}
+	}
+	// 对齐 Python：member_count 取 conversations.info 的 num_members。
+	if info.NumMembers > 0 {
+		c := info.NumMembers
+		group.MemberCount = &c
 	}
 
 	var members []platform.MessageMember
@@ -914,8 +917,10 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 	}
 	if len(members) > 0 {
 		group.Members = members
-		c := len(members)
-		group.MemberCount = &c
+		if group.MemberCount == nil {
+			c := len(members)
+			group.MemberCount = &c
+		}
 	}
 
 	return group, nil

@@ -3,6 +3,7 @@
 package misskey
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -296,13 +298,57 @@ func createFileComponent(fileInfo map[string]interface{}) (message.Component, st
 	case strings.HasPrefix(fileType, "image/"):
 		return &message.Image{URL: fileURL, File: fileName}, fmt.Sprintf("图片[%s]", fileName)
 	case strings.HasPrefix(fileType, "audio/"):
-		// Python 在此处将音频下载并转码为 wav；Go 侧无转码能力，直接引用原文件
+		// 对齐 Python misskey_utils.py:281-287：音频经 MediaResolver(target_format="wav")
+		// 下载并转 wav 后引用本地文件；失败时降级引用原 URL。
+		if wavPath := materializeAudioWav(fileURL); wavPath != "" {
+			return &message.Record{URL: wavPath, File: wavPath}, fmt.Sprintf("音频[%s]", fileName)
+		}
 		return &message.Record{URL: fileURL, File: fileName}, fmt.Sprintf("音频[%s]", fileName)
 	case strings.HasPrefix(fileType, "video/"):
 		return &message.Video{URL: fileURL}, fmt.Sprintf("视频[%s]", fileName)
 	default:
 		return &message.File{Name: fileName, URL: fileURL}, fmt.Sprintf("文件[%s]", fileName)
 	}
+}
+
+// materializeAudioWav 下载远程音频并转 wav，返回本地 wav 路径；
+// 下载/转码失败返回空字符串（调用方降级为原 URL）。
+// 对齐 Python MediaResolver(...).to_path(target_format="wav")。
+func materializeAudioWav(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	data, err := platform.SafeDownloadBytes(ctx, rawURL, 64<<20)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	tmp, err := os.CreateTemp("", "astrbot_misskey_voice_*")
+	if err != nil {
+		return ""
+	}
+	inPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(inPath)
+		return ""
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(inPath)
+		return ""
+	}
+	wavPath, err := utils.EnsureWAV(inPath)
+	if err != nil || wavPath == "" {
+		_ = os.Remove(inPath)
+		return ""
+	}
+	if wavPath == inPath {
+		// 输入已是 wav：直接把临时文件作为结果返回。
+		return wavPath
+	}
+	_ = os.Remove(inPath)
+	return wavPath
 }
 
 // processFiles 处理文件列表，添加到消息组件中并返回文本描述（对应 process_files）。
@@ -386,8 +432,11 @@ func ExtractSenderInfo(rawData map[string]interface{}, isChat bool) SenderInfo {
 	username := ""
 	if sender != nil {
 		username, _ = sender["username"].(string)
-		nickname, _ = sender["name"].(string)
-		if nickname == "" {
+		// 对齐 Python sender.get("name", sender.get("username",""))：
+		// 仅当 "name" 键缺失时才回退 username（键存在但为空则保持空）。
+		if name, ok := sender["name"]; ok {
+			nickname, _ = name.(string)
+		} else {
 			nickname = username
 		}
 	}
@@ -426,7 +475,8 @@ func CreateBaseMessage(rawData map[string]interface{}, senderInfo SenderInfo, bo
 		sessionID = fmt.Sprintf("%s%%%s", sessionPrefix, senderInfo.SenderID)
 		m.Type = platform.OtherMessage
 	}
-	if senderInfo.SenderID == "" && roomID == "" {
+	if senderInfo.SenderID == "" {
+		// 对齐 Python：sender_id 为空即回退 <prefix>%unknown（room 场景亦然）。
 		sessionID = fmt.Sprintf("%s%%unknown", sessionPrefix)
 	}
 	m.SessionID = sessionID

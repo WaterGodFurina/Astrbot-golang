@@ -151,7 +151,7 @@ func TestConvertMessageImage(t *testing.T) {
 	abm := a.convertMessage(msg)
 	if img, ok := abm.Message[0].(*message.Image); !ok {
 		t.Errorf("image component expected, got %#v", abm.Message[0])
-	} else if img.URL != "http://img/1.jpg" || img.File != "media123" {
+	} else if img.URL != "http://img/1.jpg" || img.File != "http://img/1.jpg" {
 		t.Errorf("image fields: %+v", img)
 	}
 }

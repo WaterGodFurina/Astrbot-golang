@@ -1169,7 +1169,7 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 			IsGroup:    isGroup,
 		},
 		Message:    msgChain,
-		MessageStr: extractPlainText(msgChain),
+		MessageStr: buildAioMessageStr(msgChain.Chain, selfID),
 		RawMessage: rawJSON(raw),
 		Timestamp:  time.Now(),
 		Metadata:   make(map[string]interface{}),
@@ -1179,7 +1179,7 @@ func (a *Adapter) handleMessage(raw map[string]interface{}) {
 			SessionID:   convID,
 			MessageType: messageType,
 			Platform:    "aiocqhttp",
-			MessageStr:  extractPlainText(msgChain),
+			MessageStr:  buildAioMessageStr(msgChain.Chain, selfID),
 			RawMessage:  raw,
 			Timestamp:   time.Now(),
 		},
@@ -1245,6 +1245,8 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 			PlatformID: a.ID(),
 			SelfID:     selfID,
 			SenderID:   senderID,
+			// 对齐 Python _convert_handle_notice_event：sender.nickname = str(user_id)。
+			SenderName: senderID,
 			ConvID:     convID,
 			IsGroup:    isGroup,
 		},
@@ -1262,9 +1264,7 @@ func (a *Adapter) handleNotice(raw map[string]interface{}) {
 			Timestamp:   time.Now(),
 		},
 	}
-	if noticeType == "group_recall" || noticeType == "friend_recall" {
-		event.MessageStr = "[撤回通知]"
-	}
+	// 对齐 Python：notice 事件 message_str 恒为空（撤回通知也不注入占位文本）。
 	// 戳一戳通知（对齐 Python adapter.py:192-194：notice 事件 sub_type=poke
 	// 且携带 target_id 时，构造含 Poke(target_id) 组件的消息事件，插件可据此
 	// 响应戳一戳）。
@@ -1682,4 +1682,36 @@ func extractPlainText(mc *message.MessageChain) string {
 		}
 	}
 	return result
+}
+
+// buildAioMessageStr 组装 aiocqhttp 的 message_str：拼接 Plain 文本，并把
+// 非首个“@机器人”与其它 @ 用户追加为 " @name(qq) "（对齐 Python
+// aiocqhttp_platform_adapter.py:344-397 的 at_parts 逻辑）。@全体（qq=="all"）
+// 与首个 @机器人不进入 message_str。
+func buildAioMessageStr(chain []message.Component, selfID string) string {
+	if chain == nil {
+		return ""
+	}
+	var b strings.Builder
+	firstSelfSkipped := false
+	for _, comp := range chain {
+		switch c := comp.(type) {
+		case *message.Plain:
+			b.WriteString(c.Text)
+		case *message.At:
+			if c.TargetID == "all" {
+				continue
+			}
+			if c.TargetID == selfID && !firstSelfSkipped {
+				firstSelfSkipped = true
+				continue
+			}
+			b.WriteString(" @")
+			b.WriteString(c.Name)
+			b.WriteString("(")
+			b.WriteString(c.TargetID)
+			b.WriteString(") ")
+		}
+	}
+	return b.String()
 }

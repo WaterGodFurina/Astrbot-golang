@@ -68,7 +68,7 @@ func (s *ProcessStage) sendToolStatus(event *core.Event, text string) {
 		return
 	}
 	chain := &message.MessageChain{Chain: []message.Component{&message.Plain{Text: text}}}
-	if err := s.platformMgr.Send(event.Source.Platform, event.Source.ConvID, chain); err != nil {
+	if err := s.platformMgr.SendByEvent(event, chain); err != nil {
 		logger.I18nWarn("工具状态消息发送失败: %v", err)
 	}
 }

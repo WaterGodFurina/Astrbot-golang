@@ -279,11 +279,8 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 	abm := platform.NewAstrBotMessage()
 	if isGroup {
 		abm.Type = platform.GroupMessage
-	} else {
-		abm.Type = platform.FriendMessage
-	}
-	abm.Group = &platform.Group{GroupID: msg.ChannelID}
-	if isGroup {
+		// 对齐 Python：仅群聊构造 Group，私聊 group 为 None。
+		abm.Group = &platform.Group{GroupID: msg.ChannelID}
 		guildName := ""
 		if msg.GuildID != "" && s.State != nil {
 			for _, g := range s.State.Guilds {
@@ -301,6 +298,8 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 		} else if guildName != "" {
 			abm.Group.GroupName = guildName
 		}
+	} else {
+		abm.Type = platform.FriendMessage
 	}
 	abm.MessageStr = content
 	// 防御 webhook 等无 Author 的消息（调用方已判空，这里再做一层保证）。
@@ -320,9 +319,12 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 		ct := att.ContentType
 		switch {
 		case strings.HasPrefix(ct, "image/"):
-			chain = append(chain, &message.Image{URL: att.URL})
+			// 对齐 Python discord_platform_adapter.py:271-273：Image(file=url, filename=...)。
+			chain = append(chain, &message.Image{URL: att.URL, File: att.URL, Filename: att.Filename})
 		case strings.HasPrefix(ct, "audio/"):
-			chain = append(chain, &message.Record{URL: att.URL, File: att.URL})
+			// 对齐 Python discord_platform_adapter.py:291-307：语音经
+			// MediaResolver(target_format="wav") 转 wav 后投递（失败时降级原 URL）。
+			chain = append(chain, a.discordAudioComponent(att.URL))
 		default:
 			chain = append(chain, &message.File{Name: att.Filename, URL: att.URL})
 		}
@@ -335,15 +337,40 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 	return abm
 }
 
-// discordNickname 返回发送者的展示名：优先公会昵称（Member.Nick），否则用户名。
-//
-// 有意偏离说明：discord.py 的 display_name 会优先取 global_name。但本项目
-// go.mod 固定的 discordgo v0.26.0 的 User 结构体没有 global_name 字段
-// （见 discordgo@v0.26.0/user.go 的 User 定义，仅有 Username/Discriminator），
-// 无法读取该值；Member.Nick 是该 SDK 中可用的最接近“展示名”的字段，故以其
-// 优先、username 兜底。若后续升级 discordgo（≥v0.27 提供 GlobalName），应改为
-// 在此优先返回 user.GlobalName。
+// discordAudioComponent 将入站语音附件转成 wav 并落地为本地临时文件，
+// 对齐 Python 入站语音 MediaResolver(target_format="wav") 行为：
+// 下载字节 → convertAudioToWav → 写临时文件；任一步失败都降级为原 URL。
+func (a *Adapter) discordAudioComponent(url string) *message.Record {
+	fallback := &message.Record{URL: url, File: url}
+	data := a.recordAudioData(url, "", "")
+	if data == nil {
+		return fallback
+	}
+	wav := convertAudioToWav(data)
+	f, err := os.CreateTemp("", "astrbot_discord_voice_*.wav")
+	if err != nil {
+		return fallback
+	}
+	path := f.Name()
+	if _, err := f.Write(wav); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return fallback
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return fallback
+	}
+	return &message.Record{URL: url, File: path, Path: path}
+}
+
+// discordNickname 返回发送者的展示名（对齐 discord.py display_name：
+// global_name → 公会昵称 Member.Nick → 用户名）。discordgo 已升级到 v0.29，
+// User 结构提供 GlobalName 字段。
 func discordNickname(member *discordgo.Member, user *discordgo.User) string {
+	if user != nil && user.GlobalName != "" {
+		return user.GlobalName
+	}
 	if member != nil && member.Nick != "" {
 		return member.Nick
 	}
@@ -376,8 +403,15 @@ func (a *Adapter) handleMsg(abm *platform.AstrBotMessage) {
 		MessageStr: abm.MessageStr,
 		Timestamp:  time.Unix(abm.Timestamp, 0),
 		MessageObj: &core.MessageObj{
-			MessageID: abm.MessageID,
-			SelfID:    a.botSelfID,
+			MessageID:   abm.MessageID,
+			SelfID:      a.botSelfID,
+			SessionID:   abm.SessionID,
+			MessageType: string(abm.Type),
+			Platform:    "discord",
+			MessageStr:  abm.MessageStr,
+			RawMessage:  abm.RawMessage,
+			Timestamp:   time.Unix(abm.Timestamp, 0),
+			Group:       abm.Group,
 		},
 		Metadata: map[string]interface{}{},
 	}

@@ -105,7 +105,7 @@ func parseDiscordButton(fm map[string]interface{}) *discordgo.Button {
 		Style:    buttonStyleByName(jsonStr(fm, "style")),
 	}
 	if emoji := jsonStr(fm, "emoji"); emoji != "" {
-		btn.Emoji = discordgo.ComponentEmoji{Name: emoji}
+		btn.Emoji = &discordgo.ComponentEmoji{Name: emoji}
 	}
 	// URL 按钮强制 link 样式（本体：component.url 存在时 style=ButtonStyle.link）。
 	if btn.URL != "" {

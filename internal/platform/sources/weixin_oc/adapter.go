@@ -332,15 +332,12 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 	}
 
 	// 缓存入站最近消息（引用回复时间窗匹配的数据源）。
-	createTimeMs := msg.CreateTimeMs
-	if createTimeMs <= 0 {
-		createTimeMs = time.Now().UnixMilli()
-	}
+	createTimeSec, createTimeMs := messageCreateTime(msg)
 	a.cacheRecentMessage(fromUser, recentMessage{
 		messageID:   strconv.FormatInt(msg.MessageID, 10),
 		senderID:    fromUser,
 		senderNick:  fromUser,
-		timestamp:   createTimeMs / 1000,
+		timestamp:   createTimeSec,
 		timestampMs: createTimeMs,
 		components:  append([]message.Component{}, components...),
 		messageStr:  messageTextFromItemList(msg.ItemList),
@@ -352,7 +349,14 @@ func (a *Adapter) handleMessage(c *ilink.Context) {
 	}
 	ev := messageToEvent(msg, fromUser, components)
 	// 覆盖为 config.id（适配器实例 id），messageToEvent 为纯函数无 a 访问权。
+	// 对齐 Python abm.self_id = self.meta().id：self_id 取适配器实例 id，
+	// 而非入站消息的 to_user_id（出站缓存 recentOutboundID 也写适配器 id，
+	// 二者一致才能命中“引用机器人消息即唤醒”的 Reply.SenderID == SelfID 判定）。
 	ev.Source.PlatformID = a.ID()
+	ev.Source.SelfID = a.ID()
+	if ev.MessageObj != nil {
+		ev.MessageObj.SelfID = a.ID()
+	}
 	// 管线完成信号：结束后回收该消息的 typing owner（对齐本体 finally 中
 	// event.stop_typing() —— 无论是否发出回复都停止）。
 	done := core.NewPipelineDone()
@@ -484,15 +488,65 @@ func (a *Adapter) resolveRefItemComponents(mi *ilink.MessageItem) []message.Comp
 	return comps
 }
 
+// messageCreateTime 解析入站消息时间戳（对齐 Python weixin_oc_adapter.py:1537-1547：
+// create_time_ms（毫秒）优先，其次秒级 create_time，缺失回退当前时间），
+// 返回 (秒, 毫秒)。
+func messageCreateTime(msg *ilink.Message) (sec, ms int64) {
+	switch {
+	case msg.CreateTimeMs > 0:
+		return msg.CreateTimeMs / 1000, msg.CreateTimeMs
+	case msg.CreateTime > 0:
+		return msg.CreateTime, msg.CreateTime * 1000
+	default:
+		now := time.Now()
+		return now.Unix(), now.UnixMilli()
+	}
+}
+
 // messageToEvent converts an iLink message to a core.Event (pure function,
 // testable without a bus).
 func messageToEvent(msg *ilink.Message, fromUser string, components []message.Component) *core.Event {
 	// message_str 由 item_list 生成（含媒体占位与语音转写），与 Python
 	// abm.message_str = _message_text_from_item_list(...) 对齐。
 	text := messageTextFromItemList(msg.ItemList)
-	createTime := time.Now().Unix()
-	if msg.CreateTimeMs > 0 {
-		createTime = msg.CreateTimeMs / 1000
+	createTime, _ := messageCreateTime(msg)
+	mtype := "FriendMessage"
+	if msg.IsGroup() {
+		mtype = "GroupMessage"
+	}
+	// 引用元信息（对齐 Python weixin_oc_adapter.py:1559-1564）。
+	obj := &core.MessageObj{
+		MessageID:   strconv.FormatInt(msg.MessageID, 10),
+		SelfID:      msg.ToUserID,
+		SessionID:   fromUser,
+		MessageType: mtype,
+		Platform:    "weixin_oc",
+		MessageStr:  text,
+		RawMessage:  msg,
+		Timestamp:   time.Unix(createTime, 0),
+	}
+	for i := range msg.ItemList {
+		ref := msg.ItemList[i].RefMsg
+		if ref == nil {
+			continue
+		}
+		obj.IsReply = true
+		obj.RefMsg = ref
+		if ref.MessageItem != nil {
+			it := int(ref.MessageItem.Type)
+			obj.QuotedItemType = &it
+			obj.ReplyKind = itemKindString(it)
+			if ref.MessageItem.TextItem != nil {
+				obj.QuotedText = strings.TrimSpace(ref.MessageItem.TextItem.Text)
+			}
+		}
+		obj.ReplyTo = map[string]interface{}{
+			"matched":      true,
+			"strategy":     "direct-ref-msg",
+			"matched_kind": obj.ReplyKind,
+			"confidence":   1.0,
+		}
+		break
 	}
 	event := &core.Event{
 		Type: core.EventMessage,
@@ -508,7 +562,7 @@ func messageToEvent(msg *ilink.Message, fromUser string, components []message.Co
 		Message:    &message.MessageChain{Chain: components},
 		MessageStr: text,
 		Timestamp:  time.Unix(createTime, 0),
-		MessageObj: &core.MessageObj{MessageID: strconv.FormatInt(msg.MessageID, 10), SelfID: msg.ToUserID},
+		MessageObj: obj,
 		Metadata:   map[string]interface{}{},
 	}
 	if msg.IsGroup() && msg.GroupID != "" {
