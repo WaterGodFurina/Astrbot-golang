@@ -1309,7 +1309,7 @@ export default {
     },
     openTutorial() {
       const tutorialUrl = getTutorialLink(this.selectedPlatformConfig.type);
-      window.open(tutorialUrl, "_blank", "noopener,noreferrer");
+      window.open(tutorialUrl, "_blank");
     },
     openConfigDrawer(configId) {
       const targetId = configId || "default";
@@ -1419,6 +1419,7 @@ export default {
       }
 
       try {
+        const createdPlatformId = this.selectedPlatformConfig.id;
         // 先保存平台配置
         const res = await botApi.create(this.selectedPlatformConfig);
 
@@ -1428,7 +1429,7 @@ export default {
         this.loading = false;
         this.showDialog = false;
         this.resetForm();
-        this.$emit("refresh-config");
+        this.$emit("refresh-config", createdPlatformId);
         this.showSuccess(
           res.data.message || this.tm("messages.addSuccessWithConfig"),
         );

@@ -38,7 +38,7 @@ withDefaults(defineProps<{
   border: 1px solid rgba(var(--v-theme-on-surface), 0.09) !important;
   background: rgba(var(--v-theme-surface), 0.98) !important;
   backdrop-filter: blur(10px);
-  box-shadow: var(--astrbot-menu-shadow, 0 12px 28px rgba(0, 0, 0, 0.08)) !important;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.07) !important;
 }
 
 .v-overlay.v-menu .v-overlay__content > .styled-menu-card:not(.styled-menu-card-borderless) {

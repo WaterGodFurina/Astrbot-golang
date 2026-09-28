@@ -63,10 +63,6 @@ export default {
       type: String,
       default: '',
     },
-    displayName: {
-      type: String,
-      default: '',
-    },
     customName: {
       type: String,
       default: '',
@@ -115,7 +111,7 @@ export default {
       return this.sessionId || this.umoParts.slice(2).join(':') || this.umo
     },
     aliasName() {
-      return this.displayName || this.userAlias || this.customName || ''
+      return this.userAlias || this.customName || ''
     },
     displayName() {
       if (this.aliasName && this.autoName && this.aliasName !== this.autoName) {

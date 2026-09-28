@@ -16,11 +16,11 @@ function normalizeLanguage(language) {
 
 export function escapeHtml(value = "") {
   return String(value)
-    .replaceAll("&", "&amp;") // nosemgrep: replaceall-sanitization
-    .replaceAll("<", "&lt;") // nosemgrep: replaceall-sanitization
-    .replaceAll(">", "&gt;") // nosemgrep: replaceall-sanitization
-    .replaceAll('"', "&quot;") // nosemgrep: replaceall-sanitization
-    .replaceAll("'", "&#39;"); // nosemgrep: replaceall-sanitization
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 export async function getShikiHighlighter() {

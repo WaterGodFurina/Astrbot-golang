@@ -227,7 +227,7 @@
 
         <!-- 对话详情对话框 -->
         <v-dialog v-model="dialogView" max-width="900px" scrollable>
-            <v-card class="conversation-detail-card">
+            <v-card class="conversation-detail-card" :class="{ 'conversation-detail-card--edit': isEditingHistory }">
                 <v-card-title class="text-h3 pa-4 pb-0 pl-6 conversation-detail-title">
                     <div class="conversation-detail-heading">
                         <span class="text-truncate">{{ selectedConversation?.title || tm('status.noTitle') }}</span>
@@ -580,12 +580,13 @@ export default {
             return {
                 platforms: platforms,
                 messageTypes: this.messageTypeFilter,
-                search: String(this.search ?? "")
+                search: this.search
             };
         },
 
         // 检测是否为暗色模式
         isDark() {
+            console.log('isDark', this.customizerStore.uiTheme);
             return this.customizerStore.uiTheme === 'PurpleThemeDark';
         },
 
@@ -603,6 +604,8 @@ export default {
                 // tool / system 等非聊天角色不直接渲染为气泡，避免大文本走 markdown 路径卡死页面
                 .filter(msg => msg.role === 'user' || msg.role === 'assistant')
                 .map(msg => {
+                    console.log('处理消息:', msg.role, msg.content);
+
                     const messageParts = this.convertContentToMessageParts(msg.content)
                         // 丢弃 convertContentToMessageParts 兜底插入的空 plain，避免 assistant 仅有工具调用时渲染空气泡
                         .filter(part => part.type !== 'plain' || (part.text && part.text.trim()));
@@ -774,7 +777,7 @@ export default {
                     typeof item === 'object' ? item.value : item
                 ),
                 messageTypes: [...this.messageTypeFilter],
-                search: String(this.search ?? "")
+                search: this.search
             };
             this.listAbortController = markRaw(controller);
             this.listLoading = true;
@@ -800,7 +803,6 @@ export default {
                 }
 
                 params.exclude_ids = 'astrbot';
-                params.exclude_platforms = 'webchat';
                 params.include_history = false;
 
                 const response = await conversationApi.list(params, {
@@ -864,6 +866,7 @@ export default {
             this.isEditingHistory = false;
 
             try {
+                console.log(`正在请求对话详情，user_id=${item.user_id}, cid=${item.cid}`);
                 const response = await conversationApi.get(item.user_id, item.cid);
 
                 if (response.data.status === "ok") {
@@ -878,14 +881,8 @@ export default {
                         };
                         this.selectedConversation = mergedConversation;
 
-                        const historyData = detailData.history;
-                        if (typeof historyData === 'string') {
-                            this.conversationHistory = JSON.parse(historyData);
-                        } else if (Array.isArray(historyData)) {
-                            this.conversationHistory = historyData;
-                        } else {
-                            this.conversationHistory = [];
-                        }
+                        const historyData = detailData.history || '[]';
+                        this.conversationHistory = JSON.parse(historyData);
                         this.editedHistory = JSON.stringify(this.conversationHistory, null, 2);
                     } catch (e) {
                         this.conversationHistory = [];
@@ -1162,19 +1159,11 @@ export default {
             }
         },
 
-        // 格式化时间戳。兼容三种来源：RFC3339 字符串（后端 API 返回格式）、
-        // Unix 秒（10 位）、Unix 毫秒（13 位）。
+        // 格式化时间戳
         formatTimestamp(timestamp) {
             if (!timestamp) return this.tm('status.unknown');
 
-            let date;
-            if (typeof timestamp === 'number') {
-                date = new Date(timestamp < 1e12 ? timestamp * 1000 : timestamp);
-            } else {
-                date = new Date(timestamp);
-            }
-            if (isNaN(date.getTime())) return this.tm('status.unknown');
-
+            const date = new Date(timestamp * 1000);
             const locale = this.locale || 'zh-CN';
             return new Intl.DateTimeFormat(locale, {
                 year: 'numeric',
@@ -1294,8 +1283,17 @@ export default {
     font-weight: 500;
 }
 
+/* 编辑模式：编辑器填满剩余高度，避免与外层滚动条叠加 */
+.conversation-detail-card--edit > .v-card-text {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
 .monaco-editor-container {
-    height: 500px;
+    flex: 1;
+    min-height: 0;
     border-radius: 8px;
     overflow: hidden;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
@@ -1330,6 +1328,11 @@ export default {
     max-height: 90vh;
     display: flex;
     flex-direction: column;
+}
+
+/* 编辑模式：卡片固定高度，让 flex 链完整，Monaco 填满剩余空间 */
+.v-dialog > .v-overlay__content > .conversation-detail-card--edit {
+    flex: 0 0 90vh;
 }
 
 .conversation-detail-title {

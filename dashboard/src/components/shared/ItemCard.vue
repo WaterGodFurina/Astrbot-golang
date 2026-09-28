@@ -175,4 +175,5 @@ export default {
 .item-status-indicator.active {
   background-color: #4caf50;
 }
+
 </style>

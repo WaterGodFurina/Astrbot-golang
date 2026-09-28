@@ -36,9 +36,13 @@ export function useSessions(chatboxMode: boolean = false) {
             const response = await chatApi.listSessions();
             sessions.value = response.data.data;
 
+
+
+    
         } catch (err: any) {
-            // 401 统一由 @/api/http 拦截器处理（清除 token 并跳转登录页），
-            // hash 路由下此处无法正确传递 redirect 参数，故不在此重复处理。
+            if (err.response?.status === 401) {
+                router.push('/auth/login?redirect=/chatbox');
+            }
             console.error(err);
         }
     }
