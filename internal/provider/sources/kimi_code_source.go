@@ -18,18 +18,17 @@ import (
 const (
 	kimiCodeAPIBase      = "https://api.kimi.com/coding"
 	kimiCodeDefaultModel = "kimi-for-coding"
-	kimiCodeUserAgent    = "claude-code/0.1.0"
 )
 
 // KimiCodeSource is a Kimi coding chat provider speaking the Anthropic
-// Messages protocol with a spoofed Claude Code user agent.
+// Messages protocol. v4.28.2 (commit d524b870) 起 User-Agent 与其它 provider
+// 统一为 astrbot/<version>（不再伪装 claude-code/0.1.0），custom_headers 可覆盖。
 type KimiCodeSource struct {
 	*provider.BaseProvider
 	apiBase        string
 	apiKey         string
 	client         *http.Client
 	streamClient   *http.Client
-	customHeaders  map[string]string
 	thinkingConfig map[string]interface{}
 }
 
@@ -37,10 +36,9 @@ type KimiCodeSource struct {
 func NewKimiCodeSource(config, settings map[string]interface{}) *KimiCodeSource {
 	bp := provider.NewBaseProvider(config, settings)
 	s := &KimiCodeSource{
-		BaseProvider:  bp,
-		client:        &http.Client{Timeout: 120 * time.Second},
-		streamClient:  newStreamClient(),
-		customHeaders: map[string]string{},
+		BaseProvider: bp,
+		client:       &http.Client{Timeout: 120 * time.Second},
+		streamClient: newStreamClient(),
 	}
 	s.apiBase = configString(config, "api_base", kimiCodeAPIBase)
 	if s.GetModel() == "" {
@@ -58,14 +56,6 @@ func NewKimiCodeSource(config, settings map[string]interface{}) *KimiCodeSource 
 		if k, ok := config["key"].(string); ok {
 			s.apiKey = k
 		}
-	}
-	if ch, ok := config["custom_headers"].(map[string]interface{}); ok {
-		for k, v := range ch {
-			s.customHeaders[k] = fmt.Sprint(v)
-		}
-	}
-	if strings.TrimSpace(s.customHeaders["User-Agent"]) == "" {
-		s.customHeaders["User-Agent"] = kimiCodeUserAgent
 	}
 	if tc, ok := config["anth_thinking_config"].(map[string]interface{}); ok {
 		s.thinkingConfig = tc
@@ -91,6 +81,9 @@ func (s *KimiCodeSource) GetModels(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	req.Header.Set("x-api-key", s.apiKey)
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -489,7 +482,9 @@ func (s *KimiCodeSource) doRequest(ctx context.Context, body map[string]interfac
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("x-api-key", s.apiKey)
 		httpReq.Header.Set("anthropic-version", "2023-06-01")
-		for k, v := range s.customHeaders {
+		// 统一请求头注入（默认 astrbot/<version> UA，custom_headers 覆盖；
+		// 对齐 py ProviderKimiCode 的 _resolve_custom_headers）。
+		for k, v := range s.RequestHeaders() {
 			httpReq.Header.Set(k, v)
 		}
 		return httpReq, nil

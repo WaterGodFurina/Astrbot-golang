@@ -334,26 +334,27 @@ func (r *StarHandlerRegistry) Mutate(fullName string, fn func(*StarHandlerMetada
 }
 
 // setPermissionLocked 在持有 registry 写锁时更新（或插入）handler 的权限
-// 过滤器，不会与并发读的过滤器遍历交错。
-func setPermissionLocked(h *StarHandlerMetadata, perm string) {
-	var target PermissionType
-	switch perm {
-	case "admin":
-		target = PermissionAdmin
-	default:
-		target = PermissionMember
+// 过滤器，不会与并发读的过滤器遍历交错。无效权限字符串不生效——对齐 py
+// star_manager.load：alter_cmd 中 cmd_type 不在 COMMAND_PERMISSION_TYPES
+// 时直接跳过，保留 handler 原有过滤器。返回是否已应用。
+func setPermissionLocked(h *StarHandlerMetadata, perm string) bool {
+	target, ok := ParsePermissionType(perm)
+	if !ok {
+		return false
 	}
 	for i, filter := range h.EventFilters {
 		if _, ok := filter.(*PermissionFilter); ok {
 			h.EventFilters[i] = NewPermissionFilter(target)
-			return
+			return true
 		}
 	}
 	h.EventFilters = append(h.EventFilters, NewPermissionFilter(target))
+	return true
 }
 
 // SetHandlerPermission updates the permission filter of a handler under the
-// registry write lock. Returns false when the handler does not exist.
+// registry write lock. Returns false when the handler does not exist or the
+// permission string is invalid (no change applied).
 func (r *StarHandlerRegistry) SetHandlerPermission(fullName, perm string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -361,8 +362,7 @@ func (r *StarHandlerRegistry) SetHandlerPermission(fullName, perm string) bool {
 	if !ok {
 		return false
 	}
-	setPermissionLocked(h, perm)
-	return true
+	return setPermissionLocked(h, perm)
 }
 
 // Clear removes all handlers.

@@ -181,6 +181,12 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		// SenderID / Flags 同本体队列 payload 字段。
 		SenderID string                 `json:"sender_id"`
 		Flags    map[string]interface{} `json:"flags"`
+		// 遗留顶层 flag 字段：flags.* 未传时回退（对齐本体
+		// resolve_webchat_request_flags 的 payload 顶层字段语义）。
+		EnableInlineGenui         *bool `json:"enable_inline_genui"`
+		EnableDefaultSystemPrompt *bool `json:"enable_default_system_prompt"`
+		EnableStreaming           *bool `json:"enable_streaming"`
+		EnableReasoning           *bool `json:"enable_reasoning"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
@@ -243,8 +249,13 @@ func (a *Adapter) handleChat(w http.ResponseWriter, r *http.Request) {
 		Timestamp:  time.Now(),
 		Metadata:   make(map[string]interface{}),
 	}
-	// flags 未传默认 true（对齐本体 request_flags.resolve_webchat_request_flags）。
-	event.Metadata["flags"] = resolveRequestFlags(req.Flags)
+	// flags 未传默认 true（对齐本体 request_flags.resolve_webchat_request_flags：
+	// flags.* 优先，其次请求体顶层遗留字段）。
+	flags := resolveRequestFlags(req.Flags, legacyRequestFlagPayload(
+		req.EnableInlineGenui, req.EnableDefaultSystemPrompt, req.EnableStreaming, req.EnableReasoning,
+	))
+	event.Metadata["flags"] = flags
+	applyRequestFlagsExtras(event, flags)
 	// 对齐本体 webchat_adapter.create_event 注入 extra 的字段。
 	event.Metadata["action_type"] = "chat"
 
@@ -300,17 +311,49 @@ func isJSONString(raw json.RawMessage) bool {
 }
 
 // resolveRequestFlags 对齐本体 request_flags.resolve_webchat_request_flags：
-// flags[key] 显式 bool 优先，未传默认 true。
-func resolveRequestFlags(flags map[string]interface{}) map[string]interface{} {
-	resolved := make(map[string]interface{}, 3)
-	for _, key := range []string{"enable_inline_genui", "enable_default_system_prompt", "enable_streaming"} {
+// flags[key] 显式 bool 优先，其次请求体顶层同名字段（payload），未传默认
+// true。enable_reasoning 默认开启（对齐 py v4.28.2
+// WEBCHAT_REQUEST_FLAG_DEFAULTS）。
+func resolveRequestFlags(flags, payload map[string]interface{}) map[string]interface{} {
+	resolved := make(map[string]interface{}, 4)
+	for _, key := range []string{"enable_inline_genui", "enable_default_system_prompt", "enable_streaming", "enable_reasoning"} {
 		value := true
 		if b, ok := flags[key].(bool); ok {
+			value = b
+		} else if b, ok := payload[key].(bool); ok {
 			value = b
 		}
 		resolved[key] = value
 	}
 	return resolved
+}
+
+// legacyRequestFlagPayload 把请求体中的顶层遗留 flag 字段收集成 map（对齐
+// 本体 payload 顶层 enable_* 回退字段），nil 字段不放入（表示未传）。
+func legacyRequestFlagPayload(inlineGenui, defaultPrompt, streaming, reasoning *bool) map[string]interface{} {
+	payload := make(map[string]interface{}, 4)
+	if inlineGenui != nil {
+		payload["enable_inline_genui"] = *inlineGenui
+	}
+	if defaultPrompt != nil {
+		payload["enable_default_system_prompt"] = *defaultPrompt
+	}
+	if streaming != nil {
+		payload["enable_streaming"] = *streaming
+	}
+	if reasoning != nil {
+		payload["enable_reasoning"] = *reasoning
+	}
+	return payload
+}
+
+// applyRequestFlagsExtras 对齐本体 webchat_adapter.create_event：把解析后的
+// 每个 flag 单独写入事件 extra，供管线按本体语义读取（如 enable_reasoning /
+// enable_streaming），同时保留完整 flags 映射。
+func applyRequestFlagsExtras(event *core.Event, flags map[string]interface{}) {
+	for key, value := range flags {
+		event.Metadata[key] = value
+	}
 }
 
 // parseMessageParts 把 message parts 数组解析为组件链（对齐本体

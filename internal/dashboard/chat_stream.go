@@ -187,9 +187,9 @@ type chatStreamRequest struct {
 
 // resolveWebchatRequestFlags 对齐本体 request_flags.resolve_webchat_request_flags：
 // flags[key]（bool）优先，其次 payload 顶层同名字段（bool），否则默认 true。
-// 三个 flag 未传时默认开启（Go decode 后缺字段是零值，需显式 resolve）。
+// 各 flag 未传时默认开启（Go decode 后缺字段是零值，需显式 resolve）。
 func resolveWebchatRequestFlags(flags map[string]interface{}, payload map[string]interface{}) map[string]interface{} {
-	resolved := make(map[string]interface{}, 3)
+	resolved := make(map[string]interface{}, len(webchatRequestFlagKeys))
 	for _, key := range webchatRequestFlagKeys {
 		value := boolFlagValue(flags[key])
 		if value == nil {
@@ -203,11 +203,13 @@ func resolveWebchatRequestFlags(flags map[string]interface{}, payload map[string
 	return resolved
 }
 
-// webchatRequestFlagKeys 对齐本体 WEBCHAT_REQUEST_FLAG_DEFAULTS（三者默认 true）。
+// webchatRequestFlagKeys 对齐本体 WEBCHAT_REQUEST_FLAG_DEFAULTS（默认 true；
+// enable_reasoning 为 v4.28.2 新增，webchat 请求默认开启推理内容展示）。
 var webchatRequestFlagKeys = []string{
 	"enable_inline_genui",
 	"enable_default_system_prompt",
 	"enable_streaming",
+	"enable_reasoning",
 }
 
 // boolFlagValue 仅接受显式 bool，其余（含缺省/类型不符）返回 nil 触发回退。
@@ -220,8 +222,8 @@ func boolFlagValue(v interface{}) interface{} {
 
 // legacyFlagPayload 把请求体中的遗留顶层 flag 字段收集成 map（对齐本体
 // payload 顶层 enable_* 回退字段），nil 字段不放入（表示未传）。
-func legacyFlagPayload(inlineGenui, defaultPrompt, streaming *bool) map[string]interface{} {
-	payload := make(map[string]interface{}, 3)
+func legacyFlagPayload(inlineGenui, defaultPrompt, streaming, reasoning *bool) map[string]interface{} {
+	payload := make(map[string]interface{}, 4)
 	if inlineGenui != nil {
 		payload["enable_inline_genui"] = *inlineGenui
 	}
@@ -230,6 +232,9 @@ func legacyFlagPayload(inlineGenui, defaultPrompt, streaming *bool) map[string]i
 	}
 	if streaming != nil {
 		payload["enable_streaming"] = *streaming
+	}
+	if reasoning != nil {
+		payload["enable_reasoning"] = *reasoning
 	}
 	return payload
 }
@@ -250,6 +255,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 		EnableInlineGenui         *bool `json:"enable_inline_genui"`
 		EnableDefaultSystemPrompt *bool `json:"enable_default_system_prompt"`
 		EnableStreaming           *bool `json:"enable_streaming"`
+		EnableReasoning           *bool `json:"enable_reasoning"`
 		// 对齐本体 webchat_adapter.create_event 注入 extra 的三个字段。
 		ActionType         string `json:"action_type"`
 		LLMCheckpointID    string `json:"_llm_checkpoint_id"`
@@ -300,7 +306,7 @@ func (s *Server) handleChatSend(w http.ResponseWriter, r *http.Request) {
 			"thread_selected_text": body.ThreadSelectedText,
 		},
 		// 遗留顶层 flag 字段与显式 flags 一并交给 resolveWebchatRequestFlags。
-		LegacyFlags:     legacyFlagPayload(body.EnableInlineGenui, body.EnableDefaultSystemPrompt, body.EnableStreaming),
+		LegacyFlags:     legacyFlagPayload(body.EnableInlineGenui, body.EnableDefaultSystemPrompt, body.EnableStreaming, body.EnableReasoning),
 		LLMCheckpointID: llmCheckpointID,
 	})
 }
@@ -940,7 +946,13 @@ func (s *Server) processChatEvent(ctx context.Context, sessionID, runID, text st
 	}
 	// flags 解析对齐本体 request_flags.resolve_webchat_request_flags：
 	// flags.* > 遗留顶层 enable_* > 默认 true，总是注入完整 flag 集。
-	event.Metadata["flags"] = resolveWebchatRequestFlags(req.Flags, req.LegacyFlags)
+	flags := resolveWebchatRequestFlags(req.Flags, req.LegacyFlags)
+	event.Metadata["flags"] = flags
+	// 对齐本体 webchat_adapter.create_event：每个 flag 同时单独写入事件
+	// extra，供管线（enable_reasoning / enable_streaming 等）按本体语义读取。
+	for key, value := range flags {
+		event.Metadata[key] = value
+	}
 	// 对齐本体 webchat_adapter.create_event：action_type / llm_checkpoint_id /
 	// thread_selected_text 注入事件 extra（Go 侧为 Metadata）。
 	for _, key := range []string{"action_type", "llm_checkpoint_id", "thread_selected_text"} {

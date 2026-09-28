@@ -5,6 +5,7 @@ package cron
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -32,7 +33,13 @@ type Job struct {
 	Handler        JobFunc
 	NextRun        time.Time
 	Enabled        bool
-	running        bool // 执行中标志（在 m.mu 保护下读写），防止同 job 重叠执行
+	// Status/LastError/LastRunAt 记录最近一次执行的终态（对齐 py _run_job：
+	// scheduled → completed/failed，last_error 保存失败文案），与 DB cron_jobs
+	// 的 status/last_error/last_run_at 列同步。
+	Status    string
+	LastError string
+	LastRunAt time.Time
+	running   bool // 执行中标志（在 m.mu 保护下读写），防止同 job 重叠执行
 }
 
 // IsDue reports whether the job should fire at `now`.
@@ -190,6 +197,7 @@ func (m *CronJobManager) AddActiveJob(name, cronExpr string, payload map[string]
 		RunOnce:        runOnce,
 		RunAt:          runAt,
 		Payload:        payload,
+		Status:         "scheduled",
 	}
 	m.Add(job)
 	// 返回副本（Get 在锁内 clone），调用方读 NextRun 等字段不会与 tick 的
@@ -316,11 +324,56 @@ func (m *CronJobManager) RunNow(id string) error {
 				}
 			}
 		}()
-		if err := j.Handler(runCtx); err != nil {
-			logger.Error("Cron job %s run-now failed: %v", j.ID, err)
+		runErr := j.Handler(runCtx)
+		if runErr != nil {
+			logger.Error("Cron job %s run-now failed: %v", j.ID, runErr)
+		}
+		if !isShutdownCancellation(runCtx, runErr) {
+			m.recordJobRun(j.ID, runErr)
 		}
 	}(job, snap)
 	return nil
+}
+
+// recordJobRun 把一次执行的终态写入内存 Job 与 DB（对齐 Python _run_job 的
+// finally：status=completed/failed、last_run_at、last_error）。发布方
+// （active_agent handler）已把 agent 终态 ERROR / agent 构建失败转成 error
+// 返回，因此这里失败即 status=failed、last_error=错误文案。
+func (m *CronJobManager) recordJobRun(jobID string, runErr error) {
+	status := "completed"
+	lastError := ""
+	if runErr != nil {
+		status = "failed"
+		lastError = runErr.Error()
+	}
+	now := time.Now().UTC()
+	m.mu.Lock()
+	if job := m.jobs[jobID]; job != nil {
+		job.Status = status
+		job.LastError = lastError
+		job.LastRunAt = now
+	}
+	m.mu.Unlock()
+	if m.db == nil {
+		return
+	}
+	if err := m.db.UpdateCronJob(jobID, map[string]interface{}{
+		"status":      status,
+		"last_run_at": now.Format(time.RFC3339),
+		"last_error":  lastError,
+	}); err != nil {
+		logger.Error("记录定时任务 %s 运行状态失败: %v", jobID, err)
+	}
+}
+
+// isShutdownCancellation 报告运行错误是否只是运行上下文被取消（进程关闭或
+// 管理器停止）。这类错误不应把任务记为 failed：Python 关闭 APScheduler 时
+// 不会进入 _run_job 的失败分支写库，子任务只是随进程退出。
+func isShutdownCancellation(runCtx context.Context, runErr error) bool {
+	if runErr == nil || runCtx == nil {
+		return false
+	}
+	return runCtx.Err() != nil && errors.Is(runErr, context.Canceled)
 }
 
 // Start begins the cron loop.
@@ -422,8 +475,12 @@ func (m *CronJobManager) tick(ctx context.Context, now time.Time) {
 				live.running = false
 				m.mu.Unlock()
 			}()
-			if err := j.Handler(ctx); err != nil {
-				logger.Error("Cron job %s failed: %v", j.ID, err)
+			runErr := j.Handler(ctx)
+			if runErr != nil {
+				logger.Error("Cron job %s failed: %v", j.ID, runErr)
+			}
+			if !isShutdownCancellation(ctx, runErr) {
+				m.recordJobRun(j.ID, runErr)
 			}
 		}(dj.live, dj.snap)
 	}
@@ -508,6 +565,15 @@ func (m *CronJobManager) Load() {
 			Timezone:       row.Timezone,
 			RunOnce:        row.RunOnce,
 			Enabled:        row.Enabled,
+			Status:         row.Status,
+			LastError:      row.LastError,
+		}
+		if row.LastRunAt != "" {
+			if t, err := time.Parse(time.RFC3339, row.LastRunAt); err == nil {
+				job.LastRunAt = t
+			} else if t, err := time.Parse("2006-01-02 15:04:05", row.LastRunAt); err == nil {
+				job.LastRunAt = t.UTC()
+			}
 		}
 		if row.Payload != "" {
 			var payload map[string]interface{}
@@ -644,6 +710,10 @@ func SerializeJob(j *Job) map[string]interface{} {
 	if !j.NextRun.IsZero() {
 		nextRun = j.NextRun.Format(time.RFC3339)
 	}
+	lastRun := ""
+	if !j.LastRunAt.IsZero() {
+		lastRun = j.LastRunAt.UTC().Format(time.RFC3339)
+	}
 	payloadCopy := map[string]interface{}{}
 	for k, v := range j.Payload {
 		payloadCopy[k] = v
@@ -663,6 +733,11 @@ func SerializeJob(j *Job) map[string]interface{} {
 		"note":            note,
 		"run_at":          runAt,
 		"next_run_time":   nextRun,
+		// 最近一次执行终态（对齐 py _run_job / WebUI CronJobPage 的
+		// status/last_run_at/last_error 展示字段）。
+		"status":      j.Status,
+		"last_run_at": lastRun,
+		"last_error":  j.LastError,
 	}
 }
 

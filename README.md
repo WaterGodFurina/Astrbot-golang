@@ -112,7 +112,7 @@ golang 插件通过[独立 module](github.com/WaterGodFurina/astrbot-go-plugin-s
 
 为兼容 AstrBot 生态，Python 插件通过[独立 module](github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk) 桥接进宿主。
 
-- API 对齐：astrbot.api.* 与 astrbot.core.* 对齐 Python AstrBot v4.27.4
+- API 对齐：astrbot.api.* 与 astrbot.core.* 对齐 Python AstrBot v4.28.2
 - 能力桥接：Context.get_all_stars/get_all_providers 等经宿主 RPC 反向调用；session_waiter 跨进程喂入
 
 #### 自带 Python 解释器
@@ -244,7 +244,7 @@ go test ./... -v
 - 代码行数：约 14万 行 （含**测试代码**）
 - 平台适配器：18 个
 - Provider 能力：Chat 14 / TTS 9 / STT 2 / Embedding 5 / Rerank 5
-- 对齐版本：Python AstrBot v4.28.0
+- 对齐版本：Python AstrBot v4.28.2
 
 ---
 

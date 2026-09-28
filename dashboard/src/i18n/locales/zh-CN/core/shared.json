@@ -39,6 +39,8 @@
     "noSearchResults": "没有匹配的插件"
   },
   "providerSelector": {
+    "allSources": "全部源",
+    "filterSource": "筛选提供商源",
     "notSelected": "未选择",
     "buttonText": "选择提供商...",
     "dialogTitle": "选择提供商",

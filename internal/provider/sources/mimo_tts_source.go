@@ -126,6 +126,11 @@ func (s *MiMoTTSApiSource) GetAudio(ctx context.Context, text string) (string, e
 			req.Header.Set(k, v)
 		}
 	}
+	// 统一请求头（对齐 py mimo_tts: {**build_headers(...), **request_headers}，
+	// request_headers 后合并）。
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

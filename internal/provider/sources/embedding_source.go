@@ -130,6 +130,12 @@ func (s *OpenAIEmbeddingSource) embed(ctx context.Context, texts []string) ([][]
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		// 统一请求头（对齐 py openai_embedding: default_headers=request_headers）。
+		for k, v := range s.RequestHeaders() {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
 		return req, nil
 	}, cfg, "Embedding")
 	if err != nil {
@@ -171,6 +177,11 @@ func (s *OpenAIEmbeddingSource) Test(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return err

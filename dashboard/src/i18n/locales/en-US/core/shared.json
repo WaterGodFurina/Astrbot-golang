@@ -39,6 +39,8 @@
     "noSearchResults": "No matching plugins"
   },
   "providerSelector": {
+    "allSources": "All sources",
+    "filterSource": "Filter by provider source",
     "notSelected": "Not selected",
     "buttonText": "Select Provider...",
     "dialogTitle": "Select Provider",

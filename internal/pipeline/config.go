@@ -52,7 +52,8 @@ type ProviderSettings struct {
 
 // bindProviderSettings decodes provider_settings from a config map into a
 // typed struct. Missing/invalid values fall back to zero values, matching the
-// previous assertion-based reads.
+// previous assertion-based reads. 随后叠加 agent_runner.config.compression 的
+// 共享压缩配置（compression 优先，缺省回退 provider_settings）。
 func bindProviderSettings(cfg map[string]interface{}) *ProviderSettings {
 	ps := &ProviderSettings{}
 	raw, _ := cfg["provider_settings"].(map[string]interface{})
@@ -61,7 +62,128 @@ func bindProviderSettings(cfg map[string]interface{}) *ProviderSettings {
 			logger.Warn("provider_settings decode failed: %v", err)
 		}
 	}
+	applyContextCompressionConfig(ps, cfg)
 	return ps
+}
+
+// agentRunnerCompressionSection 读取 agent_runner.config.compression
+// （键路径对齐 Python astrbot/core/config/agent_runner.py:99 的共享解析函数入参；
+// Go 默认配置未内置该段，存在时优先于 provider_settings）。
+func agentRunnerCompressionSection(cfg map[string]interface{}) map[string]interface{} {
+	ar, _ := cfg["agent_runner"].(map[string]interface{})
+	if ar == nil {
+		return nil
+	}
+	arCfg, _ := ar["config"].(map[string]interface{})
+	if arCfg == nil {
+		return nil
+	}
+	comp, _ := arCfg["compression"].(map[string]interface{})
+	return comp
+}
+
+// applyContextCompressionConfig 把 agent_runner.config.compression 映射为
+// 压缩参数并覆盖到 provider_settings 绑定的结果上（对齐 Python v4.28.2
+// `resolve_context_compression_config` 的字段语义）：
+//
+//	max_turns            -> MaxContextLength
+//	trim_turns           -> DequeueContextLength（按 py 公式钳制）
+//	overflow_strategy    -> ContextLimitStrategy
+//	instruction          -> LLMCompressInstruction
+//	keep_recent_ratio    -> LLMCompressKeepRecentRatio
+//	provider_id          -> LLMCompressProviderID
+//	fallback_max_tokens  -> FallbackMaxContextTokens
+//
+// 优先级：compression 中显式出现的键覆盖 provider_settings；未出现的键保持
+// provider_settings（Go 现状兼容），整个 compression 段缺失时完全不改动。
+// cron/后台任务唤醒合成的 proactive 事件与普通 chat 都经同一 ProcessStage
+// 处理，因此二者共用这一套压缩参数。
+func applyContextCompressionConfig(ps *ProviderSettings, cfg map[string]interface{}) {
+	comp := agentRunnerCompressionSection(cfg)
+	if len(comp) == 0 {
+		return
+	}
+	if v, ok := comp["overflow_strategy"].(string); ok {
+		ps.ContextLimitStrategy = v
+	}
+	if v, ok := comp["instruction"].(string); ok {
+		ps.LLMCompressInstruction = v
+	}
+	if v, ok := comp["keep_recent_ratio"]; ok {
+		if f, ok := configFloatValue(v); ok {
+			ps.LLMCompressKeepRecentRatio = f
+		}
+	}
+	if v, ok := comp["provider_id"].(string); ok {
+		ps.LLMCompressProviderID = v
+	}
+	if v, ok := comp["fallback_max_tokens"]; ok {
+		if n, ok := configIntValue(v); ok {
+			ps.FallbackMaxContextTokens = n
+		}
+	}
+	maxTurns := ps.MaxContextLength
+	maxTurnsSet := false
+	if v, ok := comp["max_turns"]; ok {
+		if n, ok := configIntValue(v); ok {
+			maxTurns = n
+			ps.MaxContextLength = n
+			maxTurnsSet = true
+		}
+	}
+	trimTurns := ps.DequeueContextLength
+	_, trimSet := comp["trim_turns"]
+	if v, ok := comp["trim_turns"]; ok {
+		if n, ok := configIntValue(v); ok {
+			trimTurns = n
+		}
+	}
+	if maxTurnsSet || trimSet {
+		// py 公式：dequeue = min(max(1, trim), max>0 ? max-1 : trim)，再 max(1, dequeue)。
+		dequeue := trimTurns
+		if dequeue < 1 {
+			dequeue = 1
+		}
+		if maxTurns > 0 && dequeue > maxTurns-1 {
+			dequeue = maxTurns - 1
+		}
+		if dequeue < 1 {
+			dequeue = 1
+		}
+		ps.DequeueContextLength = dequeue
+	}
+}
+
+// configIntValue 从 JSON/Go 数字中取整数（int/int64/float64/json.Number）。
+func configIntValue(v interface{}) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case float64:
+		return int(n), true
+	case float32:
+		return int(n), true
+	default:
+		return 0, false
+	}
+}
+
+// configFloatValue 从 JSON/Go 数字中取浮点数。
+func configFloatValue(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	default:
+		return 0, false
+	}
 }
 
 // PlatformSettings is the structured binding of `platform_settings`, shared by

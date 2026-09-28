@@ -82,7 +82,7 @@ jobs:
       - name: 读取 AstrBot（Python）源版本
         id: pymeta
         run: |
-          ver="${PYTHON_VERSION:-4.27.4}"
+          ver="${PYTHON_VERSION:-4.28.2}"
           echo "python_version=${ver}" >> "$GITHUB_OUTPUT"
           echo "AstrBot Python 源版本: ${ver}"
         env:

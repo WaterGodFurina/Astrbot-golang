@@ -319,7 +319,7 @@ func TestStreamingControlTextSplitAcrossChunks(t *testing.T) {
 	}}
 	event := &core.Event{Source: core.EventSource{Platform: "qq", ConvID: "g:1", SenderID: "u1"}}
 	streamer := newStreamSender(s, event)
-	resp, err := s.chatRound(context.Background(), inst, &provider.ProviderRequest{}, true, streamer)
+	resp, err := s.chatRound(context.Background(), inst, &provider.ProviderRequest{}, true, false, streamer)
 	if err != nil {
 		t.Fatalf("chatRound: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestStreamingLegitAngleNotSwallowed(t *testing.T) {
 	}}
 	event := &core.Event{Source: core.EventSource{Platform: "qq", ConvID: "g:1", SenderID: "u1"}}
 	streamer := newStreamSender(s, event)
-	if _, err := s.chatRound(context.Background(), inst, &provider.ProviderRequest{}, true, streamer); err != nil {
+	if _, err := s.chatRound(context.Background(), inst, &provider.ProviderRequest{}, true, false, streamer); err != nil {
 		t.Fatalf("chatRound: %v", err)
 	}
 	if got := streamer.pending.String(); got != "price < 5" {

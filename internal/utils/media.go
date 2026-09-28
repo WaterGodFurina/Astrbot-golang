@@ -176,15 +176,29 @@ func ReadFileToBase64(path string) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// EnsureJPEG 返回原始路径，不做实际 JPEG 转码：本实现未引入图像处理依赖
-// （Python 原版使用 PIL 转码），调用方不应依赖格式转换结果；只校验文件存在。
+// EnsureJPEG 确保图片指向模型可消费的 JPEG/PNG 工作文件（保留旧签名兼容）。
+// 内部走 v4.28.2 的新图片准备链路（PrepareModelImage）：合规图片原字节复用但
+// 仍产出独立工作文件（调用方持有），需要缩放/方向矫正/透明处理时写出转换结果。
+// Python v4.28.2 已移除 ensure_jpeg（预处理的转码职责合并进
+// prepare_model_image），此函数仅用于兼容既有调用方。
 func EnsureJPEG(path string) (string, error) {
-	// In Go, we would use imaging library to convert.
-	// For now, just verify the file exists.
 	if _, err := os.Stat(path); err != nil {
 		return "", err
 	}
-	return path, nil
+	prepared, err := PrepareModelImage(context.Background(), path, ModelImageOptions{
+		// 不缩放：旧 ensure_jpeg 只转码不缩放，1_000_000 相当于不设限。
+		MaxSize:   1_000_000,
+		OutputDir: DataPath("temp"),
+		Quality:   ImageCompressDefaultQuality,
+	})
+	if err != nil {
+		return "", err
+	}
+	if prepared == "" {
+		// 可恢复失败（如图片损坏）：保留旧语义——返回原路径交由上游处理。
+		return path, nil
+	}
+	return prepared, nil
 }
 
 // DetectAudioFormat 通过文件头 magic bytes 识别音频格式（对应

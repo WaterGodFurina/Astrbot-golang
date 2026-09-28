@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -208,16 +209,26 @@ func exaSearchToolSchema() map[string]interface{} {
 		})
 }
 
-// anySearchToolSchema 对齐 Python v4.28.0 #9767 AnySearch 的 Field 定义。
+// anySearchToolSchema 对齐 Python v4.28.2 #9979 AnySearch 的 Field 定义
+// （16 个垂直域、结果上限 10、zone 增加 global、新增 params）。
 func anySearchToolSchema() map[string]interface{} {
 	return webSearchToolSchema("web_search_anysearch",
-		"A web search tool powered by AnySearch. Supports general web search and domain-specific search over academic, code, finance, legal and security sources.",
+		"A web search tool powered by AnySearch. Supports general web search and "+
+			"16 vertical domains: academic(search/biomedical/citation/preprint/dataset), "+
+			"business(company/jobs/people/trade), code(doc/snippet), "+
+			"energy(production/electricity), environment(aqi), "+
+			"finance(quote/fundamental/news/calendar/screen/macro), film(torrent), "+
+			"gaming(esports/store), health(drug/stats/trial), ip(global), "+
+			"legal(case/statute/legislation), resource(image), "+
+			"security(vuln/noise/intel/scan), social_media, "+
+			"travel(flight/flight_status), agriculture(fao), and general web search.",
 		map[string]interface{}{
 			"query":       map[string]interface{}{"type": "string", "description": "Required. Search query."},
-			"max_results": map[string]interface{}{"type": "integer", "description": "Optional. The maximum number of results to return. Default is 10. Range is 1-20."},
-			"tag":         map[string]interface{}{"type": "string", "description": `Optional. Domain capability tag in "{domain}.{subdomain}" form, for example "academic.paper" or "finance.news". Omit it for general web search.`},
-			"zone":        map[string]interface{}{"type": "string", "description": `Optional. Result region, must be one of "cn", "intl".`},
+			"max_results": map[string]interface{}{"type": "integer", "description": "Optional. The maximum number of results to return. Default is 10. Range is 1-10."},
+			"tag":         map[string]interface{}{"type": "string", "description": `Optional. Domain capability tag in "{domain}.{subdomain}" form, for example "finance.quote" or "academic.search". Available domains: general, resource, social_media, finance(quote/fundamental/news/calendar/screen/macro), academic(search/biomedical/citation/preprint/dataset), legal(case/statute/legislation), health(drug/stats/trial), business(company/jobs/people/trade), security(vuln/noise/intel/scan), ip(global), code(doc/snippet), energy(production/electricity), environment(aqi), agriculture(fao), travel(flight/flight_status), film(torrent), gaming(esports/store). Omit for general web search.`},
+			"zone":        map[string]interface{}{"type": "string", "description": `Optional. Result region, must be one of "cn", "intl", "global".`},
 			"language":    map[string]interface{}{"type": "string", "description": `Optional. Preferred result language, for example "zh-CN" or "en".`},
+			"params":      map[string]interface{}{"type": "object", "description": `Optional. Extra parameters required by specific vertical tags. Examples: {"symbol": "AAPL", "type": "stock"} for finance.quote, {"type": "cve", "value": "CVE-2021-44228"} for security.vuln, {"doi": "10.1038/s41586-021-03819-2"} for academic.search, {"departure": "SHA", "arrival": "PEK", "date": "2026-09-10"} for travel.flight.`},
 		})
 }
 
@@ -785,21 +796,39 @@ func anySearchKeys(cfg map[string]interface{}) []string {
 	return providerStringKeys(cfg, "websearch_anysearch_key")
 }
 
-// executeWebSearchAnySearch 对齐 Python v4.28.0 #9767 AnySearch：
+// executeWebSearchAnySearch 对齐 Python v4.28.2 #9979 AnySearch：
 // AnySearch 支持匿名调用（每日免费额度），key 列表为空时发送一次无
 // Authorization 的请求；配置了 key 时按顺序轮询，遇到可重试状态码
 // {401,402,403,429} 换下一个 key 重试直至耗尽，其余状态码直接失败。
+// max_results 上限为 10、zone 支持 global、params 透传给垂直域（对齐 py）。
 func executeWebSearchAnySearch(cfg map[string]interface{}, args map[string]interface{}) string {
 	query := strings.TrimSpace(argString(args, "query"))
 	if query == "" {
 		return "Error: web_search_anysearch requires a query."
 	}
-	maxResults := argIntDefault(args, "max_results", 10)
+	// 对齐 py：int(kwargs.get("max_results", 10))，转换失败回退 10，范围裁剪到 [1, 10]。
+	maxResults := 10
+	switch v := args["max_results"].(type) {
+	case float64:
+		maxResults = int(v)
+	case int:
+		maxResults = v
+	case string:
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			maxResults = n
+		}
+	case bool:
+		if v {
+			maxResults = 1
+		} else {
+			maxResults = 0
+		}
+	}
 	if maxResults < 1 {
 		maxResults = 1
 	}
-	if maxResults > 20 {
-		maxResults = 20
+	if maxResults > 10 {
+		maxResults = 10
 	}
 	payload := map[string]interface{}{
 		"query":       query,
@@ -809,11 +838,16 @@ func executeWebSearchAnySearch(cfg map[string]interface{}, args map[string]inter
 	if v := strings.TrimSpace(argString(args, "tag")); v != "" {
 		payload["tag"] = v
 	}
-	if v := strings.TrimSpace(argString(args, "zone")); v == "cn" || v == "intl" {
+	if v := strings.TrimSpace(argString(args, "zone")); v == "cn" || v == "intl" || v == "global" {
 		payload["zone"] = v
 	}
 	if v := strings.TrimSpace(argString(args, "language")); v != "" {
 		payload["language"] = v
+	}
+	// params 仅接受对象（对齐 py `isinstance(params, dict)`），原样透传给
+	// 垂直域标签（如 finance.quote 的 symbol）。
+	if params, ok := args["params"].(map[string]interface{}); ok {
+		payload["params"] = params
 	}
 
 	results, err := anySearchSearch(cfg, payload)
@@ -880,43 +914,125 @@ func anySearchRetryableStatus(status int) bool {
 	return false
 }
 
+// parseAnySearchResults 解析 AnySearch 响应（对齐 py v4.28.2 #9979
+// _anysearch_search）：HTTP 200 且业务 code 非空且非 0 时抛出业务错误
+// （如垂直域缺少必填参数），不再吞掉错误码；结果取 data.results（回退顶层
+// results）；垂直域返回的 title/url/snippet/content/favicon 之外的标量与
+// 嵌套字段序列化后追加进 snippet，避免结构化数据丢失。
 func parseAnySearchResults(data []byte) ([]searchResult, error) {
-	var resp struct {
-		Data struct {
-			Results []struct {
-				Title   string `json:"title"`
-				URL     string `json:"url"`
-				Snippet string `json:"snippet"`
-				Content string `json:"content"`
-			} `json:"results"`
-		} `json:"data"`
-		Results []struct {
-			Title   string `json:"title"`
-			URL     string `json:"url"`
-			Snippet string `json:"snippet"`
-			Content string `json:"content"`
-		} `json:"results"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	var raw map[string]interface{}
+	// UseNumber 保留 JSON 数字原文（"5" 与 "5.0" 不互相转化），与 py 的
+	// int/float 区分保持一致，供 extras 拼接时原样输出。
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&raw); err != nil {
 		return nil, err
 	}
-	// results 在 data.results，兼容顶层 results。
-	items := resp.Data.Results
-	if len(items) == 0 {
-		items = resp.Results
+	// AnySearch 以 HTTP 200 + 非 0 code 表示业务错误，把 message 抛给 LLM。
+	if code, ok := raw["code"]; ok && !isZeroJSONScalar(code) {
+		msg, _ := raw["message"].(string)
+		if strings.TrimSpace(msg) == "" {
+			msg = fmt.Sprintf("%v", code)
+		}
+		return nil, fmt.Errorf("AnySearch web search failed: %s", msg)
 	}
+	// results 在 data.results，兼容顶层 results（对齐 py `data or data` 回退语义）。
+	body := raw
+	if d, ok := raw["data"].(map[string]interface{}); ok && len(d) > 0 {
+		body = d
+	}
+	items, _ := body["results"].([]interface{})
 	var out []searchResult
-	for _, r := range items {
-		if r.URL == "" {
+	for _, it := range items {
+		item, ok := it.(map[string]interface{})
+		if !ok {
 			continue
 		}
-		snippet := r.Snippet
-		if snippet == "" {
-			snippet = r.Content
+		url := jsonScalarText(item["url"])
+		if url == "" {
+			continue
 		}
-		out = append(out, searchResult{Title: r.Title, URL: r.URL, Snippet: snippet})
+		snippet := jsonScalarText(item["snippet"])
+		if snippet == "" {
+			snippet = jsonScalarText(item["content"])
+		}
+		// 垂直域结构化字段（finance.quote、security.vuln 等）没有
+		// snippet/content：把其余标量/嵌套字段序列化后追加进 snippet。
+		extras := make([]string, 0, len(item))
+		for key, value := range item {
+			switch key {
+			case "title", "url", "snippet", "content", "favicon":
+				continue
+			}
+			if value == nil {
+				continue
+			}
+			switch value.(type) {
+			case map[string]interface{}, []interface{}:
+				// 嵌套结构序列化为 JSON 文本（对齐 py json.dumps ensure_ascii=False，
+				// 不做 HTML 转义），保证 security.vuln affected_products、
+				// travel.flight segments 等不丢失。
+				if b, ok := marshalJSONText(value); ok {
+					extras = append(extras, fmt.Sprintf("%s: %s", key, b))
+				}
+			case string, float64, bool, json.Number:
+				extras = append(extras, fmt.Sprintf("%s: %s", key, jsonScalarText(value)))
+			}
+		}
+		if len(extras) > 0 {
+			snippet = strings.TrimSpace(strings.Join(append([]string{snippet}, extras...), "\n"))
+		}
+		out = append(out, searchResult{Title: jsonScalarText(item["title"]), URL: url, Snippet: snippet})
 	}
 	return out, nil
+}
+
+// isZeroJSONScalar 判定业务 code 是否为“无错误”值：null 或数值 0
+// （对齐 py `code not in (None, 0)`；UseNumber 解码后数字为 json.Number，
+// 且 Python 中 False == 0 同样视为无错误）。
+func isZeroJSONScalar(v interface{}) bool {
+	switch code := v.(type) {
+	case nil:
+		return true
+	case json.Number:
+		n, err := code.Float64()
+		return err == nil && n == 0
+	case float64:
+		return code == 0
+	case int:
+		return code == 0
+	case bool:
+		return !code
+	}
+	return false
+}
+
+// jsonScalarText 把 JSON 标量渲染为文本（字符串原样，数字保留原文、布尔用
+// %v 输出，对象/数组等非标量返回空串）。
+func jsonScalarText(v interface{}) string {
+	switch val := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return val
+	case json.Number:
+		return string(val)
+	case float64, bool:
+		return fmt.Sprintf("%v", val)
+	}
+	return ""
+}
+
+// marshalJSONText 把嵌套结构序列化为 JSON 文本（对齐 py json.dumps
+// ensure_ascii=False：不做 HTML 转义，保留 UTF-8 原文）。
+func marshalJSONText(v interface{}) (string, bool) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return "", false
+	}
+	return strings.TrimRight(buf.String(), "\n"), true
 }
 
 // ---------------------------------------------------------------------------

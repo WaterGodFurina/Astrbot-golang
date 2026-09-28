@@ -89,6 +89,13 @@ func (s *DashScopeEmbeddingSource) embed(ctx context.Context, texts []string) ([
 	if s.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	}
+	// 统一请求头（对齐 py dashscope_embedding：kwargs["headers"]=request_headers，
+	// SDK 显式 header 优先，统一头只补充缺失项）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

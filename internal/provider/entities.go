@@ -5,6 +5,9 @@ package provider
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
+
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 )
 
 // ProviderCapabilityType identifies what a provider can do.
@@ -180,6 +183,11 @@ type ProviderRequest struct {
 	SystemPrompt string                   `json:"system_prompt"`
 	Conversation interface{}              `json:"conversation,omitempty"` // *Conversation
 	Model        string                   `json:"model,omitempty"`
+	// FallbackProviderIDs 为主动 agent（cron/后台任务唤醒）的会话模型降级候选
+	// provider id 列表，来自 agent_runner.config.model.fallback_provider_ids
+	// （对齐 py f2ead292 的 MainAgentBuildConfig.fallback_provider_ids）。普通
+	// chat 不填充该字段，携带该参数的请求只参与调用链传递，provider 实现忽略它。
+	FallbackProviderIDs []string `json:"fallback_provider_ids,omitempty"`
 }
 
 // NewProviderRequest creates a default request.
@@ -192,10 +200,38 @@ func NewProviderRequest() *ProviderRequest {
 }
 
 // AssembleContext builds the user message dict from prompt + media URLs.
+//
+// 对齐 py v4.28.2 assemble_context：图片参考（image_urls 与 extra 内容块中的
+// image_url）在此序列化为 portable base64 data URI，失败按 py 一致语义跳过并
+// 在无其它有效内容时给出 [Image unavailable] 占位。Go 无受检异常，不可恢复
+// 错误（资源耗尽/取消）经日志上报后同样降级为占位；需要传播错误的调用方可
+// 使用 AssembleContextE。
 func (r *ProviderRequest) AssembleContext() map[string]interface{} {
-	contentBlocks := []map[string]interface{}{}
+	message, err := r.AssembleContextE()
+	if err != nil {
+		logger.Error("AssembleContext: non-recoverable image resolution error: %v", err)
+		if message == nil {
+			message = map[string]interface{}{
+				"role":    "user",
+				"content": []map[string]interface{}{{"type": "text", "text": "[Image unavailable]"}},
+			}
+		}
+	}
+	return message
+}
 
-	if r.Prompt != "" {
+// AssembleContextE 是 AssembleContext 的可返回错误版本（非可恢复错误向上
+// 传播，对齐 py assemble_context 中 `if not is_recoverable_image_error: raise`）。
+func (r *ProviderRequest) AssembleContextE() (map[string]interface{}, error) {
+	return r.assembleContextWithResolver(utils.ResolveImageRefToDataURL)
+}
+
+// assembleContextWithResolver 是 assemble_context 的解析器可注入实现。
+func (r *ProviderRequest) assembleContextWithResolver(resolve func(string) (string, error)) (map[string]interface{}, error) {
+	contentBlocks := []map[string]interface{}{}
+	imageCaptureFailed := false
+
+	if strings.TrimSpace(r.Prompt) != "" {
 		contentBlocks = append(contentBlocks, map[string]interface{}{
 			"type": "text",
 			"text": r.Prompt,
@@ -212,12 +248,60 @@ func (r *ProviderRequest) AssembleContext() map[string]interface{} {
 		})
 	}
 
-	contentBlocks = append(contentBlocks, r.ExtraUserContentParts...)
+	for _, part := range r.ExtraUserContentParts {
+		dumped := part
+		if partType, _ := part["type"].(string); partType == "image_url" {
+			imageURL, _ := part["image_url"].(map[string]interface{})
+			rawURL, _ := imageURL["url"].(string)
+			if rawURL != "" {
+				resolved, err := resolve(rawURL)
+				if err != nil {
+					if !utils.IsRecoverableImageError(err) {
+						return nil, err
+					}
+					logger.Warn("Image source capture failed; skipping image (%T).", err)
+					imageCaptureFailed = true
+					continue
+				}
+				if resolved == "" {
+					logger.Warn("Image source capture returned no data; skipping image.")
+					imageCaptureFailed = true
+					continue
+				}
+				copiedImageURL := make(map[string]interface{}, len(imageURL)+1)
+				for key, value := range imageURL {
+					copiedImageURL[key] = value
+				}
+				copiedImageURL["url"] = resolved
+				copiedPart := make(map[string]interface{}, len(part)+1)
+				for key, value := range part {
+					copiedPart[key] = value
+				}
+				copiedPart["image_url"] = copiedImageURL
+				dumped = copiedPart
+			}
+		}
+		contentBlocks = append(contentBlocks, dumped)
+	}
 
-	for _, imgURL := range r.ImageURLs {
+	for _, imageURL := range r.ImageURLs {
+		resolved, err := resolve(imageURL)
+		if err != nil {
+			if !utils.IsRecoverableImageError(err) {
+				return nil, err
+			}
+			logger.Warn("Image source capture failed; skipping image (%T).", err)
+			imageCaptureFailed = true
+			continue
+		}
+		if resolved == "" {
+			logger.Warn("Image source capture returned no data; skipping image.")
+			imageCaptureFailed = true
+			continue
+		}
 		contentBlocks = append(contentBlocks, map[string]interface{}{
 			"type":      "image_url",
-			"image_url": map[string]interface{}{"url": imgURL},
+			"image_url": map[string]interface{}{"url": resolved},
 		})
 	}
 
@@ -228,19 +312,36 @@ func (r *ProviderRequest) AssembleContext() map[string]interface{} {
 		})
 	}
 
+	if imageCaptureFailed && !hasMeaningfulContentBlock(contentBlocks) {
+		contentBlocks = []map[string]interface{}{{"type": "text", "text": "[Image unavailable]"}}
+	}
+
 	// Simple format if only one text block
 	if len(contentBlocks) == 1 && contentBlocks[0]["type"] == "text" &&
 		len(r.ExtraUserContentParts) == 0 && len(r.ImageURLs) == 0 && len(r.AudioURLs) == 0 {
 		return map[string]interface{}{
 			"role":    "user",
 			"content": contentBlocks[0]["text"],
-		}
+		}, nil
 	}
 
 	return map[string]interface{}{
 		"role":    "user",
 		"content": contentBlocks,
+	}, nil
+}
+
+// hasMeaningfulContentBlock 复刻 py assemble_context 的占位判定：
+// 非 text 块，或 text 非空白，都算“有内容”。
+func hasMeaningfulContentBlock(blocks []map[string]interface{}) bool {
+	for _, block := range blocks {
+		blockType, _ := block["type"].(string)
+		text, _ := block["text"].(string)
+		if blockType != "text" || strings.TrimSpace(text) != "" {
+			return true
+		}
 	}
+	return false
 }
 
 // ToUserMessage is an alias for AssembleContext, building the user message dict.

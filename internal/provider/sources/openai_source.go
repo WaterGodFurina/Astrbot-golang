@@ -51,7 +51,8 @@ type OpenAISource struct {
 	apiKeys      []string
 	client       *http.Client
 	streamClient *http.Client
-	// extraHeaders are additional HTTP headers applied to every request.
+	// extraHeaders 为具体源额外附加到每个请求上的 header（如 OpenRouter /
+	// AIHubMix 的标识码），与 BaseProvider.RequestHeaders 叠加使用。
 	extraHeaders map[string]string
 	// imageModerationPatterns 图片内容审核错误关键词（对齐 py
 	// image_moderation_error_patterns 配置：大小写不敏感子串匹配，非正则）。
@@ -103,21 +104,17 @@ func NewOpenAISource(config, settings map[string]interface{}) *OpenAISource {
 			s.streamClient.Transport = tr
 		}
 	}
-	// custom_headers 配置（对齐 py：非空 dict 时生效，值 str() 强转）。
-	if ch, ok := config["custom_headers"].(map[string]interface{}); ok && len(ch) > 0 {
-		s.extraHeaders = make(map[string]string, len(ch))
-		for k, v := range ch {
-			s.extraHeaders[k] = fmt.Sprintf("%v", v)
-		}
-	}
+	// custom_headers 经 NewBaseProvider 统一构建（默认 astrbot/<version> UA，
+	// custom_headers 覆盖），请求组装处通过 s.RequestHeaders() 取用
+	// （对齐 py openai_source: self.custom_headers = self.request_headers）。
 	// image_moderation_error_patterns 配置（对齐 py
 	// _get_image_moderation_error_patterns：兼容单字符串或字符串数组，
 	// 去空白、忽略空项与非字符串项）。
 	s.imageModerationPatterns = parseImageModerationPatterns(config["image_moderation_error_patterns"])
-	s.apiBase, _ = config["api_base"].(string)
-	if s.apiBase == "" {
-		s.apiBase = "https://api.openai.com/v1"
-	}
+	// api_base 为空时先读环境变量 OPENAI_BASE_URL，再回退官方默认（对齐 py
+	// 7ee03f22：base_url=provider_config.get("api_base") or None，由 OpenAI
+	// SDK 按 env → 官方默认的顺序解析端点）。
+	s.apiBase = resolveOpenAIAPIBase(config, "api_base")
 	keys := s.getKeys()
 	if len(keys) > 0 {
 		s.apiKey = keys[0]
@@ -172,6 +169,12 @@ func (s *OpenAISource) GetModels(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
+	for k, v := range s.extraHeaders {
+		req.Header.Set(k, v)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1678,6 +1681,10 @@ func (s *OpenAISource) doRequestWithKey(ctx context.Context, body map[string]int
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+key)
+		// 统一请求头（默认 astrbot/<version> UA + custom_headers）。
+		for k, v := range s.RequestHeaders() {
+			httpReq.Header.Set(k, v)
+		}
 		for k, v := range s.extraHeaders {
 			httpReq.Header.Set(k, v)
 		}

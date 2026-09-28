@@ -37,15 +37,69 @@
         class="text-h3 pa-4 pb-0 pl-6 d-flex align-center justify-space-between gap-4 flex-wrap"
       >
         <span>{{ tm('providerSelector.dialogTitle') }}</span>
-        <v-btn
-          size="small"
-          color="primary"
-          variant="tonal"
-          prepend-icon="mdi-plus"
-          @click="openProviderDrawer"
-        >
-          {{ tm('providerSelector.createProvider') }}
-        </v-btn>
+        <div class="d-flex align-center ga-2">
+          <v-menu
+            v-if="providerSources.length > 1"
+            v-model="sourceMenuOpen"
+            :close-on-content-click="false"
+            offset="6"
+            transition="none"
+          >
+            <template #activator="{ props: sourceMenuProps }">
+              <button
+                v-bind="sourceMenuProps"
+                type="button"
+                class="provider-source-trigger"
+                :title="tm('providerSelector.filterSource')"
+              >
+                <span>{{
+                  selectedSourceId || tm('providerSelector.allSources')
+                }}</span>
+                <v-icon size="16">mdi-chevron-down</v-icon>
+              </button>
+            </template>
+            <v-card class="provider-source-menu" elevation="0">
+              <v-list density="compact" nav>
+                <v-list-item
+                  :active="!selectedSourceId"
+                  @click="
+                    selectedSourceId = '';
+                    sourceMenuOpen = false;
+                  "
+                >
+                  <v-list-item-title>{{
+                    tm('providerSelector.allSources')
+                  }}</v-list-item-title>
+                </v-list-item>
+                <v-list-item
+                  v-for="source in providerSources"
+                  :key="source.id"
+                  :active="selectedSourceId === source.id"
+                  @click="
+                    selectedSourceId = source.id;
+                    sourceMenuOpen = false;
+                  "
+                >
+                  <v-list-item-title>{{ source.id }}</v-list-item-title>
+                  <v-list-item-subtitle
+                    v-if="source.apiBase"
+                    :title="source.apiBase"
+                    >{{ source.apiBase }}</v-list-item-subtitle
+                  >
+                </v-list-item>
+              </v-list>
+            </v-card>
+          </v-menu>
+          <v-btn
+            size="small"
+            color="primary"
+            variant="tonal"
+            prepend-icon="mdi-plus"
+            @click="openProviderDrawer"
+          >
+            {{ tm('providerSelector.createProvider') }}
+          </v-btn>
+        </div>
       </v-card-title>
       
       <v-card-text class="pa-0" style="max-height: 400px; overflow-y: auto;">
@@ -92,7 +146,7 @@
           <v-divider class="ma-1"></v-divider>
         </div>
         
-        <v-list v-if="!loading && providerList.length > 0" density="compact">
+        <v-list v-if="!loading && filteredProviderList.length > 0" density="compact">
           <!-- 不选择选项 -->
           <v-list-item
             v-if="!multiple"
@@ -112,14 +166,18 @@
           
           <v-divider class="ma-1"></v-divider>
           
-          <v-list-item
-            v-for="provider in providerList"
-            :key="provider.id"
-            :value="provider.id"
-            @click="selectProvider(provider)"
-            :active="isProviderSelected(provider.id)"
-            rounded="md"
-            class="ma-1">
+          <template v-for="group in groupedProviderList" :key="group.id">
+            <v-list-subheader class="provider-source-header">
+              {{ group.id }}
+            </v-list-subheader>
+            <v-list-item
+              v-for="provider in group.providers"
+              :key="provider.id"
+              :value="provider.id"
+              @click="selectProvider(provider)"
+              :active="isProviderSelected(provider.id)"
+              rounded="md"
+              class="ma-1">
             <v-list-item-title>{{ provider.id }}</v-list-item-title>
             <v-list-item-subtitle>
               {{ provider.type || provider.provider_type || tm('providerSelector.unknownType') }}
@@ -188,10 +246,11 @@
                 <v-icon v-if="isProviderSelected(provider.id)">mdi-check-circle</v-icon>
               </div>
             </template>
-          </v-list-item>
+            </v-list-item>
+          </template>
         </v-list>
         
-        <div v-else-if="!loading && providerList.length === 0" class="text-center py-8">
+        <div v-else-if="!loading && filteredProviderList.length === 0" class="text-center py-8">
           <v-icon size="64" color="grey-lighten-1">mdi-api-off</v-icon>
           <p class="text-grey mt-4">{{ tm('providerSelector.noProviders') }}</p>
         </div>
@@ -281,6 +340,46 @@ const selectedProviders = ref([])
 const providerDrawer = ref(false)
 const testingProviders = ref([])
 const modelMetadata = ref({})
+const sourceMenuOpen = ref(false)
+const selectedSourceId = ref('')
+
+const providerSources = computed(() => {
+  const sources = new Map()
+  for (const provider of providerList.value) {
+    const id = provider?.provider_source_id || provider?.type || provider?.id
+    if (!id || sources.has(id)) continue
+    sources.set(id, {
+      id,
+      apiBase:
+        provider.api_base
+        || provider.embedding_api_base
+        || provider.rerank_api_base
+        || provider.gemini_tts_api_base
+        || ''
+    })
+  }
+  return [...sources.values()]
+})
+
+const filteredProviderList = computed(() => {
+  if (!selectedSourceId.value) return providerList.value
+  return providerList.value.filter(
+    (provider) =>
+      (provider?.provider_source_id || provider?.type || provider?.id)
+      === selectedSourceId.value
+  )
+})
+
+const groupedProviderList = computed(() => {
+  const groups = new Map()
+  for (const provider of filteredProviderList.value) {
+    const sourceId = provider?.provider_source_id || provider?.type || provider?.id || ''
+    const group = groups.get(sourceId)
+    if (group) group.push(provider)
+    else groups.set(sourceId, [provider])
+  }
+  return Array.from(groups, ([id, providers]) => ({ id, providers }))
+})
 
 const hasSelection = computed(() => {
   if (props.multiple) {
@@ -321,6 +420,7 @@ async function openDialog() {
   } else {
     selectedProvider.value = typeof props.modelValue === 'string' ? props.modelValue : ''
   }
+  selectedSourceId.value = ''
   dialog.value = true
   await loadProviders()
 }
@@ -478,6 +578,45 @@ function closeProviderDrawer() {
   white-space: nowrap;
   max-width: calc(100% - 80px);
   display: inline-block;
+}
+
+.provider-source-trigger {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 135px;
+  height: 36px;
+  padding: 0 8px;
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.16);
+  border-radius: 10px;
+  color: rgb(var(--v-theme-on-surface));
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.provider-source-trigger span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.provider-source-menu {
+  width: min(360px, calc(100vw - 24px));
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.09);
+  border-radius: 12px !important;
+}
+
+.provider-source-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  height: 32px;
+  min-height: 32px;
+  background: rgb(var(--v-theme-surface));
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .selected-preview {

@@ -67,32 +67,28 @@ type responsesResponse struct {
 // OpenAIResponsesSource is a stateless Responses API chat provider.
 type OpenAIResponsesSource struct {
 	*provider.BaseProvider
-	apiBase       string
-	apiKey        string
-	keyMu         sync.RWMutex
-	client        *http.Client
-	streamClient  *http.Client
-	customHeaders map[string]string
+	apiBase      string
+	apiKey       string
+	keyMu        sync.RWMutex
+	client       *http.Client
+	streamClient *http.Client
 }
 
 // NewOpenAIResponsesSource creates an OpenAI Responses API provider.
 func NewOpenAIResponsesSource(config, settings map[string]interface{}) *OpenAIResponsesSource {
 	bp := provider.NewBaseProvider(config, settings)
 	s := &OpenAIResponsesSource{
-		BaseProvider:  bp,
-		client:        &http.Client{Timeout: 120 * time.Second},
-		streamClient:  newStreamClient(),
-		customHeaders: map[string]string{},
+		BaseProvider: bp,
+		client:       &http.Client{Timeout: 120 * time.Second},
+		streamClient: newStreamClient(),
 	}
-	s.apiBase = configString(config, "api_base", "https://api.openai.com/v1")
+	// py 中 ProviderOpenAIResponses 继承 ProviderOpenAIOfficial，共享同一
+	// 端点解析顺序（7ee03f22），Go 侧独立实现需显式对齐：api_base 为空时
+	// 先读 OPENAI_BASE_URL，再回退官方默认。
+	s.apiBase = resolveOpenAIAPIBase(config, "api_base")
 	keys := s.getKeys()
 	if len(keys) > 0 {
 		s.apiKey = keys[0]
-	}
-	if ch, ok := config["custom_headers"].(map[string]interface{}); ok {
-		for k, v := range ch {
-			s.customHeaders[k] = fmt.Sprint(v)
-		}
 	}
 	return s
 }
@@ -141,6 +137,10 @@ func (s *OpenAIResponsesSource) GetModels(ctx context.Context) ([]string, error)
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.GetCurrentKey())
+	// 统一请求头（对齐 py openai_responses：default_headers=request_headers）。
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -778,7 +778,8 @@ func (s *OpenAIResponsesSource) doRequest(ctx context.Context, body map[string]i
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Authorization", "Bearer "+s.GetCurrentKey())
-		for k, v := range s.customHeaders {
+		// 统一请求头（默认 astrbot/<version> UA + custom_headers）。
+		for k, v := range s.RequestHeaders() {
 			httpReq.Header.Set(k, v)
 		}
 		return httpReq, nil

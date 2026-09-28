@@ -1,15 +1,37 @@
-# 忽略编译文件
-bin/
-astrbot
+# ===== Go 构建产物 =====
+/bin/
+/astrbot
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+*.prof
 
-# 忽略用户数据文件
-data/
+# ===== 前端构建产物 =====
+/dashboard/node_modules/
+/dashboard/dist/
+/dashboard/.vite/
+/dashboard/.turbo/
+/dashboard/stats.html
+/webui/
+# 注意：internal/dashboard/web/dist/ 是 //go:embed 使用的前端产物，必须保持跟踪
+#（由 CI 前端构建 job 生成并提交，勿在此忽略）
 
-# 忽略开发文件
-memory.md
-tmp/
-bug.md
-start-astrbot.sh
+# ===== 运行时数据 =====
+/data/
+/plugin_data/
+*.log
+/logs/
 
-# Python 插件误写仓库根的数据目录（正确位置 data/plugin_data）
-plugin_data/
+# ===== 开发与记忆文件 =====
+/memory.md
+/bug.md
+/start-astrbot.sh
+/tmp/
+
+# 适配器测试运行时误写包目录的数据（应走 ASTRBOT_DATA_PATH / 仓库根 data/）
+/internal/platform/sources/*/data/
+/internal/**/data/

@@ -112,8 +112,10 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 	a.clientSecret, _ = config["client_secret"].(string)
 	a.dataDir, _ = config["dingtalk_data_dir"].(string)
 	if a.dataDir == "" {
-		wd, _ := os.Getwd()
-		a.dataDir = filepath.Join(wd, "data", "dingtalk")
+		// 默认落宿主数据目录（ASTRBOT_DATA_PATH / ASTRBOT_ROOT 可覆盖），不再
+		// 依赖 CWD——否则测试或非仓库根启动会把 state.json 写进包目录（曾被
+		// 误提交为 fixture）。
+		a.dataDir = filepath.Join(utils.AstrbotDataDir(), "dingtalk")
 	}
 	a.loadState()
 	return a

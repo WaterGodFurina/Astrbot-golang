@@ -96,6 +96,12 @@ func (s *OpenAIWhisperSource) GetText(ctx context.Context, audioURL string) (str
 		}
 		req.Header.Set("Content-Type", mw.FormDataContentType())
 		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		// 统一请求头（对齐 py whisper_api: default_headers=request_headers）。
+		for k, v := range s.RequestHeaders() {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
 		return req, nil
 	}, cfg, "STT-Whisper")
 	if err != nil {
@@ -193,6 +199,11 @@ func (s *OpenAIWhisperSource) Test(ctx context.Context) error {
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+s.apiKey)
+		for k, v := range s.RequestHeaders() {
+			if req.Header.Get(k) == "" {
+				req.Header.Set(k, v)
+			}
+		}
 		return req, nil
 	}, cfg, "STT-Whisper")
 	if err != nil {

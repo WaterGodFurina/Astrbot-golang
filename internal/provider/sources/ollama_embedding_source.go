@@ -83,6 +83,12 @@ func (s *OllamaEmbeddingSource) embed(ctx context.Context, texts []string) ([][]
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// 统一请求头（对齐 py ollama_embedding: {**request_headers, **headers}）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

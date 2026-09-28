@@ -143,7 +143,7 @@ func TestChatRoundNonStreamingParsesXMLToolCalls(t *testing.T) {
 			CompletionText: "<function_calls><invoke name=\"read\"><parameter name=\"path\">/etc/hostname</parameter></invoke></function_calls>\n\n正文",
 		},
 	}
-	resp, err := s.chatRound(context.Background(), inst, &provider.ProviderRequest{}, false, nil)
+	resp, err := s.chatRound(context.Background(), inst, &provider.ProviderRequest{}, false, false, nil)
 	if err != nil {
 		t.Fatalf("chatRound: %v", err)
 	}

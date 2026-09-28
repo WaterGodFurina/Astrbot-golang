@@ -126,6 +126,13 @@ func (s *MiniMaxTTSSource) GetAudio(ctx context.Context, text string) (string, e
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
+	// 统一请求头（对齐 py minimax_tts：session 默认 headers=request_headers，
+	// 请求级 Authorization/accept/content-type 优先，统一头只补充缺失项）。
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := s.client.Do(req)
 	if err != nil {

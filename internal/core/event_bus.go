@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
@@ -117,6 +118,60 @@ type Event struct {
 
 	// Trace records agent invocation spans (TracePage /api/v1/trace).
 	Trace *log.TraceSpan
+
+	// temporaryMu 保护 temporaryFiles。图片准备链路（prepare_model_image）
+	// 产出的工作文件归属于事件，事件处理结束后由流水线统一删除
+	// （对齐 py AstrMessageEvent.track/untrack/cleanup_temporary_local_files）。
+	temporaryMu    sync.Mutex
+	temporaryFiles []string
+}
+
+// TrackTemporaryFile records a temp file for cleanup after the event finishes.
+// 与 py track_temporary_local_file 一致：重复路径只记录一次。
+func (e *Event) TrackTemporaryFile(path string) {
+	if path == "" {
+		return
+	}
+	e.temporaryMu.Lock()
+	defer e.temporaryMu.Unlock()
+	for _, existing := range e.temporaryFiles {
+		if existing == path {
+			return
+		}
+	}
+	e.temporaryFiles = append(e.temporaryFiles, path)
+}
+
+// UntrackTemporaryFile stops tracking a path so cleanup will not delete it
+// (mirrors py untrack_temporary_local_file). Attachment references outlive
+// the event; model-owned copies do not.
+func (e *Event) UntrackTemporaryFile(path string) {
+	if path == "" {
+		return
+	}
+	e.temporaryMu.Lock()
+	defer e.temporaryMu.Unlock()
+	for i, existing := range e.temporaryFiles {
+		if existing == path {
+			e.temporaryFiles = append(e.temporaryFiles[:i], e.temporaryFiles[i+1:]...)
+			return
+		}
+	}
+}
+
+// CleanupTemporaryFiles removes all tracked temporary files (best-effort).
+// 对齐 py cleanup_temporary_local_files：逐个删除，失败仅记日志，不影响
+// 其余文件。
+func (e *Event) CleanupTemporaryFiles() {
+	e.temporaryMu.Lock()
+	files := e.temporaryFiles
+	e.temporaryFiles = nil
+	e.temporaryMu.Unlock()
+	for _, path := range files {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			logger.Debug("CleanupTemporaryFiles: remove %s: %v", path, err)
+		}
+	}
 }
 
 // UnifiedMsgOrigin returns the three-part unified_msg_origin
@@ -650,6 +705,9 @@ func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
 	scheduler := bus.pickScheduler(event)
 	if scheduler == nil {
 		logger.Error("EventBus: 事件 %q 未找到可用的管线调度器，已忽略", event.UnifiedMsgOrigin())
+		// 无调度器意味着事件没有被真正处理：把这一终态错误暴露给等待合成
+		// 事件结果的发布方（cron 任务随之记为 failed，而不是误记 completed）。
+		event.SetExtra(MetadataAgentTerminalError, "no pipeline scheduler available for event")
 		if event.Metadata != nil {
 			if done, ok := event.Metadata[MetadataPipelineDone].(*PipelineDone); ok {
 				done.Signal()
@@ -676,6 +734,12 @@ func (bus *EventBus) dispatch(ctx context.Context, event *Event) {
 	result, err := scheduler.Process(ctx, event)
 	if err != nil {
 		logger.Error("Pipeline task failed: %v", err)
+		// 管线阶段异常同样属于主动任务终态失败（对齐 py _run_job 的 except：
+		// 异常逃逸即 failed）。仅在阶段尚未记录 agent 终态错误时写入，保留
+		// 更具体的 agent 错误文案。
+		if v, _ := event.GetExtra(MetadataAgentTerminalError).(string); v == "" {
+			event.SetExtra(MetadataAgentTerminalError, err.Error())
+		}
 	} else if result != nil && !result.Continue {
 		logger.Debug("EventBus: 调度器 %s 拦截了事件 %q", scheduler.ConfID(), event.MessageStr)
 	}
@@ -745,6 +809,12 @@ func (d *PipelineDone) Signal() {
 // completion signal is stored.
 const MetadataPipelineDone = "__pipeline_done"
 
+// MetadataAgentTerminalError is the Event.Metadata key under which the pipeline
+// records an agent terminal failure (string). 对齐 Python v4.28.2 #9987：
+// runner 终态 ERROR（如错误响应 role=err）与 agent 构建失败都会被记录，
+// cron 等需要回传运行结果的合成事件发布方在管线完成后读取该键判定 failed。
+const MetadataAgentTerminalError = "__agent_terminal_error"
+
 // PipelineScheduler runs events through a chain of stages.
 type PipelineScheduler struct {
 	confID string
@@ -766,6 +836,9 @@ func (s *PipelineScheduler) AddStage(stage PipelineStage) {
 
 // Process runs the event through all stages.
 func (s *PipelineScheduler) Process(ctx context.Context, event *Event) (result *StageResult, err error) {
+	// 对齐 py scheduler.execute 的 finally：流水线结束（含提前 Stop / panic）
+	// 后清理事件归属的临时文件（图片准备链路产出的模型工作文件等）。
+	defer event.CleanupTemporaryFiles()
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Pipeline panic while processing event %q: %v", event.MessageStr, r)

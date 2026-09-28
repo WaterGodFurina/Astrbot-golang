@@ -76,6 +76,12 @@ func (s *GeminiSource) doRequest(ctx context.Context, client *http.Client, url s
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("x-goog-api-key", s.apiKey)
+		// 统一请求头（对齐 py gemini_source: types.HttpOptions(headers=request_headers)）。
+		for k, v := range s.RequestHeaders() {
+			if httpReq.Header.Get(k) == "" {
+				httpReq.Header.Set(k, v)
+			}
+		}
 		return httpReq, nil
 	}, cfg, "Gemini")
 }
@@ -89,6 +95,11 @@ func (s *GeminiSource) GetModels(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	req.Header.Set("x-goog-api-key", s.apiKey)
+	for k, v := range s.RequestHeaders() {
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err

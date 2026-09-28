@@ -70,17 +70,21 @@ func NewPermissionFilter(perm PermissionType) *PermissionFilter {
 }
 
 // Match returns true if the user has sufficient permission.
+// 对齐 py v4.28.2 PermissionTypeFilter.filter：
+//   - ADMIN：任何会话都要求 AstrBot 管理员（event.is_admin()）；
+//   - GROUP_ADMIN：仅群聊要求管理员，私聊放行（py 条件带 group_id 判断）；
+//   - SHARED_GROUP_ADMIN：仅群聊要求管理员或已实际应用会话隔离
+//     （_session_isolated），私聊放行；
+//   - MEMBER/Everyone：直接放行（py 中 member 落到末尾的 return True）。
 func (f *PermissionFilter) Match(ctx *FilterContext) bool {
-	if f.permission == PermissionEveryone {
-		return true
-	}
-	if f.permission == PermissionAdmin {
+	if f.permission == PermissionAdmin ||
+		(f.permission == PermissionGroupAdmin && ctx.IsGroup) {
 		return ctx.EventRole == "admin"
 	}
-	if f.permission == PermissionMember {
-		return ctx.EventRole == "member" || ctx.EventRole == "admin"
+	if f.permission == PermissionSharedGroupAdmin && ctx.IsGroup {
+		return ctx.EventRole == "admin" || ctx.SessionIsolated
 	}
-	return false
+	return true
 }
 
 // FilterType returns the filter type name.

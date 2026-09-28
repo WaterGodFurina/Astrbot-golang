@@ -3,17 +3,11 @@ package pipeline
 import (
 	"context"
 	"fmt"
-	"image"
-	_ "image/gif"
-	"image/jpeg"
-	_ "image/png"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/fogleman/gg"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
@@ -222,9 +216,10 @@ func providerModalities(providerCfg map[string]interface{}) []string {
 	return out
 }
 
-// compressImageForProvider resizes/compresses an image to the configured
-// max_size (longest edge) and JPEG quality, returning a temp file path
-// (mirrors _compress_image_for_provider; implemented with gg).
+// compressImageForProvider 把图片准备成模型可消费的工作文件（EXIF 方向矫正、
+// 超限缩放、透明压平、动图 3x3 拼图、内容寻址缓存）。旧实现总是重编码 JPEG；
+// v4.28.2 起统一走 utils.PrepareModelImage 链路（对齐 py prepare_model_image）。
+// 返回工作文件路径；准备失败/不可用时返回原引用路径，调用方按原路径兜底。
 func (s *ProcessStage) compressImageForProvider(urlOrPath string) string {
 	enabled, maxSize, quality := s.imageCompressArgs()
 	if !enabled {
@@ -234,72 +229,57 @@ func (s *ProcessStage) compressImageForProvider(urlOrPath string) string {
 	if !fileExists(path) {
 		return urlOrPath
 	}
-	img, err := loadImage(path)
+	out, err := utils.PrepareModelImage(context.Background(), path, utils.ModelImageOptions{
+		MaxSize:   maxSize,
+		OutputDir: utils.DataPath("temp"),
+		Quality:   quality,
+	})
 	if err != nil {
-		logger.I18nWarn("图片压缩失败(加载): %v", err)
+		logger.I18nWarn("图片压缩失败: %v", err)
 		return urlOrPath
 	}
-	bounds := img.Bounds()
-	w, h := bounds.Dx(), bounds.Dy()
-	if w <= 0 || h <= 0 {
+	if out == "" {
 		return urlOrPath
 	}
-	if w > maxSize || h > maxSize {
-		scale := float64(maxSize) / float64(w)
-		if h > w {
-			scale = float64(maxSize) / float64(h)
-		}
-		nw, nh := int(float64(w)*scale), int(float64(h)*scale)
-		dc := gg.NewContext(nw, nh)
-		dc.DrawImage(img, 0, 0)
-		img = dc.Image()
-	}
-	tmp, err := os.CreateTemp("", "astrbot-compress-*.jpg")
-	if err != nil {
-		return urlOrPath
-	}
-	name := tmp.Name()
-	_ = tmp.Close()
-	dc := gg.NewContext(img.Bounds().Dx(), img.Bounds().Dy())
-	dc.DrawImage(img, 0, 0)
-	if err := encodeJPEG(dc.Image(), name, quality); err != nil {
-		logger.I18nWarn("图片压缩失败(编码): %v", err)
-		_ = os.Remove(name)
-		return urlOrPath
-	}
-	return name
+	return out
 }
 
-// isCompressTempFile reports whether p is one of the temp files created by
-// compressImageForProvider, so callers can schedule its removal after the
-// request consumes it without risking the original image path.
+// isCompressTempFile reports whether p is one of the model-image working files
+// created by compressImageForProvider / prepare_request_images, so callers can
+// schedule its removal after the request consumes it without risking the
+// original image path.
 func isCompressTempFile(p string) bool {
-	return strings.HasPrefix(filepath.Base(p), "astrbot-compress-")
+	base := filepath.Base(p)
+	// "astrbot-compress-" 为旧实现前缀（保留兼容）；"model_image_" 为 v4.28.2
+	// prepare_model_image 工作文件前缀。
+	return strings.HasPrefix(base, "astrbot-compress-") || strings.HasPrefix(base, "model_image_")
 }
 
 // imageCompressArgs reads provider_settings.image_compress_enabled/options.
+// max_size 经 utils.NormalizeModelImageMaxSize 归一化（无效值回退默认并告警），
+// quality 钳制到 1-100（对齐 py v4.28.2 internal.py 的配置读取）。
 func (s *ProcessStage) imageCompressArgs() (bool, int, int) {
-	maxSize, quality := 1280, 95
 	ps, ok := s.config["provider_settings"].(map[string]interface{})
 	if !ok {
-		return true, maxSize, quality
+		return true, utils.ImageCompressDefaultMaxSize, utils.ImageCompressDefaultQuality
 	}
 	enabled := true
 	if v, ok := ps["image_compress_enabled"].(bool); ok {
 		enabled = v
 	}
+	maxSize := utils.ImageCompressDefaultMaxSize
+	quality := utils.ImageCompressDefaultQuality
 	if opts, ok := ps["image_compress_options"].(map[string]interface{}); ok {
-		if v, ok := opts["max_size"].(int); ok && v > 0 {
-			maxSize = v
-		}
-		if v, ok := opts["max_size"].(float64); ok && v > 0 {
-			maxSize = int(v)
-		}
-		if v, ok := opts["quality"].(int); ok && v > 0 {
+		maxSize = utils.NormalizeModelImageMaxSize(opts["max_size"])
+		switch v := opts["quality"].(type) {
+		case int:
 			quality = v
-		}
-		if v, ok := opts["quality"].(float64); ok && v > 0 {
+		case int64:
 			quality = int(v)
+		case float64:
+			if v == float64(int(v)) {
+				quality = int(v)
+			}
 		}
 	}
 	if quality < 1 {
@@ -311,31 +291,10 @@ func (s *ProcessStage) imageCompressArgs() (bool, int, int) {
 	return enabled, maxSize, quality
 }
 
-// encodeJPEG writes an image as JPEG with the given quality.
-func encodeJPEG(img image.Image, path string, quality int) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return jpeg.Encode(f, img, &jpeg.Options{Quality: quality})
-}
-
 // fileExists reports whether path exists.
 func fileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir()
-}
-
-// loadImage decodes an image file.
-func loadImage(path string) (image.Image, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	img, _, err := image.Decode(f)
-	return img, err
 }
 
 // toolCallTimeout returns the configured tool call timeout (default 120s).

@@ -138,6 +138,11 @@ func (s *AzureTTSProvider) syncTime(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// OTTS 客户端默认 headers（对齐 py OTTSProvider.__aenter__ 的
+	// AsyncClient(headers=self.request_headers)）。
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		if s.syncAge() > time.Hour {
@@ -199,6 +204,11 @@ func (s *AzureTTSProvider) refreshToken(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// 统一请求头（默认 astrbot/<version> UA + custom_headers，对齐 py
+	// AzureNativeProvider._refresh_token 经由 client 默认 headers 携带）。
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("Ocp-Apim-Subscription-Key", s.subscriptionKey)
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -249,7 +259,11 @@ func (s *AzureTTSProvider) getNativeAudio(ctx context.Context, text string) (str
 	req.Header.Set("Content-Type", "application/ssml+xml")
 	req.Header.Set("X-Microsoft-OutputFormat", azureOutputFormat)
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", "AstrBot/Go")
+	// 统一请求头最后注入：py 侧合并顺序为 {Authorization, **request_headers}，
+	// custom_headers 可覆盖显式 header（对齐 v4.28.2 azure_tts_source）。
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return "", err
@@ -281,7 +295,11 @@ func (s *AzureTTSProvider) getOTTSAudio(ctx context.Context, text string) (strin
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "AstrBot/Go")
+	// 统一请求头（默认 astrbot/<version> UA），UAK 最后设置以对齐 py
+	// {**request_headers, "UAK": "AstrBot/AzureTTS"} 的覆盖顺序。
+	for k, v := range s.RequestHeaders() {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("UAK", "AstrBot/AzureTTS")
 	resp, err := s.client.Do(req)
 	if err != nil {

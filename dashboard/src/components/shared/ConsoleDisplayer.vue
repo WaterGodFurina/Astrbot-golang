@@ -224,6 +224,10 @@ export default {
       if (!newLogs || newLogs.length === 0) return;
 
       let hasUpdate = false;
+      const termElement = document.getElementById("term");
+      // 将本次渲染的日志节点批量写入 DocumentFragment，历史日志很多时
+      // 只触发一次重排，避免逐条 appendChild + 强制回流导致页面卡死。
+      const fragment = termElement ? document.createDocumentFragment() : null;
 
       // 用 Set 代替逐条 some() 全表比对，避免日志爆发时的 O(n²)
       const seen = new Set(
@@ -241,7 +245,9 @@ export default {
           hasUpdate = true;
 
           if (this.isLevelSelected(log.level) && !this.isHiddenByCategory(log)) {
-            this.printLog(log.data);
+            if (fragment) {
+              fragment.appendChild(this.buildLogElement(log.data));
+            }
           }
         }
       });
@@ -265,6 +271,14 @@ export default {
         }
         if (skip > 0) {
           this.localLogCache.splice(0, skip);
+        }
+      }
+
+      if (fragment && fragment.childNodes.length > 0) {
+        termElement.appendChild(fragment);
+        this.trimTermOverflow(termElement);
+        if (this.autoScroll) {
+          termElement.scrollTop = termElement.scrollHeight;
         }
       }
     },
@@ -300,17 +314,22 @@ export default {
 
     refreshDisplay() {
       const termElement = document.getElementById('term');
-      if (termElement) {
-        // nosemgrep: innerhtml, document-method
-        termElement.innerHTML = '';
-        
-        if (this.localLogCache && this.localLogCache.length > 0) {
-          this.localLogCache.forEach(logItem => {
-            if (this.isLevelSelected(logItem.level) && !this.isHiddenByCategory(logItem)) {
-              this.printLog(logItem.data);
-            }
-          });
+      if (!termElement) return;
+
+      // nosemgrep: innerhtml, document-method
+      termElement.innerHTML = '';
+      if (!this.localLogCache || this.localLogCache.length === 0) return;
+
+      const fragment = document.createDocumentFragment();
+      this.localLogCache.forEach(logItem => {
+        if (this.isLevelSelected(logItem.level) && !this.isHiddenByCategory(logItem)) {
+          fragment.appendChild(this.buildLogElement(logItem.data));
         }
+      });
+      termElement.appendChild(fragment);
+      this.trimTermOverflow(termElement);
+      if (this.autoScroll) {
+        termElement.scrollTop = termElement.scrollHeight;
       }
     },
 
@@ -336,7 +355,7 @@ export default {
     appendLogContent(element, log) {
       const levelMatch = log.match(/\[(DEBG|INFO|WARN|ERRO|CRIT|DEBUG|WARNING|ERROR|CRITICAL)\]/);
       if (!levelMatch) {
-        element.innerText = `${log}`;
+        element.textContent = `${log}`;
         return;
       }
 
@@ -347,15 +366,15 @@ export default {
 
       const prefixSpan = document.createElement('span');
       prefixSpan.className = 'console-log-prefix';
-      prefixSpan.innerText = prefix;
+      prefixSpan.textContent = prefix;
 
       const levelSpan = document.createElement('span');
       levelSpan.className = 'console-log-level';
-      levelSpan.innerText = levelMatch[0];
+      levelSpan.textContent = levelMatch[0];
 
       const messageSpan = document.createElement('span');
       messageSpan.className = 'console-log-message';
-      messageSpan.innerText = message;
+      messageSpan.textContent = message;
 
       element.classList.add('console-log-line--structured');
       element.appendChild(prefixSpan);
@@ -363,33 +382,27 @@ export default {
       element.appendChild(messageSpan);
     },
 
-    printLog(log) {
-      let ele = document.getElementById('term')
-      if (!ele) {
-        return;
-      }
-      
+    trimTermOverflow(ele) {
       while (ele.children.length > 200) {
-        ele.removeChild(ele.firstChild)
+        ele.removeChild(ele.firstChild);
       }
-      
-      let span = document.createElement('pre')
-      let style = this.logColorAnsiMap['default']
-      for (let key in this.logColorAnsiMap) {
+    },
+
+    buildLogElement(log) {
+      const span = document.createElement('pre');
+      let style = this.logColorAnsiMap['default'];
+      for (const key in this.logColorAnsiMap) {
         if (log.startsWith(key)) {
-          style = this.logColorAnsiMap[key]
-          log = log.replace(key, '').replace('\u001b[0m', '')
-          break
+          style = this.logColorAnsiMap[key];
+          log = log.replace(key, '').replace('\u001b[0m', '');
+          break;
         }
       }
 
-      span.style = style
-      span.classList.add('console-log-line', 'fade-in')
+      span.style = style;
+      span.classList.add('console-log-line', 'fade-in');
       this.appendLogContent(span, log);
-      ele.appendChild(span)
-      if (this.autoScroll) {
-        ele.scrollTop = ele.scrollHeight
-      }
+      return span;
     }
   },
 }

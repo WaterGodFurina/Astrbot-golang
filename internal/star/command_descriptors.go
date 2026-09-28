@@ -163,18 +163,20 @@ func isReservedModule(modulePath string) bool {
 }
 
 // permissionFor extracts the permission level from a handler's filters.
+// 对齐 py command_management._determine_permission：
+//   - 有权限过滤器时返回其名称（admin/member/group_admin/shared_group_admin），
+//     未注册类型回退 "member"；
+//   - 无权限过滤器时返回 "everyone"（py 默认 everyone）。
 func permissionFor(h *StarHandlerMetadata) string {
 	for _, filter := range h.EventFilters {
 		if pf, ok := filter.(*PermissionFilter); ok {
-			switch pf.Permission() {
-			case PermissionAdmin:
-				return "admin"
-			case PermissionMember:
-				return "member"
+			if name, ok := permissionTypeName(pf.Permission()); ok {
+				return name
 			}
+			return "member"
 		}
 	}
-	return "member"
+	return "everyone"
 }
 
 // ApplyCommandConfigs applies persisted command configs (enabled / renamed /

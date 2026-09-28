@@ -580,13 +580,19 @@ func (e *RiskError) Error() string {
 }
 
 // InstallFromSource downloads a plugin's Go source, statically scans it, compiles it with the bundled toolchain and loads it. The compiled artifact and install record are persisted so a restart can reload from cache. source may be a git URL, an archive URL (.zip/.tar.gz/.tgz), or a local directory. When the static scan finds risky imports and IgnoreRisk is not set, a *RiskError with the offending code locations is returned and nothing is installed. When the plugin declares cgo and the host must pick a C compiler, a *CCompilerPromptError is returned so the caller can ask the user and retry with opts.CCChoice set.
+//
+// 当目标插件（来源推导 id 或 metadata 稳定 id）已安装时，本次调用按"更新"
+// 处理而非报错：卸载旧实例后复用既有 staging/.old 提交制换名与失败回滚
+// 替换源码（对齐 Python _install_plugin_from_directory 的同名插件替换语义，
+// 配置与数据目录保留）。
 func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source string, opts InstallOptions) (*PluginInstance, error) {
 	if id == "" {
 		return nil, fmt.Errorf("plugin id cannot be empty")
 	}
-	if m.Get(id) != nil {
-		return nil, fmt.Errorf("plugin %s already installed (reload or uninstall first)", id)
-	}
+	// 来源推导 id（上传文件名/仓库名）可能在元数据解析后被稳定 id 取代，
+	// 先记录；旧实例的实际卸载延后到新源码通过 metadata/astrbot_version
+	// 校验之后，避免无效安装包提前打断运行中的旧版本。
+	origID := id
 
 	// 优先使用市场提供的 download_url（zip 直链）下载；否则回退 source （git 仓库 URL 走 git clone）。对齐 Python updater：有 download_url 时 直接下载安装包，避免在无 git 环境（如 Termux/Android）下克隆失败。
 	fetchSource := source
@@ -614,12 +620,18 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 
 	// 稳定 id：插件名 + language（PluginIDFromMeta）。来源推导 id（带版本/ commit，如 astrbot-plugin-xxx-4.11.2-<commit>）在更新后变化，导致重装 （不勾清除配置/数据）时数据目录变成全新的。稳定 id 让重装后配置 （按 name）与数据目录（按 id）都能保留。
 	if stableID := PluginIDFromMeta(meta, lang); stableID != "" && stableID != id {
-		if m.Get(stableID) != nil {
-			return nil, fmt.Errorf("plugin %s already installed (reload or uninstall first)", stableID)
-		}
-		// 旧来源 id 的数据目录迁移到稳定 id：重装已装插件时保留运行时数据。
+		// 稳定 id 命中已装插件不再报"已安装"：本次 URL/上传安装按更新处理
+		//（对齐 Python 同名插件替换），旧来源 id 的数据目录迁移到稳定 id，
+		// 保证重装后配置/数据都能保留。
 		m.migratePluginData(id, stableID)
 		id = stableID
+	}
+
+	// 已装插件（来源 id / 稳定 id 任一命中运行实例）按更新处理：先卸载旧
+	// 实例，后续沿用既有 staging/.old 提交制换名与失败回滚；未运行或不曾
+	// 安装则跳过，走全新安装。
+	if err := m.unloadForUpdate(origID, id); err != nil {
+		return nil, err
 	}
 
 	if lang == "python" {
@@ -760,6 +772,31 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	m.cachePluginDocs(inst.ID, srcDest, meta)
 	m.writeMetadataConfig(inst.ID, meta)
 	return inst, nil
+}
+
+// unloadForUpdate 卸载因安装/更新目标命中的已运行实例，供更新路径在替换
+// 源码前调用。ids 允许同时传入来源推导 id 与稳定 id（二者可能不同：来源
+// id 在 metadata 解析后被稳定 id 取代的迁移窗口）；空值与重复 id 跳过，
+// 未运行的 id 视为无需卸载。Unload 内部持 per-plugin 生命周期锁，不会与
+// 并发的崩溃重启交错。
+func (m *SubprocessManager) unloadForUpdate(ids ...string) error {
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if m.Get(id) == nil {
+			continue
+		}
+		if err := m.Unload(id); err != nil {
+			return fmt.Errorf("unload plugin %s before update: %w", id, err)
+		}
+	}
+	return nil
 }
 
 // installPythonSource installs a Python plugin: copies the source tree into data/plugins/<id> (the "binary" the runtime launches), optionally installs requirements.txt into the Python venv, then loads it.
