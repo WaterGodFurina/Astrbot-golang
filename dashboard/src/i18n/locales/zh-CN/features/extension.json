@@ -139,7 +139,10 @@
       "supportPlatforms": "支持平台",
       "authorWebsite": "作者网站",
       "repository": "仓库",
-      "pluginLanguage": "插件语言"
+      "pluginLanguage": "插件语言",
+      "pluginRuntime": "运行方式",
+      "runtimeGrpc": "子进程（gRPC）",
+      "runtimeNative": "进程内（Native）"
     }
   },
   "market": {
@@ -277,6 +280,18 @@
     "risk_warning": {
       "message": "插件源码中检测到潜在风险，请确认后继续"
     },
+    "native_runtime": {
+      "title": "Native 运行方式风险警告",
+      "message": "Native 模式将插件加载到 AstrBot-Go 主进程中，不具备进程级隔离。插件崩溃或内存问题可能影响主程序；更新、禁用或卸载插件可能需要重启 AstrBot。",
+      "bullet1": "Native 插件运行在 AstrBot 主进程中，无法像 gRPC 插件一样独立卸载。",
+      "bullet2": "Native 插件更新/停用需要重启 AstrBot 才能完整生效（动态库一旦加载不可卸载）。",
+      "bullet3": "Native 插件发生严重错误可能影响 AstrBot 主进程。",
+      "bullet4": "Native 插件不支持闲置休眠（无法 kill/唤醒）。",
+      "hint": "选择 Native 表示你已了解上述风险，并自行承担插件质量带来的影响。",
+      "installLabel": "以 Native 运行方式安装（加载进主进程，无进程隔离）",
+      "installHint": "默认 gRPC（独立子进程）。Native 更快、内存更省，但无隔离、更新/卸载需重启。",
+      "confirm": "我已知晓，使用 Native"
+    },
     "c_compiler": {
       "message": "未检测到可用的 C 编译器，需要选择系统编译器或自动下载 zig"
     },
@@ -304,6 +319,9 @@
     "logLevelUpdated": "日志级别已更新并实时生效",
     "reloadSuccess": "重载成功",
     "reloadFailed": "重载失败",
+    "nativeReloadNotice": "Native 插件重载仅支持指令和过滤器等功能的重新注册，不会重新加载 Native 动态库。如需完整重启插件功能，请重启整个 AstrBot 进程。",
+    "nativeUpdateNotice": "Native 插件已更新，重启 AstrBot 后新版本才会完整生效。",
+    "nativeToggleNotice": "Native 插件已停用/启用。动态库仍驻留在主进程中，彻底移除需重启 AstrBot。",
     "updateSuccess": "更新成功!",
     "addSuccess": "添加成功!",
     "saveSuccess": "保存成功!",

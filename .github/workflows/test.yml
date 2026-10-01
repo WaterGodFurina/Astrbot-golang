@@ -173,6 +173,71 @@ jobs:
           # Windows 产物无法在 runner 上执行，仅校验 PE 格式与体积
           head -c 2 astrbot-windows-amd64.exe | xxd | grep "4d5a" || { echo "不是有效的 PE 头"; exit 1; }
 
+      # Native 运行方式 POC（Windows .dll）：注入 native_entry.go 后用
+      # -buildmode=c-shared 产出 DLL，并校验 C ABI 导出符号 AstrBotNativeServe。
+      # 验证 Windows 上 C 入口（//export + C.int、零参数）可被宿主 Loader
+      # GetProcAddress 找到，与 Unix .so 加载层对齐。
+      - name: Native POC - 确认 C 编译器可用（cgo 需要）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          which gcc || true
+          gcc --version | head -1 || { echo "缺少 gcc（cgo 无法编译 c-shared）"; exit 1; }
+
+      - name: Native POC - 编译 echo 插件为 Windows .dll（c-shared）
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: internal/plugin/testdata/native_poc
+        env:
+          CGO_ENABLED: '1'
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          cat > native_entry.go <<'EOF'
+          package main
+
+          /*
+          #include <stdint.h>
+          */
+          import "C"
+
+          import sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+
+          //export AstrBotNativeServe
+          func AstrBotNativeServe() C.int {
+          	sdk.Register(plugin)
+          	return C.int(sdk.NativeServe())
+          }
+
+          func main() {}
+          EOF
+          go mod tidy
+          go build -buildmode=c-shared -o nativepoc.dll .
+          rm -f native_entry.go
+          ls -la nativepoc.dll
+
+      - name: Native POC - 校验 DLL 导出 AstrBotNativeServe
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: internal/plugin/testdata/native_poc
+        run: |
+          set -euo pipefail
+          # 用 mingw nm 读 PE 导出表（go tool nm 不解析 PE 导出目录）。
+          nm nativepoc.dll | grep -i "AstrBotNativeServe" || \
+            go tool nm nativepoc.dll | grep -i "AstrBotNativeServe" || {
+              echo "DLL 未导出 AstrBotNativeServe"; exit 1; }
+          echo "OK: DLL 导出 AstrBotNativeServe"
+
+      - name: Native POC - 上传 .dll（供人工检查）
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v5
+        with:
+          name: native-poc-windows-dll
+          path: internal/plugin/testdata/native_poc/nativepoc.dll
+          if-no-files-found: error
+
       - name: 上传 Windows 编译产物
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v5

@@ -119,6 +119,16 @@
     "noPlugins": "No enabled plugins",
     "globalSaved": "New-plugin default idle time saved",
     "pluginSaved": "Plugin sleep policy updated",
-    "intro": "Configure idle auto-sleep per plugin: when enabled, an idle plugin process is reclaimed after the configured minutes to free memory, and is lazily woken on next use (transparent). Resident (off) by default."
+    "intro": "Configure idle auto-sleep per plugin: when enabled, an idle plugin process is reclaimed after the configured minutes to free memory, and is lazily woken on next use (transparent). Resident (off) by default.",
+    "columnRuntime": "Runtime",
+    "runtimeGrpc": "Subprocess (gRPC)",
+    "runtimeNative": "In-process (Native)",
+    "runtimeNativeHint": "Native loads the plugin as an in-process dynamic library (.so/.dll): higher performance, but a crash may affect the host, and it does not support sleep, reload, or hot-update—a restart is required.",
+    "runtimeOnlyGo": "Go plugins only",
+    "runtimeSaved": "Plugin runtime updated (restart to take effect)",
+    "runtimeSwitchTitle": "Switch to Native runtime?",
+    "runtimeSwitchConfirm": "Continue & switch",
+    "runtimeRestartNote": "After changing the runtime, a rebuild and restart of AstrBot are required for it to take effect.",
+    "runtimeCancel": "Cancel"
   }
 }

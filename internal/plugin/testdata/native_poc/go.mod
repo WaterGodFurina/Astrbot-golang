@@ -1,0 +1,5 @@
+module github.com/WaterGodFurina/Astrbot-golang/internal/plugin/testdata/native_poc
+
+go 1.24
+
+require github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.7.0

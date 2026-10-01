@@ -198,6 +198,15 @@ const languageDisplay = computed(() => {
   return "";
 });
 
+// 运行方式：仅对已安装的 Go 插件显示；gRPC 为默认。Native 为宿主侧配置。
+const pluginRuntimeDisplay = computed(() => {
+  if (isMarketDetail.value) return "";
+  if (languageDisplay.value !== "golang") return "";
+  return pluginData.value?.runtime === "native"
+    ? tm("detail.info.runtimeNative")
+    : tm("detail.info.runtimeGrpc");
+});
+
 const firstPresentValue = (...values) =>
   values.find(
     (value) =>
@@ -328,6 +337,11 @@ const infoRows = computed(() => {
       label: tm("detail.info.pluginLanguage"),
       value: languageDisplay.value,
       optional: true,
+    },
+    {
+      label: tm("detail.info.pluginRuntime"),
+      value: pluginRuntimeDisplay.value,
+      optional: !isMarketDetail.value,
     },
   ];
 

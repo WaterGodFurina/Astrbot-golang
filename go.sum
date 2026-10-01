@@ -29,6 +29,8 @@ github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.2 h1:IU5ptgPcGyCd+N0cksIFs4
 github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.2/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
 github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.3 h1:YgjCVl52jYuT3ngJtG3qtPwhFP8Ba4eGx61bXk2NkH8=
 github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.6.3/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.7.0 h1:qpw2dJxA2odgjISePpUY3UYGoanVCfE4raRfSHl0OfM=
+github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.7.0/go.mod h1:V2GMs80ro3DUWKbBRUmlewm6SSkPqHXLA8KwC1oX9uM=
 github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.9 h1:8W48PatOSWIvviOyan3GYC+Mnl17j/Q4UNKLgzVbwa0=
 github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.9/go.mod h1:Ici1h1XuueS5HROwbsEkd+Q99MB303WmmLKQzgS1v6c=
 github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.10 h1:9624nFZAyP0mr7PnKJTS6mGAXvtz1PvW3y17yvapwQU=

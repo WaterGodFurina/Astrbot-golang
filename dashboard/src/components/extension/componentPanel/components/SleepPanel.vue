@@ -31,6 +31,8 @@ interface SleepPluginItem {
   hasHook: boolean;
   activeEventListener: boolean;
   version: string;
+  runtime: string;
+  nativeConfirmed: boolean;
 }
 
 // 休眠唤醒方式选项：command_only = 插件指令+工具唤醒（默认；钩子/被动事件不唤醒）；
@@ -89,6 +91,8 @@ const fetchData = async () => {
           hasHook: Boolean(p.has_hook),
           activeEventListener: Boolean(p.active_event_listener),
           version: String(p.version || ""),
+          runtime: String(p.runtime || "grpc") === "native" ? "native" : "grpc",
+          nativeConfirmed: Boolean(p.native_confirmed),
         }));
     }
   } catch (err) {
@@ -175,6 +179,68 @@ const savePluginWakeMode = async (item: SleepPluginItem, mode: string) => {
   }
 };
 
+// ---- 运行方式（gRPC / Native，仅 Go 插件） ----
+// Native 切换需用户先确认风险警告（后端强制），且重新构建 + 重启后生效。
+const isGoPlugin = (item: SleepPluginItem) => item.language === "golang";
+const runtimeDialog = ref<{
+  show: boolean;
+  item: SleepPluginItem | null;
+}>({ show: false, item: null });
+
+const applyRuntime = async (item: SleepPluginItem, native: boolean) => {
+  if (saving.value || !item.id) return;
+  saving.value = true;
+  try {
+    const res = await pluginApi.setRuntime(item.id, native);
+    if (res.data.status === "ok") {
+      item.runtime = native ? "native" : "grpc";
+      toast(tm("sleep.runtimeSaved"));
+    } else {
+      toast(
+        (res.data as any)?.message || tm("messages.operationFailed"),
+        "error",
+      );
+    }
+  } catch (err) {
+    toast((err as any)?.message || String(err), "error");
+  } finally {
+    saving.value = false;
+  }
+};
+
+const requestRuntimeChange = async (item: SleepPluginItem, native: boolean) => {
+  if (!native) {
+    await applyRuntime(item, false);
+    return;
+  }
+  // 已确认过风险警告则直接切换，否则先弹窗确认并记录确认。
+  if (item.nativeConfirmed) {
+    await applyRuntime(item, true);
+    return;
+  }
+  runtimeDialog.value = { show: true, item };
+};
+
+const confirmRuntimeChange = async () => {
+  const item = runtimeDialog.value.item;
+  runtimeDialog.value = { show: false, item: null };
+  if (!item) return;
+  try {
+    const res = await pluginApi.confirmNative(item.id);
+    if (res.data.status !== "ok") {
+      toast(
+        (res.data as any)?.message || tm("messages.operationFailed"),
+        "error",
+      );
+      return;
+    }
+    item.nativeConfirmed = true;
+    await applyRuntime(item, true);
+  } catch (err) {
+    toast((err as any)?.message || String(err), "error");
+  }
+};
+
 onMounted(async () => {
   await fetchData();
 });
@@ -193,6 +259,7 @@ onMounted(async () => {
             <tr>
               <th>{{ tm("sleep.columnPlugin") }}</th>
               <th>{{ tm("sleep.columnLanguage") }}</th>
+              <th>{{ tm("sleep.columnRuntime") }}</th>
               <th>{{ tm("sleep.columnAllow") }}</th>
               <th>{{ tm("sleep.columnMinutes") }}</th>
               <th>{{ tm("sleep.columnWake") }}</th>
@@ -211,6 +278,28 @@ onMounted(async () => {
               </td>
               <td>
                 <span class="text-body-2">{{ item.language }}</span>
+              </td>
+              <td class="sleep-table__runtime">
+                <template v-if="isGoPlugin(item)">
+                  <v-switch
+                    :model-value="item.runtime === 'native'"
+                    color="primary"
+                    density="compact"
+                    hide-details
+                    :disabled="saving"
+                    :label="
+                      item.runtime === 'native'
+                        ? tm('sleep.runtimeNative')
+                        : tm('sleep.runtimeGrpc')
+                    "
+                    @update:model-value="
+                      (v: boolean | null) => requestRuntimeChange(item, !!v)
+                    "
+                  />
+                </template>
+                <span v-else class="text-caption text-medium-emphasis">
+                  {{ tm("sleep.runtimeOnlyGo") }}
+                </span>
               </td>
               <td class="sleep-table__toggle">
                 <v-switch
@@ -272,6 +361,29 @@ onMounted(async () => {
       </v-card-text>
     </v-card>
 
+    <v-dialog v-model="runtimeDialog.show" max-width="520">
+      <v-card>
+        <v-card-title class="text-wrap">
+          ⚠️ {{ tm("sleep.runtimeSwitchTitle") }}
+        </v-card-title>
+        <v-card-text>
+          <p class="mb-3">{{ tm("sleep.runtimeNativeHint") }}</p>
+          <p class="text-medium-emphasis mb-0">
+            {{ tm("sleep.runtimeRestartNote") }}
+          </p>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="runtimeDialog = { show: false, item: null }">
+            {{ tm("sleep.runtimeCancel") }}
+          </v-btn>
+          <v-btn color="primary" variant="flat" @click="confirmRuntimeChange">
+            {{ tm("sleep.runtimeSwitchConfirm") }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
     <v-snackbar
       :timeout="2000"
       elevation="6"
@@ -296,5 +408,10 @@ onMounted(async () => {
 
 .sleep-table__toggle {
   width: 96px;
+}
+
+.sleep-table__runtime {
+  min-width: 180px;
+  white-space: nowrap;
 }
 </style>
