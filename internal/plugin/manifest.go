@@ -37,6 +37,18 @@ type ManifestEntry struct {
 	// Language is "go" (compiled binary) or "python" (source tree run under
 	// the embedded Python SDK). Empty/absent = "go" (legacy entries).
 	Language string `json:"language,omitempty"`
+	// Runtime 是插件的运行方式（宿主侧配置，非插件 metadata）：""/"grpc"
+	// = 默认子进程（go-plugin + gRPC）；"native" = 进程内 .so/.dll（Native
+	// runtime）。运行方式属于 AstrBot 宿主侧的运行配置，不写入插件的
+	// metadata.json。
+	Runtime string `json:"runtime,omitempty"`
+	// NativeConfirmed 记录用户是否已明确确认 Native 风险警告；未确认不得
+	// 切换为 Native。
+	NativeConfirmed bool `json:"native_confirmed,omitempty"`
+	// NativeTarget 是 Native 插件已发布的本机回环 gRPC target（unix socket
+	// 路径 / 127.0.0.1:port），用于禁用后再启用时重新连接（Go plugin 不可
+	// 二次 Open，插件服务进程内常驻，重启用 reconnect 而非重新加载）。
+	NativeTarget string `json:"native_target,omitempty"`
 	// DisplayName / ShortDesc are the plugin's display metadata (Python
 	// metadata.yaml display_name / short_desc), surfaced to the WebUI.
 	DisplayName string `json:"display_name,omitempty"`

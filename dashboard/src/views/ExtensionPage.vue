@@ -180,6 +180,11 @@ const {
   chooseDepsMode,
   cancelDepsMode,
   copyPkgCommand,
+  nativeInstall,
+  nativeDialog,
+  requestInstall,
+  confirmNativeInstall,
+  cancelNativeInstall,
   installProgress,
   newExtension,
   normalizePlatformList,
@@ -674,6 +679,37 @@ const updateDialogPluginLogo = computed(() => {
   </v-dialog>
 
   <!-- 插件源码风险警告对话框 -->
+  <v-dialog v-model="nativeDialog.show" width="620" persistent>
+    <v-card>
+      <v-card-title class="text-h3 pa-4 pb-0 pl-6">
+        {{ tm("dialogs.native_runtime.title") }}
+      </v-card-title>
+      <v-card-text class="pa-6">
+        <v-alert type="warning" variant="tonal" density="comfortable" class="mb-4">
+          {{ nativeDialog.message || tm("dialogs.native_runtime.message") }}
+        </v-alert>
+        <ul class="native-warning-list text-body-2">
+          <li>{{ tm("dialogs.native_runtime.bullet1") }}</li>
+          <li>{{ tm("dialogs.native_runtime.bullet2") }}</li>
+          <li>{{ tm("dialogs.native_runtime.bullet3") }}</li>
+          <li>{{ tm("dialogs.native_runtime.bullet4") }}</li>
+        </ul>
+        <div class="text-medium-emphasis mt-3">
+          {{ tm("dialogs.native_runtime.hint") }}
+        </div>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer></v-spacer>
+        <v-btn color="grey" variant="text" @click="cancelNativeInstall">{{
+          tm("buttons.cancel")
+        }}</v-btn>
+        <v-btn color="warning" variant="text" @click="confirmNativeInstall">{{
+          tm("dialogs.native_runtime.confirm")
+        }}</v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
   <v-dialog v-model="riskDialog.show" width="640" persistent>
     <v-card>
       <v-card-title class="text-h3 pa-4 pb-0 pl-6 d-flex align-center">
@@ -1279,6 +1315,24 @@ const updateDialogPluginLogo = computed(() => {
             </v-window-item>
           </v-window>
         </template>
+
+        <div class="pa-4 pt-0">
+          <v-checkbox
+            v-model="nativeInstall"
+            density="comfortable"
+            hide-details
+            color="warning"
+          >
+            <template #label>
+              <span class="text-body-2">{{
+                tm("dialogs.native_runtime.installLabel")
+              }}</span>
+            </template>
+          </v-checkbox>
+          <div class="text-caption text-medium-emphasis ml-10">
+            {{ tm("dialogs.native_runtime.installHint") }}
+          </div>
+        </div>
       </div>
 
       <div
@@ -1312,7 +1366,7 @@ const updateDialogPluginLogo = computed(() => {
           variant="text"
           :loading="loading_ || installUrlValidation.validating"
           :disabled="loading_ || installUrlValidation.validating"
-          @click="newExtension()"
+          @click="requestInstall()"
           >{{ tm("buttons.install") }}</v-btn
         >
       </div>

@@ -239,6 +239,17 @@ export const useExtensionPage = (initialTab = "installed") => {
   // 用户选择的依赖安装模式（lazy / full）
   const depsChoice = ref("");
 
+  // Native 运行方式（进程内 .so/.dll）：安装时可选，切换时也可选。
+  // nativeInstall 是安装对话框里的"以 Native 运行方式安装"开关；
+  // nativeDialog 是 Native 风险警告弹窗，必须在检测/下载 Go 工具链之前弹出；
+  // nativeInstallConfirmed 记录本次安装是否已确认过风险警告。
+  const nativeInstall = ref(false);
+  const nativeInstallConfirmed = ref(false);
+  const nativeDialog = reactive({
+    show: false,
+    message: "",
+  });
+
   // 安装进度轮询状态
   const installProgress = ref({
     show: false,
@@ -844,6 +855,12 @@ export const useExtensionPage = (initialTab = "installed") => {
     );
   };
 
+  // 运行方式：'native' | 'grpc'（缺省 grpc）。用于 Native 专属提示。
+  const runtimeOfExtension = (extensionName) => {
+    const ext = getInstalledExtensionByName(extensionName);
+    return ext && ext.runtime === "native" ? "native" : "grpc";
+  };
+
   const findMarketPluginForExtension = (extension) => {
     if (!extension) return null;
     const source = extension.install_source || {};
@@ -1099,6 +1116,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     }
 
     const hasDownloadUrl = Boolean(getUpdateDownloadUrl(ext));
+    const isNative = runtimeOfExtension(extensionName) === "native";
 
     closeUpdateConfirmDialog();
     loadingDialog.title = tm("status.loading");
@@ -1122,7 +1140,13 @@ export const useExtensionPage = (initialTab = "installed") => {
         toast(tm("messages.refreshing"), "info", 2000);
         try {
           await getExtensions();
-          toast(tm("messages.refreshSuccess"), "success");
+          // Native 插件更新后动态库不可热替换，新版本需重启才完整生效。
+          toast(
+            isNative
+              ? tm("messages.nativeUpdateNotice")
+              : tm("messages.refreshSuccess"),
+            isNative ? "error" : "success",
+          );
 
           // 更新完成后弹出更新日志
           viewChangelog({
@@ -1241,7 +1265,12 @@ export const useExtensionPage = (initialTab = "installed") => {
         return;
       }
       extension.activated = true;
-      toast(res.data.message, "success");
+      // Native 插件为逻辑启停：动态库仍驻留主进程，提示需重启才能彻底移除。
+      if (extension.runtime === "native") {
+        toast(tm("messages.nativeToggleNotice"), "info");
+      } else {
+        toast(res.data.message, "success");
+      }
       await getExtensions();
 
       await checkAndPromptConflicts();
@@ -1262,7 +1291,11 @@ export const useExtensionPage = (initialTab = "installed") => {
         return;
       }
       extension.activated = false;
-      toast(res.data.message, "success");
+      if (extension.runtime === "native") {
+        toast(tm("messages.nativeToggleNotice"), "info");
+      } else {
+        toast(res.data.message, "success");
+      }
       await getExtensions();
     } catch (err) {
       toast(resolveErrorMessage(err, tm("messages.operationFailed")), "error");
@@ -1369,13 +1402,19 @@ export const useExtensionPage = (initialTab = "installed") => {
   };
 
   const reloadPlugin = async (plugin_name) => {
+    const isNative = runtimeOfExtension(plugin_name) === "native";
     try {
       const res = await pluginApi.reload(plugin_name);
       if (res.data.status === "error") {
         toast(res.data.message || tm("messages.reloadFailed"), "error");
         return;
       }
-      toast(tm("messages.reloadSuccess"), "success");
+      // Native 插件无法重新加载动态库，重载只做轻量重注册：红色提示说明限制。
+      if (isNative) {
+        toast(tm("messages.nativeReloadNotice"), "error");
+      } else {
+        toast(tm("messages.reloadSuccess"), "success");
+      }
       await getExtensions();
     } catch (err) {
       toast(resolveErrorMessage(err, tm("messages.reloadFailed")), "error");
@@ -2539,6 +2578,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     source,
     ignoreVersionCheck,
     ignoreRisk,
+    native,
     ccChoice,
     goChoice,
     goMirror,
@@ -2549,11 +2589,13 @@ export const useExtensionPage = (initialTab = "installed") => {
   }) => {
     const shouldIgnoreVersionCheck = ignoreVersionCheck === true;
     const shouldIgnoreRisk = ignoreRisk === true;
+    const shouldUseNative = native === true;
     if (source === "file") {
       const formData = new FormData();
       formData.append("file", upload_file.value);
       formData.append("ignore_version_check", String(shouldIgnoreVersionCheck));
       formData.append("ignore_risk", String(shouldIgnoreRisk));
+      formData.append("native", String(shouldUseNative));
       formData.append("cc_choice", ccChoice || "");
       formData.append("go_choice", goChoice || "");
       formData.append("go_mirror", goMirror || "");
@@ -2572,6 +2614,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         : getRepositoryProxy(extension_url.value),
       ignore_version_check: shouldIgnoreVersionCheck,
       ignore_risk: shouldIgnoreRisk,
+      native: shouldUseNative,
       cc_choice: ccChoice || "",
       go_choice: goChoice || "",
       go_mirror: goMirror || "",
@@ -2596,6 +2639,9 @@ export const useExtensionPage = (initialTab = "installed") => {
     } else {
       extension_url.value = "";
     }
+    // 安装终态：重置本轮的 Native 确认（下次安装重新弹警告）。nativeInstall
+    // 开关保留，方便用户连续安装多个 Native 插件。
+    nativeInstallConfirmed.value = false;
 
     toast(resData.message, "success");
     dialog.value = false;
@@ -2610,6 +2656,30 @@ export const useExtensionPage = (initialTab = "installed") => {
     });
 
     await checkAndPromptConflicts();
+  };
+
+  // requestInstall 是安装按钮入口：若用户选了 Native 运行方式且本次尚未确认
+  // 风险警告，先弹 Native 警告（在检测/下载 Go 工具链之前），确认后再进入
+  // newExtension（后者才会触发后端安装 → Go 工具链/C 编译器检测）。非 Native
+  // 或已确认则直接安装。
+  const requestInstall = async () => {
+    if (nativeInstall.value && !nativeInstallConfirmed.value) {
+      nativeDialog.message = tm("dialogs.native_runtime.message");
+      nativeDialog.show = true;
+      return;
+    }
+    await newExtension();
+  };
+
+  const confirmNativeInstall = async () => {
+    nativeDialog.show = false;
+    nativeInstallConfirmed.value = true;
+    await newExtension();
+  };
+
+  const cancelNativeInstall = () => {
+    nativeDialog.show = false;
+    nativeInstallConfirmed.value = false;
   };
 
   const newExtension = async (ignoreVersionCheck = false) => {
@@ -2686,6 +2756,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         source,
         ignoreVersionCheck: shouldIgnoreVersionCheck,
         ignoreRisk: shouldIgnoreRisk,
+        native: nativeInstall.value,
         ccChoice: chosenCC,
         goChoice: chosenGo,
         goMirror: chosenGoMirror,
@@ -3157,6 +3228,11 @@ export const useExtensionPage = (initialTab = "installed") => {
     chooseDepsMode,
     cancelDepsMode,
     copyPkgCommand,
+    nativeInstall,
+    nativeDialog,
+    requestInstall,
+    confirmNativeInstall,
+    cancelNativeInstall,
     installProgress,
     newExtension,
     normalizePlatformList,

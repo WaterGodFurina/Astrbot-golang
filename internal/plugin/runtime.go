@@ -3,6 +3,7 @@ package plugin
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -25,6 +26,8 @@ import (
 	"github.com/hashicorp/go-hclog"
 	goplugin "github.com/hashicorp/go-plugin"
 	"golang.org/x/mod/module"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // logger 供插件运行时与编译相关路径记录日志。
@@ -53,6 +56,20 @@ const pluginHookRPCTimeout = 30 * time.Second
 // restartBudgetResetWindow resets the crash-restart budget after this idle gap so low-frequency crashes don't get permanently banned (only consecutive/ recent crashes count).
 const restartBudgetResetWindow = 10 * time.Minute
 
+// Native 运行方式的宿主↔插件 rendezvous 环境变量（与 SDK serve_native.go
+// 中一致；两者共享宿主进程环境变量，故无需 IPC）。
+const (
+	envNativeRendezvous = "ASTRBOT_NATIVE_RENDEZVOUS"
+	envNativeHostAddr   = "ASTRBOT_NATIVE_HOST_ADDR"
+)
+
+// nativeMaxMsgSize 是 Native 运行方式 gRPC 的最大消息体（与 SDK 一致）。
+const nativeMaxMsgSize = 128 << 20
+
+// nativeRendezvousTimeout bounds how long the host waits for the plugin to
+// publish its listener address via the rendezvous file.
+const nativeRendezvousTimeout = 15 * time.Second
+
 // DefaultIdleUnloadMinutes is the single source of truth for the idle-unload threshold applied when sleep is enabled but no threshold is configured yet.
 const DefaultIdleUnloadMinutes = 10
 
@@ -65,6 +82,13 @@ type PluginInstance struct {
 
 	// Language is "go" (compiled binary) or "python" (source tree).
 	Language string
+	// Runtime is the plugin execution mode: ""/"grpc" = isolated subprocess
+	// (go-plugin + gRPC, default), "native" = in-process .so/.dll loaded via
+	// the Native runtime (no process isolation).
+	Runtime string
+	// nativeTarget 是 Native 插件发布的本机回环 gRPC target；禁用后重新启用
+	// 时用于 reconnect（Go plugin 不可二次 Open，插件服务进程内常驻）。
+	nativeTarget string
 	// DisplayName / ShortDesc are display metadata from the packaged plugin manifest, surfaced to the WebUI.
 	DisplayName string
 	ShortDesc   string
@@ -554,6 +578,11 @@ type InstallOptions struct {
 	// CCChoice carries the user's answer to a cgo C-compiler prompt (one of "gcc" / "clang" / "download" / "cancel"). It is only meaningful when the plugin declares cgo and the host needs to pick a compiler; empty means no decision has been made yet (→ a CCompilerPromptError is returned).
 	CCChoice string
 
+	// Native 请求以 Native 运行方式安装（进程内 .so/.dll），而非默认的
+	// gRPC 子进程。Native 构建必须 CGO（-buildmode=plugin / c-shared），
+	// 即使插件本身是纯 Go 也需 C 编译器；构建产物为 .so/.dll。
+	Native bool
+
 	// GoChoice carries the user's answer to a Go toolchain/SDK prompt (one of "download" / "cancel"). Empty means no decision has been made yet (→ a RuntimePromptError with Kind RuntimePromptGoSDK is returned when the Go toolchain or the plugin SDK is not resolvable).
 	GoChoice string
 
@@ -650,15 +679,21 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	}
 
 	// cgo plugin → resolve the C compiler first (may surface a user prompt).
+	// Native 构建（-buildmode=plugin / c-shared）必须 CGO，即使纯 Go 插件也
+	// 需要 C 编译器。
 	var cc, cxx string
-	if meta.RequiresCgo() {
+	if meta.RequiresCgo() || opts.Native {
 		cc, cxx, err = ensureCCompiler(ctx, opts)
 		if err != nil {
 			var promptErr *CCompilerPromptError
 			if errors.As(err, &promptErr) {
 				return nil, promptErr
 			}
-			return nil, fmt.Errorf("cgo 插件需要 C 编译器: %w", err)
+			reason := "cgo 插件"
+			if opts.Native && !meta.RequiresCgo() {
+				reason = "Native 运行方式（需要 CGO）"
+			}
+			return nil, fmt.Errorf("%s需要 C 编译器: %w", reason, err)
 		}
 	}
 
@@ -731,6 +766,9 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		}
 	}
 	artifact := filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id), artifactName(id))
+	if opts.Native {
+		artifact = filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id), nativeArtifactName(id))
+	}
 	lineCb := func(line string) {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -740,7 +778,11 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 			opts.Stage(line)
 		}
 	}
-	if err := m.compiler.BuildWithProgressOut(ctx, srcDest, artifact, opts.Progress, cc, cxx, lineCb); err != nil {
+	if opts.Native {
+		if err := m.compiler.BuildNative(ctx, srcDest, artifact, opts.Progress, cc, cxx, lineCb); err != nil {
+			return nil, fmt.Errorf("build native plugin %s: %w", id, err)
+		}
+	} else if err := m.compiler.BuildWithProgressOut(ctx, srcDest, artifact, opts.Progress, cc, cxx, lineCb); err != nil {
 		return nil, fmt.Errorf("build plugin %s: %w", id, err)
 	}
 
@@ -748,7 +790,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	unlock := m.lockOp(id)
 	defer unlock()
 
-	inst, err := m.loadLocked(ctx, id, artifact, "go", false)
+	inst, err := m.loadLocked(ctx, id, artifact, "go", runtimeFromOpts(opts), false)
 	if err != nil {
 		return nil, err
 	}
@@ -881,7 +923,7 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	unlock := m.lockOp(id)
 	defer unlock()
 
-	inst, err := m.loadLocked(ctx, id, dest, "python", false)
+	inst, err := m.loadLocked(ctx, id, dest, "python", "", false)
 	if err != nil {
 		return nil, err
 	}
@@ -1062,6 +1104,7 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		Binary:           artifact,
 		Enabled:          true,
 		Language:         inst.Language,
+		Runtime:          runtimeFromOpts(opts),
 		DisplayName:      inst.DisplayName,
 		ShortDesc:        inst.ShortDesc,
 		InstallMethod:    opts.InstallMethod,
@@ -1153,11 +1196,11 @@ func (m *SubprocessManager) loadLang(ctx context.Context, id, binary, language s
 	}
 	unlock := m.lockOp(id)
 	defer unlock()
-	return m.loadLocked(ctx, id, binary, language, wake)
+	return m.loadLocked(ctx, id, binary, language, "", wake)
 }
 
-// loadLocked is Load's body; the caller must hold the per-plugin lifecycle lock for id (m.lockOp).
-func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language string, wake bool) (*PluginInstance, error) {
+// loadLocked is Load's body; the caller must hold the per-plugin lifecycle lock for id (m.lockOp). runtimeHint 为安装/调用方显式指定的运行方式（"native"/"grpc"/""）；空串时从 manifest 读取。
+func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language, runtimeHint string, wake bool) (*PluginInstance, error) {
 	m.mu.RLock()
 	if inst, ok := m.instances[id]; ok {
 		m.mu.RUnlock()
@@ -1165,9 +1208,29 @@ func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language
 	}
 	m.mu.RUnlock()
 
-	inst, err := m.startInstance(ctx, id, binary, language)
-	if err != nil {
-		return nil, err
+	rt := runtimeHint
+	if rt == "" {
+		rt = m.pluginRuntime(id)
+	}
+
+	var inst *PluginInstance
+	var err error
+	if rt == "native" {
+		inst, err = m.loadNativeInstance(ctx, id, binary)
+		if err != nil {
+			return nil, err
+		}
+		// 持久化 Native 回环 target，供禁用后再启用时重新连接。
+		if inst.nativeTarget != "" {
+			if err := m.setNativeTargetManifest(id, inst.nativeTarget); err != nil {
+				logger.I18nWarn("插件 %s 持久化 native target 失败: %v", id, err)
+			}
+		}
+	} else {
+		inst, err = m.startInstance(ctx, id, binary, language)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// 落盘 config schema 缓存，供插件禁用后仍能渲染配置对话框。
 	if inst.Meta != nil {
@@ -1184,7 +1247,12 @@ func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language
 	m.instances[id] = inst
 	m.mu.Unlock()
 
-	m.startWatch(inst)
+	if inst.Runtime != "native" {
+		m.startWatch(inst)
+	} else {
+		// Native 无子进程可 watch（§7/§13），不启动进程退出 watcher。
+		logger.Debug("插件 %s 为 Native 运行方式，跳过进程退出 watcher", id)
+	}
 	logger.I18nInfo("插件 %s 已从 %s 加载 (v%s)", id, inst.Binary, inst.Version)
 	if !wake {
 		// 通知所有已加载插件：新插件加载完成（on_plugin_loaded）。仅真正
@@ -1229,6 +1297,17 @@ func (m *SubprocessManager) Reload(ctx context.Context, id string) error {
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("plugin %s: %w", id, ErrPluginNotLoaded)
+	}
+
+	// Native 插件进程内常驻、不可 kill/重新加载 .so（§13.1）：重载仅做
+	// 轻量重注册（Command/Filter 等可安全注销/注册的功能），触发宿主
+	// re-bridge；不重启插件服务，也不二次 plugin.Open。
+	if old.Runtime == "native" {
+		logger.I18nWarn("插件 %s 为 Native 运行方式：重载仅重新注册指令/过滤器等，不重新加载动态库", id)
+		if m.OnInstancesChanged != nil {
+			m.OnInstancesChanged()
+		}
+		return nil
 	}
 
 	newInst, err := m.startInstance(ctx, id, old.Binary, old.Language)
@@ -1350,6 +1429,12 @@ func (m *SubprocessManager) SetPluginIdleUnload(id string, allow bool) error {
 	if e == nil {
 		return fmt.Errorf("插件 %s 未安装", id)
 	}
+	if e.Runtime == "native" {
+		// Native 插件进程内常驻、不可 kill/休眠，禁止开启闲置休眠（§7）。
+		if allow {
+			return fmt.Errorf("Native 插件不支持闲置休眠（进程内常驻，无法 kill/唤醒）")
+		}
+	}
 	wasAllow := e.IdleUnload
 	e.IdleUnload = allow
 	// 仅「关闭→开启」翻转且从未设阈值时落默认值：否则清扫按 minutes<=0 视为常驻（开了但永不休眠）；已是开启态则尊重用户显式设的 0（常驻）。
@@ -1370,6 +1455,10 @@ func (m *SubprocessManager) SetPluginIdleUnload(id string, allow bool) error {
 // PluginIdleUnload reports whether the plugin is allowed to idle-unload.
 func (m *SubprocessManager) PluginIdleUnload(id string) bool {
 	if e := m.cachedManifest().Get(id); e != nil {
+		// Native 插件进程内常驻，永不参与闲置休眠（§7）。
+		if e.Runtime == "native" {
+			return false
+		}
 		return e.IdleUnload
 	}
 	return false
@@ -1493,6 +1582,10 @@ func (m *SubprocessManager) sweepIdlePlugins() {
 
 	now := time.Now()
 	for _, inst := range insts {
+		// Native 插件进程内常驻、不可 kill/休眠（Go plugin 不可卸载，见 §7）。
+		if inst.Runtime == "native" {
+			continue
+		}
 		// 进行中的 RPC 不判闲：避免正在执行命令/工具的插件被回收。
 		if inst.activeRPC.Load() > 0 {
 			continue
@@ -1839,6 +1932,177 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 	// Go 插件同样接 stderr 采集器：握手失败（Windows CI 上"Unrecognized remote plugin
 	// message"空尾串）时可回吐子进程真实输出定位根因；无 [ASTRBOT] 协议行时按原文诊断。
 	return m.dispensePlugin(ctx, id, abs, language, cmd, newAstrbotStartupParser())
+}
+
+// loadNativeInstance loads a Go plugin shared library in-process (Native
+// runtime): opens the .so/.dll, serves the host's HostService on a loopback
+// listener, calls the plugin's AstrBotNativeServe entry (which blocks serving
+// PluginService on its own loopback listener), polls the rendezvous file for
+// the plugin listener address, connects a gRPC client and performs Register.
+//
+// 生命周期：Native 插件与本进程共享地址空间，不能被 kill / 卸载 / 闲置休眠
+// （§7/§13 of native plugin plan）；更新、禁用、卸载、重载均需重启 AstrBot。
+func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, soPath string) (*PluginInstance, error) {
+	startInstanceMu.Lock()
+	defer startInstanceMu.Unlock()
+
+	if spec := m.installedAstrbotVersion(id); spec != "" {
+		if err := CheckAstrbotVersionCompatibility(spec); err != nil {
+			return nil, fmt.Errorf("插件 %s 与当前 AstrBot 版本不兼容，已拒绝加载: %w", id, err)
+		}
+	}
+	abs, err := filepath.Abs(soPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve plugin path: %w", err)
+	}
+	if info, err := os.Stat(abs); err != nil || info.IsDir() {
+		return nil, fmt.Errorf("plugin library not found: %s", abs)
+	}
+
+	entry, err := openNativePlugin(abs)
+	if err != nil {
+		return nil, err
+	}
+
+	// 宿主侧 HostService：本机回环 listener（unix socket / 127.0.0.1）。
+	hostLis, hostTarget, err := newNativeHostListener()
+	if err != nil {
+		return nil, fmt.Errorf("host hostservice listener: %w", err)
+	}
+	hostSrv, err := pluginsdk.ServeHostServiceOnListener(hostLis, id)
+	if err != nil {
+		_ = hostLis.Close()
+		return nil, fmt.Errorf("serve host hostservice: %w", err)
+	}
+
+	// 插件 .so/.dll 与宿主共享进程环境变量：直接 set 后由插件 NativeServe 读取。
+	// 保持设置直至插件生命周期结束（同进程，无需恢复）。
+	rdFile := filepath.Join(os.TempDir(), fmt.Sprintf("astrbot-native-%s-%d.json", sanitizeID(id), time.Now().UnixNano()))
+	os.Setenv(envNativeHostAddr, hostTarget)
+	os.Setenv(envNativeRendezvous, rdFile)
+	go entry() // 阻塞在插件侧 NativeServe
+
+	pluginTarget, err := waitNativeRendezvous(rdFile, nativeRendezvousTimeout)
+	if err != nil {
+		hostSrv.Stop()
+		_ = hostLis.Close()
+		return nil, err
+	}
+
+	conn, err := grpc.NewClient(pluginTarget,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(nativeMaxMsgSize),
+			grpc.MaxCallSendMsgSize(nativeMaxMsgSize),
+		))
+	if err != nil {
+		hostSrv.Stop()
+		_ = hostLis.Close()
+		return nil, fmt.Errorf("dial native plugin %s: %w", id, err)
+	}
+	client := pluginsdk.NewClient(conn)
+	client.AttachNativeHostService(hostSrv, hostLis, id)
+
+	regCtx, cancel := context.WithTimeout(ctx, registerTimeout)
+	defer cancel()
+	meta, err := client.Register(regCtx)
+	if err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("native plugin %s register: %w", id, err)
+	}
+
+	inst := &PluginInstance{
+		ID:           id,
+		Name:         meta.GetName(),
+		Version:      meta.GetVersion(),
+		Binary:       abs,
+		StartedAt:    time.Now(),
+		Language:     "go",
+		Runtime:      "native",
+		Client:       client,
+		Meta:         meta,
+		nativeTarget: pluginTarget,
+	}
+	return inst, nil
+}
+
+// pluginRuntime 返回插件 manifest 中记录的运行方式（"grpc" 缺省）。
+func (m *SubprocessManager) pluginRuntime(id string) string {
+	if man, err := LoadManifest(m.manifestPath()); err == nil {
+		if e := man.Get(id); e != nil {
+			if e.Runtime == "native" {
+				return "native"
+			}
+		}
+	}
+	return "grpc"
+}
+
+// setNativeTargetManifest 持久化 Native 插件的回环 gRPC target 到 manifest。
+func (m *SubprocessManager) setNativeTargetManifest(id, target string) error {
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return err
+	}
+	e := man.Get(id)
+	if e == nil {
+		return fmt.Errorf("plugin %s not in install manifest", id)
+	}
+	e.NativeTarget = target
+	return m.saveManifest(man)
+}
+
+// runtimeFromOpts 返回安装请求对应的运行方式（"native" 或 "grpc" 缺省）。
+func runtimeFromOpts(opts InstallOptions) string {
+	if opts.Native {
+		return "native"
+	}
+	return "grpc"
+}
+
+// newNativeHostListener 创建宿主侧 Native HostService 的本机回环 listener：
+// Unix 用 unix socket，Windows 用 127.0.0.1 随机端口 TCP。返回 listener 与其
+// gRPC target。
+func newNativeHostListener() (net.Listener, string, error) {
+	if runtime.GOOS == "windows" {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, "", err
+		}
+		return lis, lis.Addr().String(), nil
+	}
+	dir, err := os.MkdirTemp("", "astrbot-native-host-*")
+	if err != nil {
+		return nil, "", err
+	}
+	sock := filepath.Join(dir, "host.sock")
+	lis, err := net.Listen("unix", sock)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, "", err
+	}
+	return lis, "unix://" + sock, nil
+}
+
+// waitNativeRendezvous 轮询 rendezvous 文件直到插件写入其 listener 地址
+// （或超时）。NativeServe 原子写文件（临时文件 + Rename），这里只需读到
+// 非空 plugin_addr 即视为就绪。
+func waitNativeRendezvous(path string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil { // #nosec G304 -- 读取宿主自己创建的 rendezvous 文件
+			var rd struct {
+				PluginAddr string `json:"plugin_addr"`
+			}
+			if json.Unmarshal(data, &rd) == nil && rd.PluginAddr != "" {
+				return rd.PluginAddr, nil
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return "", fmt.Errorf("native 插件 rendezvous 超时（%s 未就绪）", path)
 }
 
 // pythonRuntime resolves (once) the Python subprocess environment: SDK extraction + venv/grpcio preparation + (optionally) downloading a bundled Python when the system has none. The first Python plugin load may take a while (download / venv creation + pip install). 供给模式取宿主配置 （pipDepsMode：lazy 核心层 / full 全量 / 空按 pysdk 默认 lazy）。
@@ -2588,7 +2852,22 @@ var (
 
 // teardownInstance gracefully asks the plugin to clean up, kills the process (its whole process group, so anything the plugin spawned dies too), then releases the RPC client (gRPC conn + HostService server) so repeated reloads do not leak connections/goroutines. Safe to call multiple times.
 func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
-	if inst == nil || inst.raw == nil {
+	if inst == nil {
+		return
+	}
+	// Native 插件进程内常驻：没有可 kill 的子进程，也不可卸载动态库。
+	// 仅做逻辑停止：跑 Cleanup + 关闭 gRPC Client（插件服务 goroutine 与
+	// .so/.dll 仍驻留本进程，RSS 无法保证回收，见 §13）。彻底移除需重启。
+	if inst.Runtime == "native" {
+		if inst.Client != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+			_ = inst.Client.Cleanup(ctx)
+			cancel()
+			_ = inst.Client.Close()
+		}
+		return
+	}
+	if inst.raw == nil {
 		return
 	}
 	if !inst.raw.Exited() {

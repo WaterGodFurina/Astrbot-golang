@@ -24,7 +24,43 @@ const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 // sdkModuleVersion 是宿主内置的插件 SDK 版本（与宿主 go.mod 的 require 一致，
 // 发版时同步 bump）。发布版宿主进程的 CWD 下没有 go.mod，SDK 解析与下载在
 // 找不到 go.mod 时以该常量兜底定位模块缓存，不再依赖进程工作目录。
-const sdkModuleVersion = "v1.6.3"
+const sdkModuleVersion = "v1.7.0"
+
+// nativeEntryUnix 是 Native 构建时注入插件 package main 的生成入口
+// （不改动插件作者源码）。宿主 Loader 加载 .so 后 Lookup 并调用它：
+// 先 sdk.Register(plugin)（plugin 为作者提升的包级变量），再进入 NativeServe。
+const nativeEntryUnix = `package main
+
+import sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+
+func AstrBotNativeServe() int {
+	sdk.Register(plugin)
+	return sdk.NativeServe()
+}
+`
+
+// nativeEntryWindows 是 Windows Native 构建（-buildmode=c-shared）的生成入口：
+// 通过 //export + import "C" 导出 C ABI 符号 AstrBotNativeServe（C.int、零参数，
+// 地址经共享 env/rendezvous 传递）。C ABI 仅限该加载层入口。
+//
+// 不在此声明 func main()：插件作者源码的 main.go 已提供 main()（其内容是
+// sdk.Serve(plugin)），重复声明会编译报 "main redeclared"。c-shared 不需要
+// 本文件再补 main。
+const nativeEntryWindows = `package main
+
+/*
+#include <stdint.h>
+*/
+import "C"
+
+import sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+
+//export AstrBotNativeServe
+func AstrBotNativeServe() C.int {
+	sdk.Register(plugin)
+	return C.int(sdk.NativeServe())
+}
+`
 
 // Compiler builds plugin source into a platform-native executable using the
 // bundled Go toolchain. It also performs static safety checks (import
@@ -477,4 +513,98 @@ func artifactName(id string) string {
 		ext = ".exe"
 	}
 	return sanitizeID(id) + "-" + runtime.GOOS + "-" + runtime.GOARCH + ext
+}
+
+// nativeArtifactName returns the Native shared-library file name for the
+// current platform: "<id>-<GOOS>-<GOARCH>.so" (Unix) / ".dll" (Windows).
+func nativeArtifactName(id string) string {
+	base := sanitizeID(id) + "-" + runtime.GOOS + "-" + runtime.GOARCH
+	if runtime.GOOS == "windows" {
+		return base + ".dll"
+	}
+	return base + ".so"
+}
+
+// BuildNative compiles a plugin module into a Native shared library that the
+// host loads in-process (plugin.Open on Unix / LoadDLL on Windows). It injects
+// a generated package-main entry (native_entry.go) exposing AstrBotNativeServe
+// and builds with `-buildmode=plugin` (Unix) / `-buildmode=c-shared` (Windows).
+// CGO must be enabled; cc/cxx come from ensureCCompiler. The injected entry
+// file is removed after the build so the plugin source directory stays
+// untouched.
+//
+// 不需要 `-tags native`：SDK 的 Native 运行时代码总是编译（gRPC 模式下为
+// 死代码），因此宿主与插件对 SDK 包的 build 配置一致，plugin.Open 不校验
+// 自定义 tag。宿主二进制也无需任何自定义 tag。
+func (c *Compiler) BuildNative(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc, cc, cxx string, outputCb func(line string)) error {
+	entry := nativeEntryUnix
+	if runtime.GOOS == "windows" {
+		entry = nativeEntryWindows
+	}
+	entryPath := filepath.Join(srcDir, "native_entry.go")
+	if err := os.WriteFile(entryPath, []byte(entry), 0o644); err != nil { // #nosec G306 -- 注入到插件 srcDir 的生成文件，常规权限
+		return fmt.Errorf("inject native entry: %w", err)
+	}
+	defer os.Remove(entryPath)
+
+	goBin, err := c.tc.EnsureWithProgress(progress)
+	if err != nil {
+		return fmt.Errorf("ensure toolchain: %w", err)
+	}
+	absOut, err := filepath.Abs(outputPath)
+	if err != nil {
+		return fmt.Errorf("resolve output path: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(absOut), 0o755); err != nil { // #nosec G301 -- 插件构建产物目录（用户态）
+		return err
+	}
+
+	buildmode := "plugin"
+	if runtime.GOOS == "windows" {
+		buildmode = "c-shared"
+	}
+	args := []string{"build", "-buildmode=" + buildmode}
+	if outputCb != nil {
+		args = append(args, "-v")
+	}
+	args = append(args, "-o", absOut, "-ldflags=-s -w", "./...")
+	cmd := exec.CommandContext(ctx, goBin, args...) // #nosec G204 -- 编译插件模块（核心），args 由固定 flag 拼装
+	cmd.Dir = srcDir
+	extra := map[string]string{
+		"GOPROXY":     c.goproxyEnv(),
+		"GOFLAGS":     c.goflagsEnv(),
+		"CGO_ENABLED": "1",
+	}
+	if cc != "" {
+		extra["CC"] = cc
+		extra["CXX"] = cxx
+	}
+	cmd.Env = c.tc.BuildEnv(extra)
+
+	if outputCb == nil {
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("go build native: %w\n%s", err, out)
+		}
+		return nil
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
+	}
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("go build native start: %w", err)
+	}
+	scanner := bufio.NewScanner(io.TeeReader(stderr, &stderrBuf))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1*1024*1024)
+	for scanner.Scan() {
+		outputCb(scanner.Text())
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("go build native: %w\n%s", err, stderrBuf.String())
+	}
+	return nil
 }

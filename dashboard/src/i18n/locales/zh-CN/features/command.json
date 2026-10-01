@@ -119,6 +119,16 @@
     "noPlugins": "暂无已启用的插件",
     "globalSaved": "已保存新装插件默认休眠时间",
     "pluginSaved": "插件休眠策略已更新",
-    "intro": "为每个插件单独配置闲置自动休眠：开启后，插件进程在闲置达到设定分钟数时被回收以释放内存，下次触发时自动唤醒（无感恢复）。默认常驻（不开启）。"
+    "intro": "为每个插件单独配置闲置自动休眠：开启后，插件进程在闲置达到设定分钟数时被回收以释放内存，下次触发时自动唤醒（无感恢复）。默认常驻（不开启）。",
+    "columnRuntime": "运行方式",
+    "runtimeGrpc": "子进程（gRPC）",
+    "runtimeNative": "进程内（Native）",
+    "runtimeNativeHint": "Native 运行方式将插件作为进程内动态库加载（.so/.dll），性能更高但崩溃可能影响宿主，且不支持休眠、重载与热更新，需重启生效。",
+    "runtimeOnlyGo": "仅 Go 插件",
+    "runtimeSaved": "插件运行方式已更新（需重启生效）",
+    "runtimeSwitchTitle": "切换到 Native 运行方式？",
+    "runtimeSwitchConfirm": "继续并切换",
+    "runtimeRestartNote": "运行方式变更后需重新构建并重启 AstrBot 才能生效。",
+    "runtimeCancel": "取消"
   }
 }

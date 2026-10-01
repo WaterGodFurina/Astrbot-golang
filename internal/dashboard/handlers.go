@@ -2156,6 +2156,53 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			}
 		}
 		writeJSON(w, http.StatusOK, apiError("插件不存在或不可用"))
+	case "runtime":
+		// 插件运行方式（宿主侧配置）：POST {plugin_id, confirm?: bool}
+		// 确认 Native 风险警告；POST {plugin_id, native: true/false} 切换
+		// gRPC（默认）/Native。Native 切换需先 ConfirmNative，且重新构建
+		// .so/.dll 后重启生效。
+		var body struct {
+			PluginID string `json:"plugin_id"`
+			Native   *bool  `json:"native"`
+			Confirm  bool   `json:"confirm"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
+			return
+		}
+		if s.subPluginMgr == nil {
+			writeJSON(w, http.StatusOK, apiError("插件管理器不可用"))
+			return
+		}
+		pid, _, ok := s.resolveSubprocessPlugin(body.PluginID)
+		if !ok {
+			writeJSON(w, http.StatusOK, apiError("插件不存在或不可用"))
+			return
+		}
+		if body.Confirm {
+			if err := s.subPluginMgr.ConfirmNative(pid); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("已确认 Native 风险警告", map[string]interface{}{}))
+			return
+		}
+		if body.Native != nil {
+			if err := s.subPluginMgr.SetNativeRuntime(pid, *body.Native); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("插件运行方式已更新（需重新构建并重启生效）", map[string]interface{}{
+				"runtime": func() string {
+					if *body.Native {
+						return "native"
+					}
+					return "grpc"
+				}(),
+			}))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiError("缺少 native 或 confirm 参数"))
 	case "failed":
 		// DELETE /plugins/failed/{plugin_id}：卸载失败插件——清除崩溃失败
 		// 记录并清理残留安装目录（对齐前端"卸载失败插件"按钮语义）。
@@ -2545,6 +2592,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 
 	var source, id, installID string
 	var ignoreRisk bool
+	var native bool
 	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror, depsChoice string
 	var installMethod, registryURL, registryName, marketPluginID, repo, downloadURL string
 
@@ -2558,6 +2606,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		var body struct {
 			URL            string `json:"url"`
 			IgnoreRisk     bool   `json:"ignore_risk"`
+			Native         bool   `json:"native"`
 			CCChoice       string `json:"cc_choice"`
 			GoChoice       string `json:"go_choice"`
 			PythonChoice   string `json:"python_choice"`
@@ -2578,6 +2627,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		}
 		source = strings.TrimSpace(body.URL)
 		ignoreRisk = body.IgnoreRisk
+		native = body.Native
 		ccChoice = strings.TrimSpace(body.CCChoice)
 		goChoice = strings.TrimSpace(body.GoChoice)
 		pythonChoice = strings.TrimSpace(body.PythonChoice)
@@ -2632,6 +2682,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		source = archive
 		id = idFromSource(fh.Filename)
 		ignoreRisk = r.FormValue("ignore_risk") == "true"
+		native = r.FormValue("native") == "true"
 		ccChoice = strings.TrimSpace(r.FormValue("cc_choice"))
 		goChoice = strings.TrimSpace(r.FormValue("go_choice"))
 		pythonChoice = strings.TrimSpace(r.FormValue("python_choice"))
@@ -2716,6 +2767,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 
 	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{
 		IgnoreRisk:     ignoreRisk,
+		Native:         native,
 		CCChoice:       ccChoice,
 		GoChoice:       goChoice,
 		PythonChoice:   pythonChoice,

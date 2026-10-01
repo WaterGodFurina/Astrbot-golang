@@ -86,6 +86,8 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"path":                    inst.Binary,
 			"id":                      inst.ID,
 			"language":                inst.Language,
+			"runtime":                 runtimeOf(inst, e),
+			"native_confirmed":        e != nil && e.NativeConfirmed,
 			"logo":                    m.pluginLogoURL(inst.ID),
 			"loaded":                  true,
 			"enabled":                 true,
@@ -171,6 +173,8 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"path":                    e.Binary,
 			"id":                      e.ID,
 			"language":                e.Language,
+			"runtime":                 runtimeOf(nil, &e),
+			"native_confirmed":        e.NativeConfirmed,
 			"logo":                    m.pluginLogoURL(e.ID),
 			"loaded":                  false,
 			"enabled":                 enabled,
@@ -437,6 +441,77 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 	return err
 }
 
+// runtimeOf 返回插件的运行方式："grpc"（缺省）或 "native"。优先取运行中
+// 实例的 Runtime，其次取 manifest 记录。
+func runtimeOf(inst *PluginInstance, e *ManifestEntry) string {
+	if inst != nil && inst.Runtime != "" {
+		return inst.Runtime
+	}
+	if e != nil && e.Runtime == "native" {
+		return "native"
+	}
+	return "grpc"
+}
+
+// ConfirmNative records that the user explicitly acknowledged the Native risk
+// warning for a plugin. Native 运行方式必须先确认警告（§8）。
+func (m *SubprocessManager) ConfirmNative(id string) error {
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return err
+	}
+	e := man.Get(id)
+	if e == nil {
+		return fmt.Errorf("插件 %s 未安装", id)
+	}
+	e.NativeConfirmed = true
+	return m.saveManifest(man)
+}
+
+// SetNativeRuntime switches a Go plugin's runtime between gRPC (subprocess,
+// default) and Native (in-process .so/.dll). Switching requires the user to
+// have confirmed the warning first (ConfirmNative), and takes effect after a
+// rebuild + reload (for a currently loaded plugin this needs a restart).
+// 运行方式是宿主侧 manifest 配置，不写入插件 metadata.json。
+func (m *SubprocessManager) SetNativeRuntime(id string, native bool) error {
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return err
+	}
+	e := man.Get(id)
+	if e == nil {
+		return fmt.Errorf("插件 %s 未安装", id)
+	}
+	if e.Language == "python" {
+		return fmt.Errorf("Python 插件不支持 Native 运行方式（仅 Go 插件）")
+	}
+	if native && !e.NativeConfirmed {
+		return fmt.Errorf("Native 运行方式需要先确认风险警告（ConfirmNative）")
+	}
+	was := e.Runtime
+	e.Runtime = ""
+	if native {
+		e.Runtime = "native"
+	}
+	if err := m.saveManifest(man); err != nil {
+		return err
+	}
+	logger.I18nInfo("插件 %s 运行方式：%s → %s（Native 需重新构建 .so/.dll 并重启生效）",
+		id, orGrpc(was), orGrpc(e.Runtime))
+	return nil
+}
+
+func orGrpc(r string) string {
+	if r == "" {
+		return "grpc"
+	}
+	return r
+}
+
 // BindSource updates the persisted install source of an installed plugin so
 // future update/reinstall requests resolve from the new registry/repository.
 // It mirrors the dashboard's install_source record (market or repository).
@@ -521,6 +596,8 @@ func (m *SubprocessManager) ReinstallSource(ctx context.Context, id string, opts
 		PythonChoice: opts.PythonChoice,
 		GoMirror:     opts.GoMirror,
 		PythonMirror: opts.PythonMirror,
+		// 重装保持原运行方式：native 插件重装仍按 Native 构建/加载。
+		Native: entry.Runtime == "native",
 		// 依赖分层选择：更新路径同样要透传（config 为空时安装路径会弹
 		// python_deps_prompt，重发请求带的 deps_choice 不能在重装链路丢）。
 		DepsChoice:     opts.DepsChoice,
@@ -613,12 +690,18 @@ func (m *SubprocessManager) uninstallLocked(id string, deleteConfig, deleteData 
 			entry = e
 		}
 	}
+	wasNative := entry != nil && entry.Runtime == "native"
 	man.Remove(id)
 	if err := m.saveManifest(man); err != nil {
 		m.manifestMu.Unlock()
 		return err
 	}
 	m.manifestMu.Unlock()
+	if wasNative {
+		// Native 插件的 .so/.dll 已加载进本进程，卸载后代码仍驻留内存，
+		// 彻底移除需重启 AstrBot（§13.4/13.6）。
+		logger.I18nWarn("插件 %s 为 Native 运行方式：已卸载 manifest/文件，但动态库仍在本进程驻留，重启 AstrBot 后彻底移除", id)
+	}
 
 	// 二进制目录（始终删除）。
 	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id)))

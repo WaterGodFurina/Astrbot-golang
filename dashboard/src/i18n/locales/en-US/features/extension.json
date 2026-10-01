@@ -139,7 +139,10 @@
       "supportPlatforms": "Supported Platforms",
       "authorWebsite": "Author Website",
       "repository": "Repository",
-      "pluginLanguage": "Plugin Language"
+      "pluginLanguage": "Plugin Language",
+      "pluginRuntime": "Runtime",
+      "runtimeGrpc": "Subprocess (gRPC)",
+      "runtimeNative": "In-process (Native)"
     }
   },
   "market": {
@@ -277,6 +280,18 @@
     "risk_warning": {
       "message": "Potential risks detected in the plugin source. Please confirm to continue"
     },
+    "native_runtime": {
+      "title": "Native runtime risk warning",
+      "message": "Native mode loads the plugin into the AstrBot-Go host process with no process-level isolation. A plugin crash or memory issue may affect the host; updating, disabling or uninstalling may require restarting AstrBot.",
+      "bullet1": "Native plugins run inside the AstrBot host process and cannot be unloaded independently like gRPC plugins.",
+      "bullet2": "Updating/disabling a Native plugin fully takes effect only after restarting AstrBot (a loaded shared library cannot be unloaded).",
+      "bullet3": "A serious error in a Native plugin may affect the AstrBot host process.",
+      "bullet4": "Native plugins do not support idle-unload (cannot be killed/woken).",
+      "hint": "Choosing Native means you understand the risks above and accept the impact of the plugin's quality.",
+      "installLabel": "Install as Native runtime (loaded into host process, no isolation)",
+      "installHint": "Default is gRPC (isolated subprocess). Native is faster and uses less memory, but has no isolation and needs a restart to update/uninstall.",
+      "confirm": "I understand, use Native"
+    },
     "c_compiler": {
       "message": "No usable C compiler detected. Choose a system compiler or download zig automatically"
     },
@@ -304,6 +319,9 @@
     "logLevelUpdated": "Log level updated and applied immediately",
     "reloadSuccess": "Reload successful",
     "reloadFailed": "Reload failed",
+    "nativeReloadNotice": "Reloading a Native plugin only re-registers commands and filters; it does not reload the Native dynamic library. Restart the entire AstrBot process to fully restart the plugin.",
+    "nativeUpdateNotice": "Native plugin updated. The new version takes full effect after restarting AstrBot.",
+    "nativeToggleNotice": "Native plugin disabled/enabled. The dynamic library remains in the main process; a full removal requires restarting AstrBot.",
     "updateSuccess": "Update successful!",
     "addSuccess": "Add successful!",
     "saveSuccess": "Save successful!",

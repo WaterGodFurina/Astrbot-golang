@@ -1306,6 +1306,18 @@ export const pluginApi = {
       }),
     );
   },
+  setRuntime(pluginId: string, native: boolean) {
+    return apiV1Client.post<ApiEnvelope<{ runtime?: string }>>(
+      `/plugins/runtime`,
+      { plugin_id: pluginId, native },
+    );
+  },
+  confirmNative(pluginId: string) {
+    return apiV1Client.post<ApiEnvelope<unknown>>(`/plugins/runtime`, {
+      plugin_id: pluginId,
+      confirm: true,
+    });
+  },
   update(pluginId: string, body?: OpenConfig) {
     return typed<OpenConfig>(
       openApiV1.updatePlugins({
