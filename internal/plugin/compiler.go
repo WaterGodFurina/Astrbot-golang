@@ -42,6 +42,10 @@ func AstrBotNativeServe() int {
 // nativeEntryWindows 是 Windows Native 构建（-buildmode=c-shared）的生成入口：
 // 通过 //export + import "C" 导出 C ABI 符号 AstrBotNativeServe（C.int、零参数，
 // 地址经共享 env/rendezvous 传递）。C ABI 仅限该加载层入口。
+//
+// 不在此声明 func main()：插件作者源码的 main.go 已提供 main()（其内容是
+// sdk.Serve(plugin)），重复声明会编译报 "main redeclared"。c-shared 不需要
+// 本文件再补 main。
 const nativeEntryWindows = `package main
 
 /*
@@ -56,8 +60,6 @@ func AstrBotNativeServe() C.int {
 	sdk.Register(plugin)
 	return C.int(sdk.NativeServe())
 }
-
-func main() {}
 `
 
 // Compiler builds plugin source into a platform-native executable using the

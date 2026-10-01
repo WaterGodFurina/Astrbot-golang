@@ -210,8 +210,6 @@ jobs:
           	sdk.Register(plugin)
           	return C.int(sdk.NativeServe())
           }
-
-          func main() {}
           EOF
           go mod tidy
           go build -buildmode=c-shared -o nativepoc.dll .
