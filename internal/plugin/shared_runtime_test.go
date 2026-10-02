@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -102,6 +104,39 @@ func TestIsolationStateMachine(t *testing.T) {
 	}
 	if m.IsIsolationPending("p") {
 		t.Error("IsIsolationPending should be false after clear")
+	}
+}
+
+// TestContentFingerprint 验证内容指纹：同内容稳定、内容变更后改变、缓存目录
+// 不影响指纹（避免 __pycache__ 造成误判）。
+func TestContentFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("print(1)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "__pycache__"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "__pycache__", "main.cpython-312.pyc"), []byte("junk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h1 := contentFingerprint(dir)
+	if h1 == "" {
+		t.Fatal("fingerprint 为空")
+	}
+	// 改变 __pycache__ 内容不影响指纹
+	if err := os.WriteFile(filepath.Join(dir, "__pycache__", "main.cpython-312.pyc"), []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if h2 := contentFingerprint(dir); h2 != h1 {
+		t.Errorf("__pycache__ 变化不应改变指纹: %s != %s", h1, h2)
+	}
+	// 改变源码内容改变指纹
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("print(2)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if h3 := contentFingerprint(dir); h3 == h1 {
+		t.Error("源码变化应改变指纹")
 	}
 }
 

@@ -3,6 +3,8 @@ package plugin
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"regexp"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1204,13 +1207,16 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		metaPages = meta.Pages
 		metaLogoPath = meta.LogoPath
 	}
-	// 板块 6：更新检测——旧条目版本与本次不同（或曾标记隔离）时，新条目进入
-	// RECOVERY_PENDING，不继承旧故障状态（v1.3.0 不应继续沿用 v1.2.0 的
-	// ISOLATED）；下次加载先尝试 python-shared，观察窗口内正常 → NORMAL。
+	// 板块 6：更新检测——旧条目版本**或内容指纹**与本次不同（或曾标记隔离）
+	// 时，新条目进入 RECOVERY_PENDING，不继承旧故障状态（v1.3.0 不应继续沿用
+	// v1.2.0 的 ISOLATED）；下次加载先尝试 python-shared，观察窗口内正常 →
+	// NORMAL。内容指纹覆盖「版本号没变但文件被修改」（开发模式/git 提交）。
 	prev := man.Get(inst.ID)
+	newHash := contentFingerprint(artifact)
+	changed := prev != nil && (prev.Version != inst.Version ||
+		(prev.SourceHash != "" && newHash != "" && prev.SourceHash != newHash))
 	newHealth := ""
-	if prev != nil && prev.Version != inst.Version &&
-		(prev.IsolationRequired || prev.HealthState != "") {
+	if changed && (prev.IsolationRequired || prev.HealthState != "") {
 		newHealth = HealthRecoveryPending
 	}
 	man.Upsert(ManifestEntry{
@@ -1238,6 +1244,8 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		LogoPath:         metaLogoPath,
 		// 更新后进入 RECOVERY_PENDING（其余情况空，表示新装/NORMAL）。
 		HealthState: newHealth,
+		// 内容身份指纹（版本 + 源码/二进制哈希），更新后据此判断是否需重新评估。
+		SourceHash: newHash,
 		// 新装插件默认常驻（不开启休眠），独立分钟数 0 = 未设置；「关闭→开启」翻转时由后端落 DefaultIdleUnloadMinutes。
 		IdleUnload:        false,
 		IdleUnloadMinutes: 0,
@@ -1246,6 +1254,60 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		DocsDir:           filepath.Join("plugins", sanitizeID(inst.ID)),
 	})
 	return m.saveManifest(man)
+}
+
+// contentFingerprint 计算插件内容身份指纹（方案「甚至可以不单纯依赖版本号」）：
+// 对文件取大小+内容的 sha256；对目录按相对路径排序后逐个文件哈希再汇总。
+// 用于识别「版本号没变但文件被修改」的更新。计算失败（不可读）返回 ""，调用方
+// 按"无指纹"处理（不误判为变更）。
+func contentFingerprint(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	h := sha256.New()
+	if !info.IsDir() {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return ""
+		}
+		h.Write(b)
+		return hex.EncodeToString(h.Sum(nil))
+	}
+	var files []string
+	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if name == "__pycache__" || name == "node_modules" || name == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if ext := filepath.Ext(p); ext == ".pyc" || ext == ".pyo" {
+			return nil
+		}
+		rel, rerr := filepath.Rel(path, p)
+		if rerr != nil {
+			return nil
+		}
+		files = append(files, rel)
+		return nil
+	})
+	sort.Strings(files)
+	for _, rel := range files {
+		h.Write([]byte(rel))
+		h.Write([]byte{0})
+		b, err := os.ReadFile(filepath.Join(path, rel))
+		if err != nil {
+			continue
+		}
+		h.Write(b)
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // manifestPath returns the persisted install manifest location.
