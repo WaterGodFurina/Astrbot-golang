@@ -112,6 +112,8 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"root_dir_name":           "",
 			"star_handler_full_names": []string{},
 		}
+		// 板块 5/6：附 Python 状态镜像与持久化故障/隔离状态。
+		addStatusMirror(info, inst, e)
 		if e != nil {
 			info["repo"] = e.Repo
 			if info["repo"] == "" {
@@ -198,9 +200,58 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"pages":                   e.Pages,
 			"root_dir_name":           e.ID,
 			"star_handler_full_names": []string{},
+			// 板块 5：未加载实例无状态镜像。休眠（已启用未加载）标记 SLEEPING，
+			// 禁用标记 UNLOADED；health 恒 NORMAL（未运行无故障判定）。
+			"python_state":  idlePlaceholderState(e.Enabled),
+			"python_health": "NORMAL",
+			"python_error":  "",
+			"last_activity": 0.0,
+			"generation":    int64(0),
+			"status_seen":   false,
+			// 板块 6：持久化的故障/隔离状态（未加载也展示，供前端/恢复决策）。
+			"health_state":       e.HealthState,
+			"isolation_required": e.IsolationRequired,
+			"runtime_preferred":  e.RuntimePreferred,
+			"runtime_current":    e.RuntimeCurrent,
 		})
 	}
 	return result
+}
+
+// addStatusMirror 把 PluginInstance 的 Python 状态镜像（板块 5）与持久化的
+// 故障/隔离状态（板块 6）写入 ListInfo 条目。仅 Python 插件有意义；Go/Native
+// 插件也附空值以保持字段一致。
+func addStatusMirror(info map[string]interface{}, inst *PluginInstance, e *ManifestEntry) {
+	state, health, errStr, lastActivity, generation, seen := inst.StatusMirror()
+	info["python_state"] = state
+	info["python_health"] = health
+	info["python_error"] = errStr
+	info["last_activity"] = lastActivity
+	info["generation"] = generation
+	info["status_seen"] = seen
+	// 板块 6：持久化的故障/隔离状态（Go Runtime Manager 决策依据）。
+	healthState := ""
+	isolationRequired := false
+	preferred := ""
+	current := ""
+	if e != nil {
+		healthState = e.HealthState
+		isolationRequired = e.IsolationRequired
+		preferred = e.RuntimePreferred
+		current = e.RuntimeCurrent
+	}
+	info["health_state"] = healthState
+	info["isolation_required"] = isolationRequired
+	info["runtime_preferred"] = preferred
+	info["runtime_current"] = current
+}
+
+// idlePlaceholderState 返回未加载实例（休眠/禁用）占位的插件状态。
+func idlePlaceholderState(enabled bool) string {
+	if enabled {
+		return "SLEEPING" // 已启用但进程不在：闲置自动卸载后的休眠态
+	}
+	return "UNLOADED" // 已禁用
 }
 
 // pluginDisplayName resolves the display name shown in the WebUI: manifest
@@ -444,11 +495,22 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 // runtimeOf 返回插件的运行方式："grpc"（缺省）或 "native"。优先取运行中
 // 实例的 Runtime，其次取 manifest 记录。
 func runtimeOf(inst *PluginInstance, e *ManifestEntry) string {
+	// 运行中实例的 Runtime 是权威（含 shared/native/grpc 三态的当前值）。
 	if inst != nil && inst.Runtime != "" {
 		return inst.Runtime
 	}
-	if e != nil && e.Runtime == "native" {
-		return "native"
+	if e != nil {
+		// 未加载（休眠/占位）时按 manifest 偏好回显：Python 三值（python-shared
+		// / python-isolated / python-grpc）原样返回；Go 插件回退 grpc/native。
+		switch e.Runtime {
+		case "native":
+			return "native"
+		case "python-shared", "python-isolated", "python-grpc":
+			return e.Runtime
+		}
+		if e.RuntimePreferred != "" {
+			return e.RuntimePreferred
+		}
 	}
 	return "grpc"
 }
@@ -791,7 +853,7 @@ func (m *SubprocessManager) ConfigSchema(id string) map[string]interface{} {
 	// RPC 失败/空响应（插件未实现或实例不可用）回退 Register 快照/磁盘缓存。
 	if inst != nil && inst.Client != nil {
 		rpcCtx, cancel := context.WithTimeout(context.Background(), pluginHookRPCTimeout)
-		data, err := inst.Client.GetConfigSchema(rpcCtx)
+		data, err := inst.Client.GetConfigSchema(rpcCtx, &sdkv1.PluginRef{PluginId: inst.ID})
 		cancel()
 		if err == nil && len(data) > 0 {
 			var schema map[string]interface{}
@@ -1070,7 +1132,7 @@ func (m *SubprocessManager) FlatSchemaByID(id string) map[string]interface{} {
 	// Use a short timeout so a hung plugin does not block the UI.
 	if inst.Client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		raw, err := inst.Client.GetConfigSchema(ctx)
+		raw, err := inst.Client.GetConfigSchema(ctx, &sdkv1.PluginRef{PluginId: inst.ID})
 		cancel()
 		if err == nil && len(raw) > 0 {
 			var schema map[string]interface{}

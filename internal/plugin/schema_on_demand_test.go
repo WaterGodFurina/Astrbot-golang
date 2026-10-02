@@ -20,7 +20,7 @@ type mockSchemaService struct {
 	schemaJSON []byte
 }
 
-func (s *mockSchemaService) GetConfigSchema(_ context.Context, _ *sdkv1.Empty) (*sdkv1.GetConfigSchemaResponse, error) {
+func (s *mockSchemaService) GetConfigSchema(_ context.Context, _ *sdkv1.PluginRef) (*sdkv1.GetConfigSchemaResponse, error) {
 	return &sdkv1.GetConfigSchemaResponse{SchemaJson: s.schemaJSON}, nil
 }
 

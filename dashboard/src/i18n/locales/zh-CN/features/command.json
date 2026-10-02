@@ -129,6 +129,9 @@
     "runtimeSwitchTitle": "切换到 Native 运行方式？",
     "runtimeSwitchConfirm": "继续并切换",
     "runtimeRestartNote": "运行方式变更后需重新构建并重启 AstrBot 才能生效。",
-    "runtimeCancel": "取消"
+    "runtimeCancel": "取消",
+    "runtimePythonGrpc": "一插件一进程（python-grpc）",
+    "runtimePythonShared": "共享 Runtime（python-shared）",
+    "runtimePythonIsolated": "进程隔离（python-isolated）"
   }
 }

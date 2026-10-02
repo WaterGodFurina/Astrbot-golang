@@ -24,22 +24,25 @@ import (
 type CCompilerPromptKind string
 
 const (
-	// PromptChooseCompiler is shown when a system GCC exists: the user picks
-	// GCC, Clang (bundled/downloaded), or cancels.
-	PromptChooseCompiler CCompilerPromptKind = "choose_compiler"
-	// PromptDownloadClang is shown when no C compiler is present at all: the
-	// user chooses whether to download Clang or cancel.
-	PromptDownloadClang CCompilerPromptKind = "download_clang"
+	// PromptChooseGCC is shown when a system GCC exists: the user picks
+	// GCC, auto-downloaded zig cc, or cancels.
+	PromptChooseGCC CCompilerPromptKind = "choose_gcc"
+	// PromptChooseClang is shown when a system Clang exists (no GCC): the user
+	// picks system Clang, auto-downloaded zig cc, or cancels.
+	PromptChooseClang CCompilerPromptKind = "choose_clang"
+	// PromptDownloadZigCC is shown when no C compiler is present at all: the
+	// user chooses whether to download zig cc or cancel.
+	PromptDownloadZigCC CCompilerPromptKind = "download_zig_cc"
 )
 
 // CCompilerChoice is the user's answer to a CCompilerPromptError.
 type CCompilerChoice string
 
 const (
-	CCChoiceGCC      CCompilerChoice = "gcc"      // use the system GCC (CC/CXX env)
-	CCChoiceClang    CCompilerChoice = "clang"    // use bundled/auto-downloaded Clang
-	CCChoiceDownload CCompilerChoice = "download" // auto-download Clang
-	CCChoiceCancel   CCompilerChoice = "cancel"   // abort installation
+	CCChoiceGCC    CCompilerChoice = "gcc"    // use the system GCC (CC/CXX env)
+	CCChoiceClang  CCompilerChoice = "clang"  // use the system Clang
+	CCChoiceZigCC  CCompilerChoice = "zig_cc" // use/download the bundled zig cc
+	CCChoiceCancel CCompilerChoice = "cancel" // abort installation
 )
 
 // CCompilerPromptError is returned by InstallFromSource when a plugin declares
@@ -49,29 +52,32 @@ type CCompilerPromptError struct {
 	// Kind is which dialog the frontend should render.
 	Kind CCompilerPromptKind `json:"kind"`
 	// HasGCC reports whether a usable system GCC was detected (only meaningful
-	// for PromptChooseCompiler).
+	// for PromptChooseGCC).
 	HasGCC bool `json:"has_gcc"`
 	// GCCPath / GCCXXPath are the detected system compiler paths.
 	GCCPath   string `json:"gcc_path,omitempty"`
 	GCCXXPath string `json:"gcc_xx_path,omitempty"`
 	// GCCVersion is a short version string of the detected GCC (for display).
 	GCCVersion string `json:"gcc_version,omitempty"`
+	// HasClang reports whether a usable system Clang was detected (only
+	// meaningful for PromptChooseClang).
+	HasClang bool `json:"has_clang"`
+	// ClangPath / ClangXXPath are the detected system Clang paths.
+	ClangPath   string `json:"clang_path,omitempty"`
+	ClangXXPath string `json:"clang_xx_path,omitempty"`
+	// ClangVersion is a short version string of the detected Clang.
+	ClangVersion string `json:"clang_version,omitempty"`
 }
 
 func (e *CCompilerPromptError) Error() string {
 	switch e.Kind {
-	case PromptChooseCompiler:
-		return "检测到系统已安装 GCC，需要选择使用 GCC 还是 Clang"
+	case PromptChooseGCC:
+		return "检测到系统已安装 GCC，需要选择使用 GCC 还是下载 zig cc"
+	case PromptChooseClang:
+		return "检测到系统已安装 Clang，需要选择使用 Clang 还是下载 zig cc"
 	default:
-		return "未检测到 C 编译器，需要确认是否自动下载并安装 Clang"
+		return "未检测到 C 编译器，需要确认是否自动下载并安装 zig cc"
 	}
-}
-
-// ClangEnv is returned by the compiler-selection logic: the resolved CC/CXX
-// paths to put into the build environment.
-type ClangEnv struct {
-	CC  string
-	CXX string
 }
 
 // ensureCCompiler resolves the C compiler to use for a cgo plugin.
@@ -79,13 +85,15 @@ type ClangEnv struct {
 // The flow (all prompts surface through WebUI/CLI via CCompilerPromptError):
 //
 //  1. If the user already answered (options.CCChoice), honor it:
-//     - gcc      → return the detected system GCC/CC/CXX.
-//     - clang    → use bundled/downloaded Clang (download if needed).
-//     - download → download Clang for the current platform.
-//     - cancel   → return a user-cancelled error.
-//  2. Otherwise detect: if a system GCC exists (via ASTRBOT_CC > CC > PATH
-//     gcc), return a PromptChooseCompiler error; if only Clang exists it is
-//     used directly; if neither exists, return a PromptDownloadClang error.
+//     - gcc     → return the detected system GCC/CC/CXX.
+//     - clang   → return the detected system Clang.
+//     - zig_cc  → use/download the bundled zig cc.
+//     - cancel  → return a user-cancelled error.
+//  2. Otherwise detect in priority order:
+//     - zig cc (bundled download or `zig` on PATH) → used directly, no prompt.
+//     - system GCC → return a PromptChooseGCC error.
+//     - system Clang → return a PromptChooseClang error.
+//     - neither → return a PromptDownloadZigCC error.
 //
 // It returns the compiler paths (ccPath/cxxPath) once the user choice is
 // resolved, or an error (CCompilerPromptError for decisions still needed).
@@ -96,9 +104,13 @@ func ensureCCompiler(ctx context.Context, options InstallOptions) (ccPath, cxxPa
 	}
 
 	// No explicit choice yet: detect what the host already has.
+	// Priority: zig cc (bundled or on PATH) > GCC > Clang.
+	if cc, cxx, ok := detectZigCC(); ok {
+		return cc, cxx, nil
+	}
 	if gcc, cxx, ver, ok := detectSystemGCC(); ok {
 		return "", "", &CCompilerPromptError{
-			Kind:       PromptChooseCompiler,
+			Kind:       PromptChooseGCC,
 			HasGCC:     true,
 			GCCPath:    gcc,
 			GCCXXPath:  cxx,
@@ -106,16 +118,22 @@ func ensureCCompiler(ctx context.Context, options InstallOptions) (ccPath, cxxPa
 		}
 	}
 	if clang, cxx, ok := detectSystemClang(); ok {
-		return clang, cxx, nil
+		return "", "", &CCompilerPromptError{
+			Kind:         PromptChooseClang,
+			HasClang:     true,
+			ClangPath:    clang,
+			ClangXXPath:  cxx,
+			ClangVersion: compilerVersion(clang),
+		}
 	}
-	return "", "", &CCompilerPromptError{Kind: PromptDownloadClang}
+	return "", "", &CCompilerPromptError{Kind: PromptDownloadZigCC}
 }
 
 // resolveCCChoice applies a user's decision to pick a C compiler.
 func resolveCCChoice(ctx context.Context, choice CCompilerChoice, options InstallOptions) (ccPath, cxxPath string, err error) {
 	switch choice {
 	case CCChoiceCancel:
-		return "", "", errors.New("已取消安装：请先手动安装 C 编译器（GCC 或 Clang）后再安装该插件")
+		return "", "", errors.New("已取消安装：请先手动安装 C 编译器（GCC/Clang 或下载 zig cc）后再安装该插件")
 	case CCChoiceGCC:
 		gcc, cxx, ver, ok := detectSystemGCC()
 		if !ok {
@@ -124,13 +142,18 @@ func resolveCCChoice(ctx context.Context, choice CCompilerChoice, options Instal
 		logger.I18nInfo("为 cgo 插件使用系统 GCC: %s (v%s)", gcc, ver)
 		return gcc, cxx, nil
 	case CCChoiceClang:
-		if clang, cxx, ok := detectSystemClang(); ok {
-			logger.I18nInfo("为 cgo 插件使用系统 Clang: %s", clang)
-			return clang, cxx, nil
+		clang, cxx, ok := detectSystemClang()
+		if !ok {
+			return "", "", fmt.Errorf("未找到系统 Clang（ASTRBOT_CC/CC 环境变量或 PATH 中的 clang）")
 		}
-		return downloadAndSetupClang(ctx, options)
-	case CCChoiceDownload:
-		return downloadAndSetupClang(ctx, options)
+		logger.I18nInfo("为 cgo 插件使用系统 Clang: %s", clang)
+		return clang, cxx, nil
+	case CCChoiceZigCC:
+		if cc, cxx, ok := detectZigCC(); ok {
+			logger.I18nInfo("为 cgo 插件使用 zig cc: %s", cc)
+			return cc, cxx, nil
+		}
+		return downloadAndSetupZigCC(ctx, options)
 	default:
 		return "", "", fmt.Errorf("未知的 C 编译器选择: %q", choice)
 	}
@@ -192,6 +215,21 @@ func detectSystemClang() (cc, cxx string, ok bool) {
 	return "", "", false
 }
 
+// detectZigCC resolves zig cc (used as the C compiler), whether from the
+// bundled download (zigCCFromRoot) or a system `zig` on PATH. Returns
+// ok=false when none exists.
+func detectZigCC() (cc, cxx string, ok bool) {
+	if cc, cxx, ok := zigCCFromRoot(zigRoot()); ok {
+		return cc, cxx, true
+	}
+	if p, err := exec.LookPath("zig"); err == nil {
+		if info, serr := os.Stat(p); serr == nil && !info.IsDir() { // #nosec G703 -- read-only stat on locally resolved compiler path
+			return p + " cc", p + " c++", true
+		}
+	}
+	return "", "", false
+}
+
 // siblingCompiler returns the sibling C++ compiler next to cc (e.g. gcc → g++,
 // clang → clang++), preserving a windows .exe suffix.
 func siblingCompiler(cc, base string) string {
@@ -207,7 +245,7 @@ func siblingCompiler(cc, base string) string {
 func compilerVersion(cc string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, cc, "--version").Output() // #nosec G204 -- 插件编译核心：探测随附/系统 C 编译器版本，cc 由 clangRoot/detectSystemGCC 解析得出，参数固定为 "--version"; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	out, err := exec.CommandContext(ctx, cc, "--version").Output() // #nosec G204 -- 插件编译核心：探测随附/系统 C 编译器版本，cc 由 zigRoot/detectSystemGCC 解析得出，参数固定为 "--version"; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 	if err != nil {
 		return ""
 	}
@@ -218,40 +256,44 @@ func compilerVersion(cc string) string {
 	return line
 }
 
-// clangRoot returns the per-OS private directory where the bundled Clang is
-// extracted (e.g. ~/.local/share/astrbot-go/clang). Overridable with
-// ASTRBOT_CLANG_BIN pointing directly at a clang executable.
-func clangRoot() string {
-	if p := os.Getenv("ASTRBOT_CLANG_BIN"); p != "" {
+// zigRoot returns the per-OS private directory where the bundled zig cc is
+// extracted (e.g. ~/.local/share/astrbot-go/zigcc). Overridable with
+// ASTRBOT_ZIGCC_BIN pointing directly at a zig executable.
+func zigRoot() string {
+	if p := os.Getenv("ASTRBOT_ZIGCC_BIN"); p != "" {
 		return p
 	}
-	return filepath.Join(toolchainUserStateDir(), "clang")
+	return filepath.Join(toolchainUserStateDir(), "zigcc")
 }
 
-// downloadAndSetupClang downloads the platform's prebuilt Clang and returns the
-// CC/CXX paths, installing it under the private user dir. It falls back to a
-// friendly error when the platform has no prebuilt archive (e.g. Termux).
+// downloadAndSetupZigCC downloads the platform's prebuilt zig cc and returns
+// the CC/CXX paths, installing it under the private user dir. It falls back to
+// a friendly error when the platform has no prebuilt archive (e.g. Termux).
 // Progress (bytes) and stage text are reported through options.Progress/Stage
-// so the WebUI can show a live download bar while Clang is being fetched.
-// clangLockFile is the name of the marker file written while a Clang download/
+// so the WebUI can show a live download bar while zig cc is being fetched.
+// zigCCLockFile is the name of the marker file written while a zig cc download/
 // extract is in progress. If it is present on a later run, the previous attempt
 // did not finish cleanly (crash / user cancel / kill), so the whole root dir is
-// discarded and re-downloaded instead of trusting a half-extracted Clang.
-const clangLockFile = ".install-lock"
+// discarded and re-downloaded instead of trusting a half-extracted zig cc.
+const zigCCLockFile = ".install-lock"
 
-func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx string, err error) {
-	// Bundled/system clang already present?
+func downloadAndSetupZigCC(ctx context.Context, options InstallOptions) (cc, cxx string, err error) {
+	// 已下载的 zig cc 已存在？直接用（不重新下载）。
+	root := zigRoot()
+	if cc, cxx, ok := zigCCFromRoot(root); ok {
+		return cc, cxx, nil
+	}
+	// 系统 Clang 已存在？直接用（无需下载 zig cc）。
 	if clang, cxx, ok := detectSystemClang(); ok {
 		return clang, cxx, nil
 	}
-	root := clangRoot()
 
-	// A previously downloaded Clang (zig) at the private root — but only trust
+	// A previously downloaded zig cc at the private root — but only trust
 	// it if no lock file is left behind from an interrupted install.
-	if _, err := os.Stat(filepath.Join(root, clangLockFile)); err == nil {
-		logger.I18nWarn("Clang 安装此前被中断，正在删除 %s 并重新下载", root)
+	if _, err := os.Stat(filepath.Join(root, zigCCLockFile)); err == nil {
+		logger.I18nWarn("zig cc 安装此前被中断，正在删除 %s 并重新下载", root)
 		if err := os.RemoveAll(root); err != nil {
-			return "", "", fmt.Errorf("清理未完成的 Clang 安装目录失败: %w", err)
+			return "", "", fmt.Errorf("清理未完成的 zig cc 安装目录失败: %w", err)
 		}
 	}
 	if cc, cxx, ok := zigCCFromRoot(root); ok {
@@ -265,7 +307,7 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 
 	// Download cache lives next to the toolchain (NOT the volatile tmp dir),
 	// so an interrupted download can be resumed via Range requests.
-	cacheDir := filepath.Join(toolchainUserStateDir(), "clang-download")
+	cacheDir := filepath.Join(toolchainUserStateDir(), "zigcc-download")
 	// #nosec G301 -- 工具链缓存目录（用户态）
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return "", "", err
@@ -280,11 +322,11 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 	if options.Stage != nil {
 		options.Stage("下载 C 编译器 (zig)…")
 	}
-	if err := downloadClangArchive(ctx, info.archive, archivePath, options.Progress); err != nil {
+	if err := downloadZigCCArchive(ctx, info.archive, archivePath, options.Progress); err != nil {
 		return "", "", err
 	}
 	if hadPartial {
-		logger.I18nInfo("Clang (zig) 压缩包 %s 已断点续传并完成", info.archive)
+		logger.I18nInfo("zig cc 压缩包 %s 已断点续传并完成", info.archive)
 	}
 
 	if options.Stage != nil {
@@ -296,12 +338,12 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 	}
 	// Mark the install as in progress: a leftover lock on a later run means the
 	// extract never finished, so it is discarded and retried from scratch.
-	lockPath := filepath.Join(root, clangLockFile)
+	lockPath := filepath.Join(root, zigCCLockFile)
 	// #nosec G306 -- 安装锁仅记录时间戳，无需收紧权限
 	if err := os.WriteFile(lockPath, []byte(time.Now().Format(time.RFC3339)), 0o644); err != nil {
-		return "", "", fmt.Errorf("创建 Clang 安装锁失败: %w", err)
+		return "", "", fmt.Errorf("创建 zig cc 安装锁失败: %w", err)
 	}
-	if err := extractClangArchive(ctx, archivePath, root, info.triple); err != nil {
+	if err := extractZigCCArchive(ctx, archivePath, root, info.triple); err != nil {
 		// 保留安装锁：取消/中断或解压错误时，下次运行会丢弃 root 重来，而不是
 		// 信任半成品 zig。归档本身损坏（非用户取消）时同时清除缓存文件，避免
 		// 损坏归档被"已缓存"逻辑长期信任导致 cgo 安装持续失败。
@@ -315,9 +357,9 @@ func downloadAndSetupClang(ctx context.Context, options InstallOptions) (cc, cxx
 		// 解压完成但布局不对（归档损坏/与平台不匹配）：同样保留锁并清除缓存，
 		// 避免下次继续信任这个无法使用的归档。
 		_ = os.Remove(archivePath)
-		return "", "", fmt.Errorf("解压后未找到 zig/clang 可执行文件")
+		return "", "", fmt.Errorf("解压后未找到 zig 可执行文件")
 	} else if err := os.Remove(lockPath); err != nil {
-		return "", "", fmt.Errorf("清理 Clang 安装锁失败: %w", err)
+		return "", "", fmt.Errorf("清理 zig cc 安装锁失败: %w", err)
 	} else {
 		return cc, cxx, nil
 	}
@@ -360,7 +402,7 @@ func zigArchiveInfoFor() (zigArchiveInfo, error) {
 }
 
 func zigVersion() string {
-	if v := os.Getenv("ASTRBOT_CLANG_VERSION"); v != "" {
+	if v := os.Getenv("ASTRBOT_ZIGCC_VERSION"); v != "" {
 		return v
 	}
 	return "0.16.0"
@@ -390,14 +432,14 @@ func zigUnsupportedHint() error {
 			"  pkg update && pkg install clang\n"+
 			"安装后即可自动检测到（或设置环境变量 ASTRBOT_CC=%s/bin/clang），然后重新安装插件。", prefix)
 	}
-	return fmt.Errorf("当前平台 %s/%s 没有可用的 C 编译器预编译包，请手动安装 Clang/GCC 后再安装插件",
+	return fmt.Errorf("当前平台 %s/%s 没有可用的 C 编译器预编译包，请手动安装 GCC/Clang 后再安装插件",
 		runtime.GOOS, runtime.GOARCH)
 }
 
 // zigArchiveSHA256 是默认 zig 版本（0.16.0）各平台归档的 sha256 校验值
 // （来源 https://ziglang.org/download/index.json），下载后校验再解压，防镜像
-// 被劫持时执行被篡改的编译器。自定义版本/镜像（ASTRBOT_CLANG_VERSION /
-// ASTRBOT_CLANG_MIRROR）的归档不在表内时跳过校验（best effort）。
+// 被劫持时执行被篡改的编译器。自定义版本/镜像（ASTRBOT_ZIGCC_VERSION /
+// ASTRBOT_ZIGCC_MIRROR）的归档不在表内时跳过校验（best effort）。
 var zigArchiveSHA256 = map[string]string{
 	"zig-x86_64-linux-0.16.0.tar.xz":  "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
 	"zig-aarch64-linux-0.16.0.tar.xz": "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
@@ -407,24 +449,24 @@ var zigArchiveSHA256 = map[string]string{
 	"zig-aarch64-windows-0.16.0.zip":  "aee38316ee4111717900f45dd3130145c39289e105541d737eb8c5ed653c78ef",
 }
 
-// downloadClangArchive downloads the Clang archive to dest, trying each mirror
+// downloadZigCCArchive downloads the zig cc archive to dest, trying each mirror
 // base in order and resuming an existing partial file via HTTP Range requests.
 // A 10-minute per-request timeout keeps a stalled mirror from hanging forever.
-func downloadClangArchive(ctx context.Context, archive, dest string, progress func(downloaded, total int64)) error {
+func downloadZigCCArchive(ctx context.Context, archive, dest string, progress func(downloaded, total int64)) error {
 	// Already fully cached? 缓存命中同样必须过 sha256（复用 pin 表）：仅 stat
 	// 大小会被预放的伪造归档绕过 pin 表，直接解压执行被篡改的编译器。
 	if info, err := os.Stat(dest); err == nil && !info.IsDir() && info.Size() > 0 {
 		if sum, ok := zigArchiveSHA256[archive]; ok {
 			if verr := verifySHA256(dest, sum); verr == nil {
-				logger.I18nInfo("Clang 压缩包已缓存且 sha256 校验通过: %s", dest)
+				logger.I18nInfo("zig cc 压缩包已缓存且 sha256 校验通过: %s", dest)
 				return nil
 			} else {
-				logger.I18nWarn("缓存的 Clang 归档 sha256 校验失败，删除后重新下载: %v", verr)
+				logger.I18nWarn("缓存的 zig cc 归档 sha256 校验失败，删除后重新下载: %v", verr)
 				_ = os.Remove(dest)
 			}
 		} else {
 			// 自定义版本/镜像不在 pin 表内（best effort）：保持原缓存行为。
-			logger.I18nInfo("Clang 压缩包已缓存: %s", dest)
+			logger.I18nInfo("zig cc 压缩包已缓存: %s", dest)
 			return nil
 		}
 	}
@@ -440,25 +482,25 @@ func downloadClangArchive(ctx context.Context, archive, dest string, progress fu
 		url := base + "/" + archive
 		if err := resumeDownload(ctx, client, url, dest, progress); err != nil {
 			lastErr = err
-			logger.I18nWarn("从 %s 下载 Clang 失败: %v", url, err)
+			logger.I18nWarn("从 %s 下载 zig cc 失败: %v", url, err)
 			continue
 		}
 		// 完整性校验：默认版本归档在表内，校验失败即删除并换下一个镜像。
 		if sum, ok := zigArchiveSHA256[archive]; ok {
 			if err := verifySHA256(dest, sum); err != nil {
-				lastErr = fmt.Errorf("Clang 归档 sha256 校验失败: %w", err)
+				lastErr = fmt.Errorf("zig cc 归档 sha256 校验失败: %w", err)
 				_ = os.Remove(dest)
-				logger.I18nWarn("从 %s 下载的 Clang 归档校验失败，已删除: %v", url, err)
+				logger.I18nWarn("从 %s 下载的 zig cc 归档校验失败，已删除: %v", url, err)
 				continue
 			}
 		}
-		logger.I18nInfo("Clang 压缩包已从 %s 下载", url)
+		logger.I18nInfo("zig cc 压缩包已从 %s 下载", url)
 		return nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no mirror base configured")
 	}
-	return fmt.Errorf("下载 Clang 失败：%w。可手动安装 Clang/GCC 或设置 ASTRBOT_CLANG_BIN", lastErr)
+	return fmt.Errorf("下载 zig cc 失败：%w。可手动安装 GCC/Clang 或设置 ASTRBOT_ZIGCC_BIN", lastErr)
 }
 
 // verifySHA256 校验文件的 sha256 与期望值一致（十六进制，大小写不敏感）。
@@ -573,9 +615,9 @@ func resumeDownload(ctx context.Context, client *http.Client, url, dest string, 
 }
 
 // zigMirrorBases returns the ordered list of download bases tried for the zig
-// archive. A user override via ASTRBOT_CLANG_MIRROR replaces the whole list.
+// archive. A user override via ASTRBOT_ZIGCC_MIRROR replaces the whole list.
 func zigMirrorBases() []string {
-	if p := os.Getenv("ASTRBOT_CLANG_MIRROR"); p != "" {
+	if p := os.Getenv("ASTRBOT_ZIGCC_MIRROR"); p != "" {
 		return []string{strings.TrimRight(p, "/")}
 	}
 	return []string{
@@ -583,13 +625,13 @@ func zigMirrorBases() []string {
 	}
 }
 
-// extractClangArchive unpacks the downloaded zig archive into root, promoting
+// extractZigCCArchive unpacks the downloaded zig archive into root, promoting
 // the single top-level directory so the zig binary lands at root/zig. It uses
 // mholt/archives for format identification + extraction (pure Go, cross
 // platform: zip / tar.xz / tar.gz all handled uniformly). It checks ctx
 // cancellation between members so an aborted install leaves the lock file
 // behind (the next run discards root and retries).
-func extractClangArchive(ctx context.Context, archive, root, triple string) error {
+func extractZigCCArchive(ctx context.Context, archive, root, triple string) error {
 	f, err := os.Open(archive) // #nosec G304 -- 已下载的工具链归档路径
 	if err != nil {
 		return err

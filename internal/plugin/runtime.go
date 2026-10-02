@@ -84,8 +84,13 @@ type PluginInstance struct {
 	Language string
 	// Runtime is the plugin execution mode: ""/"grpc" = isolated subprocess
 	// (go-plugin + gRPC, default), "native" = in-process .so/.dll loaded via
-	// the Native runtime (no process isolation).
+	// the Native runtime (no process isolation), "python-shared" = loads into a
+	// shared multi-tenant Python Runtime (one process hosts N plugins).
 	Runtime string
+	// shared 标记本实例运行在共享 Runtime（python-shared）中：其 Client 是
+	// Runtime 级共享连接上的 per-plugin 视图，raw 为 nil——teardown 只经
+	// ManagePlugin 卸载单插件，绝不 kill 共享进程。
+	shared bool
 	// nativeTarget 是 Native 插件发布的本机回环 gRPC target；禁用后重新启用
 	// 时用于 reconnect（Go plugin 不可二次 Open，插件服务进程内常驻）。
 	nativeTarget string
@@ -125,6 +130,16 @@ type PluginInstance struct {
 
 	// owner is the owning SubprocessManager; written back after RefreshTools succeeds for the tool registry.
 	owner *SubprocessManager
+
+	// statusMu guards the Python status mirror (板块 5): Python 是 Python 插件
+	// 生命周期/健康状态的权威来源，Go 只做镜像（HealthCheck RPC 拉取）。
+	statusMu       sync.RWMutex
+	pyState        string  // PluginStatus.state（ACTIVE/IDLE/SLEEPING/...）
+	pyHealth       string  // PluginStatus.health（NORMAL/DEGRADED/UNHEALTHY/...）
+	pyError        string  // PluginStatus.error
+	pyLastActivity float64 // PluginStatus.last_activity（Unix 秒）
+	pyGeneration   int64   // PluginStatus.generation
+	pyStatusSeen   bool    // 是否已成功拉到过状态（区分空镜像）
 }
 
 // SubprocessManager manages plugins running as isolated child processes (go-plugin + gRPC); replaces the legacy .so loader (removed). Unlike in-process .so plugins, child processes can be fully terminated so memory + handles are reclaimed by the OS and a crash can't take the host down; crashed plugins restart with backoff.
@@ -174,6 +189,8 @@ type SubprocessManager struct {
 
 	// pythonEnv is the resolved Python subprocess env (interpreter + SDK dir); lazily set on first Python plugin start (may create venv + install deps). nil = not yet resolved.
 	pythonEnv *pysdk.RuntimeEnv
+	// sharedRTMgr 管理 python-shared 共享 Runtime 进程（单进程承载 N 插件）；懒初始化。nil = 尚未使用共享模式。
+	sharedRTMgr *PythonRuntimeManager
 	// pythonEnvMu only guards pythonEnv (not the full manager lock) because provisioning can take minutes; holding m.mu then would block Get/List/Load/Unload/idle-sweep/restart during first Python plugin boot.
 	pythonEnvMu sync.Mutex
 
@@ -194,6 +211,12 @@ type SubprocessManager struct {
 	// idleUnload is the idle auto-unload threshold (0 = disabled); plugins idle past it are auto-unloaded (OS reclaims memory) and lazily re-loaded on next trigger — a process-pool for embedded/low-memory hosts.
 	idleUnload   time.Duration
 	scanInterval time.Duration // idle sweep interval (default 1m; tests may inject)
+	// defaultIdleMinutes 是「开启休眠但未设独立阈值」时回填的默认分钟数
+	//（config plugin_unload_timeout_minutes；0 = 用 DefaultIdleUnloadMinutes）。
+	// defaultIdleTimeoutMinutes 是 ACTIVE→IDLE 的观察阈值（config
+	// plugin_idle_timeout_minutes，0 = 不单独观察，直接按卸载阈值）。
+	defaultIdleMinutes        int
+	defaultIdleTimeoutMinutes int
 
 	// hostCapabilities is the host-advertised capability set injected via ASTRBOT_HOST_CAPABILITIES into Python subprocesses (platform adapter ids + fixed caps llm/send_message/react/t2i/config/web); queried by plugin-side HostBridge.has().
 	hostCapabilities []string
@@ -247,7 +270,7 @@ func (inst *PluginInstance) RefreshTools(ctx context.Context) {
 		return
 	}
 	rpcCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	tools, err := inst.Client.ListTools(rpcCtx)
+	tools, err := inst.Client.ListTools(rpcCtx, &sdkv1.PluginRef{PluginId: inst.ID})
 	cancel()
 	if err != nil {
 		logger.I18nWarn("插件 %s ListTools 失败: %v", inst.ID, err)
@@ -280,6 +303,91 @@ func (inst *PluginInstance) ToolsSnapshot() []*sdkv1.ToolDesc {
 		return inst.Meta.Tools
 	}
 	return nil
+}
+
+// RefreshStatus 通过 HealthCheck RPC 拉取插件上报的状态（板块 5），写入
+// Python 状态镜像。Python 是状态的权威来源，Go 只做镜像。resp.Plugins 中
+// 按 plugin_id 匹配本实例（单插件进程 plugins 含自身；共享 Runtime 汇总）。
+// 失败静默（镜像保持上次值），不阻断调用方。
+func (inst *PluginInstance) RefreshStatus(ctx context.Context) {
+	if inst.Client == nil {
+		return
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	resp, err := inst.Client.HealthCheck(rpcCtx)
+	cancel()
+	if err != nil {
+		logger.I18nWarn("插件 %s HealthCheck 失败: %v", inst.ID, err)
+		return
+	}
+	var matched *sdkv1.PluginStatus
+	for _, ps := range resp.GetPlugins() {
+		// 单插件进程可能不带 plugin_id（空），此时视为自身。
+		if ps.GetPluginId() == inst.ID || ps.GetPluginId() == "" {
+			matched = ps
+			break
+		}
+	}
+	if matched == nil {
+		return
+	}
+	inst.statusMu.Lock()
+	inst.pyState = matched.GetState()
+	inst.pyHealth = matched.GetHealth()
+	inst.pyError = matched.GetError()
+	inst.pyLastActivity = matched.GetLastActivity()
+	inst.pyGeneration = matched.GetGeneration()
+	inst.pyStatusSeen = true
+	health := inst.pyHealth
+	errStr := inst.pyError
+	inst.statusMu.Unlock()
+
+	// Runtime 心跳观察（方案第 6 节）：连接存活但心跳停滞 = Runtime 疑似 hang。
+	// 只告警不擅自重启（避免误判；进程真实退出由 watchSharedRuntime 处理）。
+	if inst.shared {
+		if hb := resp.GetRuntimeHeartbeat(); hb > 0 {
+			if lag := time.Since(time.Unix(int64(hb), 0)); lag > 90*time.Second {
+				logger.I18nWarn("共享 Runtime 心跳停滞 %v（疑似卡死，连接仍存活）", lag.Round(time.Second))
+			}
+		}
+	}
+
+	// 板块 6：Python Watchdog 上报 UNHEALTHY → Go Runtime Manager 立即持久化
+	// ISOLATION_PENDING（不能等迁移完成再写——Runtime 随后崩溃会丢失该状态）。
+	if health == HealthUnhealthy && inst.owner != nil {
+		if err := inst.owner.MarkIsolationPending(inst.ID, errStr); err != nil {
+			logger.I18nWarn("插件 %s 持久化隔离状态失败: %v", inst.ID, err)
+		} else {
+			logger.I18nWarn("插件 %s 上报 UNHEALTHY，已标记 ISOLATION_PENDING", inst.ID)
+			// 方案第 4 节：Go Runtime Manager 收到 UNHEALTHY → 迁移到独立
+			// python-grpc 进程（复用既有进程隔离，不另建 Worker）。仅对当前
+			// 运行在共享 Runtime 的插件执行；迁移后 current=python-grpc、
+			// state=ISOLATED。异步执行避免阻塞状态拉取循环。
+			if inst.shared {
+				go inst.owner.migrateToIsolated(inst.ID)
+			}
+		}
+		return
+	}
+	// 恢复（方案第 7 节「去隔离」+ 观察窗口）：曾隔离/待恢复、且当前实际运行
+	// 在独立 python-grpc 且持续 NORMAL 达观察窗口的插件，清除隔离标记并迁回
+	// 共享 Runtime。用实例启动时间 + 连续 NORMAL 观察避免「启动即 NORMAL」
+	// 的假恢复（插件可能启动 5 秒后又崩）。
+	if inst.owner != nil && inst.Runtime == "python-grpc" && !inst.shared && health == HealthNormal {
+		if _, _, pending := inst.owner.PluginHealthStateOf(inst.ID); pending {
+			if time.Since(inst.StartedAt) >= isolationRecoveryWindow {
+				go inst.owner.migrateBackToShared(inst.ID)
+			}
+		}
+	}
+}
+
+// StatusMirror 返回状态镜像快照（python_state/python_health/last_activity/
+// generation/error），供 ListInfo 展示。seen=false 表示尚未拉到过状态。
+func (inst *PluginInstance) StatusMirror() (state, health, errStr string, lastActivity float64, generation int64, seen bool) {
+	inst.statusMu.RLock()
+	defer inst.statusMu.RUnlock()
+	return inst.pyState, inst.pyHealth, inst.pyError, inst.pyLastActivity, inst.pyGeneration, inst.pyStatusSeen
 }
 
 // docFetchCacheTTL 是远程文档拉取结果（含负面）的缓存时长。
@@ -564,7 +672,7 @@ type InstallOptions struct {
 	// Progress receives toolchain download progress (bytes) during the first plugin build, when the bundled Go has to be downloaded (~150-200MB).
 	Progress func(downloaded, total int64)
 
-	// Stage receives human-readable phase changes during install (e.g. "下载 C 编译器 (Clang)…" / "下载 Go 工具链…" / "编译插件…") so the WebUI can show what the install is doing while progress bytes are 0.
+	// Stage receives human-readable phase changes during install (e.g. "下载 C 编译器 (zig)…" / "下载 Go 工具链…" / "编译插件…") so the WebUI can show what the install is doing while progress bytes are 0.
 	Stage func(text string)
 
 	// Install source metadata persisted into the manifest so the WebUI can offer reinstall / change-source. installMethod is one of "market", "repository", "url" or "upload"; registryURL/marketPluginID describe a marketplace binding, repo/downloadURL the actual fetch targets.
@@ -575,7 +683,7 @@ type InstallOptions struct {
 	Repo           string
 	DownloadURL    string
 
-	// CCChoice carries the user's answer to a cgo C-compiler prompt (one of "gcc" / "clang" / "download" / "cancel"). It is only meaningful when the plugin declares cgo and the host needs to pick a compiler; empty means no decision has been made yet (→ a CCompilerPromptError is returned).
+	// CCChoice carries the user's answer to a cgo C-compiler prompt (one of "gcc" / "clang" / "zig_cc" / "cancel"). It is only meaningful when the plugin declares cgo and the host needs to pick a compiler; empty means no decision has been made yet (→ a CCompilerPromptError is returned).
 	CCChoice string
 
 	// Native 请求以 Native 运行方式安装（进程内 .so/.dll），而非默认的
@@ -1096,6 +1204,15 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		metaPages = meta.Pages
 		metaLogoPath = meta.LogoPath
 	}
+	// 板块 6：更新检测——旧条目版本与本次不同（或曾标记隔离）时，新条目进入
+	// RECOVERY_PENDING，不继承旧故障状态（v1.3.0 不应继续沿用 v1.2.0 的
+	// ISOLATED）；下次加载先尝试 python-shared，观察窗口内正常 → NORMAL。
+	prev := man.Get(inst.ID)
+	newHealth := ""
+	if prev != nil && prev.Version != inst.Version &&
+		(prev.IsolationRequired || prev.HealthState != "") {
+		newHealth = HealthRecoveryPending
+	}
 	man.Upsert(ManifestEntry{
 		ID:               inst.ID,
 		Name:             inst.Name,
@@ -1119,6 +1236,8 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		I18n:             metaI18n,
 		Pages:            metaPages,
 		LogoPath:         metaLogoPath,
+		// 更新后进入 RECOVERY_PENDING（其余情况空，表示新装/NORMAL）。
+		HealthState: newHealth,
 		// 新装插件默认常驻（不开启休眠），独立分钟数 0 = 未设置；「关闭→开启」翻转时由后端落 DefaultIdleUnloadMinutes。
 		IdleUnload:        false,
 		IdleUnloadMinutes: 0,
@@ -1395,6 +1514,34 @@ func (m *SubprocessManager) Get(id string) *PluginInstance {
 	return m.instances[id]
 }
 
+// SetIdleTimeouts 注入全局休眠/卸载默认阈值（config
+// plugin_idle_timeout_minutes / plugin_unload_timeout_minutes）。
+// unloadMinutes 作为「开启休眠但未设独立阈值」时的默认值；idleMinutes 作为
+// ACTIVE→IDLE 的观察阈值（0 = 不单独观察）。均 0 时回退既有行为。
+func (m *SubprocessManager) SetIdleTimeouts(idleMinutes, unloadMinutes int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if idleMinutes < 0 {
+		idleMinutes = 0
+	}
+	if unloadMinutes < 0 {
+		unloadMinutes = 0
+	}
+	m.defaultIdleTimeoutMinutes = idleMinutes
+	m.defaultIdleMinutes = unloadMinutes
+}
+
+// defaultIdleUnloadMinutes 返回「开启休眠」时回填的默认卸载分钟数：
+// config 配置优先，未配置回退 DefaultIdleUnloadMinutes。
+func (m *SubprocessManager) defaultIdleUnloadMinutes() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.defaultIdleMinutes > 0 {
+		return m.defaultIdleMinutes
+	}
+	return DefaultIdleUnloadMinutes
+}
+
 // SetIdleUnload enables the idle-unload sweep: plugin processes with no RPC activity for longer than idle are unloaded so the OS reclaims their memory (lazy reload happens on the next triggered call via EnsureLoaded). idle <= 0 disables the sweep. Cross-platform: works with any plugin process (Go binary / Python interpreter) since it only manages process lifecycles.
 func (m *SubprocessManager) SetIdleUnload(idle time.Duration) {
 	// 休眠为单插件独立控制：全局阈值仅作兼容性保留字段（IdleUnloadEnabled/ IdleUnloadMinutes 报告），不再驱动清扫。清扫循环自 NewSubprocessManager 常驻运行（见 idleSweepLoop），此处不重复启动。
@@ -1439,7 +1586,7 @@ func (m *SubprocessManager) SetPluginIdleUnload(id string, allow bool) error {
 	e.IdleUnload = allow
 	// 仅「关闭→开启」翻转且从未设阈值时落默认值：否则清扫按 minutes<=0 视为常驻（开了但永不休眠）；已是开启态则尊重用户显式设的 0（常驻）。
 	if allow && !wasAllow && e.IdleUnloadMinutes <= 0 {
-		e.IdleUnloadMinutes = DefaultIdleUnloadMinutes
+		e.IdleUnloadMinutes = m.defaultIdleUnloadMinutes()
 	}
 	if err := m.saveManifest(man); err != nil {
 		return err
@@ -1543,8 +1690,29 @@ func (m *SubprocessManager) idleSweepLoop() {
 		case <-ticker.C:
 			// 休眠为单插件独立控制：无全局开关，循环常驻运行，仅对 开启休眠且配置有效独立分钟数的插件执行清扫。
 			m.sweepIdlePlugins()
+			// 板块 5：同一周期拉取各插件的 Python 状态镜像（HealthCheck RPC），
+			// 保持 Go 侧镜像与 Python 权威状态一致。
+			m.refreshAllStatus()
 		}
 	}
+}
+
+// refreshAllStatus 周期性拉取所有已加载实例的 Python 状态镜像（板块 5）。
+func (m *SubprocessManager) refreshAllStatus() {
+	m.mu.RLock()
+	insts := make([]*PluginInstance, 0, len(m.instances))
+	for _, inst := range m.instances {
+		insts = append(insts, inst)
+	}
+	m.mu.RUnlock()
+	for _, inst := range insts {
+		inst.RefreshStatus(m.ctx)
+	}
+}
+
+// RefreshStatusNow 立即拉取一次全部实例的状态镜像（供 WebUI 触发/测试）。
+func (m *SubprocessManager) RefreshStatusNow() {
+	m.refreshAllStatus()
 }
 
 // SweepIdle immediately runs the idle-unload sweep once (also invoked by the background loop). Exported for tests and dashboard-triggered sweeps.
@@ -1899,6 +2067,12 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 
 	// Python 插件：python3 -m astrbot._bridge.server <源码目录>
 	if language == "python" {
+		// 运行方式分流（方案第 2 节）：manifest 标记 python-shared 的插件接入
+		// 共享 Runtime（单进程多租户）；python-grpc / python-isolated 走既有
+		// 一插件一进程路径（isoalted 复用 grpc 进程边界）。
+		if m.pluginWantsSharedRuntime(id) {
+			return m.startSharedInstance(ctx, id, abs)
+		}
 		env, err := m.pythonRuntime()
 		if err != nil {
 			return nil, fmt.Errorf("python runtime: %w", err)
@@ -2148,7 +2322,10 @@ func pythonEnvUsable(env *pysdk.RuntimeEnv) bool {
 }
 
 // dispensePlugin runs the go-plugin handshake against a prepared command. stderrParser is non-nil for Python plugins: their stderr lines are routed through the [ASTRBOT] protocol parser and phase-aware startup errors.
-func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, language string, cmd *exec.Cmd, stderrParser *astrbotStartupParser) (*PluginInstance, error) {
+// dispenseHandshake 完成 go-plugin 握手并返回 (raw, pc, pid, minp)。单插件
+// （python-grpc）与共享 Runtime（python-shared）两条路径共用：前者随后
+// Register + 构建 PluginInstance；后者作为共享进程句柄。
+func (m *SubprocessManager) dispenseHandshake(ctx context.Context, id, abs, language string, cmd *exec.Cmd, stderrParser *astrbotStartupParser) (*goplugin.Client, *pluginsdk.Client, int, uint, error) {
 	// 进程组隔离（Linux 附加 Pdeathsig）：宿主死亡/退出时内核自动回收插件， teardown 时按组杀整棵进程树（见 process_*.go）。
 	setupChildProcess(cmd)
 	cfg := &goplugin.ClientConfig{
@@ -2176,7 +2353,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		minp, maxp = m.allocPortRangeDefault()
 	}
 	if minp == 0 {
-		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: 无可分配握手端口", id))
+		return nil, nil, 0, 0, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: 无可分配握手端口", id))
 	}
 	cfg.MinPort, cfg.MaxPort = minp, maxp
 	raw := goplugin.NewClient(cfg)
@@ -2230,7 +2407,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 			// 握手失败时直接子进程可能已退出（killProcessGroup 对 ESRCH 视为 完成），但 Python 桥可能已拉起子进程：按组回收兜底。
 			killProcessGroup(&PluginInstance{pgid: res.pid})
 			waitExeHandleReleased(abs)
-			return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: %w", id, res.err))
+			return nil, nil, 0, 0, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: %w", id, res.err))
 		}
 		pc = res.pc
 		pid = res.pid
@@ -2244,7 +2421,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 			_ = res.pc.Close()
 		}
 		waitExeHandleReleased(abs)
-		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: handshake timed out after %v", id, startTimeout))
+		return nil, nil, 0, 0, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: handshake timed out after %v", id, startTimeout))
 	case <-m.ctx.Done():
 		raw.Kill()
 		releasePluginPort(minp)
@@ -2254,7 +2431,15 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 			_ = res.pc.Close()
 		}
 		waitExeHandleReleased(abs)
-		return nil, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: manager shutting down", id))
+		return nil, nil, 0, 0, m.wrapStartError(stderrParser, fmt.Errorf("start plugin %s: manager shutting down", id))
+	}
+	return raw, pc, pid, minp, nil
+}
+
+func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, language string, cmd *exec.Cmd, stderrParser *astrbotStartupParser) (*PluginInstance, error) {
+	raw, pc, pid, minp, err := m.dispenseHandshake(ctx, id, abs, language, cmd, stderrParser)
+	if err != nil {
+		return nil, err
 	}
 
 	regCtx, cancel := context.WithTimeout(ctx, registerTimeout)
@@ -2861,10 +3046,17 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	if inst.Runtime == "native" {
 		if inst.Client != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-			_ = inst.Client.Cleanup(ctx)
+			_ = inst.Client.Cleanup(ctx, &sdkv1.PluginRef{PluginId: inst.ID})
 			cancel()
 			_ = inst.Client.Close()
 		}
+		return
+	}
+	// 共享 Runtime（python-shared）：只经 ManagePlugin 卸载单插件，不 close
+	// 共享连接、不 kill 共享进程（方案第 8 节）。Client 是共享连接视图
+	// （ownsConn=false），Close 本身也不会关闭底层连接。
+	if inst.shared {
+		m.sharedInstanceTeardown(inst)
 		return
 	}
 	if inst.raw == nil {
@@ -2873,7 +3065,7 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	if !inst.raw.Exited() {
 		if inst.Client != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-			_ = inst.Client.Cleanup(ctx)
+			_ = inst.Client.Cleanup(ctx, &sdkv1.PluginRef{PluginId: inst.ID})
 			cancel()
 		}
 	}

@@ -182,23 +182,34 @@ func TestResolveLanguage(t *testing.T) {
 }
 
 // TestEnsureCCompilerPromptsWithoutChoice exercises the detection flow: with no
-// user choice and a fresh environment the function must return a
-// CCompilerPromptError (either choose_compiler when GCC is present, or
-// download_clang when not) instead of silently succeeding.
+// user choice, a system zig cc is used directly; otherwise the function must
+// return a CCompilerPromptError (choose_gcc / choose_clang / download_zig_cc)
+// so the caller can ask the user instead of silently succeeding.
 func TestEnsureCCompilerPromptsWithoutChoice(t *testing.T) {
-	_, _, err := ensureCCompiler(context.Background(), InstallOptions{GoChoice: "download"})
+	cc, cxx, err := ensureCCompiler(context.Background(), InstallOptions{GoChoice: "download"})
+	if err == nil {
+		// zig cc (bundled or on PATH) was detected and used directly.
+		if cc == "" || cxx == "" {
+			t.Fatalf("zig cc detected but empty CC/CXX: %q / %q", cc, cxx)
+		}
+		return
+	}
 	var promptErr *CCompilerPromptError
 	if !errors.As(err, &promptErr) {
 		t.Fatalf("expected *CCompilerPromptError, got %T: %v", err, err)
 	}
 	switch promptErr.Kind {
-	case PromptChooseCompiler:
+	case PromptChooseGCC:
 		if !promptErr.HasGCC || promptErr.GCCPath == "" {
-			t.Errorf("choose_compiler prompt missing GCC info: %+v", promptErr)
+			t.Errorf("choose_gcc prompt missing GCC info: %+v", promptErr)
 		}
-	case PromptDownloadClang:
-		if promptErr.HasGCC {
-			t.Errorf("download_clang prompt should not report GCC: %+v", promptErr)
+	case PromptChooseClang:
+		if !promptErr.HasClang || promptErr.ClangPath == "" {
+			t.Errorf("choose_clang prompt missing Clang info: %+v", promptErr)
+		}
+	case PromptDownloadZigCC:
+		if promptErr.HasGCC || promptErr.HasClang {
+			t.Errorf("download_zig_cc prompt should not report a compiler: %+v", promptErr)
 		}
 	default:
 		t.Fatalf("unexpected prompt kind: %s", promptErr.Kind)
@@ -331,9 +342,9 @@ func main() { sdk.Serve(&sdk.Plugin{Name: "cgoplugin"}) }
 	}
 }
 
-// TestExtractClangArchiveSinglePass verifies the flat extraction strips the
+// TestExtractZigCCArchiveSinglePass verifies the flat extraction strips the
 // top-level triple/ prefix and writes straight to root (no temp-dir copy).
-func TestExtractClangArchiveSinglePass(t *testing.T) {
+func TestExtractZigCCArchiveSinglePass(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "zig.zip")
 	root := filepath.Join(dir, "out")
@@ -363,8 +374,8 @@ func TestExtractClangArchiveSinglePass(t *testing.T) {
 	}
 	_ = zf.Close()
 
-	if err := extractClangArchive(context.Background(), src, root, "triple"); err != nil {
-		t.Fatalf("extractClangArchive: %v", err)
+	if err := extractZigCCArchive(context.Background(), src, root, "triple"); err != nil {
+		t.Fatalf("extractZigCCArchive: %v", err)
 	}
 	for _, want := range []string{"bin/zig", "bin/zig2", "lib/libfoo.so"} {
 		if _, err := os.Stat(filepath.Join(root, want)); err != nil {
@@ -376,8 +387,8 @@ func TestExtractClangArchiveSinglePass(t *testing.T) {
 	}
 }
 
-// TestExtractClangArchiveTarXz verifies .tar.xz extraction via mholt/archives.
-func TestExtractClangArchiveTarXz(t *testing.T) {
+// TestExtractZigCCArchiveTarXz verifies .tar.xz extraction via mholt/archives.
+func TestExtractZigCCArchiveTarXz(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "zig.tar.xz")
 	root := filepath.Join(dir, "out")
@@ -414,8 +425,8 @@ func TestExtractClangArchiveTarXz(t *testing.T) {
 	if out, err := exec.Command("xz", "-k", tarPath).CombinedOutput(); err != nil {
 		t.Skipf("xz not available, skipping: %v %s", err, out)
 	}
-	if err := extractClangArchive(context.Background(), src, root, "triple"); err != nil {
-		t.Fatalf("extractClangArchive tar.xz: %v", err)
+	if err := extractZigCCArchive(context.Background(), src, root, "triple"); err != nil {
+		t.Fatalf("extractZigCCArchive tar.xz: %v", err)
 	}
 	for _, want := range []string{"bin/zig", "lib/libfoo.so"} {
 		if _, err := os.Stat(filepath.Join(root, want)); err != nil {
@@ -424,21 +435,21 @@ func TestExtractClangArchiveTarXz(t *testing.T) {
 	}
 }
 
-// TestClangLockFileDiscardsInterruptedInstall verifies that a leftover// .install-lock makes downloadAndSetupClang discard the cached root and
-// re-download instead of trusting a half-extracted Clang. It serves a fake zig
+// TestZigCCLockFileDiscardsInterruptedInstall verifies that a leftover// .install-lock makes downloadAndSetupZigCC discard the cached root and
+// re-download instead of trusting a half-extracted zig cc. It serves a fake zig
 // archive from a local httptest server so the test needs no network.
-func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
+func TestZigCCLockFileDiscardsInterruptedInstall(t *testing.T) {
 	if _, _, ok := detectSystemClang(); ok {
 		t.Skip("system clang present; download path not exercised")
 	}
-	old := os.Getenv("ASTRBOT_CLANG_BIN")
-	oldMirror := os.Getenv("ASTRBOT_CLANG_MIRROR")
+	old := os.Getenv("ASTRBOT_ZIGCC_BIN")
+	oldMirror := os.Getenv("ASTRBOT_ZIGCC_MIRROR")
 	t.Cleanup(func() {
-		_ = os.Setenv("ASTRBOT_CLANG_BIN", old)
-		_ = os.Setenv("ASTRBOT_CLANG_MIRROR", oldMirror)
+		_ = os.Setenv("ASTRBOT_ZIGCC_BIN", old)
+		_ = os.Setenv("ASTRBOT_ZIGCC_MIRROR", oldMirror)
 	})
 	root := t.TempDir()
-	if err := os.Setenv("ASTRBOT_CLANG_BIN", root); err != nil {
+	if err := os.Setenv("ASTRBOT_ZIGCC_BIN", root); err != nil {
 		t.Fatal(err)
 	}
 
@@ -452,7 +463,7 @@ func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
 		_, _ = w.Write(fakeZip.Bytes())
 	}))
 	defer srv.Close()
-	if err := os.Setenv("ASTRBOT_CLANG_MIRROR", srv.URL); err != nil {
+	if err := os.Setenv("ASTRBOT_ZIGCC_MIRROR", srv.URL); err != nil {
 		t.Fatal(err)
 	}
 
@@ -462,16 +473,16 @@ func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
 	if err := os.WriteFile(staleZig, []byte("stale-binary"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	lock := filepath.Join(root, clangLockFile)
+	lock := filepath.Join(root, zigCCLockFile)
 	if err := os.WriteFile(lock, []byte("2026-01-01T00:00:00Z"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	// The stale root (with its lock) must be discarded before download starts,
 	// then a fresh zig is downloaded and installed.
-	cc, cxx, err := downloadAndSetupClang(context.Background(), InstallOptions{GoChoice: "download"})
+	cc, cxx, err := downloadAndSetupZigCC(context.Background(), InstallOptions{GoChoice: "download"})
 	if err != nil {
-		t.Fatalf("downloadAndSetupClang: %v", err)
+		t.Fatalf("downloadAndSetupZigCC: %v", err)
 	}
 	if _, serr := os.Stat(lock); !os.IsNotExist(serr) {
 		t.Errorf("lock file should have been removed after a clean install")
@@ -484,12 +495,12 @@ func TestClangLockFileDiscardsInterruptedInstall(t *testing.T) {
 	}
 }
 
-// TestClangExtractFailureKeepsLockAndClearsCache verifies that when the
-// downloaded Clang archive fails to extract (i.e. it is corrupt), the install
+// TestZigCCExtractFailureKeepsLockAndClearsCache verifies that when the
+// downloaded zig cc archive fails to extract (i.e. it is corrupt), the install
 // lock is PRESERVED so the next run discards the half-extracted root, and the
 // corrupt archive cache file is removed so it is not trusted forever (which
 // would otherwise make cgo installs fail indefinitely).
-func TestClangExtractFailureKeepsLockAndClearsCache(t *testing.T) {
+func TestZigCCExtractFailureKeepsLockAndClearsCache(t *testing.T) {
 	if _, _, ok := detectSystemClang(); ok {
 		t.Skip("system clang present; download path not exercised")
 	}
@@ -498,14 +509,14 @@ func TestClangExtractFailureKeepsLockAndClearsCache(t *testing.T) {
 		t.Skipf("no zig archive for this platform: %v", err)
 	}
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("ASTRBOT_CLANG_BIN", t.TempDir())
+	t.Setenv("ASTRBOT_ZIGCC_BIN", t.TempDir())
 	// Serve a non-archive body so download succeeds but extraction fails.
 	mockBody := []byte("this is definitely not a zip or tar archive")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(mockBody)
 	}))
 	defer srv.Close()
-	t.Setenv("ASTRBOT_CLANG_MIRROR", srv.URL)
+	t.Setenv("ASTRBOT_ZIGCC_MIRROR", srv.URL)
 
 	// zigArchiveSHA256 引入后，默认版本归档会先做 sha256 校验：mock 的非归档
 	// 内容与官方 pin 值不符会被判"校验失败"而走不到 extract 路径。测试同包
@@ -522,17 +533,17 @@ func TestClangExtractFailureKeepsLockAndClearsCache(t *testing.T) {
 		}
 	})
 
-	_, _, err = downloadAndSetupClang(context.Background(), InstallOptions{GoChoice: "download"})
+	_, _, err = downloadAndSetupZigCC(context.Background(), InstallOptions{GoChoice: "download"})
 	if err == nil {
 		t.Fatal("expected extract failure for a corrupt archive")
 	}
 
-	root := clangRoot()
-	lock := filepath.Join(root, clangLockFile)
+	root := zigRoot()
+	lock := filepath.Join(root, zigCCLockFile)
 	if _, serr := os.Stat(lock); os.IsNotExist(serr) {
 		t.Error("install lock must be preserved on extract failure so the next run discards the root")
 	}
-	cacheFile := filepath.Join(toolchainUserStateDir(), "clang-download", info.archive)
+	cacheFile := filepath.Join(toolchainUserStateDir(), "zigcc-download", info.archive)
 	if _, serr := os.Stat(cacheFile); !os.IsNotExist(serr) {
 		t.Errorf("corrupt archive cache %s should have been removed, stat err=%v", cacheFile, serr)
 	}
@@ -570,8 +581,8 @@ func TestExtractAbortsOnCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := extractClangArchive(ctx, src, root, "triple"); err == nil {
-		t.Fatal("expected cancellation error from extractClangArchive")
+	if err := extractZigCCArchive(ctx, src, root, "triple"); err == nil {
+		t.Fatal("expected cancellation error from extractZigCCArchive")
 	}
 }
 

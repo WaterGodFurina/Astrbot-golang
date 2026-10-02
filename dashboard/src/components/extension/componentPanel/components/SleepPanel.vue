@@ -45,6 +45,14 @@ const wakeModeItems = computed(() => [
   { value: WAKE_COMMAND_ONLY, title: tm("sleep.wakeCommandOnly") },
 ]);
 
+// Python 运行方式选项：python-grpc（一插件一进程，默认）/ python-shared
+// （共享 Runtime 多插件）/ python-isolated（高风险插件进程隔离）。
+const pythonRuntimeItems = computed(() => [
+  { value: PY_RUNTIME_GRPC, title: tm("sleep.runtimePythonGrpc") },
+  { value: PY_RUNTIME_SHARED, title: tm("sleep.runtimePythonShared") },
+  { value: PY_RUNTIME_ISOLATED, title: tm("sleep.runtimePythonIsolated") },
+]);
+
 // 插件语言从 id 后缀（_go/_python）推断，优先用后端 language 字段。
 const languageOf = (p: Record<string, unknown>) => {
   const lang = String(p.language || "").toLowerCase();
@@ -54,6 +62,20 @@ const languageOf = (p: Record<string, unknown>) => {
   if (/_python$/i.test(id)) return "python";
   if (/_go$/i.test(id)) return "golang";
   return "";
+};
+
+// 运行方式归一化：Go 为 grpc/native；Python 为 python-grpc（默认回退）/
+// python-shared（共享 Runtime）/python-isolated（进程隔离）。
+const PY_RUNTIME_GRPC = "python-grpc";
+const PY_RUNTIME_SHARED = "python-shared";
+const PY_RUNTIME_ISOLATED = "python-isolated";
+const normalizeRuntime = (raw: string, lang: string) => {
+  const v = raw.toLowerCase();
+  if (lang === "python") {
+    if (v === PY_RUNTIME_SHARED || v === PY_RUNTIME_ISOLATED) return v;
+    return PY_RUNTIME_GRPC;
+  }
+  return v === "native" ? "native" : "grpc";
 };
 
 const loading = ref(false);
@@ -91,7 +113,7 @@ const fetchData = async () => {
           hasHook: Boolean(p.has_hook),
           activeEventListener: Boolean(p.active_event_listener),
           version: String(p.version || ""),
-          runtime: String(p.runtime || "grpc") === "native" ? "native" : "grpc",
+          runtime: normalizeRuntime(String(p.runtime || ""), languageOf(p)),
           nativeConfirmed: Boolean(p.native_confirmed),
         }));
     }
@@ -182,6 +204,7 @@ const savePluginWakeMode = async (item: SleepPluginItem, mode: string) => {
 // ---- 运行方式（gRPC / Native，仅 Go 插件） ----
 // Native 切换需用户先确认风险警告（后端强制），且重新构建 + 重启后生效。
 const isGoPlugin = (item: SleepPluginItem) => item.language === "golang";
+const isPythonPlugin = (item: SleepPluginItem) => item.language === "python";
 const runtimeDialog = ref<{
   show: boolean;
   item: SleepPluginItem | null;
@@ -194,6 +217,27 @@ const applyRuntime = async (item: SleepPluginItem, native: boolean) => {
     const res = await pluginApi.setRuntime(item.id, native);
     if (res.data.status === "ok") {
       item.runtime = native ? "native" : "grpc";
+      toast(tm("sleep.runtimeSaved"));
+    } else {
+      toast(
+        (res.data as any)?.message || tm("messages.operationFailed"),
+        "error",
+      );
+    }
+  } catch (err) {
+    toast((err as any)?.message || String(err), "error");
+  } finally {
+    saving.value = false;
+  }
+};
+
+const applyPythonRuntime = async (item: SleepPluginItem, runtime: string) => {
+  if (saving.value || !item.id) return;
+  saving.value = true;
+  try {
+    const res = await pluginApi.setRuntimeMode(item.id, runtime);
+    if (res.data.status === "ok") {
+      item.runtime = runtime;
       toast(tm("sleep.runtimeSaved"));
     } else {
       toast(
@@ -295,6 +339,19 @@ onMounted(async () => {
                     @update:model-value="
                       (v: boolean | null) => requestRuntimeChange(item, !!v)
                     "
+                  />
+                </template>
+                <template v-else-if="isPythonPlugin(item)">
+                  <v-select
+                    :model-value="item.runtime"
+                    :items="pythonRuntimeItems"
+                    item-title="title"
+                    item-value="value"
+                    density="compact"
+                    hide-details
+                    style="max-width: 200px"
+                    :disabled="saving"
+                    @update:model-value="(v: string) => applyPythonRuntime(item, v)"
                   />
                 </template>
                 <span v-else class="text-caption text-medium-emphasis">

@@ -9,6 +9,9 @@
     "appearance": {
       "title": "Appearance"
     },
+    "plugins": {
+      "title": "Plugins"
+    },
     "network": {
       "title": "Network"
     },
@@ -39,6 +42,13 @@
       "subtitle": "Visit the AstrBot GitHub repository."
     }
   },
+  "plugins": {
+    "sleep": {
+      "title": "Sleep & Unload",
+      "subtitle": "Configure idle sleep, wake mode, and runtime per plugin.",
+      "button": "Open plugin page"
+    }
+  },
   "systemConfig": {
     "restartRequired": "System config saved. Some changes only take effect after restarting AstrBot.",
     "groups": {
@@ -48,7 +58,11 @@
       },
       "network": {
         "title": "Proxy & Dependency Sources",
-        "subtitle": "Runtime proxy, Python dependency install options, and PyPI source."
+        "subtitle": "Runtime network proxy and PyPI source."
+      },
+      "plugins": {
+        "title": "Python Dependency Install",
+        "subtitle": "How Python plugin dependencies are installed (on demand / full preinstall)."
       },
       "webuiSecurity": {
         "title": "WebUI Security",

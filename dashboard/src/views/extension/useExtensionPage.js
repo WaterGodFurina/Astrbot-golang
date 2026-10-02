@@ -189,12 +189,15 @@ export const useExtensionPage = (initialTab = "installed") => {
   const ccDialog = reactive({
     show: false,
     message: "",
-    kind: "download_clang",
+    kind: "download_zig_cc",
     hasGCC: false,
     gccPath: "",
     gccVersion: "",
+    hasClang: false,
+    clangPath: "",
+    clangVersion: "",
   });
-  // 用户选择的 C 编译器（gcc / clang / download / cancel）
+  // 用户选择的 C 编译器（gcc / clang / zig_cc / cancel）
   const ccChoice = ref("");
 
   // Go SDK 选择对话框（Go 插件需要 Go 工具链）
@@ -2406,10 +2409,13 @@ export const useExtensionPage = (initialTab = "installed") => {
       const data = resData.data || {};
       ccDialog.message =
         resData.message || tm("dialogs.c_compiler.message");
-      ccDialog.kind = data.kind || "download_clang";
+      ccDialog.kind = data.kind || "download_zig_cc";
       ccDialog.hasGCC = !!data.has_gcc;
       ccDialog.gccPath = data.gcc_path || "";
       ccDialog.gccVersion = data.gcc_version || "";
+      ccDialog.hasClang = !!data.has_clang;
+      ccDialog.clangPath = data.clang_path || "";
+      ccDialog.clangVersion = data.clang_version || "";
       ccDialog.show = true;
       await refreshExtensionsAfterInstallFailure();
       return false;
@@ -2498,9 +2504,9 @@ export const useExtensionPage = (initialTab = "installed") => {
     await newExtension();
   };
 
-  const chooseCCDownload = async () => {
+  const chooseCCZigCC = async () => {
     ccDialog.show = false;
-    ccChoice.value = "download";
+    ccChoice.value = "zig_cc";
     await newExtension();
   };
 
@@ -3214,7 +3220,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     ccDialog,
     chooseCCGCC,
     chooseCCClang,
-    chooseCCDownload,
+    chooseCCZigCC,
     cancelCCInstall,
     goSdkDialog,
     chooseGoDownload,

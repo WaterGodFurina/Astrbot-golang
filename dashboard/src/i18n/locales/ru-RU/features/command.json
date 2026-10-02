@@ -129,6 +129,9 @@
     "runtimeSwitchTitle": "Переключить на Native?",
     "runtimeSwitchConfirm": "Продолжить и переключить",
     "runtimeRestartNote": "После смены способа запуска требуется пересборка и перезапуск AstrBot.",
-    "runtimeCancel": "Отмена"
+    "runtimeCancel": "Отмена",
+    "runtimePythonGrpc": "Процесс на плагин (python-grpc)",
+    "runtimePythonShared": "Общий runtime (python-shared)",
+    "runtimePythonIsolated": "Изоляция процесса (python-isolated)"
   }
 }

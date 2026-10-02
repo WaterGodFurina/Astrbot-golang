@@ -106,7 +106,11 @@
     "ttsStatus": "TTS ステータス",
     "chatProvider": "チャットモデル",
     "ttsProvider": "TTS モデル",
-    "apply": "変更を適用"
+    "apply": "変更を適用",
+    "selectSessions": "セッションを選択",
+    "searchSessions": "セッションを検索...",
+    "selectAll": "すべて選択",
+    "clearAll": "クリア"
   },
   "groups": {
     "title": "グループ管理",

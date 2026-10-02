@@ -81,7 +81,7 @@ func (e *RuntimePromptError) Error() string {
 			// 依赖里的 C 扩展包（grpcio/cryptography/pillow/psutil）在
 			// Termux 无预编译 wheel、pip 本地编译失败——而非缺解释器本身。
 			// 这 4 个包 Termux 官方仓库有预编译包；其余依赖均为纯 Python/
-			// 有 wheel，pip 直接装无需 clang。
+			// 有 wheel，pip 直接装无需 C 编译器。
 			e.Command = "pkg install python python-grpcio python-cryptography python-pillow python-psutil"
 			return "无法准备 Python 插件运行环境：缺少 C 扩展依赖的预编译包"
 		default:

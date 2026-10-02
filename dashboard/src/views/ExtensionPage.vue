@@ -168,7 +168,7 @@ const {
   ccDialog,
   chooseCCGCC,
   chooseCCClang,
-  chooseCCDownload,
+  chooseCCZigCC,
   cancelCCInstall,
   goSdkDialog,
   chooseGoDownload,
@@ -788,11 +788,24 @@ const updateDialogPluginLogo = computed(() => {
             {{ ccDialog.gccVersion }}
           </div>
         </div>
+        <div v-if="ccDialog.hasClang" class="mb-2">
+          <div class="d-flex align-center">
+            <v-chip size="small" color="info" variant="tonal" class="mr-2">
+              Clang
+            </v-chip>
+            <code>{{ ccDialog.clangPath }}</code>
+          </div>
+          <div v-if="ccDialog.clangVersion" class="mt-1 text-caption">
+            {{ ccDialog.clangVersion }}
+          </div>
+        </div>
         <div class="text-medium-emphasis">
           {{
             ccDialog.hasGCC
-              ? tm("dialogs.c_compiler.choose_hint")
-              : tm("dialogs.c_compiler.download_hint")
+              ? tm("dialogs.c_compiler.choose_gcc_hint")
+              : ccDialog.hasClang
+                ? tm("dialogs.c_compiler.choose_clang_hint")
+                : tm("dialogs.c_compiler.download_hint")
           }}
         </div>
       </v-card-text>
@@ -805,15 +818,23 @@ const updateDialogPluginLogo = computed(() => {
           <v-btn color="success" variant="tonal" @click="chooseCCGCC">
             {{ tm("dialogs.c_compiler.use_gcc") }}
           </v-btn>
-          <v-btn color="primary" variant="tonal" @click="chooseCCClang">
+          <v-btn color="primary" variant="tonal" @click="chooseCCZigCC">
+            {{ tm("dialogs.c_compiler.download") }}
+          </v-btn>
+        </template>
+        <template v-else-if="ccDialog.hasClang">
+          <v-btn color="info" variant="tonal" @click="chooseCCClang">
             {{ tm("dialogs.c_compiler.use_clang") }}
+          </v-btn>
+          <v-btn color="primary" variant="tonal" @click="chooseCCZigCC">
+            {{ tm("dialogs.c_compiler.download") }}
           </v-btn>
         </template>
         <v-btn
           v-else
           color="primary"
           variant="tonal"
-          @click="chooseCCDownload"
+          @click="chooseCCZigCC"
         >
           {{ tm("dialogs.c_compiler.download") }}
         </v-btn>
