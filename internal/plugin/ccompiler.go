@@ -282,26 +282,24 @@ func zigRoot() string {
 const zigCCLockFile = ".install-lock"
 
 func downloadAndSetupZigCC(ctx context.Context, options InstallOptions) (cc, cxx string, err error) {
-	// 已下载的 zig cc 已存在？直接用（不重新下载）。
 	root := zigRoot()
-	if cc, cxx, ok := zigCCFromRoot(root); ok {
-		return cc, cxx, nil
-	}
-	// 系统 Clang 已存在？直接用（无需下载 zig cc）。
-	if clang, cxx, ok := detectSystemClang(); ok {
-		return clang, cxx, nil
-	}
 
-	// A previously downloaded zig cc at the private root — but only trust
-	// it if no lock file is left behind from an interrupted install.
+	// 中断锁检查必须**先于**「已有 zig 就返回」：存在锁文件说明上次安装/解压
+	// 未完成，root 不可信（可能是半解压的陈旧 zig），必须整体丢弃重下，而不
+	// 能因为 root 下恰好有个 zig 二进制就信任它。
 	if _, err := os.Stat(filepath.Join(root, zigCCLockFile)); err == nil {
 		logger.I18nWarn("zig cc 安装此前被中断，正在删除 %s 并重新下载", root)
 		if err := os.RemoveAll(root); err != nil {
 			return "", "", fmt.Errorf("清理未完成的 zig cc 安装目录失败: %w", err)
 		}
 	}
+	// 已下载的 zig cc 已存在（且无中断锁）？直接用（不重新下载）。
 	if cc, cxx, ok := zigCCFromRoot(root); ok {
 		return cc, cxx, nil
+	}
+	// 系统 Clang 已存在？直接用（无需下载 zig cc）。
+	if clang, cxx, ok := detectSystemClang(); ok {
+		return clang, cxx, nil
 	}
 
 	info, err := zigArchiveInfoFor()

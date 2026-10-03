@@ -18,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ulikunitz/xz"
 )
 
 // TestReadPluginMetadata validates metadata.json parsing, required fields and
@@ -453,14 +455,31 @@ func TestZigCCLockFileDiscardsInterruptedInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A tiny fake zig distribution: a zip with <triple>/zig.
-	var fakeZip bytes.Buffer
-	zw := zip.NewWriter(&fakeZip)
-	w, _ := zw.Create("zig-x86_64-linux-0.16.0/zig")
-	_, _ = w.Write([]byte("#!/bin/sh\nexit 0\n"))
-	_ = zw.Close()
+	// A tiny fake zig distribution matching the platform archive format
+	// (tar.xz on linux/macos, zip on windows) with a <triple>/zig entry.
+	info, err := zigArchiveInfoFor()
+	if err != nil {
+		t.Skipf("no zig archive for this platform: %v", err)
+	}
+	fakeArchive := buildFakeZigArchive(t, info)
+
+	// zigArchiveSHA256 引入后，默认版本归档下载后会先做 sha256 校验：mock 的
+	// 假归档与官方 pin 值不符会被判"校验失败"而走不到 extract 路径。测试同包
+	// 临时把 info.archive 的 pin 覆盖为假归档的真实 sha256（defer 恢复原值），
+	// 让下载通过校验、真正进入下载→解压→清锁路径。
+	zsum := sha256.Sum256(fakeArchive)
+	oldSum, hadSum := zigArchiveSHA256[info.archive]
+	zigArchiveSHA256[info.archive] = hex.EncodeToString(zsum[:])
+	t.Cleanup(func() {
+		if hadSum {
+			zigArchiveSHA256[info.archive] = oldSum
+		} else {
+			delete(zigArchiveSHA256, info.archive)
+		}
+	})
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(fakeZip.Bytes())
+		_, _ = w.Write(fakeArchive)
 	}))
 	defer srv.Close()
 	if err := os.Setenv("ASTRBOT_ZIGCC_MIRROR", srv.URL); err != nil {
@@ -493,6 +512,85 @@ func TestZigCCLockFileDiscardsInterruptedInstall(t *testing.T) {
 	if !strings.Contains(cc, "zig") || !strings.Contains(cxx, "zig") {
 		t.Errorf("expected zig-based CC/CXX, got %q / %q", cc, cxx)
 	}
+}
+
+// TestZigMirrorBases 验证 zig cc 下载源优先级：用户选择 > ASTRBOT_ZIGCC_MIRROR
+// 环境变量 > 默认列表（华为云 → 官方）。
+func TestZigMirrorBases(t *testing.T) {
+	// 默认列表：首个为华为云加速，含官方 ziglang.org。
+	def := defaultZigMirrorBases()
+	if len(def) < 2 {
+		t.Fatalf("defaultZigMirrorBases 至少应含加速+官方两项, got %v", def)
+	}
+	if !strings.Contains(def[0], "huaweicloud") {
+		t.Errorf("默认首选应为华为云加速, got %q", def[0])
+	}
+	if !strings.Contains(def[len(def)-1], "ziglang.org") {
+		t.Errorf("默认末位应为官方 ziglang.org, got %q", def[len(def)-1])
+	}
+
+	// 用户显式选择覆盖默认。
+	got := zigMirrorBases("https://mirror.example.com/zig/")
+	if len(got) != 1 || got[0] != "https://mirror.example.com/zig" {
+		t.Errorf("用户选择镜像应独占且去尾斜杠, got %v", got)
+	}
+
+	// 环境变量次之。
+	t.Setenv("ASTRBOT_ZIGCC_MIRROR", "https://env.example.com/zig")
+	got = zigMirrorBases("")
+	if len(got) != 1 || got[0] != "https://env.example.com/zig" {
+		t.Errorf("ASTRBOT_ZIGCC_MIRROR 应被采用, got %v", got)
+	}
+
+	// 都为空 → 默认列表。
+	t.Setenv("ASTRBOT_ZIGCC_MIRROR", "")
+	got = zigMirrorBases("")
+	if len(got) != len(def) {
+		t.Errorf("空选择应回退默认列表, got %v", got)
+	}
+}
+
+// buildFakeZigArchive builds a minimal valid plugin archive in the platform's
+// zig archive format (tar.xz / zip) containing a single "<triple>/zig" entry,
+// so the download→extract path can be exercised without network access.
+func buildFakeZigArchive(t *testing.T, info zigArchiveInfo) []byte {
+	t.Helper()
+	payload := []byte("#!/bin/sh\nexit 0\n")
+	var buf bytes.Buffer
+	switch info.kind {
+	case "zip":
+		zw := zip.NewWriter(&buf)
+		w, err := zw.Create(info.triple + "/zig")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+	default: // tar.xz
+		xw, err := xz.NewWriter(&buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tw := tar.NewWriter(xw)
+		hdr := &tar.Header{Name: info.triple + "/zig", Mode: 0o755, Size: int64(len(payload))}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := xw.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return buf.Bytes()
 }
 
 // TestZigCCExtractFailureKeepsLockAndClearsCache verifies that when the
