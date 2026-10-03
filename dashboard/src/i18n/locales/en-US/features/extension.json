@@ -334,11 +334,19 @@
       "hint": "Your choice will be saved to the system config (python_deps_install_mode).",
       "cancel": "Cancel"
     },
-    "python_runtime_preference": {
-      "label": "Python Preferred Runtime",
-      "shared": "Shared process (recommended)",
-      "grpc": "Separate process",
-      "hint": "shared: multiple plugins share one Python process (low memory); grpc: this plugin runs in its own Python process. \"isolated\" is applied automatically by the system on failure, not a user choice."
+    "runtime_preference": {
+      "title": "Choose Runtime",
+      "hint": "Plugin language detected. Choose how this plugin runs. \"isolated\" is applied automatically by the system on failure, not a user choice.",
+      "goGrpc": "gRPC (separate subprocess)",
+      "goGrpcDesc": "Pros: runs in its own process, crashes don't affect the host; supports idle sleep, reload and hot update; process memory is reclaimed by the OS.\nCons: an extra IPC layer per call, slightly slower than Native.",
+      "goNative": "Native (in-process .so/.dll)",
+      "goNativeDesc": "Pros: loaded in-process (.so/.dll), higher performance and lower memory.\nCons: no process isolation, a crash may affect the host; update/disable/uninstall requires restarting AstrBot; no idle sleep.",
+      "pythonShared": "Shared process (recommended)",
+      "pythonSharedDesc": "Pros: multiple plugins share one Python process/interpreter/SDK/deps, significantly lower resident memory.\nCons: no process isolation; interpreter-level state (sys.modules / C extensions) cannot be isolated; the system auto-isolates it to a separate process on failure.",
+      "pythonGrpc": "Separate process",
+      "pythonGrpcDesc": "Pros: one dedicated Python process, process-level isolation (good for plugins using special C extensions, polluting globals, or dependency conflicts).\nCons: one interpreter/SDK per plugin, higher memory usage.",
+      "cancel": "Cancel",
+      "confirm": "OK"
     }
   },
   "messages": {

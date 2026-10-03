@@ -695,6 +695,18 @@ type InstallOptions struct {
 	// Watchdog 在故障时把 shared 插件迁移到独立进程后派生的状态。
 	PythonRuntimePreference string
 
+	// RuntimeChoice 是运行方式选择弹窗（RuntimePromptPluginRuntime）回传的
+	// 原始选择，随插件语言解释：Go → "grpc"/"native"；Python → "shared"/"grpc"。
+	// 空 = 用户尚未选择（首次安装会触发弹窗）。与 PythonRuntimePreference /
+	// Native 的关系：InstallFromSource 探测语言后按语言把它映射到
+	// PythonRuntimePreference（Python）或 Native（Go）。
+	RuntimeChoice string
+
+	// PromptRuntime 标记本次安装来自 WebUI 交互路径：首次安装且 RuntimeChoice
+	// 为空时返回 RuntimePromptPluginRuntime 让前端弹运行方式选择。测试/插件
+	// 反向安装/headless 不设置，静默用默认值。
+	PromptRuntime bool
+
 	// Native 请求以 Native 运行方式安装（进程内 .so/.dll），而非默认的
 	// gRPC 子进程。Native 构建必须 CGO（-buildmode=plugin / c-shared），
 	// 即使插件本身是纯 Go 也需 C 编译器；构建产物为 .so/.dll。
@@ -771,6 +783,27 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		// 保证重装后配置/数据都能保留。
 		m.migratePluginData(id, stableID)
 		id = stableID
+	}
+
+	// 运行方式选择（WebUI 首次安装）：语言已由入口文件探测（main.py /
+	// __init__.py → python，否则 go）。新装（manifest 无此条目）且未带
+	// RuntimeChoice 时返回 RuntimePromptPluginRuntime，让前端弹运行方式选择
+	//（Go：gRPC/Native；Python：共享/独立进程）。更新/重装沿用已装首选，不弹。
+	// isolated 不是用户选项（Watchdog 派生状态），不在此列出。
+	if opts.PromptRuntime && strings.TrimSpace(opts.RuntimeChoice) == "" &&
+		m.cachedManifest().Get(id) == nil {
+		return nil, &RuntimePromptError{
+			Kind:     RuntimePromptPluginRuntime,
+			Language: lang,
+			PluginID: id,
+		}
+	}
+	// 按语言把 RuntimeChoice 映射到既有字段：Python → PythonRuntimePreference；
+	// Go → Native。保持两套语义（安装期选择 vs 进程实际部署）互不混淆。
+	if lang == "python" && strings.TrimSpace(opts.RuntimeChoice) != "" {
+		opts.PythonRuntimePreference = opts.RuntimeChoice
+	} else if strings.TrimSpace(opts.RuntimeChoice) != "" {
+		opts.Native = opts.RuntimeChoice == "native"
 	}
 
 	// 已装插件（来源 id / 稳定 id 任一命中运行实例）按更新处理：先卸载旧

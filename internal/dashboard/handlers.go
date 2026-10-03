@@ -2792,6 +2792,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		PythonMirror:            pythonMirror,
 		DepsChoice:              depsChoice,
 		PythonRuntimePreference: preferredRuntime,
+		RuntimeChoice:           preferredRuntime,
+		PromptRuntime:           true,
 		Progress:                s.installProgressCallback(installID),
 		Stage:                   s.installStageCallback(installID),
 		InstallMethod:           installMethod,
@@ -2845,6 +2847,22 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			switch runtimeErr.Kind {
 			case plugin.RuntimePromptPython:
 				code = "python_runtime_prompt"
+			case plugin.RuntimePromptPluginRuntime:
+				// 运行方式选择（语言已由入口文件探测）：前端弹窗让用户选
+				// Go 的 gRPC/Native 或 Python 的 共享进程/独立进程，
+				// 选择经 preferred_runtime 重发。
+				s.setInstallProgress(installID, &installStatus{Status: "installing", Text: "等待选择运行方式…"})
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"status":  "error",
+					"code":    "plugin_runtime_prompt",
+					"message": runtimeErr.Error(),
+					"data": map[string]interface{}{
+						"kind":      string(runtimeErr.Kind),
+						"language":  runtimeErr.Language,
+						"plugin_id": runtimeErr.PluginID,
+					},
+				})
+				return
 			case plugin.RuntimePromptPythonDeps:
 				// 依赖分层模式未选择：data 带 config_key 供前端写回提示。
 				s.setInstallProgress(installID, &installStatus{Status: "installing", Text: "等待选择依赖安装模式…"})

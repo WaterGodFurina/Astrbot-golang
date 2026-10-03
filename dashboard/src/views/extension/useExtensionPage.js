@@ -242,20 +242,25 @@ export const useExtensionPage = (initialTab = "installed") => {
   // 用户选择的依赖安装模式（lazy / full）
   const depsChoice = ref("");
 
-  // Native 运行方式（进程内 .so/.dll）：安装时可选，切换时也可选。
-  // nativeInstall 是安装对话框里的"以 Native 运行方式安装"开关；
-  // nativeDialog 是 Native 风险警告弹窗，必须在检测/下载 Go 工具链之前弹出；
-  // nativeInstallConfirmed 记录本次安装是否已确认过风险警告。
-  const nativeInstall = ref(false);
+  // Native 运行方式（进程内 .so/.dll）：安装时经运行方式弹窗选择。
+  // nativeDialog 是 Native 风险警告弹窗（选 Native 时二次确认）。
+  // 运行方式选择（plugin_runtime_prompt）：后端拿到 zip 并探测到插件语言
+  // （main.go/main.py）后返回提示，前端弹 dialog 让用户选运行方式。
+  // runtimeChoice 是本次安装最终确定的运行方式（Go："grpc"/"native"；
+  // Python："shared"/"grpc"），重发安装时经 preferred_runtime 带出。
+  // isolated 不是用户选项——它是 Watchdog 在故障时自动隔离后派生的状态。
+  const runtimeChoice = ref("");
+  const runtimeDialog = reactive({
+    show: false,
+    language: "go",
+    selected: "grpc",
+  });
+  // nativeInstallConfirmed 记录本次安装是否已确认过 Go Native 风险警告。
   const nativeInstallConfirmed = ref(false);
   const nativeDialog = reactive({
     show: false,
     message: "",
   });
-  // pythonPreferredRuntime 是 Python 插件的**首选运行方式**：shared（共享进程，
-  // 推荐）或 grpc（独立进程）。isolated 不是用户选项——它是 Watchdog 在故障时
-  // 自动隔离后派生的状态（preferred 保持 shared，current 变为 python-grpc）。
-  const pythonPreferredRuntime = ref("shared");
 
   // 安装进度轮询状态
   const installProgress = ref({
@@ -2474,6 +2479,20 @@ export const useExtensionPage = (initialTab = "installed") => {
       return false;
     }
 
+    if (
+      resData.status === "error" &&
+      resData.code === "plugin_runtime_prompt"
+    ) {
+      const data = resData.data || {};
+      const language = String(data.language || "go");
+      runtimeDialog.language = language;
+      // 默认预选：Go → gRPC；Python → 共享进程。
+      runtimeDialog.selected = language === "python" ? "shared" : "grpc";
+      runtimeDialog.show = true;
+      await refreshExtensionsAfterInstallFailure();
+      return false;
+    }
+
     if (resData.status === "error") {
       stopInstallProgressPolling();
       toast(resData.message, "error");
@@ -2652,9 +2671,9 @@ export const useExtensionPage = (initialTab = "installed") => {
     } else {
       extension_url.value = "";
     }
-    // 安装终态：重置本轮的 Native 确认（下次安装重新弹警告）。nativeInstall
-    // 开关保留，方便用户连续安装多个 Native 插件。
+    // 安装终态：重置本轮运行方式选择与 Native 确认（下次安装重新弹）。
     nativeInstallConfirmed.value = false;
+    runtimeChoice.value = "";
 
     toast(resData.message, "success");
     dialog.value = false;
@@ -2671,17 +2690,32 @@ export const useExtensionPage = (initialTab = "installed") => {
     await checkAndPromptConflicts();
   };
 
-  // requestInstall 是安装按钮入口：若用户选了 Native 运行方式且本次尚未确认
-  // 风险警告，先弹 Native 警告（在检测/下载 Go 工具链之前），确认后再进入
-  // newExtension（后者才会触发后端安装 → Go 工具链/C 编译器检测）。非 Native
-  // 或已确认则直接安装。
+  // requestInstall 是安装按钮入口：运行方式在拿到包并探测语言后由独立弹窗
+  //（plugin_runtime_prompt）选择，这里直接发起安装。
   const requestInstall = async () => {
-    if (nativeInstall.value && !nativeInstallConfirmed.value) {
+    await newExtension();
+  };
+
+  // confirmRuntimeChoice 确认运行方式弹窗：记录选择；Go 选 Native 时先走
+  // 二次风险确认（保留现有安全流程），确认后再重发安装。
+  const confirmRuntimeChoice = async () => {
+    runtimeDialog.show = false;
+    runtimeChoice.value = runtimeDialog.selected;
+    if (
+      runtimeDialog.language === "go" &&
+      runtimeDialog.selected === "native" &&
+      !nativeInstallConfirmed.value
+    ) {
       nativeDialog.message = tm("dialogs.native_runtime.message");
       nativeDialog.show = true;
       return;
     }
     await newExtension();
+  };
+
+  const cancelRuntimeChoice = () => {
+    runtimeDialog.show = false;
+    runtimeChoice.value = "";
   };
 
   const confirmNativeInstall = async () => {
@@ -2693,6 +2727,7 @@ export const useExtensionPage = (initialTab = "installed") => {
   const cancelNativeInstall = () => {
     nativeDialog.show = false;
     nativeInstallConfirmed.value = false;
+    runtimeChoice.value = "";
   };
 
   const newExtension = async (ignoreVersionCheck = false) => {
@@ -2769,14 +2804,14 @@ export const useExtensionPage = (initialTab = "installed") => {
         source,
         ignoreVersionCheck: shouldIgnoreVersionCheck,
         ignoreRisk: shouldIgnoreRisk,
-        native: nativeInstall.value,
+        native: runtimeChoice.value === "native",
         ccChoice: chosenCC,
         goChoice: chosenGo,
         goMirror: chosenGoMirror,
         pythonChoice: chosenPython,
         pythonMirror: chosenPythonMirror,
         depsChoice: chosenDeps,
-        preferredRuntime: pythonPreferredRuntime.value,
+        preferredRuntime: runtimeChoice.value,
         installId,
       });
       loading_.value = false;
@@ -3242,12 +3277,13 @@ export const useExtensionPage = (initialTab = "installed") => {
     chooseDepsMode,
     cancelDepsMode,
     copyPkgCommand,
-    nativeInstall,
     nativeDialog,
     requestInstall,
     confirmNativeInstall,
     cancelNativeInstall,
-    pythonPreferredRuntime,
+    runtimeDialog,
+    confirmRuntimeChoice,
+    cancelRuntimeChoice,
     installProgress,
     newExtension,
     normalizePlatformList,

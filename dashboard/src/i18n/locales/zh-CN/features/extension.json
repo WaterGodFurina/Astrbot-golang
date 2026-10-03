@@ -334,11 +334,19 @@
       "hint": "选择后此设置将保存到系统配置（python_deps_install_mode）。",
       "cancel": "取消"
     },
-    "python_runtime_preference": {
-      "label": "Python 首选运行方式",
-      "shared": "共享进程（推荐）",
-      "grpc": "独立进程",
-      "hint": "shared：多插件共用一个 Python 进程，省内存；grpc：该插件独占一个 Python 进程。isolated 由系统在故障时自动隔离，不作为选项。"
+    "runtime_preference": {
+      "title": "选择运行方式",
+      "hint": "已检测到插件语言，请为该插件选择运行方式。isolated（隔离）由系统在故障时自动应用，不作为选项。",
+      "goGrpc": "gRPC（独立子进程）",
+      "goGrpcDesc": "优点：独立子进程运行，崩溃不影响宿主；支持闲置休眠、重载与热更新；进程内存可被系统回收。\n缺点：每次交互多一层进程间通信，性能略低于 Native。",
+      "goNative": "Native（进程内动态库）",
+      "goNativeDesc": "优点：进程内加载（.so/.dll），性能高、内存省。\n缺点：无进程级隔离，崩溃可能影响宿主；更新/禁用/卸载需重启 AstrBot；不支持闲置休眠。",
+      "pythonShared": "共享进程（推荐）",
+      "pythonSharedDesc": "优点：多个插件共用一个 Python 进程，共享解释器/SDK/依赖，显著降低常驻内存。\n缺点：无进程级隔离，sys.modules / C 扩展等解释器级状态无法隔离；故障时系统会自动将其隔离到独立进程。",
+      "pythonGrpc": "独立进程",
+      "pythonGrpcDesc": "优点：独占一个 Python 进程，进程级隔离，互不干扰（适合依赖特殊 C 扩展、污染全局状态或依赖版本冲突的插件）。\n缺点：每插件一份解释器/SDK 开销，内存占用更高。",
+      "cancel": "取消",
+      "confirm": "确定"
     }
   },
   "messages": {
