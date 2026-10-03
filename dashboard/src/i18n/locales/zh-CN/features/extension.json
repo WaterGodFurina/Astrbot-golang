@@ -333,6 +333,12 @@
       "fullLabel": "完整安装",
       "hint": "选择后此设置将保存到系统配置（python_deps_install_mode）。",
       "cancel": "取消"
+    },
+    "python_runtime_preference": {
+      "label": "Python 首选运行方式",
+      "shared": "共享进程（推荐）",
+      "grpc": "独立进程",
+      "hint": "shared：多插件共用一个 Python 进程，省内存；grpc：该插件独占一个 Python 进程。isolated 由系统在故障时自动隔离，不作为选项。"
     }
   },
   "messages": {

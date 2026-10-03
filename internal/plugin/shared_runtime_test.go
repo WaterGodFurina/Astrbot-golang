@@ -8,32 +8,32 @@ import (
 
 // TestPluginWantsSharedRuntime 验证运行方式分流与隔离迁移的判定逻辑（纯逻辑，
 // 不启动子进程）：Runtime/RuntimePreferred 决定是否接入共享 Runtime；隔离
-// （ISOLATION_PENDING/ISOLATED/isolation_required）与 python-isolated 一律
-// 走独立进程；RECOVERY_PENDING 按偏好重新评估。
+// （ISOLATION_PENDING/ISOLATED/isolation_required）与首选 grpc（独立进程）
+// 一律走独立进程；RECOVERY_PENDING 按首选（shared）重新评估。
 func TestPluginWantsSharedRuntime(t *testing.T) {
 	m := newTestManager(t)
 	man := &Manifest{Version: 1}
 	man.Plugins = []ManifestEntry{
-		{ID: "shared", Runtime: "python-shared"},
-		{ID: "grpc", Runtime: "python-grpc"},
-		{ID: "iso", Runtime: "python-isolated"},
-		{ID: "pref", RuntimePreferred: "python-shared"},
-		{ID: "pending", Runtime: "python-shared", HealthState: HealthIsolationPending, IsolationRequired: true},
-		{ID: "isolated", Runtime: "python-shared", HealthState: HealthIsolated, IsolationRequired: true},
-		{ID: "recover", RuntimePreferred: "python-shared", HealthState: HealthRecoveryPending},
+		{ID: "shared", Language: "python", RuntimePreferred: "shared"},
+		{ID: "grpc", Language: "python", RuntimePreferred: "grpc"},
+		{ID: "legacy_iso", Language: "python", RuntimePreferred: "python-isolated"},
+		{ID: "pref_empty", Language: "python", RuntimePreferred: ""},
+		{ID: "pending", Language: "python", RuntimePreferred: "shared", HealthState: HealthIsolationPending, IsolationRequired: true},
+		{ID: "isolated", Language: "python", RuntimePreferred: "shared", HealthState: HealthIsolated, IsolationRequired: true},
+		{ID: "recover", Language: "python", RuntimePreferred: "shared", HealthState: HealthRecoveryPending},
 	}
 	if err := man.Save(m.manifestPath()); err != nil {
 		t.Fatalf("save manifest: %v", err)
 	}
 
 	cases := map[string]bool{
-		"shared":   true,
-		"grpc":     false,
-		"iso":      false,
-		"pref":     true,
-		"pending":  false, // 隔离中：走 python-grpc
-		"isolated": false,
-		"recover":  true, // 更新后按偏好重新尝试共享
+		"shared":     true,
+		"grpc":       false,
+		"legacy_iso": false,
+		"pref_empty": true,  // 空 → 默认 shared
+		"pending":    false, // 隔离中：走 python-grpc
+		"isolated":   false,
+		"recover":    true, // 更新后按首选（shared）重新尝试共享
 	}
 	for id, want := range cases {
 		if got := m.pluginWantsSharedRuntime(id); got != want {
@@ -46,24 +46,32 @@ func TestPluginWantsSharedRuntime(t *testing.T) {
 	}
 }
 
-// TestSetPluginRuntimePreference 验证运行方式偏好的持久化与校验。
+// TestSetPluginRuntimePreference 验证运行方式偏好的持久化与校验（preferred 取值
+// 只有 shared/grpc；isolated 是派生状态，不作为用户选项）。
 func TestSetPluginRuntimePreference(t *testing.T) {
 	m := newTestManager(t)
 	man := &Manifest{Version: 1, Plugins: []ManifestEntry{{ID: "p", Language: "python"}}}
 	if err := man.Save(m.manifestPath()); err != nil {
 		t.Fatalf("save: %v", err)
 	}
-	if err := m.SetPluginRuntimePreference("p", "python-shared"); err != nil {
+	if err := m.SetPluginRuntimePreference("p", "shared"); err != nil {
 		t.Fatalf("set shared: %v", err)
 	}
 	pref, cur := m.PluginRuntimeOf("p")
-	if pref != "python-shared" || cur != "python-shared" {
-		t.Errorf("runtime pref/cur = %q/%q, want python-shared/python-shared", pref, cur)
+	if pref != "shared" || cur != "python-shared" {
+		t.Errorf("runtime pref/cur = %q/%q, want shared/python-shared", pref, cur)
+	}
+	if err := m.SetPluginRuntimePreference("p", "grpc"); err != nil {
+		t.Fatalf("set grpc: %v", err)
+	}
+	pref, cur = m.PluginRuntimeOf("p")
+	if pref != "grpc" || cur != "python-grpc" {
+		t.Errorf("runtime pref/cur = %q/%q, want grpc/python-grpc", pref, cur)
 	}
 	if err := m.SetPluginRuntimePreference("p", "bogus"); err == nil {
 		t.Error("invalid runtime should error")
 	}
-	if err := m.SetPluginRuntimePreference("missing", "python-grpc"); err == nil {
+	if err := m.SetPluginRuntimePreference("missing", "grpc"); err == nil {
 		t.Error("unknown plugin should error")
 	}
 }

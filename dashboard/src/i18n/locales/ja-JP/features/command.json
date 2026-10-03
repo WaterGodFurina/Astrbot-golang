@@ -130,8 +130,12 @@
     "runtimeSwitchConfirm": "続行して切り替える",
     "runtimeRestartNote": "実行方式の変更後は、再ビルドと AstrBot の再起動が必要です。",
     "runtimeCancel": "キャンセル",
-    "runtimePythonGrpc": "プラグインごとに1プロセス（python-grpc）",
-    "runtimePythonShared": "共有 Runtime（python-shared）",
-    "runtimePythonIsolated": "プロセス分離（python-isolated）"
+    "runtimePythonGrpc": "独立プロセス",
+    "runtimePythonShared": "共有プロセス（推奨）",
+    "runtimePythonIsolated": "独立プロセス",
+    "runtimePythonIsolatedState": "分離済み",
+    "runtimePythonRecovery": "復旧評価中",
+    "runtimePythonCurrentShared": "共有プロセスで実行中",
+    "runtimePythonCurrentGrpc": "独立プロセスで実行中"
   }
 }

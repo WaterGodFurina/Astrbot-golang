@@ -689,6 +689,12 @@ type InstallOptions struct {
 	// CCChoice carries the user's answer to a cgo C-compiler prompt (one of "gcc" / "clang" / "zig_cc" / "cancel"). It is only meaningful when the plugin declares cgo and the host needs to pick a compiler; empty means no decision has been made yet (→ a CCompilerPromptError is returned).
 	CCChoice string
 
+	// PythonRuntimePreference 是 Python 插件的**首选运行方式**（"shared" 共享
+	// 进程，推荐 / "grpc" 独立进程；空 = 默认 shared）。仅 Python 插件生效，
+	// 写入 manifest.RuntimePreferred。注意：isolated 不是用户选项——它是
+	// Watchdog 在故障时把 shared 插件迁移到独立进程后派生的状态。
+	PythonRuntimePreference string
+
 	// Native 请求以 Native 运行方式安装（进程内 .so/.dll），而非默认的
 	// gRPC 子进程。Native 构建必须 CGO（-buildmode=plugin / c-shared），
 	// 即使插件本身是纯 Go 也需 C 编译器；构建产物为 .so/.dll。
@@ -1219,6 +1225,26 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 	if changed && (prev.IsolationRequired || prev.HealthState != "") {
 		newHealth = HealthRecoveryPending
 	}
+	// Python 首选运行方式（安装期选择）：shared 共享进程（默认）/ grpc 独立
+	// 进程。isolated 不是用户选项，不在此写入。**更新时未显式选择则保留原
+	// 首选**（否则 grpc 偏好会被重置为 shared）。
+	pythonPreferred := ""
+	if inst.Language == "python" {
+		choice := strings.TrimSpace(opts.PythonRuntimePreference)
+		switch choice {
+		case "grpc", "python-grpc", "python-isolated", "isolated":
+			pythonPreferred = "grpc"
+		case "shared", "python-shared":
+			pythonPreferred = "shared"
+		default:
+			// 未显式选择：更新保留原首选，全新安装默认 shared。
+			if prev != nil && prev.RuntimePreferred != "" {
+				pythonPreferred = pluginPreferredRuntime(prev)
+			} else {
+				pythonPreferred = "shared"
+			}
+		}
+	}
 	man.Upsert(ManifestEntry{
 		ID:               inst.ID,
 		Name:             inst.Name,
@@ -1246,6 +1272,9 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 		HealthState: newHealth,
 		// 内容身份指纹（版本 + 源码/二进制哈希），更新后据此判断是否需重新评估。
 		SourceHash: newHash,
+		// Python 首选运行方式（shared/grpc）与实际当前方式。
+		RuntimePreferred: pythonPreferred,
+		RuntimeCurrent:   pythonPreferredCurrent(pythonPreferred),
 		// 新装插件默认常驻（不开启休眠），独立分钟数 0 = 未设置；「关闭→开启」翻转时由后端落 DefaultIdleUnloadMinutes。
 		IdleUnload:        false,
 		IdleUnloadMinutes: 0,
@@ -1260,6 +1289,16 @@ func (m *SubprocessManager) recordInstall(inst *PluginInstance, source, artifact
 // 对文件取大小+内容的 sha256；对目录按相对路径排序后逐个文件哈希再汇总。
 // 用于识别「版本号没变但文件被修改」的更新。计算失败（不可读）返回 ""，调用方
 // 按"无指纹"处理（不误判为变更）。
+// pythonPreferredCurrent 把 Python 首选运行方式映射为安装时预期的当前方式
+// （shared → python-shared；grpc → python-grpc）。实际以加载为准，这里仅用于
+// 安装后未加载阶段的展示。
+func pythonPreferredCurrent(preferred string) string {
+	if preferred == "grpc" {
+		return "python-grpc"
+	}
+	return "python-shared"
+}
+
 func contentFingerprint(path string) string {
 	info, err := os.Stat(path)
 	if err != nil {

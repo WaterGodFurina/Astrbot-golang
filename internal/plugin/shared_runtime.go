@@ -314,24 +314,46 @@ func (pm *PythonRuntimeManager) RuntimePID() int {
 // 隔离迁移（方案第 6-7 节）：被标记 ISOLATION_PENDING / ISOLATED 的插件**不再
 // 进入共享 Runtime**，改用 python-grpc 独立进程边界（复用既有进程隔离，不再
 // 实现第二套 Worker）；RECOVERY_PENDING（更新后）重新尝试共享。
+// pluginPreferredRuntime 规范化插件的**首选运行方式**为 "shared"/"grpc"
+// （方案：preferred_runtime = 用户/插件声明的希望怎么运行；只有两个用户可见
+// 选项——共享进程 / 独立进程）。旧值 python-shared → shared；
+// python-isolated / python-grpc / isolated → grpc；空 → shared。
+// 注意：**isolated 不是用户选项**，它是 Watchdog 在故障时把 shared 插件
+// 迁移到独立进程后派生出的**状态**（current=python-grpc + health=ISOLATED），
+// 用户选 shared 不代表禁止系统自动隔离。
+func pluginPreferredRuntime(e *ManifestEntry) string {
+	if e == nil {
+		return "shared"
+	}
+	switch e.RuntimePreferred {
+	case "shared":
+		return "shared"
+	case "grpc", "isolated", "python-isolated", "python-grpc":
+		return "grpc"
+	}
+	switch e.Runtime {
+	case "python-shared":
+		return "shared"
+	case "python-isolated", "python-grpc":
+		return "grpc"
+	}
+	return "shared"
+}
+
 func (m *SubprocessManager) pluginWantsSharedRuntime(id string) bool {
 	e := m.cachedManifest().Get(id)
 	if e == nil {
 		return false
 	}
-	// 当前实例需隔离：不接入共享，走 python-grpc（进程级隔离）。
+	// 系统自动故障隔离优先于用户偏好：被标记 ISOLATION_PENDING / ISOLATED /
+	// isolation_required 的插件，即使 preferred=shared 也不接入共享 Runtime，
+	// 改用独立 python-grpc 进程（方案「用户选 shared 不是禁止系统在故障时隔离」）。
 	if e.IsolationRequired || e.HealthState == HealthIsolationPending || e.HealthState == HealthIsolated {
 		return false
 	}
-	// 更新后重新评估：优先按其偏好（默认 shared）尝试。
-	if e.HealthState == HealthRecoveryPending {
-		return e.RuntimePreferred == "python-shared"
-	}
-	// 注意：python-isolated 显式要求进程隔离 → 不接入共享。
-	if e.Runtime == "python-isolated" {
-		return false
-	}
-	return e.Runtime == "python-shared" || e.RuntimePreferred == "python-shared"
+	// preferred=grpc（独立进程）：天生不适合共享解释器的插件（C 扩展 /
+	// sys.modules 污染 / 依赖版本冲突）直接独立进程。
+	return pluginPreferredRuntime(e) == "shared"
 }
 
 // migrateToIsolated 把被判定 UNHEALTHY（已持久化 ISOLATION_PENDING）的插件从
@@ -375,12 +397,18 @@ const isolationRecoveryWindow = 5 * time.Minute
 // （方案第 7 节「恢复 → NORMAL」）：清除隔离标记 → 重载（pluginWantsShared
 // Runtime 重新返回 true）→ 回到共享 Runtime，preferred/current 归位。
 func (m *SubprocessManager) migrateBackToShared(id string) {
+	// 仅迁回「首选=shared」的插件；用户明确选独立进程（grpc）的插件不因
+	// 恢复而改回共享（隔离状态由 Watchdog 派生，不覆盖用户偏好）。
+	if pluginPreferredRuntime(m.cachedManifest().Get(id)) != "shared" {
+		return
+	}
 	// 清除隔离：恢复 NORMAL、isolation_required=false、FailureCount 归零。
 	if err := m.ClearPluginIsolation(id); err != nil {
 		logger.I18nWarn("恢复迁移：清除插件 %s 隔离标记失败: %v", id, err)
 		return
 	}
-	if err := m.SetPluginRuntime(id, "python-shared", "python-shared"); err != nil {
+	// preferred 保持 "shared"；current 归位为 python-shared。
+	if err := m.SetPluginRuntime(id, "shared", "python-shared"); err != nil {
 		logger.I18nWarn("恢复迁移：持久化插件 %s 运行方式失败: %v", id, err)
 	}
 	if err := m.Reload(context.Background(), id); err != nil {
@@ -390,15 +418,9 @@ func (m *SubprocessManager) migrateBackToShared(id string) {
 	logger.I18nInfo("插件 %s 已恢复正常，迁回共享 Python Runtime", id)
 }
 
-// runtimePreferredOf 读取插件偏好运行方式（preferred 为空时回退当前 Runtime）。
+// runtimePreferredOf 读取插件首选运行方式（规范化 "shared"/"isolated"）。
 func (m *SubprocessManager) runtimePreferredOf(id string) string {
-	if pref, _ := m.PluginRuntimeOf(id); pref != "" {
-		return pref
-	}
-	if e := m.cachedManifest().Get(id); e != nil && e.Runtime != "" {
-		return e.Runtime
-	}
-	return "python-shared"
+	return pluginPreferredRuntime(m.cachedManifest().Get(id))
 }
 
 // SetPluginRuntimePreference 设置插件的运行方式偏好（前端"运行方式"列）：
@@ -406,8 +428,16 @@ func (m *SubprocessManager) runtimePreferredOf(id string) string {
 // {"grpc","native"}（Go）。写入 manifest.Runtime；对 Python 同时写
 // RuntimePreferred/Current。需重载插件生效。
 func (m *SubprocessManager) SetPluginRuntimePreference(id, runtime string) error {
+	// Go 插件：grpc/native；Python 插件：shared/grpc（含旧值映射）。
+	// Python 无 "isolated" 用户选项（isolated 是 Watchdog 的派生状态）。
+	isNative := runtime == "native"
+	var pref string // Python 首选运行方式
 	switch runtime {
-	case "python-grpc", "python-shared", "python-isolated", "grpc", "native":
+	case "shared", "python-shared":
+		pref = "shared"
+	case "grpc", "python-grpc", "python-isolated", "isolated":
+		pref = "grpc"
+	case "native":
 	default:
 		return fmt.Errorf("无效的运行方式 %q", runtime)
 	}
@@ -421,14 +451,23 @@ func (m *SubprocessManager) SetPluginRuntimePreference(id, runtime string) error
 	if e == nil {
 		return fmt.Errorf("插件 %s 未安装", id)
 	}
-	e.Runtime = runtime
-	if e.Language == "python" && runtime != "native" {
-		e.RuntimePreferred = runtime
-		e.RuntimeCurrent = runtime
-		// 切换运行方式即视为重新评估：清除隔离/恢复标记，允许按新方式加载。
-		if runtime == "python-shared" {
-			e.HealthState = ""
-			e.IsolationRequired = false
+	if e.Language == "python" {
+		e.Runtime = ""
+		e.RuntimePreferred = pref
+		// 切换运行方式即视为重新评估：清除隔离/恢复标记，允许按新方式加载
+		//（方案「ISOLATED 不是永久处罚」）。isolated 状态由 Watchdog 派生，
+		// 不在此处写入。
+		e.HealthState = ""
+		e.IsolationRequired = false
+		if pref == "grpc" {
+			e.RuntimeCurrent = "python-grpc"
+		} else {
+			e.RuntimeCurrent = "python-shared"
+		}
+	} else {
+		e.Runtime = "grpc"
+		if isNative {
+			e.Runtime = "native"
 		}
 	}
 	return m.saveManifest(man)
@@ -467,10 +506,10 @@ func (m *SubprocessManager) startSharedInstance(ctx context.Context, id, abs str
 	if meta != nil && len(meta.Tools) > 0 {
 		m.setPluginTools(id, meta.Tools)
 	}
-	// 持久化运行时偏好与当前值（方案第 5 节）：preferred=python-shared（插件
-	// 正常应运行的方式），current=python-shared（当前实际运行方式）。隔离迁移
-	// 后 current 会变为 python-grpc，preferred 保持不变。
-	_ = m.SetPluginRuntime(id, "python-shared", "python-shared")
+	// 持久化运行时偏好与当前值（方案第 5 节）：preferred 保持用户选择
+	//（shared/grpc），current=python-shared（当前实际运行方式）。隔离迁移后
+	// current 会变为 python-grpc，preferred 保持不变。
+	_ = m.SetPluginRuntime(id, pluginPreferredRuntime(entry), "python-shared")
 	logger.I18nInfo("插件 %s 已加载到共享 Python Runtime (plugin_id=%s)", id, id)
 	return inst, nil
 }

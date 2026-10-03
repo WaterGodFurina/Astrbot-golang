@@ -130,8 +130,12 @@
     "runtimeSwitchConfirm": "继续并切换",
     "runtimeRestartNote": "运行方式变更后需重新构建并重启 AstrBot 才能生效。",
     "runtimeCancel": "取消",
-    "runtimePythonGrpc": "一插件一进程（python-grpc）",
-    "runtimePythonShared": "共享 Runtime（python-shared）",
-    "runtimePythonIsolated": "进程隔离（python-isolated）"
+    "runtimePythonGrpc": "独立进程",
+    "runtimePythonShared": "共享进程（推荐）",
+    "runtimePythonIsolated": "独立进程",
+    "runtimePythonIsolatedState": "已隔离",
+    "runtimePythonRecovery": "恢复评估中",
+    "runtimePythonCurrentShared": "运行于共享进程",
+    "runtimePythonCurrentGrpc": "独立进程运行中"
   }
 }

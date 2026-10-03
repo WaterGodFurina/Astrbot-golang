@@ -252,6 +252,10 @@ export const useExtensionPage = (initialTab = "installed") => {
     show: false,
     message: "",
   });
+  // pythonPreferredRuntime 是 Python 插件的**首选运行方式**：shared（共享进程，
+  // 推荐）或 grpc（独立进程）。isolated 不是用户选项——它是 Watchdog 在故障时
+  // 自动隔离后派生的状态（preferred 保持 shared，current 变为 python-grpc）。
+  const pythonPreferredRuntime = ref("shared");
 
   // 安装进度轮询状态
   const installProgress = ref({
@@ -2591,6 +2595,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     pythonChoice,
     pythonMirror,
     depsChoice,
+    preferredRuntime,
     installId,
   }) => {
     const shouldIgnoreVersionCheck = ignoreVersionCheck === true;
@@ -2608,6 +2613,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       formData.append("python_choice", pythonChoice || "");
       formData.append("python_mirror", pythonMirror || "");
       formData.append("deps_choice", depsChoice || "");
+      formData.append("preferred_runtime", preferredRuntime || "");
       formData.append("install_id", installId || "");
       return pluginApi.installUpload(formData);
     }
@@ -2627,6 +2633,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       python_choice: pythonChoice || "",
       python_mirror: pythonMirror || "",
       deps_choice: depsChoice || "",
+      preferred_runtime: preferredRuntime || "",
       install_id: installId || "",
       ...getMarketInstallSourcePayload(),
     };
@@ -2769,6 +2776,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         pythonChoice: chosenPython,
         pythonMirror: chosenPythonMirror,
         depsChoice: chosenDeps,
+        preferredRuntime: pythonPreferredRuntime.value,
         installId,
       });
       loading_.value = false;
@@ -3239,6 +3247,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     requestInstall,
     confirmNativeInstall,
     cancelNativeInstall,
+    pythonPreferredRuntime,
     installProgress,
     newExtension,
     normalizePlatformList,

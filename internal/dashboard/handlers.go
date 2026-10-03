@@ -2607,7 +2607,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	var source, id, installID string
 	var ignoreRisk bool
 	var native bool
-	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror, depsChoice string
+	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror, depsChoice, preferredRuntime string
 	var installMethod, registryURL, registryName, marketPluginID, repo, downloadURL string
 
 	method := "url"
@@ -2618,22 +2618,23 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	switch method {
 	case "url", "git", "github":
 		var body struct {
-			URL            string `json:"url"`
-			IgnoreRisk     bool   `json:"ignore_risk"`
-			Native         bool   `json:"native"`
-			CCChoice       string `json:"cc_choice"`
-			GoChoice       string `json:"go_choice"`
-			PythonChoice   string `json:"python_choice"`
-			GoMirror       string `json:"go_mirror"`
-			PythonMirror   string `json:"python_mirror"`
-			DepsChoice     string `json:"deps_choice"`
-			InstallID      string `json:"install_id"`
-			InstallMethod  string `json:"install_method"`
-			RegistryURL    string `json:"registry_url"`
-			RegistryName   string `json:"registry_name"`
-			MarketPluginID string `json:"market_plugin_id"`
-			Repo           string `json:"repo"`
-			DownloadURL    string `json:"download_url"`
+			URL              string `json:"url"`
+			IgnoreRisk       bool   `json:"ignore_risk"`
+			Native           bool   `json:"native"`
+			CCChoice         string `json:"cc_choice"`
+			GoChoice         string `json:"go_choice"`
+			PythonChoice     string `json:"python_choice"`
+			GoMirror         string `json:"go_mirror"`
+			PythonMirror     string `json:"python_mirror"`
+			DepsChoice       string `json:"deps_choice"`
+			PreferredRuntime string `json:"preferred_runtime"`
+			InstallID        string `json:"install_id"`
+			InstallMethod    string `json:"install_method"`
+			RegistryURL      string `json:"registry_url"`
+			RegistryName     string `json:"registry_name"`
+			MarketPluginID   string `json:"market_plugin_id"`
+			Repo             string `json:"repo"`
+			DownloadURL      string `json:"download_url"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
@@ -2648,6 +2649,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		goMirror = strings.TrimSpace(body.GoMirror)
 		pythonMirror = strings.TrimSpace(body.PythonMirror)
 		depsChoice = strings.TrimSpace(body.DepsChoice)
+		preferredRuntime = strings.TrimSpace(body.PreferredRuntime)
 		installID = body.InstallID
 		installMethod = body.InstallMethod
 		registryURL = body.RegistryURL
@@ -2703,6 +2705,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		goMirror = strings.TrimSpace(r.FormValue("go_mirror"))
 		pythonMirror = strings.TrimSpace(r.FormValue("python_mirror"))
 		depsChoice = strings.TrimSpace(r.FormValue("deps_choice"))
+		preferredRuntime = strings.TrimSpace(r.FormValue("preferred_runtime"))
 		installID = r.FormValue("install_id")
 		installMethod = r.FormValue("install_method")
 		registryURL = r.FormValue("registry_url")
@@ -2780,22 +2783,23 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	}
 
 	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{
-		IgnoreRisk:     ignoreRisk,
-		Native:         native,
-		CCChoice:       ccChoice,
-		GoChoice:       goChoice,
-		PythonChoice:   pythonChoice,
-		GoMirror:       goMirror,
-		PythonMirror:   pythonMirror,
-		DepsChoice:     depsChoice,
-		Progress:       s.installProgressCallback(installID),
-		Stage:          s.installStageCallback(installID),
-		InstallMethod:  installMethod,
-		RegistryURL:    registryURL,
-		RegistryName:   registryName,
-		MarketPluginID: marketPluginID,
-		Repo:           repo,
-		DownloadURL:    downloadURL,
+		IgnoreRisk:              ignoreRisk,
+		Native:                  native,
+		CCChoice:                ccChoice,
+		GoChoice:                goChoice,
+		PythonChoice:            pythonChoice,
+		GoMirror:                goMirror,
+		PythonMirror:            pythonMirror,
+		DepsChoice:              depsChoice,
+		PythonRuntimePreference: preferredRuntime,
+		Progress:                s.installProgressCallback(installID),
+		Stage:                   s.installStageCallback(installID),
+		InstallMethod:           installMethod,
+		RegistryURL:             registryURL,
+		RegistryName:            registryName,
+		MarketPluginID:          marketPluginID,
+		Repo:                    repo,
+		DownloadURL:             downloadURL,
 	})
 	if err != nil {
 		var riskErr *plugin.RiskError

@@ -33,6 +33,9 @@ interface SleepPluginItem {
   version: string;
   runtime: string;
   nativeConfirmed: boolean;
+  runtimeCurrent: string;
+  healthState: string;
+  healthReason: string;
 }
 
 // 休眠唤醒方式选项：command_only = 插件指令+工具唤醒（默认；钩子/被动事件不唤醒）；
@@ -45,12 +48,11 @@ const wakeModeItems = computed(() => [
   { value: WAKE_COMMAND_ONLY, title: tm("sleep.wakeCommandOnly") },
 ]);
 
-// Python 运行方式选项：python-grpc（一插件一进程，默认）/ python-shared
-// （共享 Runtime 多插件）/ python-isolated（高风险插件进程隔离）。
+// Python 首选运行方式选项：shared（共享进程，推荐）/ grpc（独立进程）。
+// isolated 由系统在故障时自动隔离，不作为用户选项。
 const pythonRuntimeItems = computed(() => [
-  { value: PY_RUNTIME_GRPC, title: tm("sleep.runtimePythonGrpc") },
   { value: PY_RUNTIME_SHARED, title: tm("sleep.runtimePythonShared") },
-  { value: PY_RUNTIME_ISOLATED, title: tm("sleep.runtimePythonIsolated") },
+  { value: PY_RUNTIME_GRPC, title: tm("sleep.runtimePythonGrpc") },
 ]);
 
 // 插件语言从 id 后缀（_go/_python）推断，优先用后端 language 字段。
@@ -64,16 +66,19 @@ const languageOf = (p: Record<string, unknown>) => {
   return "";
 };
 
-// 运行方式归一化：Go 为 grpc/native；Python 为 python-grpc（默认回退）/
-// python-shared（共享 Runtime）/python-isolated（进程隔离）。
-const PY_RUNTIME_GRPC = "python-grpc";
-const PY_RUNTIME_SHARED = "python-shared";
-const PY_RUNTIME_ISOLATED = "python-isolated";
+// 运行方式：Go 为 grpc/native；Python 为 preferred（shared 共享进程 /
+// grpc 独立进程）。isolated 不是用户选项——它是 Watchdog 在故障时自动隔离
+// 后派生的状态（preferred 保持 shared，current 变为 python-grpc）。
+const PY_RUNTIME_SHARED = "shared";
+const PY_RUNTIME_GRPC = "grpc";
 const normalizeRuntime = (raw: string, lang: string) => {
-  const v = raw.toLowerCase();
+  const v = String(raw || "").toLowerCase();
   if (lang === "python") {
-    if (v === PY_RUNTIME_SHARED || v === PY_RUNTIME_ISOLATED) return v;
-    return PY_RUNTIME_GRPC;
+    if (v === PY_RUNTIME_SHARED) return PY_RUNTIME_SHARED;
+    if (v === "python-isolated" || v === "python-grpc" || v === "isolated") {
+      return PY_RUNTIME_GRPC;
+    }
+    return v === PY_RUNTIME_GRPC ? PY_RUNTIME_GRPC : PY_RUNTIME_SHARED;
   }
   return v === "native" ? "native" : "grpc";
 };
@@ -113,7 +118,10 @@ const fetchData = async () => {
           hasHook: Boolean(p.has_hook),
           activeEventListener: Boolean(p.active_event_listener),
           version: String(p.version || ""),
-          runtime: normalizeRuntime(String(p.runtime || ""), languageOf(p)),
+          runtime: normalizeRuntime(String(p.runtime_preferred || p.runtime || ""), languageOf(p)),
+          runtimeCurrent: String(p.runtime_current || ""),
+          healthState: String(p.health_state || ""),
+          healthReason: String(p.health_reason || ""),
           nativeConfirmed: Boolean(p.native_confirmed),
         }));
     }
@@ -229,6 +237,28 @@ const applyRuntime = async (item: SleepPluginItem, native: boolean) => {
   } finally {
     saving.value = false;
   }
+};
+
+// pythonRuntimeStatus 计算 Python 插件当前状态文案：正常显示实际部署方式；
+// 被系统自动隔离时显示「已隔离 + 原因」（preferred 仍为用户选择，不受影响）。
+const pythonRuntimeStatus = (item: SleepPluginItem) => {
+  if (item.healthState === "ISOLATED" || item.healthState === "ISOLATION_PENDING") {
+    const reason = item.healthReason ? `（${item.healthReason}）` : "";
+    return `${tm("sleep.runtimePythonIsolatedState")}${reason}`;
+  }
+  if (item.healthState === "RECOVERY_PENDING") {
+    return tm("sleep.runtimePythonRecovery");
+  }
+  if (item.runtimeCurrent === "python-grpc" && item.runtime === "shared") {
+    return tm("sleep.runtimePythonIsolatedState");
+  }
+  if (item.runtimeCurrent === "python-shared") {
+    return tm("sleep.runtimePythonCurrentShared");
+  }
+  if (item.runtimeCurrent === "python-grpc") {
+    return tm("sleep.runtimePythonCurrentGrpc");
+  }
+  return "";
 };
 
 const applyPythonRuntime = async (item: SleepPluginItem, runtime: string) => {
@@ -353,6 +383,9 @@ onMounted(async () => {
                     :disabled="saving"
                     @update:model-value="(v: string) => applyPythonRuntime(item, v)"
                   />
+                  <div v-if="pythonRuntimeStatus(item)" class="text-caption text-medium-emphasis">
+                    {{ pythonRuntimeStatus(item) }}
+                  </div>
                 </template>
                 <span v-else class="text-caption text-medium-emphasis">
                   {{ tm("sleep.runtimeOnlyGo") }}

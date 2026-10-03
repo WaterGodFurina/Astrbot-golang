@@ -185,6 +185,7 @@ const {
   requestInstall,
   confirmNativeInstall,
   cancelNativeInstall,
+  pythonPreferredRuntime,
   installProgress,
   newExtension,
   normalizePlatformList,
@@ -206,6 +207,11 @@ const {
   handleLocaleChange,
   searchDebounceTimer,
 } = pageState;
+
+const pythonRuntimePreferenceItems = computed(() => [
+  { title: tm("dialogs.python_runtime_preference.shared"), value: "shared" },
+  { title: tm("dialogs.python_runtime_preference.grpc"), value: "grpc" },
+]);
 
 const logLevelItems = computed(() => [
   { title: tm("dialogs.config.coreSettings.followGlobal"), value: null },
@@ -1352,6 +1358,25 @@ const updateDialogPluginLogo = computed(() => {
           </v-checkbox>
           <div class="text-caption text-medium-emphasis ml-10">
             {{ tm("dialogs.native_runtime.installHint") }}
+          </div>
+
+          <div class="d-flex align-center mt-3">
+            <div class="text-body-2" style="min-width: 150px">
+              {{ tm("dialogs.python_runtime_preference.label") }}
+            </div>
+            <v-select
+              v-model="pythonPreferredRuntime"
+              :items="pythonRuntimePreferenceItems"
+              item-title="title"
+              item-value="value"
+              variant="outlined"
+              density="compact"
+              hide-details
+              style="max-width: 240px"
+            ></v-select>
+          </div>
+          <div class="text-caption text-medium-emphasis mt-1">
+            {{ tm("dialogs.python_runtime_preference.hint") }}
           </div>
         </div>
       </div>

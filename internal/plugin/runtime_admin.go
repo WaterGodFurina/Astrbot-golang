@@ -210,6 +210,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"status_seen":   false,
 			// 板块 6：持久化的故障/隔离状态（未加载也展示，供前端/恢复决策）。
 			"health_state":       e.HealthState,
+			"health_reason":      e.HealthReason,
 			"isolation_required": e.IsolationRequired,
 			"runtime_preferred":  e.RuntimePreferred,
 			"runtime_current":    e.RuntimeCurrent,
@@ -231,16 +232,23 @@ func addStatusMirror(info map[string]interface{}, inst *PluginInstance, e *Manif
 	info["status_seen"] = seen
 	// 板块 6：持久化的故障/隔离状态（Go Runtime Manager 决策依据）。
 	healthState := ""
+	healthReason := ""
 	isolationRequired := false
 	preferred := ""
 	current := ""
 	if e != nil {
 		healthState = e.HealthState
+		healthReason = e.HealthReason
 		isolationRequired = e.IsolationRequired
-		preferred = e.RuntimePreferred
+		// preferred 规范化暴露为 shared/grpc（isolated 只是派生状态，不作为
+		// 用户可见的首选值）；仅 Python 插件有意义。
+		if e.Language == "python" {
+			preferred = pluginPreferredRuntime(e)
+		}
 		current = e.RuntimeCurrent
 	}
 	info["health_state"] = healthState
+	info["health_reason"] = healthReason
 	info["isolation_required"] = isolationRequired
 	info["runtime_preferred"] = preferred
 	info["runtime_current"] = current
@@ -500,13 +508,20 @@ func runtimeOf(inst *PluginInstance, e *ManifestEntry) string {
 		return inst.Runtime
 	}
 	if e != nil {
-		// 未加载（休眠/占位）时按 manifest 偏好回显：Python 三值（python-shared
-		// / python-isolated / python-grpc）原样返回；Go 插件回退 grpc/native。
-		switch e.Runtime {
-		case "native":
+		// Go 插件回退 grpc/native。
+		if e.Runtime == "native" {
 			return "native"
-		case "python-shared", "python-isolated", "python-grpc":
-			return e.Runtime
+		}
+		if e.Language == "python" {
+			// 未加载（休眠/占位）时按实际当前方式回显（python-shared /
+			// python-grpc）；无 current 则按首选推导。
+			if e.RuntimeCurrent != "" {
+				return e.RuntimeCurrent
+			}
+			if pluginPreferredRuntime(e) == "grpc" {
+				return "python-grpc"
+			}
+			return "python-shared"
 		}
 		if e.RuntimePreferred != "" {
 			return e.RuntimePreferred
