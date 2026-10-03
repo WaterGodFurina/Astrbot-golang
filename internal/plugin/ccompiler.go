@@ -67,6 +67,10 @@ type CCompilerPromptError struct {
 	ClangXXPath string `json:"clang_xx_path,omitempty"`
 	// ClangVersion is a short version string of the detected Clang.
 	ClangVersion string `json:"clang_version,omitempty"`
+	// Mirrors 是 zig cc 可选下载镜像基地址列表（"github 加速镜像选择"同款交互），
+	// 前端弹窗展示让用户选择；选择经 install 的 zig_mirror 回传覆盖默认顺序。
+	// 仅对 PromptDownloadZigCC（及选择"下载 zig cc"）有意义。
+	Mirrors []string `json:"mirrors,omitempty"`
 }
 
 func (e *CCompilerPromptError) Error() string {
@@ -126,7 +130,7 @@ func ensureCCompiler(ctx context.Context, options InstallOptions) (ccPath, cxxPa
 			ClangVersion: compilerVersion(clang),
 		}
 	}
-	return "", "", &CCompilerPromptError{Kind: PromptDownloadZigCC}
+	return "", "", &CCompilerPromptError{Kind: PromptDownloadZigCC, Mirrors: defaultZigMirrorBases()}
 }
 
 // resolveCCChoice applies a user's decision to pick a C compiler.
@@ -322,7 +326,7 @@ func downloadAndSetupZigCC(ctx context.Context, options InstallOptions) (cc, cxx
 	if options.Stage != nil {
 		options.Stage("下载 C 编译器 (zig)…")
 	}
-	if err := downloadZigCCArchive(ctx, info.archive, archivePath, options.Progress); err != nil {
+	if err := downloadZigCCArchive(ctx, info.archive, archivePath, options.ZigCCMirror, options.Progress); err != nil {
 		return "", "", err
 	}
 	if hadPartial {
@@ -452,7 +456,7 @@ var zigArchiveSHA256 = map[string]string{
 // downloadZigCCArchive downloads the zig cc archive to dest, trying each mirror
 // base in order and resuming an existing partial file via HTTP Range requests.
 // A 10-minute per-request timeout keeps a stalled mirror from hanging forever.
-func downloadZigCCArchive(ctx context.Context, archive, dest string, progress func(downloaded, total int64)) error {
+func downloadZigCCArchive(ctx context.Context, archive, dest, mirror string, progress func(downloaded, total int64)) error {
 	// Already fully cached? 缓存命中同样必须过 sha256（复用 pin 表）：仅 stat
 	// 大小会被预放的伪造归档绕过 pin 表，直接解压执行被篡改的编译器。
 	if info, err := os.Stat(dest); err == nil && !info.IsDir() && info.Size() > 0 {
@@ -478,7 +482,7 @@ func downloadZigCCArchive(ctx context.Context, archive, dest string, progress fu
 		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: pinnedDialContext()},
 	}
 	var lastErr error
-	for _, base := range zigMirrorBases() {
+	for _, base := range zigMirrorBases(mirror) {
 		url := base + "/" + archive
 		if err := resumeDownload(ctx, client, url, dest, progress); err != nil {
 			lastErr = err
@@ -614,15 +618,28 @@ func resumeDownload(ctx context.Context, client *http.Client, url, dest string, 
 	}
 }
 
+// defaultZigMirrorBases 返回 zig cc 的默认下载镜像基地址（用户可选列表）。
+// 已验证可达：华为云（国内加速，200）+ 官方 ziglang.org。其余（日本
+// zig.worker.green 已无 DNS、俄罗斯 mirror.mephi.ru 不可达、GitHub 加速前缀
+// 不代理 ziglang.org）不加入，避免每个死源超时拖慢下载。
+func defaultZigMirrorBases() []string {
+	return []string{
+		"https://mirrors.huaweicloud.com/zig/download/" + zigVersion(),
+		"https://ziglang.org/download/" + zigVersion(),
+	}
+}
+
 // zigMirrorBases returns the ordered list of download bases tried for the zig
-// archive. A user override via ASTRBOT_ZIGCC_MIRROR replaces the whole list.
-func zigMirrorBases() []string {
+// archive. 优先级：本次用户选择的镜像（zig_mirror）→ ASTRBOT_ZIGCC_MIRROR
+// 环境变量覆盖 → 默认列表。
+func zigMirrorBases(mirror string) []string {
+	if m := strings.TrimSpace(mirror); m != "" {
+		return []string{strings.TrimRight(m, "/")}
+	}
 	if p := os.Getenv("ASTRBOT_ZIGCC_MIRROR"); p != "" {
 		return []string{strings.TrimRight(p, "/")}
 	}
-	return []string{
-		"https://ziglang.org/download/" + zigVersion(),
-	}
+	return defaultZigMirrorBases()
 }
 
 // extractZigCCArchive unpacks the downloaded zig archive into root, promoting

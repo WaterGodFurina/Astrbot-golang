@@ -904,6 +904,21 @@ const updateDialogPluginLogo = computed(() => {
                 : tm("dialogs.c_compiler.download_hint")
           }}
         </div>
+        <div v-if="ccDialog.mirrors.length" class="mt-3">
+          <div class="text-body-2 mb-1">
+            {{ tm("dialogs.c_compiler.mirrorLabel") }}
+          </div>
+          <v-select
+            v-model="ccDialog.selectedMirror"
+            :items="ccDialog.mirrors"
+            density="compact"
+            variant="outlined"
+            hide-details
+          ></v-select>
+          <div class="text-caption text-medium-emphasis mt-1">
+            {{ tm("dialogs.c_compiler.mirrorHint") }}
+          </div>
+        </div>
       </v-card-text>
       <v-card-actions>
         <v-spacer></v-spacer>

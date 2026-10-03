@@ -301,7 +301,9 @@
       "cancel": "Cancel",
       "use_gcc": "Use system GCC",
       "use_clang": "Use system Clang",
-      "download": "Download zig cc"
+      "download": "Download zig cc",
+      "mirrorLabel": "zig cc download mirror",
+      "mirrorHint": "Mirror used to download zig cc (default: Huawei Cloud → official ziglang.org)."
     },
     "go_sdk": {
       "message": "No usable Go toolchain/SDK detected. Confirm whether to download the Go toolchain automatically",
@@ -336,7 +338,7 @@
     },
     "runtime_preference": {
       "title": "Choose Runtime",
-      "hint": "Plugin language detected. Choose how this plugin runs. \"isolated\" is applied automatically by the system on failure, not a user choice.",
+      "hint": "Plugin language detected. Choose how this plugin runs.",
       "goGrpc": "gRPC (separate subprocess)",
       "goGrpcDesc": "Pros: runs in its own process, crashes don't affect the host; supports idle sleep, reload and hot update; process memory is reclaimed by the OS.\nCons: an extra IPC layer per call, slightly slower than Native.",
       "goNative": "Native (in-process .so/.dll)",

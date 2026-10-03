@@ -301,7 +301,9 @@
       "cancel": "取消",
       "use_gcc": "使用系统 GCC",
       "use_clang": "使用系统 Clang",
-      "download": "下载 zig cc"
+      "download": "下载 zig cc",
+      "mirrorLabel": "zig cc 下载镜像",
+      "mirrorHint": "下载 zig cc 时使用的镜像源（默认华为云 → 官方 ziglang.org）。"
     },
     "go_sdk": {
       "message": "未检测到可用的 Go 工具链/SDK，需要确认是否自动下载 Go 工具链",
@@ -336,7 +338,7 @@
     },
     "runtime_preference": {
       "title": "选择运行方式",
-      "hint": "已检测到插件语言，请为该插件选择运行方式。isolated（隔离）由系统在故障时自动应用，不作为选项。",
+      "hint": "已检测到插件语言，请为该插件选择运行方式。",
       "goGrpc": "gRPC（独立子进程）",
       "goGrpcDesc": "优点：独立子进程运行，崩溃不影响宿主；支持闲置休眠、重载与热更新；进程内存可被系统回收。\n缺点：每次交互多一层进程间通信，性能略低于 Native。",
       "goNative": "Native（进程内动态库）",

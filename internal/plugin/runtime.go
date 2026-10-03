@@ -707,6 +707,10 @@ type InstallOptions struct {
 	// 反向安装/headless 不设置，静默用默认值。
 	PromptRuntime bool
 
+	// ZigCCMirror 是用户在 C 编译器弹窗里选择的 zig cc 下载镜像基地址
+	//（github 加速镜像选择同款交互）；空 = 用默认列表（华为云 → 官方）。
+	ZigCCMirror string
+
 	// Native 请求以 Native 运行方式安装（进程内 .so/.dll），而非默认的
 	// gRPC 子进程。Native 构建必须 CGO（-buildmode=plugin / c-shared），
 	// 即使插件本身是纯 Go 也需 C 编译器；构建产物为 .so/.dll。

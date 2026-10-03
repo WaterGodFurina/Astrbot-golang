@@ -196,9 +196,15 @@ export const useExtensionPage = (initialTab = "installed") => {
     hasClang: false,
     clangPath: "",
     clangVersion: "",
+    // zig cc 可选下载镜像（github 加速镜像选择同款交互）：mirrors 由后端下发，
+    // selectedMirror 为用户选择，下载 zig cc 时经 zig_mirror 回传。
+    mirrors: [],
+    selectedMirror: "",
   });
   // 用户选择的 C 编译器（gcc / clang / zig_cc / cancel）
   const ccChoice = ref("");
+  // 用户选择的 zig cc 下载镜像基地址（空 = 默认列表）。
+  const zigMirror = ref("");
 
   // Go SDK 选择对话框（Go 插件需要 Go 工具链）
   const goSdkDialog = reactive({
@@ -2425,6 +2431,8 @@ export const useExtensionPage = (initialTab = "installed") => {
       ccDialog.hasClang = !!data.has_clang;
       ccDialog.clangPath = data.clang_path || "";
       ccDialog.clangVersion = data.clang_version || "";
+      ccDialog.mirrors = Array.isArray(data.mirrors) ? data.mirrors : [];
+      ccDialog.selectedMirror = ccDialog.mirrors[0] || "";
       ccDialog.show = true;
       await refreshExtensionsAfterInstallFailure();
       return false;
@@ -2530,6 +2538,7 @@ export const useExtensionPage = (initialTab = "installed") => {
   const chooseCCZigCC = async () => {
     ccDialog.show = false;
     ccChoice.value = "zig_cc";
+    zigMirror.value = ccDialog.selectedMirror || "";
     await newExtension();
   };
 
@@ -2609,6 +2618,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     ignoreRisk,
     native,
     ccChoice,
+    zigMirror,
     goChoice,
     goMirror,
     pythonChoice,
@@ -2627,6 +2637,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       formData.append("ignore_risk", String(shouldIgnoreRisk));
       formData.append("native", String(shouldUseNative));
       formData.append("cc_choice", ccChoice || "");
+      formData.append("zig_mirror", zigMirror || "");
       formData.append("go_choice", goChoice || "");
       formData.append("go_mirror", goMirror || "");
       formData.append("python_choice", pythonChoice || "");
@@ -2647,6 +2658,7 @@ export const useExtensionPage = (initialTab = "installed") => {
       ignore_risk: shouldIgnoreRisk,
       native: shouldUseNative,
       cc_choice: ccChoice || "",
+      zig_mirror: zigMirror || "",
       go_choice: goChoice || "",
       go_mirror: goMirror || "",
       python_choice: pythonChoice || "",
@@ -2736,6 +2748,8 @@ export const useExtensionPage = (initialTab = "installed") => {
     ignoreRiskFlag.value = false;
     const chosenCC = ccChoice.value;
     ccChoice.value = "";
+    const chosenZigMirror = zigMirror.value;
+    zigMirror.value = "";
     const chosenGo = goChoice.value;
     goChoice.value = "";
     const chosenGoMirror = goMirror.value;
@@ -2806,6 +2820,7 @@ export const useExtensionPage = (initialTab = "installed") => {
         ignoreRisk: shouldIgnoreRisk,
         native: runtimeChoice.value === "native",
         ccChoice: chosenCC,
+        zigMirror: chosenZigMirror,
         goChoice: chosenGo,
         goMirror: chosenGoMirror,
         pythonChoice: chosenPython,

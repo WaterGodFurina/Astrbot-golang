@@ -2607,7 +2607,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	var source, id, installID string
 	var ignoreRisk bool
 	var native bool
-	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror, depsChoice, preferredRuntime string
+	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror, depsChoice, preferredRuntime, zigMirror string
 	var installMethod, registryURL, registryName, marketPluginID, repo, downloadURL string
 
 	method := "url"
@@ -2628,6 +2628,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			PythonMirror     string `json:"python_mirror"`
 			DepsChoice       string `json:"deps_choice"`
 			PreferredRuntime string `json:"preferred_runtime"`
+			ZigMirror        string `json:"zig_mirror"`
 			InstallID        string `json:"install_id"`
 			InstallMethod    string `json:"install_method"`
 			RegistryURL      string `json:"registry_url"`
@@ -2650,6 +2651,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		pythonMirror = strings.TrimSpace(body.PythonMirror)
 		depsChoice = strings.TrimSpace(body.DepsChoice)
 		preferredRuntime = strings.TrimSpace(body.PreferredRuntime)
+		zigMirror = strings.TrimSpace(body.ZigMirror)
 		installID = body.InstallID
 		installMethod = body.InstallMethod
 		registryURL = body.RegistryURL
@@ -2706,6 +2708,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		pythonMirror = strings.TrimSpace(r.FormValue("python_mirror"))
 		depsChoice = strings.TrimSpace(r.FormValue("deps_choice"))
 		preferredRuntime = strings.TrimSpace(r.FormValue("preferred_runtime"))
+		zigMirror = strings.TrimSpace(r.FormValue("zig_mirror"))
 		installID = r.FormValue("install_id")
 		installMethod = r.FormValue("install_method")
 		registryURL = r.FormValue("registry_url")
@@ -2794,6 +2797,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		PythonRuntimePreference: preferredRuntime,
 		RuntimeChoice:           preferredRuntime,
 		PromptRuntime:           true,
+		ZigCCMirror:             zigMirror,
 		Progress:                s.installProgressCallback(installID),
 		Stage:                   s.installStageCallback(installID),
 		InstallMethod:           installMethod,
@@ -2836,6 +2840,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 					"clang_path":    ccErr.ClangPath,
 					"clang_xx_path": ccErr.ClangXXPath,
 					"clang_version": ccErr.ClangVersion,
+					"mirrors":       ccErr.Mirrors,
 				},
 			})
 			return
