@@ -1433,10 +1433,6 @@ const updateDialogPluginLogo = computed(() => {
           </v-window>
         </template>
 
-        <div class="pa-4 pt-0">
-          <!-- 运行方式（gRPC/Native；Python 共享/独立进程）在拿到包并探测到
-               语言后由独立弹窗选择（plugin_runtime_prompt），不再内联。 -->
-        </div>
       </div>
 
       <div
