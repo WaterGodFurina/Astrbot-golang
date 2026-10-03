@@ -187,6 +187,7 @@
     "updateToolPermissionSuccess": "ツール {name} の権限を更新しました",
     "updateToolPermissionFailed": "ツール権限の更新に失敗しました",
     "updateToolPermissionBuiltin": "組み込みツールでは個別の権限を設定できません",
-    "testError": "接続テストに失敗しました：{error}"
+    "testError": "接続テストに失敗しました：{error}",
+    "testSuccess": "MCP サーバーのテストに成功しました（{count} 個のツール）"
   }
 }

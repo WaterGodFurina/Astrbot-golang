@@ -5,8 +5,8 @@ go 1.26
 require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.7.0
-	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.9.10
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk v1.8.0
+	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.14.1
 	github.com/blusewang/wx v1.3.3
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/dobest1024/go-weixin-ilink v0.2.0
@@ -85,7 +85,7 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/tiendc/go-deepcopy v1.7.2 // indirect
-	github.com/ulikunitz/xz v0.5.16 // indirect
+	github.com/ulikunitz/xz v0.5.16
 	github.com/xuri/efp v0.0.1 // indirect
 	github.com/xuri/nfp v0.0.2-0.20250530014748-2ddeb826f9a9 // indirect
 	github.com/yoshino-s/silk-go v0.1.0

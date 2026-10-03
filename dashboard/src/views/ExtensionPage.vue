@@ -168,7 +168,7 @@ const {
   ccDialog,
   chooseCCGCC,
   chooseCCClang,
-  chooseCCDownload,
+  chooseCCZigCC,
   cancelCCInstall,
   goSdkDialog,
   chooseGoDownload,
@@ -180,11 +180,13 @@ const {
   chooseDepsMode,
   cancelDepsMode,
   copyPkgCommand,
-  nativeInstall,
   nativeDialog,
   requestInstall,
   confirmNativeInstall,
   cancelNativeInstall,
+  runtimeDialog,
+  confirmRuntimeChoice,
+  cancelRuntimeChoice,
   installProgress,
   newExtension,
   normalizePlatformList,
@@ -215,6 +217,41 @@ const logLevelItems = computed(() => [
   { title: "ERROR", value: "ERROR" },
   { title: "CRITICAL", value: "CRITICAL" },
 ]);
+
+// 运行方式选择弹窗的选项（按探测到的语言）：Go → gRPC/Native；
+// Python → 共享进程/独立进程。isolated 不是用户选项（Watchdog 派生状态）。
+const runtimeOptionList = computed(() => {
+  const lang = runtimeDialog.language;
+  if (lang === "python") {
+    return [
+      {
+        value: "shared",
+        title: tm("dialogs.runtime_preference.pythonShared"),
+        desc: tm("dialogs.runtime_preference.pythonSharedDesc"),
+      },
+      {
+        value: "grpc",
+        title: tm("dialogs.runtime_preference.pythonGrpc"),
+        desc: tm("dialogs.runtime_preference.pythonGrpcDesc"),
+      },
+    ];
+  }
+  return [
+    {
+      value: "grpc",
+      title: tm("dialogs.runtime_preference.goGrpc"),
+      desc: tm("dialogs.runtime_preference.goGrpcDesc"),
+    },
+    {
+      value: "native",
+      title: tm("dialogs.runtime_preference.goNative"),
+      desc: tm("dialogs.runtime_preference.goNativeDesc"),
+    },
+  ];
+});
+const selectedRuntimeOption = computed(() =>
+  runtimeOptionList.value.find((o) => o.value === runtimeDialog.selected),
+);
 
 const selectedPluginId = computed(() => {
   const pluginId = route.params.pluginId;
@@ -678,6 +715,65 @@ const updateDialogPluginLogo = computed(() => {
     </v-card>
   </v-dialog>
 
+  <!-- 运行方式选择对话框：拿到插件包并探测到语言后弹出（plugin_runtime_prompt） -->
+  <v-dialog v-model="runtimeDialog.show" width="560" persistent>
+    <v-card>
+      <v-card-title class="text-h3 pa-4 pb-0 pl-6">
+        {{ tm("dialogs.runtime_preference.title") }}
+      </v-card-title>
+      <v-card-text class="pt-4">
+        <p class="text-body-2 text-medium-emphasis mb-3">
+          {{ tm("dialogs.runtime_preference.hint") }}
+        </p>
+
+        <div
+          v-for="opt in runtimeOptionList"
+          :key="opt.value"
+          class="runtime-option pa-3 mb-2"
+          :class="{ 'runtime-option--selected': runtimeDialog.selected === opt.value }"
+          role="radio"
+          :aria-checked="runtimeDialog.selected === opt.value"
+          tabindex="0"
+          @click="runtimeDialog.selected = opt.value"
+        >
+          <div class="d-flex align-center">
+            <v-icon
+              size="20"
+              :color="
+                runtimeDialog.selected === opt.value ? 'primary' : 'grey'
+              "
+              class="mr-2"
+            >
+              {{
+                runtimeDialog.selected === opt.value
+                  ? "mdi-radiobox-marked"
+                  : "mdi-radiobox-blank"
+              }}
+            </v-icon>
+            <span class="text-body-1">{{ opt.title }}</span>
+          </div>
+        </div>
+
+        <!-- 选中项优缺点（显示在所有选项下方，跟随选中项切换） -->
+        <div
+          v-if="selectedRuntimeOption"
+          class="runtime-option-desc pa-3 mt-2 text-body-2"
+        >
+          {{ selectedRuntimeOption.desc }}
+        </div>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn variant="text" @click="cancelRuntimeChoice">
+          {{ tm("dialogs.runtime_preference.cancel") }}
+        </v-btn>
+        <v-btn color="primary" variant="flat" @click="confirmRuntimeChoice">
+          {{ tm("dialogs.runtime_preference.confirm") }}
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
   <!-- 插件源码风险警告对话框 -->
   <v-dialog v-model="nativeDialog.show" width="620" persistent>
     <v-card>
@@ -788,12 +884,40 @@ const updateDialogPluginLogo = computed(() => {
             {{ ccDialog.gccVersion }}
           </div>
         </div>
+        <div v-if="ccDialog.hasClang" class="mb-2">
+          <div class="d-flex align-center">
+            <v-chip size="small" color="info" variant="tonal" class="mr-2">
+              Clang
+            </v-chip>
+            <code>{{ ccDialog.clangPath }}</code>
+          </div>
+          <div v-if="ccDialog.clangVersion" class="mt-1 text-caption">
+            {{ ccDialog.clangVersion }}
+          </div>
+        </div>
         <div class="text-medium-emphasis">
           {{
             ccDialog.hasGCC
-              ? tm("dialogs.c_compiler.choose_hint")
-              : tm("dialogs.c_compiler.download_hint")
+              ? tm("dialogs.c_compiler.choose_gcc_hint")
+              : ccDialog.hasClang
+                ? tm("dialogs.c_compiler.choose_clang_hint")
+                : tm("dialogs.c_compiler.download_hint")
           }}
+        </div>
+        <div v-if="ccDialog.mirrors.length" class="mt-3">
+          <div class="text-body-2 mb-1">
+            {{ tm("dialogs.c_compiler.mirrorLabel") }}
+          </div>
+          <v-select
+            v-model="ccDialog.selectedMirror"
+            :items="ccDialog.mirrors"
+            density="compact"
+            variant="outlined"
+            hide-details
+          ></v-select>
+          <div class="text-caption text-medium-emphasis mt-1">
+            {{ tm("dialogs.c_compiler.mirrorHint") }}
+          </div>
         </div>
       </v-card-text>
       <v-card-actions>
@@ -805,15 +929,23 @@ const updateDialogPluginLogo = computed(() => {
           <v-btn color="success" variant="tonal" @click="chooseCCGCC">
             {{ tm("dialogs.c_compiler.use_gcc") }}
           </v-btn>
-          <v-btn color="primary" variant="tonal" @click="chooseCCClang">
+          <v-btn color="primary" variant="tonal" @click="chooseCCZigCC">
+            {{ tm("dialogs.c_compiler.download") }}
+          </v-btn>
+        </template>
+        <template v-else-if="ccDialog.hasClang">
+          <v-btn color="info" variant="tonal" @click="chooseCCClang">
             {{ tm("dialogs.c_compiler.use_clang") }}
+          </v-btn>
+          <v-btn color="primary" variant="tonal" @click="chooseCCZigCC">
+            {{ tm("dialogs.c_compiler.download") }}
           </v-btn>
         </template>
         <v-btn
           v-else
           color="primary"
           variant="tonal"
-          @click="chooseCCDownload"
+          @click="chooseCCZigCC"
         >
           {{ tm("dialogs.c_compiler.download") }}
         </v-btn>
@@ -1316,23 +1448,6 @@ const updateDialogPluginLogo = computed(() => {
           </v-window>
         </template>
 
-        <div class="pa-4 pt-0">
-          <v-checkbox
-            v-model="nativeInstall"
-            density="comfortable"
-            hide-details
-            color="warning"
-          >
-            <template #label>
-              <span class="text-body-2">{{
-                tm("dialogs.native_runtime.installLabel")
-              }}</span>
-            </template>
-          </v-checkbox>
-          <div class="text-caption text-medium-emphasis ml-10">
-            {{ tm("dialogs.native_runtime.installHint") }}
-          </div>
-        </div>
       </div>
 
       <div
@@ -1690,6 +1805,30 @@ const updateDialogPluginLogo = computed(() => {
   padding: 5px;
   border-radius: 5px;
   background-color: #f5f5f5;
+}
+
+.runtime-option {
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+
+.runtime-option:hover {
+  border-color: rgba(128, 128, 128, 0.7);
+}
+
+.runtime-option--selected {
+  border-color: rgb(var(--v-theme-primary));
+  background-color: rgba(var(--v-theme-primary), 0.06);
+}
+
+.runtime-option-desc {
+  border-radius: 8px;
+  background-color: rgba(128, 128, 128, 0.08);
+  color: rgba(var(--v-theme-on-surface), 0.75);
+  line-height: 1.6;
+  white-space: pre-line;
 }
 
 .fab-button {

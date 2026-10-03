@@ -27,6 +27,15 @@
 // for that exact reason. New plugin binaries fill BOTH the result sub-message
 // and the legacy fields so old hosts keep working. Proto3 forward/backward
 // compatibility rule: only append fields, never remove/reorder/rename.
+//
+// Multi-tenant plugin_id (python-shared runtime): the classic layout is "one
+// plugin process per plugin", so the plugin's identity is implied by the
+// connection. The shared-Python-Runtime layout hosts MANY plugins in ONE
+// process and serves them over one endpoint, so plugin-targeted PluginService
+// RPCs carry an explicit `plugin_id` to route to the right plugin session.
+// It is an APPENDED optional field: old SDKs leave it empty and the host falls
+// back to the connection identity (single-tenant); new SDKs fill it. HostService
+// reverse calls already carry `plugin_name` for the same reason.
 syntax = "proto3";
 
 package astrbot.sdk.v1;
@@ -56,14 +65,15 @@ service PluginService {
   // __init__/initialize), which happens AFTER Register — so the host pulls the
   // live tool list through this RPC instead of relying on the Register
   // snapshot (aligned with Python AstrBot's runtime tool collection).
-  rpc ListTools(Empty) returns (ListToolsResponse);
+  // 多租户（python-shared）：请求体带 plugin_id 定位目标插件；单插件进程留空。
+  rpc ListTools(PluginRef) returns (ListToolsResponse);
   // ListWebApis returns the plugin's CURRENT Web API routes. Plugin routes may
   // be registered during instantiation (context.register_web_api in
   // __init__/initialize), after the Register snapshot — so the host pulls the
   // live route list through this RPC (aligned with ListTools). Old plugin
   // binaries without this RPC return UNIMPLEMENTED; the host falls back to the
   // Register snapshot.
-  rpc ListWebApis(Empty) returns (ListWebApisResponse);
+  rpc ListWebApis(PluginRef) returns (ListWebApisResponse);
   // HandleWebRequest dispatches a dashboard HTTP request to a plugin-registered
   // Web API (context.register_web_api / /api/plug/<path>).
   rpc HandleWebRequest(HandleWebRequestRequest) returns (HandleWebRequestResponse);
@@ -84,13 +94,23 @@ service PluginService {
   // dropdown options in __init__). Aligns with Python AstrBot's WebUI reading
   // the live star instance config.schema. Host falls back to the Register
   // snapshot when this RPC is unimplemented/empty.
-  rpc GetConfigSchema(Empty) returns (GetConfigSchemaResponse);
+  rpc GetConfigSchema(PluginRef) returns (GetConfigSchemaResponse);
   // Cleanup is called when the host unloads the plugin.
-  rpc Cleanup(Empty) returns (Empty);
+  rpc Cleanup(PluginRef) returns (Empty);
   // FeedCronJob 宿主 cron 到点触发插件注册的 basic 任务（经 CronCreate
   // 注册、payload 带 _plugin_id），插件执行注册的 handler；无匹配 handler
   // 返回 handled=false（对齐 FeedSessionWait 语义）。
   rpc FeedCronJob(FeedCronJobRequest) returns (FeedCronJobResponse);
+  // ManagePlugin（python-shared 共享 Runtime 多租户）管理共享进程内的插件
+  // 成员，使 Go Runtime Manager 能在不重启整个 Runtime 的前提下按插件
+  // 加载/卸载（对齐方案「Unload/Reload → 通知 Runtime 卸载单插件，非杀
+  // 进程」）：
+  //   action="load"：登记并 import 插件（等价单插件 server.py 的阶段 A），
+  //     随后宿主对同一 plugin_id 调 Register 触发实例化；
+  //   action="unload"：卸载单个插件（terminate + 清理 session），不影响
+  //     共享 Runtime 内其它插件。
+  // 单插件进程（python-grpc / python-isolated）不使用，返回 UNIMPLEMENTED。
+  rpc ManagePlugin(ManagePluginRequest) returns (ManagePluginResponse);
 }
 
 // HostService is served by the HOST and dialed by plugins for reverse calls.
@@ -345,6 +365,15 @@ message ReleaseBlobRequest {
 
 message Empty {}
 
+// PluginRef 定位共享 Runtime（python-shared）中的目标插件。单插件进程布局
+// （一插件一进程）留空，由连接身份确定；共享 Runtime 下用它把 ListTools /
+// ListWebApis / GetConfigSchema / Cleanup 等无其它参数的 RPC 路由到对应插件。
+message PluginRef {
+  string plugin_id = 1;
+  // 冗余携带插件名（便于日志 / 旧宿主按名匹配）。
+  string plugin_name = 2;
+}
+
 // EventResult aggregates the handler-outcome flags that used to be scattered
 // bool fields on individual response messages (sent / stop / handled). It is
 // the forward extension point: future semantics (blocked, consumed, ...) are
@@ -399,12 +428,37 @@ message RegisterRequest {
   // 连接级协议版本（P1 协商）：插件上报自身支持的最高协议版本。旧 SDK 不填
   // =0 → 宿主按 legacy（event_json / chain_json）路径。P1_MIN_PROTOCOL=2。
   int32 protocol_version = 1;
+  // 多租户（python-shared）：本次注册对应的插件 id。单插件进程（旧布局）留空，
+  // 由连接身份确定；共享 Runtime 下一个进程注册多个插件时用它区分。
+  string plugin_id = 2;
+}
+
+// ManagePluginRequest 管理共享 Runtime（python-shared）内的插件成员。
+message ManagePluginRequest {
+  // "load" | "unload"。
+  string action = 1;
+  // 宿主分配的目标插件 id（python-shared 下为 manifest id）。
+  string plugin_id = 2;
+  // action="load" 时的插件源码目录（绝对路径）；unload 可留空。
+  string plugin_dir = 3;
+  // 插件显示名 / 版本（可选，仅日志与占位；实际以 Register 上报为准）。
+  string plugin_name = 4;
+  string version = 5;
+}
+
+// ManagePluginResponse 返回管理操作结果。error 非空表示失败（宿主保留该
+// 插件为 ERROR 状态，不影响共享 Runtime 内其它插件）。
+message ManagePluginResponse {
+  bool ok = 1;
+  string error = 2;
 }
 
 // SetLogLevelRequest carries the desired log level name
 // (DEBUG/INFO/WARNING/ERROR/CRITICAL) or "" to follow the host's global level.
 message SetLogLevelRequest {
   string level = 1;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 2;
 }
 
 message RegisterResponse {
@@ -457,6 +511,8 @@ message HandleWebRequestRequest {
   repeated WebKV headers = 4;
   bytes body = 5;
   repeated WebUploadFile files = 6;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 7;
 }
 
 message HandleWebRequestResponse {
@@ -471,6 +527,8 @@ message HandleCommandRequest {
   reserved 3; // 曾为 legacy event_json（P1 移除，不复用 field number）
   // 原生事件（P1）：Event 路径 0 JSON。
   SDKEvent event = 4;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 5;
 }
 
 message HandleCommandResponse {
@@ -493,6 +551,8 @@ message HandleFilterRequest {
   reserved 2; // 曾为 legacy event_json（P1 移除）
   // 原生事件（P1）。
   SDKEvent event = 3;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 4;
 }
 
 message HandleFilterResponse {
@@ -514,6 +574,8 @@ message HandleHookRequest {
   // on_llm_response, sdk.ToolCall for on_using_llm_tool/on_llm_tool_respond,
   // sdk.PluginError for on_plugin_error). 保留 JSON（动态结构，非 Message Chain）。
   bytes payload_json = 4;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 7;
 }
 
 // HookResponse replaces Empty as the HandleHook return value so hooks can
@@ -539,6 +601,8 @@ message HandleLLMRequestRequest {
   string system_prompt = 3;
   // User prompt being sent to the model.
   string user_prompt = 4;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 6;
 }
 
 message HandleLLMRequestResponse {
@@ -561,6 +625,8 @@ message HandleToolRequest {
   reserved 3; // 曾为 legacy event_json（P1 移除）
   // 原生事件（P1）。
   SDKEvent event = 4;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 5;
 }
 
 message HandleToolResponse {
@@ -585,6 +651,32 @@ message HealthResponse {
   bool ok = 1;
   double load = 2;
   string version = 3;
+  // 插件状态上报（板块 5：Python → Go 状态镜像）。Python Runtime 是 Python
+  // 插件生命周期/健康状态的权威来源，Go 只做镜像。单插件进程（python-grpc）
+  // 下 plugins 含 1 个元素（自身）；共享 Runtime（python-shared）下含其承载的
+  // 全部插件。旧 SDK 不含该字段 → 空，Go 回退既有状态。
+  repeated PluginStatus plugins = 4;
+  // Runtime 心跳时间戳（Unix 秒；0 = 未上报/旧 SDK）。Runtime 主循环周期刷新，
+  // 供 Go 侧判断 Runtime 是否卡死（连接存活但心跳停滞 = 疑似 hang，方案第 6 节
+  // 「Go 只判断 Runtime 连接状态」的补充）。进程级崩溃检测仍由 Go 负责。
+  double runtime_heartbeat = 5;
+}
+
+// PluginStatus 是单个 Python 插件的状态镜像单元（对齐方案文档第五节）。
+message PluginStatus {
+  string plugin_id = 1;
+  string plugin_name = 2;
+  // 生命周期状态：LOADING / ACTIVE / IDLE / SLEEPING / UNLOADED / ERROR
+  string state = 3;
+  // 健康状态：NORMAL / DEGRADED / UNHEALTHY / ISOLATION_PENDING /
+  // ISOLATED / RECOVERY_PENDING / REMOVED（Python Watchdog 判定）
+  string health = 4;
+  // 最近活动时间（Unix 秒；0 = 未知）
+  double last_activity = 5;
+  // 错误信息（无错误为空串）
+  string error = 6;
+  // 实例代际（每次 reload +1，防止旧实例消息污染）
+  int64 generation = 7;
 }
 
 // --- HostService payloads --------------------------------------------------
@@ -971,6 +1063,8 @@ message FeedSessionWaitRequest {
   reserved 1; // 曾为 legacy event_json（P1 移除）
   // 原生事件（P1）。
   SDKEvent event = 2;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 3;
 }
 
 message FeedSessionWaitResponse {
@@ -1196,6 +1290,8 @@ message FeedCronJobRequest {
   bytes payload_json = 3;
   // 宿主实际触发时刻（RFC3339）。
   string run_at = 4;
+  // 多租户：目标插件 id（共享 Runtime；单插件进程留空）。
+  string plugin_id = 5;
 }
 
 // FeedCronJobResponse handled=插件存在匹配 handler 并已调度执行；无匹配

@@ -124,7 +124,8 @@
       "commands": "コマンド / コマンドグループ",
       "hooks": "フック",
       "functionTools": "関数ツール",
-      "eventListeners": "イベントリスナー"
+      "eventListeners": "イベントリスナー",
+      "sleep": "スリープポリシー"
     },
     "info": {
       "title": "情報",
@@ -137,7 +138,11 @@
       "astrbotVersion": "AstrBot バージョン要件",
       "supportPlatforms": "対応プラットフォーム",
       "authorWebsite": "開発者のウェブサイト",
-      "repository": "リポジトリ"
+      "repository": "リポジトリ",
+      "pluginLanguage": "プラグイン言語",
+      "pluginRuntime": "実行方式",
+      "runtimeGrpc": "サブプロセス（gRPC）",
+      "runtimeNative": "プロセス内（Native）"
     }
   },
   "market": {
@@ -178,7 +183,9 @@
     "sourceResolved": "プラグインソースを利用できます",
     "installPlugin": "プラグインをインストール",
     "randomPlugins": "🎲 ランダムプラグイン",
-    "sourceSafetyWarning": "デフォルトのプラグインソースであっても、プラグインの安定性と安全性を完全には保証できません。使用前に十分確認してください。"
+    "sourceSafetyWarning": "デフォルトのプラグインソースであっても、プラグインの安定性と安全性を完全には保証できません。使用前に十分確認してください。",
+    "defaultSourceHint": "内蔵マーケット（既定）",
+    "sourceTypeHint": "ソースのプラグイン種別を選択します。Golang ソースは Go プラグインを収録し（Go バージョンで互換性を判定）、Python ソースは Python プラグインを収録します（対応する Python バージョンで判定）。種別はインストール方式（zip 直リンク / git clone）とバージョン互換性の判定に影響します。"
   },
   "sort": {
     "by": "並べ替え",
@@ -229,7 +236,8 @@
       "supportPlatformsCount": "{count} 個のプラットフォームに対応",
       "sectionTitle": "インストール",
       "downloadSource": "次の場所からプラグインパッケージをインストールします：",
-      "repositorySecurityWarning": "AstrBot は、コードリポジトリからダウンロードしたプラグインの安全性を保証できません。信頼できる配布元であることを確認してからインストールしてください。"
+      "repositorySecurityWarning": "AstrBot は、コードリポジトリからダウンロードしたプラグインの安全性を保証できません。信頼できる配布元であることを確認してからインストールしてください。",
+      "preparing": "インストールを準備中…"
     },
     "update": {
       "title": "プラグインを更新",
@@ -268,6 +276,79 @@
       "installDestination": "インストール先",
       "confirm": "このプラグインソースを使用",
       "confirmAndContinue": "使用して続行"
+    },
+    "risk_warning": {
+      "message": "プラグインのソースコードに潜在的なリスクが検出されました。確認してから続行してください"
+    },
+    "native_runtime": {
+      "title": "Native 実行方式のリスク警告",
+      "message": "Native モードはプラグインを AstrBot-Go メインプロセスに読み込み、プロセスレベルの分離を行いません。プラグインのクラッシュやメモリ問題がメインプロセスに影響する可能性があり、プラグインの更新、無効化、アンインストールには AstrBot の再起動が必要になることがあります。",
+      "bullet1": "Native プラグインは AstrBot メインプロセス内で動作するため、gRPC プラグインのように単独でアンロードできません。",
+      "bullet2": "Native プラグインの更新/無効化は、AstrBot を再起動しないと完全には反映されません（動的ライブラリは一度読み込まれるとアンロードできません）。",
+      "bullet3": "Native プラグインで重大なエラーが発生すると、AstrBot メインプロセスに影響する可能性があります。",
+      "bullet4": "Native プラグインはアイドルスリープに対応していません（kill/復帰ができません）。",
+      "hint": "Native を選択すると、上記のリスクを理解し、プラグインの品質による影響を自ら負担することに同意したものとみなされます。",
+      "installLabel": "Native 実行方式でインストール（メインプロセスに読み込み、プロセス分離なし）",
+      "installHint": "既定は gRPC（独立したサブプロセス）。Native はより高速でメモリも節約できますが、分離がなく、更新/アンインストールには再起動が必要です。",
+      "confirm": "理解しました。Native を使用します"
+    },
+    "c_compiler": {
+      "message": "利用可能な C コンパイラーが検出されませんでした。システムコンパイラーを選択するか、zig cc を自動ダウンロードする必要があります",
+      "title": "C コンパイラー",
+      "choose_gcc_hint": "システムに GCC がインストールされていることを検出しました。システム GCC を使用するか、zig cc を自動ダウンロードするかを選択できます",
+      "choose_clang_hint": "システムに Clang がインストールされていることを検出しました。システム Clang を使用するか、zig cc を自動ダウンロードするかを選択できます",
+      "download_hint": "利用可能な C コンパイラーが検出されませんでした。zig cc を自動ダウンロードしてインストールするか確認する必要があります",
+      "cancel": "キャンセル",
+      "use_gcc": "システム GCC を使用",
+      "use_clang": "システム Clang を使用",
+      "download": "zig cc をダウンロード",
+      "mirrorLabel": "zig cc ダウンロードミラー",
+      "mirrorHint": "zig cc のダウンロードに使用するミラー（既定：Huawei Cloud → 公式 ziglang.org）。"
+    },
+    "go_sdk": {
+      "message": "利用可能な Go ツールチェーン/SDK が検出されませんでした。Go ツールチェーンを自動ダウンロードするか確認する必要があります",
+      "title": "Go ツールチェーンが見つかりません",
+      "android_hint": "Android では次のコマンドを実行して Go をインストールしてください：",
+      "copy": "コピー",
+      "download_hint": "利用可能な Go ツールチェーン/SDK が検出されませんでした。Go ツールチェーンを自動ダウンロードするか確認する必要があります",
+      "mirrorLabel": "ダウンロードミラーを選択：",
+      "installed": "インストール済み",
+      "cancel": "キャンセル",
+      "download": "自動ダウンロード"
+    },
+    "python_runtime": {
+      "message": "Python ランタイムを準備できませんでした。CPython を自動ダウンロードするか確認する必要があります",
+      "title": "Python ランタイムが見つかりません",
+      "android_hint": "Android では次のコマンドを実行して Python をインストールしてください：",
+      "copy": "コピー",
+      "download_hint": "Python ランタイムを準備できませんでした。CPython を自動ダウンロードするか確認する必要があります",
+      "primaryLabel": "メインアドレス：",
+      "mirrorLabel": "ダウンロードミラーを選択：",
+      "installed": "インストール済み",
+      "cancel": "キャンセル",
+      "download": "自動ダウンロード"
+    },
+    "depsMode": {
+      "title": "Python 依存パッケージのインストール方式を選択",
+      "desc": "完全インストールではすべてのホスト依存パッケージを事前インストールします（約 3〜5 分）。オンデマンドインストールではコア依存のみをインストールし、実行時に不足するパッケージを自動で補います。後からでも 設定-プラグイン で変更できます。",
+      "lazyLabel": "オンデマンドインストール（推奨）",
+      "fullLabel": "完全インストール",
+      "hint": "選択すると、この設定はシステム設定（python_deps_install_mode）に保存されます。",
+      "cancel": "キャンセル"
+    },
+    "runtime_preference": {
+      "title": "実行方式を選択",
+      "hint": "プラグインの言語を検出しました。実行方式を選択してください。",
+      "goGrpc": "gRPC（独立サブプロセス）",
+      "goGrpcDesc": "利点：独立プロセスで動作し、クラッシュしてもホストに影響しません。アイドルスリープ・再読み込み・ホットアップデートに対応。プロセスのメモリは OS が回収。\n欠点：呼び出しごとに IPC が増え、Native よりやや遅い。",
+      "goNative": "Native（プロセス内ダイナミックライブラリ）",
+      "goNativeDesc": "利点：プロセス内に読み込み（.so/.dll）、高性能・省メモリ。\n欠点：プロセス分離なし。クラッシュがホストに影響する可能性。更新/無効化/アンインストールには AstrBot の再起動が必要。アイドルスリープ不可。",
+      "pythonShared": "共有プロセス（推奨）",
+      "pythonSharedDesc": "利点：複数プラグインで 1 つの Python プロセス/インタプリタ/SDK を共有し、常駐メモリを大幅削減。\n欠点：プロセス分離なし。sys.modules / C 拡張などのインタプリタ状態は分離不可。障害時はシステムが自動で独立プロセスへ分離。",
+      "pythonGrpc": "独立プロセス",
+      "pythonGrpcDesc": "利点：専用の Python プロセスで実行し、プロセス分離（特殊な C 拡張・グローバル汚染・依存関係の競合に適する）。\n欠点：プラグインごとにインタプリタ/SDK が必要で、メモリ消費が増える。",
+      "cancel": "キャンセル",
+      "confirm": "確定"
     }
   },
   "messages": {
@@ -312,7 +393,12 @@
     "sourceBindSuccess": "プラグインソースを更新しました",
     "validatingPlugin": "プラグインを検証中…",
     "pluginValidateSuccess": "プラグインの検証に成功しました",
-    "pluginValidateFailed": "プラグインの検証に失敗しました"
+    "pluginValidateFailed": "プラグインの検証に失敗しました",
+    "nativeReloadNotice": "Native プラグインの再読み込みは、コマンドやフィルターなどの機能の再登録のみに対応しており、Native 動的ライブラリは再読み込みしません。プラグイン機能を完全に再起動するには、AstrBot プロセス全体を再起動してください。",
+    "nativeUpdateNotice": "Native プラグインを更新しました。新バージョンは AstrBot の再起動後に完全に反映されます。",
+    "nativeToggleNotice": "Native プラグインを無効化/有効化しました。動的ライブラリはメインプロセス内に残っているため、完全に削除するには AstrBot の再起動が必要です。",
+    "pkgCommandCopied": "コマンドをコピーしました。ターミナルで実行してください",
+    "pkgCommandCopyFailed": "コピーに失敗しました。手動でコマンドをコピーしてください"
   },
   "upload": {
     "fromFile": "ファイルからインストール",
@@ -478,5 +564,15 @@
   },
   "pluginChangelog": {
     "menuTitle": "変更履歴を表示"
+  },
+  "adminList": {
+    "manage": "プラグイン権限を管理",
+    "hint": "指定したプラグインに他のプラグインを管理する権限（インストール/アンインストール/起動停止）を付与します。権限のないプラグインは自身のみを操作できます。空欄の場合は管理プラグインなしになります。",
+    "label": "プラグイン登録名（カンマ区切り）",
+    "placeholder": "astrbot_plugin_xxx_python, astrbot_plugin_yyy_go",
+    "example": "プラグイン登録名の形式：プラグイン名_言語（例: astrbot_plugin_box_python）。プラグインの再起動後に有効になります。",
+    "save": "保存",
+    "cancel": "キャンセル",
+    "saved": "プラグイン権限リストを保存しました"
   }
 }

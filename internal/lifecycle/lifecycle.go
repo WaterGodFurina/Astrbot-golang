@@ -380,8 +380,13 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// pip/venv 安装代理：config http_proxy 优先于系统代理，为空时 pip 才回退
 	// 系统 https_proxy（与通用请求"配置为空即直连"不同）。
 	pysdk.SetPipProxy(cfg.GetString("http_proxy"))
-	// 注意：已移除全局 plugin_idle_unload_minutes 同步；
-	// 休眠为单插件独立控制，lifecycle 不再向 runtime 推全局阈值。
+	// 休眠为单插件独立控制，但新增两个全局默认阈值（方案第 6 节「语义分离」）：
+	// plugin_unload_timeout_minutes（开启休眠但未设独立阈值时回填的冷卸载阈值）
+	// 与 plugin_idle_timeout_minutes（ACTIVE→IDLE 观察阈值）。0 = 回退既有行为。
+	l.subPluginMgr.SetIdleTimeouts(
+		cfg.GetInt("plugin_idle_timeout_minutes"),
+		cfg.GetInt("plugin_unload_timeout_minutes"),
+	)
 	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
 	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
 	// back into the host. 同时注入会话/人格/Provider/Star 管理器，供插件

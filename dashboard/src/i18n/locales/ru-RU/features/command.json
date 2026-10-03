@@ -129,6 +129,13 @@
     "runtimeSwitchTitle": "Переключить на Native?",
     "runtimeSwitchConfirm": "Продолжить и переключить",
     "runtimeRestartNote": "После смены способа запуска требуется пересборка и перезапуск AstrBot.",
-    "runtimeCancel": "Отмена"
+    "runtimeCancel": "Отмена",
+    "runtimePythonGrpc": "Отдельный процесс",
+    "runtimePythonShared": "Общий процесс (рекомендуется)",
+    "runtimePythonIsolated": "Отдельный процесс",
+    "runtimePythonIsolatedState": "Изолирован",
+    "runtimePythonRecovery": "Оценка восстановления",
+    "runtimePythonCurrentShared": "В общем процессе",
+    "runtimePythonCurrentGrpc": "В отдельном процессе"
   }
 }

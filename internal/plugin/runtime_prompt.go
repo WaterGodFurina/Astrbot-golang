@@ -25,6 +25,11 @@ const (
 	// 前端弹窗让用户选 "lazy"（只预装核心层，推荐）/ "full"（全量预装），
 	// 选择经 dashboard 写回 config 并以 deps_choice 重发安装。
 	RuntimePromptPythonDeps RuntimePromptKind = "python_deps_mode"
+	// RuntimePromptPluginRuntime 是子进程插件（Go/Python）首次安装时运行方式
+	// 未选择（且语言已由入口文件 main.go/main.py 探测）的提示 Kind：前端弹
+	// 窗让用户选 Go 的 gRPC/Native 或 Python 的 共享进程/独立进程，选择经
+	// preferred_runtime 重发。isolated 不是用户选项（Watchdog 派生状态）。
+	RuntimePromptPluginRuntime RuntimePromptKind = "plugin_runtime"
 )
 
 // goSDKMirrors 是 Go 工具链官方归档的下载镜像列表（base URL 风格：archive
@@ -65,6 +70,11 @@ type RuntimePromptError struct {
 	// Command 是 Android/Termux 下建议用户执行的补救命令（前端 code 块展示
 	// 并提供复制按钮）。
 	Command string `json:"command,omitempty"`
+	// Language 是运行方式选择提示（RuntimePromptPluginRuntime）探测到的插件
+	// 语言（"go"/"python"，由入口文件 main.go/main.py 判定）。
+	Language string `json:"language,omitempty"`
+	// PluginID 是本次安装的目标插件 id（供前端重发时保持一致）。
+	PluginID string `json:"plugin_id,omitempty"`
 }
 
 func (e *RuntimePromptError) Error() string {
@@ -81,7 +91,7 @@ func (e *RuntimePromptError) Error() string {
 			// 依赖里的 C 扩展包（grpcio/cryptography/pillow/psutil）在
 			// Termux 无预编译 wheel、pip 本地编译失败——而非缺解释器本身。
 			// 这 4 个包 Termux 官方仓库有预编译包；其余依赖均为纯 Python/
-			// 有 wheel，pip 直接装无需 clang。
+			// 有 wheel，pip 直接装无需 C 编译器。
 			e.Command = "pkg install python python-grpcio python-cryptography python-pillow python-psutil"
 			return "无法准备 Python 插件运行环境：缺少 C 扩展依赖的预编译包"
 		default:
@@ -92,6 +102,14 @@ func (e *RuntimePromptError) Error() string {
 	case RuntimePromptPythonDeps:
 		// 依赖分层选择弹窗：首次安装 Python 插件且从未选择过安装模式。
 		return "首次安装 Python 插件：请选择宿主依赖安装模式（lazy 仅安装核心依赖 / full 全量预装）"
+	case RuntimePromptPluginRuntime:
+		// 运行方式选择弹窗：语言已由入口文件探测（main.py → python，main.go
+		// → go），请选择该插件的运行方式（Go：gRPC/Native；Python：共享进程/
+		// 独立进程）。
+		if e.Language == "go" {
+			return "请选择该 Go 插件的运行方式（gRPC 独立子进程 / Native 进程内动态库）"
+		}
+		return "请选择该 Python 插件的首选运行方式（共享进程 / 独立进程）"
 	case RuntimePromptPython:
 		return "无法准备 Python 运行时，需要确认是否自动下载 CPython"
 	default:

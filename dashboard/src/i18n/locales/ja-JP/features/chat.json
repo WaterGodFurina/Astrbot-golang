@@ -23,7 +23,8 @@
     "recordingPrompt": "録音中です。お話しください…",
     "chatPrompt": "チャットしよう！",
     "dropToUpload": "ドロップしてファイルをアップロード",
-    "stopGenerating": "生成を停止"
+    "stopGenerating": "生成を停止",
+    "fileTooLarge": "ファイル {name} は 4GB の上限を超えているため、スキップしました"
   },
   "message": {
     "user": "ユーザー",

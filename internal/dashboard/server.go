@@ -2679,7 +2679,7 @@ func (s *Server) installProgressCallback(installID string) func(downloaded, tota
 }
 
 // installStageCallback builds a callback that records a human-readable phase
-// text (e.g. "下载 C 编译器 (Clang)…", "编译插件…") for the given install_id,
+// text (e.g. "下载 C 编译器 (zig)…", "编译插件…") for the given install_id,
 // shown by the WebUI while no byte progress is available.
 func (s *Server) installStageCallback(installID string) func(text string) {
 	return func(text string) {
