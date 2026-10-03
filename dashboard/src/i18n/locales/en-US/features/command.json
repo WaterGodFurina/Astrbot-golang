@@ -129,6 +129,13 @@
     "runtimeSwitchTitle": "Switch to Native runtime?",
     "runtimeSwitchConfirm": "Continue & switch",
     "runtimeRestartNote": "After changing the runtime, a rebuild and restart of AstrBot are required for it to take effect.",
-    "runtimeCancel": "Cancel"
+    "runtimeCancel": "Cancel",
+    "runtimePythonGrpc": "Separate process",
+    "runtimePythonShared": "Shared process (recommended)",
+    "runtimePythonIsolated": "Separate process",
+    "runtimePythonIsolatedState": "Isolated",
+    "runtimePythonRecovery": "Recovery evaluation",
+    "runtimePythonCurrentShared": "Running in shared process",
+    "runtimePythonCurrentGrpc": "Running in separate process"
   }
 }

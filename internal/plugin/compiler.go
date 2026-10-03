@@ -19,47 +19,49 @@ import (
 
 // sdkModulePath is the module path of the standalone plugin SDK that every
 // plugin links against. Builds `replace` it to the local copy.
-const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 
 // sdkModuleVersion 是宿主内置的插件 SDK 版本（与宿主 go.mod 的 require 一致，
 // 发版时同步 bump）。发布版宿主进程的 CWD 下没有 go.mod，SDK 解析与下载在
 // 找不到 go.mod 时以该常量兜底定位模块缓存，不再依赖进程工作目录。
-const sdkModuleVersion = "v1.7.0"
+const sdkModuleVersion = "v2.0.4"
 
 // nativeEntryUnix 是 Native 构建时注入插件 package main 的生成入口
-// （不改动插件作者源码）。宿主 Loader 加载 .so 后 Lookup 并调用它：
-// 先 sdk.Register(plugin)（plugin 为作者提升的包级变量），再进入 NativeServe。
+// （不改动插件作者源码）。宿主用 plugin.Open 加载 .so 后 Lookup 并调用它：
+// 它把作者声明的包级变量 plugin（*sdk.Plugin）交给 native.Serve，后者跑
+// OnLoad、绑定进程内 HostService，并返回 PluginService 供宿主【直接函数调用】。
+//
+// 注意：Native 插件作者必须用一个非 main 文件声明 `var plugin = &sdk.Plugin{...}`
+// （main() 不执行、且这里按名引用它）。已在 README 记录。
 const nativeEntryUnix = `package main
 
-import sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 
-func AstrBotNativeServe() int {
-	sdk.Register(plugin)
-	return sdk.NativeServe()
+func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
+	return native.Serve(plugin, pluginID)
 }
 `
 
-// nativeEntryWindows 是 Windows Native 构建（-buildmode=c-shared）的生成入口：
-// 通过 //export + import "C" 导出 C ABI 符号 AstrBotNativeServe（C.int、零参数，
-// 地址经共享 env/rendezvous 传递）。C ABI 仅限该加载层入口。
+// nativeEntryWindows 是 Windows Native 构建（-buildmode=c-shared）注入的入口。
+// 宿主用 LoadLibrary 加载 .dll 后 GetProcAddress 调用 C 符号
+// AstrBotPluginOpen/Call/Free/Close（见 SDK native/cabi_windows.go）。本文件只
+// 负责把作者的包级 plugin 变量登记给 SDK（main() 在 c-shared 下不执行）。
 //
-// 不在此声明 func main()：插件作者源码的 main.go 已提供 main()（其内容是
-// sdk.Serve(plugin)），重复声明会编译报 "main redeclared"。c-shared 不需要
-// 本文件再补 main。
+// 注意：不声明 func main()——作者源码已有 main()（内容 sdk.Serve(plugin)），
+// c-shared 下不执行但需存在，重复声明会 "main redeclared"。
 const nativeEntryWindows = `package main
 
-/*
-#include <stdint.h>
-*/
-import "C"
+import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 
-import sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+func init() { native.SetPlugin(plugin) }
+`
 
-//export AstrBotNativeServe
-func AstrBotNativeServe() C.int {
-	sdk.Register(plugin)
-	return C.int(sdk.NativeServe())
-}
+// grpcEntry 是为普通（gRPC 子进程）Go 插件注入的空导入：它链接
+// transport/grpc，使其 init() 注册 sdk.Serve 的真实实现与反向调用拨号器。
+// Native 构建不注入本文件，因此 Native 插件不链接 grpc/go-plugin。
+const grpcEntry = `package main
+
+import _ "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/transport/grpc"
 `
 
 // Compiler builds plugin source into a platform-native executable using the
@@ -151,17 +153,11 @@ func (c *Compiler) Prepare(srcDir, moduleName string) error {
 	if f.Go == nil {
 		_ = f.AddGoStmt("1.23")
 	}
-	hasRequire := false
-	for _, r := range f.Require {
-		if r.Mod.Path == sdkModulePath {
-			hasRequire = true
-			break
-		}
-	}
-	if !hasRequire {
-		if err := f.AddRequire(sdkModulePath, "v0.0.0"); err != nil {
-			return fmt.Errorf("add require: %w", err)
-		}
+	// SDK require 的版本必须与模块路径的主版本一致（/v2 路径要求 v2.x.y）：
+	// 插件模板里的 v0.0.0 对 /v2 非法，故无条件写成宿主内置版本；replace 到
+	// 本地 sdkDir 后该版本仅作占位。
+	if err := f.AddRequire(sdkModulePath, sdkModuleVersion); err != nil {
+		return fmt.Errorf("add require: %w", err)
 	}
 	_ = f.DropReplace(sdkModulePath, "")
 	if err := f.AddReplace(sdkModulePath, "", sdkDir, ""); err != nil {
@@ -172,6 +168,31 @@ func (c *Compiler) Prepare(srcDir, moduleName string) error {
 		return fmt.Errorf("format go.mod: %w", err)
 	}
 	return os.WriteFile(modPath, out, 0o644) // #nosec G306 -- go.mod 常规权限即可
+}
+
+// Tidy re-resolves the plugin module's dependency graph after Prepare replaced
+// the SDK with the local copy. Without it the plugin keeps the indirect versions
+// recorded in its own go.mod (e.g. protobuf v1.34.2 from an older SDK), while the
+// host links the SDK's own versions (v1.36.11). Native plugin.Open requires both
+// sides to share every linked package's exact version, so a stale indirect dep
+// makes it fail with "plugin was built with a different version of package
+// google.golang.org/protobuf/internal/pragma".
+//
+// Failure is non-fatal: a network hiccup leaves the module as-is and the build
+// proceeds (matching the previous behavior) rather than blocking the install.
+func (c *Compiler) Tidy(ctx context.Context, srcDir string) error {
+	goBin, err := c.tc.Ensure()
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, goBin, "mod", "tidy") // #nosec G204 -- 依赖对齐：args 固定; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	cmd.Dir = srcDir
+	cmd.Env = c.tc.BuildEnv(map[string]string{"GOPROXY": c.goproxyEnv(), "GOFLAGS": c.goflagsEnv()})
+	if out, err := cmd.CombinedOutput(); err != nil {
+		logger.I18nWarn("插件 go mod tidy 失败（依赖版本可能落后于宿主 SDK）: %v\n%s", err, out)
+		return nil
+	}
+	return nil
 }
 
 // Vet runs `go vet ./...` in the plugin module.
@@ -233,6 +254,15 @@ func (c *Compiler) build(ctx context.Context, srcDir, outputPath string, progres
 	if err := os.MkdirAll(filepath.Dir(absOut), 0o755); err != nil {
 		return err
 	}
+	// Link the gRPC transport so sdk.Serve (now a grpc-free hook) is populated
+	// in subprocess plugins. Native builds inject native_entry.go instead and do
+	// not link grpc/go-plugin.
+	grpcEntryPath := filepath.Join(srcDir, "grpc_entry.go")
+	if err := os.WriteFile(grpcEntryPath, []byte(grpcEntry), 0o644); err != nil { // #nosec G306 -- 生成文件，常规权限
+		return fmt.Errorf("inject grpc entry: %w", err)
+	}
+	defer os.Remove(grpcEntryPath)
+
 	args := []string{"build"}
 	if outputCb != nil {
 		args = append(args, "-v")
@@ -364,7 +394,7 @@ func (c *Compiler) sdkDir() (string, error) {
 }
 
 // sdkRequireFromGoMod extracts the SDK require version from go.mod contents
-// (single-line form: "github.com/WaterGodFurina/Astrbot-go-plugin-sdk vX.Y.Z").
+// (single-line form: "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 vX.Y.Z").
 func sdkRequireFromGoMod(data []byte) string {
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -526,16 +556,19 @@ func nativeArtifactName(id string) string {
 }
 
 // BuildNative compiles a plugin module into a Native shared library that the
-// host loads in-process (plugin.Open on Unix / LoadDLL on Windows). It injects
-// a generated package-main entry (native_entry.go) exposing AstrBotNativeServe
-// and builds with `-buildmode=plugin` (Unix) / `-buildmode=c-shared` (Windows).
-// CGO must be enabled; cc/cxx come from ensureCCompiler. The injected entry
-// file is removed after the build so the plugin source directory stays
-// untouched.
+// host loads in-process. Platform transport differs but the source shape is the
+// same (`var plugin` + main()):
 //
-// 不需要 `-tags native`：SDK 的 Native 运行时代码总是编译（gRPC 模式下为
-// 死代码），因此宿主与插件对 SDK 包的 build 配置一致，plugin.Open 不校验
-// 自定义 tag。宿主二进制也无需任何自定义 tag。
+//   - Unix: -buildmode=plugin, entry exports AstrBotNativePlugin; host uses
+//     plugin.Open + direct Go calls (zero serialization).
+//   - Windows: -buildmode=c-shared, entry registers the plugin via
+//     native.SetPlugin and the SDK exports the C-handle bridge
+//     (AstrBotPluginOpen/Call/Free/Close); host uses LoadLibrary + sdkv1
+//     protobuf bytes (one marshal round trip).
+//
+// CGO must be enabled; cc/cxx come from ensureCCompiler. The injected entry file
+// is removed after the build so the plugin source directory stays untouched.
+// 两平台都不导入 transport/grpc，故 Native 插件不链接 grpc/go-plugin。
 func (c *Compiler) BuildNative(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc, cc, cxx string, outputCb func(line string)) error {
 	entry := nativeEntryUnix
 	if runtime.GOOS == "windows" {

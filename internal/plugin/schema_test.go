@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 // TestNormalizeSchemaAndDefaults verifies FlatSchema normalizes the
@@ -72,7 +72,7 @@ func TestResolvePluginConfig(t *testing.T) {
 	}
 	raw, _ := json.Marshal(schema)
 	m.instances["test"] = &PluginInstance{
-		Meta: &sdkv1.RegisterResponse{ConfigSchemaJson: raw},
+		Meta: &pluginsdk.PluginInfo{ConfigSchemaJSON: raw},
 	}
 
 	cfg := m.ConfigResolver().ResolvePluginConfig("test")

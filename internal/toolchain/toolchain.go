@@ -69,9 +69,27 @@ type ProgressFunc func(downloaded, total int64)
 func New() *Toolchain {
 	v := os.Getenv(EnvGoVer)
 	if v == "" {
+		// Native 插件用 Go 的 plugin 包在宿主机进程内加载，**要求宿主与插件用
+		// 完全相同的 Go 版本构建**（否则 plugin.Open 报 "runtime: no plugin
+		// module data"）。因此 bundled 工具链默认取宿主自身构建所用的 Go 版本，
+		// 而非固定的 1.24.3——否则宿主随 go.mod（go 1.26）用更新 Go 构建后，
+		// Native 插件永远加载失败。可用 ASTRBOT_GO_VERSION 显式覆盖。
+		v = hostGoVersion()
+	}
+	if v == "" {
 		v = DefaultGoVersion
 	}
 	return &Toolchain{Version: v}
+}
+
+// hostGoVersion 返回本二进制构建所用 Go 版本（"go1.26.8" → "1.26.8"）。
+// devel/不可解析时返回 ""（调用方回退 DefaultGoVersion）。
+func hostGoVersion() string {
+	v := runtime.Version()
+	if !strings.HasPrefix(v, "go1.") {
+		return ""
+	}
+	return strings.TrimPrefix(v, "go")
 }
 
 // GoBin returns the resolved `go` binary path without provisioning, or an

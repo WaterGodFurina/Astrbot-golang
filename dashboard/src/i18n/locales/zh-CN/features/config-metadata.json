@@ -27,14 +27,30 @@
       "description": "Dify 配置",
       "agent_runner": {
         "config": {
-          "dify_api_type": { "description": "应用类型" },
-          "dify_api_key": { "description": "API Key" },
-          "dify_api_base": { "description": "API Base URL" },
-          "dify_workflow_output_key": { "description": "Workflow 输出变量名" },
-          "dify_query_input_key": { "description": "Prompt 输入变量名" },
-          "variables": { "description": "变量" },
-          "timeout": { "description": "超时时间（秒）" },
-          "proxy": { "description": "代理地址" }
+          "dify_api_type": {
+            "description": "应用类型"
+          },
+          "dify_api_key": {
+            "description": "API Key"
+          },
+          "dify_api_base": {
+            "description": "API Base URL"
+          },
+          "dify_workflow_output_key": {
+            "description": "Workflow 输出变量名"
+          },
+          "dify_query_input_key": {
+            "description": "Prompt 输入变量名"
+          },
+          "variables": {
+            "description": "变量"
+          },
+          "timeout": {
+            "description": "超时时间（秒）"
+          },
+          "proxy": {
+            "description": "代理地址"
+          }
         }
       }
     },
@@ -42,12 +58,24 @@
       "description": "Coze 配置",
       "agent_runner": {
         "config": {
-          "coze_api_key": { "description": "API Key" },
-          "bot_id": { "description": "Bot ID" },
-          "coze_api_base": { "description": "API Base URL" },
-          "auto_save_history": { "description": "由 Coze 管理对话记录" },
-          "timeout": { "description": "超时时间（秒）" },
-          "proxy": { "description": "代理地址" }
+          "coze_api_key": {
+            "description": "API Key"
+          },
+          "bot_id": {
+            "description": "Bot ID"
+          },
+          "coze_api_base": {
+            "description": "API Base URL"
+          },
+          "auto_save_history": {
+            "description": "由 Coze 管理对话记录"
+          },
+          "timeout": {
+            "description": "超时时间（秒）"
+          },
+          "proxy": {
+            "description": "代理地址"
+          }
         }
       }
     },
@@ -55,17 +83,35 @@
       "description": "阿里云百炼应用配置",
       "agent_runner": {
         "config": {
-          "dashscope_app_type": { "description": "应用类型" },
-          "dashscope_api_key": { "description": "API Key" },
-          "dashscope_app_id": { "description": "应用 ID" },
-          "rag_options": {
-            "pipeline_ids": { "description": "知识库 Pipeline ID" },
-            "file_ids": { "description": "文件 ID" },
-            "output_reference": { "description": "输出引用" }
+          "dashscope_app_type": {
+            "description": "应用类型"
           },
-          "variables": { "description": "变量" },
-          "timeout": { "description": "超时时间（秒）" },
-          "proxy": { "description": "代理地址" }
+          "dashscope_api_key": {
+            "description": "API Key"
+          },
+          "dashscope_app_id": {
+            "description": "应用 ID"
+          },
+          "rag_options": {
+            "pipeline_ids": {
+              "description": "知识库 Pipeline ID"
+            },
+            "file_ids": {
+              "description": "文件 ID"
+            },
+            "output_reference": {
+              "description": "输出引用"
+            }
+          },
+          "variables": {
+            "description": "变量"
+          },
+          "timeout": {
+            "description": "超时时间（秒）"
+          },
+          "proxy": {
+            "description": "代理地址"
+          }
         }
       }
     },
@@ -73,18 +119,42 @@
       "description": "DeerFlow 配置",
       "agent_runner": {
         "config": {
-          "deerflow_api_base": { "description": "API Base URL" },
-          "deerflow_api_key": { "description": "API Key" },
-          "deerflow_auth_header": { "description": "Authorization Header" },
-          "deerflow_assistant_id": { "description": "Assistant ID" },
-          "deerflow_model_name": { "description": "模型名称覆盖" },
-          "deerflow_thinking_enabled": { "description": "启用思考模式" },
-          "deerflow_plan_mode": { "description": "启用计划模式" },
-          "deerflow_subagent_enabled": { "description": "启用子智能体" },
-          "deerflow_max_concurrent_subagents": { "description": "子智能体最大并发数" },
-          "deerflow_recursion_limit": { "description": "递归深度上限" },
-          "timeout": { "description": "超时时间（秒）" },
-          "proxy": { "description": "代理地址" }
+          "deerflow_api_base": {
+            "description": "API Base URL"
+          },
+          "deerflow_api_key": {
+            "description": "API Key"
+          },
+          "deerflow_auth_header": {
+            "description": "Authorization Header"
+          },
+          "deerflow_assistant_id": {
+            "description": "Assistant ID"
+          },
+          "deerflow_model_name": {
+            "description": "模型名称覆盖"
+          },
+          "deerflow_thinking_enabled": {
+            "description": "启用思考模式"
+          },
+          "deerflow_plan_mode": {
+            "description": "启用计划模式"
+          },
+          "deerflow_subagent_enabled": {
+            "description": "启用子智能体"
+          },
+          "deerflow_max_concurrent_subagents": {
+            "description": "子智能体最大并发数"
+          },
+          "deerflow_recursion_limit": {
+            "description": "递归深度上限"
+          },
+          "timeout": {
+            "description": "超时时间（秒）"
+          },
+          "proxy": {
+            "description": "代理地址"
+          }
         }
       }
     },
@@ -147,7 +217,9 @@
       "agent_runner": {
         "config": {
           "persona": {
-            "persona_id": { "description": "默认采用的人格" },
+            "persona_id": {
+              "description": "默认采用的人格"
+            },
             "safety_mode": {
               "description": "健康模式",
               "hint": "引导模型输出健康、安全的内容，避免有害或敏感话题。"
@@ -342,7 +414,10 @@
             },
             "overflow_strategy": {
               "description": "历史超限或上下文接近上限时的处理方式",
-              "labels": ["按对话轮数截断", "由 LLM 压缩上下文"],
+              "labels": [
+                "按对话轮数截断",
+                "由 LLM 压缩上下文"
+              ],
               "hint": "普通会话历史仅在超过\"压缩前最多保留对话轮数\"后执行该策略；请求发送前也会在上下文 token 接近模型窗口时使用同一策略保护本次请求。"
             },
             "instruction": {
@@ -370,11 +445,16 @@
       "agent_runner": {
         "config": {
           "misc": {
-            "max_steps": { "description": "工具调用轮数上限" },
+            "max_steps": {
+              "description": "工具调用轮数上限"
+            },
             "tool_schema_mode": {
               "description": "工具调用模式",
               "hint": "skills-like 先下发工具名称与描述，再下发参数；full 一次性下发完整参数。",
-              "labels": ["Skills-like（两阶段）", "Full（完整参数）"]
+              "labels": [
+                "Skills-like（两阶段）",
+                "Full（完整参数）"
+              ]
             },
             "tool_call_timeout": {
               "description": "工具调用超时时间(秒)"
@@ -934,6 +1014,14 @@
       "wake_prefix": {
         "description": "唤醒词"
       },
+      "t2i": {
+        "description": "文本转图像输出",
+        "hint": "启用后，机器人发送的文本消息将渲染为图片后再发送。"
+      },
+      "t2i_word_threshold": {
+        "description": "文本转图像字数阈值",
+        "hint": "消息字数达到该阈值时才会转为图片发送，默认 150。"
+      },
       "disable_builtin_commands": {
         "description": "禁用自带指令",
         "hint": "禁用所有 AstrBot 自带指令,如 help, sid, new 等"
@@ -1233,6 +1321,26 @@
         "description": "PyPI 软件仓库地址",
         "hint": "安装 Python 依赖时请求的 PyPI 软件仓库地址。默认为 [https://mirrors.aliyun.com/pypi/simple/](https://mirrors.aliyun.com/pypi/simple/)"
       },
+      "goproxy": {
+        "description": "Go 模块代理地址",
+        "hint": "编译 Go 插件时使用的 Go 模块代理（GOPROXY）。默认为 https://goproxy.cn,direct；多个代理用英文逗号分隔。"
+      },
+      "goflags": {
+        "description": "Go 编译额外参数",
+        "hint": "编译 Go 插件时传递给 Go 工具链的额外参数（GOFLAGS），如 -mod=mod 等。留空表示不附加。"
+      },
+      "python_deps_install_mode": {
+        "description": "Python 依赖安装模式",
+        "hint": "安装 Python 插件依赖的方式：lazy（仅装核心依赖，运行时按需补装）或 full（一次性预装全部宿主依赖）。留空时首次安装会由弹窗询问。"
+      },
+      "plugin_idle_timeout_minutes": {
+        "description": "插件闲置观察时间（分钟）",
+        "hint": "插件无活动超过该分钟数后进入 IDLE（逻辑空闲，未释放内存）；0 = 不单独观察。仅作为新装插件的默认值。"
+      },
+      "plugin_unload_timeout_minutes": {
+        "description": "插件冷卸载时间（分钟）",
+        "hint": "插件闲置超过该分钟数后被回收进程以释放内存，下次触发自动唤醒；0 = 使用内置默认（10 分钟）。作为新装插件开启休眠时的默认阈值。"
+      },
       "callback_api_base": {
         "description": "对外可达的回调接口地址",
         "hint": "外部服务可能会通过 AstrBot 生成的回调链接(如文件下载链接)访问 AstrBot 后端。由于 AstrBot 无法自动判断部署环境中对外可达的主机地址(host),因此需要通过此配置项显式指定外部服务如何访问 AstrBot 的地址。如 [http://localhost:6185](http://localhost:6185),[https://example.com](https://example.com) 等。"
@@ -1431,7 +1539,6 @@
           "工具使用"
         ]
       },
-
       "custom_headers": {
         "description": "自定义请求头",
         "hint": "此处添加的键值对将被合并到 OpenAI SDK 的 default_headers 中，用于自定义 HTTP 请求头。值必须为字符串。"

@@ -293,21 +293,67 @@
       "confirm": "I understand, use Native"
     },
     "c_compiler": {
-      "message": "No usable C compiler detected. Choose a system compiler or download zig automatically"
+      "message": "No usable C compiler detected. Choose a system compiler or download zig cc automatically",
+      "title": "C Compiler",
+      "choose_gcc_hint": "A system GCC was detected. You can use the system GCC or download zig cc automatically",
+      "choose_clang_hint": "A system Clang was detected. You can use the system Clang or download zig cc automatically",
+      "download_hint": "No usable C compiler detected. Confirm whether to download and install zig cc automatically",
+      "cancel": "Cancel",
+      "use_gcc": "Use system GCC",
+      "use_clang": "Use system Clang",
+      "download": "Download zig cc",
+      "mirrorLabel": "zig cc download mirror",
+      "mirrorHint": "Mirror used to download zig cc (default: Huawei Cloud → official ziglang.org)."
     },
     "go_sdk": {
-      "message": "No usable Go toolchain/SDK detected. Confirm whether to download the Go toolchain automatically"
+      "message": "No usable Go toolchain/SDK detected. Confirm whether to download the Go toolchain automatically",
+      "title": "Go Toolchain Missing",
+      "android_hint": "On Android, run the following command to install Go:",
+      "copy": "Copy",
+      "download_hint": "No usable Go toolchain/SDK detected. Confirm whether to download the Go toolchain automatically",
+      "mirrorLabel": "Select a download mirror:",
+      "installed": "Installed",
+      "cancel": "Cancel",
+      "download": "Download"
     },
     "python_runtime": {
-      "message": "Failed to prepare the Python runtime. Confirm whether to download CPython automatically"
+      "message": "Failed to prepare the Python runtime. Confirm whether to download CPython automatically",
+      "title": "Python Runtime Missing",
+      "android_hint": "On Android, run the following command to install Python:",
+      "copy": "Copy",
+      "download_hint": "Failed to prepare the Python runtime. Confirm whether to download CPython automatically",
+      "primaryLabel": "Primary address:",
+      "mirrorLabel": "Select a download mirror:",
+      "installed": "Installed",
+      "cancel": "Cancel",
+      "download": "Download"
     },
     "depsMode": {
       "title": "Choose Python Dependency Install Mode",
-      "desc": "Full install pre-installs all host dependencies (about 3-5 minutes); install on demand only installs core dependencies and automatically installs missing packages at runtime. You can change this anytime in Settings - Network.",
+      "desc": "Full install pre-installs all host dependencies (about 3-5 minutes); install on demand only installs core dependencies and automatically installs missing packages at runtime. You can change this anytime in Settings - Plugins.",
       "lazyLabel": "Install on demand (recommended)",
       "fullLabel": "Full install",
       "hint": "Your choice will be saved to the system config (python_deps_install_mode).",
       "cancel": "Cancel"
+    },
+    "runtime_preference": {
+      "title": "Choose Runtime",
+      "hint": "Plugin language detected. Choose how this plugin runs.",
+      "goGrpc": "gRPC (separate subprocess)",
+      "goGrpcDesc": "Pros: runs in its own process, crashes don't affect the host; supports idle sleep, reload and hot update; process memory is reclaimed by the OS.\nCons: an extra IPC layer per call, slightly slower than Native.",
+      "goNative": "Native (in-process .so/.dll)",
+      "goNativeDesc": "Pros: loaded in-process (.so/.dll), higher performance and lower memory.\nCons: no process isolation, a crash may affect the host; update/disable/uninstall requires restarting AstrBot; no idle sleep.",
+      "pythonShared": "Shared process (recommended)",
+      "pythonSharedDesc": "Pros: multiple plugins share one Python process/interpreter/SDK/deps, significantly lower resident memory.\nCons: no process isolation; interpreter-level state (sys.modules / C extensions) cannot be isolated; the system auto-isolates it to a separate process on failure.",
+      "pythonGrpc": "Separate process",
+      "pythonGrpcDesc": "Pros: one dedicated Python process, process-level isolation (good for plugins using special C extensions, polluting globals, or dependency conflicts).\nCons: one interpreter/SDK per plugin, higher memory usage.",
+      "cancel": "Cancel",
+      "confirm": "OK"
+    },
+    "native_rebuild": {
+      "title": "Recompiling Native plugin",
+      "hint": "A shared-library load failure usually means the prebuilt plugin is ABI-incompatible after a host Go version upgrade. The recompile runs in the background without blocking use and reloads automatically when done. If it keeps failing, reinstall the plugin from the WebUI.",
+      "ok": "Got it"
     }
   },
   "messages": {

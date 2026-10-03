@@ -25,8 +25,8 @@ func TestBlobCreateReadRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if ref.HandleId == "" || len(ref.HandleId) != 32 {
-		t.Fatalf("handle must be 32 hex, got %q", ref.HandleId)
+	if ref.HandleID == "" || len(ref.HandleID) != 32 {
+		t.Fatalf("handle must be 32 hex, got %q", ref.HandleID)
 	}
 	if ref.Size != int64(len(data)) {
 		t.Fatalf("size mismatch: %d vs %d", ref.Size, len(data))
@@ -37,7 +37,7 @@ func TestBlobCreateReadRelease(t *testing.T) {
 	var total int64
 	offset := int64(0)
 	for {
-		chunk, eof, totalSize, err := bs.Read(ref.HandleId, offset, 64)
+		chunk, eof, totalSize, err := bs.Read(ref.HandleID, offset, 64)
 		if err != nil {
 			t.Fatalf("Read: %v", err)
 		}
@@ -56,12 +56,12 @@ func TestBlobCreateReadRelease(t *testing.T) {
 	}
 
 	// Release 后（TTL 极短）Read 应最终失败。
-	if err := bs.Release(ref.HandleId); err != nil {
+	if err := bs.Release(ref.HandleID); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 	time.Sleep(400 * time.Millisecond)
 	bs.gcOnce()
-	if _, _, _, err := bs.Read(ref.HandleId, 0, 64); err == nil {
+	if _, _, _, err := bs.Read(ref.HandleID, 0, 64); err == nil {
 		t.Fatalf("expected error after release+gc")
 	}
 }
@@ -85,7 +85,7 @@ func TestBlobGCRemovesExpired(t *testing.T) {
 	// TTL 200ms，等待过期后 gcOnce 应清理。
 	time.Sleep(400 * time.Millisecond)
 	bs.gcOnce()
-	if _, _, _, err := bs.Read(ref.HandleId, 0, 64); err == nil || !strings.Contains(err.Error(), "not found") {
+	if _, _, _, err := bs.Read(ref.HandleID, 0, 64); err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("expected expired blob gone, got err=%v", err)
 	}
 }

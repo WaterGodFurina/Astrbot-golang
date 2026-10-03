@@ -80,13 +80,19 @@ func buildTestPlugin() string {
 		logger.I18nWarn("BuildTestPlugin: %v", err)
 		return ""
 	}
+	// Link the gRPC transport, mirroring the host's real gRPC build injection.
+	// #nosec G306 -- 临时测试模块源码
+	if err := os.WriteFile(filepath.Join(tmp, "grpc_entry.go"), []byte(grpcEntry), 0o644); err != nil {
+		logger.I18nWarn("BuildTestPlugin: %v", err)
+		return ""
+	}
 	goMod := fmt.Sprintf(`module example.com/astrbot-test-plugin
 
 go 1.23
 
-require github.com/WaterGodFurina/Astrbot-go-plugin-sdk v0.0.0
+require github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.4
 
-replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => %s
+replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 => %s
 `, sdkDir)
 	// #nosec G306 -- 临时测试模块 go.mod
 	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte(goMod), 0o644); err != nil {

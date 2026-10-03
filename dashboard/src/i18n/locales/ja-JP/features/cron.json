@@ -168,6 +168,7 @@
     "createSuccess": "作成しました",
     "createFailed": "作成に失敗しました",
     "runStarted": "実行を開始しました",
-    "runFailed": "実行に失敗しました"
+    "runFailed": "実行に失敗しました",
+    "deleteConfirm": "タスク {name} を削除してもよろしいですか？この操作は元に戻せません。"
   }
 }

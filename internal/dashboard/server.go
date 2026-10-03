@@ -2084,6 +2084,34 @@ func (s *Server) SetRestartFunc(fn func()) {
 	s.restartFunc = fn
 }
 
+// isStaticAssetPath reports whether a WebUI request path targets a concrete
+// file (a content-hashed asset, favicon, robots.txt, index.html, ...) rather
+// than a client-side route. Used to decide SPA fallback eligibility.
+func isStaticAssetPath(p string) bool {
+	if strings.HasPrefix(p, "assets/") {
+		return true
+	}
+	base := p
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		base = p[i+1:]
+	}
+	return strings.Contains(base, ".")
+}
+
+// setWebUICacheControl sets Cache-Control for a served WebUI file:
+//   - HTML (index.html) → no-cache: must revalidate so a redeploy/更新 takes
+//     effect immediately (otherwise clients keep an old index.html);
+//   - other static assets (content-hashed) → immutable 1y.
+func setWebUICacheControl(w http.ResponseWriter, path string) {
+	if strings.HasSuffix(path, ".html") {
+		w.Header().Set("Cache-Control", "no-cache")
+		return
+	}
+	if isStaticAssetPath(path) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+}
+
 // serveWebUI serves the Vue dashboard (AstrBot original WebUI).
 func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 	// Strip leading slash for fs lookup
@@ -2091,6 +2119,10 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 	if cleanPath == "" {
 		cleanPath = "index.html"
 	}
+	// 仅 `/assets/*`（内容哈希构建产物）做「缺失即 404」的严格处理——它是
+	// 缓存投毒（把 HTML 缓存进 *.js URL）的唯一来源。其它任何路径（含用户
+	// 输错的普通路径）仍回退 index.html，交给前端路由渲染（App 自己的 404）。
+	isAsset := strings.HasPrefix(cleanPath, "assets/")
 
 	// Prefer external WebUI directory if configured
 	if s.webuiDir != "" {
@@ -2103,9 +2135,7 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 		}
 		if data, err := os.ReadFile(fsPath); err == nil {
 			w.Header().Set("Content-Type", contentTypeFor(cleanPath))
-			if strings.HasPrefix(cleanPath, "assets/") {
-				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-			}
+			setWebUICacheControl(w, cleanPath)
 			// #nosec no-direct-write-to-responsewriter -- 静态资源服务：内容为 WebUI 自身构建产物（embed/外部目录），
 			// 路径经穿越校验，Content-Type 按扩展名设置，非用户输入内容。
 			_, _ = w.Write(data) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
@@ -2117,6 +2147,14 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 	fsPath := "web/dist/" + cleanPath
 	data, err := webFS.ReadFile(fsPath)
 	if err != nil {
+		if isAsset {
+			// 缺失的**具体文件**（如坏构建下 index.html 引用了不存在的
+			// 内容哈希资源）绝不能回退成 index.html：否则会以 200 + HTML +
+			// `immutable` 缓存返回给一个 *.js/*.css URL，浏览器把 HTML 当
+			// JS 缓存死 → 整个 SPA 永久白屏。返回 404（不缓存）即可。
+			http.NotFound(w, r)
+			return
+		}
 		// SPA fallback: serve index.html for unknown non-file paths
 		// (enables Vue Router history mode)
 		data, err = webFS.ReadFile("web/dist/index.html")
@@ -2124,15 +2162,12 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "WebUI not available", http.StatusInternalServerError)
 			return
 		}
+		cleanPath = "index.html"
 	}
 
 	// Set content type based on file extension
 	w.Header().Set("Content-Type", contentTypeFor(cleanPath))
-
-	// Cache static assets aggressively (they have content hashes in filenames)
-	if strings.HasPrefix(cleanPath, "assets/") {
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	}
+	setWebUICacheControl(w, cleanPath)
 	// #nosec no-direct-write-to-responsewriter -- 静态资源服务：内容为 WebUI 自身构建产物（embed/web/dist），
 	// Content-Type 按扩展名设置，非用户输入内容。
 	_, _ = w.Write(data) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
@@ -2679,7 +2714,7 @@ func (s *Server) installProgressCallback(installID string) func(downloaded, tota
 }
 
 // installStageCallback builds a callback that records a human-readable phase
-// text (e.g. "下载 C 编译器 (Clang)…", "编译插件…") for the given install_id,
+// text (e.g. "下载 C 编译器 (zig)…", "编译插件…") for the given install_id,
 // shown by the WebUI while no byte progress is available.
 func (s *Server) installStageCallback(installID string) func(text string) {
 	return func(text string) {

@@ -9,6 +9,9 @@
     "appearance": {
       "title": "外观"
     },
+    "plugins": {
+      "title": "插件"
+    },
     "network": {
       "title": "网络"
     },
@@ -39,6 +42,13 @@
       "subtitle": "访问 AstrBot GitHub 仓库。"
     }
   },
+  "plugins": {
+    "sleep": {
+      "title": "休眠与卸载",
+      "subtitle": "按插件单独设置闲置休眠、唤醒方式与运行方式。",
+      "button": "前往插件页面设置"
+    }
+  },
   "systemConfig": {
     "restartRequired": "系统配置已保存。部分配置需要重启 AstrBot 后才会生效。",
     "groups": {
@@ -48,7 +58,11 @@
       },
       "network": {
         "title": "代理与依赖源",
-        "subtitle": "运行时代理、Python 依赖安装参数和 PyPI 源。"
+        "subtitle": "运行时网络代理与 PyPI 源。"
+      },
+      "plugins": {
+        "title": "Python 依赖安装",
+        "subtitle": "安装 Python 插件依赖的方式（按需安装 / 全量预装）。"
       },
       "webuiSecurity": {
         "title": "WebUI 安全",

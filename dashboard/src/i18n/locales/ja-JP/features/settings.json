@@ -9,6 +9,9 @@
     "appearance": {
       "title": "外観"
     },
+    "plugins": {
+      "title": "プラグイン"
+    },
     "network": {
       "title": "ネットワーク"
     },
@@ -39,6 +42,13 @@
       "subtitle": "AstrBot の GitHub リポジトリを開きます。"
     }
   },
+  "plugins": {
+    "sleep": {
+      "title": "スリープとアンロード",
+      "subtitle": "プラグインごとにアイドルスリープ、復帰方式、実行方式を設定します。",
+      "button": "プラグインページを開く"
+    }
+  },
   "systemConfig": {
     "restartRequired": "システム設定を保存しました。一部の設定は AstrBot の再起動後に反映されます。",
     "groups": {
@@ -48,7 +58,11 @@
       },
       "network": {
         "title": "プロキシと依存パッケージの取得元",
-        "subtitle": "実行時プロキシ、Python 依存パッケージのインストール設定、PyPI ミラー。"
+        "subtitle": "実行時のネットワークプロキシと PyPI ミラー。"
+      },
+      "plugins": {
+        "title": "Python 依存パッケージのインストール",
+        "subtitle": "Python プラグインの依存パッケージのインストール方法（オンデマンド / 一括事前インストール）。"
       },
       "webuiSecurity": {
         "title": "WebUI セキュリティ",
@@ -301,7 +315,8 @@
       "deleteSuccess": "API キーを削除しました",
       "deleteFailed": "API キーの削除に失敗しました",
       "copySuccess": "API キーをコピーしました",
-      "copyFailed": "API キーのコピーに失敗しました"
+      "copyFailed": "API キーのコピーに失敗しました",
+      "nameRequired": "キー名を入力してください"
     }
   }
 }

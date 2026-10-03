@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/backup"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
@@ -146,8 +146,9 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		}
 	}
 
-	// 插件方案：全面采用子进程插件运行时（go-plugin + gRPC），
-	// 已舍弃 legacy .so 方案（不再加载/桥接 .so 插件）。
+	// 插件方案：gRPC 子进程运行时（go-plugin + gRPC）为默认，另有
+	// Native 进程内 .so 运行时（plugin.Open，直接调用）与 Python 共享
+	// Runtime；三者由 SubprocessManager 统一管理。
 
 	// Apply the log level from config unless ASTRBOT_LOG_LEVEL is set
 	// explicitly in the environment (env takes precedence).
@@ -380,8 +381,13 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	// pip/venv 安装代理：config http_proxy 优先于系统代理，为空时 pip 才回退
 	// 系统 https_proxy（与通用请求"配置为空即直连"不同）。
 	pysdk.SetPipProxy(cfg.GetString("http_proxy"))
-	// 注意：已移除全局 plugin_idle_unload_minutes 同步；
-	// 休眠为单插件独立控制，lifecycle 不再向 runtime 推全局阈值。
+	// 休眠为单插件独立控制，但新增两个全局默认阈值（方案第 6 节「语义分离」）：
+	// plugin_unload_timeout_minutes（开启休眠但未设独立阈值时回填的冷卸载阈值）
+	// 与 plugin_idle_timeout_minutes（ACTIVE→IDLE 观察阈值）。0 = 回退既有行为。
+	l.subPluginMgr.SetIdleTimeouts(
+		cfg.GetInt("plugin_idle_timeout_minutes"),
+		cfg.GetInt("plugin_unload_timeout_minutes"),
+	)
 	// Install reverse-call hooks (CallAction/SendMessage/RecallMessage/
 	// GetConfig/SetConfig/ChatLLM) before plugins load, so handlers can call
 	// back into the host. 同时注入会话/人格/Provider/Star 管理器，供插件
@@ -457,7 +463,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.subPluginMgr.LoadInstalled(runCtx)
 	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.RegisteredPlugins())
 
-	// (已舍弃 legacy .so 方案：不再加载/桥接 .so 插件)
+	// (Native .so 插件由 SubprocessManager 加载并桥接，无需在此单独处理)
 
 	// 11. Load platform adapters from config
 	if err := l.loadPlatforms(runCtx); err != nil {
@@ -1133,7 +1139,7 @@ func (l *Lifecycle) syncHostCapabilities() {
 
 // RebridgePlugins re-registers plugin commands/filters/hooks after plugin
 // changes (enable/disable/reload/install/unload) so the pipeline picks up the
-// latest set. 全面采用子进程插件运行时（legacy .so 已舍弃）。
+// latest set. 插件由 SubprocessManager 以 gRPC 子进程 / Native 进程内 .so / Python 共享 Runtime 三种方式运行。
 func (l *Lifecycle) RebridgePlugins() {
 	if l.starMgr == nil {
 		return

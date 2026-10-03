@@ -196,6 +196,44 @@
                     </div>
                 </section>
 
+                <section id="settings-plugins" class="settings-section" v-show="activeSettingsSection === 'plugins'">
+                    <div class="settings-section__heading">
+                        <div class="settings-section__title">{{ tm('sections.plugins.title') }}</div>
+                    </div>
+                    <div class="settings-section__content">
+                        <template v-if="!systemConfigLoading">
+                            <div
+                                v-for="group in pluginsSystemConfigGroups"
+                                :key="group.key"
+                                class="system-config-group"
+                                @focusout.capture="scheduleSystemConfigAutoSave"
+                            >
+                                <div class="system-config-group__title">{{ group.title }}</div>
+                                <AstrBotConfigV4
+                                    :metadata="group.metadata"
+                                    :iterable="systemConfigData"
+                                    :metadata-key="group.key"
+                                />
+                            </div>
+                        </template>
+
+                        <div class="settings-list-card">
+                            <div class="settings-item">
+                                <div class="settings-item__label">
+                                    <div class="settings-item__title">{{ tm('plugins.sleep.title') }}</div>
+                                    <div class="settings-item__subtitle">{{ tm('plugins.sleep.subtitle') }}</div>
+                                </div>
+                                <div class="settings-item__control">
+                                    <v-btn color="primary" variant="tonal" @click="openPluginsPage">
+                                        <v-icon class="mr-2">mdi-puzzle-outline</v-icon>
+                                        {{ tm('plugins.sleep.button') }}
+                                    </v-btn>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
                 <section id="settings-security" class="settings-section" v-show="activeSettingsSection === 'security'">
                     <div class="settings-section__heading">
                         <div class="settings-section__title">{{ tm('sections.security.title') }}</div>
@@ -504,6 +542,7 @@
 
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
 import { apiKeyApi, systemConfigApi } from '@/api/v1';
 import AstrBotConfigV4 from '@/components/shared/AstrBotConfigV4.vue';
 import WaitingForRestart from '@/components/shared/WaitingForRestart.vue';
@@ -528,6 +567,7 @@ const { t, locale } = useI18n();
 const toastStore = useToastStore();
 const confirmDialog = useConfirmDialog();
 const theme = useTheme();
+const router = useRouter();
 
 const getStoredColor = (key, fallback) => {
     const stored = typeof window !== 'undefined' ? localStorage.getItem(key) : null;
@@ -649,6 +689,7 @@ const apiKeyScopeOrder = availableScopes.flatMap((scope) => [
 const settingsNavItems = computed(() => [
     { id: 'general', label: tm('sections.general.title'), icon: 'mdi mdi-tune-variant' },
     { id: 'appearance', label: tm('sections.appearance.title'), icon: 'mdi mdi-palette-outline' },
+    { id: 'plugins', label: tm('sections.plugins.title'), icon: 'mdi mdi-puzzle-outline' },
     { id: 'network', label: tm('sections.network.title'), icon: 'mdi mdi-lan-connect' },
     { id: 'security', label: tm('sections.security.title'), icon: 'mdi mdi-shield-lock-outline' },
     { id: 'maintenance', label: tm('sections.maintenance.title'), icon: 'mdi mdi-tools' },
@@ -760,7 +801,8 @@ const systemConfigGroups = computed(() => {
 
     return [
         createGroup('runtime', ['timezone', 'callback_api_base']),
-        createGroup('network', ['http_proxy', 'no_proxy', 'goproxy', 'goflags', 'pypi_index_url', 'pip_install_arg', 'python_deps_install_mode']),
+        createGroup('network', ['http_proxy', 'no_proxy', 'goproxy', 'goflags', 'pypi_index_url', 'pip_install_arg']),
+        createGroup('plugins', ['python_deps_install_mode', 'plugin_idle_timeout_minutes', 'plugin_unload_timeout_minutes']),
         createGroup('webuiSecurity', [
             'dashboard.trust_proxy_headers',
             'dashboard.ssl.enable',
@@ -801,6 +843,9 @@ const appearanceSystemConfigGroups = computed(() => systemConfigGroups.value.fil
 )));
 const networkSystemConfigGroups = computed(() => systemConfigGroups.value.filter((group) => (
     group.key === 'network'
+)));
+const pluginsSystemConfigGroups = computed(() => systemConfigGroups.value.filter((group) => (
+    group.key === 'plugins'
 )));
 const securitySystemConfigGroups = computed(() => systemConfigGroups.value.filter((group) => (
     group.key === 'webuiSecurity'
@@ -1149,6 +1194,10 @@ const openBackupDialog = () => {
     }
 };
 
+const openPluginsPage = () => {
+    router.push('/extension/components');
+};
+
 const resetThemeColors = () => {
     primaryColor.value = PurpleTheme.colors.primary;
     secondaryColor.value = PurpleTheme.colors.secondary;
@@ -1163,6 +1212,8 @@ onMounted(async () => {
     const hash = window.location.hash;
     if (hash.includes('settings-appearance')) {
         activeSettingsSection.value = 'appearance';
+    } else if (hash.includes('settings-plugins')) {
+        activeSettingsSection.value = 'plugins';
     } else if (hash.includes('settings-network')) {
         activeSettingsSection.value = 'network';
     } else if (hash.includes('settings-security')) {

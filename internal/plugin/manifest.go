@@ -75,6 +75,29 @@ type ManifestEntry struct {
 	IdleUnloadMinutes int `json:"idle_unload_minutes,omitempty"`
 	// IdleWakeMode 是休眠插件的唤醒方式："hook_and_command" = 指令/工具/过滤器均可唤醒；"command_only"（默认，空值同此）= 仅指令/工具唤醒（钩子从不唤醒，见 runtime wake 路径）。
 	IdleWakeMode string `json:"idle_wake_mode,omitempty"`
+
+	// ── 故障/隔离状态持久化（板块 6；方案用户修订版）─────────────────
+	// Python 是插件健康状态的权威来源；Go Runtime Manager 负责**持久化**
+	// 决策结果（隔离迁移/恢复依据），使状态在 Go 侧崩溃/重启后不丢失。
+	// 注意：ISOLATED 是「当前实例的运行状态」，不是永久处罚——恢复/卸载/
+	// 更新后必须清理或重新评估（见 RecoverState/更新路径）。
+	//
+	// RuntimePreferred / RuntimeCurrent 分离：preferred = 插件正常应运行的
+	// 方式（python-shared）；current = 因故障被隔离后暂用 python-grpc。
+	RuntimePreferred string `json:"runtime_preferred,omitempty"`
+	RuntimeCurrent   string `json:"runtime_current,omitempty"`
+	// HealthState：NORMAL/DEGRADED/UNHEALTHY/ISOLATION_PENDING/ISOLATED/
+	// RECOVERY_PENDING/REMOVED。
+	HealthState  string `json:"health_state,omitempty"`
+	HealthReason string `json:"health_reason,omitempty"`
+	FailureCount int    `json:"failure_count,omitempty"`
+	// IsolationRequired：当前插件实例是否需保持隔离（恢复/更新后重新评估）。
+	IsolationRequired  bool  `json:"isolation_required,omitempty"`
+	LastFailureTime    int64 `json:"last_failure_time,omitempty"` // Unix 秒
+	RecoveryGeneration int64 `json:"recovery_generation,omitempty"`
+	// SourceHash：插件内容身份（版本 + 源码哈希），更新后据此判断「是否
+	// 继承旧故障状态」——v1.3.0 更新后不应继续沿用 v1.2.0 的 ISOLATED。
+	SourceHash string `json:"source_hash,omitempty"`
 }
 
 // LoadManifest reads a manifest file, tolerating absence.

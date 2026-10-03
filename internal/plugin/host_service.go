@@ -13,8 +13,7 @@ import (
 	"sync"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
@@ -319,6 +318,38 @@ func resolvePluginConfig(m *SubprocessManager, name string) map[string]any {
 		return map[string]any{}
 	}
 	return m.ConfigResolver().ResolvePluginConfig(id)
+}
+
+// resolvePluginConfigByID 是 resolvePluginConfig 的租户精确版本：入参已是
+// manifest plugin_id（多租户/shared Runtime 由插件侧 current PluginSession
+// 提供），直接按 id 取配置，**不再**做注册名解析——消除同名歧义。
+func resolvePluginConfigByID(m *SubprocessManager, id string) map[string]any {
+	if m == nil || id == "" {
+		return map[string]any{}
+	}
+	return m.ConfigResolver().ResolvePluginConfig(id)
+}
+
+// injectPluginConfigSchema 把插件的配置 JSON Schema 以扁平 __schema__ 注入
+// 配置 dict（插件 self.config.schema 直接按顶层 key 访问）。id 为空（无法
+// 定位）时不注入，避免串用他人 schema。
+func injectPluginConfigSchema(m *SubprocessManager, id string, cfg map[string]any) map[string]any {
+	if cfg == nil {
+		cfg = map[string]any{}
+	}
+	if m == nil || id == "" {
+		return cfg
+	}
+	s := m.ConfigSchema(id)
+	if len(s) == 0 {
+		return cfg
+	}
+	if props, ok := s["properties"].(map[string]any); ok {
+		cfg["__schema__"] = props
+	} else {
+		cfg["__schema__"] = s
+	}
+	return cfg
 }
 
 // serializeConversation 把会话对象序列化为 SDK 约定的 map（对齐 Python
@@ -751,35 +782,13 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			// 带全量默认键（Python AstrBot 语义），裸配置缺键会让插件
 			// KeyError（如 box 的 config["protect_ids"]）。
 			cfg := resolvePluginConfig(subMgr, pluginName)
-			if cfg == nil {
-				return map[string]any{}, nil
-			}
-			// 附带配置 schema（if available），SDK 侧 AstrBotConfig 提取
-			// __schema__ 挂到自身 schema 属性，使插件 __init__ 里
-			// self.config.schema 可访问（update_manager 等依赖此属性
-			// 动态填充 options/labels）。
+			// 附带配置 schema（if available）：id == ""（同名多变体歧义）时
+			// 不附加 schema，避免串用他人 schema。
+			id := ""
 			if subMgr != nil {
-				id := subMgr.pluginConfigID(pluginName)
-				// id == ""（同名多变体歧义）时不附加 schema：避免把另一个
-				// 变体的 schema 串给调用方（get_config 的默认值合并已在上方
-				// resolvePluginConfig 同样 fail-closed）。
-				if id != "" {
-					// __schema__ 注入**扁平**结构（对齐原版插件期望）：插件侧
-					// self.config.schema 是"配置项名 → 元数据"的 dict，插件
-					// 直接按顶层 key 访问（如 update_manager 的
-					// schema.get("white_plugin_list")）。Register 上报的
-					// ConfigSchemaJson 是 WebUI 用的 {"type","properties"}
-					// 包装（SDK _load_config_schema），需展开 properties。
-					if s := subMgr.ConfigSchema(id); len(s) > 0 {
-						if props, ok := s["properties"].(map[string]any); ok {
-							cfg["__schema__"] = props
-						} else {
-							cfg["__schema__"] = s
-						}
-					}
-				}
+				id = subMgr.pluginConfigID(pluginName)
 			}
-			return cfg, nil
+			return injectPluginConfigSchema(subMgr, id, cfg), nil
 		},
 		SetConfig: func(pluginName string, cfg map[string]any) error {
 			if subMgr == nil {
@@ -790,6 +799,22 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 				return fmt.Errorf("无法唯一定位插件 %q 的配置（可能同名多变体），已拒绝写入以避免跨变体覆盖", pluginName)
 			}
 			return subMgr.SaveConfig(id, cfg)
+		},
+		// 多租户精确版本：入参为 manifest plugin_id（shared Runtime 由插件侧
+		// current PluginSession 注入），直接按 id 解析配置/schema，不依赖注册名
+		//（同名插件不再歧义；A 的读写严格落在 A 的 id 上）。
+		GetConfigByID: func(pluginID string) (map[string]any, error) {
+			cfg := resolvePluginConfigByID(subMgr, pluginID)
+			return injectPluginConfigSchema(subMgr, pluginID, cfg), nil
+		},
+		SetConfigByID: func(pluginID string, cfg map[string]any) error {
+			if subMgr == nil {
+				return fmt.Errorf("plugin manager not available")
+			}
+			if pluginID == "" {
+				return fmt.Errorf("缺少 plugin_id，拒绝写入配置")
+			}
+			return subMgr.SaveConfig(pluginID, cfg)
 		},
 		RegisterBridgeHook: func(pluginName, hookName string) error {
 			if subMgr == nil {
@@ -818,7 +843,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		},
 
 		// ── 大文件 Blob 存储（P0-2）──
-		CreateBlob: func(data []byte, mimeType, filename string, ttlSeconds int32) (*sdkv1.FileReference, error) {
+		CreateBlob: func(data []byte, mimeType, filename string, ttlSeconds int32) (*pluginsdk.FileReference, error) {
 			bs := getBlobStore()
 			if bs == nil {
 				return nil, fmt.Errorf("blob store not initialized")
@@ -836,7 +861,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			return bs.Read(handleID, offset, limit)
 		},
-		GetBlobInfo: func(handleID string) (*sdkv1.FileReference, error) {
+		GetBlobInfo: func(handleID string) (*pluginsdk.FileReference, error) {
 			bs := getBlobStore()
 			if bs == nil {
 				return nil, fmt.Errorf("blob store not initialized")
@@ -854,24 +879,24 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			return bs.Release(handleID)
 		},
-		ChatLLM: func(req *sdkv1.ChatLLMRequest) (string, error) {
+		ChatLLM: func(req *pluginsdk.ChatLLMRequest) (string, error) {
 			if chatLLM == nil {
 				return "", fmt.Errorf("ChatLLM not configured on this host")
 			}
 			cmd := ChatLLMCmd{
 				Prompt:       req.Prompt,
 				SystemPrompt: req.SystemPrompt,
-				ImageURLs:    req.ImageUrls,
-				AudioURLs:    req.AudioUrls,
-				ProviderID:   req.ProviderId,
+				ImageURLs:    req.ImageURLs,
+				AudioURLs:    req.AudioURLs,
+				ProviderID:   req.ProviderID,
 			}
-			if len(req.ToolsJson) > 0 {
-				if err := json.Unmarshal(req.ToolsJson, &cmd.Tools); err != nil {
+			if len(req.ToolsJSON) > 0 {
+				if err := json.Unmarshal(req.ToolsJSON, &cmd.Tools); err != nil {
 					return "", fmt.Errorf("ChatLLM tools_json 解析失败: %w", err)
 				}
 			}
-			if len(req.ContextsJson) > 0 {
-				if err := json.Unmarshal(req.ContextsJson, &cmd.Contexts); err != nil {
+			if len(req.ContextsJSON) > 0 {
+				if err := json.Unmarshal(req.ContextsJSON, &cmd.Contexts); err != nil {
 					return "", fmt.Errorf("ChatLLM contexts_json 解析失败: %w", err)
 				}
 			}
@@ -1943,10 +1968,10 @@ func RegisterCronFeedHandler(m *cron.CronJobManager, subMgr *SubprocessManager) 
 		}
 		rpcCtx, cancel := context.WithTimeout(ctx, pluginCronFeedTimeout)
 		defer cancel()
-		if _, err := inst.Client.FeedCronJob(rpcCtx, &sdkv1.FeedCronJobRequest{
-			JobId:       job.ID,
+		if _, err := inst.Client.FeedCronJob(rpcCtx, pluginsdk.FeedCronJobRequest{
+			JobID:       job.ID,
 			JobName:     job.Name,
-			PayloadJson: payloadJSON,
+			PayloadJSON: payloadJSON,
 			RunAt:       time.Now().Format(time.RFC3339),
 		}); err != nil {
 			// UNIMPLEMENTED：旧 SDK 插件（编译时不带 FeedCronJob RPC），

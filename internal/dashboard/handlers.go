@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/backup"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
@@ -2164,7 +2164,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		var body struct {
 			PluginID string `json:"plugin_id"`
 			Native   *bool  `json:"native"`
-			Confirm  bool   `json:"confirm"`
+			// Runtime 是显式运行方式（Python：python-grpc/python-shared/
+			// python-isolated；Go：grpc/native）。为空时回退 Native 布尔。
+			Runtime string `json:"runtime"`
+			Confirm bool   `json:"confirm"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
@@ -2177,6 +2180,17 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 		pid, _, ok := s.resolveSubprocessPlugin(body.PluginID)
 		if !ok {
 			writeJSON(w, http.StatusOK, apiError("插件不存在或不可用"))
+			return
+		}
+		// 显式 runtime（含 Python 三值）：直接设置偏好并重载。
+		if body.Runtime != "" {
+			if err := s.subPluginMgr.SetPluginRuntimePreference(pid, body.Runtime); err != nil {
+				writeJSON(w, http.StatusOK, apiError(err.Error()))
+				return
+			}
+			writeJSON(w, http.StatusOK, apiOKMsg("插件运行方式已更新（需重载生效）", map[string]interface{}{
+				"runtime": body.Runtime,
+			}))
 			return
 		}
 		if body.Confirm {
@@ -2593,7 +2607,7 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	var source, id, installID string
 	var ignoreRisk bool
 	var native bool
-	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror, depsChoice string
+	var ccChoice, goChoice, pythonChoice, goMirror, pythonMirror, depsChoice, preferredRuntime, zigMirror string
 	var installMethod, registryURL, registryName, marketPluginID, repo, downloadURL string
 
 	method := "url"
@@ -2604,22 +2618,24 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	switch method {
 	case "url", "git", "github":
 		var body struct {
-			URL            string `json:"url"`
-			IgnoreRisk     bool   `json:"ignore_risk"`
-			Native         bool   `json:"native"`
-			CCChoice       string `json:"cc_choice"`
-			GoChoice       string `json:"go_choice"`
-			PythonChoice   string `json:"python_choice"`
-			GoMirror       string `json:"go_mirror"`
-			PythonMirror   string `json:"python_mirror"`
-			DepsChoice     string `json:"deps_choice"`
-			InstallID      string `json:"install_id"`
-			InstallMethod  string `json:"install_method"`
-			RegistryURL    string `json:"registry_url"`
-			RegistryName   string `json:"registry_name"`
-			MarketPluginID string `json:"market_plugin_id"`
-			Repo           string `json:"repo"`
-			DownloadURL    string `json:"download_url"`
+			URL              string `json:"url"`
+			IgnoreRisk       bool   `json:"ignore_risk"`
+			Native           bool   `json:"native"`
+			CCChoice         string `json:"cc_choice"`
+			GoChoice         string `json:"go_choice"`
+			PythonChoice     string `json:"python_choice"`
+			GoMirror         string `json:"go_mirror"`
+			PythonMirror     string `json:"python_mirror"`
+			DepsChoice       string `json:"deps_choice"`
+			PreferredRuntime string `json:"preferred_runtime"`
+			ZigMirror        string `json:"zig_mirror"`
+			InstallID        string `json:"install_id"`
+			InstallMethod    string `json:"install_method"`
+			RegistryURL      string `json:"registry_url"`
+			RegistryName     string `json:"registry_name"`
+			MarketPluginID   string `json:"market_plugin_id"`
+			Repo             string `json:"repo"`
+			DownloadURL      string `json:"download_url"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, apiError("无效的 JSON: "+err.Error()))
@@ -2634,6 +2650,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		goMirror = strings.TrimSpace(body.GoMirror)
 		pythonMirror = strings.TrimSpace(body.PythonMirror)
 		depsChoice = strings.TrimSpace(body.DepsChoice)
+		preferredRuntime = strings.TrimSpace(body.PreferredRuntime)
+		zigMirror = strings.TrimSpace(body.ZigMirror)
 		installID = body.InstallID
 		installMethod = body.InstallMethod
 		registryURL = body.RegistryURL
@@ -2689,6 +2707,8 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 		goMirror = strings.TrimSpace(r.FormValue("go_mirror"))
 		pythonMirror = strings.TrimSpace(r.FormValue("python_mirror"))
 		depsChoice = strings.TrimSpace(r.FormValue("deps_choice"))
+		preferredRuntime = strings.TrimSpace(r.FormValue("preferred_runtime"))
+		zigMirror = strings.TrimSpace(r.FormValue("zig_mirror"))
 		installID = r.FormValue("install_id")
 		installMethod = r.FormValue("install_method")
 		registryURL = r.FormValue("registry_url")
@@ -2766,22 +2786,26 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 	}
 
 	inst, err := s.subPluginMgr.InstallFromSource(ctx, id, source, plugin.InstallOptions{
-		IgnoreRisk:     ignoreRisk,
-		Native:         native,
-		CCChoice:       ccChoice,
-		GoChoice:       goChoice,
-		PythonChoice:   pythonChoice,
-		GoMirror:       goMirror,
-		PythonMirror:   pythonMirror,
-		DepsChoice:     depsChoice,
-		Progress:       s.installProgressCallback(installID),
-		Stage:          s.installStageCallback(installID),
-		InstallMethod:  installMethod,
-		RegistryURL:    registryURL,
-		RegistryName:   registryName,
-		MarketPluginID: marketPluginID,
-		Repo:           repo,
-		DownloadURL:    downloadURL,
+		IgnoreRisk:              ignoreRisk,
+		Native:                  native,
+		CCChoice:                ccChoice,
+		GoChoice:                goChoice,
+		PythonChoice:            pythonChoice,
+		GoMirror:                goMirror,
+		PythonMirror:            pythonMirror,
+		DepsChoice:              depsChoice,
+		PythonRuntimePreference: preferredRuntime,
+		RuntimeChoice:           preferredRuntime,
+		PromptRuntime:           true,
+		ZigCCMirror:             zigMirror,
+		Progress:                s.installProgressCallback(installID),
+		Stage:                   s.installStageCallback(installID),
+		InstallMethod:           installMethod,
+		RegistryURL:             registryURL,
+		RegistryName:            registryName,
+		MarketPluginID:          marketPluginID,
+		Repo:                    repo,
+		DownloadURL:             downloadURL,
 	})
 	if err != nil {
 		var riskErr *plugin.RiskError
@@ -2807,11 +2831,16 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 				"code":    "c_compiler_prompt",
 				"message": ccErr.Error(),
 				"data": map[string]interface{}{
-					"kind":        string(ccErr.Kind),
-					"has_gcc":     ccErr.HasGCC,
-					"gcc_path":    ccErr.GCCPath,
-					"gcc_xx_path": ccErr.GCCXXPath,
-					"gcc_version": ccErr.GCCVersion,
+					"kind":          string(ccErr.Kind),
+					"has_gcc":       ccErr.HasGCC,
+					"gcc_path":      ccErr.GCCPath,
+					"gcc_xx_path":   ccErr.GCCXXPath,
+					"gcc_version":   ccErr.GCCVersion,
+					"has_clang":     ccErr.HasClang,
+					"clang_path":    ccErr.ClangPath,
+					"clang_xx_path": ccErr.ClangXXPath,
+					"clang_version": ccErr.ClangVersion,
+					"mirrors":       ccErr.Mirrors,
 				},
 			})
 			return
@@ -2823,6 +2852,22 @@ func (s *Server) handlePluginInstall(w http.ResponseWriter, r *http.Request, par
 			switch runtimeErr.Kind {
 			case plugin.RuntimePromptPython:
 				code = "python_runtime_prompt"
+			case plugin.RuntimePromptPluginRuntime:
+				// 运行方式选择（语言已由入口文件探测）：前端弹窗让用户选
+				// Go 的 gRPC/Native 或 Python 的 共享进程/独立进程，
+				// 选择经 preferred_runtime 重发。
+				s.setInstallProgress(installID, &installStatus{Status: "installing", Text: "等待选择运行方式…"})
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"status":  "error",
+					"code":    "plugin_runtime_prompt",
+					"message": runtimeErr.Error(),
+					"data": map[string]interface{}{
+						"kind":      string(runtimeErr.Kind),
+						"language":  runtimeErr.Language,
+						"plugin_id": runtimeErr.PluginID,
+					},
+				})
+				return
 			case plugin.RuntimePromptPythonDeps:
 				// 依赖分层模式未选择：data 带 config_key 供前端写回提示。
 				s.setInstallProgress(installID, &installStatus{Status: "installing", Text: "等待选择依赖安装模式…"})
@@ -3194,7 +3239,7 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 	// Register 快照（对齐 ListTools 模式）。
 	hasWebAPI := false
 	if inst.Meta != nil {
-		hasWebAPI = len(inst.Meta.WebApis) > 0
+		hasWebAPI = len(inst.Meta.WebAPIs) > 0
 	}
 	webAPICtx, webAPICancel := context.WithTimeout(r.Context(), 30*time.Second)
 	descs, listErr := inst.Client.ListWebApis(webAPICtx)
@@ -3210,68 +3255,60 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 		return
 	}
 
-	// 组装请求（query 多值 / headers / body / multipart 文件）
-	req := &sdkv1.HandleWebRequestRequest{
-		Method: r.Method,
-		Path:   "/" + pluginPath,
+	// 组装请求（query 多值 / headers / body / multipart 表单字段）
+	req := pluginsdk.HandleWebRequest{
+		Method:  r.Method,
+		Path:    "/" + pluginPath,
+		Query:   map[string][]string{},
+		Headers: map[string][]string{},
 	}
 	for k, vs := range r.URL.Query() {
 		// 宿主鉴权凭据不转发给插件（防泄露）：api_key / key / token query 通道剥离。
 		if pluginProxyBlockedQuery(k) {
 			continue
 		}
-		for _, v := range vs {
-			req.Query = append(req.Query, &sdkv1.WebKV{Key: k, Value: v})
-		}
+		req.Query[k] = append(req.Query[k], vs...)
 	}
 	for k, vs := range r.Header {
 		if pluginProxyBlockedHeader(k) {
 			continue
 		}
-		for _, v := range vs {
-			req.Headers = append(req.Headers, &sdkv1.WebKV{Key: k, Value: v})
-		}
+		req.Headers[k] = append(req.Headers[k], vs...)
 	}
 	// 注入宿主解析出的可信调用者身份（对齐 Python PluginRequest.username /
 	// DashboardRequestState.username）。宿主凭据本身不转发，仅此身份头可信。
 	if caller := s.pluginCallerUsername(r); caller != "" {
-		req.Headers = append(req.Headers, &sdkv1.WebKV{Key: "X-AstrBot-Username", Value: caller})
+		req.Headers["X-AstrBot-Username"] = append(req.Headers["X-AstrBot-Username"], caller)
 	}
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		if err := r.ParseMultipartForm(64 << 20); err == nil {
 			if r.MultipartForm != nil {
-				for field, files := range r.MultipartForm.File {
-					for _, fh := range files {
-						f, err := fh.Open()
-						if err != nil {
-							continue
-						}
-						content, err := io.ReadAll(io.LimitReader(f, 64<<20+1))
-						_ = f.Close()
-						if err != nil {
-							continue
-						}
-						if len(content) > 64<<20 {
-							writeJSON(w, http.StatusRequestEntityTooLarge, apiError("文件过大（上限 64MB）"))
-							return
-						}
-						req.Files = append(req.Files, &sdkv1.WebUploadFile{
-							Field:       field,
-							Filename:    fh.Filename,
-							ContentType: fh.Header.Get("Content-Type"),
-							Content:     content,
-						})
-					}
-				}
 				for k, vs := range r.MultipartForm.Value {
 					// multipart 表单字段同样可能承载 api_key/key/token
 					// 凭据，必须与 URL query 一样剥离后再转发。
 					if pluginProxyBlockedQuery(k) {
 						continue
 					}
-					for _, v := range vs {
-						req.Query = append(req.Query, &sdkv1.WebKV{Key: k, Value: v})
+					req.Query[k] = append(req.Query[k], vs...)
+				}
+				for field, fhs := range r.MultipartForm.File {
+					for _, fh := range fhs {
+						f, ferr := fh.Open()
+						if ferr != nil {
+							continue
+						}
+						content, rerr := io.ReadAll(io.LimitReader(f, 64<<20))
+						_ = f.Close()
+						if rerr != nil {
+							continue
+						}
+						req.Files = append(req.Files, pluginsdk.WebUploadFile{
+							Field:       field,
+							Filename:    fh.Filename,
+							ContentType: fh.Header.Get("Content-Type"),
+							Content:     content,
+						})
 					}
 				}
 			}
@@ -3288,12 +3325,12 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 		writeJSON(w, http.StatusOK, apiError("插件 Web API 调用失败: "+err.Error()))
 		return
 	}
-	status := int(resp.StatusCode)
+	status := resp.StatusCode
 	if status <= 0 {
 		status = http.StatusNotFound
 	}
-	for _, kv := range resp.Headers {
-		w.Header().Set(kv.Key, kv.Value)
+	for k, v := range resp.Headers {
+		w.Header().Set(k, v)
 	}
 	w.WriteHeader(status)
 	// #nosec no-direct-write-to-responsewriter -- 插件 Web API 代理：原样透传插件
@@ -5086,8 +5123,8 @@ func (s *Server) listTools() []interface{} {
 				continue
 			}
 			params := map[string]interface{}{}
-			if len(entry.Desc.ParamsJson) > 0 {
-				_ = json.Unmarshal(entry.Desc.ParamsJson, &params)
+			if len(entry.Desc.ParamsSchemaJSON) > 0 {
+				_ = json.Unmarshal(entry.Desc.ParamsSchemaJSON, &params)
 			}
 			display := nameByID[entry.PluginID]
 			if display == "" {

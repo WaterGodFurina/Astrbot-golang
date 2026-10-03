@@ -24,13 +24,15 @@
   "type": {
     "command": "コマンド",
     "group": "コマンドグループ",
-    "subCommand": "サブコマンド"
+    "subCommand": "サブコマンド",
+    "sleep": "スリープポリシー"
   },
   "status": {
     "enabled": "有効",
     "disabled": "無効",
     "pluginDisabled": "プラグイン無効",
-    "conflict": "競合あり"
+    "conflict": "競合あり",
+    "pluginInactive": "先にプラグインを有効化してください"
   },
   "permission": {
     "groupAdmin": "グループ内のみ管理者に制限",
@@ -78,7 +80,8 @@
     "renameFailed": "名前を変更できませんでした",
     "loadFailed": "コマンド一覧を読み込めませんでした",
     "updateSuccess": "更新しました",
-    "updateFailed": "更新できませんでした"
+    "updateFailed": "更新できませんでした",
+    "operationFailed": "操作に失敗しました"
   },
   "search": {
     "placeholder": "コマンドを検索…"
@@ -98,5 +101,41 @@
     "byStatus": "状態で絞り込む",
     "showSystemPlugins": "システムプラグインのコマンドを表示",
     "systemPluginConflictHint": "システムプラグインに関する競合があります。非表示にするには、先に競合を解消してください"
+  },
+  "sleep": {
+    "globalMinutesLabel": "新規プラグインの既定スリープ（分）",
+    "globalMinutesDesc": "新規プラグインの既定スリープ時間",
+    "globalMinutesHint": "新規インストールしたプラグインの既定アイドルしきい値としてのみ使用されます。0 = 既定で常駐となり、個別に設定済みのプラグインは上書きしません。",
+    "columnPlugin": "プラグイン",
+    "columnLanguage": "プラグイン言語",
+    "columnAllow": "スリープを許可",
+    "columnMinutes": "アイドル時間（分）",
+    "columnWake": "復帰方式",
+    "wakeCommandOnly": "プラグインコマンドとツールで復帰",
+    "wakeHookAndCommand": "プラグインコマンド、ツール、フィルターで復帰",
+    "commandOnlyRisk": "「プラグインコマンドとツールで復帰」を選択すると、スリープ後にプロセスが終了され、スリープ中はパッシブメッセージ/イベントを主動的に受信せず、フックでは復帰しません",
+    "columnRisk": "リスク",
+    "residentLabel": "常駐",
+    "noPlugins": "有効なプラグインがありません",
+    "globalSaved": "新規プラグインの既定スリープ時間を保存しました",
+    "pluginSaved": "プラグインのスリープポリシーを更新しました",
+    "intro": "プラグインごとにアイドル自動スリープを個別に設定します。有効にすると、プラグインのプロセスが設定した分数に達した時点で回収されてメモリが解放され、次回のトリガー時に自動で復帰します（透過的に復元）。既定は常駐（無効）です。",
+    "columnRuntime": "実行方式",
+    "runtimeGrpc": "サブプロセス（gRPC）",
+    "runtimeNative": "プロセス内（Native）",
+    "runtimeNativeHint": "Native 実行方式はプラグインをプロセス内の動的ライブラリ（.so/.dll）として読み込みます。性能は高いですが、クラッシュするとホストに影響する可能性があり、スリープ、再読み込み、ホットアップデートに対応していません。有効化には再起動が必要です。",
+    "runtimeOnlyGo": "Go プラグインのみ",
+    "runtimeSaved": "プラグインの実行方式を更新しました（再起動で有効）",
+    "runtimeSwitchTitle": "Native 実行方式に切り替えますか？",
+    "runtimeSwitchConfirm": "続行して切り替える",
+    "runtimeRestartNote": "実行方式の変更後は、再ビルドと AstrBot の再起動が必要です。",
+    "runtimeCancel": "キャンセル",
+    "runtimePythonGrpc": "独立プロセス",
+    "runtimePythonShared": "共有プロセス（推奨）",
+    "runtimePythonIsolated": "独立プロセス",
+    "runtimePythonIsolatedState": "分離済み",
+    "runtimePythonRecovery": "復旧評価中",
+    "runtimePythonCurrentShared": "共有プロセスで実行中",
+    "runtimePythonCurrentGrpc": "独立プロセスで実行中"
   }
 }

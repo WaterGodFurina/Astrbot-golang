@@ -1,7 +1,7 @@
-// Package plugin - subprocess runtime management extensions: dashboard-facing
-// list/enable/disable/uninstall and config storage, mirroring the legacy .so
-// manager's extensions.go semantics but backed by the install manifest and
-// compiled binaries instead of .so files.
+// Package plugin - plugin runtime management extensions: dashboard-facing
+// list/enable/disable/uninstall and config storage, backed by the install
+// manifest and per-runtime artifacts (gRPC child-process executables, Native
+// .so libraries, or Python source trees).
 package plugin
 
 import (
@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 )
 
@@ -27,15 +27,15 @@ import (
 // pluginHasMetaFilters/Hooks/PassiveEvents 报告插件是否声明了需要主动接收
 // 宿主事件的过滤器/钩子（闲置休眠后进程已终止，无法再被动监听，供 WebUI
 // 风险提示）。
-func pluginHasMetaFilters(meta *sdkv1.RegisterResponse) bool {
+func pluginHasMetaFilters(meta *pluginsdk.PluginInfo) bool {
 	return meta != nil && len(meta.Filters) > 0
 }
 
-func pluginHasMetaHooks(meta *sdkv1.RegisterResponse) bool {
+func pluginHasMetaHooks(meta *pluginsdk.PluginInfo) bool {
 	return meta != nil && len(meta.Hooks) > 0
 }
 
-func pluginHasPassiveEvents(meta *sdkv1.RegisterResponse) bool {
+func pluginHasPassiveEvents(meta *pluginsdk.PluginInfo) bool {
 	return pluginHasMetaFilters(meta) || pluginHasMetaHooks(meta)
 }
 
@@ -112,6 +112,10 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"root_dir_name":           "",
 			"star_handler_full_names": []string{},
 		}
+		// 板块 5/6：附 Python 状态镜像与持久化故障/隔离状态。
+		addStatusMirror(info, inst, e)
+		// Native 异步重编译状态（加载失败后后台重编译，供 WebUI 弹窗）。
+		info["native_rebuild"] = m.nativeRebuildStatus(inst.ID)
 		if e != nil {
 			info["repo"] = e.Repo
 			if info["repo"] == "" {
@@ -141,7 +145,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 	// 较大，一次性持锁拷贝指针比逐个 HandlerMetaByID 反复加锁更省；
 	// 元数据本身只读，锁外通过快照访问是安全的。
 	m.handlerMetaMu.RLock()
-	metaSnapshot := make(map[string]*sdkv1.RegisterResponse, len(m.handlerMeta))
+	metaSnapshot := make(map[string]*pluginsdk.PluginInfo, len(m.handlerMeta))
 	for mid, meta := range m.handlerMeta {
 		metaSnapshot[mid] = meta
 	}
@@ -198,9 +202,68 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"pages":                   e.Pages,
 			"root_dir_name":           e.ID,
 			"star_handler_full_names": []string{},
+			// 板块 5：未加载实例无状态镜像。休眠（已启用未加载）标记 SLEEPING，
+			// 禁用标记 UNLOADED；health 恒 NORMAL（未运行无故障判定）。
+			"python_state":  idlePlaceholderState(e.Enabled),
+			"python_health": "NORMAL",
+			"python_error":  "",
+			"last_activity": 0.0,
+			"generation":    int64(0),
+			"status_seen":   false,
+			// 板块 6：持久化的故障/隔离状态（未加载也展示，供前端/恢复决策）。
+			"health_state":       e.HealthState,
+			"health_reason":      e.HealthReason,
+			"isolation_required": e.IsolationRequired,
+			"runtime_preferred":  e.RuntimePreferred,
+			"runtime_current":    e.RuntimeCurrent,
+			// Native 异步重编译状态（加载失败后后台重编译，供 WebUI 弹窗）。
+			"native_rebuild": m.nativeRebuildStatus(e.ID),
 		})
 	}
 	return result
+}
+
+// addStatusMirror 把 PluginInstance 的 Python 状态镜像（板块 5）与持久化的
+// 故障/隔离状态（板块 6）写入 ListInfo 条目。仅 Python 插件有意义；Go/Native
+// 插件也附空值以保持字段一致。
+func addStatusMirror(info map[string]interface{}, inst *PluginInstance, e *ManifestEntry) {
+	state, health, errStr, lastActivity, generation, seen := inst.StatusMirror()
+	info["python_state"] = state
+	info["python_health"] = health
+	info["python_error"] = errStr
+	info["last_activity"] = lastActivity
+	info["generation"] = generation
+	info["status_seen"] = seen
+	// 板块 6：持久化的故障/隔离状态（Go Runtime Manager 决策依据）。
+	healthState := ""
+	healthReason := ""
+	isolationRequired := false
+	preferred := ""
+	current := ""
+	if e != nil {
+		healthState = e.HealthState
+		healthReason = e.HealthReason
+		isolationRequired = e.IsolationRequired
+		// preferred 规范化暴露为 shared/grpc（isolated 只是派生状态，不作为
+		// 用户可见的首选值）；仅 Python 插件有意义。
+		if e.Language == "python" {
+			preferred = pluginPreferredRuntime(e)
+		}
+		current = e.RuntimeCurrent
+	}
+	info["health_state"] = healthState
+	info["health_reason"] = healthReason
+	info["isolation_required"] = isolationRequired
+	info["runtime_preferred"] = preferred
+	info["runtime_current"] = current
+}
+
+// idlePlaceholderState 返回未加载实例（休眠/禁用）占位的插件状态。
+func idlePlaceholderState(enabled bool) string {
+	if enabled {
+		return "SLEEPING" // 已启用但进程不在：闲置自动卸载后的休眠态
+	}
+	return "UNLOADED" // 已禁用
 }
 
 // pluginDisplayName resolves the display name shown in the WebUI: manifest
@@ -444,11 +507,29 @@ func (m *SubprocessManager) SetEnabled(id string, enabled bool) error {
 // runtimeOf 返回插件的运行方式："grpc"（缺省）或 "native"。优先取运行中
 // 实例的 Runtime，其次取 manifest 记录。
 func runtimeOf(inst *PluginInstance, e *ManifestEntry) string {
+	// 运行中实例的 Runtime 是权威（含 shared/native/grpc 三态的当前值）。
 	if inst != nil && inst.Runtime != "" {
 		return inst.Runtime
 	}
-	if e != nil && e.Runtime == "native" {
-		return "native"
+	if e != nil {
+		// Go 插件回退 grpc/native。
+		if e.Runtime == "native" {
+			return "native"
+		}
+		if e.Language == "python" {
+			// 未加载（休眠/占位）时按实际当前方式回显（python-shared /
+			// python-grpc）；无 current 则按首选推导。
+			if e.RuntimeCurrent != "" {
+				return e.RuntimeCurrent
+			}
+			if pluginPreferredRuntime(e) == "grpc" {
+				return "python-grpc"
+			}
+			return "python-shared"
+		}
+		if e.RuntimePreferred != "" {
+			return e.RuntimePreferred
+		}
 	}
 	return "grpc"
 }
@@ -800,9 +881,9 @@ func (m *SubprocessManager) ConfigSchema(id string) map[string]interface{} {
 			}
 		}
 	}
-	if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
+	if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJSON) > 0 {
 		var schema map[string]interface{}
-		if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
+		if err := json.Unmarshal(inst.Meta.ConfigSchemaJSON, &schema); err != nil {
 			logger.I18nWarn("ConfigSchema(%s): %v", id, err)
 		} else {
 			return schema
@@ -826,13 +907,13 @@ func (m *SubprocessManager) schemaCachePath(id string) string {
 
 // cacheConfigSchema persists a loaded plugin's config schema so the WebUI can
 // render its config dialog even while the plugin is disabled (unloaded).
-func (m *SubprocessManager) cacheConfigSchema(id string, meta *sdkv1.RegisterResponse) {
-	if meta == nil || len(meta.ConfigSchemaJson) == 0 {
+func (m *SubprocessManager) cacheConfigSchema(id string, meta *pluginsdk.PluginInfo) {
+	if meta == nil || len(meta.ConfigSchemaJSON) == 0 {
 		return
 	}
 	path := m.schemaCachePath(id)
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)           // #nosec G301 -- 配置 schema 缓存目录（WebUI 需读取）
-	_ = os.WriteFile(path, meta.ConfigSchemaJson, 0o644) // #nosec G306 -- schema 缓存非常规敏感信息
+	_ = os.WriteFile(path, meta.ConfigSchemaJSON, 0o644) // #nosec G306 -- schema 缓存非常规敏感信息
 }
 
 // Components returns the plugin's behavior components (commands / llm tools /
@@ -1084,11 +1165,11 @@ func (m *SubprocessManager) FlatSchemaByID(id string) map[string]interface{} {
 	}
 
 	// Fallback to the Register snapshot.
-	if inst.Meta == nil || len(inst.Meta.ConfigSchemaJson) == 0 {
+	if inst.Meta == nil || len(inst.Meta.ConfigSchemaJSON) == 0 {
 		return map[string]interface{}{}
 	}
 	var schema map[string]interface{}
-	if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
+	if err := json.Unmarshal(inst.Meta.ConfigSchemaJSON, &schema); err != nil {
 		return map[string]interface{}{}
 	}
 	if props, ok := schema["properties"].(map[string]interface{}); ok {

@@ -5,8 +5,9 @@ import (
 	"net"
 	"testing"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/gen/sdkv1"
+	sdkv1grpc "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/gen/sdkv1grpc"
+	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/transport/grpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -16,11 +17,11 @@ import (
 // schema"（如 update_manager 动态填充 options），模拟插件运行中更新
 // config.schema 后宿主实时拉取的场景。
 type mockSchemaService struct {
-	sdkv1.UnimplementedPluginServiceServer
+	sdkv1grpc.UnimplementedPluginServiceServer
 	schemaJSON []byte
 }
 
-func (s *mockSchemaService) GetConfigSchema(_ context.Context, _ *sdkv1.Empty) (*sdkv1.GetConfigSchemaResponse, error) {
+func (s *mockSchemaService) GetConfigSchema(_ context.Context, _ *sdkv1.PluginRef) (*sdkv1.GetConfigSchemaResponse, error) {
 	return &sdkv1.GetConfigSchemaResponse{SchemaJson: s.schemaJSON}, nil
 }
 
@@ -30,7 +31,7 @@ func TestConfigSchemaOnDemand(t *testing.T) {
 
 	lis := bufconn.Listen(1024 * 1024)
 	srv := grpc.NewServer()
-	sdkv1.RegisterPluginServiceServer(srv, &mockSchemaService{schemaJSON: updated})
+	sdkv1grpc.RegisterPluginServiceServer(srv, &mockSchemaService{schemaJSON: updated})
 	go srv.Serve(lis)
 	defer srv.Stop()
 
@@ -44,7 +45,7 @@ func TestConfigSchemaOnDemand(t *testing.T) {
 	}
 	defer conn.Close()
 
-	client := pluginsdk.NewClient(conn)
+	client := grpctransport.NewClient(conn)
 	m := NewSubprocessManager(nil, t.TempDir())
 	inst := &PluginInstance{
 		ID:       "test_plugin_python",

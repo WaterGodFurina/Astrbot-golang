@@ -293,21 +293,67 @@
       "confirm": "我已知晓，使用 Native"
     },
     "c_compiler": {
-      "message": "未检测到可用的 C 编译器，需要选择系统编译器或自动下载 zig"
+      "message": "未检测到可用的 C 编译器，需要选择系统编译器或自动下载 zig cc",
+      "title": "C 编译器",
+      "choose_gcc_hint": "检测到系统已安装 GCC，可选择使用系统 GCC 或自动下载 zig cc",
+      "choose_clang_hint": "检测到系统已安装 Clang，可选择使用系统 Clang 或自动下载 zig cc",
+      "download_hint": "未检测到可用的 C 编译器，需要确认是否自动下载并安装 zig cc",
+      "cancel": "取消",
+      "use_gcc": "使用系统 GCC",
+      "use_clang": "使用系统 Clang",
+      "download": "下载 zig cc",
+      "mirrorLabel": "zig cc 下载镜像",
+      "mirrorHint": "下载 zig cc 时使用的镜像源（默认华为云 → 官方 ziglang.org）。"
     },
     "go_sdk": {
-      "message": "未检测到可用的 Go 工具链/SDK，需要确认是否自动下载 Go 工具链"
+      "message": "未检测到可用的 Go 工具链/SDK，需要确认是否自动下载 Go 工具链",
+      "title": "Go 工具链缺失",
+      "android_hint": "在 Android 上请运行以下命令安装 Go：",
+      "copy": "复制",
+      "download_hint": "未检测到可用的 Go 工具链/SDK，需要确认是否自动下载 Go 工具链",
+      "mirrorLabel": "选择下载镜像：",
+      "installed": "已安装",
+      "cancel": "取消",
+      "download": "自动下载"
     },
     "python_runtime": {
-      "message": "无法准备 Python 运行时，需要确认是否自动下载 CPython"
+      "message": "无法准备 Python 运行时，需要确认是否自动下载 CPython",
+      "title": "Python 运行时缺失",
+      "android_hint": "在 Android 上请运行以下命令安装 Python：",
+      "copy": "复制",
+      "download_hint": "无法准备 Python 运行时，需要确认是否自动下载 CPython",
+      "primaryLabel": "主地址：",
+      "mirrorLabel": "选择下载镜像：",
+      "installed": "已安装",
+      "cancel": "取消",
+      "download": "自动下载"
     },
     "depsMode": {
       "title": "选择 Python 依赖安装方式",
-      "desc": "完整安装将预装全部宿主依赖（约 3-5 分钟）；需要时安装仅装核心依赖，运行缺包时自动补装。可随时在 设置-网络 中修改。",
+      "desc": "完整安装将预装全部宿主依赖（约 3-5 分钟）；需要时安装仅装核心依赖，运行缺包时自动补装。可随时在 设置-插件 中修改。",
       "lazyLabel": "需要时安装（推荐）",
       "fullLabel": "完整安装",
       "hint": "选择后此设置将保存到系统配置（python_deps_install_mode）。",
       "cancel": "取消"
+    },
+    "runtime_preference": {
+      "title": "选择运行方式",
+      "hint": "已检测到插件语言，请为该插件选择运行方式。",
+      "goGrpc": "gRPC（独立子进程）",
+      "goGrpcDesc": "优点：独立子进程运行，崩溃不影响宿主；支持闲置休眠、重载与热更新；进程内存可被系统回收。\n缺点：每次交互多一层进程间通信，性能略低于 Native。",
+      "goNative": "Native（进程内动态库）",
+      "goNativeDesc": "优点：进程内加载（.so/.dll），性能高、内存省。\n缺点：无进程级隔离，崩溃可能影响宿主；更新/禁用/卸载需重启 AstrBot；不支持闲置休眠。",
+      "pythonShared": "共享进程（推荐）",
+      "pythonSharedDesc": "优点：多个插件共用一个 Python 进程，共享解释器/SDK/依赖，显著降低常驻内存。\n缺点：无进程级隔离，sys.modules / C 扩展等解释器级状态无法隔离；故障时系统会自动将其隔离到独立进程。",
+      "pythonGrpc": "独立进程",
+      "pythonGrpcDesc": "优点：独占一个 Python 进程，进程级隔离，互不干扰（适合依赖特殊 C 扩展、污染全局状态或依赖版本冲突的插件）。\n缺点：每插件一份解释器/SDK 开销，内存占用更高。",
+      "cancel": "取消",
+      "confirm": "确定"
+    },
+    "native_rebuild": {
+      "title": "Native 插件正在重新编译",
+      "hint": "链接库加载失败通常是宿主 Go 版本升级后与旧插件 ABI 不兼容所致。重编译在后台进行，不阻塞使用；完成后会自动重新加载。若长时间失败，请在 WebUI 重新安装该插件。",
+      "ok": "我知道了"
     }
   },
   "messages": {

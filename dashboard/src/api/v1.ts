@@ -1312,6 +1312,12 @@ export const pluginApi = {
       { plugin_id: pluginId, native },
     );
   },
+  setRuntimeMode(pluginId: string, runtime: string) {
+    return apiV1Client.post<ApiEnvelope<{ runtime?: string }>>(
+      `/plugins/runtime`,
+      { plugin_id: pluginId, runtime },
+    );
+  },
   confirmNative(pluginId: string) {
     return apiV1Client.post<ApiEnvelope<unknown>>(`/plugins/runtime`, {
       plugin_id: pluginId,

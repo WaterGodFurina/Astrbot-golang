@@ -42,20 +42,25 @@
     }
   },
   "messageOverview": {
-    "title": "メッセージ"
+    "title": "メッセージ",
+    "subtitle": "ボットメッセージデータの統計"
   },
   "messageTrend": {
     "title": "メッセージの推移",
-    "totalMessages": "メッセージ総数"
+    "totalMessages": "メッセージ総数",
+    "subtitle": "{range} の時間別集計"
   },
   "platformRanking": {
-    "title": "プラットフォーム別メッセージランキング"
+    "title": "プラットフォーム別メッセージランキング",
+    "subtitle": "{range} の集計メッセージ総量順"
   },
   "modelCalls": {
-    "title": "AI モデル"
+    "title": "AI モデル",
+    "subtitle": "モデル呼び出しデータの統計"
   },
   "modelTrend": {
-    "title": "モデル呼び出しの推移"
+    "title": "モデル呼び出しの推移",
+    "subtitle": "モデル呼び出しトークン（Tokens）の推移統計"
   },
   "modelTotal": {
     "title": "{range}のモデル呼び出し合計",
@@ -66,11 +71,13 @@
     "successRate": "呼び出し成功率"
   },
   "modelRanking": {
-    "title": "モデル使用量ランキング"
+    "title": "モデル使用量ランキング",
+    "subtitle": "モデル呼び出しトークン（Tokens）のランキング"
   },
   "sessionRanking": {
     "title": "{range}のセッション別モデル使用量上位 10 件",
-    "openConversation": "会話を見る"
+    "openConversation": "会話を見る",
+    "subtitle": "トークン（Tokens）使用量が最大のセッションランキング"
   },
   "empty": {
     "platformStats": "プラットフォーム別メッセージ統計データはありません。",

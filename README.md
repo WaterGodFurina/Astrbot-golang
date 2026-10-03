@@ -9,7 +9,7 @@
 
 ## 项目简介
 
-AstrBot-golang 是一个**高性能、可扩展**的聊天机器人框架，原生支持 **18 个消息平台**、**14 类 LLM Provider**、**子进程插件系统**（兼容 Python/Go 插件）以及 **WebUI 管理面板**。项目采用纯 Go 编写，核心二进制不依赖 CGO，可轻松跨平台部署（Windows / macOS / Linux / Termux）。
+AstrBot-golang 是一个**高性能、可扩展**的聊天机器人框架，原生支持 **18 个消息平台**、**14 类 LLM Provider**、**插件系统**（原生 Go 插件 + 兼容 Python 插件）以及 **WebUI 管理面板**。项目采用纯 Go 编写，核心二进制不依赖 CGO，可轻松跨平台部署（Windows / macOS / Linux / Termux）。
 
 ---
 
@@ -64,19 +64,44 @@ astrbot-go/
 
 ## 插件系统
 
-插件系统采用 子进程方案（go-plugin + gRPC），保证隔离性和稳定性
+AstrBot-Golang 支持 Go 与 Python 插件，通过插件目录里的 main.go / main.py 自动识别类型。Go 插件默认独立进程运行、Python 插件默认共享进程运行，插件之间互不影响；为防止宿主被强制退出后残留插件进程，程序启动时会自动清理孤儿进程。
 
-为防止因为宿主强退而带来的插件孤儿进程，本项目在启动时会检查孤儿进程是否存在，如果有，则会执行清理
+### 插件的运行方式
+
+本项目原生支持 **Go 插件**，同时为兼容 AstrBot 生态支持 **Python 插件**。同一个插件可以在管理面板里选择运行方式。
+
+**Go 插件**（原生支持）：
+
+- **独立进程**（默认）：每个插件单独一个进程，通过 gRPC 与宿主通信，稳定、进程隔离彻底。
+- **Native 方式**：直接加载 `.so` / `.dll` 在宿主进程内运行，启动更快、更省内存，但**没有进程隔离**，且要求主程序以 `CGO_ENABLED=1` 构建（详见「构建」）。
+
+**Python 插件**（为兼容 AstrBot 生态）：
+
+- **共享进程**（默认，推荐）：多个 Python 插件共用一个进程，内存占用大幅降低，适合同时安装了很多插件的用户。
+- **独立进程**：一个插件一个进程，进程级隔离最好；代价是每个 Python 插件大约占用 60-80MB 内存。
+
+插件运行出错时，系统会自动把它切换到独立进程隔离运行；如果它随后稳定运行超过 5 分钟，再自动切回原来的方式。
+
+### 插件之间会互相干扰吗？
+
+不会。即使是共享进程，每个插件的以下内容也都是各自独立、互不可见的：
+
+- 指令、事件过滤器、钩子
+- LLM 工具（供大模型调用的函数）
+- 配置项（每个插件只读写自己的配置，不会串）
+- 后台任务
+
+卸载、报错或更新其中一个插件，都不会影响其他插件。
+
+> 说明：共享进程提供的是"各插件数据互不干扰"的逻辑隔离，并不隔离 Python 解释器本身——所有 Python 插件仍共用同一套 Python 包。如果某个插件需要完全独立的运行环境，请把它设为"独立进程"。
 
 ### 核心特性
 
-- 跨语言兼容：支持 Go 与 Python 插件，通过 main.go / main.py 自动识别类型。
-- 进程隔离：每个插件运行在独立子进程中，崩溃自动重启（带退避与次数上限）。
-- 热重载：零停机更新（先起新进程，再杀旧进程）。
-- 闲置休眠：可配置 plugin_idle_unload_minutes，超时无 RPC 活动的插件进程被终止（内存归还），但命令/过滤器/LLM 工具仍保留在注册表中；下次触发时自动懒加载唤醒，用户无感。
-- 兼容 AstrBot 生态：Python 插件通过独立 gRPC 桥接，支持直接从市场安装（zip/Git），requirements.txt 自动安装依赖，_conf_schema.json 渲染 WebUI 配置面板。
-
-> 注意：Python 插件每个进程约占用 60-80MB 内存（因 gRPC 隔离）。
+- 跨语言兼容：支持 Go 与 Python 插件，自动识别类型。
+- 崩溃自愈：独立进程插件崩溃后自动重启（带退避与次数上限）。
+- 热重载：更新插件无需停机。
+- 闲置休眠：可配置 plugin_idle_unload_minutes，闲置超时的插件进程会被回收内存，其指令 / 过滤器 / LLM 工具仍保留，下次触发时自动唤醒，用户无感。
+- 兼容 AstrBot 生态：Python 插件支持直接从插件市场安装（zip / Git），自动安装 requirements.txt 依赖，_conf_schema.json 自动生成配置面板。
 
 ---
 
@@ -113,7 +138,8 @@ golang 插件通过[独立 module](github.com/WaterGodFurina/astrbot-go-plugin-s
 为兼容 AstrBot 生态，Python 插件通过[独立 module](github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk) 桥接进宿主。
 
 - API 对齐：astrbot.api.* 与 astrbot.core.* 对齐 Python AstrBot v4.28.2
-- 能力桥接：Context.get_all_stars/get_all_providers 等经宿主 RPC 反向调用；session_waiter 跨进程喂入
+- 能力桥接：Context.get_all_stars/get_all_providers 等经宿主反调用；session_waiter 跨进程喂入
+- 运行方式：支持独立进程与共享进程两种（见上文「插件的运行方式」），插件代码无需改动
 
 #### 自带 Python 解释器
 
@@ -211,12 +237,20 @@ go build -o astrbot ./cmd/astrbot/main.go
 ## 构建
 
 ```bash
-# 主程序（纯 Go，无需 CGO，CGO_ENABLED=0 亦可）
-go build -o bin/astrbot ./cmd/astrbot
+# 方式一（推荐）：需要 Native（.so/.dll）插件支持 —— 必须开启 CGO，
+# 且系统需已安装 C 编译器（gcc / clang）
+CGO_ENABLED=1 go build -o bin/astrbot ./cmd/astrbot
+
+# 方式二：只用 go-plugin（gRPC）插件、不需要 Native 插件 —— 可关闭 CGO，
+# 纯 Go 构建，可交叉编译静态二进制
+CGO_ENABLED=0 go build -o bin/astrbot ./cmd/astrbot
 ```
 
-CGO 说明：主程序使用纯 Go SQLite 驱动（modernc.org/sqlite），不依赖 CGO，可交叉编译出静态二进制，适合 Windows / macOS / Linux（含 Termux）及无 GCC 的 Docker 环境。
-仅当插件在 metadata.json 中声明 "cgo": true 时才需要 C 编译器（宿主自动选择 zig/clang/GCC）。
+**CGO 说明：**
+
+- **Native 插件（Go 的 `.so` / `.dll` 加载方式）依赖标准库 `plugin`，而 `plugin` 必须启用 cgo。因此要使用 Native 插件，主程序必须用 `CGO_ENABLED=1` 构建（本机需有 C 编译器）。**
+- 若不需要 Native 插件，可用 `CGO_ENABLED=0` 构建：主程序使用纯 Go SQLite 驱动（modernc.org/sqlite），不依赖 CGO，可交叉编译出静态二进制，适合 Windows / macOS / Linux（含 Termux）及无 GCC 的 Docker 环境。
+- 编译**声明了 `"cgo": true` 的插件**时，宿主在缺少 C 编译器时会**自动下载并安装 zig cc**（内置 clang），无需用户手动安装 gcc/clang；下载版本与镜像可用 `ASTRBOT_CLANG_VERSION` / `ASTRBOT_CLANG_MIRROR` 控制，详见「cgo 支持」。
 
 - 模块路径：github.com/WaterGodFurina/Astrbot-golang
 - 插件 SDK：作为普通依赖从 GitHub 拉取（github.com/WaterGodFurina/Astrbot-go-plugin-sdk），无需本地 replace，直接 go build 即可（需联网拉取依赖）。
@@ -240,8 +274,8 @@ go test ./... -v
 
 ## 代码规模
 
-- Go 文件：410 个（非测试 226，测试 128，58 个包）
-- 代码行数：约 14万 行 （含**测试代码**）
+- Go 文件：453 个（非测试 284，测试 169，58 个包）
+- 代码行数：约 16 万 行 （含**测试代码**）
 - 平台适配器：18 个
 - Provider 能力：Chat 14 / TTS 9 / STT 2 / Embedding 5 / Rerank 5
 - 对齐版本：Python AstrBot v4.28.2

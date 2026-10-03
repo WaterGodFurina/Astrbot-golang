@@ -1,0 +1,167 @@
+package plugin
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// TestPluginWantsSharedRuntime 验证运行方式分流与隔离迁移的判定逻辑（纯逻辑，
+// 不启动子进程）：Runtime/RuntimePreferred 决定是否接入共享 Runtime；隔离
+// （ISOLATION_PENDING/ISOLATED/isolation_required）与首选 grpc（独立进程）
+// 一律走独立进程；RECOVERY_PENDING 按首选（shared）重新评估。
+func TestPluginWantsSharedRuntime(t *testing.T) {
+	m := newTestManager(t)
+	man := &Manifest{Version: 1}
+	man.Plugins = []ManifestEntry{
+		{ID: "shared", Language: "python", RuntimePreferred: "shared"},
+		{ID: "grpc", Language: "python", RuntimePreferred: "grpc"},
+		{ID: "legacy_iso", Language: "python", RuntimePreferred: "python-isolated"},
+		{ID: "pref_empty", Language: "python", RuntimePreferred: ""},
+		{ID: "pending", Language: "python", RuntimePreferred: "shared", HealthState: HealthIsolationPending, IsolationRequired: true},
+		{ID: "isolated", Language: "python", RuntimePreferred: "shared", HealthState: HealthIsolated, IsolationRequired: true},
+		{ID: "recover", Language: "python", RuntimePreferred: "shared", HealthState: HealthRecoveryPending},
+	}
+	if err := man.Save(m.manifestPath()); err != nil {
+		t.Fatalf("save manifest: %v", err)
+	}
+
+	cases := map[string]bool{
+		"shared":     true,
+		"grpc":       false,
+		"legacy_iso": false,
+		"pref_empty": true,  // 空 → 默认 shared
+		"pending":    false, // 隔离中：走 python-grpc
+		"isolated":   false,
+		"recover":    true, // 更新后按首选（shared）重新尝试共享
+	}
+	for id, want := range cases {
+		if got := m.pluginWantsSharedRuntime(id); got != want {
+			t.Errorf("pluginWantsSharedRuntime(%s) = %v, want %v", id, got, want)
+		}
+	}
+	// 未安装插件 → false
+	if m.pluginWantsSharedRuntime("nope") {
+		t.Error("unknown plugin should not want shared runtime")
+	}
+}
+
+// TestSetPluginRuntimePreference 验证运行方式偏好的持久化与校验（preferred 取值
+// 只有 shared/grpc；isolated 是派生状态，不作为用户选项）。
+func TestSetPluginRuntimePreference(t *testing.T) {
+	m := newTestManager(t)
+	man := &Manifest{Version: 1, Plugins: []ManifestEntry{{ID: "p", Language: "python"}}}
+	if err := man.Save(m.manifestPath()); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if err := m.SetPluginRuntimePreference("p", "shared"); err != nil {
+		t.Fatalf("set shared: %v", err)
+	}
+	pref, cur := m.PluginRuntimeOf("p")
+	if pref != "shared" || cur != "python-shared" {
+		t.Errorf("runtime pref/cur = %q/%q, want shared/python-shared", pref, cur)
+	}
+	if err := m.SetPluginRuntimePreference("p", "grpc"); err != nil {
+		t.Fatalf("set grpc: %v", err)
+	}
+	pref, cur = m.PluginRuntimeOf("p")
+	if pref != "grpc" || cur != "python-grpc" {
+		t.Errorf("runtime pref/cur = %q/%q, want grpc/python-grpc", pref, cur)
+	}
+	if err := m.SetPluginRuntimePreference("p", "bogus"); err == nil {
+		t.Error("invalid runtime should error")
+	}
+	if err := m.SetPluginRuntimePreference("missing", "grpc"); err == nil {
+		t.Error("unknown plugin should error")
+	}
+}
+
+// TestIsolationStateMachine 验证隔离/恢复状态机的持久化流转。
+func TestIsolationStateMachine(t *testing.T) {
+	m := newTestManager(t)
+	man := &Manifest{Version: 1, Plugins: []ManifestEntry{{ID: "p", Language: "python"}}}
+	if err := man.Save(m.manifestPath()); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// UNHEALTHY 上报 → ISOLATION_PENDING（立即持久化）。
+	if err := m.MarkIsolationPending("p", "plugin_unhealthy"); err != nil {
+		t.Fatalf("mark pending: %v", err)
+	}
+	if state, reason, iso := m.PluginHealthStateOf("p"); state != HealthIsolationPending || !iso || reason != "plugin_unhealthy" {
+		t.Fatalf("after pending: state=%q reason=%q iso=%v", state, reason, iso)
+	}
+	if !m.IsIsolationPending("p") {
+		t.Error("IsIsolationPending should be true")
+	}
+
+	// 迁移完成 → ISOLATED。
+	if err := m.SetPluginHealthState("p", HealthIsolated, "plugin_unhealthy"); err != nil {
+		t.Fatalf("set isolated: %v", err)
+	}
+	if !m.IsIsolationPending("p") {
+		t.Error("IsIsolationPending should stay true while ISOLATED")
+	}
+
+	// 恢复 → NORMAL（清隔离）。
+	if err := m.ClearPluginIsolation("p"); err != nil {
+		t.Fatalf("clear isolation: %v", err)
+	}
+	if state, _, iso := m.PluginHealthStateOf("p"); state != HealthNormal || iso {
+		t.Fatalf("after clear: state=%q iso=%v", state, iso)
+	}
+	if m.IsIsolationPending("p") {
+		t.Error("IsIsolationPending should be false after clear")
+	}
+}
+
+// TestContentFingerprint 验证内容指纹：同内容稳定、内容变更后改变、缓存目录
+// 不影响指纹（避免 __pycache__ 造成误判）。
+func TestContentFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("print(1)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "__pycache__"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "__pycache__", "main.cpython-312.pyc"), []byte("junk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h1 := contentFingerprint(dir)
+	if h1 == "" {
+		t.Fatal("fingerprint 为空")
+	}
+	// 改变 __pycache__ 内容不影响指纹
+	if err := os.WriteFile(filepath.Join(dir, "__pycache__", "main.cpython-312.pyc"), []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if h2 := contentFingerprint(dir); h2 != h1 {
+		t.Errorf("__pycache__ 变化不应改变指纹: %s != %s", h1, h2)
+	}
+	// 改变源码内容改变指纹
+	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("print(2)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if h3 := contentFingerprint(dir); h3 == h1 {
+		t.Error("源码变化应改变指纹")
+	}
+}
+
+// TestSetIdleTimeouts 验证全局休眠/卸载默认阈值的注入与回退。
+func TestSetIdleTimeouts(t *testing.T) {
+	m := newTestManager(t)
+	// 默认回退内置常量。
+	if got := m.defaultIdleUnloadMinutes(); got != DefaultIdleUnloadMinutes {
+		t.Errorf("default = %d, want %d", got, DefaultIdleUnloadMinutes)
+	}
+	m.SetIdleTimeouts(1, 20)
+	if got := m.defaultIdleUnloadMinutes(); got != 20 {
+		t.Errorf("after set = %d, want 20", got)
+	}
+	// 负值归零 → 回退内置默认。
+	m.SetIdleTimeouts(-5, -5)
+	if got := m.defaultIdleUnloadMinutes(); got != DefaultIdleUnloadMinutes {
+		t.Errorf("after negative = %d, want %d", got, DefaultIdleUnloadMinutes)
+	}
+}

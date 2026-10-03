@@ -35,3 +35,9 @@ coverage.out
 # 适配器测试运行时误写包目录的数据（应走 ASTRBOT_DATA_PATH / 仓库根 data/）
 /internal/platform/sources/*/data/
 /internal/**/data/
+
+# ===== Go workspace（仅本地开发：指向 SDK 本地检出）=====
+# 勿提交：release/CI runner 上没有 ../AstrbotDev/astrbot-go-plugin-sdk，提交的
+# go.work 会让所有平台的 go build 因"目录不存在"失败。依赖走 go.mod require。
+/go.work
+/go.work.sum

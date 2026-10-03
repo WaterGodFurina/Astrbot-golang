@@ -23,8 +23,9 @@ import (
 	"testing"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/gen/sdkv1"
+	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/transport/grpc"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 	"google.golang.org/protobuf/proto"
 )
@@ -134,7 +135,7 @@ func BenchmarkRpcPathEventJSON(b *testing.B) {
 func BenchmarkRpcPathProtoEventBytes(b *testing.B) {
 	for _, size := range []int{1 << 10, 10 << 10, 100 << 10} {
 		ev := makeEvent(b, size)
-		req := &sdkv1.HandleCommandRequest{Name: "cmd", Args: []string{"a"}, Event: pluginsdk.EventToSDKEvent(ev)}
+		req := &sdkv1.HandleCommandRequest{Name: "cmd", Args: []string{"a"}, Event: grpctransport.EventToSDKEvent(ev)}
 		b.Run(fmt.Sprintf("size_%dKB", size>>10), func(b *testing.B) {
 			b.ReportAllocs()
 			var once []byte
@@ -278,7 +279,7 @@ func BenchmarkRpcPathBlobFileRef(b *testing.B) {
 				}
 				var off int64
 				for {
-					chunk, eof, _, err := bs.Read(ref.HandleId, off, 1<<20)
+					chunk, eof, _, err := bs.Read(ref.HandleID, off, 1<<20)
 					if err != nil {
 						b.Fatal(err)
 					}
@@ -288,7 +289,7 @@ func BenchmarkRpcPathBlobFileRef(b *testing.B) {
 						break
 					}
 				}
-				_ = bs.Release(ref.HandleId)
+				_ = bs.Release(ref.HandleID)
 			}
 			_ = once
 		})
@@ -365,7 +366,7 @@ func BenchmarkRpcPathSDKEventProto(b *testing.B) {
 			var once []byte
 			var out sdkv1.SDKEvent
 			for i := 0; i < b.N; i++ {
-				se := pluginsdk.EventToSDKEvent(ev)
+				se := grpctransport.EventToSDKEvent(ev)
 				data, err := proto.Marshal(se)
 				if err != nil {
 					b.Fatal(err)
@@ -373,7 +374,7 @@ func BenchmarkRpcPathSDKEventProto(b *testing.B) {
 				if err := proto.Unmarshal(data, &out); err != nil {
 					b.Fatal(err)
 				}
-				_ = pluginsdk.SDKEventToEvent(&out)
+				_ = grpctransport.SDKEventToEvent(&out)
 				once = data
 			}
 			_ = once

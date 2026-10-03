@@ -13,8 +13,7 @@ import (
 	"testing"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 )
@@ -100,11 +99,11 @@ func pluginReply(t *testing.T, m *SubprocessManager, id string) string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	text, _, _, err := inst.Client.HandleCommand(ctx, "test", nil, &sdkv1.SDKEvent{})
+	res, err := inst.Client.HandleCommand(ctx, "test", nil, &pluginsdk.Event{})
 	if err != nil {
 		t.Fatalf("HandleCommand: %v", err)
 	}
-	return text
+	return res.Text
 }
 
 // TestNewSDKCapabilities exercises the extended SDK surface end-to-end across a
@@ -139,35 +138,36 @@ func TestNewSDKCapabilities(t *testing.T) {
 	defer cancel()
 
 	// LLM tool execution.
-	text, isErr, _, err := inst.Client.HandleTool(ctx, "echo_tool", map[string]any{"text": "hi"}, &sdkv1.SDKEvent{})
-	if err != nil || isErr {
-		t.Fatalf("HandleTool: err=%v isErr=%v", err, isErr)
+	toolRes, err := inst.Client.HandleTool(ctx, "echo_tool", map[string]any{"text": "hi"}, &pluginsdk.Event{})
+	if err != nil || toolRes.IsError {
+		t.Fatalf("HandleTool: err=%v isErr=%v", err, toolRes.IsError)
 	}
-	if text != "tool:hi" {
-		t.Fatalf("HandleTool result = %q, want %q", text, "tool:hi")
+	if toolRes.Text != "tool:hi" {
+		t.Fatalf("HandleTool result = %q, want %q", toolRes.Text, "tool:hi")
 	}
 
 	// on_llm_request hook: modifies the system prompt.
-	sp, _, stop, _, err := inst.Client.HandleLLMRequest(ctx, "inject", &sdkv1.SDKEvent{}, "base", "user")
+	llmRes, err := inst.Client.HandleLLMRequest(ctx, "inject", &pluginsdk.Event{}, "base", "user")
 	if err != nil {
 		t.Fatalf("HandleLLMRequest: %v", err)
 	}
-	if stop {
+	if llmRes.Stop {
 		t.Fatalf("unexpected stop")
 	}
-	if !strings.Contains(sp, "[injected]") {
-		t.Fatalf("system prompt not injected: %q", sp)
+	if !strings.Contains(llmRes.SystemPrompt, "[injected]") {
+		t.Fatalf("system prompt not injected: %q", llmRes.SystemPrompt)
 	}
 
 	// Result hook: decorates the outgoing chain.
 	chain := []pluginsdk.Component{pluginsdk.Text("hi")}
-	newChain, stop, _, err := inst.Client.HandleHook(ctx, "decorate", &sdkv1.SDKEvent{}, chain)
+	hookRes, err := inst.Client.HandleHook(ctx, "decorate", &pluginsdk.Event{}, chain)
 	if err != nil {
 		t.Fatalf("HandleHook(decorate): %v", err)
 	}
-	if stop {
+	if hookRes.Result.StopPropagation {
 		t.Fatalf("unexpected stop")
 	}
+	newChain := hookRes.Chain
 	if len(newChain) != 2 || newChain[1].Text != "[decorated]" {
 		t.Fatalf("decorated chain mismatch: %+v", newChain)
 	}
@@ -181,7 +181,7 @@ func TestHostServiceReverseCalls(t *testing.T) {
 
 	// Install fake host hooks before launching the plugin client.
 	pluginsdk.SetHostHooks(pluginsdk.HostServiceHooks{
-		ChatLLM: func(req *sdkv1.ChatLLMRequest) (string, error) {
+		ChatLLM: func(req *pluginsdk.ChatLLMRequest) (string, error) {
 			return "echo:" + req.Prompt, nil
 		},
 		SetConfig: func(pluginName string, cfg map[string]any) error {
@@ -207,12 +207,12 @@ func TestHostServiceReverseCalls(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	inst := m.Get(id)
-	text, _, _, err := inst.Client.HandleCommand(ctx, "hosttest", nil, &sdkv1.SDKEvent{})
+	res, err := inst.Client.HandleCommand(ctx, "hosttest", nil, &pluginsdk.Event{})
 	if err != nil {
 		t.Fatalf("HandleCommand(hosttest): %v", err)
 	}
-	if text != "llm=echo:ping cfg=v" {
-		t.Fatalf("hosttest result = %q, want %q", text, "llm=echo:ping cfg=v")
+	if res.Text != "llm=echo:ping cfg=v" {
+		t.Fatalf("hosttest result = %q, want %q", res.Text, "llm=echo:ping cfg=v")
 	}
 }
 
@@ -485,7 +485,7 @@ import (
 	"os/exec"
 	"syscall"
 
-	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 func main() { sdk.Serve(&sdk.Plugin{Name: "evil"}) }
@@ -547,7 +547,7 @@ func TestStaticScanDetectsDirectives(t *testing.T) {
 import (
 	"reflect"
 
-	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 //go:linkname getpid syscall.Getpid
@@ -681,7 +681,7 @@ func TestReadmeCachedAtInstall(t *testing.T) {
 	srcMain := `package main
 
 import (
-	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 func main() { sdk.Serve(&sdk.Plugin{Name: "docplugin"}) }

@@ -976,6 +976,10 @@
         "description": "最大連続失敗回数",
         "type": "int",
         "hint": "許容する連続失敗回数の上限です。超過すると再試行を停止します。"
+      },
+      "use_markdown": {
+        "description": "主動メッセージで Markdown を使用",
+        "hint": "有効にすると、ボットが主動的に送信するメッセージは既定で Markdown モードで送信されます。プラグインが use_markdown() を明示的に呼び出して指定した場合はこの設定の影響を受けません。"
       }
     },
     "general": {
@@ -1009,6 +1013,14 @@
       },
       "wake_prefix": {
         "description": "ウェイクワード"
+      },
+      "t2i": {
+        "description": "テキストを画像で出力",
+        "hint": "有効にすると、ボットが送信するテキストメッセージを画像にレンダリングして送信します。"
+      },
+      "t2i_word_threshold": {
+        "description": "テキスト画像化の文字数しきい値",
+        "hint": "メッセージの文字数がこのしきい値に達すると画像に変換されます。既定は 150。"
       },
       "disable_builtin_commands": {
         "description": "組み込みコマンドを無効化",
@@ -1309,6 +1321,26 @@
         "description": "PyPI リポジトリアドレス",
         "hint": "Python の依存関係をインストールする際に使用する PyPI リポジトリアドレスです。デフォルトは [https://mirrors.aliyun.com/pypi/simple/](https://mirrors.aliyun.com/pypi/simple/) です。"
       },
+      "goproxy": {
+        "description": "Go モジュールプロキシアドレス",
+        "hint": "Go プラグインのコンパイル時に使用する Go モジュールプロキシ（GOPROXY）。デフォルトは https://goproxy.cn,direct です。複数のプロキシはカンマで区切ります。"
+      },
+      "goflags": {
+        "description": "Go コンパイルの追加引数",
+        "hint": "Go プラグインのコンパイル時に Go ツールチェーンへ渡す追加引数（GOFLAGS）。例: -mod=mod。空欄の場合は追加しません。"
+      },
+      "python_deps_install_mode": {
+        "description": "Python 依存関係のインストールモード",
+        "hint": "Python プラグインの依存関係のインストール方法: lazy（コア依存のみ、実行時にオンデマンドで追加）または full（ホスト依存を一括で事前インストール）。空欄の場合、初回インストール時にダイアログで確認します。"
+      },
+      "plugin_idle_timeout_minutes": {
+        "description": "プラグインのアイドル観察時間（分）",
+        "hint": "この分数以上アクティビティがないプラグインは IDLE（論理的なアイドル、メモリは未解放）に遷移します。0 = 個別観察しない。新規プラグインの既定値として使用。"
+      },
+      "plugin_unload_timeout_minutes": {
+        "description": "プラグインのコールドアンロード時間（分）",
+        "hint": "この分数以上アイドル状態が続くとプロセスを回収してメモリを解放し、次回トリガーで自動復帰します。0 = 組み込み既定（10 分）。新規プラグインでスリープを有効にした際の既定しきい値。"
+      },
       "callback_api_base": {
         "description": "外部からアクセス可能なコールバック API アドレス",
         "hint": "外部サービスは、AstrBot が生成したコールバックリンク（ファイルダウンロードリンクなど）を通じて AstrBot バックエンドへアクセスする場合があります。AstrBot はデプロイ環境で外部から到達可能なホストアドレス（ホスト）を自動判定できないため、この設定で外部サービスから AstrBot へアクセスするアドレスを明示的に指定します。例: [http://localhost:6185](http://localhost:6185)、[https://example.com](https://example.com)。"
@@ -1507,7 +1539,6 @@
           "ツール使用"
         ]
       },
-
       "custom_headers": {
         "description": "カスタムリクエストヘッダー",
         "hint": "ここで追加したキーと値のペアは、カスタム HTTP リクエストヘッダーとして OpenAI SDK の default_headers に統合されます。値は文字列である必要があります。"

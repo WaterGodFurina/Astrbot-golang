@@ -24,5 +24,16 @@
   },
   "debugHint": {
     "text": "Debug ログは「設定ファイル → システム → コンソールログレベル」で有効にできます"
+  },
+  "goInstall": {
+    "button": "pip ライブラリをインストール",
+    "dialogTitle": "Pip ライブラリをインストール",
+    "packageLabel": "*ライブラリ名（例: llmtuner）",
+    "mirrorLabel": "PyPI リポジトリを強制指定（任意）",
+    "mirrorHint": "強制 PyPI リポジトリ URL > 設定項目「PyPI リポジトリアドレス」",
+    "installButton": "インストール",
+    "installSuccess": "インストールに成功しました。",
+    "installFailed": "インストールに失敗しました。",
+    "requestFailed": "リクエストに失敗しました。"
   }
 }
