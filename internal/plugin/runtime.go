@@ -876,14 +876,24 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("清理残留旧版本插件源码 %s: %w", old, err)
 	}
-	if err := os.Rename(srcDest, old); err != nil && !os.IsNotExist(err) {
-		_ = os.RemoveAll(staged)
-		return nil, fmt.Errorf("暂存旧版本插件源码: %w", err)
+	// hadOld 标记本次是否真的暂存了旧版本：全新安装（srcDest 不存在）时 old
+	// 不会被创建，回滚/失败路径不得再尝试还原 old，否则每个失败的全新安装都会
+	// 打一条 "恢复旧版本...失败: no such file or directory" 的误导性告警。
+	hadOld := true
+	if err := os.Rename(srcDest, old); err != nil {
+		if os.IsNotExist(err) {
+			hadOld = false
+		} else {
+			_ = os.RemoveAll(staged)
+			return nil, fmt.Errorf("暂存旧版本插件源码: %w", err)
+		}
 	}
 	if err := os.Rename(staged, srcDest); err != nil {
 		// 换名错误不得静默吞掉：尽力回滚旧源码，清理 staged 后上抛。
-		if rerr := os.Rename(old, srcDest); rerr != nil {
-			logger.I18nWarn("回滚旧版本插件源码 %s → %s 失败: %v", old, srcDest, rerr)
+		if hadOld {
+			if rerr := os.Rename(old, srcDest); rerr != nil {
+				logger.I18nWarn("回滚旧版本插件源码 %s → %s 失败: %v", old, srcDest, rerr)
+			}
 		}
 		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("提交新版本插件源码: %w", err)
@@ -896,12 +906,14 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 			}
 			return
 		}
-		// 回滚：新源码挪回 staged 待清理，旧源码归位。
+		// 回滚：新源码挪回 staged 待清理，旧源码归位（仅当确有旧版本）。
 		if err := os.Rename(srcDest, staged); err != nil {
 			logger.I18nWarn("回滚新版本插件源码 %s → %s 失败: %v", srcDest, staged, err)
 		}
-		if err := os.Rename(old, srcDest); err != nil {
-			logger.I18nWarn("恢复旧版本插件源码 %s → %s 失败: %v", old, srcDest, err)
+		if hadOld {
+			if err := os.Rename(old, srcDest); err != nil {
+				logger.I18nWarn("恢复旧版本插件源码 %s → %s 失败: %v", old, srcDest, err)
+			}
 		}
 		_ = os.RemoveAll(staged)
 	}()
@@ -1035,13 +1047,22 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("清理残留旧版本 Python 插件源码 %s: %w", old, err)
 	}
-	if err := os.Rename(dest, old); err != nil && !os.IsNotExist(err) {
-		_ = os.RemoveAll(staged)
-		return nil, fmt.Errorf("暂存旧版本 Python 插件源码: %w", err)
+	// hadOld 同 Go 路径：全新安装无旧版本，回滚不得尝试还原 old（否则打误导
+	// 告警 "恢复旧版本...失败: no such file or directory"）。
+	hadOld := true
+	if err := os.Rename(dest, old); err != nil {
+		if os.IsNotExist(err) {
+			hadOld = false
+		} else {
+			_ = os.RemoveAll(staged)
+			return nil, fmt.Errorf("暂存旧版本 Python 插件源码: %w", err)
+		}
 	}
 	if err := os.Rename(staged, dest); err != nil {
-		if rerr := os.Rename(old, dest); rerr != nil {
-			logger.I18nWarn("回滚旧版本 Python 插件源码 %s → %s 失败: %v", old, dest, rerr)
+		if hadOld {
+			if rerr := os.Rename(old, dest); rerr != nil {
+				logger.I18nWarn("回滚旧版本 Python 插件源码 %s → %s 失败: %v", old, dest, rerr)
+			}
 		}
 		_ = os.RemoveAll(staged)
 		return nil, fmt.Errorf("提交新版本 Python 插件源码: %w", err)
@@ -1057,8 +1078,10 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 		if err := os.Rename(dest, staged); err != nil {
 			logger.I18nWarn("回滚新版本 Python 插件源码 %s → %s 失败: %v", dest, staged, err)
 		}
-		if err := os.Rename(old, dest); err != nil {
-			logger.I18nWarn("恢复旧版本 Python 插件源码 %s → %s 失败: %v", old, dest, err)
+		if hadOld {
+			if err := os.Rename(old, dest); err != nil {
+				logger.I18nWarn("恢复旧版本 Python 插件源码 %s → %s 失败: %v", old, dest, err)
+			}
 		}
 		_ = os.RemoveAll(staged)
 	}()
