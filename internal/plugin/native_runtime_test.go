@@ -1,0 +1,196 @@
+package plugin
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginNative "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+)
+
+// buildTestNativeLib compiles a Native (.so) test plugin with the local SDK.
+// It skips when a C toolchain / Go toolchain / SDK is unavailable.
+func buildTestNativeLib(t *testing.T, source string) string {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not in PATH")
+	}
+	sdkDir, err := findSDKDir()
+	if err != nil {
+		t.Skipf("local SDK not found: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mod := fmt.Sprintf("example.com/native-test-plugin-%d", time.Now().UnixNano())
+	goMod := "module " + mod + "\n\ngo 1.23\n\n" +
+		"require github.com/WaterGodFurina/Astrbot-go-plugin-sdk v0.0.0\n\n" +
+		"replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => " + sdkDir + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "native_plugin.so")
+	cmd := exec.Command("go", "build", "-buildmode=plugin", "-o", out, ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOFLAGS=-mod=mod", "GOPROXY=https://goproxy.cn,direct")
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("native build failed (no cgo toolchain?): %v\n%s", err, b)
+	}
+	return out
+}
+
+const nativeTestSrc = `package main
+
+import (
+	"strings"
+
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+)
+
+var plugin = &sdk.Plugin{
+	Name:    "native_test",
+	Version: "1.0.0",
+	Commands: []sdk.Command{{
+		Name: "echo",
+		Handler: func(e *sdk.Event, args []string) (string, error) {
+			return "native:" + strings.Join(args, " "), nil
+		},
+	}},
+}
+
+func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
+	return native.Serve(plugin, pluginID)
+}
+
+func main() {}
+`
+
+// TestNativeLoadAndCall exercises the real path: plugin.Open -> entry ->
+// direct in-process call (no subprocess, no gRPC).
+func TestNativeLoadAndCall(t *testing.T) {
+	so := buildTestNativeLib(t, nativeTestSrc)
+	entry, err := openNativePlugin(so)
+	if err != nil {
+		t.Fatalf("openNativePlugin: %v", err)
+	}
+	np, err := entry("native_test")
+	if err != nil {
+		t.Fatalf("native entry: %v", err)
+	}
+	client := pluginNative.NewClient("native_test", np)
+
+	meta, err := client.Register(context.Background())
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if meta.GetName() != "native_test" {
+		t.Fatalf("name = %q", meta.GetName())
+	}
+	text, _, _, err := client.HandleCommand(context.Background(), "echo", []string{"hi", "there"}, &sdkv1.SDKEvent{Type: "test"})
+	if err != nil {
+		t.Fatalf("HandleCommand: %v", err)
+	}
+	if text != "native:hi there" {
+		t.Fatalf("HandleCommand = %q", text)
+	}
+}
+
+func TestNativeSymbolMissing(t *testing.T) {
+	so := buildTestNativeLib(t, "package main\n\nvar plugin = 1\n\nfunc main() {}\n")
+	_, err := openNativePlugin(so)
+	if err == nil || !strings.Contains(err.Error(), "Lookup(AstrBotNativePlugin)") {
+		t.Fatalf("want Lookup error, got %v", err)
+	}
+}
+
+func TestNativeSymbolWrongType(t *testing.T) {
+	so := buildTestNativeLib(t, "package main\n\nvar AstrBotNativePlugin = 42\n\nfunc main() {}\n")
+	_, err := openNativePlugin(so)
+	if err == nil || !strings.Contains(err.Error(), "unexpected type") {
+		t.Fatalf("want type mismatch error, got %v", err)
+	}
+}
+
+// TestNativeNotIdleUnloaded verifies the host keeps Native instances out of the
+// idle-unload sweep.
+func TestNativeNotIdleUnloaded(t *testing.T) {
+	m := NewSubprocessManager(nil, t.TempDir())
+	m.SetIdleUnload(time.Minute)
+	inst := &PluginInstance{ID: "native_test", Runtime: "native", Language: "go"}
+	m.mu.Lock()
+	m.instances[inst.ID] = inst
+	m.mu.Unlock()
+	inst.BackdateIdle(time.Hour) // well past the threshold
+	m.sweepIdlePlugins()
+	m.mu.RLock()
+	_, still := m.instances[inst.ID]
+	m.mu.RUnlock()
+	if !still {
+		t.Fatal("Native instance was idle-unloaded; it must be resident for the process lifetime")
+	}
+}
+
+func TestNativeLoadViaManager(t *testing.T) {
+	so := buildTestNativeLib(t, nativeTestSrc)
+	m := NewSubprocessManager(nil, t.TempDir())
+	inst, err := m.loadLocked(context.Background(), "native_test", so, "go", "native", false)
+	if err != nil {
+		t.Fatalf("loadLocked native: %v", err)
+	}
+	if inst.Runtime != "native" {
+		t.Fatalf("runtime = %q", inst.Runtime)
+	}
+	if inst.raw != nil || inst.pgid != 0 {
+		t.Fatal("Native load must not create a subprocess (raw/pgid set)")
+	}
+	got, _, _, err := inst.Client.HandleCommand(context.Background(), "echo", []string{"x"}, &sdkv1.SDKEvent{Type: "test"})
+	if err != nil {
+		t.Fatalf("HandleCommand: %v", err)
+	}
+	if got != "native:x" {
+		t.Fatalf("got %q", got)
+	}
+	// Re-open on a second manager (restart semantics: re-plugin.Open).
+	m2 := NewSubprocessManager(nil, t.TempDir())
+	if _, err := m2.loadLocked(context.Background(), "native_test", so, "go", "native", false); err != nil {
+		t.Fatalf("reload native: %v", err)
+	}
+}
+
+// TestNativeAndGRPCCoexist loads a Native instance and a gRPC subprocess
+// instance in the same manager and calls both.
+func TestNativeAndGRPCCoexist(t *testing.T) {
+	so := buildTestNativeLib(t, nativeTestSrc)
+	grpcBin := BuildTestPlugin()
+	if grpcBin == "" {
+		t.Skip("gRPC test plugin unavailable")
+	}
+	m := NewSubprocessManager(nil, t.TempDir())
+	nat, err := m.loadLocked(context.Background(), "native_test", so, "go", "native", false)
+	if err != nil {
+		t.Fatalf("load native: %v", err)
+	}
+	grp, err := m.loadLocked(context.Background(), "grpc_test", grpcBin, "go", "grpc", false)
+	if err != nil {
+		t.Fatalf("load grpc: %v", err)
+	}
+	if nat.Runtime != "native" || (grp.Runtime != "" && grp.Runtime != "grpc") {
+		t.Fatalf("runtimes = %q / %q", nat.Runtime, grp.Runtime)
+	}
+	nText, _, _, err := nat.Client.HandleCommand(context.Background(), "echo", []string{"a"}, &sdkv1.SDKEvent{Type: "t"})
+	if err != nil || nText != "native:a" {
+		t.Fatalf("native call: %q err=%v", nText, err)
+	}
+	gText, _, _, err := grp.Client.HandleCommand(context.Background(), "test", nil, &sdkv1.SDKEvent{Type: "t"})
+	if err != nil || gText != "pong" {
+		t.Fatalf("grpc call: %q err=%v", gText, err)
+	}
+}

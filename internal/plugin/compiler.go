@@ -24,42 +24,30 @@ const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 // sdkModuleVersion 是宿主内置的插件 SDK 版本（与宿主 go.mod 的 require 一致，
 // 发版时同步 bump）。发布版宿主进程的 CWD 下没有 go.mod，SDK 解析与下载在
 // 找不到 go.mod 时以该常量兜底定位模块缓存，不再依赖进程工作目录。
-const sdkModuleVersion = "v1.8.0"
+const sdkModuleVersion = "v1.9.0"
 
 // nativeEntryUnix 是 Native 构建时注入插件 package main 的生成入口
-// （不改动插件作者源码）。宿主 Loader 加载 .so 后 Lookup 并调用它：
-// 先 sdk.Register(plugin)（plugin 为作者提升的包级变量），再进入 NativeServe。
+// （不改动插件作者源码）。宿主用 plugin.Open 加载 .so 后 Lookup 并调用它：
+// 它把作者声明的包级变量 plugin（*sdk.Plugin）交给 native.Serve，后者跑
+// OnLoad、绑定进程内 HostService，并返回 PluginService 供宿主【直接函数调用】。
+//
+// 注意：Native 插件作者必须用一个非 main 文件声明 `var plugin = &sdk.Plugin{...}`
+// （main() 不执行、且这里按名引用它）。已在 README 记录。
 const nativeEntryUnix = `package main
 
-import sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
 
-func AstrBotNativeServe() int {
-	sdk.Register(plugin)
-	return sdk.NativeServe()
+func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
+	return native.Serve(plugin, pluginID)
 }
 `
 
-// nativeEntryWindows 是 Windows Native 构建（-buildmode=c-shared）的生成入口：
-// 通过 //export + import "C" 导出 C ABI 符号 AstrBotNativeServe（C.int、零参数，
-// 地址经共享 env/rendezvous 传递）。C ABI 仅限该加载层入口。
-//
-// 不在此声明 func main()：插件作者源码的 main.go 已提供 main()（其内容是
-// sdk.Serve(plugin)），重复声明会编译报 "main redeclared"。c-shared 不需要
-// 本文件再补 main。
-const nativeEntryWindows = `package main
+// grpcEntry 是为普通（gRPC 子进程）Go 插件注入的空导入：它链接
+// transport/grpc，使其 init() 注册 sdk.Serve 的真实实现与反向调用拨号器。
+// Native 构建不注入本文件，因此 Native 插件不链接 grpc/go-plugin。
+const grpcEntry = `package main
 
-/*
-#include <stdint.h>
-*/
-import "C"
-
-import sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-
-//export AstrBotNativeServe
-func AstrBotNativeServe() C.int {
-	sdk.Register(plugin)
-	return C.int(sdk.NativeServe())
-}
+import _ "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/transport/grpc"
 `
 
 // Compiler builds plugin source into a platform-native executable using the
@@ -233,6 +221,15 @@ func (c *Compiler) build(ctx context.Context, srcDir, outputPath string, progres
 	if err := os.MkdirAll(filepath.Dir(absOut), 0o755); err != nil {
 		return err
 	}
+	// Link the gRPC transport so sdk.Serve (now a grpc-free hook) is populated
+	// in subprocess plugins. Native builds inject native_entry.go instead and do
+	// not link grpc/go-plugin.
+	grpcEntryPath := filepath.Join(srcDir, "grpc_entry.go")
+	if err := os.WriteFile(grpcEntryPath, []byte(grpcEntry), 0o644); err != nil { // #nosec G306 -- 生成文件，常规权限
+		return fmt.Errorf("inject grpc entry: %w", err)
+	}
+	defer os.Remove(grpcEntryPath)
+
 	args := []string{"build"}
 	if outputCb != nil {
 		args = append(args, "-v")
@@ -526,21 +523,20 @@ func nativeArtifactName(id string) string {
 }
 
 // BuildNative compiles a plugin module into a Native shared library that the
-// host loads in-process (plugin.Open on Unix / LoadDLL on Windows). It injects
-// a generated package-main entry (native_entry.go) exposing AstrBotNativeServe
-// and builds with `-buildmode=plugin` (Unix) / `-buildmode=c-shared` (Windows).
+// host loads in-process with plugin.Open. It injects a generated package-main
+// entry (native_entry.go) exposing AstrBotNativePlugin and builds with
+// `-buildmode=plugin` (Unix only; stdlib plugin is unavailable on Windows).
 // CGO must be enabled; cc/cxx come from ensureCCompiler. The injected entry
 // file is removed after the build so the plugin source directory stays
 // untouched.
 //
-// 不需要 `-tags native`：SDK 的 Native 运行时代码总是编译（gRPC 模式下为
-// 死代码），因此宿主与插件对 SDK 包的 build 配置一致，plugin.Open 不校验
-// 自定义 tag。宿主二进制也无需任何自定义 tag。
+// 不需要 `-tags native`：宿主与插件对 core sdk 包的 build 配置一致，
+// plugin.Open 通过；Native 插件不导入 transport/grpc，因此不链接 grpc/go-plugin。
 func (c *Compiler) BuildNative(ctx context.Context, srcDir, outputPath string, progress toolchain.ProgressFunc, cc, cxx string, outputCb func(line string)) error {
-	entry := nativeEntryUnix
 	if runtime.GOOS == "windows" {
-		entry = nativeEntryWindows
+		return fmt.Errorf("Native runtime is unsupported on Windows: stdlib plugin is unavailable and c-shared cannot carry Go interfaces; use the gRPC runtime")
 	}
+	entry := nativeEntryUnix
 	entryPath := filepath.Join(srcDir, "native_entry.go")
 	if err := os.WriteFile(entryPath, []byte(entry), 0o644); err != nil { // #nosec G306 -- 注入到插件 srcDir 的生成文件，常规权限
 		return fmt.Errorf("inject native entry: %w", err)

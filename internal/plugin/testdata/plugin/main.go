@@ -24,72 +24,76 @@ func init() {
 	}
 }
 
+// plugin is exposed as a package-level variable so the Native build can reach
+// it from the injected entry (main() does not run for a loaded .so).
+var plugin = &sdk.Plugin{
+	Name:        "testplugin",
+	Version:     "1.0.0",
+	Description: "test plugin for SubprocessManager integration tests",
+	Commands: []sdk.Command{{
+		Name: "test",
+		Handler: func(e *sdk.Event, args []string) (string, error) {
+			if v := os.Getenv("TEST_PLUGIN_REPLY"); v != "" {
+				return v, nil
+			}
+			return "pong", nil
+		},
+	}, {
+		// hosttest exercises the bidirectional HostService: plugins call
+		// back into the host (ChatLLM / SetConfig / GetConfig).
+		Name: "hosttest",
+		Handler: func(e *sdk.Event, args []string) (string, error) {
+			llm, _ := sdk.Host.ChatLLM("ping", "you are a test", nil)
+			if err := sdk.Host.SetConfig("testplugin", map[string]any{"k": "v"}); err != nil {
+				return "setcfg-error: " + err.Error(), nil
+			}
+			cfg, err := sdk.Host.GetConfig("testplugin")
+			if err != nil {
+				return "getcfg-error: " + err.Error(), nil
+			}
+			v, _ := cfg["k"].(string)
+			return "llm=" + llm + " cfg=" + v, nil
+		},
+	}},
+	Filters: []sdk.Filter{{
+		Name:    "block_admins",
+		Handler: func(e *sdk.Event) bool { return !e.IsAdmin },
+	}},
+	Hooks: []sdk.Hook{{
+		Name:  "startup",
+		Event: "startup",
+		Handler: func(e *sdk.Event) error {
+			return nil
+		},
+	}},
+	Tools: []sdk.Tool{{
+		Name:        "echo_tool",
+		Description: "returns the given text",
+		ParamsSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"text": map[string]any{"type": "string"}},
+		},
+		Handler: func(e *sdk.Event, args map[string]any) (string, error) {
+			text, _ := args["text"].(string)
+			return "tool:" + text, nil
+		},
+	}},
+	LLMRequestHooks: []sdk.LLMRequestHook{{
+		Name: "inject",
+		Handler: func(e *sdk.Event, req *sdk.ProviderRequest) (*sdk.ProviderRequest, error) {
+			req.SystemPrompt += "\n[injected]"
+			return req, nil
+		},
+	}},
+	ResultHooks: []sdk.ResultHook{{
+		Name:  "decorate",
+		Event: "on_decorating_result",
+		Handler: func(e *sdk.Event, chain []sdk.Component) ([]sdk.Component, error) {
+			return append(chain, sdk.Text("[decorated]")), nil
+		},
+	}},
+}
+
 func main() {
-	sdk.Serve(&sdk.Plugin{
-		Name:        "testplugin",
-		Version:     "1.0.0",
-		Description: "test plugin for SubprocessManager integration tests",
-		Commands: []sdk.Command{{
-			Name: "test",
-			Handler: func(e *sdk.Event, args []string) (string, error) {
-				if v := os.Getenv("TEST_PLUGIN_REPLY"); v != "" {
-					return v, nil
-				}
-				return "pong", nil
-			},
-		}, {
-			// hosttest exercises the bidirectional HostService: plugins call
-			// back into the host (ChatLLM / SetConfig / GetConfig).
-			Name: "hosttest",
-			Handler: func(e *sdk.Event, args []string) (string, error) {
-				llm, _ := sdk.Host.ChatLLM("ping", "you are a test", nil)
-				if err := sdk.Host.SetConfig("testplugin", map[string]any{"k": "v"}); err != nil {
-					return "setcfg-error: " + err.Error(), nil
-				}
-				cfg, err := sdk.Host.GetConfig("testplugin")
-				if err != nil {
-					return "getcfg-error: " + err.Error(), nil
-				}
-				v, _ := cfg["k"].(string)
-				return "llm=" + llm + " cfg=" + v, nil
-			},
-		}},
-		Filters: []sdk.Filter{{
-			Name:    "block_admins",
-			Handler: func(e *sdk.Event) bool { return !e.IsAdmin },
-		}},
-		Hooks: []sdk.Hook{{
-			Name:  "startup",
-			Event: "startup",
-			Handler: func(e *sdk.Event) error {
-				return nil
-			},
-		}},
-		Tools: []sdk.Tool{{
-			Name:        "echo_tool",
-			Description: "returns the given text",
-			ParamsSchema: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{"text": map[string]any{"type": "string"}},
-			},
-			Handler: func(e *sdk.Event, args map[string]any) (string, error) {
-				text, _ := args["text"].(string)
-				return "tool:" + text, nil
-			},
-		}},
-		LLMRequestHooks: []sdk.LLMRequestHook{{
-			Name: "inject",
-			Handler: func(e *sdk.Event, req *sdk.ProviderRequest) (*sdk.ProviderRequest, error) {
-				req.SystemPrompt += "\n[injected]"
-				return req, nil
-			},
-		}},
-		ResultHooks: []sdk.ResultHook{{
-			Name:  "decorate",
-			Event: "on_decorating_result",
-			Handler: func(e *sdk.Event, chain []sdk.Component) ([]sdk.Component, error) {
-				return append(chain, sdk.Text("[decorated]")), nil
-			},
-		}},
-	})
+	sdk.Serve(plugin)
 }

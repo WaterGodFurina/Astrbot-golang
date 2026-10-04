@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -23,14 +22,14 @@ import (
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginNative "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/transport/grpc"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
 	"github.com/hashicorp/go-hclog"
 	goplugin "github.com/hashicorp/go-plugin"
 	"golang.org/x/mod/module"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // logger 供插件运行时与编译相关路径记录日志。
@@ -59,20 +58,6 @@ const pluginHookRPCTimeout = 30 * time.Second
 // restartBudgetResetWindow resets the crash-restart budget after this idle gap so low-frequency crashes don't get permanently banned (only consecutive/ recent crashes count).
 const restartBudgetResetWindow = 10 * time.Minute
 
-// Native 运行方式的宿主↔插件 rendezvous 环境变量（与 SDK serve_native.go
-// 中一致；两者共享宿主进程环境变量，故无需 IPC）。
-const (
-	envNativeRendezvous = "ASTRBOT_NATIVE_RENDEZVOUS"
-	envNativeHostAddr   = "ASTRBOT_NATIVE_HOST_ADDR"
-)
-
-// nativeMaxMsgSize 是 Native 运行方式 gRPC 的最大消息体（与 SDK 一致）。
-const nativeMaxMsgSize = 128 << 20
-
-// nativeRendezvousTimeout bounds how long the host waits for the plugin to
-// publish its listener address via the rendezvous file.
-const nativeRendezvousTimeout = 15 * time.Second
-
 // DefaultIdleUnloadMinutes is the single source of truth for the idle-unload threshold applied when sleep is enabled but no threshold is configured yet.
 const DefaultIdleUnloadMinutes = 10
 
@@ -94,15 +79,12 @@ type PluginInstance struct {
 	// Runtime 级共享连接上的 per-plugin 视图，raw 为 nil——teardown 只经
 	// ManagePlugin 卸载单插件，绝不 kill 共享进程。
 	shared bool
-	// nativeTarget 是 Native 插件发布的本机回环 gRPC target；禁用后重新启用
-	// 时用于 reconnect（Go plugin 不可二次 Open，插件服务进程内常驻）。
-	nativeTarget string
 	// DisplayName / ShortDesc are display metadata from the packaged plugin manifest, surfaced to the WebUI.
 	DisplayName string
 	ShortDesc   string
 
 	// Client is the typed gRPC client (nil while the plugin is idle-sleeping; the tool registry keeps the entry so an LLM tool call can EnsureLoaded to wake).
-	Client *pluginsdk.Client
+	Client pluginsdk.PluginClient
 	// Meta is the plugin's Register() response snapshot (handlers + config schema); retained while sleeping so handlers can be re-bridged.
 	Meta *sdkv1.RegisterResponse
 
@@ -1500,12 +1482,6 @@ func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language
 		if err != nil {
 			return nil, err
 		}
-		// 持久化 Native 回环 target，供禁用后再启用时重新连接。
-		if inst.nativeTarget != "" {
-			if err := m.setNativeTargetManifest(id, inst.nativeTarget); err != nil {
-				logger.I18nWarn("插件 %s 持久化 native target 失败: %v", id, err)
-			}
-		}
 	} else {
 		inst, err = m.startInstance(ctx, id, binary, language)
 		if err != nil {
@@ -2043,10 +2019,10 @@ func (m *SubprocessManager) RegisteredPlugins() []*PluginInstance {
 }
 
 // Clients returns the RPC client of every running plugin (for the star bridge).
-func (m *SubprocessManager) Clients() map[string]*pluginsdk.Client {
+func (m *SubprocessManager) Clients() map[string]pluginsdk.PluginClient {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	out := make(map[string]*pluginsdk.Client, len(m.instances))
+	out := make(map[string]pluginsdk.PluginClient, len(m.instances))
 	for id, inst := range m.instances {
 		out[id] = inst.Client
 	}
@@ -2270,14 +2246,12 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 }
 
 // loadNativeInstance loads a Go plugin shared library in-process (Native
-// runtime): opens the .so/.dll, serves the host's HostService on a loopback
-// listener, calls the plugin's AstrBotNativeServe entry (which blocks serving
-// PluginService on its own loopback listener), polls the rendezvous file for
-// the plugin listener address, connects a gRPC client and performs Register.
+// runtime) and calls it directly: plugin.Open -> exported entry -> in-process
+// PluginService. No subprocess, no gRPC, no protobuf-RPC, no rendezvous.
 //
 // 生命周期：Native 插件与本进程共享地址空间，不能被 kill / 卸载 / 闲置休眠
-// （§7/§13 of native plugin plan）；更新、禁用、卸载、重载均需重启 AstrBot。
-func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, soPath string) (*PluginInstance, error) {
+// （§8/§9/§10）；更新、禁用、卸载、重载均需重启 AstrBot。
+func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, libPath string) (*PluginInstance, error) {
 	startInstanceMu.Lock()
 	defer startInstanceMu.Unlock()
 
@@ -2286,7 +2260,7 @@ func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, soPath s
 			return nil, fmt.Errorf("插件 %s 与当前 AstrBot 版本不兼容，已拒绝加载: %w", id, err)
 		}
 	}
-	abs, err := filepath.Abs(soPath)
+	abs, err := filepath.Abs(libPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve plugin path: %w", err)
 	}
@@ -2298,46 +2272,12 @@ func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, soPath s
 	if err != nil {
 		return nil, err
 	}
-
-	// 宿主侧 HostService：本机回环 listener（unix socket / 127.0.0.1）。
-	hostLis, hostTarget, err := newNativeHostListener()
+	np, err := entry(id)
 	if err != nil {
-		return nil, fmt.Errorf("host hostservice listener: %w", err)
-	}
-	hostSrv, err := pluginsdk.ServeHostServiceOnListener(hostLis, id)
-	if err != nil {
-		_ = hostLis.Close()
-		return nil, fmt.Errorf("serve host hostservice: %w", err)
+		return nil, fmt.Errorf("native plugin %s init: %w", id, err)
 	}
 
-	// 插件 .so/.dll 与宿主共享进程环境变量：直接 set 后由插件 NativeServe 读取。
-	// 保持设置直至插件生命周期结束（同进程，无需恢复）。
-	rdFile := filepath.Join(os.TempDir(), fmt.Sprintf("astrbot-native-%s-%d.json", sanitizeID(id), time.Now().UnixNano()))
-	os.Setenv(envNativeHostAddr, hostTarget)
-	os.Setenv(envNativeRendezvous, rdFile)
-	go entry() // 阻塞在插件侧 NativeServe
-
-	pluginTarget, err := waitNativeRendezvous(rdFile, nativeRendezvousTimeout)
-	if err != nil {
-		hostSrv.Stop()
-		_ = hostLis.Close()
-		return nil, err
-	}
-
-	conn, err := grpc.NewClient(pluginTarget,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(nativeMaxMsgSize),
-			grpc.MaxCallSendMsgSize(nativeMaxMsgSize),
-		))
-	if err != nil {
-		hostSrv.Stop()
-		_ = hostLis.Close()
-		return nil, fmt.Errorf("dial native plugin %s: %w", id, err)
-	}
-	client := pluginsdk.NewClient(conn)
-	client.AttachNativeHostService(hostSrv, hostLis, id)
-
+	client := pluginNative.NewClient(id, np)
 	regCtx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
 	meta, err := client.Register(regCtx)
@@ -2347,16 +2287,15 @@ func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, soPath s
 	}
 
 	inst := &PluginInstance{
-		ID:           id,
-		Name:         meta.GetName(),
-		Version:      meta.GetVersion(),
-		Binary:       abs,
-		StartedAt:    time.Now(),
-		Language:     "go",
-		Runtime:      "native",
-		Client:       client,
-		Meta:         meta,
-		nativeTarget: pluginTarget,
+		ID:        id,
+		Name:      meta.GetName(),
+		Version:   meta.GetVersion(),
+		Binary:    abs,
+		StartedAt: time.Now(),
+		Language:  "go",
+		Runtime:   "native",
+		Client:    client,
+		Meta:      meta,
 	}
 	return inst, nil
 }
@@ -2373,71 +2312,12 @@ func (m *SubprocessManager) pluginRuntime(id string) string {
 	return "grpc"
 }
 
-// setNativeTargetManifest 持久化 Native 插件的回环 gRPC target 到 manifest。
-func (m *SubprocessManager) setNativeTargetManifest(id, target string) error {
-	m.manifestMu.Lock()
-	defer m.manifestMu.Unlock()
-	man, err := LoadManifest(m.manifestPath())
-	if err != nil {
-		return err
-	}
-	e := man.Get(id)
-	if e == nil {
-		return fmt.Errorf("plugin %s not in install manifest", id)
-	}
-	e.NativeTarget = target
-	return m.saveManifest(man)
-}
-
 // runtimeFromOpts 返回安装请求对应的运行方式（"native" 或 "grpc" 缺省）。
 func runtimeFromOpts(opts InstallOptions) string {
 	if opts.Native {
 		return "native"
 	}
 	return "grpc"
-}
-
-// newNativeHostListener 创建宿主侧 Native HostService 的本机回环 listener：
-// Unix 用 unix socket，Windows 用 127.0.0.1 随机端口 TCP。返回 listener 与其
-// gRPC target。
-func newNativeHostListener() (net.Listener, string, error) {
-	if runtime.GOOS == "windows" {
-		lis, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			return nil, "", err
-		}
-		return lis, lis.Addr().String(), nil
-	}
-	dir, err := os.MkdirTemp("", "astrbot-native-host-*")
-	if err != nil {
-		return nil, "", err
-	}
-	sock := filepath.Join(dir, "host.sock")
-	lis, err := net.Listen("unix", sock)
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, "", err
-	}
-	return lis, "unix://" + sock, nil
-}
-
-// waitNativeRendezvous 轮询 rendezvous 文件直到插件写入其 listener 地址
-// （或超时）。NativeServe 原子写文件（临时文件 + Rename），这里只需读到
-// 非空 plugin_addr 即视为就绪。
-func waitNativeRendezvous(path string, timeout time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(path); err == nil { // #nosec G304 -- 读取宿主自己创建的 rendezvous 文件
-			var rd struct {
-				PluginAddr string `json:"plugin_addr"`
-			}
-			if json.Unmarshal(data, &rd) == nil && rd.PluginAddr != "" {
-				return rd.PluginAddr, nil
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return "", fmt.Errorf("native 插件 rendezvous 超时（%s 未就绪）", path)
 }
 
 // pythonRuntime resolves (once) the Python subprocess environment: SDK extraction + venv/grpcio preparation + (optionally) downloading a bundled Python when the system has none. The first Python plugin load may take a while (download / venv creation + pip install). 供给模式取宿主配置 （pipDepsMode：lazy 核心层 / full 全量 / 空按 pysdk 默认 lazy）。
@@ -2486,12 +2366,12 @@ func pythonEnvUsable(env *pysdk.RuntimeEnv) bool {
 // dispenseHandshake 完成 go-plugin 握手并返回 (raw, pc, pid, minp)。单插件
 // （python-grpc）与共享 Runtime（python-shared）两条路径共用：前者随后
 // Register + 构建 PluginInstance；后者作为共享进程句柄。
-func (m *SubprocessManager) dispenseHandshake(ctx context.Context, id, abs, language string, cmd *exec.Cmd, stderrParser *astrbotStartupParser) (*goplugin.Client, *pluginsdk.Client, int, uint, error) {
+func (m *SubprocessManager) dispenseHandshake(ctx context.Context, id, abs, language string, cmd *exec.Cmd, stderrParser *astrbotStartupParser) (*goplugin.Client, pluginsdk.PluginClient, int, uint, error) {
 	// 进程组隔离（Linux 附加 Pdeathsig）：宿主死亡/退出时内核自动回收插件， teardown 时按组杀整棵进程树（见 process_*.go）。
 	setupChildProcess(cmd)
 	cfg := &goplugin.ClientConfig{
-		HandshakeConfig:  pluginsdk.Handshake,
-		Plugins:          pluginsdk.PluginMap,
+		HandshakeConfig:  grpctransport.Handshake,
+		Plugins:          grpctransport.PluginMap,
 		Cmd:              cmd,
 		AllowedProtocols: []goplugin.Protocol{goplugin.ProtocolGRPC},
 		Managed:          true,
@@ -2521,7 +2401,7 @@ func (m *SubprocessManager) dispenseHandshake(ctx context.Context, id, abs, lang
 
 	// go-plugin's handshake has no built-in timeout; enforce one.
 	type dispenseResult struct {
-		pc  *pluginsdk.Client
+		pc  pluginsdk.PluginClient
 		pid int // direct child pid once the process has started (0 = not started)
 		err error
 	}
@@ -2550,7 +2430,7 @@ func (m *SubprocessManager) dispenseHandshake(ctx context.Context, id, abs, lang
 			resCh <- dispenseResult{pid: pid, err: err}
 			return
 		}
-		pc, ok := rpcClient.(*pluginsdk.Client)
+		pc, ok := rpcClient.(*grpctransport.Client)
 		if !ok {
 			resCh <- dispenseResult{pid: pid, err: fmt.Errorf("unexpected plugin client type %T", rpcClient)}
 			return
@@ -2558,7 +2438,7 @@ func (m *SubprocessManager) dispenseHandshake(ctx context.Context, id, abs, lang
 		resCh <- dispenseResult{pc: pc, pid: pid}
 	}()
 
-	var pc *pluginsdk.Client
+	var pc pluginsdk.PluginClient
 	var pid int
 	select {
 	case res := <-resCh:
@@ -2573,7 +2453,7 @@ func (m *SubprocessManager) dispenseHandshake(ctx context.Context, id, abs, lang
 		pc = res.pc
 		pid = res.pid
 	case <-time.After(startTimeout):
-		// 杀进程先让 dispense goroutine 结束，再取回可能已创建的 *pluginsdk.Client（持有 gRPC conn + HostService server）并关闭， 避免反复 Load 泄漏连接与 goroutine。
+		// 杀进程先让 dispense goroutine 结束，再取回可能已创建的 pluginsdk.PluginClient（持有 gRPC conn + HostService server）并关闭， 避免反复 Load 泄漏连接与 goroutine。
 		raw.Kill()
 		releasePluginPort(minp)
 		res := <-resCh

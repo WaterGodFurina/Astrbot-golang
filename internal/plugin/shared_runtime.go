@@ -37,7 +37,7 @@ type PythonRuntimeManager struct {
 type sharedRuntime struct {
 	mgr    *SubprocessManager
 	raw    *goplugin.Client
-	client *pluginsdk.Client
+	client pluginsdk.PluginClient
 	cmd    *exec.Cmd
 	pid    int
 	minp   uint
@@ -165,7 +165,7 @@ func (pm *PythonRuntimeManager) ensureRuntime(ctx context.Context) (*sharedRunti
 // EnsurePlugin 在共享 Runtime 中加载/激活一个插件，返回 per-plugin 客户端视图
 // 与 Register 元数据。宿主随后以此为 Client 调用各 PluginService RPC（自动携带
 // plugin_id）。
-func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir, pluginName, version string) (*pluginsdk.Client, *sdkv1.RegisterResponse, error) {
+func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir, pluginName, version string) (pluginsdk.PluginClient, *sdkv1.RegisterResponse, error) {
 	rt, err := pm.ensureRuntime(ctx)
 	if err != nil {
 		return nil, nil, err
