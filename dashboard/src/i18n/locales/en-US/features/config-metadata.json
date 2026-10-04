@@ -1014,6 +1014,14 @@
       "wake_prefix": {
         "description": "Wake Word"
       },
+      "t2i": {
+        "description": "Text-to-image output",
+        "hint": "When enabled, the bot renders outgoing text messages as images before sending."
+      },
+      "t2i_word_threshold": {
+        "description": "Text-to-image word threshold",
+        "hint": "Messages whose length reaches this threshold are converted to images. Default 150."
+      },
       "disable_builtin_commands": {
         "description": "Disable Built-in Commands",
         "hint": "Disable all built-in AstrBot commands such as help, sid, new, etc."

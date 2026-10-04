@@ -1014,6 +1014,14 @@
       "wake_prefix": {
         "description": "唤醒词"
       },
+      "t2i": {
+        "description": "文本转图像输出",
+        "hint": "启用后，机器人发送的文本消息将渲染为图片后再发送。"
+      },
+      "t2i_word_threshold": {
+        "description": "文本转图像字数阈值",
+        "hint": "消息字数达到该阈值时才会转为图片发送，默认 150。"
+      },
       "disable_builtin_commands": {
         "description": "禁用自带指令",
         "hint": "禁用所有 AstrBot 自带指令,如 help, sid, new 等"

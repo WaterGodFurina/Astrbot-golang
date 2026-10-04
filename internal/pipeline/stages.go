@@ -4895,16 +4895,35 @@ func (s *ResultDecorateStage) Process(ctx context.Context, event *core.Event) (*
 	if !shouldTTS && showReasoning && !streamed {
 		if reasoning, ok := event.GetExtra("_llm_reasoning_content").(string); ok && reasoning != "" {
 			// 对齐 py：Lark 前置可折叠面板 JSON，其余平台前置 "🤔 思考: ..." 文本。
+			var prefix message.Component
 			if event.Source.Platform == "lark" {
-				panel := &message.Json{Data: map[string]interface{}{
+				prefix = &message.Json{Data: map[string]interface{}{
 					"type":     "lark_collapsible_panel_reasoning",
 					"title":    "💭 Thinking",
 					"expanded": false,
 					"content":  reasoning,
 				}}
-				event.Result.Chain = append([]message.Component{panel}, event.Result.Chain...)
 			} else {
-				prefix := &message.Plain{Text: fmt.Sprintf("🤔 思考: %s\n\n────\n", reasoning)}
+				prefix = &message.Plain{Text: fmt.Sprintf("🤔 思考: %s\n\n────\n", reasoning)}
+			}
+			// 合并转发（aiocqhttp）时链已被替换为单个 Node：思考内容必须并入
+			// Node 的 Content，否则落在转发节点之外，平台适配器只发节点、丢弃
+			// 外部前缀 → 思考内容丢失。（对齐 py：py 在构建 Node 之前注入思考，
+			// 故节点内容天然包含。）
+			if forwarded && len(event.Result.Chain) == 1 {
+				switch c := event.Result.Chain[0].(type) {
+				case *message.Node:
+					c.Content = append([]message.Component{prefix}, c.Content...)
+				case *message.Nodes:
+					if len(c.Nodes) > 0 {
+						c.Nodes[0].Content = append([]message.Component{prefix}, c.Nodes[0].Content...)
+					} else {
+						c.Nodes = append(c.Nodes, &message.Node{UIN: event.Source.SelfID, Name: "AstrBot", Content: []message.Component{prefix}})
+					}
+				default:
+					event.Result.Chain = append([]message.Component{prefix}, event.Result.Chain...)
+				}
+			} else {
 				event.Result.Chain = append([]message.Component{prefix}, event.Result.Chain...)
 			}
 		}

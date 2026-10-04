@@ -1014,6 +1014,14 @@
       "wake_prefix": {
         "description": "ウェイクワード"
       },
+      "t2i": {
+        "description": "テキストを画像で出力",
+        "hint": "有効にすると、ボットが送信するテキストメッセージを画像にレンダリングして送信します。"
+      },
+      "t2i_word_threshold": {
+        "description": "テキスト画像化の文字数しきい値",
+        "hint": "メッセージの文字数がこのしきい値に達すると画像に変換されます。既定は 150。"
+      },
       "disable_builtin_commands": {
         "description": "組み込みコマンドを無効化",
         "hint": "help、sid、new など、AstrBot のすべての組み込みコマンドを無効にします。"
