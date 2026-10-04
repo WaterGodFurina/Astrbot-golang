@@ -18,6 +18,9 @@ import (
 // It skips when a C toolchain / Go toolchain / SDK is unavailable.
 func buildTestNativeLib(t *testing.T, source string) string {
 	t.Helper()
+	if !nativeTestCgoEnabled {
+		t.Skip("CGO disabled: Go plugin.Open is a stub; Native runtime unavailable")
+	}
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go not in PATH")
 	}
@@ -37,7 +40,14 @@ func buildTestNativeLib(t *testing.T, source string) string {
 		t.Fatal(err)
 	}
 	out := filepath.Join(dir, "native_plugin.so")
-	cmd := exec.Command("go", "build", "-buildmode=plugin", "-o", out, ".")
+	args := []string{"build", "-buildmode=plugin", "-o", out}
+	if nativeTestRaceEnabled {
+		// Match the -race host test binary; otherwise plugin.Open reports a
+		// mismatched internal/race package.
+		args = append(args, "-race")
+	}
+	args = append(args, ".")
+	cmd := exec.Command("go", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=1", "GOFLAGS=-mod=mod", "GOPROXY=https://goproxy.cn,direct")
 	if b, err := cmd.CombinedOutput(); err != nil {
