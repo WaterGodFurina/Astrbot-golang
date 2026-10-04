@@ -229,7 +229,12 @@ func detectZigCC() (cc, cxx string, ok bool) {
 	}
 	if p, err := exec.LookPath("zig"); err == nil {
 		if info, serr := os.Stat(p); serr == nil && !info.IsDir() { // #nosec G703 -- read-only stat on locally resolved compiler path
-			return p + " cc", p + " c++", true
+			target := zigTargetFlag()
+			sep := " "
+			if target == "" {
+				sep = ""
+			}
+			return p + " cc" + sep + target, p + " c++" + sep + target, true
 		}
 	}
 	return "", "", false
@@ -413,14 +418,63 @@ func zigVersion() string {
 
 // zigCCFromRoot returns the CC/CXX paths for a previously-installed zig bundle
 // at root, or ok=false when the zig binary is not present.
+// zigTargetFlag 返回 zig cc 的目标三元组参数（"-target <triple>"）。
+//
+// **必须显式指定**：zig cc 不指定 target 时会链接宿主 glibc 的 linker script
+// （/usr/lib/x86_64-linux-gnu/libc.so，纯文本）并把 DT_NEEDED 记成 "libc.so"，
+// 导致 dlopen 报 "invalid ELF header"（Native 插件加载失败）。指定 gnu target
+// 后 zig 用自身 glibc stub，NEEDED 正确记为 "libc.so.6"。宿主/插件平台一致，
+// 故按 runtime.GOOS/GOARCH 取本机三元组。
+func zigTargetFlag() string {
+	if t := zigTargetTriple(); t != "" {
+		return "-target " + t
+	}
+	return ""
+}
+
+func zigTargetTriple() string {
+	switch runtime.GOOS {
+	case "linux":
+		switch runtime.GOARCH {
+		case "amd64":
+			return "x86_64-linux-gnu"
+		case "arm64":
+			return "aarch64-linux-gnu"
+		case "386":
+			return "x86-linux-gnu"
+		}
+	case "darwin":
+		switch runtime.GOARCH {
+		case "amd64":
+			return "x86_64-macos"
+		case "arm64":
+			return "aarch64-macos"
+		}
+	case "windows":
+		switch runtime.GOARCH {
+		case "amd64":
+			return "x86_64-windows-gnu"
+		case "arm64":
+			return "aarch64-windows-gnu"
+		}
+	}
+	return ""
+}
+
 func zigCCFromRoot(root string) (cc, cxx string, ok bool) {
 	bin := filepath.Join(root, "zig")
 	if runtime.GOOS == "windows" {
 		bin += ".exe"
 	}
 	if info, err := os.Stat(bin); err == nil && !info.IsDir() {
-		// go uses `zig cc` / `zig c++` as the C/C++ compilers.
-		return bin + " cc", bin + " c++", true
+		// go uses `zig cc` / `zig c++` as the C/C++ compilers. 目标三元组不可
+		// 省略（见 zigTargetFlag 注释），否则 Native 插件 NEEDED 写成 libc.so。
+		target := zigTargetFlag()
+		sep := " "
+		if target == "" {
+			sep = ""
+		}
+		return bin + " cc" + sep + target, bin + " c++" + sep + target, true
 	}
 	return "", "", false
 }

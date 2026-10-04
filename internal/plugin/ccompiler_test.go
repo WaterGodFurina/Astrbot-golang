@@ -259,8 +259,19 @@ func TestZigCCFromRoot(t *testing.T) {
 	if !ok {
 		t.Fatal("expected zigCCFromRoot to detect the zig binary")
 	}
-	if cc != bin+" cc" || cxx != bin+" c++" {
-		t.Errorf("unexpected CC/CXX: %q / %q", cc, cxx)
+	// CC/CXX 必须以 "<zig> cc"/"<zig> c++" 开头，并附带目标三元组
+	//（-target <triple>，缺失会导致 Native 插件 NEEDED=libc.so 加载失败）。
+	wantSuffix := zigTargetFlag()
+	wantCC := bin + " cc"
+	if wantSuffix != "" {
+		wantCC += " " + wantSuffix
+	}
+	wantCXX := bin + " c++"
+	if wantSuffix != "" {
+		wantCXX += " " + wantSuffix
+	}
+	if cc != wantCC || cxx != wantCXX {
+		t.Errorf("unexpected CC/CXX: %q / %q (want %q / %q)", cc, cxx, wantCC, wantCXX)
 	}
 	if _, _, ok := zigCCFromRoot(t.TempDir()); ok {
 		t.Error("empty root should not report a zig binary")
