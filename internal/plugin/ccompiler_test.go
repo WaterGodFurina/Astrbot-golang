@@ -522,8 +522,8 @@ func TestZigMirrorBases(t *testing.T) {
 	if len(def) < 2 {
 		t.Fatalf("defaultZigMirrorBases 至少应含加速+官方两项, got %v", def)
 	}
-	if !strings.Contains(def[0], "huaweicloud") {
-		t.Errorf("默认首选应为华为云加速, got %q", def[0])
+	if !strings.Contains(def[0], "liujiacai.net") {
+		t.Errorf("默认首选应为国内社区镜像, got %q", def[0])
 	}
 	if !strings.Contains(def[len(def)-1], "ziglang.org") {
 		t.Errorf("默认末位应为官方 ziglang.org, got %q", def[len(def)-1])

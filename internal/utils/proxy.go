@@ -21,6 +21,17 @@ import (
 // （见 pysdk.PipEnv：配置代理为空时才回退系统 https_proxy）。
 // no_proxy 中的条目遵循标准格式，例如 "localhost"、"127.0.0.1"、"192.168.*"、
 // "*.example.com" 等。
+// globalProxyFunc 保存最近一次 ConfigureGlobalProxy 构建的代理函数，供自行构造
+// http.Transport 的调用方（如插件 zig cc / 源码下载）复用，保持与全局请求一致的
+// 代理策略：仅认 config http_proxy，未配置即直连（不跟随环境变量）。
+var globalProxyFunc func(req *http.Request) (*url.URL, error)
+
+// ProxyFunc 返回全局代理函数（源自 config http_proxy；未配置时为 nil=直连）。
+// 供未使用 http.DefaultTransport 的自建 Transport 复用同一策略。
+func ProxyFunc() func(req *http.Request) (*url.URL, error) {
+	return globalProxyFunc
+}
+
 func ConfigureGlobalProxy(proxyURL string, noProxy []string) {
 	var proxyFunc func(req *http.Request) (*url.URL, error)
 	if strings.TrimSpace(proxyURL) != "" {
@@ -38,6 +49,7 @@ func ConfigureGlobalProxy(proxyURL string, noProxy []string) {
 		}
 	}
 	// proxyFunc 为 nil 时 Transport.Proxy == nil → 直连。
+	globalProxyFunc = proxyFunc
 
 	// 保留与 http.DefaultTransport 相近的合理默认值（连接池、超时等）。
 	http.DefaultTransport = &http.Transport{

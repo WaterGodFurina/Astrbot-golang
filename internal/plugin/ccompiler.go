@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/mholt/archives"
 )
 
@@ -477,7 +478,7 @@ func downloadZigCCArchive(ctx context.Context, archive, dest, mirror string, pro
 		CheckRedirect: safeRedirect,
 		// 与 source.go 下载路径一致：pin 单次 DNS 解析结果，封死
 		// DNS-rebinding TOCTOU（safeRedirect 只复检主机名）。
-		Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: pinnedDialContext()},
+		Transport: &http.Transport{Proxy: utils.ProxyFunc(), DialContext: pinnedDialContext()},
 	}
 	var lastErr error
 	for _, base := range zigMirrorBases(mirror) {
@@ -617,13 +618,24 @@ func resumeDownload(ctx context.Context, client *http.Client, url, dest string, 
 }
 
 // defaultZigMirrorBases 返回 zig cc 的默认下载镜像基地址（用户可选列表）。
-// 已验证可达：华为云（国内加速，200）+ 官方 ziglang.org。其余（日本
-// zig.worker.green 已无 DNS、俄罗斯 mirror.mephi.ru 不可达、GitHub 加速前缀
-// 不代理 ziglang.org）不加入，避免每个死源超时拖慢下载。
+// 来源为 ziglang.org 官方社区镜像清单 https://ziglang.org/download/community-mirrors.txt
+// （其路径约定为 <base>/<version>/<archive>），本机实测可达者入列。首个为国内
+// 镜像 fs.liujiacai.net（实测 ~2.7MB/s），末位官方 ziglang.org 兜底。
+// 注意：GitHub 上的 ziglang/zig release 只有 zig-bootstrap 源码、无预编译二进制，
+// 故不提供 GitHub 下载途径；ziglang.org 也未列日本/俄罗斯专属镜像（社区清单
+// 不含区域标注），需要者可用弹窗选择或 ASTRBOT_ZIGCC_MIRROR 指定。
 func defaultZigMirrorBases() []string {
+	ver := zigVersion()
 	return []string{
-		"https://mirrors.huaweicloud.com/zig/download/" + zigVersion(),
-		"https://ziglang.org/download/" + zigVersion(),
+		"https://fs.liujiacai.net/zigbuilds/" + ver,
+		"https://pkg.hexops.org/zig/" + ver,
+		"https://zig.mirror.mschae23.de/zig/" + ver,
+		"https://zig.linus.dev/zig/" + ver,
+		"https://zig.karearl.com/zig/" + ver,
+		"https://zig.vortan.dev/zig/" + ver,
+		"https://pkg.alexrp.com/zig/" + ver,
+		"https://zig.bcr.ist/" + ver,
+		"https://ziglang.org/download/" + ver,
 	}
 }
 

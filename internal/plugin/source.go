@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/netguard"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 )
 
 // forbiddenImports are packages plugin source may not import. This is a
@@ -469,7 +470,7 @@ func downloadFileWithProgress(ctx context.Context, url, dest string, progress fu
 	// （DNS-rebinding TOCTOU 防护，见 pinnedDialContext）。URL 保持不变，
 	// Host header 与 TLS SNI 仍然携带原始主机名。
 	transport := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 utils.ProxyFunc(),
 		DialContext:           pinnedDialContext(),
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
