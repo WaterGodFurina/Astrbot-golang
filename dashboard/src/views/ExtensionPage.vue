@@ -187,6 +187,7 @@ const {
   runtimeDialog,
   confirmRuntimeChoice,
   cancelRuntimeChoice,
+  nativeRebuildDialog,
   installProgress,
   newExtension,
   normalizePlatformList,
@@ -769,6 +770,36 @@ const updateDialogPluginLogo = computed(() => {
         </v-btn>
         <v-btn color="primary" variant="flat" @click="confirmRuntimeChoice">
           {{ tm("dialogs.runtime_preference.confirm") }}
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <!-- Native 插件后台重编译提醒：.so 加载失败（多为 Go 版本升级导致 ABI
+       不兼容）时，宿主在后台重编译，不阻塞 WebUI；此处仅提醒用户。 -->
+  <v-dialog v-model="nativeRebuildDialog.show" width="560">
+    <v-card>
+      <v-card-title class="text-h3 pa-4 pb-0 pl-6">
+        {{ tm("dialogs.native_rebuild.title") }}
+      </v-card-title>
+      <v-card-text class="pt-4">
+        <v-alert type="info" variant="tonal" density="comfortable" class="mb-3">
+          <span v-if="nativeRebuildDialog.pluginName" class="font-weight-medium">
+            {{ nativeRebuildDialog.pluginName }}
+          </span>
+          {{ nativeRebuildDialog.message }}
+        </v-alert>
+        <div class="text-medium-emphasis text-body-2">
+          {{ tm("dialogs.native_rebuild.hint") }}
+        </div>
+      </v-card-text>
+      <v-card-actions>
+        <v-spacer />
+        <v-btn
+          variant="text"
+          @click="nativeRebuildDialog.show = false"
+        >
+          {{ tm("dialogs.native_rebuild.ok") }}
         </v-btn>
       </v-card-actions>
     </v-card>

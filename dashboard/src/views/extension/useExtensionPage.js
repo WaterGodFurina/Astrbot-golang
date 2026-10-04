@@ -268,6 +268,39 @@ export const useExtensionPage = (initialTab = "installed") => {
     message: "",
   });
 
+  // nativeRebuildDialog 在收到后端 native_rebuild 状态（Native .so 加载
+  // 失败、正在后台重编译，通常是 Go 版本升级导致 ABI 不兼容）时弹窗提醒
+  // 用户；重编译在后台进行，不阻塞 WebUI。每条插件只提醒一次。
+  const nativeRebuildDialog = reactive({
+    show: false,
+    pluginName: "",
+    message: "",
+  });
+  const nativeRebuildNotified = new Set();
+  const scanNativeRebuild = (plugins) => {
+    if (!Array.isArray(plugins)) return;
+    for (const p of plugins) {
+      const rb = p && p.native_rebuild;
+      if (!rb || !rb.state) continue;
+      const key = `${p.id || p.name}:${rb.state}`;
+      if (rb.state === "running" && !nativeRebuildNotified.has(key)) {
+        nativeRebuildNotified.add(key);
+        nativeRebuildDialog.pluginName = p.display_name || p.name || p.id || "";
+        nativeRebuildDialog.message =
+          rb.message ||
+          "Native 插件链接库加载失败，正在后台重新编译…（不阻塞使用，完成后自动重新加载）";
+        nativeRebuildDialog.show = true;
+      }
+      if (rb.state === "failed" && !nativeRebuildNotified.has(key + ":failed")) {
+        nativeRebuildNotified.add(key + ":failed");
+        nativeRebuildDialog.pluginName = p.display_name || p.name || p.id || "";
+        nativeRebuildDialog.message =
+          rb.message || "Native 插件自动重编译失败，请在 WebUI 重新安装该插件。";
+        nativeRebuildDialog.show = true;
+      }
+    }
+  };
+
   // 安装进度轮询状态
   const installProgress = ref({
     show: false,
@@ -657,6 +690,9 @@ export const useExtensionPage = (initialTab = "installed") => {
 
       // 同步插件数据到侧边栏共享状态
       pluginSidebarState.plugins = res.data?.data || [];
+
+      // Native 插件后台重编译提醒（不阻塞 WebUI）。
+      scanNativeRebuild(res.data?.data);
 
       const failRes = await pluginApi.failed();
       failedPluginsDict.value = failRes.data.data || {};
@@ -3299,6 +3335,7 @@ export const useExtensionPage = (initialTab = "installed") => {
     runtimeDialog,
     confirmRuntimeChoice,
     cancelRuntimeChoice,
+    nativeRebuildDialog,
     installProgress,
     newExtension,
     normalizePlatformList,

@@ -1,7 +1,7 @@
-// Package plugin - subprocess runtime management extensions: dashboard-facing
-// list/enable/disable/uninstall and config storage, mirroring the legacy .so
-// manager's extensions.go semantics but backed by the install manifest and
-// compiled binaries instead of .so files.
+// Package plugin - plugin runtime management extensions: dashboard-facing
+// list/enable/disable/uninstall and config storage, backed by the install
+// manifest and per-runtime artifacts (gRPC child-process executables, Native
+// .so libraries, or Python source trees).
 package plugin
 
 import (
@@ -114,6 +114,8 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 		}
 		// 板块 5/6：附 Python 状态镜像与持久化故障/隔离状态。
 		addStatusMirror(info, inst, e)
+		// Native 异步重编译状态（加载失败后后台重编译，供 WebUI 弹窗）。
+		info["native_rebuild"] = m.nativeRebuildStatus(inst.ID)
 		if e != nil {
 			info["repo"] = e.Repo
 			if info["repo"] == "" {
@@ -214,6 +216,8 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 			"isolation_required": e.IsolationRequired,
 			"runtime_preferred":  e.RuntimePreferred,
 			"runtime_current":    e.RuntimeCurrent,
+			// Native 异步重编译状态（加载失败后后台重编译，供 WebUI 弹窗）。
+			"native_rebuild": m.nativeRebuildStatus(e.ID),
 		})
 	}
 	return result

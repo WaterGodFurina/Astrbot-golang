@@ -109,9 +109,31 @@ func ensureCCompiler(ctx context.Context, options InstallOptions) (ccPath, cxxPa
 	}
 
 	// No explicit choice yet: detect what the host already has.
-	// Priority: zig cc (bundled or on PATH) > GCC > Clang.
+	// Priority: zig cc (bundled or on PATH) > musl-gcc > GCC > Clang.
 	if cc, cxx, ok := detectZigCC(); ok {
 		return cc, cxx, nil
+	}
+	if hostLibc() == "musl" {
+		// Alpine/musl：`musl-gcc`（musl-dev）就是该环境下的 gcc——它只能生成
+		// musl 目标，与宿主一致，无需 -target（musl-gcc 已内置）。普通 gcc 会
+		// 链接 glibc，绝不能用于 musl 宿主的 Native 插件，故在此直接采用
+		// musl-gcc，不落到下面的普通 gcc 分支。
+		if gcc, cxx, ver, ok := detectMuslGCC(); ok {
+			logger.I18nInfo("为 Native 插件使用 musl-gcc: %s (v%s)", gcc, ver)
+			return gcc, cxx, nil
+		}
+		// musl 下普通 gcc/clang 会产出 glibc 目标，加载必失败；只在确实没有
+		// musl-gcc 时才提示（用户可装 musl-dev 或下载 zig cc）。
+		if clang, cxx, ok := detectSystemClang(); ok {
+			return "", "", &CCompilerPromptError{
+				Kind:         PromptChooseClang,
+				HasClang:     true,
+				ClangPath:    clang,
+				ClangXXPath:  cxx,
+				ClangVersion: compilerVersion(clang),
+			}
+		}
+		return "", "", &CCompilerPromptError{Kind: PromptDownloadZigCC, Mirrors: defaultZigMirrorBases()}
 	}
 	if gcc, cxx, ver, ok := detectSystemGCC(); ok {
 		return "", "", &CCompilerPromptError{
@@ -162,6 +184,26 @@ func resolveCCChoice(ctx context.Context, choice CCompilerChoice, options Instal
 	default:
 		return "", "", fmt.Errorf("未知的 C 编译器选择: %q", choice)
 	}
+}
+
+// detectMuslGCC resolves a usable musl-gcc wrapper (Alpine's musl-dev / Debian's
+// musl-tools). It only yields a musl target, matching a musl host. Returns
+// ok=false when absent.
+func detectMuslGCC() (cc, cxx, version string, ok bool) {
+	for _, name := range []string{"musl-gcc", "musl-g++"} {
+		p, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		if info, serr := os.Stat(p); serr == nil && !info.IsDir() {
+			cxx := p
+			if cp, err := exec.LookPath("musl-g++"); err == nil {
+				cxx = cp
+			}
+			return p, cxx, compilerVersion(p), true
+		}
+	}
+	return "", "", "", false
 }
 
 // detectSystemGCC resolves a usable system GCC following the documented
@@ -422,9 +464,10 @@ func zigVersion() string {
 //
 // **必须显式指定**：zig cc 不指定 target 时会链接宿主 glibc 的 linker script
 // （/usr/lib/x86_64-linux-gnu/libc.so，纯文本）并把 DT_NEEDED 记成 "libc.so"，
-// 导致 dlopen 报 "invalid ELF header"（Native 插件加载失败）。指定 gnu target
-// 后 zig 用自身 glibc stub，NEEDED 正确记为 "libc.so.6"。宿主/插件平台一致，
-// 故按 runtime.GOOS/GOARCH 取本机三元组。
+// 导致 dlopen 报 "invalid ELF header"（Native 插件加载失败）。指定 target 后
+// zig 用自带 stub，NEEDED 正确。三元组按宿主平台取（libc 由 hostLibc()
+// 决定：glibc 宿主 → x86_64-linux-gnu，musl 宿主 → x86_64-linux-musl），
+// 宿主与插件 libc 必须一致才能 plugin.Open。
 func zigTargetFlag() string {
 	if t := zigTargetTriple(); t != "" {
 		return "-target " + t
@@ -432,16 +475,22 @@ func zigTargetFlag() string {
 	return ""
 }
 
+// zigTargetTriple returns the target triple for the host platform. The libc
+// component is overridable with ASTRBOT_LIBC (musl|gnu); it defaults to the
+// host's own libc. Native plugins MUST be built for the same libc as the host
+// binary (Go plugin rejects a mismatch), so on an Alpine/musl host the musl
+// triple is selected automatically and via `ASTRBOT_LIBC=musl`.
 func zigTargetTriple() string {
 	switch runtime.GOOS {
 	case "linux":
+		libc := hostLibc()
 		switch runtime.GOARCH {
 		case "amd64":
-			return "x86_64-linux-gnu"
+			return "x86_64-linux-" + libc
 		case "arm64":
-			return "aarch64-linux-gnu"
+			return "aarch64-linux-" + libc
 		case "386":
-			return "x86-linux-gnu"
+			return "x86-linux-" + libc
 		}
 	case "darwin":
 		switch runtime.GOARCH {

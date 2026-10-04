@@ -146,8 +146,9 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		}
 	}
 
-	// 插件方案：全面采用子进程插件运行时（go-plugin + gRPC），
-	// 已舍弃 legacy .so 方案（不再加载/桥接 .so 插件）。
+	// 插件方案：gRPC 子进程运行时（go-plugin + gRPC）为默认，另有
+	// Native 进程内 .so 运行时（plugin.Open，直接调用）与 Python 共享
+	// Runtime；三者由 SubprocessManager 统一管理。
 
 	// Apply the log level from config unless ASTRBOT_LOG_LEVEL is set
 	// explicitly in the environment (env takes precedence).
@@ -462,7 +463,7 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.subPluginMgr.LoadInstalled(runCtx)
 	star.RegisterSubprocessPlugins(l.starMgr, l.subPluginMgr, l.subPluginMgr.RegisteredPlugins())
 
-	// (已舍弃 legacy .so 方案：不再加载/桥接 .so 插件)
+	// (Native .so 插件由 SubprocessManager 加载并桥接，无需在此单独处理)
 
 	// 11. Load platform adapters from config
 	if err := l.loadPlatforms(runCtx); err != nil {
@@ -1138,7 +1139,7 @@ func (l *Lifecycle) syncHostCapabilities() {
 
 // RebridgePlugins re-registers plugin commands/filters/hooks after plugin
 // changes (enable/disable/reload/install/unload) so the pipeline picks up the
-// latest set. 全面采用子进程插件运行时（legacy .so 已舍弃）。
+// latest set. 插件由 SubprocessManager 以 gRPC 子进程 / Native 进程内 .so / Python 共享 Runtime 三种方式运行。
 func (l *Lifecycle) RebridgePlugins() {
 	if l.starMgr == nil {
 		return

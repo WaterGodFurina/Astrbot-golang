@@ -349,6 +349,11 @@
       "pythonGrpcDesc": "Pros: one dedicated Python process, process-level isolation (good for plugins using special C extensions, polluting globals, or dependency conflicts).\nCons: one interpreter/SDK per plugin, higher memory usage.",
       "cancel": "Cancel",
       "confirm": "OK"
+    },
+    "native_rebuild": {
+      "title": "Recompiling Native plugin",
+      "hint": "A shared-library load failure usually means the prebuilt plugin is ABI-incompatible after a host Go version upgrade. The recompile runs in the background without blocking use and reloads automatically when done. If it keeps failing, reinstall the plugin from the WebUI.",
+      "ok": "Got it"
     }
   },
   "messages": {

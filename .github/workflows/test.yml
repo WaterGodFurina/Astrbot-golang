@@ -173,67 +173,92 @@ jobs:
           # Windows 产物无法在 runner 上执行，仅校验 PE 格式与体积
           head -c 2 astrbot-windows-amd64.exe | xxd | grep "4d5a" || { echo "不是有效的 PE 头"; exit 1; }
 
-      # Native 运行方式 POC（Windows .dll）：注入 native_entry.go 后用
-      # -buildmode=c-shared 产出 DLL，并校验 C ABI 导出符号 AstrBotNativeServe。
-      # 验证 Windows 上 C 入口（//export + C.int、零参数）可被宿主 Loader
-      # GetProcAddress 找到，与 Unix .so 加载层对齐。
-      - name: Native POC - 确认 C 编译器可用（cgo 需要）
-        if: runner.os == 'Windows'
+      # Native 运行方式 POC（Linux .so，musl 与 gnu）：注入 native_entry.go
+      # 后用 -buildmode=plugin 产出 .so，并校验导出符号 AstrBotNativePlugin。
+      # 该 POC 同时覆盖 musl 目标（Alpine/zig cc -target ...-musl），验证
+      # musl 环境下 Native 库可编译，且 gRPC 子进程路径不依赖 C 编译器。
+      - name: Native POC - 确认 C 编译器可用（musl 需 musl-gcc 或 zig cc）
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          which gcc || true
-          gcc --version | head -1 || { echo "缺少 gcc（cgo 无法编译 c-shared）"; exit 1; }
+          gcc --version | head -1 || true
+          which musl-gcc zig || true
 
-      - name: Native POC - 编译 echo 插件为 Windows .dll（c-shared）
-        if: runner.os == 'Windows'
+      - name: Native POC - 编译 echo 插件为 Linux gnu .so（cgo + -buildmode=plugin）
+        if: runner.os == 'Linux'
         shell: bash
         working-directory: internal/plugin/testdata/native_poc
         env:
           CGO_ENABLED: '1'
-          GOOS: windows
+          GOOS: linux
           GOARCH: amd64
         run: |
           set -euo pipefail
           cat > native_entry.go <<'EOF'
           package main
 
-          /*
-          #include <stdint.h>
-          */
-          import "C"
+          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
 
-          import sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-
-          //export AstrBotNativeServe
-          func AstrBotNativeServe() C.int {
-          	sdk.Register(plugin)
-          	return C.int(sdk.NativeServe())
+          func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
+          	return native.Serve(plugin, pluginID)
           }
           EOF
           go mod tidy
-          go build -buildmode=c-shared -o nativepoc.dll .
+          go build -buildmode=plugin -o nativepoc-gnu.so .
           rm -f native_entry.go
-          ls -la nativepoc.dll
+          ls -la nativepoc-gnu.so
+          go tool nm nativepoc-gnu.so | grep -i "AstrBotNativePlugin" || {
+            echo "gnu .so 未导出 AstrBotNativePlugin"; exit 1; }
+          echo "OK: gnu .so 导出 AstrBotNativePlugin"
 
-      - name: Native POC - 校验 DLL 导出 AstrBotNativeServe
-        if: runner.os == 'Windows'
+      - name: Native POC - 安装 musl 工具链并编译 musl .so
+        if: runner.os == 'Linux'
         shell: bash
-        working-directory: internal/plugin/testdata/native_poc
         run: |
           set -euo pipefail
-          # 用 mingw nm 读 PE 导出表（go tool nm 不解析 PE 导出目录）。
-          nm nativepoc.dll | grep -i "AstrBotNativeServe" || \
-            go tool nm nativepoc.dll | grep -i "AstrBotNativeServe" || {
-              echo "DLL 未导出 AstrBotNativeServe"; exit 1; }
-          echo "OK: DLL 导出 AstrBotNativeServe"
+          sudo apt-get update -q -o Acquire::Retries=3
+          sudo apt-get install -y -q musl-tools
+          musl-gcc --version | head -1
 
-      - name: Native POC - 上传 .dll（供人工检查）
-        if: runner.os == 'Windows'
+      - name: Native POC - 编译 echo 插件为 Linux musl .so（CC=musl-gcc）
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: internal/plugin/testdata/native_poc
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: amd64
+          CC: musl-gcc
+          ASTRBOT_LIBC: musl
+        run: |
+          set -euo pipefail
+          cat > native_entry.go <<'EOF'
+          package main
+
+          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+
+          func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
+          	return native.Serve(plugin, pluginID)
+          }
+          EOF
+          go mod tidy
+          go build -buildmode=plugin -o nativepoc-musl.so .
+          rm -f native_entry.go
+          ls -la nativepoc-musl.so
+          file nativepoc-musl.so | grep -i "musl\|interpreter\|dynamically linked" || true
+          go tool nm nativepoc-musl.so | grep -i "AstrBotNativePlugin" || {
+            echo "musl .so 未导出 AstrBotNativePlugin"; exit 1; }
+          echo "OK: musl .so 导出 AstrBotNativePlugin"
+
+      - name: Native POC - 上传 .so（供人工检查）
+        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v5
         with:
-          name: native-poc-windows-dll
-          path: internal/plugin/testdata/native_poc/nativepoc.dll
+          name: native-poc-linux-so
+          path: |
+            internal/plugin/testdata/native_poc/nativepoc-gnu.so
+            internal/plugin/testdata/native_poc/nativepoc-musl.so
           if-no-files-found: error
 
       - name: 上传 Windows 编译产物
@@ -264,6 +289,42 @@ jobs:
           name: astrbot-linux-amd64
           path: astrbot-linux-amd64
           if-no-files-found: error
+
+  native-linux:
+    # 专门以 CGO_ENABLED=1 跑 Native（进程内 .so）测试：Go 的 plugin 包在
+    # 非 cgo 下是 stub（plugin: not implemented），普通 go-test 矩阵用的是
+    # CGO_ENABLED=0，Native 测试会跳过。此 job 让 plugin.Open 走真实路径。
+    name: Native 测试 (linux, cgo)
+    needs: frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || needs.frontend.outputs.sha }}
+          fetch-depth: 0
+
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: 配置 Go 环境（代理与模块）
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
+          GOFLAGS: -mod=mod
+        run: |
+          go env -w GOPROXY="https://goproxy.cn,direct"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
+
+      - name: 运行 Native 测试（CGO_ENABLED=1）
+        env:
+          CGO_ENABLED: '1'
+          PIP_INDEX_URL: https://pypi.org/simple
+          ASTRBOT_PYPI_INDEX: https://pypi.org/simple
+        run: go test ./internal/plugin/ -count=1 -timeout 30m -run 'TestNative'
 
   frontend:
     name: 前端构建

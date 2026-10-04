@@ -127,7 +127,7 @@ type PluginInstance struct {
 	pyStatusSeen   bool    // 是否已成功拉到过状态（区分空镜像）
 }
 
-// SubprocessManager manages plugins running as isolated child processes (go-plugin + gRPC); replaces the legacy .so loader (removed). Unlike in-process .so plugins, child processes can be fully terminated so memory + handles are reclaimed by the OS and a crash can't take the host down; crashed plugins restart with backoff.
+// SubprocessManager manages plugin instances across runtimes: isolated child processes (go-plugin + gRPC), the shared multi-tenant Python Runtime, and in-process Native .so plugins. gRPC child processes can be fully terminated so memory + handles are reclaimed by the OS and a crash can't take the host down (crashed plugins restart with backoff); Native plugins share the host address space and are resident for the process lifetime.
 type SubprocessManager struct {
 	mu        sync.RWMutex
 	instances map[string]*PluginInstance
@@ -153,6 +153,13 @@ type SubprocessManager struct {
 	// docMu guards docFetchCache (remote README/CHANGELOG fetch results incl. negative cache). TTL-bounded so GitHub outages don't hard-block the details page, but transient failures retry later.
 	docMu         sync.Mutex
 	docFetchCache map[string]docCacheEntry
+
+	// nativeRebuildMu guards nativeRebuilds: the async recompile state for
+	// Native (.so) plugins whose library failed to load (e.g. after a Go
+	// version bump the prebuilt .so is ABI-incompatible). The host never blocks
+	// startup/WebUI on the rebuild; the WebUI surfaces the state as a popup.
+	nativeRebuildMu sync.Mutex
+	nativeRebuilds  map[string]*NativeRebuildStatus
 
 	// githubProxy prefixes git clone URLs for GitHub acceleration (e.g. https://ghfast.top/).
 	githubProxy string
@@ -541,6 +548,7 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 		handlerMeta:      make(map[string]*sdkv1.RegisterResponse),
 		sessionWaitReg:   make(map[string]*sessionWaitEntry),
 		bridgeHooks:      make(map[string]map[string]struct{}),
+		nativeRebuilds:   make(map[string]*NativeRebuildStatus),
 		logLevels:        newLogLevels(dataDir),
 		toolchain:        tc,
 		compiler:         NewCompiler(tc),
@@ -2728,6 +2736,13 @@ func (m *SubprocessManager) LoadInstalled(ctx context.Context) {
 					continue
 				}
 				logger.I18nWarn("插件 %s 协议不匹配且自动重编译失败（无本地源码或工具链不可用），请于 WebUI 重新安装: %v", e.ID, rerr)
+				continue
+			}
+			// Native（.so）插件加载失败且疑似 ABI / Go 版本不兼容：不阻塞
+			// 启动，后台异步重编译源码到原路径（Go 版本升级后自愈），状态经
+			// ListInfo.native_rebuild 暴露给 WebUI 弹窗提醒用户。
+			if e.Runtime == "native" && isNativeABIMismatchErr(err) {
+				m.scheduleNativeRebuild(e.ID, e.Binary, err)
 				continue
 			}
 			logger.I18nWarn("加载已安装插件 %s 失败: %v", e.ID, err)
