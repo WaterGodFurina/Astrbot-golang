@@ -28,7 +28,13 @@ case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     DATA_DIR="${DATA_DIR//\\//}"
     ASTRBOT_BIN="${ASTRBOT_BIN//\\//}"
-    REPO_ROOT="${REPO_ROOT//\\//}"
+    # REPO_ROOT 由 Git Bash `pwd` 得到 MSYS 风格 /d/a/...，Windows Go 无法解析；
+    # 用 cygpath -m 转成 D:/a/...（正向斜杠的 Windows 路径）。
+    if command -v cygpath >/dev/null 2>&1; then
+      REPO_ROOT="$(cygpath -m "$REPO_ROOT")"
+    else
+      REPO_ROOT="${REPO_ROOT//\\//}"
+    fi
     ;;
 esac
 
