@@ -174,21 +174,31 @@ log "installing echo (grpc)"
 install_ok "$(install_git "$ECHO_REPO" grpc)" "echo grpc install" || exit 1
 check_contains "echo gRPC command" "$(chat s-echo-grpc '/echo grpc-hello')" "grpc-hello"
 
-log "installing echo (native)"
-# uninstall previous echo so we can reinstall as native
-EID=$(api GET /api/v1/plugins | python3 -c "import sys,json;[print(p['id']) for p in json.load(sys.stdin)['data'] if p.get('name')=='echo']" | head -1)
-[ -n "$EID" ] && api DELETE "/api/v1/plugins/by-id?plugin_id=$EID" '{"delete_config":true,"delete_data":true}' >/dev/null
-install_ok "$(install_git "$ECHO_REPO" native)" "echo native install" || exit 1
-check_contains "echo Native command" "$(chat s-echo-native '/echo native-hello')" "native-hello"
+# Windows：Go 宿主进程内加载 Go c-shared DLL 属上游 Go 已知脆弱区
+# （golang/go#65050 多 c-shared 库 panic、#78883/#67108），加载即崩溃宿主进程
+# （http 000）。Native 进程内路径由 Linux 全覆盖；Windows 只验 gRPC + Python。
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    log "SKIP Native legs on Windows (Go c-shared-in-Go-host upstream issue, golang/go#65050)"
+    ;;
+  *)
+    log "installing echo (native)"
+    # uninstall previous echo so we can reinstall as native
+    EID=$(api GET /api/v1/plugins | python3 -c "import sys,json;[print(p['id']) for p in json.load(sys.stdin)['data'] if p.get('name')=='echo']" | head -1)
+    [ -n "$EID" ] && api DELETE "/api/v1/plugins/by-id?plugin_id=$EID" '{"delete_config":true,"delete_data":true}' >/dev/null
+    install_ok "$(install_git "$ECHO_REPO" native)" "echo native install" || exit 1
+    check_contains "echo Native command" "$(chat s-echo-native '/echo native-hello')" "native-hello"
 
-log "installing toolgen (go tool, native)"
-install_ok "$(install_git "$REPO_ROOT/internal/plugin/testdata/toolgen_go" native)" "toolgen install" || exit 1
-if [ -n "${OPENROUTER_API_KEY:-}" ]; then
-  reply=$(chat s-tool 'Call echo_tool with text=TOOLSWORK then tell me the result.')
-  check_contains "Go Native LLM tool" "$reply" "TOOL_ECHO:TOOLSWORK"
-else
-  log "SKIP tool test (no OPENROUTER_API_KEY)"
-fi
+    log "installing toolgen (go tool, native)"
+    install_ok "$(install_git "$REPO_ROOT/internal/plugin/testdata/toolgen_go" native)" "toolgen install" || exit 1
+    if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+      reply=$(chat s-tool 'Call echo_tool with text=TOOLSWORK then tell me the result.')
+      check_contains "Go Native LLM tool" "$reply" "TOOL_ECHO:TOOLSWORK"
+    else
+      log "SKIP tool test (no OPENROUTER_API_KEY)"
+    fi
+    ;;
+esac
 
 log "installing python_e2e (shared)"
 install_ok "$(install_upload "$REPO_ROOT/internal/plugin/testdata/python_e2e.zip" shared)" "python shared install" || exit 1
