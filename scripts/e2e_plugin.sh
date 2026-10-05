@@ -88,6 +88,14 @@ api() { # method path [json-body]
   fi
 }
 
+install_ok() { # response-json label
+  if echo "$1" | grep -q '"status":"ok"'; then
+    return 0
+  fi
+  echo "[e2e][FAIL] $2: $1" >&2
+  return 1
+}
+
 install_git() { # url runtime [extra-json]
   local url="$1" runtime="$2" extra="${3:-}"
   api POST /api/v1/plugins/install/git \
@@ -130,18 +138,18 @@ trap 'kill -9 "$HOST_PID" 2>/dev/null || true' EXIT
 login "AstrbotE2E!"
 
 log "installing echo (grpc)"
-install_git "$ECHO_REPO" grpc | grep -q '"status":"ok"' || fail "echo grpc install failed"
+install_ok "$(install_git "$ECHO_REPO" grpc)" "echo grpc install" || exit 1
 check_contains "echo gRPC command" "$(chat s-echo-grpc '/echo grpc-hello')" "grpc-hello"
 
 log "installing echo (native)"
 # uninstall previous echo so we can reinstall as native
 EID=$(api GET /api/v1/plugins | python3 -c "import sys,json;[print(p['id']) for p in json.load(sys.stdin)['data'] if p.get('name')=='echo']" | head -1)
 [ -n "$EID" ] && api DELETE "/api/v1/plugins/by-id?plugin_id=$EID" '{"delete_config":true,"delete_data":true}' >/dev/null
-install_git "$ECHO_REPO" native | grep -q '"status":"ok"' || fail "echo native install failed"
+install_ok "$(install_git "$ECHO_REPO" native)" "echo native install" || exit 1
 check_contains "echo Native command" "$(chat s-echo-native '/echo native-hello')" "native-hello"
 
 log "installing toolgen (go tool, native)"
-install_git "$REPO_ROOT/internal/plugin/testdata/toolgen_go" native | grep -q '"status":"ok"' || fail "toolgen install failed"
+install_ok "$(install_git "$REPO_ROOT/internal/plugin/testdata/toolgen_go" native)" "toolgen install" || exit 1
 if [ -n "${OPENROUTER_API_KEY:-}" ]; then
   reply=$(chat s-tool 'Call echo_tool with text=TOOLSWORK then tell me the result.')
   check_contains "Go Native LLM tool" "$reply" "TOOL_ECHO:TOOLSWORK"
@@ -150,13 +158,13 @@ else
 fi
 
 log "installing python_e2e (shared)"
-install_upload "$REPO_ROOT/internal/plugin/testdata/python_e2e.zip" shared | grep -q '"status":"ok"' || fail "python shared install failed"
+install_ok "$(install_upload "$REPO_ROOT/internal/plugin/testdata/python_e2e.zip" shared)" "python shared install" || exit 1
 check_contains "Python shared command" "$(chat s-py-shared '/am_status')" "agentmemory unavailable"
 
 log "installing python_e2e (grpc)"
 PID2=$(api GET /api/v1/plugins | python3 -c "import sys,json;[print(p['id']) for p in json.load(sys.stdin)['data'] if 'agentmemory' in p.get('id','')]" | head -1)
 [ -n "$PID2" ] && api DELETE "/api/v1/plugins/by-id?plugin_id=$PID2" '{"delete_config":true,"delete_data":true}' >/dev/null
-install_upload "$REPO_ROOT/internal/plugin/testdata/python_e2e.zip" grpc | grep -q '"status":"ok"' || fail "python grpc install failed"
+install_ok "$(install_upload "$REPO_ROOT/internal/plugin/testdata/python_e2e.zip" grpc)" "python grpc install" || exit 1
 check_contains "Python grpc command" "$(chat s-py-grpc '/am_status')" "agentmemory unavailable"
 
 log "ALL E2E CHECKS PASSED"
