@@ -450,6 +450,12 @@ jobs:
           CGO_ENABLED: '1'
         run: go build -o astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/astrbot
 
+      - name: 诊断宿主链接版本
+        shell: bash
+        run: |
+          echo "go: $(go version)"
+          go version -m "astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }}" | grep -E "protobuf|Astrbot-go-plugin-sdk|grpc" || true
+
       - name: 运行插件 E2E
         shell: bash
         env:
