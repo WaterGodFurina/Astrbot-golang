@@ -56,7 +56,7 @@ json.dump(d,open(p,"w"),ensure_ascii=False,indent=2)
 PY
   # 诊断：确认模板已应用（jwt_secret 固定前缀、password_change_required=false）。
   if [ -f "$DATA_DIR/cmd_config.json" ]; then
-    log "prepared config: $(grep -o '"jwt_secret":"[0-9a-f]\{8\}' "$DATA_DIR/cmd_config.json" | head -1) pw_change=$(grep -o '"password_change_required":[a-z]*' "$DATA_DIR/cmd_config.json" | head -1)"
+    log "prepared config: $(grep -o '"jwt_secret": *"[0-9a-f]\{8\}' "$DATA_DIR/cmd_config.json" | head -1) pw_change=$(grep -o '"password_change_required": *[a-z]*' "$DATA_DIR/cmd_config.json" | head -1)"
   else
     fail "cmd_config.json 未生成（$DATA_DIR/cmd_config.json）"
   fi
@@ -87,10 +87,20 @@ start_host() {
 }
 
 login() {
-  local pw="$1"
+  local pw="$1" user="astrbot"
   TOKEN=$(curl -s -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"astrbot\",\"password\":\"$pw\"}" \
-    | python3 -c "import sys,json;print(json.load(sys.stdin)['data']['token'])")
+    -d "{\"username\":\"$user\",\"password\":\"$pw\"}" \
+    | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('token') or '')")
+  if [ -z "$TOKEN" ]; then
+    # Windows 宿主偶发未采纳 datatest 的固定凭据、自举随机初始凭据：
+    # 从 host.log 抓取初始 Username/Password 重试（对齐本地验证的"抓初始密码"）。
+    log "固定凭据登录失败，尝试 host.log 初始凭据"
+    user=$(grep -a 'Username:' "$DATA_DIR/host.log" | head -1 | sed 's/.*Username: *//' | tr -d '\r')
+    pw=$(grep -a 'Password:' "$DATA_DIR/host.log" | head -1 | sed 's/.*Password: *//' | tr -d '\r')
+    TOKEN=$(curl -s -X POST "$BASE/api/auth/login" -H 'Content-Type: application/json' \
+      -d "{\"username\":\"$user\",\"password\":\"$pw\"}" \
+      | python3 -c "import sys,json;print(json.load(sys.stdin).get('data',{}).get('token') or '')")
+  fi
   [ -n "$TOKEN" ] || fail "login failed"
 }
 
