@@ -24,7 +24,7 @@ const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 // sdkModuleVersion 是宿主内置的插件 SDK 版本（与宿主 go.mod 的 require 一致，
 // 发版时同步 bump）。发布版宿主进程的 CWD 下没有 go.mod，SDK 解析与下载在
 // 找不到 go.mod 时以该常量兜底定位模块缓存，不再依赖进程工作目录。
-const sdkModuleVersion = "v2.0.2"
+const sdkModuleVersion = "v2.0.3"
 
 // nativeEntryUnix 是 Native 构建时注入插件 package main 的生成入口
 // （不改动插件作者源码）。宿主用 plugin.Open 加载 .so 后 Lookup 并调用它：
