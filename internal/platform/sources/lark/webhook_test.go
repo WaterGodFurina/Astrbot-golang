@@ -92,10 +92,20 @@ func TestWebhookEncryptedEventWrongSignature(t *testing.T) {
 	srv := NewLarkWebhookServer("app", "secret", encryptKey, "")
 	enc := encryptForTest(t, encryptKey, `{"header":{"event_type":"im.message.receive_v1"},"event":{}}`)
 	body := `{"encrypt":"` + enc + `"}`
+	ts := fmt.Sprintf("%d", time.Now().Unix())
+	nonce := "nonce_1"
+	// 先算正确签名，再确定性地翻转首字符——避免 "00"+sig[2:] 在正确签名恰好
+	// 以 "00" 开头时变成有效签名（约 1/256 概率造成 flaky）。
+	correct := signatureForTest(t, encryptKey, ts, nonce, body)
+	flip := byte('0')
+	if correct[0] == '0' {
+		flip = '1'
+	}
+	wrong := string(flip) + correct[1:]
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
-	req.Header.Set("X-Lark-Request-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
-	req.Header.Set("X-Lark-Request-Nonce", "nonce_1")
-	req.Header.Set("X-Lark-Signature", "00"+signatureForTest(t, encryptKey, fmt.Sprintf("%d", time.Now().Unix()), "nonce_1", body)[2:])
+	req.Header.Set("X-Lark-Request-Timestamp", ts)
+	req.Header.Set("X-Lark-Request-Nonce", nonce)
+	req.Header.Set("X-Lark-Signature", wrong)
 	w := httptest.NewRecorder()
 	srv.HandleCallback(w, req)
 	if w.Code != http.StatusUnauthorized {
