@@ -647,8 +647,27 @@ func (c *Compiler) BuildNative(ctx context.Context, srcDir, outputPath string, p
 	}
 	if os.Getenv("ASTRBOT_DEBUG_NATIVE_BUILDID") != "" {
 		logger.I18nInfo("native buildid 诊断：%s", c.pragmaBuildID(ctx, srcDir, extra))
+		if data, rerr := os.ReadFile(filepath.Join(srcDir, "go.mod")); rerr == nil { // #nosec G304 -- 诊断
+			logger.I18nInfo("native 诊断 go.mod:\n%s", data)
+		}
+		if mods := c.listModules(ctx, srcDir, extra); mods != "" {
+			logger.I18nInfo("native 诊断 modules:\n%s", mods)
+		}
 	}
 	return nil
+}
+
+// listModules 是临时诊断：dump 插件构建环境解析出的关键模块版本。
+func (c *Compiler) listModules(ctx context.Context, srcDir string, extra map[string]string) string {
+	goBin, err := c.tc.Ensure()
+	if err != nil {
+		return "ensure: " + err.Error()
+	}
+	cmd := exec.CommandContext(ctx, goBin, "list", "-m", "-f", "{{.Path}} {{.Version}}", "google.golang.org/protobuf", "google.golang.org/grpc", "google.golang.org/genproto/googleapis/rpc", "github.com/WaterGodFurina/Astrbot-go-plugin-sdk") // #nosec G204 -- 诊断：args 固定
+	cmd.Dir = srcDir
+	cmd.Env = c.tc.BuildEnv(extra)
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)) + " err=" + fmt.Sprint(err)
 }
 
 // pragmaBuildID 是临时诊断：解析插件构建环境（隔离 GOPATH、插件 go.mod）下
