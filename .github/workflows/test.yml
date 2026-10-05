@@ -448,7 +448,16 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: '1'
-        run: go build -o astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/astrbot
+        run: |
+          go build -o astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/astrbot
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            echo "=== host-build pragma build id (GOFLAGS='') ==="
+            HEXP=$(go list -export -f '{{.Export}}' google.golang.org/protobuf/internal/pragma)
+            echo "export=$HEXP"; go tool buildid "$HEXP" || true
+            echo "=== host-build pragma build id (GOFLAGS=-mod=mod) ==="
+            HEXP2=$(GOFLAGS=-mod=mod go list -export -f '{{.Export}}' google.golang.org/protobuf/internal/pragma)
+            echo "export=$HEXP2"; go tool buildid "$HEXP2" || true
+          fi
 
       - name: 诊断宿主链接版本与 pragma build ID
         shell: bash
@@ -481,6 +490,7 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PIP_INDEX_URL: https://pypi.org/simple
           ASTRBOT_PYPI_INDEX: https://pypi.org/simple
+          ASTRBOT_DEBUG_NATIVE_BUILDID: '1'
         run: bash scripts/e2e_plugin.sh "${{ github.workspace }}/e2e-data" 6185
 
       - name: 上传 E2E 日志（失败时排查）

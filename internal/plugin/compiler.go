@@ -645,5 +645,33 @@ func (c *Compiler) BuildNative(ctx context.Context, srcDir, outputPath string, p
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("go build native: %w\n%s", err, stderrBuf.String())
 	}
+	if os.Getenv("ASTRBOT_DEBUG_NATIVE_BUILDID") != "" {
+		logger.I18nInfo("native buildid 诊断：%s", c.pragmaBuildID(ctx, srcDir, extra))
+	}
 	return nil
+}
+
+// pragmaBuildID 是临时诊断：解析插件构建环境（隔离 GOPATH、插件 go.mod）下
+// google.golang.org/protobuf/internal/pragma 的包 build ID，用于与宿主对比
+// 定位 plugin.Open "different version of package" 根因。仅当
+// ASTRBOT_DEBUG_NATIVE_BUILDID 设置时由 BuildNative 调用。
+func (c *Compiler) pragmaBuildID(ctx context.Context, srcDir string, extra map[string]string) string {
+	goBin, err := c.tc.Ensure()
+	if err != nil {
+		return "ensure: " + err.Error()
+	}
+	cmd := exec.CommandContext(ctx, goBin, "list", "-export", "-f", "{{.Export}}", "google.golang.org/protobuf/internal/pragma") // #nosec G204 -- 诊断：args 固定
+	cmd.Dir = srcDir
+	cmd.Env = c.tc.BuildEnv(extra)
+	out, err := cmd.Output()
+	if err != nil {
+		return "list: " + err.Error()
+	}
+	exp := strings.TrimSpace(string(out))
+	cmd2 := exec.CommandContext(ctx, "go", "tool", "buildid", exp) // #nosec G204 -- 诊断：参数为上一步输出路径
+	bid, err := cmd2.Output()
+	if err != nil {
+		return "buildid(" + exp + "): " + err.Error()
+	}
+	return exp + " -> " + strings.TrimSpace(string(bid))
 }
