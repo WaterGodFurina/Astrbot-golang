@@ -138,7 +138,7 @@ install_git() { # url runtime [extra-json]
 install_upload() { # zip runtime
   local zip="$1" runtime="$2"
   curl -s -X POST "$BASE/api/v1/plugins/install/upload" -H "Authorization: Bearer $TOKEN" \
-    -F "file=@$zip" -F "deps_choice=lazy" -F "preferred_runtime=$runtime"
+    -F "file=@$zip" -F "deps_choice=full" -F "preferred_runtime=$runtime"
 }
 
 chat() { # session text -> prints plain answer text
@@ -192,8 +192,15 @@ case "$(uname -s)" in
     log "installing toolgen (go tool, native)"
     install_ok "$(install_git "$REPO_ROOT/internal/plugin/testdata/toolgen_go" native)" "toolgen install" || exit 1
     if [ -n "${OPENROUTER_API_KEY:-}" ]; then
-      reply=$(chat s-tool 'Call echo_tool with text=TOOLSWORK then tell me the result.')
-      check_contains "Go Native LLM tool" "$reply" "TOOL_ECHO:TOOLSWORK"
+      # 免费模型（:free）常见 429/超时，重试若干次。
+      tool_ok=""
+      for attempt in 1 2 3 4; do
+        reply=$(chat "s-tool-$attempt" 'Call echo_tool with text=TOOLSWORK then tell me the result.')
+        if echo "$reply" | grep -qF "TOOL_ECHO:TOOLSWORK"; then tool_ok=1; break; fi
+        log "Go Native LLM tool attempt $attempt failed (reply: $reply); retrying"
+      done
+      [ -n "$tool_ok" ] || fail "Go Native LLM tool: expected 'TOOL_ECHO:TOOLSWORK', last reply: $reply"
+      log "OK: Go Native LLM tool"
     else
       log "SKIP tool test (no OPENROUTER_API_KEY)"
     fi
