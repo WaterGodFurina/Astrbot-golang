@@ -723,10 +723,13 @@ func extractAnimationMontageSync(source []byte, maxSize, quality int) ([]byte, b
 		position := image.Pt((outIndex%AnimatedMontageGrid)*cellW, (outIndex/AnimatedMontageGrid)*cellH)
 		stddraw.Draw(canvas, image.Rectangle{Min: position, Max: position.Add(cell.Bounds().Size())}, cell, image.Point{}, stddraw.Over)
 	}
-	encoded, err := encodeImageFrameBytes(canvas, 1, 0, quality)
-	if err != nil {
+	// 拼图画布是全不透明白底（py 用 RGB 画布），按 py 语义编码为 JPEG；
+	// 不能用 encodeImageFrameBytes（它会因 RGBA 色彩模型判定"带 alpha"而输出 PNG）。
+	jpegBuffer := new(bytes.Buffer)
+	if err := jpeg.Encode(jpegBuffer, flattenOntoWhite(canvas), &jpeg.Options{Quality: quality}); err != nil {
 		return nil, false, err
 	}
+	encoded := jpegBuffer.Bytes()
 	publishImageCacheAtomic(outputPath, encoded)
 	return encoded, true, nil
 }

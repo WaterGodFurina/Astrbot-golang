@@ -31,3 +31,7 @@ coverage.out
 /bug.md
 /start-astrbot.sh
 /tmp/
+
+# 适配器测试运行时误写包目录的数据（应走 ASTRBOT_DATA_PATH / 仓库根 data/）
+/internal/platform/sources/*/data/
+/internal/**/data/
