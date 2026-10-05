@@ -176,6 +176,31 @@ func (c *Compiler) Prepare(srcDir, moduleName string) error {
 	return os.WriteFile(modPath, out, 0o644) // #nosec G306 -- go.mod 常规权限即可
 }
 
+// Tidy re-resolves the plugin module's dependency graph after Prepare replaced
+// the SDK with the local copy. Without it the plugin keeps the indirect versions
+// recorded in its own go.mod (e.g. protobuf v1.34.2 from an older SDK), while the
+// host links the SDK's own versions (v1.36.11). Native plugin.Open requires both
+// sides to share every linked package's exact version, so a stale indirect dep
+// makes it fail with "plugin was built with a different version of package
+// google.golang.org/protobuf/internal/pragma".
+//
+// Failure is non-fatal: a network hiccup leaves the module as-is and the build
+// proceeds (matching the previous behavior) rather than blocking the install.
+func (c *Compiler) Tidy(ctx context.Context, srcDir string) error {
+	goBin, err := c.tc.Ensure()
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, goBin, "mod", "tidy") // #nosec G204 -- 依赖对齐：args 固定; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
+	cmd.Dir = srcDir
+	cmd.Env = c.tc.BuildEnv(map[string]string{"GOPROXY": c.goproxyEnv(), "GOFLAGS": c.goflagsEnv()})
+	if out, err := cmd.CombinedOutput(); err != nil {
+		logger.I18nWarn("插件 go mod tidy 失败（依赖版本可能落后于宿主 SDK）: %v\n%s", err, out)
+		return nil
+	}
+	return nil
+}
+
 // Vet runs `go vet ./...` in the plugin module.
 func (c *Compiler) Vet(ctx context.Context, srcDir string) error {
 	goBin, err := c.tc.Ensure()

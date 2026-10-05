@@ -909,6 +909,7 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	if err := m.compiler.Prepare(srcDest, goModuleNameOf(srcDest, meta)); err != nil {
 		return nil, fmt.Errorf("prepare module: %w", err)
 	}
+	_ = m.compiler.Tidy(ctx, srcDest)
 	if err := m.compiler.Vet(ctx, srcDest); err != nil {
 		return nil, fmt.Errorf("go vet: %w", err)
 	}
@@ -2777,6 +2778,7 @@ func (m *SubprocessManager) rebuildGoPluginFromSource(ctx context.Context, id, a
 	if err := m.compiler.Prepare(srcDest, goModuleNameOf(srcDest, nil)); err != nil {
 		return fmt.Errorf("prepare module: %w", err)
 	}
+	_ = m.compiler.Tidy(ctx, srcDest)
 	if err := m.compiler.Vet(ctx, srcDest); err != nil {
 		return fmt.Errorf("go vet: %w", err)
 	}

@@ -134,6 +134,7 @@ func (m *SubprocessManager) rebuildNativeFromSource(ctx context.Context, id, art
 	if err := m.compiler.Prepare(srcDest, goModuleNameOf(srcDest, nil)); err != nil {
 		return fmt.Errorf("prepare module: %w", err)
 	}
+	_ = m.compiler.Tidy(ctx, srcDest)
 	if err := m.compiler.Vet(ctx, srcDest); err != nil {
 		return fmt.Errorf("go vet: %w", err)
 	}
