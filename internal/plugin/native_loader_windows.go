@@ -96,7 +96,7 @@ type nativeABIClient struct {
 
 var _ pluginsdk.PluginClient = (*nativeABIClient)(nil)
 
-func (c *nativeABIClient) PluginID() string                   { return c.id }
+func (c *nativeABIClient) PluginID() string                        { return c.id }
 func (c *nativeABIClient) ForPlugin(string) pluginsdk.PluginClient { return c }
 func (c *nativeABIClient) Close() error {
 	if c.handle != 0 {

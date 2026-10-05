@@ -48,7 +48,18 @@ PY
 
 start_host() {
   log "starting host on :$PORT (data=$DATA_DIR)"
-  ASTRBOT_DATA_PATH="$DATA_DIR" ASTRBOT_GO_SDK="$REPO_ROOT/../AstrbotDev/astrbot-go-plugin-sdk" \
+  # ASTRBOT_GO_SDK 是宿主插件编译解析 SDK 源码的环境变量：显式 export 则沿用
+  # （校验有 go.mod），否则不设置，让宿主按自身 go.mod 的 require 版本联网解析。
+  # 不做 sibling 自动探测：宿主二进制从不读该变量来编自己，自动指向本地源码
+  # 只会造成宿主（go.mod）与插件（本地目录）SDK 版本不一致。
+  local sdk_env=()
+  if [ -n "${ASTRBOT_GO_SDK:-}" ]; then
+    if [ ! -f "${ASTRBOT_GO_SDK}/go.mod" ]; then
+      fail "ASTRBOT_GO_SDK=$ASTRBOT_GO_SDK 下没有 go.mod"
+    fi
+    sdk_env=(ASTRBOT_GO_SDK="$ASTRBOT_GO_SDK")
+  fi
+  env ASTRBOT_DATA_PATH="$DATA_DIR" "${sdk_env[@]}" \
     "$ASTRBOT_BIN" > "$DATA_DIR/host.log" 2>&1 &
   HOST_PID=$!
   for _ in $(seq 1 40); do

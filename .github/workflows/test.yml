@@ -423,6 +423,19 @@ jobs:
           go env -w GOPROXY="https://goproxy.cn,direct"
           go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
 
+      - name: 重建 go.sum（引用最新 Go SDK，与 go.mod 对齐，不提交回仓库）
+        # 宿主编译与插件编译都依赖 go.sum 对最新 SDK 版本可解析；goproxy.cn
+        # 偶发抖动，重试 5 次。
+        shell: bash
+        run: |
+          for i in 1 2 3 4 5; do
+            if go mod tidy; then exit 0; fi
+            echo "go mod tidy attempt $i failed, retrying..."
+            sleep 8
+          done
+          echo "::error::go mod tidy failed after 5 attempts"
+          exit 1
+
       - name: 缓存 E2E data 目录（复用登录/provider 配置，不回推仓库）
         uses: actions/cache@v4
         with:
