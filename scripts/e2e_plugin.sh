@@ -106,12 +106,19 @@ login() {
 
 api() { # method path [json-body]
   local m="$1" path="$2" body="${3:-}"
+  local resp code
   if [ -n "$body" ]; then
-    curl -s -X "$m" "$BASE$path" -H "Authorization: Bearer $TOKEN" \
-      -H 'Content-Type: application/json' -d "$body"
+    resp=$(curl -s -w '\n%{http_code}' -X "$m" "$BASE$path" -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' -d "$body")
   else
-    curl -s -X "$m" "$BASE$path" -H "Authorization: Bearer $TOKEN"
+    resp=$(curl -s -w '\n%{http_code}' -X "$m" "$BASE$path" -H "Authorization: Bearer $TOKEN")
   fi
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  if [ -z "$body" ]; then
+    echo "[e2e][WARN] $m $path -> http $code（空响应体；宿主可能已崩溃）" >&2
+  fi
+  printf '%s' "$body"
 }
 
 install_ok() { # response-json label
