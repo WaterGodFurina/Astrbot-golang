@@ -173,6 +173,61 @@ jobs:
           # Windows 产物无法在 runner 上执行，仅校验 PE 格式与体积
           head -c 2 astrbot-windows-amd64.exe | xxd | grep "4d5a" || { echo "不是有效的 PE 头"; exit 1; }
 
+      # Native 运行方式 POC（Windows .dll，C 句柄桥）：注入 native_entry.go
+      # 后用 -buildmode=c-shared 产出 DLL，并校验 C ABI 导出符号
+      # AstrBotPluginOpen/Call/Free/Close（宿主 LoadLibrary + GetProcAddress，
+      # 请求/响应走 sdkv1 protobuf bytes，不起 loopback gRPC）。
+      - name: Native POC - 确认 C 编译器可用（cgo 需要）
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          which gcc || true
+          gcc --version | head -1 || { echo "缺少 gcc（cgo 无法编译 c-shared）"; exit 1; }
+
+      - name: Native POC - 编译 echo 插件为 Windows .dll（c-shared，C 句柄桥）
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: internal/plugin/testdata/native_poc
+        env:
+          CGO_ENABLED: '1'
+          GOOS: windows
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          cat > native_entry.go <<'EOF'
+          package main
+
+          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+
+          func init() { native.SetPlugin(plugin) }
+          EOF
+          go mod tidy
+          go build -buildmode=c-shared -o nativepoc.dll .
+          rm -f native_entry.go
+          ls -la nativepoc.dll
+
+      - name: Native POC - 校验 DLL 导出 C 句柄桥符号
+        if: runner.os == 'Windows'
+        shell: bash
+        working-directory: internal/plugin/testdata/native_poc
+        run: |
+          set -euo pipefail
+          # 用 mingw nm 读 PE 导出表（go tool nm 不解析 PE 导出目录）。
+          for sym in AstrBotPluginOpen AstrBotPluginCall AstrBotFree AstrBotPluginClose; do
+            nm nativepoc.dll | grep -i "$sym" || {
+              echo "DLL 未导出 $sym"; exit 1; }
+          done
+          echo "OK: DLL 导出 C 句柄桥符号"
+
+      - name: Native POC - 上传 .dll（供人工检查）
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v5
+        with:
+          name: native-poc-windows-dll
+          path: internal/plugin/testdata/native_poc/nativepoc.dll
+          if-no-files-found: error
+
       # Native 运行方式 POC（Linux .so，musl 与 gnu）：注入 native_entry.go
       # 后用 -buildmode=plugin 产出 .so，并校验导出符号 AstrBotNativePlugin。
       # 该 POC 同时覆盖 musl 目标（Alpine/zig cc -target ...-musl），验证
@@ -325,6 +380,79 @@ jobs:
           PIP_INDEX_URL: https://pypi.org/simple
           ASTRBOT_PYPI_INDEX: https://pypi.org/simple
         run: go test ./internal/plugin/ -count=1 -timeout 30m -run 'TestNative'
+
+  plugin-e2e:
+    # 真实插件端到端：启动实际 astrbot，安装真实 echo / toolgen / python_e2e
+    # 插件，走 dashboard chat 断言命令与 LLM 工具回复。覆盖 gRPC 与 Native
+    # （Linux .so / Windows .dll C 句柄桥）。data 目录由 datatest 模板 + Secret
+    # 生成，并缓存复用登录/provider 配置。
+    name: 插件 E2E (${{ matrix.os }})
+    needs: frontend
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || needs.frontend.outputs.sha }}
+          fetch-depth: 0
+
+      - name: 设置 Go 版本（自动跟随 go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: 安装 Python（插件子进程测试需要）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: 'internal/pysdk/embed.go'
+
+      - name: 配置 Go 环境（代理与模块）
+        shell: bash
+        env:
+          GOPROXY: https://goproxy.cn,direct
+          GONOSUMDB: github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk
+          GOFLAGS: -mod=mod
+        run: |
+          go env -w GOPROXY="https://goproxy.cn,direct"
+          go env -w GONOSUMDB="github.com/youkale/go-querystruct,github.com/WaterGodFurina/nanovec,github.com/WaterGodFurina/go-weixin-ilink,github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk"
+
+      - name: 缓存 E2E data 目录（复用登录/provider 配置，不回推仓库）
+        uses: actions/cache@v4
+        with:
+          path: e2e-data
+          key: e2e-data-${{ runner.os }}-${{ hashFiles('datatest/cmd_config.json') }}
+          restore-keys: |
+            e2e-data-${{ runner.os }}-
+
+      - name: 构建 AstrBot（CGO_ENABLED=1，Native 需要）
+        shell: bash
+        env:
+          CGO_ENABLED: '1'
+        run: go build -o astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/astrbot
+
+      - name: 运行插件 E2E
+        shell: bash
+        env:
+          ASTRBOT_BIN: ${{ github.workspace }}/astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PIP_INDEX_URL: https://pypi.org/simple
+          ASTRBOT_PYPI_INDEX: https://pypi.org/simple
+        run: bash scripts/e2e_plugin.sh "${{ github.workspace }}/e2e-data" 6185
+
+      - name: 上传 E2E 日志（失败时排查）
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: e2e-data-${{ matrix.os }}
+          path: e2e-data/
+          if-no-files-found: ignore
 
   frontend:
     name: 前端构建

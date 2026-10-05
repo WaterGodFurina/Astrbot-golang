@@ -22,7 +22,6 @@ import (
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
-	pluginNative "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
 	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/transport/grpc"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
@@ -1496,9 +1495,19 @@ func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language
 			return nil, err
 		}
 	}
-	// 落盘 config schema 缓存，供插件禁用后仍能渲染配置对话框。
+	// 统一补齐实例的宿主侧登记（gRPC 路径在 dispensePlugin 里做，Native 路径
+	// 之前遗漏，导致 Native 插件的命令/工具都进不了管线）：
+	inst.owner = m
 	if inst.Meta != nil {
+		// config schema 缓存，供插件禁用后仍能渲染配置对话框。
 		m.cacheConfigSchema(inst.ID, inst.Meta)
+		// handler 元数据：RegisteredPlugins 据此把命令/过滤器/钩子桥接进 star 管线。
+		m.setHandlerMeta(id, inst.Meta)
+		// Register 快照里的 LLM 工具：先入注册表；插件在实例化阶段动态注册的
+		// 工具由首次 RefreshTools 回写（依赖 inst.owner）。
+		if len(inst.Meta.Tools) > 0 {
+			m.setPluginTools(id, inst.Meta.Tools)
+		}
 	}
 
 	m.mu.Lock()
@@ -2276,21 +2285,18 @@ func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, libPath 
 		return nil, fmt.Errorf("plugin library not found: %s", abs)
 	}
 
-	entry, err := openNativePlugin(abs)
+	client, cleanup, err := openNativePlugin(abs, id)
 	if err != nil {
 		return nil, err
 	}
-	np, err := entry(id)
-	if err != nil {
-		return nil, fmt.Errorf("native plugin %s init: %w", id, err)
-	}
 
-	client := pluginNative.NewClient(id, np)
 	regCtx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
 	meta, err := client.Register(regCtx)
 	if err != nil {
-		_ = client.Close()
+		if cleanup != nil {
+			_ = cleanup()
+		}
 		return nil, fmt.Errorf("native plugin %s register: %w", id, err)
 	}
 

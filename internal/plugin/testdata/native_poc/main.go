@@ -1,7 +1,7 @@
 // Native POC plugin: minimal echo in the "var plugin" form required by the
 // Native runtime (the injected native_entry.go references the package-level
-// `plugin` variable). Built in CI as a Windows .dll (-buildmode=c-shared) to
-// verify the Native entry symbol and C ABI layer.
+// `plugin` variable). Built in CI on Windows as a .dll (-buildmode=c-shared,
+// C-handle bridge) and on Linux as a .so (-buildmode=plugin, direct calls).
 package main
 
 import (

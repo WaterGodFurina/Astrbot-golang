@@ -11,7 +11,6 @@ import (
 	"time"
 
 	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
-	pluginNative "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
 )
 
 // buildTestNativeLib compiles a Native (.so) test plugin with the local SDK.
@@ -87,15 +86,11 @@ func main() {}
 // direct in-process call (no subprocess, no gRPC).
 func TestNativeLoadAndCall(t *testing.T) {
 	so := buildTestNativeLib(t, nativeTestSrc)
-	entry, err := openNativePlugin(so)
+	client, cleanup, err := openNativePlugin(so, "native_test")
 	if err != nil {
 		t.Fatalf("openNativePlugin: %v", err)
 	}
-	np, err := entry("native_test")
-	if err != nil {
-		t.Fatalf("native entry: %v", err)
-	}
-	client := pluginNative.NewClient("native_test", np)
+	defer func() { _ = cleanup() }()
 
 	meta, err := client.Register(context.Background())
 	if err != nil {
@@ -115,7 +110,7 @@ func TestNativeLoadAndCall(t *testing.T) {
 
 func TestNativeSymbolMissing(t *testing.T) {
 	so := buildTestNativeLib(t, "package main\n\nvar plugin = 1\n\nfunc main() {}\n")
-	_, err := openNativePlugin(so)
+	_, _, err := openNativePlugin(so, "native_test")
 	if err == nil || !strings.Contains(err.Error(), "Lookup(AstrBotNativePlugin)") {
 		t.Fatalf("want Lookup error, got %v", err)
 	}
@@ -123,7 +118,7 @@ func TestNativeSymbolMissing(t *testing.T) {
 
 func TestNativeSymbolWrongType(t *testing.T) {
 	so := buildTestNativeLib(t, "package main\n\nvar AstrBotNativePlugin = 42\n\nfunc main() {}\n")
-	_, err := openNativePlugin(so)
+	_, _, err := openNativePlugin(so, "native_test")
 	if err == nil || !strings.Contains(err.Error(), "unexpected type") {
 		t.Fatalf("want type mismatch error, got %v", err)
 	}
