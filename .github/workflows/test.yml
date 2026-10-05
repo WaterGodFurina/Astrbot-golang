@@ -450,11 +450,29 @@ jobs:
           CGO_ENABLED: '1'
         run: go build -o astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/astrbot
 
-      - name: 诊断宿主链接版本
+      - name: 诊断宿主链接版本与 pragma build ID
         shell: bash
         run: |
+          set -x
           echo "go: $(go version)"
           go version -m "astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }}" | grep -E "protobuf|Astrbot-go-plugin-sdk|grpc" || true
+          echo "=== host env ==="
+          go env GOFLAGS GOEXPERIMENT GODEBUG CGO_ENABLED GOMODCACHE GOPATH
+          echo "=== host pragma build id ==="
+          HOST_EXPORT=$(go list -export -f '{{.Export}}' google.golang.org/protobuf/internal/pragma 2>&1)
+          echo "export=$HOST_EXPORT"
+          [ -f "$HOST_EXPORT" ] && go tool buildid "$HOST_EXPORT" || true
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            echo "=== isolated-gopath env (plugin build env) ==="
+            ISO_GOPATH="${HOME}/.local/share/astrbot-go/gopath"
+            GOFLAGS=-mod=mod CGO_ENABLED=1 GOPATH="$ISO_GOPATH" \
+              go env GOFLAGS GOEXPERIMENT GODEBUG CGO_ENABLED GOMODCACHE GOPATH
+            echo "=== isolated pragma build id ==="
+            ISO_EXPORT=$(GOFLAGS=-mod=mod CGO_ENABLED=1 GOPATH="$ISO_GOPATH" \
+              go list -export -f '{{.Export}}' google.golang.org/protobuf/internal/pragma 2>&1)
+            echo "export=$ISO_EXPORT"
+            [ -f "$ISO_EXPORT" ] && go tool buildid "$ISO_EXPORT" || true
+          fi
 
       - name: 运行插件 E2E
         shell: bash
