@@ -1499,23 +1499,18 @@ func (m *SubprocessManager) loadLocked(ctx context.Context, id, binary, language
 	}
 	// 统一补齐实例的宿主侧登记（gRPC 路径在 dispensePlugin 里做，Native 路径
 	// 之前遗漏，导致 Native 插件的命令/工具都进不了管线）：
-	logger.I18nInfo("[native-step] loadLocked: loaded inst, begin host registration")
 	inst.owner = m
 	if inst.Meta != nil {
 		// config schema 缓存，供插件禁用后仍能渲染配置对话框。
 		m.cacheConfigSchema(inst.ID, inst.Meta)
-		logger.I18nInfo("[native-step] cacheConfigSchema done")
 		// handler 元数据：RegisteredPlugins 据此把命令/过滤器/钩子桥接进 star 管线。
 		m.setHandlerMeta(id, inst.Meta)
-		logger.I18nInfo("[native-step] setHandlerMeta done")
 		// Register 快照里的 LLM 工具：先入注册表；插件在实例化阶段动态注册的
 		// 工具由首次 RefreshTools 回写（依赖 inst.owner）。
 		if len(inst.Meta.Tools) > 0 {
 			m.setPluginTools(id, inst.Meta.Tools)
-			logger.I18nInfo("[native-step] setPluginTools done")
 		}
 	}
-	logger.I18nInfo("[native-step] host registration done")
 
 	m.mu.Lock()
 	if existing, ok := m.instances[id]; ok {
@@ -2299,7 +2294,6 @@ func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, libPath 
 
 	regCtx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
-	logger.I18nInfo("[native-step] openNativePlugin done, calling Register")
 	meta, err := client.Register(regCtx)
 	if err != nil {
 		if cleanup != nil {
@@ -2307,7 +2301,6 @@ func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, libPath 
 		}
 		return nil, fmt.Errorf("native plugin %s register: %w", id, err)
 	}
-	logger.I18nInfo("[native-step] Register done name=%q", meta.Name)
 
 	inst := &PluginInstance{
 		ID:        id,

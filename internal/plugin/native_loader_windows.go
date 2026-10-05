@@ -6,25 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"syscall"
 	"unsafe"
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	pluginNative "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 )
-
-// nativeDebug 输出 Windows 原生加载各阶段标记到 stderr（host.log），用于定位
-// c-shared DLL 加载/调用的静默崩溃点。Append+Sync 确保崩溃前落盘。
-func nativeDebug(format string, args ...any) {
-	f, err := os.OpenFile(os.Getenv("ASTRBOT_DATA_PATH")+"/native_load.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "[native-debug] "+format+"\n", args...)
-	_ = f.Sync()
-}
 
 // openNativePlugin loads a Native plugin DLL on Windows and returns a PluginClient
 // backed by the C-handle bridge. Go's stdlib `plugin` is unavailable on Windows,
@@ -40,13 +27,10 @@ func nativeDebug(format string, args ...any) {
 // responses are the JSON of the SDK native result types (sdk.PluginInfo,
 // sdk.HandleCommandResult, ...). No protobuf, no gRPC, no JSON event plane.
 func openNativePlugin(path, pluginID string) (pluginsdk.PluginClient, func() error, error) {
-	nativeDebug("LoadDLL begin: %s", path)
 	dll, err := syscall.LoadDLL(path)
 	if err != nil {
-		nativeDebug("LoadDLL error: %v", err)
 		return nil, nil, fmt.Errorf("LoadDLL(%s): %w", path, err)
 	}
-	nativeDebug("LoadDLL ok; FindProc begin")
 	procOpen, err := dll.FindProc("AstrBotPluginOpen")
 	if err != nil {
 		_ = dll.Release()
@@ -67,8 +51,6 @@ func openNativePlugin(path, pluginID string) (pluginsdk.PluginClient, func() err
 		_ = dll.Release()
 		return nil, nil, fmt.Errorf("FindProc(AstrBotPluginClose) in %s: %w", path, err)
 	}
-	nativeDebug("FindProc ok; AstrBotPluginOpen begin")
-
 	idPtr, err := syscall.BytePtrFromString(pluginID)
 	if err != nil {
 		_ = dll.Release()
@@ -79,7 +61,6 @@ func openNativePlugin(path, pluginID string) (pluginsdk.PluginClient, func() err
 		uintptr(unsafe.Pointer(idPtr)),
 		uintptr(unsafe.Pointer(&handle)),
 	)
-	nativeDebug("AstrBotPluginOpen returned r=%d handle=%d", r, handle)
 	if r != 0 {
 		_ = dll.Release()
 		return nil, nil, fmt.Errorf("AstrBotPluginOpen(%s) failed (code %d)", pluginID, r)
@@ -145,7 +126,6 @@ func (c *nativeABIClient) call(method string, req any, out any) error {
 	}
 	var respPtr *byte
 	var respLen int32
-	nativeDebug("AstrBotPluginCall begin method=%s handle=%d reqlen=%d", method, c.handle, len(reqBytes))
 	r, _, _ := c.procCall.Call(
 		c.handle,
 		uintptr(unsafe.Pointer(methodPtr)),
@@ -154,10 +134,13 @@ func (c *nativeABIClient) call(method string, req any, out any) error {
 		uintptr(unsafe.Pointer(&respPtr)),
 		uintptr(unsafe.Pointer(&respLen)),
 	)
-	nativeDebug("AstrBotPluginCall returned method=%s r=%d respLen=%d", method, r, respLen)
+	// 先把 DLL 分配的响应缓冲复制到 Go 自有内存，再 AstrBotFree——否则
+	// respBytes 指向已释放内存，随后的 json.Unmarshal 是 use-after-free
+	// （Linux 分配器保留映射而"侥幸"可用，Windows 直接崩溃）。
 	var respBytes []byte
 	if respPtr != nil && respLen > 0 {
-		respBytes = unsafe.Slice(respPtr, int(respLen))
+		respBytes = make([]byte, int(respLen))
+		copy(respBytes, unsafe.Slice(respPtr, int(respLen)))
 	}
 	if respPtr != nil {
 		_, _, _ = c.procFree.Call(uintptr(unsafe.Pointer(respPtr)))
