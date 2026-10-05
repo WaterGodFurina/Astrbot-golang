@@ -22,6 +22,16 @@ DATATEST_DIR="${DATATEST_DIR:-datatest}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ECHO_REPO="${ECHO_REPO:-https://github.com/Astrbot-Go-Market/Astrbot-go-plugin-echo}"
 
+# Windows: 工作流传入的是 "D:\a\...\e2e-data" 反斜杠路径，Git Bash 的
+# 重定向/文件操作无法正确解析（会当成带反斜杠的字面文件名），统一转正斜杠。
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    DATA_DIR="${DATA_DIR//\\//}"
+    ASTRBOT_BIN="${ASTRBOT_BIN//\\//}"
+    REPO_ROOT="${REPO_ROOT//\\//}"
+    ;;
+esac
+
 log() { echo "[e2e] $*"; }
 fail() { echo "[e2e][FAIL] $*" >&2; exit 1; }
 
@@ -44,6 +54,12 @@ d["dashboard"]["host"]="127.0.0.1"
 d["dashboard"]["port"]=port
 json.dump(d,open(p,"w"),ensure_ascii=False,indent=2)
 PY
+  # 诊断：确认模板已应用（jwt_secret 固定前缀、password_change_required=false）。
+  if [ -f "$DATA_DIR/cmd_config.json" ]; then
+    log "prepared config: $(grep -o '"jwt_secret":"[0-9a-f]\{8\}' "$DATA_DIR/cmd_config.json" | head -1) pw_change=$(grep -o '"password_change_required":[a-z]*' "$DATA_DIR/cmd_config.json" | head -1)"
+  else
+    fail "cmd_config.json 未生成（$DATA_DIR/cmd_config.json）"
+  fi
 }
 
 start_host() {
