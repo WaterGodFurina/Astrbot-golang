@@ -90,7 +90,7 @@ func buildTestPlugin() string {
 
 go 1.23
 
-require github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.0
+require github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.2
 
 replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 => %s
 `, sdkDir)
