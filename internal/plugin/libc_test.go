@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -21,6 +22,15 @@ func TestHostLibcOverride(t *testing.T) {
 }
 
 func TestZigTargetTripleLibc(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		// libc 只参与 Linux 目标三元组；其他平台（darwin/windows）三元组
+		// 不含 libc 段，ASTRBOT_LIBC 不应泄漏进去。
+		t.Setenv("ASTRBOT_LIBC", "musl")
+		if tr := zigTargetTriple(); strings.Contains(tr, "musl") {
+			t.Fatalf("non-linux triple %q must not contain musl", tr)
+		}
+		return
+	}
 	t.Setenv("ASTRBOT_LIBC", "musl")
 	tr := zigTargetTriple()
 	if tr != "" && !strings.Contains(tr, "-musl") {
