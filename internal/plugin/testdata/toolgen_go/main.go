@@ -6,7 +6,7 @@ package main
 import (
 	"strings"
 
-	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 var plugin = &sdk.Plugin{

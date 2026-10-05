@@ -90,9 +90,9 @@ func buildTestPlugin() string {
 
 go 1.23
 
-require github.com/WaterGodFurina/Astrbot-go-plugin-sdk v0.0.0
+require github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.0
 
-replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk => %s
+replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 => %s
 `, sdkDir)
 	// #nosec G306 -- 临时测试模块 go.mod
 	if err := os.WriteFile(filepath.Join(tmp, "go.mod"), []byte(goMod), 0o644); err != nil {

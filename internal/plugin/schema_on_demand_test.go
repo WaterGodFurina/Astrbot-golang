@@ -5,9 +5,9 @@ import (
 	"net"
 	"testing"
 
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
-	sdkv1grpc "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1grpc"
-	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/transport/grpc"
+	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/gen/sdkv1"
+	sdkv1grpc "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/gen/sdkv1grpc"
+	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/transport/grpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"

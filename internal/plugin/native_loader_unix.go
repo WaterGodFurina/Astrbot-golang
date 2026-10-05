@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"plugin"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	pluginNative "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
+	pluginNative "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 )
 
 // openNativePlugin opens a Go plugin shared library (.so, built with

@@ -19,12 +19,12 @@ import (
 
 // sdkModulePath is the module path of the standalone plugin SDK that every
 // plugin links against. Builds `replace` it to the local copy.
-const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+const sdkModulePath = "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 
 // sdkModuleVersion 是宿主内置的插件 SDK 版本（与宿主 go.mod 的 require 一致，
 // 发版时同步 bump）。发布版宿主进程的 CWD 下没有 go.mod，SDK 解析与下载在
 // 找不到 go.mod 时以该常量兜底定位模块缓存，不再依赖进程工作目录。
-const sdkModuleVersion = "v1.9.1"
+const sdkModuleVersion = "v2.0.1"
 
 // nativeEntryUnix 是 Native 构建时注入插件 package main 的生成入口
 // （不改动插件作者源码）。宿主用 plugin.Open 加载 .so 后 Lookup 并调用它：
@@ -35,7 +35,7 @@ const sdkModuleVersion = "v1.9.1"
 // （main() 不执行、且这里按名引用它）。已在 README 记录。
 const nativeEntryUnix = `package main
 
-import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 
 func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
 	return native.Serve(plugin, pluginID)
@@ -51,7 +51,7 @@ func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
 // c-shared 下不执行但需存在，重复声明会 "main redeclared"。
 const nativeEntryWindows = `package main
 
-import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 
 func init() { native.SetPlugin(plugin) }
 `
@@ -61,7 +61,7 @@ func init() { native.SetPlugin(plugin) }
 // Native 构建不注入本文件，因此 Native 插件不链接 grpc/go-plugin。
 const grpcEntry = `package main
 
-import _ "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/transport/grpc"
+import _ "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/transport/grpc"
 `
 
 // Compiler builds plugin source into a platform-native executable using the
@@ -153,17 +153,11 @@ func (c *Compiler) Prepare(srcDir, moduleName string) error {
 	if f.Go == nil {
 		_ = f.AddGoStmt("1.23")
 	}
-	hasRequire := false
-	for _, r := range f.Require {
-		if r.Mod.Path == sdkModulePath {
-			hasRequire = true
-			break
-		}
-	}
-	if !hasRequire {
-		if err := f.AddRequire(sdkModulePath, "v0.0.0"); err != nil {
-			return fmt.Errorf("add require: %w", err)
-		}
+	// SDK require 的版本必须与模块路径的主版本一致（/v2 路径要求 v2.x.y）：
+	// 插件模板里的 v0.0.0 对 /v2 非法，故无条件写成宿主内置版本；replace 到
+	// 本地 sdkDir 后该版本仅作占位。
+	if err := f.AddRequire(sdkModulePath, sdkModuleVersion); err != nil {
+		return fmt.Errorf("add require: %w", err)
 	}
 	_ = f.DropReplace(sdkModulePath, "")
 	if err := f.AddReplace(sdkModulePath, "", sdkDir, ""); err != nil {
@@ -400,7 +394,7 @@ func (c *Compiler) sdkDir() (string, error) {
 }
 
 // sdkRequireFromGoMod extracts the SDK require version from go.mod contents
-// (single-line form: "github.com/WaterGodFurina/Astrbot-go-plugin-sdk vX.Y.Z").
+// (single-line form: "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 vX.Y.Z").
 func sdkRequireFromGoMod(data []byte) string {
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -645,52 +639,5 @@ func (c *Compiler) BuildNative(ctx context.Context, srcDir, outputPath string, p
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("go build native: %w\n%s", err, stderrBuf.String())
 	}
-	if os.Getenv("ASTRBOT_DEBUG_NATIVE_BUILDID") != "" {
-		logger.I18nInfo("native buildid 诊断：%s", c.pragmaBuildID(ctx, srcDir, extra))
-		if data, rerr := os.ReadFile(filepath.Join(srcDir, "go.mod")); rerr == nil { // #nosec G304 -- 诊断
-			logger.I18nInfo("native 诊断 go.mod:\n%s", data)
-		}
-		if mods := c.listModules(ctx, srcDir, extra); mods != "" {
-			logger.I18nInfo("native 诊断 modules:\n%s", mods)
-		}
-	}
 	return nil
-}
-
-// listModules 是临时诊断：dump 插件构建环境解析出的关键模块版本。
-func (c *Compiler) listModules(ctx context.Context, srcDir string, extra map[string]string) string {
-	goBin, err := c.tc.Ensure()
-	if err != nil {
-		return "ensure: " + err.Error()
-	}
-	cmd := exec.CommandContext(ctx, goBin, "list", "-m", "-f", "{{.Path}} {{.Version}}", "google.golang.org/protobuf", "google.golang.org/grpc", "google.golang.org/genproto/googleapis/rpc", "github.com/WaterGodFurina/Astrbot-go-plugin-sdk") // #nosec G204 -- 诊断：args 固定
-	cmd.Dir = srcDir
-	cmd.Env = c.tc.BuildEnv(extra)
-	out, err := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out)) + " err=" + fmt.Sprint(err)
-}
-
-// pragmaBuildID 是临时诊断：解析插件构建环境（隔离 GOPATH、插件 go.mod）下
-// google.golang.org/protobuf/internal/pragma 的包 build ID，用于与宿主对比
-// 定位 plugin.Open "different version of package" 根因。仅当
-// ASTRBOT_DEBUG_NATIVE_BUILDID 设置时由 BuildNative 调用。
-func (c *Compiler) pragmaBuildID(ctx context.Context, srcDir string, extra map[string]string) string {
-	goBin, err := c.tc.Ensure()
-	if err != nil {
-		return "ensure: " + err.Error()
-	}
-	cmd := exec.CommandContext(ctx, goBin, "list", "-export", "-f", "{{.Export}}", "google.golang.org/protobuf/internal/pragma") // #nosec G204 -- 诊断：args 固定
-	cmd.Dir = srcDir
-	cmd.Env = c.tc.BuildEnv(extra)
-	out, err := cmd.Output()
-	if err != nil {
-		return "list: " + err.Error()
-	}
-	exp := strings.TrimSpace(string(out))
-	cmd2 := exec.CommandContext(ctx, "go", "tool", "buildid", exp) // #nosec G204 -- 诊断：参数为上一步输出路径
-	bid, err := cmd2.Output()
-	if err != nil {
-		return "buildid(" + exp + "): " + err.Error()
-	}
-	return exp + " -> " + strings.TrimSpace(string(bid))
 }

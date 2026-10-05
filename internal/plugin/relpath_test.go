@@ -76,7 +76,7 @@ func writeSDKModuleStub(t *testing.T, root string) {
 		t.Logf("writeSDKModuleStub: 解析目录缺 astrbot 包，跳过: %v", err)
 		return
 	}
-	goMod := "module relpath-test-host\n\ngo 1.23\n\nrequire " + sdkfs.ModulePath + " v0.0.0\n\nreplace " + sdkfs.ModulePath + " => " + sdkDir + "\n"
+	goMod := "module relpath-test-host\n\ngo 1.23\n\nrequire " + sdkfs.ModulePath + " v2.0.0\n\nreplace " + sdkfs.ModulePath + " => " + sdkDir + "\n"
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte(goMod), 0o644); err != nil {
 		t.Logf("writeSDKModuleStub: 写 go.mod 失败（回退 SDK 下载）: %v", err)
 	}
@@ -147,10 +147,11 @@ func TestPythonPluginRelativeCachePath(t *testing.T) {
 		"timestamp": 0,
 		"chain":     []map[string]any{{"type": "Plain", "text": "pyhello"}},
 	}
-	_, chain, _, err := inst.Client.HandleCommand(cmdCtx, "pyhello", nil, sdkEvent(t, ev))
+	cmdRes, err := inst.Client.HandleCommand(cmdCtx, "pyhello", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("HandleCommand(pyhello): %v", err)
 	}
+	chain := cmdRes.Chain
 	if len(chain) == 0 || !strings.Contains(chain[0].Text, "Hello from Python") {
 		t.Fatalf("pyhello 回复异常: %v", chain)
 	}

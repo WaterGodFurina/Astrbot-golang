@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 func init() {

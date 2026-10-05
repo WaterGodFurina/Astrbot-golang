@@ -28,7 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 )
 
@@ -172,23 +172,23 @@ func (s *BlobStore) blobPath(handle string) (string, error) {
 
 // Create 持久化 data 并返回受控 FileReference handle。超过单 blob 大小上限
 // 直接拒绝；ttlSeconds 请求被钳制在 maxTTL 内（不能任意延长）。
-func (s *BlobStore) Create(data []byte, mimeType, filename string, ttlSeconds int32) (sdkv1.FileReference, error) {
+func (s *BlobStore) Create(data []byte, mimeType, filename string, ttlSeconds int32) (pluginsdk.FileReference, error) {
 	if len(data) == 0 {
-		return sdkv1.FileReference{}, fmt.Errorf("empty blob data")
+		return pluginsdk.FileReference{}, fmt.Errorf("empty blob data")
 	}
 	if int64(len(data)) > s.maxBlobSize {
-		return sdkv1.FileReference{}, fmt.Errorf("blob too large: %d bytes exceeds limit %d", len(data), s.maxBlobSize)
+		return pluginsdk.FileReference{}, fmt.Errorf("blob too large: %d bytes exceeds limit %d", len(data), s.maxBlobSize)
 	}
 	handle, err := randomHandle()
 	if err != nil {
-		return sdkv1.FileReference{}, err
+		return pluginsdk.FileReference{}, err
 	}
 	path, err := s.blobPath(handle)
 	if err != nil {
-		return sdkv1.FileReference{}, err
+		return pluginsdk.FileReference{}, err
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return sdkv1.FileReference{}, fmt.Errorf("write blob: %w", err)
+		return pluginsdk.FileReference{}, fmt.Errorf("write blob: %w", err)
 	}
 	now := time.Now()
 	ttl := s.ttl
@@ -211,8 +211,8 @@ func (s *BlobStore) Create(data []byte, mimeType, filename string, ttlSeconds in
 	}
 	s.mu.Unlock()
 	blobLogger.Debug("blob created: handle=%s size=%d ttl=%v", handle, len(data), ttl)
-	return sdkv1.FileReference{
-		HandleId:  handle,
+	return pluginsdk.FileReference{
+		HandleID:  handle,
 		Size:      int64(len(data)),
 		MimeType:  mimeType,
 		Filename:  filename,
@@ -266,25 +266,25 @@ func (s *BlobStore) Read(handle string, offset int64, limit int32) ([]byte, bool
 }
 
 // Info 返回 blob 元数据。
-func (s *BlobStore) Info(handle string) (sdkv1.FileReference, error) {
+func (s *BlobStore) Info(handle string) (pluginsdk.FileReference, error) {
 	if _, err := s.blobPath(handle); err != nil {
-		return sdkv1.FileReference{}, err
+		return pluginsdk.FileReference{}, err
 	}
 	path, err := s.blobPath(handle)
 	if err != nil {
-		return sdkv1.FileReference{}, err
+		return pluginsdk.FileReference{}, err
 	}
 	info, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return sdkv1.FileReference{}, fmt.Errorf("blob not found: %s", handle)
+			return pluginsdk.FileReference{}, fmt.Errorf("blob not found: %s", handle)
 		}
-		return sdkv1.FileReference{}, err
+		return pluginsdk.FileReference{}, err
 	}
 	s.mu.Lock()
 	m := s.meta[handle]
 	s.mu.Unlock()
-	ref := sdkv1.FileReference{HandleId: handle, Size: info.Size()}
+	ref := pluginsdk.FileReference{HandleID: handle, Size: info.Size()}
 	if m != nil {
 		ref.MimeType = m.MimeType
 		ref.Filename = m.Filename

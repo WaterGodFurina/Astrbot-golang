@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/backup"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
@@ -3239,10 +3239,10 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 	// Register 快照（对齐 ListTools 模式）。
 	hasWebAPI := false
 	if inst.Meta != nil {
-		hasWebAPI = len(inst.Meta.WebApis) > 0
+		hasWebAPI = len(inst.Meta.WebAPIs) > 0
 	}
 	webAPICtx, webAPICancel := context.WithTimeout(r.Context(), 30*time.Second)
-	descs, listErr := inst.Client.ListWebApis(webAPICtx, &sdkv1.PluginRef{PluginId: pid})
+	descs, listErr := inst.Client.ListWebApis(webAPICtx)
 	webAPICancel()
 	if listErr != nil {
 		logger.I18nWarn("plug proxy: 插件 %q ListWebApis 失败: %v", pid, listErr)
@@ -3255,68 +3255,60 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 		return
 	}
 
-	// 组装请求（query 多值 / headers / body / multipart 文件）
-	req := &sdkv1.HandleWebRequestRequest{
-		Method: r.Method,
-		Path:   "/" + pluginPath,
+	// 组装请求（query 多值 / headers / body / multipart 表单字段）
+	req := pluginsdk.HandleWebRequest{
+		Method:  r.Method,
+		Path:    "/" + pluginPath,
+		Query:   map[string][]string{},
+		Headers: map[string][]string{},
 	}
 	for k, vs := range r.URL.Query() {
 		// 宿主鉴权凭据不转发给插件（防泄露）：api_key / key / token query 通道剥离。
 		if pluginProxyBlockedQuery(k) {
 			continue
 		}
-		for _, v := range vs {
-			req.Query = append(req.Query, &sdkv1.WebKV{Key: k, Value: v})
-		}
+		req.Query[k] = append(req.Query[k], vs...)
 	}
 	for k, vs := range r.Header {
 		if pluginProxyBlockedHeader(k) {
 			continue
 		}
-		for _, v := range vs {
-			req.Headers = append(req.Headers, &sdkv1.WebKV{Key: k, Value: v})
-		}
+		req.Headers[k] = append(req.Headers[k], vs...)
 	}
 	// 注入宿主解析出的可信调用者身份（对齐 Python PluginRequest.username /
 	// DashboardRequestState.username）。宿主凭据本身不转发，仅此身份头可信。
 	if caller := s.pluginCallerUsername(r); caller != "" {
-		req.Headers = append(req.Headers, &sdkv1.WebKV{Key: "X-AstrBot-Username", Value: caller})
+		req.Headers["X-AstrBot-Username"] = append(req.Headers["X-AstrBot-Username"], caller)
 	}
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		if err := r.ParseMultipartForm(64 << 20); err == nil {
 			if r.MultipartForm != nil {
-				for field, files := range r.MultipartForm.File {
-					for _, fh := range files {
-						f, err := fh.Open()
-						if err != nil {
-							continue
-						}
-						content, err := io.ReadAll(io.LimitReader(f, 64<<20+1))
-						_ = f.Close()
-						if err != nil {
-							continue
-						}
-						if len(content) > 64<<20 {
-							writeJSON(w, http.StatusRequestEntityTooLarge, apiError("文件过大（上限 64MB）"))
-							return
-						}
-						req.Files = append(req.Files, &sdkv1.WebUploadFile{
-							Field:       field,
-							Filename:    fh.Filename,
-							ContentType: fh.Header.Get("Content-Type"),
-							Content:     content,
-						})
-					}
-				}
 				for k, vs := range r.MultipartForm.Value {
 					// multipart 表单字段同样可能承载 api_key/key/token
 					// 凭据，必须与 URL query 一样剥离后再转发。
 					if pluginProxyBlockedQuery(k) {
 						continue
 					}
-					for _, v := range vs {
-						req.Query = append(req.Query, &sdkv1.WebKV{Key: k, Value: v})
+					req.Query[k] = append(req.Query[k], vs...)
+				}
+				for field, fhs := range r.MultipartForm.File {
+					for _, fh := range fhs {
+						f, ferr := fh.Open()
+						if ferr != nil {
+							continue
+						}
+						content, rerr := io.ReadAll(io.LimitReader(f, 64<<20))
+						_ = f.Close()
+						if rerr != nil {
+							continue
+						}
+						req.Files = append(req.Files, pluginsdk.WebUploadFile{
+							Field:       field,
+							Filename:    fh.Filename,
+							ContentType: fh.Header.Get("Content-Type"),
+							Content:     content,
+						})
 					}
 				}
 			}
@@ -3333,12 +3325,12 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 		writeJSON(w, http.StatusOK, apiError("插件 Web API 调用失败: "+err.Error()))
 		return
 	}
-	status := int(resp.StatusCode)
+	status := resp.StatusCode
 	if status <= 0 {
 		status = http.StatusNotFound
 	}
-	for _, kv := range resp.Headers {
-		w.Header().Set(kv.Key, kv.Value)
+	for k, v := range resp.Headers {
+		w.Header().Set(k, v)
 	}
 	w.WriteHeader(status)
 	// #nosec no-direct-write-to-responsewriter -- 插件 Web API 代理：原样透传插件
@@ -5131,8 +5123,8 @@ func (s *Server) listTools() []interface{} {
 				continue
 			}
 			params := map[string]interface{}{}
-			if len(entry.Desc.ParamsJson) > 0 {
-				_ = json.Unmarshal(entry.Desc.ParamsJson, &params)
+			if len(entry.Desc.ParamsSchemaJSON) > 0 {
+				_ = json.Unmarshal(entry.Desc.ParamsSchemaJSON, &params)
 			}
 			display := nameByID[entry.PluginID]
 			if display == "" {

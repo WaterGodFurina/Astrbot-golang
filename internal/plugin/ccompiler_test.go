@@ -314,7 +314,7 @@ func TestInstallCGoPluginPromptsForCompiler(t *testing.T) {
 	main := `package main
 
 import (
-	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
+	sdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 // #cgo CFLAGS: -I.

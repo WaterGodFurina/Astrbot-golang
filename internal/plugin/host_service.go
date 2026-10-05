@@ -13,8 +13,7 @@ import (
 	"sync"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/conversation"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/cron"
@@ -818,7 +817,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 		},
 
 		// ── 大文件 Blob 存储（P0-2）──
-		CreateBlob: func(data []byte, mimeType, filename string, ttlSeconds int32) (*sdkv1.FileReference, error) {
+		CreateBlob: func(data []byte, mimeType, filename string, ttlSeconds int32) (*pluginsdk.FileReference, error) {
 			bs := getBlobStore()
 			if bs == nil {
 				return nil, fmt.Errorf("blob store not initialized")
@@ -836,7 +835,7 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			return bs.Read(handleID, offset, limit)
 		},
-		GetBlobInfo: func(handleID string) (*sdkv1.FileReference, error) {
+		GetBlobInfo: func(handleID string) (*pluginsdk.FileReference, error) {
 			bs := getBlobStore()
 			if bs == nil {
 				return nil, fmt.Errorf("blob store not initialized")
@@ -854,24 +853,24 @@ func SetHostService(pm *platform.PlatformManager, subMgr *SubprocessManager, cha
 			}
 			return bs.Release(handleID)
 		},
-		ChatLLM: func(req *sdkv1.ChatLLMRequest) (string, error) {
+		ChatLLM: func(req *pluginsdk.ChatLLMRequest) (string, error) {
 			if chatLLM == nil {
 				return "", fmt.Errorf("ChatLLM not configured on this host")
 			}
 			cmd := ChatLLMCmd{
 				Prompt:       req.Prompt,
 				SystemPrompt: req.SystemPrompt,
-				ImageURLs:    req.ImageUrls,
-				AudioURLs:    req.AudioUrls,
-				ProviderID:   req.ProviderId,
+				ImageURLs:    req.ImageURLs,
+				AudioURLs:    req.AudioURLs,
+				ProviderID:   req.ProviderID,
 			}
-			if len(req.ToolsJson) > 0 {
-				if err := json.Unmarshal(req.ToolsJson, &cmd.Tools); err != nil {
+			if len(req.ToolsJSON) > 0 {
+				if err := json.Unmarshal(req.ToolsJSON, &cmd.Tools); err != nil {
 					return "", fmt.Errorf("ChatLLM tools_json 解析失败: %w", err)
 				}
 			}
-			if len(req.ContextsJson) > 0 {
-				if err := json.Unmarshal(req.ContextsJson, &cmd.Contexts); err != nil {
+			if len(req.ContextsJSON) > 0 {
+				if err := json.Unmarshal(req.ContextsJSON, &cmd.Contexts); err != nil {
 					return "", fmt.Errorf("ChatLLM contexts_json 解析失败: %w", err)
 				}
 			}
@@ -1943,10 +1942,10 @@ func RegisterCronFeedHandler(m *cron.CronJobManager, subMgr *SubprocessManager) 
 		}
 		rpcCtx, cancel := context.WithTimeout(ctx, pluginCronFeedTimeout)
 		defer cancel()
-		if _, err := inst.Client.FeedCronJob(rpcCtx, &sdkv1.FeedCronJobRequest{
-			JobId:       job.ID,
+		if _, err := inst.Client.FeedCronJob(rpcCtx, pluginsdk.FeedCronJobRequest{
+			JobID:       job.ID,
 			JobName:     job.Name,
-			PayloadJson: payloadJSON,
+			PayloadJSON: payloadJSON,
 			RunAt:       time.Now().Format(time.RFC3339),
 		}); err != nil {
 			// UNIMPLEMENTED：旧 SDK 插件（编译时不带 FeedCronJob RPC），

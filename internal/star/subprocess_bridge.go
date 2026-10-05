@@ -6,13 +6,11 @@ package star
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"strings"
 	"sync"
 	"time"
 
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
@@ -228,14 +226,15 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				args := commandArgsFromFilter(cf, e.MessageStr)
 				logger.Debug("plugin RPC HandleCommand: name=%s args=%v", cmd.Name, args)
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				text, chain, result, err := cur.Client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDKEvent(e))
+				cmdRes, err := cur.Client.HandleCommand(rpcCtx, cmd.Name, args, CoreEventToSDKEvent(e))
 				rpcCancel()
+				text, chain := cmdRes.Text, cmdRes.Chain
 				if err != nil {
 					// 对外脱敏：插件错误原文只进日志，避免向用户泄露内部细节（D-low-8）。
 					logger.Error("plugin command %s failed: %v", cmd.Name, err)
 					text = "插件执行失败，请稍后重试"
 					chain = nil
-				} else if result.GetSent() {
+				} else if cmdRes.Result.Sent {
 					// 插件在 handler 中主动发送过回复（_has_send_oper 语义）：
 					// 事件已处理，不再走 LLM。
 					e.HasSendOper = true
@@ -243,7 +242,7 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				// 插件 handler 调用了 event.stop_event()（无 Result 的主动
 				// 回复场景，如 box 的 recall_task 路径）：事件处理完毕，
 				// 管线停止，不得继续走 LLM 兜底。
-				if result.GetStopPropagation() {
+				if cmdRes.Result.StopPropagation {
 					e.Stop()
 				}
 				if len(chain) > 0 {
@@ -301,15 +300,15 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				}
 				defer cur.RPCGuardPassive()()
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				allow, result, err := cur.Client.HandleFilter(rpcCtx, f.Name, CoreEventToSDKEvent(e))
+				filterRes, err := cur.Client.HandleFilter(rpcCtx, f.Name, CoreEventToSDKEvent(e))
 				rpcCancel()
 				if err != nil {
 					return nil
 				}
-				if result.GetSent() {
+				if filterRes.Result.Sent {
 					e.HasSendOper = true
 				}
-				if !allow {
+				if !filterRes.Allow {
 					e.Stop()
 				}
 				return nil
@@ -356,9 +355,9 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 				}
 				defer cur.RPCGuardPassive()()
 				rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
-				_, _, result, err := cur.Client.HandleHook(rpcCtx, h.Name, CoreEventToSDKEvent(e), nil)
+				hookRes, err := cur.Client.HandleHook(rpcCtx, h.Name, CoreEventToSDKEvent(e), nil)
 				rpcCancel()
-				if result.GetSent() {
+				if hookRes.Result.Sent {
 					e.HasSendOper = true
 				}
 				return err
@@ -396,19 +395,18 @@ func RegisterSubprocessPlugin(starMgr *Manager, mgr *plugin.SubprocessManager, i
 	}
 }
 
-// CoreEventToSDKEvent 把宿主 core.Event 直接构造为 proto SDKEvent（P1 native，
-// 0 Event JSON、无中间 SDK struct）。固定字段直填 protobuf，Components 走原生
-// repeated Component，仅动态 metadata 做一次 JSON。
-func CoreEventToSDKEvent(e *core.Event) *sdkv1.SDKEvent {
-	se := &sdkv1.SDKEvent{
+// CoreEventToSDKEvent 把宿主 core.Event 直接构造为 native SDK Event（P1 native，
+// 0 JSON、无中间 SDK struct）。固定字段直填，Components 走原生 Component。
+func CoreEventToSDKEvent(e *core.Event) *pluginsdk.Event {
+	se := &pluginsdk.Event{
 		Type:        coreEventTypeName(e.Type),
 		Platform:    e.Source.Platform,
-		PlatformId:  eventPlatformID(e),
+		PlatformID:  eventPlatformID(e),
 		MessageType: eventMessageType(e),
-		SelfId:      e.Source.SelfID,
-		SenderId:    e.Source.SenderID,
+		SelfID:      e.Source.SelfID,
+		SenderID:    e.Source.SenderID,
 		SenderName:  e.Source.SenderName,
-		ConvId:      e.Source.ConvID,
+		ConvID:      e.Source.ConvID,
 		GroupName:   e.Source.GroupName,
 		IsGroup:     e.Source.IsGroup,
 		IsAtBot:     e.Source.IsAtBot,
@@ -419,87 +417,74 @@ func CoreEventToSDKEvent(e *core.Event) *sdkv1.SDKEvent {
 		Timestamp:   e.Timestamp.Unix(),
 	}
 	if e.MessageObj != nil {
-		se.MessageId = e.MessageObj.MessageID
+		se.MessageID = e.MessageObj.MessageID
 	}
 	if e.Message != nil && len(e.Message.Chain) > 0 {
-		se.Components = messageToProtoComponents(e.Message.Chain)
+		se.Chain = messageToSDKComponents(e.Message.Chain)
 	}
 	if md := sdkMetadata(e); len(md) > 0 {
-		if b, err := json.Marshal(md); err == nil {
-			se.MetadataJson = b
-		}
+		se.Metadata = md
 	}
 	return se
 }
 
-// messageToProtoComponents 把宿主 message.Component 链直接转为 proto
-// Component（P1 native，跳过 SDK 中间 struct）。
-func messageToProtoComponents(chain []message.Component) []*sdkv1.Component {
-	return messageToProtoComponentsDepth(chain, 0)
+// messageToSDKComponents 把宿主 message.Component 链转为 native SDK Component。
+func messageToSDKComponents(chain []message.Component) []pluginsdk.Component {
+	return messageToSDKComponentsDepth(chain, 0)
 }
 
-// maxProtoComponentDepth 限制组件链的嵌套深度（Reply 引用内容、Forward 节点
+// maxSDKComponentDepth 限制组件链的嵌套深度（Reply 引用内容、Forward 节点
 // 等），与 Python SDK _bridge/serialize.py 的 _MAX_NODE_DEPTH 对齐，防御
-// 畸形自嵌套链导致 proto 递归构造过深。
-const maxProtoComponentDepth = 50
+// 畸形自嵌套链导致递归构造过深。
+const maxSDKComponentDepth = 50
 
-func messageToProtoComponentsDepth(chain []message.Component, depth int) []*sdkv1.Component {
-	out := make([]*sdkv1.Component, 0, len(chain))
+func messageToSDKComponentsDepth(chain []message.Component, depth int) []pluginsdk.Component {
+	out := make([]pluginsdk.Component, 0, len(chain))
 	for _, c := range chain {
 		if c == nil {
 			continue
 		}
-		pc := &sdkv1.Component{Type: string(c.Type())}
+		pc := pluginsdk.Component{Type: pluginsdk.ComponentType(c.Type())}
 		switch v := c.(type) {
 		case *message.Plain:
 			pc.Text = v.Text
 		case *message.At:
-			pc.TargetId = v.TargetID
+			pc.TargetID = v.TargetID
 			pc.Name = v.Name
 		case *message.Image:
-			pc.Url, pc.Path, pc.File, pc.FileId = v.URL, v.Path, v.File, v.FileID
-			// 借用 proto Component.name 承载图片文件名（proto 无独立 filename
-			// 字段；Python SDK 侧 filename 目前不经过桥接，宿主原生/未来扩展用）。
+			pc.URL, pc.Path, pc.File, pc.FileID = v.URL, v.Path, v.File, v.FileID
+			// 借用 Component.name 承载图片文件名（native Component 无独立
+			// filename 字段；Python SDK 侧 filename 目前不经过桥接，宿主原生/未来扩展用）。
 			if v.Filename != "" {
 				pc.Name = v.Filename
 			}
-			if v.Base64 != "" {
-				if b, err := base64.StdEncoding.DecodeString(v.Base64); err == nil {
-					pc.Base64Data = b
-				}
-			}
+			pc.Base64 = v.Base64
 		case *message.Record:
-			pc.Url, pc.Path, pc.File, pc.FileId = v.URL, v.Path, v.File, v.FileID
-			if v.Base64 != "" {
-				if b, err := base64.StdEncoding.DecodeString(v.Base64); err == nil {
-					pc.Base64Data = b
-				}
-			}
+			pc.URL, pc.Path, pc.File, pc.FileID = v.URL, v.Path, v.File, v.FileID
+			pc.Base64 = v.Base64
 		case *message.File:
-			pc.Url, pc.Path, pc.FileId, pc.Name = v.URL, v.Path, v.FileID, v.Name
+			pc.URL, pc.Path, pc.FileID, pc.Name = v.URL, v.Path, v.FileID, v.Name
 		case *message.Video:
-			pc.Url, pc.Path, pc.FileId = v.URL, v.Path, v.FileID
+			pc.URL, pc.Path, pc.FileID = v.URL, v.Path, v.FileID
 		case *message.Face:
-			pc.Id = v.ID
+			pc.ID = v.ID
 		case *message.Emoji:
-			pc.Id, pc.Url = v.ID, v.URL
+			pc.ID, pc.URL = v.ID, v.URL
 		case *message.Json:
 			if len(v.Data) > 0 {
-				if b, err := json.Marshal(v.Data); err == nil {
-					pc.DataJson = b
-				}
+				pc.Data = v.Data
 			}
 		case *message.Reply:
 			// 引用消息完整传输（对齐 Python Reply：id/chain/sender_id/
 			// sender_nickname/time/message_str）。message_str/text 沿用
 			// 既有字段；被引用内容链与发送者信息走 sender_* / chain 字段。
-			pc.Id, pc.Text = v.MessageID, v.MessageStr
-			pc.SenderId, pc.SenderName = v.SenderID, v.SenderNick
+			pc.ID, pc.Text = v.MessageID, v.MessageStr
+			pc.SenderID, pc.SenderName = v.SenderID, v.SenderNick
 			if !v.CreatedAt.IsZero() {
 				pc.SenderTime = v.CreatedAt.Unix()
 			}
-			if depth < maxProtoComponentDepth && len(v.Chain) > 0 {
-				pc.Chain = messageToProtoComponentsDepth(v.Chain, depth+1)
+			if depth < maxSDKComponentDepth && len(v.Chain) > 0 {
+				pc.Chain = messageToSDKComponentsDepth(v.Chain, depth+1)
 			}
 		}
 		out = append(out, pc)

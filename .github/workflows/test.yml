@@ -198,7 +198,7 @@ jobs:
           cat > native_entry.go <<'EOF'
           package main
 
-          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 
           func init() { native.SetPlugin(plugin) }
           EOF
@@ -253,7 +253,7 @@ jobs:
           cat > native_entry.go <<'EOF'
           package main
 
-          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 
           func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
           	return native.Serve(plugin, pluginID)
@@ -291,7 +291,7 @@ jobs:
           cat > native_entry.go <<'EOF'
           package main
 
-          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/native"
+          import native "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 
           func AstrBotNativePlugin(pluginID string) (native.Plugin, error) {
           	return native.Serve(plugin, pluginID)
@@ -448,40 +448,7 @@ jobs:
         shell: bash
         env:
           CGO_ENABLED: '1'
-        run: |
-          go build -o astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/astrbot
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            echo "=== host-build pragma build id (GOFLAGS='') ==="
-            HEXP=$(go list -export -f '{{.Export}}' google.golang.org/protobuf/internal/pragma)
-            echo "export=$HEXP"; go tool buildid "$HEXP" || true
-            echo "=== host-build pragma build id (GOFLAGS=-mod=mod) ==="
-            HEXP2=$(GOFLAGS=-mod=mod go list -export -f '{{.Export}}' google.golang.org/protobuf/internal/pragma)
-            echo "export=$HEXP2"; go tool buildid "$HEXP2" || true
-          fi
-
-      - name: 诊断宿主链接版本与 pragma build ID
-        shell: bash
-        run: |
-          set -x
-          echo "go: $(go version)"
-          go version -m "astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }}" | grep -E "protobuf|Astrbot-go-plugin-sdk|grpc" || true
-          echo "=== host env ==="
-          go env GOFLAGS GOEXPERIMENT GODEBUG CGO_ENABLED GOMODCACHE GOPATH
-          echo "=== host pragma build id ==="
-          HOST_EXPORT=$(go list -export -f '{{.Export}}' google.golang.org/protobuf/internal/pragma 2>&1)
-          echo "export=$HOST_EXPORT"
-          [ -f "$HOST_EXPORT" ] && go tool buildid "$HOST_EXPORT" || true
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            echo "=== isolated-gopath env (plugin build env) ==="
-            ISO_GOPATH="${HOME}/.local/share/astrbot-go/gopath"
-            GOFLAGS=-mod=mod CGO_ENABLED=1 GOPATH="$ISO_GOPATH" \
-              go env GOFLAGS GOEXPERIMENT GODEBUG CGO_ENABLED GOMODCACHE GOPATH
-            echo "=== isolated pragma build id ==="
-            ISO_EXPORT=$(GOFLAGS=-mod=mod CGO_ENABLED=1 GOPATH="$ISO_GOPATH" \
-              go list -export -f '{{.Export}}' google.golang.org/protobuf/internal/pragma 2>&1)
-            echo "export=$ISO_EXPORT"
-            [ -f "$ISO_EXPORT" ] && go tool buildid "$ISO_EXPORT" || true
-          fi
+        run: go build -o astrbot-e2e${{ runner.os == 'Windows' && '.exe' || '' }} ./cmd/astrbot
 
       - name: 运行插件 E2E
         shell: bash
@@ -490,7 +457,6 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PIP_INDEX_URL: https://pypi.org/simple
           ASTRBOT_PYPI_INDEX: https://pypi.org/simple
-          ASTRBOT_DEBUG_NATIVE_BUILDID: '1'
         run: bash scripts/e2e_plugin.sh "${{ github.workspace }}/e2e-data" 6185
 
       - name: 上传 E2E 日志（失败时排查）

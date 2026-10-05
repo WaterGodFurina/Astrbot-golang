@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 // schemaFixture returns a JSON-Schema covering scalar defaults and a nested
@@ -43,7 +43,7 @@ func newResolverManager(t *testing.T, storedJSON string) *SubprocessManager {
 	m := NewSubprocessManager(nil, t.TempDir())
 	raw, _ := json.Marshal(schemaFixture())
 	m.instances["test"] = &PluginInstance{
-		Meta: &sdkv1.RegisterResponse{ConfigSchemaJson: raw},
+		Meta: &pluginsdk.PluginInfo{ConfigSchemaJSON: raw},
 	}
 	if storedJSON != "" {
 		cfgDir := filepath.Join(m.dataDir, "plugins_config", "test")

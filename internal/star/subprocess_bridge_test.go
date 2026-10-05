@@ -288,14 +288,14 @@ func TestMessageToProtoComponentsReplyChain(t *testing.T) {
 		MessageStr: "回复内容",
 	}
 	se := CoreEventToSDKEvent(ev)
-	if len(se.Components) != 2 {
-		t.Fatalf("components length = %d, want 2", len(se.Components))
+	if len(se.Chain) != 2 {
+		t.Fatalf("components length = %d, want 2", len(se.Chain))
 	}
-	rc := se.Components[0]
-	if rc.Type != "Reply" || rc.Id != "r1" || rc.Text != "被引用文本" {
+	rc := se.Chain[0]
+	if rc.Type != "Reply" || rc.ID != "r1" || rc.Text != "被引用文本" {
 		t.Fatalf("reply base mismatch: %+v", rc)
 	}
-	if rc.SenderId != "10001" || rc.SenderName != "阿明" || rc.SenderTime != quotedAt.Unix() {
+	if rc.SenderID != "10001" || rc.SenderName != "阿明" || rc.SenderTime != quotedAt.Unix() {
 		t.Fatalf("reply sender mismatch: %+v", rc)
 	}
 	if len(rc.Chain) != 2 {
@@ -304,7 +304,7 @@ func TestMessageToProtoComponentsReplyChain(t *testing.T) {
 	if rc.Chain[0].Type != "Plain" || rc.Chain[0].Text != "被引用文本" {
 		t.Fatalf("reply chain[0] mismatch: %+v", rc.Chain[0])
 	}
-	if rc.Chain[1].Type != "Image" || rc.Chain[1].Url != "https://example.com/q.png" {
+	if rc.Chain[1].Type != "Image" || rc.Chain[1].URL != "https://example.com/q.png" {
 		t.Fatalf("reply chain[1] mismatch: %+v", rc.Chain[1])
 	}
 }
@@ -313,7 +313,7 @@ func TestMessageToProtoComponentsReplyChain(t *testing.T) {
 // 转换时被深度上限截断，不无限递归。
 func TestMessageToProtoComponentsReplyChainDepthCap(t *testing.T) {
 	inner := message.Component(&message.Reply{MessageID: "leaf"})
-	for i := 0; i < maxProtoComponentDepth+10; i++ {
+	for i := 0; i < maxSDKComponentDepth+10; i++ {
 		inner = &message.Reply{MessageID: "r" + strconv.Itoa(i), Chain: []message.Component{inner}}
 	}
 	ev := &core.Event{
@@ -321,19 +321,19 @@ func TestMessageToProtoComponentsReplyChainDepthCap(t *testing.T) {
 		Source:  core.EventSource{Platform: "aiocqhttp", ConvID: "g1"},
 		Message: &message.MessageChain{Chain: []message.Component{inner}},
 	}
-	pc := CoreEventToSDKEvent(ev).Components
+	pc := CoreEventToSDKEvent(ev).Chain
 	if len(pc) != 1 {
 		t.Fatalf("components length = %d", len(pc))
 	}
 	depth := 0
 	for cur := pc[0]; len(cur.Chain) > 0; cur = cur.Chain[0] {
 		depth++
-		if depth > maxProtoComponentDepth {
+		if depth > maxSDKComponentDepth {
 			t.Fatalf("depth cap exceeded: %d", depth)
 		}
 	}
-	if depth != maxProtoComponentDepth {
-		t.Fatalf("depth = %d, want %d", depth, maxProtoComponentDepth)
+	if depth != maxSDKComponentDepth {
+		t.Fatalf("depth = %d, want %d", depth, maxSDKComponentDepth)
 	}
 }
 

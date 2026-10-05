@@ -9,9 +9,8 @@ import (
 	"syscall"
 	"unsafe"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
-	"google.golang.org/protobuf/proto"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
+	pluginNative "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/native"
 )
 
 // openNativePlugin loads a Native plugin DLL on Windows and returns a PluginClient
@@ -23,9 +22,10 @@ import (
 //	AstrBotFree(p)                                    free a response buffer
 //	AstrBotPluginClose(handle)
 //
-// Request/response cross the C ABI as sdkv1 protobuf bytes (one marshal/
-// unmarshal round trip), which keeps the C surface tiny and reuses the same
-// protocol as the gRPC runtime. No loopback gRPC, no JSON.
+// Request/response cross the C ABI as encoding/json bytes (a C ABI cannot carry
+// Go values): requests are the SDK native `native.CABI*Request` envelopes,
+// responses are the JSON of the SDK native result types (sdk.PluginInfo,
+// sdk.HandleCommandResult, ...). No protobuf, no gRPC, no JSON event plane.
 func openNativePlugin(path, pluginID string) (pluginsdk.PluginClient, func() error, error) {
 	dll, err := syscall.LoadDLL(path)
 	if err != nil {
@@ -85,7 +85,7 @@ func openNativePlugin(path, pluginID string) (pluginsdk.PluginClient, func() err
 }
 
 // nativeABIClient implements pluginsdk.PluginClient by forwarding each call to
-// the DLL's AstrBotPluginCall with sdkv1 protobuf bytes.
+// the DLL's AstrBotPluginCall with JSON request/response bytes.
 type nativeABIClient struct {
 	id        string
 	handle    uintptr
@@ -106,14 +106,14 @@ func (c *nativeABIClient) Close() error {
 	return nil
 }
 
-// call marshals req, invokes the DLL and unmarshals the response into out
-// (out may be nil for methods with an empty response). code 3 from the DLL
-// carries a plain error string instead of a protobuf body.
-func (c *nativeABIClient) call(method string, req proto.Message, out proto.Message) error {
+// call JSON-marshals req, invokes the DLL and JSON-unmarshals the response into
+// out (out may be nil for methods with an empty response). code 3 from the DLL
+// carries a plain error string instead of a JSON body.
+func (c *nativeABIClient) call(method string, req any, out any) error {
 	var reqBytes []byte
 	if req != nil {
 		var err error
-		if reqBytes, err = proto.Marshal(req); err != nil {
+		if reqBytes, err = json.Marshal(req); err != nil {
 			return err
 		}
 	}
@@ -145,7 +145,7 @@ func (c *nativeABIClient) call(method string, req proto.Message, out proto.Messa
 	switch r {
 	case 0:
 		if out != nil && len(respBytes) > 0 {
-			return proto.Unmarshal(respBytes, out)
+			return json.Unmarshal(respBytes, out)
 		}
 		return nil
 	case 3:
@@ -155,175 +155,150 @@ func (c *nativeABIClient) call(method string, req proto.Message, out proto.Messa
 	}
 }
 
-func (c *nativeABIClient) Register(ctx context.Context) (*sdkv1.RegisterResponse, error) {
-	resp := &sdkv1.RegisterResponse{}
-	if err := c.call("Register", &sdkv1.RegisterRequest{ProtocolVersion: pluginsdk.P1ProtocolVersion, PluginId: c.id}, resp); err != nil {
-		return nil, err
+func (c *nativeABIClient) Register(ctx context.Context) (pluginsdk.PluginInfo, error) {
+	var out pluginsdk.PluginInfo
+	if err := c.call("Register", pluginNative.CABIRegisterRequest{ProtocolVersion: pluginsdk.P1ProtocolVersion}, &out); err != nil {
+		return pluginsdk.PluginInfo{}, err
 	}
-	return resp, nil
+	return out, nil
 }
 
-func (c *nativeABIClient) HandleCommand(ctx context.Context, name string, args []string, se *sdkv1.SDKEvent) (string, []pluginsdk.Component, *sdkv1.EventResult, error) {
-	resp := &sdkv1.HandleCommandResponse{}
-	if err := c.call("HandleCommand", &sdkv1.HandleCommandRequest{Name: name, Args: args, Event: se, PluginId: c.id}, resp); err != nil {
-		return "", nil, &sdkv1.EventResult{}, err
+func (c *nativeABIClient) HandleCommand(ctx context.Context, name string, args []string, event *pluginsdk.Event) (pluginsdk.HandleCommandResult, error) {
+	var out pluginsdk.HandleCommandResult
+	if err := c.call("HandleCommand", pluginNative.CABIHandleCommandRequest{Name: name, Args: args, Event: event}, &out); err != nil {
+		return pluginsdk.HandleCommandResult{}, err
 	}
-	return resp.Text, pluginsdk.ProtoToComponents(resp.Chain), cabiResult(resp.Result, resp.Sent, resp.Stop, false), nil
+	return out, nil
 }
 
-func (c *nativeABIClient) HandleFilter(ctx context.Context, name string, se *sdkv1.SDKEvent) (bool, *sdkv1.EventResult, error) {
-	resp := &sdkv1.HandleFilterResponse{}
-	if err := c.call("HandleFilter", &sdkv1.HandleFilterRequest{Name: name, Event: se, PluginId: c.id}, resp); err != nil {
-		return true, &sdkv1.EventResult{}, err
+func (c *nativeABIClient) HandleFilter(ctx context.Context, name string, event *pluginsdk.Event) (pluginsdk.HandleFilterResult, error) {
+	var out pluginsdk.HandleFilterResult
+	if err := c.call("HandleFilter", pluginNative.CABIHandleFilterRequest{Name: name, Event: event}, &out); err != nil {
+		return pluginsdk.HandleFilterResult{Allow: true}, err
 	}
-	return resp.Allow, cabiResult(resp.Result, resp.Sent, false, false), nil
+	return out, nil
 }
 
-func (c *nativeABIClient) HandleHook(ctx context.Context, name string, se *sdkv1.SDKEvent, chain []pluginsdk.Component) ([]pluginsdk.Component, bool, *sdkv1.EventResult, error) {
-	return c.handleHook(ctx, name, se, chain, nil)
+func (c *nativeABIClient) HandleHook(ctx context.Context, name string, event *pluginsdk.Event, chain []pluginsdk.Component) (pluginsdk.HandleHookResult, error) {
+	return c.handleHook(ctx, name, event, chain, nil)
 }
 
-func (c *nativeABIClient) HandleHookWithPayload(ctx context.Context, name string, se *sdkv1.SDKEvent, chain []pluginsdk.Component, payload any) ([]pluginsdk.Component, bool, *sdkv1.EventResult, error) {
-	return c.handleHook(ctx, name, se, chain, payload)
+func (c *nativeABIClient) HandleHookWithPayload(ctx context.Context, name string, event *pluginsdk.Event, chain []pluginsdk.Component, payload any) (pluginsdk.HandleHookResult, error) {
+	return c.handleHook(ctx, name, event, chain, payload)
 }
 
-func (c *nativeABIClient) handleHook(ctx context.Context, name string, se *sdkv1.SDKEvent, chain []pluginsdk.Component, payload any) ([]pluginsdk.Component, bool, *sdkv1.EventResult, error) {
-	var payloadJSON []byte
+func (c *nativeABIClient) handleHook(ctx context.Context, name string, event *pluginsdk.Event, chain []pluginsdk.Component, payload any) (pluginsdk.HandleHookResult, error) {
+	var payloadJSON json.RawMessage
 	if payload != nil {
-		var err error
-		if payloadJSON, err = json.Marshal(payload); err != nil {
-			return chain, false, &sdkv1.EventResult{}, err
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return pluginsdk.HandleHookResult{Chain: chain}, err
 		}
+		payloadJSON = b
 	}
-	resp := &sdkv1.HookResponse{}
-	if err := c.call("HandleHook", &sdkv1.HandleHookRequest{Name: name, Event: se, Chain: pluginsdk.ComponentsToProto(chain), PayloadJson: payloadJSON, PluginId: c.id}, resp); err != nil {
-		return chain, false, &sdkv1.EventResult{}, err
+	var out pluginsdk.HandleHookResult
+	if err := c.call("HandleHook", pluginNative.CABIHandleHookRequest{Name: name, Event: event, Chain: chain, PayloadJSON: payloadJSON}, &out); err != nil {
+		return pluginsdk.HandleHookResult{Chain: chain}, err
 	}
-	if len(resp.Chain) > 0 {
-		chain = pluginsdk.ProtoToComponents(resp.Chain)
+	if len(out.Chain) == 0 {
+		out.Chain = chain
 	}
-	res := cabiResult(resp.Result, resp.Sent, resp.Stop, resp.Handled)
-	return chain, res.StopPropagation, res, nil
+	return out, nil
 }
 
-func (c *nativeABIClient) HandleLLMRequest(ctx context.Context, name string, se *sdkv1.SDKEvent, systemPrompt, userPrompt string) (string, string, bool, *sdkv1.EventResult, error) {
-	resp := &sdkv1.HandleLLMRequestResponse{}
-	if err := c.call("HandleLLMRequest", &sdkv1.HandleLLMRequestRequest{Name: name, Event: se, SystemPrompt: systemPrompt, UserPrompt: userPrompt, PluginId: c.id}, resp); err != nil {
-		return systemPrompt, userPrompt, false, &sdkv1.EventResult{}, err
+func (c *nativeABIClient) HandleLLMRequest(ctx context.Context, name string, event *pluginsdk.Event, systemPrompt, userPrompt string) (pluginsdk.HandleLLMRequestResult, error) {
+	var out pluginsdk.HandleLLMRequestResult
+	if err := c.call("HandleLLMRequest", pluginNative.CABIHandleLLMRequestRequest{Name: name, Event: event, SystemPrompt: systemPrompt, UserPrompt: userPrompt}, &out); err != nil {
+		return pluginsdk.HandleLLMRequestResult{SystemPrompt: systemPrompt, UserPrompt: userPrompt}, err
 	}
-	result := cabiResult(resp.Result, resp.Sent, resp.Stop, false)
-	return resp.SystemPrompt, resp.UserPrompt, result.StopPropagation, result, nil
+	return out, nil
 }
 
-func (c *nativeABIClient) ListWebApis(ctx context.Context, ref *sdkv1.PluginRef) ([]*sdkv1.WebApiDesc, error) {
-	if ref == nil {
-		ref = &sdkv1.PluginRef{PluginId: c.id}
-	}
-	resp := &sdkv1.ListWebApisResponse{}
-	if err := c.call("ListWebApis", ref, resp); err != nil {
+func (c *nativeABIClient) ListWebApis(ctx context.Context) ([]pluginsdk.WebAPIDesc, error) {
+	var out []pluginsdk.WebAPIDesc
+	if err := c.call("ListWebApis", nil, &out); err != nil {
 		return nil, err
 	}
-	return resp.GetWebApis(), nil
+	return out, nil
 }
 
-func (c *nativeABIClient) ListTools(ctx context.Context, ref *sdkv1.PluginRef) ([]*sdkv1.ToolDesc, error) {
-	if ref == nil {
-		ref = &sdkv1.PluginRef{PluginId: c.id}
-	}
-	resp := &sdkv1.ListToolsResponse{}
-	if err := c.call("ListTools", ref, resp); err != nil {
+func (c *nativeABIClient) ListTools(ctx context.Context) ([]pluginsdk.ToolDesc, error) {
+	var out []pluginsdk.ToolDesc
+	if err := c.call("ListTools", nil, &out); err != nil {
 		return nil, err
 	}
-	return resp.GetTools(), nil
+	return out, nil
 }
 
-func (c *nativeABIClient) GetConfigSchema(ctx context.Context, ref *sdkv1.PluginRef) ([]byte, error) {
-	if ref == nil {
-		ref = &sdkv1.PluginRef{PluginId: c.id}
-	}
-	resp := &sdkv1.GetConfigSchemaResponse{}
-	if err := c.call("GetConfigSchema", ref, resp); err != nil {
+func (c *nativeABIClient) GetConfigSchema(ctx context.Context) ([]byte, error) {
+	var out []byte
+	if err := c.call("GetConfigSchema", nil, &out); err != nil {
 		return nil, err
 	}
-	return resp.GetSchemaJson(), nil
+	return out, nil
 }
 
-func (c *nativeABIClient) HandleTool(ctx context.Context, name string, args map[string]any, se *sdkv1.SDKEvent) (string, bool, *sdkv1.EventResult, error) {
-	argsJSON, err := json.Marshal(args)
-	if err != nil {
-		return "", false, &sdkv1.EventResult{}, err
+func (c *nativeABIClient) HandleTool(ctx context.Context, name string, args map[string]any, event *pluginsdk.Event) (pluginsdk.HandleToolResult, error) {
+	var out pluginsdk.HandleToolResult
+	if err := c.call("HandleTool", pluginNative.CABIHandleToolRequest{Name: name, Args: args, Event: event}, &out); err != nil {
+		return pluginsdk.HandleToolResult{}, err
 	}
-	resp := &sdkv1.HandleToolResponse{}
-	if err := c.call("HandleTool", &sdkv1.HandleToolRequest{Name: name, ArgsJson: argsJSON, Event: se, PluginId: c.id}, resp); err != nil {
-		return "", false, &sdkv1.EventResult{}, err
-	}
-	return resp.Text, resp.IsError, cabiResult(resp.Result, resp.Sent, false, false), nil
+	return out, nil
 }
 
-func (c *nativeABIClient) HandleWebRequest(ctx context.Context, req *sdkv1.HandleWebRequestRequest) (*sdkv1.HandleWebRequestResponse, error) {
-	if req != nil && req.PluginId == "" {
-		req.PluginId = c.id
+func (c *nativeABIClient) HandleWebRequest(ctx context.Context, req pluginsdk.HandleWebRequest) (pluginsdk.HandleWebResponse, error) {
+	if req.PluginID == "" {
+		req.PluginID = c.id
 	}
-	resp := &sdkv1.HandleWebRequestResponse{}
-	if err := c.call("HandleWebRequest", req, resp); err != nil {
-		return nil, err
+	var out pluginsdk.HandleWebResponse
+	if err := c.call("HandleWebRequest", pluginNative.CABIHandleWebRequest{Req: req}, &out); err != nil {
+		return pluginsdk.HandleWebResponse{}, err
 	}
-	return resp, nil
+	return out, nil
 }
 
-func (c *nativeABIClient) HealthCheck(ctx context.Context) (*sdkv1.HealthResponse, error) {
-	resp := &sdkv1.HealthResponse{}
-	if err := c.call("HealthCheck", &sdkv1.Empty{}, resp); err != nil {
-		return nil, err
+func (c *nativeABIClient) HealthCheck(ctx context.Context) (pluginsdk.HealthInfo, error) {
+	var out pluginsdk.HealthInfo
+	if err := c.call("HealthCheck", nil, &out); err != nil {
+		return pluginsdk.HealthInfo{}, err
 	}
-	return resp, nil
+	return out, nil
 }
 
-func (c *nativeABIClient) Cleanup(ctx context.Context, ref *sdkv1.PluginRef) error {
-	if ref == nil {
-		ref = &sdkv1.PluginRef{PluginId: c.id}
-	}
-	return c.call("Cleanup", ref, &sdkv1.Empty{})
+func (c *nativeABIClient) Cleanup(ctx context.Context) error {
+	return c.call("Cleanup", nil, nil)
 }
 
 func (c *nativeABIClient) SetLogLevel(ctx context.Context, level string) error {
-	return c.call("SetLogLevel", &sdkv1.SetLogLevelRequest{Level: level, PluginId: c.id}, &sdkv1.Empty{})
+	return c.call("SetLogLevel", pluginNative.CABISetLogLevelRequest{Level: level}, nil)
 }
 
-func (c *nativeABIClient) FeedSessionWait(ctx context.Context, se *sdkv1.SDKEvent) (bool, error) {
-	resp := &sdkv1.FeedSessionWaitResponse{}
-	if err := c.call("FeedSessionWait", &sdkv1.FeedSessionWaitRequest{Event: se, PluginId: c.id}, resp); err != nil {
+func (c *nativeABIClient) FeedSessionWait(ctx context.Context, event *pluginsdk.Event) (bool, error) {
+	var out pluginsdk.FeedSessionWaitResult
+	if err := c.call("FeedSessionWait", pluginNative.CABIFeedSessionWaitRequest{Event: event}, &out); err != nil {
 		return false, err
 	}
-	return resp.GetHandled(), nil
+	return out.Handled, nil
 }
 
-func (c *nativeABIClient) ManagePlugin(ctx context.Context, req *sdkv1.ManagePluginRequest) (*sdkv1.ManagePluginResponse, error) {
-	if req != nil && req.PluginId == "" {
-		req.PluginId = c.id
+func (c *nativeABIClient) ManagePlugin(ctx context.Context, req pluginsdk.ManagePluginRequest) (pluginsdk.ManagePluginResponse, error) {
+	if req.PluginID == "" {
+		req.PluginID = c.id
 	}
-	resp := &sdkv1.ManagePluginResponse{}
-	if err := c.call("ManagePlugin", req, resp); err != nil {
-		return nil, err
+	var out pluginsdk.ManagePluginResponse
+	if err := c.call("ManagePlugin", req, &out); err != nil {
+		return pluginsdk.ManagePluginResponse{}, err
 	}
-	return resp, nil
+	return out, nil
 }
 
-func (c *nativeABIClient) FeedCronJob(ctx context.Context, req *sdkv1.FeedCronJobRequest) (*sdkv1.FeedCronJobResponse, error) {
-	if req != nil && req.PluginId == "" {
-		req.PluginId = c.id
+func (c *nativeABIClient) FeedCronJob(ctx context.Context, req pluginsdk.FeedCronJobRequest) (pluginsdk.FeedCronJobResponse, error) {
+	if req.PluginID == "" {
+		req.PluginID = c.id
 	}
-	resp := &sdkv1.FeedCronJobResponse{}
-	if err := c.call("FeedCronJob", req, resp); err != nil {
-		return nil, err
+	var out pluginsdk.FeedCronJobResponse
+	if err := c.call("FeedCronJob", req, &out); err != nil {
+		return pluginsdk.FeedCronJobResponse{}, err
 	}
-	return resp, nil
-}
-
-// cabiResult normalizes a response's EventResult, mirroring native.NativeClient.
-func cabiResult(r *sdkv1.EventResult, legacySent, legacyStop, legacyHandled bool) *sdkv1.EventResult {
-	if r != nil {
-		return r
-	}
-	return &sdkv1.EventResult{Handled: legacyHandled, Sent: legacySent, StopPropagation: legacyStop}
+	return out, nil
 }

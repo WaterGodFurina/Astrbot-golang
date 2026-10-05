@@ -38,10 +38,11 @@ func TestPythonPluginPackageRelativeImport(t *testing.T) {
 		"conv_id": "c", "is_group": false, "is_at_bot": true,
 		"message_str": "pkghello", "plain_text": "pkghello", "timestamp": 0,
 	}
-	_, chain, _, err := inst.Client.HandleCommand(context.Background(), "pkghello", nil, sdkEvent(t, ev))
+	cmdRes, err := inst.Client.HandleCommand(context.Background(), "pkghello", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("HandleCommand: %v", err)
 	}
+	chain := cmdRes.Chain
 	if len(chain) == 0 || !strings.Contains(chain[0].Text, "pkg relative import ok") {
 		t.Fatalf("相对导入结果异常: %v", chain)
 	}

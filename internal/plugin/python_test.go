@@ -11,17 +11,16 @@ import (
 	"testing"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 )
 
 // sdkEvent builds a *pluginsdk.Event from a raw map (used to simulate host
 // events crossing the RPC boundary).
 // sdkEvent 从测试用的 map 直接构造 proto SDKEvent（P1 native，不经过
 // SDK struct / JSON）。
-func sdkEvent(t *testing.T, m map[string]any) *sdkv1.SDKEvent {
+func sdkEvent(t *testing.T, m map[string]any) *pluginsdk.Event {
 	t.Helper()
-	se := &sdkv1.SDKEvent{}
+	se := &pluginsdk.Event{}
 	if v, ok := m["type"]; ok {
 		se.Type = fmt.Sprint(v)
 	}
@@ -29,22 +28,22 @@ func sdkEvent(t *testing.T, m map[string]any) *sdkv1.SDKEvent {
 		se.Platform = fmt.Sprint(v)
 	}
 	if v, ok := m["platform_id"]; ok {
-		se.PlatformId = fmt.Sprint(v)
+		se.PlatformID = fmt.Sprint(v)
 	}
 	if v, ok := m["message_type"]; ok {
 		se.MessageType = fmt.Sprint(v)
 	}
 	if v, ok := m["self_id"]; ok {
-		se.SelfId = fmt.Sprint(v)
+		se.SelfID = fmt.Sprint(v)
 	}
 	if v, ok := m["sender_id"]; ok {
-		se.SenderId = fmt.Sprint(v)
+		se.SenderID = fmt.Sprint(v)
 	}
 	if v, ok := m["sender_name"]; ok {
 		se.SenderName = fmt.Sprint(v)
 	}
 	if v, ok := m["conv_id"]; ok {
-		se.ConvId = fmt.Sprint(v)
+		se.ConvID = fmt.Sprint(v)
 	}
 	if v, ok := m["group_name"]; ok {
 		se.GroupName = fmt.Sprint(v)
@@ -59,7 +58,7 @@ func sdkEvent(t *testing.T, m map[string]any) *sdkv1.SDKEvent {
 		se.RawMessage = fmt.Sprint(v)
 	}
 	if v, ok := m["message_id"]; ok {
-		se.MessageId = fmt.Sprint(v)
+		se.MessageID = fmt.Sprint(v)
 	}
 	if v, ok := m["is_group"]; ok {
 		se.IsGroup = fmt.Sprint(v) == "true"
@@ -80,10 +79,8 @@ func sdkEvent(t *testing.T, m map[string]any) *sdkv1.SDKEvent {
 			se.Timestamp = n
 		}
 	}
-	if md, ok := m["metadata"]; ok {
-		if b, err := json.Marshal(md); err == nil {
-			se.MetadataJson = b
-		}
+	if md, ok := m["metadata"].(map[string]any); ok {
+		se.Metadata = md
 	}
 	return se
 }
@@ -145,11 +142,11 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	t.Logf("插件: name=%s version=%s", inst.Name, inst.Version)
 
 	// _conf_schema.json → config schema 上报
-	if len(inst.Meta.ConfigSchemaJson) == 0 {
+	if len(inst.Meta.ConfigSchemaJSON) == 0 {
 		t.Fatal("ConfigSchemaJson 为空（未读取 _conf_schema.json）")
 	}
 	var schema map[string]any
-	if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
+	if err := json.Unmarshal(inst.Meta.ConfigSchemaJSON, &schema); err != nil {
 		t.Fatalf("ConfigSchemaJson 解析失败: %v", err)
 	}
 	props, ok := schema["properties"].(map[string]any)
@@ -171,7 +168,7 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	}
 	for _, tl := range inst.Meta.Tools {
 		found["tool:"+tl.Name] = true
-		t.Logf("tool: %s params=%s", tl.Name, string(tl.ParamsJson))
+		t.Logf("tool: %s params=%s", tl.Name, string(tl.ParamsSchemaJSON))
 	}
 	for _, k := range []string{"cmd:pyhello", "cmd:pyadd", "filter:python_plugin.main_echo", "hook:on_llm_request", "tool:py_add_tool"} {
 		if !found[k] {
@@ -190,43 +187,47 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 	// HandleCommand
 	cmdCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	text, chain, result, err := inst.Client.HandleCommand(cmdCtx, "pyhello", nil, sdkEvent(t, ev))
+	cmdRes, err := inst.Client.HandleCommand(cmdCtx, "pyhello", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("HandleCommand: %v", err)
 	}
+	chain := cmdRes.Chain
 	if len(chain) == 0 || chain[0].Text == "" || !strings.Contains(chain[0].Text, "Hello from Python") {
-		t.Fatalf("pyhello 回复异常: text=%q chain=%v", text, chain)
+		t.Fatalf("pyhello 回复异常: text=%q chain=%v", cmdRes.Text, chain)
 	}
-	if result.GetSent() {
+	if cmdRes.Result.Sent {
 		t.Fatal("pyhello 通过 Result 回复（非主动发送），sent 必须为 false")
 	}
 	t.Logf("pyhello -> %s", chain[0].Text)
 
 	// 带参数命令
-	_, chain2, _, err := inst.Client.HandleCommand(cmdCtx, "pyadd", []string{"3", "4"}, sdkEvent(t, ev))
+	addRes, err := inst.Client.HandleCommand(cmdCtx, "pyadd", []string{"3", "4"}, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("pyadd: %v", err)
 	}
+	chain2 := addRes.Chain
 	if len(chain2) == 0 || !strings.Contains(chain2[0].Text, "7") {
 		t.Fatalf("pyadd 回复异常: %v", chain2)
 	}
 	t.Logf("pyadd -> %s", chain2[0].Text)
 
 	// HostService 反向调用（GetConfig：插件经 broker 读取宿主配置）
-	_, chainCfg, _, err := inst.Client.HandleCommand(cmdCtx, "pycfg", nil, sdkEvent(t, ev))
+	cfgRes, err := inst.Client.HandleCommand(cmdCtx, "pycfg", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("pycfg: %v", err)
 	}
+	chainCfg := cfgRes.Chain
 	if len(chainCfg) == 0 || !strings.Contains(chainCfg[0].Text, "你好") || !strings.Contains(chainCfg[0].Text, "enabled") {
 		t.Fatalf("pycfg 未读到宿主配置: %v", chainCfg)
 	}
 	t.Logf("pycfg -> %s", chainCfg[0].Text)
 
 	// HostService 反向调用（TextToImage：宿主 t2i 渲染返回 PNG）
-	_, chainT2I, _, err := inst.Client.HandleCommand(cmdCtx, "pyt2i", nil, sdkEvent(t, ev))
+	t2iRes, err := inst.Client.HandleCommand(cmdCtx, "pyt2i", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("pyt2i: %v", err)
 	}
+	chainT2I := t2iRes.Chain
 	if len(chainT2I) == 0 || !strings.Contains(chainT2I[0].Text, "t2i_len=") {
 		t.Fatalf("pyt2i 结果异常: %v", chainT2I)
 	}
@@ -239,34 +240,34 @@ func TestPythonPluginEndToEnd(t *testing.T) {
 		"message_str": "pyecho hello", "plain_text": "pyecho hello", "timestamp": 0,
 		"chain": []map[string]any{{"type": "Plain", "text": "pyecho hello"}},
 	}
-	allow, _, err := inst.Client.HandleFilter(cmdCtx, "python_plugin.main_echo", sdkEvent(t, ev2))
+	filterRes, err := inst.Client.HandleFilter(cmdCtx, "python_plugin.main_echo", sdkEvent(t, ev2))
 	if err != nil {
 		t.Fatalf("HandleFilter: %v", err)
 	}
-	if !allow {
+	if !filterRes.Allow {
 		t.Fatal("pyecho 应命中过滤器")
 	}
-	allow2, _, _ := inst.Client.HandleFilter(cmdCtx, "python_plugin.main_echo", sdkEvent(t, ev))
-	if !allow2 {
+	filterRes2, _ := inst.Client.HandleFilter(cmdCtx, "python_plugin.main_echo", sdkEvent(t, ev))
+	if !filterRes2.Allow {
 		t.Fatal("pyhello 不应命中过滤器（应放行）")
 	}
 
 	// HandleLLMRequest（on_llm_request 注入 system prompt）
-	sp, _, stop, _, err := inst.Client.HandleLLMRequest(cmdCtx, "python_plugin.main_llm_req", sdkEvent(t, ev), "SP", "hi")
+	llmRes, err := inst.Client.HandleLLMRequest(cmdCtx, "python_plugin.main_llm_req", sdkEvent(t, ev), "SP", "hi")
 	if err != nil {
 		t.Fatalf("HandleLLMRequest: %v", err)
 	}
-	if stop || !strings.Contains(sp, "Python插件注入") {
-		t.Fatalf("llm_req 注入失败: sp=%q stop=%v", sp, stop)
+	if llmRes.Stop || !strings.Contains(llmRes.SystemPrompt, "Python插件注入") {
+		t.Fatalf("llm_req 注入失败: sp=%q stop=%v", llmRes.SystemPrompt, llmRes.Stop)
 	}
 
 	// HandleTool
-	text2, isErr, _, err := inst.Client.HandleTool(cmdCtx, "py_add_tool", map[string]any{"a": 5, "b": 6}, sdkEvent(t, ev))
+	toolRes, err := inst.Client.HandleTool(cmdCtx, "py_add_tool", map[string]any{"a": 5, "b": 6}, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("HandleTool: %v", err)
 	}
-	if isErr || text2 != "11" {
-		t.Fatalf("py_add_tool 结果异常: text=%q err=%v", text2, isErr)
+	if toolRes.IsError || toolRes.Text != "11" {
+		t.Fatalf("py_add_tool 结果异常: text=%q err=%v", toolRes.Text, toolRes.IsError)
 	}
 
 	// Cleanup 后进程退出
@@ -359,14 +360,14 @@ func TestPythonPluginSendMarksSent(t *testing.T) {
 		"chain": []map[string]any{{"type": "Plain", "text": "pysend"}},
 	}
 	// pysend 不返回文本（Result 为空），只主动发送——sent 必须为 true。
-	text, _, result, err := inst.Client.HandleCommand(ctx, "pysend", nil, sdkEvent(t, ev))
+	sendRes, err := inst.Client.HandleCommand(ctx, "pysend", nil, sdkEvent(t, ev))
 	if err != nil {
 		t.Fatalf("HandleCommand(pysend): %v", err)
 	}
-	if text != "" {
-		t.Fatalf("pysend 不应返回文本: %q", text)
+	if sendRes.Text != "" {
+		t.Fatalf("pysend 不应返回文本: %q", sendRes.Text)
 	}
-	if !result.GetSent() {
+	if !sendRes.Result.Sent {
 		t.Fatal("event.send 后 HandleCommand 必须返回 sent=true（否则宿主继续走 LLM）")
 	}
 }

@@ -11,8 +11,7 @@ import (
 	"sync"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	goplugin "github.com/hashicorp/go-plugin"
 )
 
@@ -165,7 +164,7 @@ func (pm *PythonRuntimeManager) ensureRuntime(ctx context.Context) (*sharedRunti
 // EnsurePlugin 在共享 Runtime 中加载/激活一个插件，返回 per-plugin 客户端视图
 // 与 Register 元数据。宿主随后以此为 Client 调用各 PluginService RPC（自动携带
 // plugin_id）。
-func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir, pluginName, version string) (pluginsdk.PluginClient, *sdkv1.RegisterResponse, error) {
+func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir, pluginName, version string) (pluginsdk.PluginClient, *pluginsdk.PluginInfo, error) {
 	rt, err := pm.ensureRuntime(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -174,9 +173,9 @@ func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir,
 	pc := rt.client.ForPlugin(id)
 	loadCtx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
-	resp, err := pc.ManagePlugin(loadCtx, &sdkv1.ManagePluginRequest{
+	resp, err := pc.ManagePlugin(loadCtx, pluginsdk.ManagePluginRequest{
 		Action:     "load",
-		PluginId:   id,
+		PluginID:   id,
 		PluginDir:  pluginDir,
 		PluginName: pluginName,
 		Version:    version,
@@ -184,8 +183,8 @@ func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir,
 	if err != nil {
 		return nil, nil, fmt.Errorf("共享 Runtime 加载插件 %s: %w", id, err)
 	}
-	if !resp.GetOk() {
-		return nil, nil, fmt.Errorf("共享 Runtime 加载插件 %s 失败: %s", id, resp.GetError())
+	if !resp.OK {
+		return nil, nil, fmt.Errorf("共享 Runtime 加载插件 %s 失败: %s", id, resp.Error)
 	}
 	// Register：触发该插件的注册表构建 + 实例化（MultiTenant.Register 会在
 	// 返回后异步 instantiate）。
@@ -198,7 +197,7 @@ func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir,
 	rt.mu.Lock()
 	rt.plugins[id] = true
 	rt.mu.Unlock()
-	return pc, meta, nil
+	return pc, &meta, nil
 }
 
 // UnloadPlugin 从共享 Runtime 卸载单个插件（不杀 Runtime 进程）。
@@ -219,7 +218,7 @@ func (pm *PythonRuntimeManager) UnloadPlugin(ctx context.Context, id string) err
 	pc := rt.client.ForPlugin(id)
 	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
-	_, err := pc.ManagePlugin(ctx, &sdkv1.ManagePluginRequest{Action: "unload", PluginId: id})
+	_, err := pc.ManagePlugin(ctx, pluginsdk.ManagePluginRequest{Action: "unload", PluginID: id})
 	if err != nil {
 		return fmt.Errorf("共享 Runtime 卸载插件 %s: %w", id, err)
 	}
@@ -533,7 +532,7 @@ func (m *SubprocessManager) sharedInstanceTeardown(inst *PluginInstance) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-	_ = inst.Client.Cleanup(ctx, &sdkv1.PluginRef{PluginId: inst.ID})
+	_ = inst.Client.Cleanup(ctx)
 	cancel()
 	if mgr := m.sharedRuntimeManagerIfAny(); mgr != nil {
 		uctx, ucancel := context.WithTimeout(context.Background(), cleanupTimeout)

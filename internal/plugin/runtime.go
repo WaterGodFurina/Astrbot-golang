@@ -20,9 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk"
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
-	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/transport/grpc"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
+	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/transport/grpc"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
@@ -85,11 +84,11 @@ type PluginInstance struct {
 	// Client is the typed gRPC client (nil while the plugin is idle-sleeping; the tool registry keeps the entry so an LLM tool call can EnsureLoaded to wake).
 	Client pluginsdk.PluginClient
 	// Meta is the plugin's Register() response snapshot (handlers + config schema); retained while sleeping so handlers can be re-bridged.
-	Meta *sdkv1.RegisterResponse
+	Meta *pluginsdk.PluginInfo
 
 	// toolsMu guards toolsCache/toolsLoaded: the live snapshot of LLM function tools. Registered during start (Context.add_llm_tools) and refreshed via ListTools RPC; a reloaded instance starts empty and re-fetches.
 	toolsMu     sync.Mutex
-	toolsCache  []*sdkv1.ToolDesc
+	toolsCache  []pluginsdk.ToolDesc
 	toolsLoaded bool
 	// toolsRefreshedAtNano timestamps the last RefreshTools success; used by ToolsFreshWithin to skip redundant ListTools RPCs within the TTL.
 	toolsRefreshedAtNano atomic.Int64
@@ -176,7 +175,7 @@ type SubprocessManager struct {
 
 	// handlerMetaMu guards handlerMeta (plugin id → Register metadata snapshot). Idle-unloaded plugins are removed from `instances` but metadata stays so RebridgePlugins can rebuild their star handlers (commands/filters/hooks); sleeping plugins stay visible to Dashboard + auto-wake on call. Only real unload/disable clears entries.
 	handlerMetaMu sync.RWMutex
-	handlerMeta   map[string]*sdkv1.RegisterResponse
+	handlerMeta   map[string]*pluginsdk.PluginInfo
 
 	// pythonEnv is the resolved Python subprocess env (interpreter + SDK dir); lazily set on first Python plugin start (may create venv + install deps). nil = not yet resolved.
 	pythonEnv *pysdk.RuntimeEnv
@@ -261,7 +260,7 @@ func (inst *PluginInstance) RefreshTools(ctx context.Context) {
 		return
 	}
 	rpcCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	tools, err := inst.Client.ListTools(rpcCtx, &sdkv1.PluginRef{PluginId: inst.ID})
+	tools, err := inst.Client.ListTools(rpcCtx)
 	cancel()
 	if err != nil {
 		logger.I18nWarn("插件 %s ListTools 失败: %v", inst.ID, err)
@@ -284,7 +283,7 @@ func (inst *PluginInstance) ToolsFreshWithin(dur time.Duration) bool {
 }
 
 // ToolsSnapshot 返回插件当前的 LLM 工具列表：优先使用 ListTools 缓存 （RefreshTools 拉取）；未拉取过则回退 Register 元数据快照（Meta.Tools）。 返回的切片不可修改。
-func (inst *PluginInstance) ToolsSnapshot() []*sdkv1.ToolDesc {
+func (inst *PluginInstance) ToolsSnapshot() []pluginsdk.ToolDesc {
 	inst.toolsMu.Lock()
 	defer inst.toolsMu.Unlock()
 	if inst.toolsLoaded && inst.toolsCache != nil {
@@ -311,10 +310,11 @@ func (inst *PluginInstance) RefreshStatus(ctx context.Context) {
 		logger.I18nWarn("插件 %s HealthCheck 失败: %v", inst.ID, err)
 		return
 	}
-	var matched *sdkv1.PluginStatus
-	for _, ps := range resp.GetPlugins() {
+	var matched *pluginsdk.PluginStatus
+	for i := range resp.Plugins {
+		ps := &resp.Plugins[i]
 		// 单插件进程可能不带 plugin_id（空），此时视为自身。
-		if ps.GetPluginId() == inst.ID || ps.GetPluginId() == "" {
+		if ps.PluginID == inst.ID || ps.PluginID == "" {
 			matched = ps
 			break
 		}
@@ -323,11 +323,11 @@ func (inst *PluginInstance) RefreshStatus(ctx context.Context) {
 		return
 	}
 	inst.statusMu.Lock()
-	inst.pyState = matched.GetState()
-	inst.pyHealth = matched.GetHealth()
-	inst.pyError = matched.GetError()
-	inst.pyLastActivity = matched.GetLastActivity()
-	inst.pyGeneration = matched.GetGeneration()
+	inst.pyState = matched.State
+	inst.pyHealth = matched.Health
+	inst.pyError = matched.Error
+	inst.pyLastActivity = matched.LastActivity
+	inst.pyGeneration = matched.Generation
 	inst.pyStatusSeen = true
 	health := inst.pyHealth
 	errStr := inst.pyError
@@ -336,7 +336,7 @@ func (inst *PluginInstance) RefreshStatus(ctx context.Context) {
 	// Runtime 心跳观察（方案第 6 节）：连接存活但心跳停滞 = Runtime 疑似 hang。
 	// 只告警不擅自重启（避免误判；进程真实退出由 watchSharedRuntime 处理）。
 	if inst.shared {
-		if hb := resp.GetRuntimeHeartbeat(); hb > 0 {
+		if hb := resp.RuntimeHeartbeat; hb > 0 {
 			if lag := time.Since(time.Unix(int64(hb), 0)); lag > 90*time.Second {
 				logger.I18nWarn("共享 Runtime 心跳停滞 %v（疑似卡死，连接仍存活）", lag.Round(time.Second))
 			}
@@ -387,11 +387,11 @@ const docFetchCacheTTL = 5 * time.Minute
 // toolRegEntry 是工具注册表条目：工具名 → 所属插件 + 最新描述。
 type toolRegEntry struct {
 	PluginID string
-	Desc     *sdkv1.ToolDesc
+	Desc     *pluginsdk.ToolDesc
 }
 
 // setPluginTools 用插件的最新工具列表整体替换该插件在注册表中的条目 （RefreshTools 成功后调用；同一插件旧工具名被清除）。
-func (m *SubprocessManager) setPluginTools(id string, tools []*sdkv1.ToolDesc) {
+func (m *SubprocessManager) setPluginTools(id string, tools []pluginsdk.ToolDesc) {
 	m.toolRegMu.Lock()
 	defer m.toolRegMu.Unlock()
 	if m.toolRegistry == nil {
@@ -403,11 +403,12 @@ func (m *SubprocessManager) setPluginTools(id string, tools []*sdkv1.ToolDesc) {
 			delete(m.toolRegistry, name)
 		}
 	}
-	for _, t := range tools {
-		if t == nil || t.Name == "" {
+	for i := range tools {
+		t := tools[i]
+		if t.Name == "" {
 			continue
 		}
-		m.toolRegistry[t.Name] = toolRegEntry{PluginID: id, Desc: t}
+		m.toolRegistry[t.Name] = toolRegEntry{PluginID: id, Desc: &t}
 	}
 }
 
@@ -484,7 +485,7 @@ func (m *SubprocessManager) removePluginBridgeHooks(id string) {
 }
 
 // setHandlerMeta 记录插件 id → Register 元数据（startInstance 注册成功时 调用；reload/唤醒/崩溃重启的新实例会覆盖旧条目）。meta 为 nil 时删除。
-func (m *SubprocessManager) setHandlerMeta(id string, meta *sdkv1.RegisterResponse) {
+func (m *SubprocessManager) setHandlerMeta(id string, meta *pluginsdk.PluginInfo) {
 	m.handlerMetaMu.Lock()
 	defer m.handlerMetaMu.Unlock()
 	if meta == nil {
@@ -502,7 +503,7 @@ func (m *SubprocessManager) removeHandlerMeta(id string) {
 }
 
 // HandlerMetaByID 返回插件 id 的 Register 元数据（含休眠插件），未加载过 或已真实卸载返回 nil。
-func (m *SubprocessManager) HandlerMetaByID(id string) *sdkv1.RegisterResponse {
+func (m *SubprocessManager) HandlerMetaByID(id string) *pluginsdk.PluginInfo {
 	m.handlerMetaMu.RLock()
 	defer m.handlerMetaMu.RUnlock()
 	return m.handlerMeta[id]
@@ -544,7 +545,7 @@ func NewSubprocessManager(tc *toolchain.Toolchain, dataDir string) *SubprocessMa
 		failures:         make(map[string]error),
 		docFetchCache:    make(map[string]docCacheEntry),
 		toolRegistry:     make(map[string]toolRegEntry),
-		handlerMeta:      make(map[string]*sdkv1.RegisterResponse),
+		handlerMeta:      make(map[string]*pluginsdk.PluginInfo),
 		sessionWaitReg:   make(map[string]*sessionWaitEntry),
 		bridgeHooks:      make(map[string]map[string]struct{}),
 		nativeRebuilds:   make(map[string]*NativeRebuildStatus),
@@ -2303,14 +2304,14 @@ func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, libPath 
 
 	inst := &PluginInstance{
 		ID:        id,
-		Name:      meta.GetName(),
-		Version:   meta.GetVersion(),
+		Name:      meta.Name,
+		Version:   meta.Version,
 		Binary:    abs,
 		StartedAt: time.Now(),
 		Language:  "go",
 		Runtime:   "native",
 		Client:    client,
-		Meta:      meta,
+		Meta:      &meta,
 	}
 	return inst, nil
 }
@@ -2501,8 +2502,6 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 	regCtx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
 	meta, err := pc.Register(regCtx)
-	logger.I18nInfo("startInstance %s: Register meta name=%q version=%q (pid=%d)", id,
-		meta.GetName(), meta.GetVersion(), cmd.Process.Pid)
 	if err != nil {
 		_ = pc.Close()
 		raw.Kill()
@@ -2511,12 +2510,14 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		waitExeHandleReleased(abs)
 		return nil, m.wrapStartError(stderrParser, fmt.Errorf("plugin %s Register: %w", id, err))
 	}
+	logger.I18nInfo("startInstance %s: Register meta name=%q version=%q (pid=%d)", id,
+		meta.Name, meta.Version, cmd.Process.Pid)
 	// 用 Register 返回的注册名更新 HostService 连接的"配置归属"身份（accept
 	// 时只绑定 manifest id，name 与 id 可能不同）。之后插件 GetConfig/SetConfig
 	// 传的 name 与注册名一致，配置归属校验才能通过。
 	// 注意：BindHostServiceName 只改注册名，不改 connKey——管理鉴权始终以 accept
 	// 时绑定的 manifest id 为准，注册名不得反过来覆盖鉴权键（p11）。
-	if meta != nil && meta.Name != "" {
+	if meta.Name != "" {
 		pluginsdk.BindHostServiceName(id, meta.Name)
 	}
 
@@ -2527,7 +2528,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		Binary:        abs,
 		Language:      language,
 		Client:        pc,
-		Meta:          meta,
+		Meta:          &meta,
 		raw:           raw,
 		pgid:          pid, // Setpgid 后进程组 id = 直接子进程 pid
 		handshakePort: minp,
@@ -2535,7 +2536,7 @@ func (m *SubprocessManager) dispensePlugin(ctx context.Context, id, abs, languag
 		owner:         m,
 	}
 	// 登记 handler 元数据：休眠后实例被移出 instances 表，但元数据保留， 供 RebridgePlugins 重建休眠插件的 star handler（命令/过滤器/钩子）。
-	m.setHandlerMeta(id, meta)
+	m.setHandlerMeta(id, &meta)
 	inst.Touch() // 新加载实例视为活跃，避免被闲置清扫立刻回收
 	// Register 快照里的工具（Go 插件在 Register 元数据中声明）先入注册表； Python 插件工具晚于 Register 注册，由首次 RefreshTools 回写。
 	if len(meta.Tools) > 0 {
@@ -3024,7 +3025,7 @@ func (m *SubprocessManager) TriggerHookPayload(ctx context.Context, event string
 		hctx, hcancel := context.WithTimeout(context.Background(), 5*time.Second)
 		hresp, herr := inst.Client.HealthCheck(hctx)
 		hcancel()
-		if herr != nil || hresp == nil || !hresp.GetOk() {
+		if herr != nil || !hresp.OK {
 			logger.Debug("跳过生命周期钩子推送（%s）：插件 %s 未就绪（实例化失败或进行中）", event, inst.ID)
 			continue
 		}
@@ -3037,7 +3038,7 @@ func (m *SubprocessManager) TriggerHookPayload(ctx context.Context, event string
 				hookCtx = context.Background()
 			}
 			rpcCtx, cancel := context.WithTimeout(hookCtx, pluginHookRPCTimeout)
-			_, _, _, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, &sdkv1.SDKEvent{}, nil, payload)
+			_, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, &pluginsdk.Event{}, nil, payload)
 			cancel()
 			if err != nil {
 				logger.I18nWarn("钩子 %s (%s) 在插件 %s 上执行失败: %v", h.Name, h.Event, inst.ID, err)
@@ -3110,7 +3111,7 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	if inst.Runtime == "native" {
 		if inst.Client != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-			_ = inst.Client.Cleanup(ctx, &sdkv1.PluginRef{PluginId: inst.ID})
+			_ = inst.Client.Cleanup(ctx)
 			cancel()
 			_ = inst.Client.Close()
 		}
@@ -3129,7 +3130,7 @@ func (m *SubprocessManager) teardownInstance(inst *PluginInstance) {
 	if !inst.raw.Exited() {
 		if inst.Client != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-			_ = inst.Client.Cleanup(ctx, &sdkv1.PluginRef{PluginId: inst.ID})
+			_ = inst.Client.Cleanup(ctx)
 			cancel()
 		}
 	}

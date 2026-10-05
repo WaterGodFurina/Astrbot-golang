@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	sdkv1 "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/gen/sdkv1"
+	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/config"
 )
 
@@ -27,15 +27,15 @@ import (
 // pluginHasMetaFilters/Hooks/PassiveEvents 报告插件是否声明了需要主动接收
 // 宿主事件的过滤器/钩子（闲置休眠后进程已终止，无法再被动监听，供 WebUI
 // 风险提示）。
-func pluginHasMetaFilters(meta *sdkv1.RegisterResponse) bool {
+func pluginHasMetaFilters(meta *pluginsdk.PluginInfo) bool {
 	return meta != nil && len(meta.Filters) > 0
 }
 
-func pluginHasMetaHooks(meta *sdkv1.RegisterResponse) bool {
+func pluginHasMetaHooks(meta *pluginsdk.PluginInfo) bool {
 	return meta != nil && len(meta.Hooks) > 0
 }
 
-func pluginHasPassiveEvents(meta *sdkv1.RegisterResponse) bool {
+func pluginHasPassiveEvents(meta *pluginsdk.PluginInfo) bool {
 	return pluginHasMetaFilters(meta) || pluginHasMetaHooks(meta)
 }
 
@@ -145,7 +145,7 @@ func (m *SubprocessManager) ListInfo() []map[string]interface{} {
 	// 较大，一次性持锁拷贝指针比逐个 HandlerMetaByID 反复加锁更省；
 	// 元数据本身只读，锁外通过快照访问是安全的。
 	m.handlerMetaMu.RLock()
-	metaSnapshot := make(map[string]*sdkv1.RegisterResponse, len(m.handlerMeta))
+	metaSnapshot := make(map[string]*pluginsdk.PluginInfo, len(m.handlerMeta))
 	for mid, meta := range m.handlerMeta {
 		metaSnapshot[mid] = meta
 	}
@@ -872,7 +872,7 @@ func (m *SubprocessManager) ConfigSchema(id string) map[string]interface{} {
 	// RPC 失败/空响应（插件未实现或实例不可用）回退 Register 快照/磁盘缓存。
 	if inst != nil && inst.Client != nil {
 		rpcCtx, cancel := context.WithTimeout(context.Background(), pluginHookRPCTimeout)
-		data, err := inst.Client.GetConfigSchema(rpcCtx, &sdkv1.PluginRef{PluginId: inst.ID})
+		data, err := inst.Client.GetConfigSchema(rpcCtx)
 		cancel()
 		if err == nil && len(data) > 0 {
 			var schema map[string]interface{}
@@ -881,9 +881,9 @@ func (m *SubprocessManager) ConfigSchema(id string) map[string]interface{} {
 			}
 		}
 	}
-	if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJson) > 0 {
+	if inst != nil && inst.Meta != nil && len(inst.Meta.ConfigSchemaJSON) > 0 {
 		var schema map[string]interface{}
-		if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
+		if err := json.Unmarshal(inst.Meta.ConfigSchemaJSON, &schema); err != nil {
 			logger.I18nWarn("ConfigSchema(%s): %v", id, err)
 		} else {
 			return schema
@@ -907,13 +907,13 @@ func (m *SubprocessManager) schemaCachePath(id string) string {
 
 // cacheConfigSchema persists a loaded plugin's config schema so the WebUI can
 // render its config dialog even while the plugin is disabled (unloaded).
-func (m *SubprocessManager) cacheConfigSchema(id string, meta *sdkv1.RegisterResponse) {
-	if meta == nil || len(meta.ConfigSchemaJson) == 0 {
+func (m *SubprocessManager) cacheConfigSchema(id string, meta *pluginsdk.PluginInfo) {
+	if meta == nil || len(meta.ConfigSchemaJSON) == 0 {
 		return
 	}
 	path := m.schemaCachePath(id)
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)           // #nosec G301 -- 配置 schema 缓存目录（WebUI 需读取）
-	_ = os.WriteFile(path, meta.ConfigSchemaJson, 0o644) // #nosec G306 -- schema 缓存非常规敏感信息
+	_ = os.WriteFile(path, meta.ConfigSchemaJSON, 0o644) // #nosec G306 -- schema 缓存非常规敏感信息
 }
 
 // Components returns the plugin's behavior components (commands / llm tools /
@@ -1151,7 +1151,7 @@ func (m *SubprocessManager) FlatSchemaByID(id string) map[string]interface{} {
 	// Use a short timeout so a hung plugin does not block the UI.
 	if inst.Client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		raw, err := inst.Client.GetConfigSchema(ctx, &sdkv1.PluginRef{PluginId: inst.ID})
+		raw, err := inst.Client.GetConfigSchema(ctx)
 		cancel()
 		if err == nil && len(raw) > 0 {
 			var schema map[string]interface{}
@@ -1165,11 +1165,11 @@ func (m *SubprocessManager) FlatSchemaByID(id string) map[string]interface{} {
 	}
 
 	// Fallback to the Register snapshot.
-	if inst.Meta == nil || len(inst.Meta.ConfigSchemaJson) == 0 {
+	if inst.Meta == nil || len(inst.Meta.ConfigSchemaJSON) == 0 {
 		return map[string]interface{}{}
 	}
 	var schema map[string]interface{}
-	if err := json.Unmarshal(inst.Meta.ConfigSchemaJson, &schema); err != nil {
+	if err := json.Unmarshal(inst.Meta.ConfigSchemaJSON, &schema); err != nil {
 		return map[string]interface{}{}
 	}
 	if props, ok := schema["properties"].(map[string]interface{}); ok {
