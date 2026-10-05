@@ -45,7 +45,7 @@ require go.uber.org/mock v0.4.0 // indirect
 require (
 	github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5 // indirect
 	github.com/STARRY-S/zip v0.2.3 // indirect
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.1
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.2
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/bodgit/plumbing v1.3.0 // indirect
 	github.com/bodgit/sevenzip v1.6.1 // indirect
