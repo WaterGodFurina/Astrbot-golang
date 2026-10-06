@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,11 @@ import (
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	goplugin "github.com/hashicorp/go-plugin"
 )
+
+// errSharedDepsConflict 表示插件因 requirements.txt 版本冲突不能加入共享
+// Runtime，应回退独立 python-grpc 进程（方案第 9 节）。shared 与 grpc 共用
+// 同一 venv，本错误用于避免把互斥版本约束的插件塞进同一个共享进程。
+var errSharedDepsConflict = errors.New("共享 Runtime 依赖冲突")
 
 // PythonRuntimeManager 管理 python-shared 共享 Runtime 进程：单 CPython 进程
 // 承载 N 个 Python 插件（方案第 2/3 节）。与 python-grpc（一插件一进程）共存：
@@ -30,6 +36,10 @@ type PythonRuntimeManager struct {
 	rt *sharedRuntime
 	// gen 在每次 Runtime 重建（崩溃重启）时自增，供恢复流程区分新旧实例。
 	gen uint64
+	// pluginReqs 记录当前已加入共享 Runtime 的每个插件的 requirements.txt
+	//（规范化包名 → 版本约束），用于新插件加入前的依赖冲突检测。Runtime 重建
+	// （崩溃重启）时清空，随插件重新加载重建；卸载插件时移除其贡献。
+	pluginReqs map[string]map[string]string
 }
 
 // sharedRuntime 是单个共享 Runtime 进程的运行时句柄。
@@ -152,6 +162,9 @@ func (pm *PythonRuntimeManager) ensureRuntime(ctx context.Context) (*sharedRunti
 		}
 		// 已崩溃：清理后重建（watchSharedRuntime 通常已处理，这里兜底）。
 		pm.rt = nil
+		// Runtime 重建后所有插件都会重新加载：依赖跟踪随之失效，必须清空
+		// 以免用旧集合做冲突误判。
+		pm.pluginReqs = nil
 	}
 	rt, err := startSharedProcess(ctx, pm.mgr)
 	if err != nil {
@@ -165,10 +178,20 @@ func (pm *PythonRuntimeManager) ensureRuntime(ctx context.Context) (*sharedRunti
 // 与 Register 元数据。宿主随后以此为 Client 调用各 PluginService RPC（自动携带
 // plugin_id）。
 func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir, pluginName, version string) (pluginsdk.PluginClient, *pluginsdk.PluginInfo, error) {
+	// 依赖冲突检测（方案第 9 节）：shared 与 grpc 共用同一 venv，若本插件与
+	// 已加入共享 Runtime 的其他插件对同一包要求互斥版本，则拒绝加入 shared，
+	// 由调用方回退独立 python-grpc 进程。绝不假装 shared 有环境隔离。
+	reqs := parseRequirements(filepath.Join(pluginDir, "requirements.txt"))
+	if other, pkg, specSelf, specOther, ok := pm.conflictFor(id, reqs); ok {
+		return nil, nil, fmt.Errorf("%w: 插件 %s 需要 %s%s，但共享 Runtime 中的 %s 需要 %s%s", errSharedDepsConflict, id, pkg, specSelf, other, pkg, specOther)
+	}
 	rt, err := pm.ensureRuntime(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	// 依赖准备（与 python-grpc 启动路径语义一致）：把插件 requirements.txt
+	// 安装进共享宿主 venv。装过时 pip 命中缓存秒回；失败仅告警不阻断。
+	pm.mgr.ensurePluginRequirements(ctx, pluginDir)
 	// ManagePlugin(load)：登记 + import（等价单插件 server.py 阶段 A）。
 	pc := rt.client.ForPlugin(id)
 	loadCtx, cancel := context.WithTimeout(ctx, registerTimeout)
@@ -197,7 +220,35 @@ func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir,
 	rt.mu.Lock()
 	rt.plugins[id] = true
 	rt.mu.Unlock()
+	pm.trackSharedReqs(id, reqs)
 	return pc, &meta, nil
+}
+
+// conflictFor 返回 candidate(id, reqs) 与已加入共享 Runtime 的其他插件的依赖
+// 冲突：返回 (另一插件 id, 冲突包名, 本插件约束, 另一插件约束, 是否冲突)。
+func (pm *PythonRuntimeManager) conflictFor(id string, reqs map[string]string) (string, string, string, string, bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for otherID, otherReqs := range pm.pluginReqs {
+		if otherID == id {
+			continue
+		}
+		if pkg, specSelf, specOther, ok := requirementsConflict(reqs, otherReqs); ok {
+			return otherID, pkg, specSelf, specOther, true
+		}
+	}
+	return "", "", "", "", false
+}
+
+// trackSharedReqs 记录已成功加入共享 Runtime 的插件的依赖声明（供后续插件做
+// 冲突检测）。
+func (pm *PythonRuntimeManager) trackSharedReqs(id string, reqs map[string]string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if pm.pluginReqs == nil {
+		pm.pluginReqs = map[string]map[string]string{}
+	}
+	pm.pluginReqs[id] = reqs
 }
 
 // UnloadPlugin 从共享 Runtime 卸载单个插件（不杀 Runtime 进程）。
@@ -215,6 +266,10 @@ func (pm *PythonRuntimeManager) UnloadPlugin(ctx context.Context, id string) err
 	}
 	delete(rt.plugins, id)
 	rt.mu.Unlock()
+	// 移除该插件的依赖贡献，避免其它插件误判冲突。
+	pm.mu.Lock()
+	delete(pm.pluginReqs, id)
+	pm.mu.Unlock()
 	pc := rt.client.ForPlugin(id)
 	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
@@ -267,12 +322,12 @@ func (m *SubprocessManager) handleSharedExit(rt *sharedRuntime) {
 	rt.mu.Unlock()
 
 	logger.I18nWarn("共享 Python Runtime 进程退出，受影响插件: %v", ids)
-	// 不猜测罪魁祸首（方案第 7 节）：仅将崩溃时仍挂载的插件标记为恢复待定，
-	// 由后续加载按持久化状态决定是否隔离。
-	for _, id := range ids {
-		if err := m.MarkRecoveryPending(id, ""); err != nil {
-			logger.I18nWarn("标记插件 %s 恢复待定失败: %v", id, err)
-		}
+	// 不猜测罪魁祸首（方案第 7 节）：shared process 崩溃只说明 Runtime 失败，
+	// 不能证明任何插件有问题。**已判定需隔离的插件（ISOLATION_PENDING/ISOLATED）
+	// 必须保留隔离要求**——不能被统一重置清掉 IsolationRequired。仅非隔离插件
+	// 标记 RECOVERY_PENDING，重启后重新尝试 shared。单次原子 Load→改→Save。
+	if err := m.markCrashRecovery(ids); err != nil {
+		logger.I18nWarn("标记共享 Runtime 崩溃恢复状态失败: %v", err)
 	}
 }
 
@@ -391,6 +446,28 @@ func (m *SubprocessManager) migrateToIsolated(id string) {
 // isolationRecoveryWindow 是隔离插件恢复正常前的连续健康观察窗口（方案第 7
 // 节「不能启动即 NORMAL」：插件可能启动成功 5 秒后又崩）。
 const isolationRecoveryWindow = 5 * time.Minute
+
+// updateNormalSince 推进「连续 NORMAL」观察窗口起点（纯函数，便于单测）：
+//   - health != NORMAL（DEGRADED/UNHEALTHY/...）→ 清零（窗口中断，重新计时）；
+//   - health == NORMAL 且尚未计时 → 记为 now（开始计时）；
+//   - health == NORMAL 且已计时 → 保持原起点（连续计时）。
+//
+// 零值表示当前不在连续 NORMAL 窗口内。绝不能用 StartedAt 代替：插件可能
+// 启动成功后反复异常/恢复，StartedAt 计满窗口不代表这段一直健康。
+func updateNormalSince(prev time.Time, health string, now time.Time) time.Time {
+	if health != HealthNormal {
+		return time.Time{}
+	}
+	if prev.IsZero() {
+		return now
+	}
+	return prev
+}
+
+// recoveryWindowElapsed 报告自 normalSince 起是否已连续 NORMAL 满观察窗口。
+func recoveryWindowElapsed(normalSince, now time.Time) bool {
+	return !normalSince.IsZero() && now.Sub(normalSince) >= isolationRecoveryWindow
+}
 
 // migrateBackToShared 把已隔离/待恢复、且稳定正常的插件迁回共享 Runtime
 // （方案第 7 节「恢复 → NORMAL」）：清除隔离标记 → 重载（pluginWantsShared

@@ -123,6 +123,54 @@ func TestResolvePluginConfigStripsMetadataKeys(t *testing.T) {
 	}
 }
 
+// TestResolvePluginConfigByIDIsolation 验证多租户按 manifest plugin_id 解析配置
+// （GetConfigByID/SetConfigByID 的宿主实现）：A/B 各自读到自己的配置，不串；
+// id 为空返回空配置；schema 注入只对有效 id 生效。
+func TestResolvePluginConfigByIDIsolation(t *testing.T) {
+	m := newTestManager(t)
+	raw, _ := json.Marshal(schemaFixture())
+	for _, id := range []string{"id_a", "id_b"} {
+		m.instances[id] = &PluginInstance{
+			Meta: &pluginsdk.PluginInfo{ConfigSchemaJSON: raw},
+		}
+		dir := filepath.Join(m.dataDir, "plugins_config", id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"greeting":"`+id+`"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a := resolvePluginConfigByID(m, "id_a")
+	if a["greeting"] != "id_a" {
+		t.Fatalf("id_a config = %+v（读串到其他插件？）", a)
+	}
+	if a["enabled"] != true {
+		t.Fatalf("id_a 缺 schema 默认值: %+v", a)
+	}
+	b := resolvePluginConfigByID(m, "id_b")
+	if b["greeting"] != "id_b" {
+		t.Fatalf("id_b config = %+v", b)
+	}
+
+	// 空 id / nil manager → 空配置（fail-closed，不猜测）。
+	if got := resolvePluginConfigByID(m, ""); len(got) != 0 {
+		t.Fatalf("空 id 应返回空配置, got %+v", got)
+	}
+	if got := resolvePluginConfigByID(nil, "id_a"); len(got) != 0 {
+		t.Fatalf("nil manager 应返回空配置, got %+v", got)
+	}
+
+	// schema 注入：有效 id 注入 __schema__，空 id 不注入。
+	if cfg := injectPluginConfigSchema(m, "id_a", a); cfg["__schema__"] == nil {
+		t.Fatalf("有效 id 应注入 __schema__: %+v", cfg)
+	}
+	if cfg := injectPluginConfigSchema(m, "", map[string]any{}); cfg["__schema__"] != nil {
+		t.Fatalf("空 id 不应注入 __schema__: %+v", cfg)
+	}
+}
+
 // TestResolvePluginConfigCallPathsConsistent verifies the HostService GetConfig
 // hook seam, the manager-bound resolver (what the dashboard uses) and a
 // directly-built resolver all yield the same result for one scenario.

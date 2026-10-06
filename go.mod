@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/Baidu-AIP/golang-sdk v1.3.0
 	github.com/FloatTech/satori-go v0.0.0-20231020141005-5795eda54d4f
-	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.14.1
+	github.com/WaterGodFurina/astrbot-golang-plugin-python-sdk v0.14.2
 	github.com/blusewang/wx v1.3.3
 	github.com/bwmarrin/discordgo v0.29.0
 	github.com/dobest1024/go-weixin-ilink v0.2.0
@@ -45,7 +45,7 @@ require go.uber.org/mock v0.4.0 // indirect
 require (
 	github.com/RomiChan/websocket v1.4.3-0.20220227141055-9b2c6168c9c5 // indirect
 	github.com/STARRY-S/zip v0.2.3 // indirect
-	github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.3
+	github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.4
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/bodgit/plumbing v1.3.0 // indirect
 	github.com/bodgit/sevenzip v1.6.1 // indirect

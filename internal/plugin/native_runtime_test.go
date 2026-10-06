@@ -33,7 +33,7 @@ func buildTestNativeLib(t *testing.T, source string) string {
 	}
 	mod := fmt.Sprintf("example.com/native-test-plugin-%d", time.Now().UnixNano())
 	goMod := "module " + mod + "\n\ngo 1.23\n\n" +
-		"require github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.3\n\n" +
+		"require github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 v2.0.4\n\n" +
 		"replace github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2 => " + sdkDir + "\n"
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0o644); err != nil {
 		t.Fatal(err)

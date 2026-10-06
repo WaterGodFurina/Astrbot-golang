@@ -123,6 +123,11 @@ type PluginInstance struct {
 	pyLastActivity float64 // PluginStatus.last_activity（Unix 秒）
 	pyGeneration   int64   // PluginStatus.generation
 	pyStatusSeen   bool    // 是否已成功拉到过状态（区分空镜像）
+	// pyNormalSince 是「连续 NORMAL」观察窗口起点（方案第 7 节）：仅在健康
+	// 状态为 NORMAL 时推进；一旦 DEGRADED/UNHEALTHY 立即清零，再次 NORMAL
+	// 重新计时。零值 = 当前不在连续 NORMAL 窗口内。绝不能用 StartedAt 代替
+	// ——插件可能启动成功 5 秒后才崩溃。
+	pyNormalSince time.Time
 }
 
 // SubprocessManager manages plugin instances across runtimes: isolated child processes (go-plugin + gRPC), the shared multi-tenant Python Runtime, and in-process Native .so plugins. gRPC child processes can be fully terminated so memory + handles are reclaimed by the OS and a crash can't take the host down (crashed plugins restart with backoff); Native plugins share the host address space and are resident for the process lifetime.
@@ -329,6 +334,10 @@ func (inst *PluginInstance) RefreshStatus(ctx context.Context) {
 	inst.pyLastActivity = matched.LastActivity
 	inst.pyGeneration = matched.Generation
 	inst.pyStatusSeen = true
+	// 连续 NORMAL 观察窗口（方案第 7 节）：NORMAL 且尚未计时则开始计时；
+	// 任何非 NORMAL 立即清零（下次 NORMAL 重新计时）。用状态拉取结果推进，
+	// 而非 StartedAt，避免「启动即 NORMAL」的假恢复。
+	inst.pyNormalSince = updateNormalSince(inst.pyNormalSince, matched.Health, time.Now())
 	health := inst.pyHealth
 	errStr := inst.pyError
 	inst.statusMu.Unlock()
@@ -361,12 +370,16 @@ func (inst *PluginInstance) RefreshStatus(ctx context.Context) {
 		return
 	}
 	// 恢复（方案第 7 节「去隔离」+ 观察窗口）：曾隔离/待恢复、且当前实际运行
-	// 在独立 python-grpc 且持续 NORMAL 达观察窗口的插件，清除隔离标记并迁回
-	// 共享 Runtime。用实例启动时间 + 连续 NORMAL 观察避免「启动即 NORMAL」
-	// 的假恢复（插件可能启动 5 秒后又崩）。
+	// 在独立 python-grpc 且**连续** NORMAL 达观察窗口的插件，清除隔离标记并
+	// 迁回共享 Runtime。必须用「连续 NORMAL 起点」而非 StartedAt：插件可能
+	// 启动成功后反复 UNHEALTHY/恢复，StartedAt 计满 5 分钟并不代表这 5 分钟
+	// 一直健康。
 	if inst.owner != nil && inst.Runtime == "python-grpc" && !inst.shared && health == HealthNormal {
 		if _, _, pending := inst.owner.PluginHealthStateOf(inst.ID); pending {
-			if time.Since(inst.StartedAt) >= isolationRecoveryWindow {
+			inst.statusMu.RLock()
+			normalSince := inst.pyNormalSince
+			inst.statusMu.RUnlock()
+			if recoveryWindowElapsed(normalSince, time.Now()) {
 				go inst.owner.migrateBackToShared(inst.ID)
 			}
 		}
@@ -1114,6 +1127,26 @@ func (m *SubprocessManager) installPythonSource(ctx context.Context, id, srcDir,
 	m.cachePluginDocs(inst.ID, srcDir, meta)
 	m.writeMetadataConfig(inst.ID, meta)
 	return inst, nil
+}
+
+// ensurePluginRequirements 在启动/加载 Python 插件前，把其 requirements.txt
+// 安装进宿主 venv。python-grpc 每次启动前调用、python-shared 每次加入共享
+// Runtime 前调用——二者语义一致（都用同一 venv，均做同样的依赖准备）。venv
+// 可能刚被重建，重装可避免缺依赖；装过时 pip 命中缓存秒回。失败仅告警不阻断
+// （缺依赖插件加载会以清晰 ModuleNotFoundError 暴露）。无 requirements.txt 直接返回。
+func (m *SubprocessManager) ensurePluginRequirements(ctx context.Context, pluginDir string) {
+	req := filepath.Join(pluginDir, "requirements.txt")
+	if _, err := os.Stat(req); err != nil {
+		return
+	}
+	env, err := m.pythonRuntime()
+	if err != nil {
+		logger.I18nWarn("插件依赖准备：Python 运行时不可用: %v", err)
+		return
+	}
+	if err := m.pipInstall(ctx, env, pluginDir, req); err != nil {
+		logger.I18nWarn("插件依赖安装失败: %v（插件可能缺少依赖）", err)
+	}
 }
 
 // pipInstall runs `pip install -r requirements.txt` inside the plugin's source directory so relative dependencies resolve; the pip index honors ASTRBOT_PYPI_INDEX (or PIP_INDEX_URL). All paths are made absolute because the subprocess cwd differs from the host's. ctx 约束整个 pip 子进程：上层 超时（崩溃重启 30s / SetEnabled 60s / dashboard 10min）可终止 pip，内置 5 分钟上限防止网络缓慢时无限重试拖住 startInstance 串行化窗口。
@@ -2226,21 +2259,35 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 		// 运行方式分流（方案第 2 节）：manifest 标记 python-shared 的插件接入
 		// 共享 Runtime（单进程多租户）；python-grpc / python-isolated 走既有
 		// 一插件一进程路径（isoalted 复用 grpc 进程边界）。
+		depsConflict := false
 		if m.pluginWantsSharedRuntime(id) {
-			return m.startSharedInstance(ctx, id, abs)
+			inst, err := m.startSharedInstance(ctx, id, abs)
+			if err == nil {
+				return inst, nil
+			}
+			if !errors.Is(err, errSharedDepsConflict) {
+				return nil, err
+			}
+			// 依赖版本冲突：拒绝加入共享 Runtime，回退独立 python-grpc 进程
+			//（方案第 9 节）。shared 与 grpc 共用同一 venv，冲突时以独立进程
+			// 边界隔离运行状态，避免污染整个共享进程。
+			depsConflict = true
+			logger.I18nWarn("插件 %s 与共享 Runtime 依赖冲突，回退独立 python-grpc 进程: %v", id, err)
 		}
 		env, err := m.pythonRuntime()
 		if err != nil {
 			return nil, fmt.Errorf("python runtime: %w", err)
 		}
-		// venv 可能刚被重建（缓存失效/外部清理）：宿主基础依赖重装后，插件 自身 requirements.txt 不会自动重装。每次启动前若源码目录有 requirements.txt 则尝试安装——装过时 pip 命中缓存秒回，开销可忽略； 缺依赖插件也能加载（加载失败会清晰报 ModuleNotFoundError 而非 挂死）。失败仅告警，不阻止启动（与安装路径 installPythonSource 一致）。
-		if req := filepath.Join(abs, "requirements.txt"); func() bool {
-			_, err := os.Stat(req)
-			return err == nil
-		}() {
-			if err := m.pipInstall(ctx, env, abs, req); err != nil {
-				logger.I18nWarn("插件 %s 依赖安装失败: %v（插件可能缺少依赖）", id, err)
-			}
+		// venv 可能刚被重建（缓存失效/外部清理）：宿主基础依赖重装后，插件 自身 requirements.txt 不会自动重装。每次启动前若源码目录有 requirements.txt 则尝试安装——装过时 pip 命中缓存秒回，开销可忽略； 缺依赖插件也能加载（加载失败会清晰报 ModuleNotFoundError 而非 挂死）。失败仅告警，不阻止启动（与安装路径 installPythonSource 一致）。共享 Runtime 路径（startSharedInstance）做同样准备（方案第 9 节语义一致）。
+		//
+		// 依赖冲突回退：**跳过**安装，避免把冲突版本装进共享 venv 覆盖共享
+		// Runtime 成员已依赖的包（方案第 9 节：不允许为强行运行而覆盖/降级/
+		// 升级他人已依赖的包）。缺依赖插件会以清晰 ModuleNotFoundError 暴露，
+		// 真正需要独立依赖环境的插件应等待 per-plugin venv（后续项）。
+		if depsConflict {
+			logger.I18nWarn("插件 %s 因依赖冲突回退独立进程：跳过 requirements 安装，避免覆盖共享 Runtime 已装依赖", id)
+		} else {
+			m.ensurePluginRequirements(ctx, abs)
 		}
 		cmd := exec.Command(env.PythonBin, "-m", "astrbot._bridge.server", abs) // #nosec G204 -- 启动插件进程（插件系统核心）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
 		cmd.Dir = pluginDataRoot

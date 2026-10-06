@@ -120,6 +120,48 @@ func (m *SubprocessManager) MarkRecoveryPending(id, sourceHash string) error {
 	return m.saveManifest(man)
 }
 
+// markCrashRecovery 在共享 Runtime 整体崩溃后对崩溃时仍挂载的插件标记
+// RECOVERY_PENDING（重启后重新尝试 shared）。shared process 崩溃只证明
+// Runtime 失败，不证明任何插件有罪（方案第 7 节）——因此：
+//
+//   - **保留已有隔离要求的插件**（ISOLATION_PENDING / ISOLATED /
+//     IsolationRequired）：不能因整体崩溃被清掉隔离决策，否则会丢失
+//     "该插件曾故障、应隔离"的持久化结果。
+//   - 仅对非隔离插件写 RECOVERY_PENDING（IsolationRequired=false、
+//     FailureCount 归零、RecoveryGeneration++），并**保留 SourceHash**
+//     （崩溃恢复与"更新换源码"不同，不改变插件内容身份）。
+//
+// 单次 Load→改→Save 原子完成（持 manifestMu），避免逐插件多次 Load/Save
+// 及中间被并发修改的一致性窗口。
+func (m *SubprocessManager) markCrashRecovery(ids []string) error {
+	m.manifestMu.Lock()
+	defer m.manifestMu.Unlock()
+	man, err := LoadManifest(m.manifestPath())
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, id := range ids {
+		e := man.Get(id)
+		if e == nil {
+			continue
+		}
+		if e.HealthState == HealthIsolationPending || e.HealthState == HealthIsolated || e.IsolationRequired {
+			continue
+		}
+		e.HealthState = HealthRecoveryPending
+		e.HealthReason = ""
+		e.IsolationRequired = false
+		e.FailureCount = 0
+		e.RecoveryGeneration++
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return m.saveManifest(man)
+}
+
 // ClearPluginRuntimeState 卸载/移除时清理该插件的运行状态与恢复标记。
 func (m *SubprocessManager) ClearPluginRuntimeState(id string) error {
 	m.manifestMu.Lock()
