@@ -22,6 +22,7 @@ import (
 
 	pluginsdk "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2"
 	grpctransport "github.com/WaterGodFurina/Astrbot-go-plugin-sdk/v2/transport/grpc"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/i18n"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/pysdk"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
@@ -318,8 +319,10 @@ func (inst *PluginInstance) RefreshStatus(ctx context.Context) {
 	var matched *pluginsdk.PluginStatus
 	for i := range resp.Plugins {
 		ps := &resp.Plugins[i]
-		// 单插件进程可能不带 plugin_id（空），此时视为自身。
-		if ps.PluginID == inst.ID || ps.PluginID == "" {
+		// 单插件进程可能不带 plugin_id（空），此时视为自身。共享 Runtime
+		// 的 HealthCheck 汇总全部租户，空 plugin_id 的条目归属不明——
+		// 回退匹配会造成跨插件状态串扰，仅在非共享（单插件进程）时生效。
+		if ps.PluginID == inst.ID || (ps.PluginID == "" && !inst.shared) {
 			matched = ps
 			break
 		}
@@ -840,6 +843,12 @@ func (m *SubprocessManager) InstallFromSource(ctx context.Context, id, source st
 	// 需要 C 编译器。
 	var cc, cxx string
 	if meta.RequiresCgo() || opts.Native {
+		// Native 安装前置检测：宿主本身未启用 CGO 时，构建出的 .so/.dll
+		// 也无法被宿主加载（stdlib plugin 包要求宿主与 .so 同为 cgo 链接）。
+		// 在编译前就明确报错，避免用户白等一次完整构建。
+		if opts.Native && !nativeHostCGOAvailable {
+			return nil, errors.New(i18n.Get("插件 %s: Native（进程内 .so/.dll）运行方式要求宿主以 CGO_ENABLED=1 构建，当前宿主未启用 CGO；请改用 gRPC 运行方式，或安装 CGO 构建的 AstrBot 版本", id))
+		}
 		cc, cxx, err = ensureCCompiler(ctx, opts)
 		if err != nil {
 			var promptErr *CCompilerPromptError
@@ -2117,6 +2126,15 @@ func (m *SubprocessManager) Shutdown() {
 		inst.mu.Unlock()
 		m.teardownInstance(inst)
 	}
+	// 停共享 Runtime 进程（在实例 teardown 之后）：共享实例的 teardown 只经
+	// ManagePlugin 卸载单插件、绝不 kill 共享进程（它不在 instances 表里，由
+	// PythonRuntimeManager 独立管理）——不在此处显式停止，Windows/macOS 会
+	// 泄漏孤儿 Python 进程，且共享进程的握手端口段永不归还。放在实例卸载后
+	// 可让 Cleanup/UnloadPlugin RPC 先优雅完成。幂等（shutdownOnce），未用过
+	// 共享模式时（sharedRTMgr==nil）为空操作。
+	if srtm := m.sharedRuntimeManagerIfAny(); srtm != nil {
+		srtm.Shutdown()
+	}
 	logger.I18nInfo("子进程插件管理器已关闭 (%d 个插件已停止)", len(insts))
 }
 
@@ -2301,7 +2319,16 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 			cmd.Env = append(cmd.Env, "ASTRBOT_PLUGIN_LOG_LEVEL="+lvl)
 		}
 		// Python 插件的 stderr 走 [ASTRBOT] 协议解析器（go-plugin 逐行转发 到 cfg.Stderr）：启动失败时能把 go-plugin 笼统的握手错误提升为 phase 化的清晰错误。Go 插件保持 go-plugin 默认行为（parser=nil）。
-		return m.dispensePlugin(ctx, id, abs, language, cmd, newAstrbotStartupParser())
+		inst, err := m.dispensePlugin(ctx, id, abs, language, cmd, newAstrbotStartupParser())
+		if err != nil {
+			return nil, err
+		}
+		// 标记当前实际运行方式为独立 python-grpc 进程（shared 实例在
+		// startSharedInstance 里标 "python-shared"）。此前该字段为零值 ""，
+		// RefreshStatus 的迁回判定（inst.Runtime == "python-grpc"）永不成立，
+		// 被隔离的插件即使持续健康也无法迁回共享 Runtime。
+		inst.Runtime = "python-grpc"
+		return inst, nil
 	}
 
 	cmd := exec.Command(abs) // #nosec G204 -- 启动 Go 插件可执行文件（插件系统核心）; nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command
@@ -2315,11 +2342,21 @@ func (m *SubprocessManager) startInstance(ctx context.Context, id, binary, langu
 // runtime) and calls it directly: plugin.Open -> exported entry -> in-process
 // PluginService. No subprocess, no gRPC, no protobuf-RPC, no rendezvous.
 //
+// 锁契约：仅在 plugin.Open + entry（OnLoad/SDK 全局写入窗口）内短持
+// startInstanceMu；Register 等慢步骤在全局锁外，由调用方 loadLocked 的
+// per-plugin lockOp(id) 串行。见函数内注释。
+//
 // 生命周期：Native 插件与本进程共享地址空间，不能被 kill / 卸载 / 闲置休眠
 // （§8/§9/§10）；更新、禁用、卸载、重载均需重启 AstrBot。
 func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, libPath string) (*PluginInstance, error) {
-	startInstanceMu.Lock()
-	defer startInstanceMu.Unlock()
+	// CGO 前置检测：宿主以 CGO_ENABLED=0 构建时 stdlib `plugin` 包是返回
+	// "plugin: not implemented" 的桩，错误晦涩难懂。这里在 Open 之前按 i18n
+	// 键（plugin.native.cgo_disabled，zh_CN/en_US locale 均已登记）返回清晰
+	// 错误，提示换用 gRPC 运行方式或安装 CGO 版宿主。检测读的是编译期常量，
+	// 无竞态；plugin.Open 真正失败时仍返回原始错误兜底。
+	if !nativeHostCGOAvailable {
+		return nil, errors.New(i18n.Get("插件 %s: Native（进程内 .so/.dll）运行方式要求宿主以 CGO_ENABLED=1 构建，当前宿主未启用 CGO；请改用 gRPC 运行方式，或安装 CGO 构建的 AstrBot 版本", id))
+	}
 
 	if spec := m.installedAstrbotVersion(id); spec != "" {
 		if err := CheckAstrbotVersionCompatibility(spec); err != nil {
@@ -2334,11 +2371,27 @@ func (m *SubprocessManager) loadNativeInstance(ctx context.Context, id, libPath 
 		return nil, fmt.Errorf("plugin library not found: %s", abs)
 	}
 
+	// 短临界区（对齐旧 rendezvous 架构的 "Setenv → entry 串行窗口"）：只在
+	// 持有 startInstanceMu 期间执行 plugin.Open + entry。entry 内部会跑
+	// OnLoad（任意第三方代码，可能秒级耗时）并经 native.Serve 写 SDK 进程级
+	// 全局 hostCallerFn——这是必须串行的真实窗口。此前整个函数（含最长
+	// registerTimeout=90s 的 Register）全程持锁，一个 native 插件卡顿会阻塞
+	// 所有其他插件的启动。
+	//
+	// 残余限制（SDK v2.0.4 侧全局，宿主无法根除）：native.Serve 写
+	// hostCallerFn 不持 SDK 的 bindMu，与已加载插件的在途反向调用存在理论
+	// 竞态；SDK 侧 NativeClient.enter() 已按调用串行化绑定，本临界区进一步
+	// 串行化了唯一的裸写点，实际风险收敛到最小。
+	startInstanceMu.Lock()
 	client, cleanup, err := openNativePlugin(abs, id)
+	startInstanceMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 
+	// Register 在全局锁外执行：NativeClient.Register 经 SDK bindMu 串行化
+	// 全局重绑定，进程内直调无握手；同一插件的并发加载由调用方 loadLocked
+	// 持有的 per-plugin lockOp(id) 互斥，跨插件不再互相阻塞。
 	regCtx, cancel := context.WithTimeout(ctx, registerTimeout)
 	defer cancel()
 	meta, err := client.Register(regCtx)

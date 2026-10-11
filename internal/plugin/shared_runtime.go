@@ -31,6 +31,20 @@ var errSharedDepsConflict = errors.New("共享 Runtime 依赖冲突")
 // **进程级**监督（连接、崩溃重启、隔离迁移的持久化标记）。
 type PythonRuntimeManager struct {
 	mgr *SubprocessManager
+	// reloadFunc 是崩溃恢复时逐插件重载的回调：生产绑定 SubprocessManager.Reload
+	//（Reload 内部走 startInstance → pluginWantsSharedRuntime 按持久化状态分流：
+	// RECOVERY_PENDING 重新加入新共享 Runtime，ISOLATION_PENDING/ISOLATED 起
+	// 独立 python-grpc）；测试可注入桩避免真起子进程。nil 时回退 mgr.Reload。
+	reloadFunc func(ctx context.Context, id string) error
+	// recoveryMu 串行化崩溃恢复：恢复过程中 Runtime 再次崩溃会经
+	// handleSharedExit 再次触发，下一轮恢复在此排队（新一轮清理+重载），
+	// 避免两轮恢复并发清理/重载交错。恢复全程不持 pm.mu（重载路径
+	// startInstance → EnsurePlugin → ensureRuntime 会取 pm.mu），无锁序反转。
+	recoveryMu sync.Mutex
+
+	// shutdownOnce 保证 Shutdown 幂等：宿主关闭路径（SubprocessManager.Shutdown）
+	// 与测试 cleanup 可能多次触发，重复 Kill/Close 必须安全。
+	shutdownOnce sync.Once
 
 	mu sync.Mutex
 	rt *sharedRuntime
@@ -65,7 +79,10 @@ const sharedRuntimeEnvPlugins = "ASTRBOT_SHARED_PLUGINS"
 // 身份解析器（注册名 → manifest id，方案第 8 节身份绑定 per-request）。
 func (m *SubprocessManager) newPythonRuntimeManager() *PythonRuntimeManager {
 	pluginsdk.SetSharedPluginResolver(m.resolveSharedPluginID)
-	return &PythonRuntimeManager{mgr: m}
+	return &PythonRuntimeManager{
+		mgr:        m,
+		reloadFunc: m.Reload,
+	}
 }
 
 // resolveSharedPluginID 把共享 Runtime 反调用携带的注册名严格解析为 manifest
@@ -148,6 +165,28 @@ func startSharedProcess(ctx context.Context, m *SubprocessManager) (*sharedRunti
 	return rt, nil
 }
 
+// disposeRuntime 清理一个（疑似/确认已死或被替换的）共享 Runtime：kill 进程
+// 兜底收尾（进程已死也无妨，go-plugin 需完成簿记 reap）、关闭共享连接、归还
+// 握手端口段。崩溃恢复（recoverSharedRuntime）与 ensureRuntime 兜底重建共用，
+// 保证两条路径的资源回收语义一致。幂等（重复 Kill/Close/release 安全）。
+func disposeRuntime(rt *sharedRuntime) {
+	if rt == nil {
+		return
+	}
+	rt.mu.Lock()
+	rt.stopped = true
+	minp := rt.minp
+	rt.mu.Unlock()
+	// 归还握手端口段：不归还会永久泄漏 [minp, minp+15]（全局分配器耗尽）。
+	releasePluginPort(minp)
+	if rt.raw != nil {
+		rt.raw.Kill()
+	}
+	if rt.client != nil {
+		_ = rt.client.Close()
+	}
+}
+
 // ensureRuntime 返回可用的共享 Runtime，必要时启动。
 func (pm *PythonRuntimeManager) ensureRuntime(ctx context.Context) (*sharedRuntime, error) {
 	pm.mu.Lock()
@@ -155,12 +194,17 @@ func (pm *PythonRuntimeManager) ensureRuntime(ctx context.Context) (*sharedRunti
 	if pm.rt != nil {
 		pm.rt.mu.Lock()
 		stopped := pm.rt.stopped
-		exited := pm.rt.raw == nil || pm.rt.raw.Exited()
+		// raw == nil（未挂接 go-plugin 句柄的 rt，如测试桩）不视为已退出：
+		// 仅 stopped 或真实句柄报告退出才触发重建。
+		exited := pm.rt.raw != nil && pm.rt.raw.Exited()
 		pm.rt.mu.Unlock()
 		if !stopped && !exited {
 			return pm.rt, nil
 		}
-		// 已崩溃：清理后重建（watchSharedRuntime 通常已处理，这里兜底）。
+		// 已崩溃：清理死句柄后重建（watchSharedRuntime → handleSharedExit 通常
+		// 已异步处理，这里兜底）。不清理会让死 client 的失败 RPC 反复重试、
+		// 端口段泄漏。
+		disposeRuntime(pm.rt)
 		pm.rt = nil
 		// Runtime 重建后所有插件都会重新加载：依赖跟踪随之失效，必须清空
 		// 以免用旧集合做冲突误判。
@@ -215,6 +259,15 @@ func (pm *PythonRuntimeManager) EnsurePlugin(ctx context.Context, id, pluginDir,
 	defer cancel2()
 	meta, err := pc.Register(regCtx)
 	if err != nil {
+		// 回滚：ManagePlugin(load) 已成功，插件模块已 import 进共享进程；
+		// Register 失败后不回滚会留下僵尸模块（占 sys.modules、可能在后续
+		// 同名加载时报错）。尽力 unload，失败仅告警不掩盖原始错误。
+		ulCtx, ulCancel := context.WithTimeout(ctx, cleanupTimeout)
+		_, ulErr := pc.ManagePlugin(ulCtx, pluginsdk.ManagePluginRequest{Action: "unload", PluginID: id})
+		ulCancel()
+		if ulErr != nil {
+			logger.I18nWarn("共享 Runtime 回滚插件 %s 失败（可能残留僵尸模块）: %v", id, ulErr)
+		}
 		return nil, nil, fmt.Errorf("共享 Runtime 注册插件 %s: %w", id, err)
 	}
 	rt.mu.Lock()
@@ -252,6 +305,9 @@ func (pm *PythonRuntimeManager) trackSharedReqs(id string, reqs map[string]strin
 }
 
 // UnloadPlugin 从共享 Runtime 卸载单个插件（不杀 Runtime 进程）。
+// rt.plugins[id] 条目在 ManagePlugin(unload) RPC **成功后**才删除：失败时保留
+// 条目以便重试（否则条目已删、重试直接 short-circuit，共享进程内残留已卸载
+// 一半的插件模块，状态永久不一致）。
 func (pm *PythonRuntimeManager) UnloadPlugin(ctx context.Context, id string) error {
 	pm.mu.Lock()
 	rt := pm.rt
@@ -264,19 +320,22 @@ func (pm *PythonRuntimeManager) UnloadPlugin(ctx context.Context, id string) err
 		rt.mu.Unlock()
 		return nil
 	}
-	delete(rt.plugins, id)
 	rt.mu.Unlock()
-	// 移除该插件的依赖贡献，避免其它插件误判冲突。
-	pm.mu.Lock()
-	delete(pm.pluginReqs, id)
-	pm.mu.Unlock()
 	pc := rt.client.ForPlugin(id)
 	ctx, cancel := context.WithTimeout(ctx, cleanupTimeout)
 	defer cancel()
 	_, err := pc.ManagePlugin(ctx, pluginsdk.ManagePluginRequest{Action: "unload", PluginID: id})
 	if err != nil {
+		// RPC 失败：保留 rt.plugins 条目与依赖贡献，供后续重试。
 		return fmt.Errorf("共享 Runtime 卸载插件 %s: %w", id, err)
 	}
+	// 成功后才移除跟踪条目（先 rt.plugins 再依赖贡献，二者均为纯内存操作）。
+	rt.mu.Lock()
+	delete(rt.plugins, id)
+	rt.mu.Unlock()
+	pm.mu.Lock()
+	delete(pm.pluginReqs, id)
+	pm.mu.Unlock()
 	return nil
 }
 
@@ -305,9 +364,8 @@ func (m *SubprocessManager) watchSharedRuntime(rt *sharedRuntime) {
 	}
 }
 
-// handleSharedExit 处理共享 Runtime 崩溃：标记所有共享插件失败并触发恢复
-// （重启 Runtime + 重载）。隔离迁移本身待 PythonRuntimeManager 完整版；此处
-// 只做进程级恢复与状态标记（用户确认的第 1 层边界）。
+// handleSharedExit 处理共享 Runtime 崩溃：标记恢复状态并触发完整恢复闭环
+// （重启 Runtime + 重载全部插件，方案第 6 节 Watchdog 崩溃流程）。
 func (m *SubprocessManager) handleSharedExit(rt *sharedRuntime) {
 	rt.mu.Lock()
 	if rt.stopped {
@@ -329,26 +387,99 @@ func (m *SubprocessManager) handleSharedExit(rt *sharedRuntime) {
 	if err := m.markCrashRecovery(ids); err != nil {
 		logger.I18nWarn("标记共享 Runtime 崩溃恢复状态失败: %v", err)
 	}
+	// 异步触发恢复闭环（重启 Runtime → 逐插件 Reload → 重新注册）：不阻塞
+	// watch goroutine（它已随 handleSharedExit 返回退出）。rt.stopped=true
+	// 保证本 rt 不会被重复触发；恢复全程由 pm.recoveryMu 串行化，恢复过程中
+	// Runtime 再次崩溃则新一轮恢复在此排队。
+	if mgr := m.sharedRuntimeManagerIfAny(); mgr != nil {
+		go mgr.recoverSharedRuntime(rt, ids)
+	} else {
+		logger.I18nWarn("共享 Runtime 崩溃恢复：管理器未初始化，跳过自动重载")
+	}
 }
 
-// Shutdown 停止共享 Runtime（宿主退出时调用）。
+// recoverSharedRuntime 执行共享 Runtime 崩溃恢复闭环（方案第 6 节）：
+//
+//	清理死 Runtime（Kill/Close/释放端口）→ 重置管理器状态 → 逐插件 Reload
+//	→ Reload 内部按 manifest 持久化状态分流：RECOVERY_PENDING 的重新加入
+//	新共享 Runtime，ISOLATION_PENDING/ISOLATED 的起独立 python-grpc。
+//
+// 可重入：恢复过程中 Runtime 再次崩溃时，handleSharedExit 会再触发一轮
+// recoverSharedRuntime——recoveryMu 保证上一轮清理完成后新一轮才开始
+// （新一轮的旧 rt 句柄 dispose 幂等，重复 dispose 无副作用）。
+// 逐插件串行执行（Reload 内部持 per-id 生命周期锁），单插件失败仅告警，
+// 不中断其余插件恢复。
+func (pm *PythonRuntimeManager) recoverSharedRuntime(rt *sharedRuntime, ids []string) {
+	pm.recoveryMu.Lock()
+	defer pm.recoveryMu.Unlock()
+
+	logger.I18nInfo("共享 Runtime 崩溃恢复开始：清理旧进程并重载 %d 个插件", len(ids))
+	// 1. 清理死 Runtime：client 收尾 + 端口段归还（幂等，进程已死无妨）。
+	disposeRuntime(rt)
+	// 2. 重置管理器状态：死 runtime 句柄、依赖跟踪一并清空（重载会重建），
+	//    gen++ 使旧代际的在途加载作废。
+	pm.mu.Lock()
+	if pm.rt == rt {
+		pm.rt = nil
+	}
+	pm.pluginReqs = nil
+	pm.gen++
+	pm.mu.Unlock()
+
+	// 3. 逐插件串行重载。reloadFunc 绑定 SubprocessManager.Reload：
+	//    startInstance → pluginWantsSharedRuntime 按 manifest 健康状态分流
+	//   （RECOVERY_PENDING → 新 shared；ISOLATION_PENDING/ISOLATED → grpc）。
+	reload := pm.reloadFunc
+	if reload == nil && pm.mgr != nil {
+		reload = pm.mgr.Reload
+	}
+	if reload == nil {
+		logger.I18nWarn("共享 Runtime 崩溃恢复：无可用重载回调，跳过 %d 个插件", len(ids))
+		return
+	}
+	for _, id := range ids {
+		if pm.mgr != nil && pm.mgr.ctx.Err() != nil {
+			logger.I18nWarn("共享 Runtime 崩溃恢复：宿主已关闭，中止重载剩余插件")
+			return
+		}
+		ctx, cancel := context.WithTimeout(pm.mgrCtx(), 2*registerTimeout)
+		err := reload(ctx, id)
+		cancel()
+		if err != nil {
+			// Reload 失败（含 ErrPluginNotLoaded：实例表已被并发更新）：
+			// 不中断其余插件恢复，失败状态由 Reload/markFailed 内部记录。
+			logger.I18nWarn("共享 Runtime 崩溃恢复：重载插件 %s 失败: %v", id, err)
+			continue
+		}
+		logger.I18nInfo("共享 Runtime 崩溃恢复：插件 %s 已重载", id)
+	}
+	logger.I18nInfo("共享 Runtime 崩溃恢复完成")
+}
+
+// mgrCtx 返回所属管理器的生命周期 ctx（nil 安全；测试注入桩可能无 mgr）。
+func (pm *PythonRuntimeManager) mgrCtx() context.Context {
+	if pm.mgr == nil || pm.mgr.ctx == nil {
+		return context.Background()
+	}
+	return pm.mgr.ctx
+}
+
+// Shutdown 停止共享 Runtime（宿主退出时调用）。幂等：sync.Once 保证重复调用
+// 只执行一次停止序列；无运行中的 Runtime 时为空操作。
 func (pm *PythonRuntimeManager) Shutdown() {
+	pm.shutdownOnce.Do(func() { pm.shutdown() })
+}
+
+// shutdown 是 Shutdown 的实际执行体（经 Shutdown 的 sync.Once 保证单次执行）。
+func (pm *PythonRuntimeManager) shutdown() {
 	pm.mu.Lock()
 	rt := pm.rt
 	pm.rt = nil
+	// Runtime 重建后依赖跟踪失效，一并清空，避免残留旧集合做冲突误判。
+	pm.pluginReqs = nil
 	pm.mu.Unlock()
-	if rt == nil {
-		return
-	}
-	rt.mu.Lock()
-	rt.stopped = true
-	rt.mu.Unlock()
-	if rt.raw != nil {
-		rt.raw.Kill()
-	}
-	if rt.client != nil {
-		_ = rt.client.Close()
-	}
+	// 复用 disposeRuntime：标记 stopped + Kill + Close + 归还握手端口段。
+	disposeRuntime(rt)
 }
 
 // RuntimePID 返回当前共享 Runtime 进程 pid（0 = 未运行）；供测试/诊断。

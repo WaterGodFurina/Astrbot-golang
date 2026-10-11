@@ -894,6 +894,9 @@ func (sink *chainPartsSink) absorbThink(text string) {
 		if last, ok := sink.parts[n-1]["type"].(string); ok && last == "think" {
 			if cur, ok := sink.parts[n-1]["think"].(string); ok {
 				sink.parts[n-1]["think"] = cur + text
+				// 推理之后新到达的正文必须追加为新 part，不能并回推理前的
+				// 旧 plain part，因此合并分支同样要重置 plain 合并锚点。
+				sink.lastPlainIndex = -1
 				return
 			}
 		}

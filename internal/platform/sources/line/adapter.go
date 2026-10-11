@@ -54,10 +54,11 @@ type Adapter struct {
 	evIDTime map[string]time.Time
 	mu       sync.Mutex
 
-	// groupSourceType 缓存群/房间的真实类型（containerID → "group"/"room"），
+	// groupSourceType 缓存群/房间的真实类型（containerID → 条目），
 	// 供 GetGroupInfo 在缺少事件上下文时推断（对齐 Python 从 raw_message.source
-	// 推断 chat_type 的逻辑）。
-	groupSourceType map[string]string
+	// 推断 chat_type 的逻辑）。条目带更新时间戳，写入口惰性清理超过
+	// groupSourceTypeTTL 未刷新的条目，防止按会话数无界增长。
+	groupSourceType map[string]*groupSourceTypeEntry
 
 	mediaBaseURL    string
 	callbackAPIBase string
@@ -72,6 +73,17 @@ type replyTokenEntry struct {
 	at    time.Time
 }
 
+// groupSourceTypeEntry 记录群/房间真实类型及其最近更新时间（updatedAt 供
+// 惰性清扫判断条目是否过期）。
+type groupSourceTypeEntry struct {
+	sourceType string
+	updatedAt  time.Time
+}
+
+// groupSourceTypeTTL 是 groupSourceType 条目的保留时限：超过该时间未随入站
+// 事件刷新的会话条目在写入口顺带清理（惰性清扫，无额外 goroutine）。
+const groupSourceTypeTTL = 24 * time.Hour
+
 // New 创建 LINE 适配器（config 需要 channel_access_token 与 channel_secret）。
 func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adapter {
 	a := &Adapter{
@@ -80,7 +92,7 @@ func New(config, settings map[string]interface{}, eventBus *core.EventBus) *Adap
 		EventBus:        eventBus,
 		replyTokens:     map[string]replyTokenEntry{},
 		evIDTime:        map[string]time.Time{},
-		groupSourceType: map[string]string{},
+		groupSourceType: map[string]*groupSourceTypeEntry{},
 	}
 	channelAccessToken, _ := config["channel_access_token"].(string)
 	channelSecret, _ := config["channel_secret"].(string)
@@ -310,8 +322,15 @@ func (a *Adapter) convertMessage(event map[string]interface{}) *platform.AstrBot
 		}
 		truncateNick(&abm.Sender)
 		// 缓存群/房间真实类型，供后续 GetGroupInfo 推断 chat_type。
+		// 写入口顺带惰性清理超期条目，防止 map 随会话数无界增长。
 		a.mu.Lock()
-		a.groupSourceType[containerID] = sourceType
+		now := time.Now()
+		for id, e := range a.groupSourceType {
+			if now.Sub(e.updatedAt) > groupSourceTypeTTL {
+				delete(a.groupSourceType, id)
+			}
+		}
+		a.groupSourceType[containerID] = &groupSourceTypeEntry{sourceType: sourceType, updatedAt: now}
 		a.mu.Unlock()
 	case "user":
 		abm.Type = platform.FriendMessage
@@ -807,7 +826,10 @@ func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.G
 	// 优先用入站事件缓存的真实类型（group/room）；缺失时回退前缀启发：
 	// group_id 以 "R" 开头视为 room，否则视为 group（对齐 Python get_group）。
 	a.mu.Lock()
-	chatType := a.groupSourceType[groupID]
+	var chatType string
+	if entry, ok := a.groupSourceType[groupID]; ok {
+		chatType = entry.sourceType
+	}
 	a.mu.Unlock()
 	if chatType != "group" && chatType != "room" {
 		chatType = "group"

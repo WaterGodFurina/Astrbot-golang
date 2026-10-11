@@ -233,12 +233,32 @@ func (c *APIClient) GetMessageList(ctx context.Context, conversationID, order st
 	return c.doJSON(req)
 }
 
+// readBodySnippet 读取错误响应 body（限 4KB）用于错误信息，对齐 Python
+// raise_for_status / response.text 的语义（非 2xx 时携带服务端错误详情抛错）。
+func readBodySnippet(resp *http.Response) string {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return string(body)
+}
+
+// checkHTTPStatus 对齐 Python raise_for_status：非 2xx 时返回携带状态码与
+// body 片段（限 4KB）的错误，避免把错误 body 当 JSON 解析后返回给上层。
+func checkHTTPStatus(resp *http.Response) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, readBodySnippet(resp))
+}
+
 func (c *APIClient) doJSON(req *http.Request) (map[string]interface{}, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// 此前未检查状态码：非 2xx 时错误 body 被当 JSON 解析返回，掩盖真实错误。
+	if err := checkHTTPStatus(resp); err != nil {
+		return nil, err
+	}
 	var out map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err

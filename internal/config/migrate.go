@@ -1,7 +1,7 @@
 package config
 
 import (
-	"reflect"
+	"encoding/json"
 	"strconv"
 )
 
@@ -300,14 +300,16 @@ func migrateAgentRunnerConfig(config map[string]interface{}, fallback map[string
 	}
 
 	existing, _ := config["agent_runner"].(map[string]interface{})
-	configVersion, _ := config["config_version"].(float64)
-	legacyVersion := configVersion < 3
+	legacyVersion := configVersionOf(config) < 3
 
 	defaultLocal := map[string]interface{}{
 		"runner_type": "local",
 		"config":      agentRunnerConfigDefault("local"),
 	}
-	insertedBefore := legacyVersion && mapsEqual(existing, defaultLocal) && anyLegacyKeyIn(providerSettings)
+	// 用数值感知的相等比较：JSON 反序列化出的数值是 float64，而默认值里是
+	// Go int，直接 DeepEqual 会因类型不同而恒假，导致"先前插入过默认值 +
+	// 残留 legacy 键"的配置走不进重迁移分支（对齐 Python == 的数值语义）。
+	insertedBefore := legacyVersion && mapsEqualNormalized(existing, defaultLocal) && anyLegacyKeyIn(providerSettings)
 
 	if existing != nil && !insertedBefore {
 		// 已迁移过：仅清理残留旧键。
@@ -408,6 +410,15 @@ func migrateAgentRunnerConfig(config map[string]interface{}, fallback map[string
 			if provider != nil && getProviderRunnerType(provider) == runnerType {
 				runnerConfig = copyProviderConfig(runnerType, provider)
 			} else {
+				// 与 Python 一致：找不到匹配的 provider 时回退到 runner 默认配置，
+				// 但这里补充告警便于诊断（避免用户 API key 静默丢失）。
+				if provider == nil {
+					logger.Warn("agent runner 迁移：未找到 provider_id=%q 对应的 provider（runner_type=%s），回退到 %s 默认配置",
+						providerID, runnerType, runnerType)
+				} else {
+					logger.Warn("agent runner 迁移：provider_id=%q 的类型与 runner_type=%s 不匹配，回退到 %s 默认配置",
+						providerID, runnerType, runnerType)
+				}
 				runnerConfig = agentRunnerConfigDefault(runnerType)
 			}
 		}
@@ -422,7 +433,7 @@ func migrateAgentRunnerConfig(config map[string]interface{}, fallback map[string
 		changed = true
 	}
 
-	if cv, _ := config["config_version"].(float64); cv != 3 {
+	if cv := configVersionOf(config); cv != 3 {
 		config["config_version"] = float64(3)
 		changed = true
 	}
@@ -440,11 +451,84 @@ func anyLegacyKeyIn(m map[string]interface{}) bool {
 	return false
 }
 
-func mapsEqual(a, b map[string]interface{}) bool {
+// mapsEqualNormalized 数值感知的 map 相等比较：递归比较两棵配置树，
+// 数值统一转 float64 后比较（JSON 解析出的数值是 float64，程序内构造的
+// 默认值可能是 int，语义相等即视为相等），其余类型直接 ==。
+func mapsEqualNormalized(a, b map[string]interface{}) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	return reflect.DeepEqual(a, b)
+	if len(a) != len(b) {
+		return false
+	}
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok || !valuesEqualNormalized(av, bv) {
+			return false
+		}
+	}
+	return true
+}
+
+// valuesEqualNormalized 对两个配置值做数值归一化后的相等比较。
+func valuesEqualNormalized(a, b interface{}) bool {
+	if an, aok := normalizedNumber(a); aok {
+		if bn, bok := normalizedNumber(b); bok {
+			return an == bn
+		}
+		return false
+	}
+	am, aok := a.(map[string]interface{})
+	if aok {
+		bm, bok := b.(map[string]interface{})
+		if !bok {
+			return false
+		}
+		return mapsEqualNormalized(am, bm)
+	}
+	as, aok := a.([]interface{})
+	if aok {
+		bs, bok := b.([]interface{})
+		if !bok || len(as) != len(bs) {
+			return false
+		}
+		for i := range as {
+			if !valuesEqualNormalized(as[i], bs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return a == b
+}
+
+// normalizedNumber 把 int/int64/float64/float32/json.Number 统一为 float64。
+func normalizedNumber(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		if f, err := n.Float64(); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// configVersionOf 宽松地读取 config_version：兼容 JSON 解析出的 float64、
+// 程序内写入的 int/int64 以及 json.Number，避免仅因类型断言失败而把
+// 已是版本 3 的配置误判为旧版本、每次加载都触发重迁移。
+func configVersionOf(config map[string]interface{}) float64 {
+	if cv, ok := normalizedNumber(config["config_version"]); ok {
+		return cv
+	}
+	return 0
 }
 
 func parseIntStrict(s string) (int, error) {

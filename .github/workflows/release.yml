@@ -20,6 +20,12 @@ on:
       - 'v*'
       - '[0-9]*.*'
 
+# 显式关闭 Go workspace：仓库不再跟踪 go.work（本地开发用 go.work 指向 SDK 检出，
+# 但 release runner 上没有该路径，go.work 会让所有平台的 go build 因"目录不存在"
+# 直接失败）。此 env 作为兜底，保证即使日后误提交 go.work 也不影响发布构建。
+env:
+  GOWORK: "off"
+
 jobs:
   update-go-sum:
     runs-on: ubuntu-latest
@@ -163,15 +169,31 @@ jobs:
           tar -xJf $HOME/ndk/ndk.tar.xz -C $HOME/ndk
           echo "NDK_PATH=$HOME/ndk" >> "$GITHUB_ENV"
 
-      - name: 交叉编译 AstrBot（CGO_ENABLED=0，纯 Go，modernc.org/sqlite）
+      - name: 安装 aarch64 交叉 GCC（linux/arm64-gnu 的 CGO 构建需要）
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64' && matrix.libc == 'gnu'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: 交叉编译 AstrBot（CGO 矩阵：runner 可真实 CC 的目标 CGO_ENABLED=1 以支持 Native 插件；无交叉 C 工具链的目标保持 CGO_ENABLED=0，Native 加载时被前置检测明确拒绝）
         shell: bash
         env:
-          CGO_ENABLED: ${{ matrix.libc == 'bionic' && '1' || '0' }}
+          # CGO_NATIVE=true 的目标：runner 有可用 C 工具链，可真实 CGO 构建：
+          #   - linux/amd64（gnu/musl）：ubuntu runner 本机 gcc；
+          #   - linux/arm64-gnu：上方步骤安装的 gcc-aarch64-linux-gnu；
+          #   - macOS amd64/arm64：runner 本机 Xcode clang（darwin/arm64 相对
+          #     runner 属交叉，但 Apple 官方工具链直接支持）。
+          # 其余目标（linux/arm64-musl、linux/loongarch64-*：无交叉 C 工具链；
+          # windows msvc：CI 不配置 MSVC 全套）保持 CGO_ENABLED=0，Native 插件
+          # 不可用但 gRPC 插件不受影响，运行时前置检测会给出明确错误。
+          CGO_NATIVE: ${{ (matrix.goos == 'darwin') || (matrix.goos == 'linux' && matrix.goarch == 'amd64') || (matrix.goos == 'linux' && matrix.goarch == 'arm64' && matrix.libc == 'gnu') }}
+          CGO_ENABLED: ${{ matrix.libc == 'bionic' && '1' || env.CGO_NATIVE == 'true' && '1' || '0' }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOARM64: v8.0
-          CC: ${{ matrix.libc == 'bionic' && format('{0}/android-ndk-r29/toolchains/llvm/prebuilt/linux-aarch64/bin/aarch64-linux-android30-clang', env.NDK_PATH) || '' }}
-          CXX: ${{ matrix.libc == 'bionic' && format('{0}/android-ndk-r29/toolchains/llvm/prebuilt/linux-aarch64/bin/aarch64-linux-android30-clang++', env.NDK_PATH) || '' }}
+          CC: ${{ (matrix.libc == 'bionic' && format('{0}/android-ndk-r29/toolchains/llvm/prebuilt/linux-aarch64/bin/aarch64-linux-android30-clang', env.NDK_PATH)) || (matrix.goos == 'linux' && matrix.goarch == 'arm64' && matrix.libc == 'gnu' && 'aarch64-linux-gnu-gcc') || '' }}
+          CXX: ${{ (matrix.libc == 'bionic' && format('{0}/android-ndk-r29/toolchains/llvm/prebuilt/linux-aarch64/bin/aarch64-linux-android30-clang++', env.NDK_PATH)) || (matrix.goos == 'linux' && matrix.goarch == 'arm64' && matrix.libc == 'gnu' && 'aarch64-linux-gnu-g++') || '' }}
           CGO_CFLAGS: ''
           CGO_CPPFLAGS: ''
           CGO_CXXFLAGS: ''

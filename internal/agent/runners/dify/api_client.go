@@ -101,9 +101,10 @@ func (c *APIClient) streamPost(ctx context.Context, path string, payload map[str
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		text, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("%s：%d. %s", errPrefix, resp.StatusCode, string(text))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// 对齐 Python：非 2xx 读 text 抛错（body 限 4KB 防止异常响应撑爆内存）。
+		text, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("%s：HTTP %d. %s", errPrefix, resp.StatusCode, string(text))
 	}
 	return StreamSSE(resp.Body, onEvent)
 }
@@ -169,7 +170,7 @@ func (c *APIClient) FileUpload(ctx context.Context, user string, fileData []byte
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		text, _ := io.ReadAll(resp.Body)
+		text, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return nil, fmt.Errorf("Dify 文件上传失败：%d. %s", resp.StatusCode, string(text))
 	}
 	var out map[string]interface{}
@@ -223,12 +224,29 @@ func (c *APIClient) getJSON(ctx context.Context, url string) (map[string]interfa
 	return c.doJSON(req)
 }
 
+// checkHTTPStatus 对齐 Python raise_for_status 语义（py 端 aiohttp 非 2xx 时
+// 读 text 抛错）：非 2xx 时返回携带状态码与 body 片段（限 4KB）的错误，避免
+// 把错误 body 当 JSON 解析后返回给上层。
+func checkHTTPStatus(resp *http.Response) error {
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+}
+
 func (c *APIClient) doJSON(req *http.Request) (map[string]interface{}, error) {
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	// 此前未检查状态码：非 2xx 时错误 body 被当 JSON 解析返回，掩盖真实错误。
+	// 对齐 Python get_chat_convs / delete_chat_conv / rename（aiohttp 未显式
+	// raise，但 Go 侧统一按 raise_for_status 语义处理更稳）。
+	if err := checkHTTPStatus(resp); err != nil {
+		return nil, err
+	}
 	var out map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, err

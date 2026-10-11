@@ -38,6 +38,18 @@ func agentRunnerConfig(cfg map[string]interface{}) map[string]interface{} {
 	return out
 }
 
+// isThirdPartyAgentRunner 报告 runner 类型是否为第三方 agent runner（对齐 py
+// astrbot/core/config/agent_runner.py THIRD_PARTY_AGENT_RUNNER_TYPES，即
+// runner_type ∈ {dify, coze, dashscope, deerflow}）。第三方 runner 自带
+// agent_runner.config.* 的 HTTP 客户端，不依赖本地 chat provider。
+func isThirdPartyAgentRunner(rt string) bool {
+	switch rt {
+	case "dify", "coze", "dashscope", "deerflow":
+		return true
+	}
+	return false
+}
+
 // runDifyAgent 对齐 Python DifyAgentRunner：构造 runner，流式增量经 streamer 输出，
 // 返回最终 LLMResponse（由 finalizeAgentReply 统一落库/发结果）。
 func (s *ProcessStage) runDifyAgent(ctx context.Context, ar *agentRequest, streamer *streamSender) (*provider.LLMResponse, error) {

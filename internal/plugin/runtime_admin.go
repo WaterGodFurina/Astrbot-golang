@@ -784,10 +784,17 @@ func (m *SubprocessManager) uninstallLocked(id string, deleteConfig, deleteData 
 		logger.I18nWarn("插件 %s 为 Native 运行方式：已卸载 manifest/文件，但动态库仍在本进程驻留，重启 AstrBot 后彻底移除", id)
 	}
 
-	// 二进制目录（始终删除）。
-	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id)))
+	// 二进制目录（始终删除）。Windows 上被加载的 native .dll 在进程退出前
+	// 一直被内存映射锁住，os.RemoveAll 会失败（"Access is denied"）——此时
+	// 不视为卸载失败（manifest/实例已清理），降级为警告并提示文件将在重启后
+	// 手动清理；其余目录删除失败同样记录警告，不谎报"已彻底删除"。
+	if err := os.RemoveAll(filepath.Join(m.dataDir, "plugins-bin", sanitizeID(id))); err != nil {
+		logger.I18nWarn("插件 %s 的二进制目录删除失败（Windows 上若为 Native .dll 将在重启 AstrBot 后释放文件锁）: %v", id, err)
+	}
 	// 插件本体源码目录（Go/Python 统一在 plugins/<id>，始终删除）。
-	_ = os.RemoveAll(filepath.Join(m.dataDir, "plugins", sanitizeID(id)))
+	if err := os.RemoveAll(filepath.Join(m.dataDir, "plugins", sanitizeID(id))); err != nil {
+		logger.I18nWarn("插件 %s 的源码目录删除失败: %v", id, err)
+	}
 
 	// 目录足迹：优先用安装时记录的 manifest 条目，旧版本安装则按 id 推导。
 	// manifest 子路径都先 sanitize/校验，防止路径穿越导致误删 dataDir 之外
