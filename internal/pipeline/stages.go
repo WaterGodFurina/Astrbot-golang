@@ -1528,9 +1528,18 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 
 	providerCfg, providerSettings, err := s.resolveProvider()
 	if err != nil {
-		// 无可用模型提供商：平台侧静默（不回复），宿主启动时已打印 warn。
-		event.Result = &message.MessageEventResult{}
-		return nil, err
+		// 对齐 Python third_party.py：第三方 agent runner（dify/coze/
+		// dashscope/deerflow）自带 agent_runner.config.* 的 HTTP 客户端，
+		// 不依赖本地 chat provider（py 的 ThirdPartyAgentSubStage 完全不
+		// 走 provider 选择）。无可用 provider 时以空 provider 配置继续，
+		// 仅本地 runner（含无 provider 无法工作的路径）按原样失败。
+		if !(errors.Is(err, errNoAvailableProvider) && isThirdPartyAgentRunner(agentRunnerType(s.config))) {
+			// 无可用模型提供商：平台侧静默（不回复），宿主启动时已打印 warn。
+			event.Result = &message.MessageEventResult{}
+			return nil, err
+		}
+		logger.Debug("callLLMAgent: no chat provider configured, continuing with third-party agent runner %s", agentRunnerType(s.config))
+		providerCfg, providerSettings = nil, providerSettingsCopy(s.config)
 	}
 
 	// Session-level provider override (custom rules / /provider command): when the session has a provider_perf_chat_completion rule, use that provider instead of the global default.
@@ -1542,8 +1551,10 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 		}
 	}
 
-	// Dashboard-selected provider/model override (WebUI chat writes selected_provider/selected_model into event.Metadata, chat_stream.go). Applied on a copy so the shared provider config is never mutated (L-23).
-	providerCfg = s.applySelectedProviderModel(event, providerCfg)
+	// Dashboard-selected provider/model override (WebUI chat writes selected_provider/selected_model into event.Metadata, chat_stream.go). Applied on a copy so the shared provider config is never mutated (L-23). 第三方 runner 的空 provider（nil）在没有显式选择时保持为 nil。
+	if providerCfg != nil || selectedProviderModelSet(event) {
+		providerCfg = s.applySelectedProviderModel(event, providerCfg)
+	}
 
 	// Resolve the conversation. Mirrors Python's `_get_session_conv`: the conversation is lazily created if it does not exist yet. The current user message is appended to history only after the LLM round finishes (Python appends the user+assistant pair post-completion), so the prompt is not duplicated in req.Contexts.
 	personaID := ""
@@ -1681,8 +1692,8 @@ func (s *ProcessStage) prepareAgentRequest(ctx context.Context, event *core.Even
 		})
 	}
 
-	// Sanitize context by the provider's supported modalities (provider_settings.sanitize_context_by_modalities).
-	if s.providerConf != nil && s.providerConf.SanitizeContextByModalities {
+	// Sanitize context by the provider's supported modalities (provider_settings.sanitize_context_by_modalities). providerCfg 可能为 nil（第三方 runner 无 chat provider 路径）。
+	if s.providerConf != nil && s.providerConf.SanitizeContextByModalities && providerCfg != nil {
 		if mods := providerModalities(providerCfg); len(mods) > 0 {
 			req.Contexts = sanitizeContextByModalities(req.Contexts, mods)
 		}
@@ -1693,35 +1704,49 @@ func (s *ProcessStage) prepareAgentRequest(ctx context.Context, event *core.Even
 		s.groupCtx.OnReqLLM(event, req)
 	}
 
-	providerType, _ := providerCfg["type"].(string)
-	if providerType == "" {
-		providerType, _ = providerCfg["provider"].(string)
+	// 第三方 agent runner（dify/coze/dashscope/deerflow）不用本地 chat provider
+	// （对齐 py third_party.py：构建 runner 只依赖 agent_runner.config，py 该
+	// 路径完全不选 provider）。因此 providerCfg 缺 type 时第三方继续，本地 runner
+	// 保持原有失败文案。
+	thirdPartyRunner := isThirdPartyAgentRunner(agentRunnerType(s.config))
+	providerType := ""
+	if providerCfg != nil {
+		providerType, _ = providerCfg["type"].(string)
+		if providerType == "" {
+			providerType, _ = providerCfg["provider"].(string)
+		}
 	}
-	if providerType == "" {
+	if providerType == "" && !thirdPartyRunner {
 		event.Result = &message.MessageEventResult{}
 		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 模型提供商配置缺少 type 字段，请重新配置提供商"}}
 		return nil, fmt.Errorf("provider config missing type field")
 	}
 
-	// Merge the provider source config (api_base/key live on the source, mirroring astrbot/core/provider/manager.py get_merged_provider_config).
-	mergedCfg := mergeProviderSource(providerCfg, s.config["provider_sources"])
+	if providerType != "" {
+		// Merge the provider source config (api_base/key live on the source, mirroring astrbot/core/provider/manager.py get_merged_provider_config).
+		mergedCfg := mergeProviderSource(providerCfg, s.config["provider_sources"])
 
-	inst, err := provider.CreateProvider(providerType, mergedCfg, providerSettings)
-	if err != nil {
-		logger.Error("初始化模型提供商失败: %v", err)
-		event.Result = &message.MessageEventResult{}
-		// 对外脱敏：错误原文只进日志（D-low-8）。
-		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 初始化模型提供商失败，请检查提供商配置"}}
-		return nil, err
+		inst, err := provider.CreateProvider(providerType, mergedCfg, providerSettings)
+		if err != nil {
+			if !thirdPartyRunner {
+				logger.Error("初始化模型提供商失败: %v", err)
+				event.Result = &message.MessageEventResult{}
+				// 对外脱敏：错误原文只进日志（D-low-8）。
+				event.Result.Chain = []message.Component{&message.Plain{Text: "😕 初始化模型提供商失败，请检查提供商配置"}}
+				return nil, err
+			}
+			// 第三方 runner 不消费本地 provider，实例化失败仅告警不阻断。
+			logger.Warn("第三方 agent runner 忽略本地 chat provider %s 初始化失败: %v", providerType, err)
+		} else if chatInst, ok := inst.(provider.ChatProvider); ok {
+			ar.chatInst = chatInst
+		} else if !thirdPartyRunner {
+			event.Result = &message.MessageEventResult{}
+			event.Result.Chain = []message.Component{&message.Plain{Text: "😕 提供商 " + providerType + " 不支持聊天能力"}}
+			return nil, fmt.Errorf("provider %s has no chat capability", providerType)
+		} else {
+			logger.Warn("第三方 agent runner 忽略不支持聊天的本地提供商 %s", providerType)
+		}
 	}
-
-	chatInst, ok := inst.(provider.ChatProvider)
-	if !ok {
-		event.Result = &message.MessageEventResult{}
-		event.Result.Chain = []message.Component{&message.Plain{Text: "😕 提供商 " + providerType + " 不支持聊天能力"}}
-		return nil, fmt.Errorf("provider %s has no chat capability", providerType)
-	}
-	ar.chatInst = chatInst
 
 	// 主动 agent（cron / 后台任务唤醒）的会话模型降级：只对 proactive 合成
 	// 事件读取 agent_runner.config.model.fallback_provider_ids 并填充请求
@@ -2214,7 +2239,10 @@ func agentRunnerFallbackProviderIDs(cfg map[string]interface{}) []string {
 //   - 请求携带图片而主模型不支持 image 模态时，切换到首个支持图片的降级
 //     模型（主模型会被移出候选列表，避免重复尝试）。
 func (s *ProcessStage) buildFallbackChatProviders(ar *agentRequest, req *provider.ProviderRequest) {
-	primaryID, _ := ar.providerCfg["id"].(string)
+	primaryID := ""
+	if ar.providerCfg != nil {
+		primaryID, _ = ar.providerCfg["id"].(string)
+	}
 	seen := map[string]bool{}
 	if primaryID != "" {
 		seen[primaryID] = true
@@ -2252,11 +2280,12 @@ func (s *ProcessStage) buildFallbackChatProviders(ar *agentRequest, req *provide
 		ar.fallbackProviderCfgs = append(ar.fallbackProviderCfgs, pc)
 	}
 
-	// 图片模态选择（py _select_image_chat_provider）。
+	// 图片模态选择（py _select_image_chat_provider）。主模型 providerCfg 为 nil
+	// （第三方 runner 路径）时视为不支持图片，直接尝试降级模型。
 	if len(ar.fallbackChatInsts) == 0 || len(req.ImageURLs) == 0 {
 		return
 	}
-	if providerSupportsModality(ar.providerCfg, "image") {
+	if ar.providerCfg != nil && providerSupportsModality(ar.providerCfg, "image") {
 		return
 	}
 	for i, cfg := range ar.fallbackProviderCfgs {
@@ -2551,9 +2580,21 @@ func (ss *streamSender) flushReasoningSentences() {
 
 // sendReasoningSegment 发送单段推理链（Type="reasoning"），普通平台按原样
 // 渲染文本（行为不变），dashboard 据 Type 区分思考块。
+// 门控（对齐 py astr_agent_run_util.py）：推理与正文走同一流式通道，仅在
+// 正文会增量发送的模式（frag!=nil 原生流式编辑 / segMode 按句分段）才直发
+// 推理片段；群聊与不支持流式的平台（frag==nil && !segMode）正文不增量发，
+// 推理同样不增量发——只缓冲不置 sent，最终全文（含 "🤔 思考: ..." 前缀，
+// 见 ResultDecorateStage 的 _llm_reasoning_content 注入）由 RespondStage
+// 一次性发送。否则此处直发会置 ss.sent=true，finalizeAgentReply 据此标记
+// streamed，RespondStage 跳过最终全文 → 群聊用户只收到推理片段、收不到答案。
 func (ss *streamSender) sendReasoningSegment(text string) {
 	text = strings.TrimSpace(text)
 	if text == "" || ss.stage.platformMgr == nil {
+		return
+	}
+	if ss.frag == nil && !ss.segMode {
+		// 群聊/不支持流式的平台：推理留在 pendingReasoning 缓冲，flush()
+		// 也不发，答案连同推理前缀由 RespondStage 全文发送。
 		return
 	}
 	logger.Debug("stream reasoning segment send: %.300s", text)
@@ -2706,6 +2747,8 @@ func (ss *streamSender) flush() {
 		}
 	}
 	// 推理尾缓冲（末尾无句读符的残段）单独收尾，避免推理内容漏发。
+	// 群聊/不支持流式的平台（frag==nil && !segMode）sendReasoningSegment
+	// 门控直接丢弃，不置 sent；答案由 RespondStage 全文发送。
 	if ss.pendingReasoning.Len() > 0 {
 		ss.sendReasoningSegment(ss.pendingReasoning.String())
 		ss.pendingReasoning.Reset()
@@ -2760,8 +2803,12 @@ func (s *ProcessStage) recordProviderCall(providerCfg map[string]interface{}, um
 	if s.database == nil || resp == nil || resp.Role == "err" {
 		return
 	}
-	providerID, _ := providerCfg["id"].(string)
-	model, _ := providerCfg["model"].(string)
+	providerID := ""
+	model := ""
+	if providerCfg != nil {
+		providerID, _ = providerCfg["id"].(string)
+		model, _ = providerCfg["model"].(string)
+	}
 	// 通过回退取值接口读取 usage，缺失时返回 0，避免 nil 解引用。
 	input := resp.UsageInput()
 	output := resp.UsageOutput()
@@ -4226,16 +4273,23 @@ func (s *ProcessStage) ensureSandboxStarted(ctx context.Context, sessionID strin
 	return err
 }
 
+// providerSettingsCopy 返回 provider_settings 的浅拷贝（M-21：每请求内的
+// 写入如 persona 不得污染并发请求共享读的配置）。
+func providerSettingsCopy(cfg map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	if ps, ok := cfg["provider_settings"].(map[string]interface{}); ok {
+		for k, v := range ps {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // resolveProvider picks the provider config to use for this chat.
 func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]interface{}, error) {
 	providers, _ := s.config["provider"].([]interface{})
 	// Copy the shared provider_settings map so per-request writes (e.g. persona below) never mutate the shared config that other concurrent requests read (M-21). Only the top level is written by callers, so a shallow copy is sufficient.
-	providerSettings := map[string]interface{}{}
-	if ps, ok := s.config["provider_settings"].(map[string]interface{}); ok {
-		for k, v := range ps {
-			providerSettings[k] = v
-		}
-	}
+	providerSettings := providerSettingsCopy(s.config)
 
 	selected := ""
 	if s.providerConf != nil {
@@ -4253,10 +4307,15 @@ func (s *ProcessStage) resolveProvider() (map[string]interface{}, map[string]int
 			}
 		}
 	}
-	// Fallback: first enabled provider
+	// Fallback: first enabled provider. 排除遗留 agent_runner 类型条目（对齐
+	// dashboard handlers.go 的 list_providers 过滤）：CreateProvider 不认识
+	// "agent_runner" 类型，选中会报 unknown provider type。
 	for _, p := range providers {
 		pc, ok := p.(map[string]interface{})
 		if !ok {
+			continue
+		}
+		if pt, _ := pc["provider_type"].(string); pt == "agent_runner" {
 			continue
 		}
 		if enable, _ := pc["enable"].(bool); enable {
@@ -4271,11 +4330,11 @@ func (s *ProcessStage) applySelectedProviderModel(event *core.Event, providerCfg
 	if event.Metadata == nil {
 		return providerCfg
 	}
-	selProvider, _ := event.Metadata["selected_provider"].(string)
-	selModel, _ := event.Metadata["selected_model"].(string)
-	if selProvider == "" && selModel == "" {
+	if !selectedProviderModelSet(event) {
 		return providerCfg
 	}
+	selProvider, _ := event.Metadata["selected_provider"].(string)
+	selModel, _ := event.Metadata["selected_model"].(string)
 	pc := make(map[string]interface{}, len(providerCfg)+1)
 	for k, v := range providerCfg {
 		pc[k] = v
@@ -4292,6 +4351,16 @@ func (s *ProcessStage) applySelectedProviderModel(event *core.Event, providerCfg
 		pc["model"] = selModel
 	}
 	return pc
+}
+
+// selectedProviderModelSet 报告本次事件是否携带 WebUI 的 provider/model 显式选择。
+func selectedProviderModelSet(event *core.Event) bool {
+	if event == nil || event.Metadata == nil {
+		return false
+	}
+	sp, _ := event.Metadata["selected_provider"].(string)
+	sm, _ := event.Metadata["selected_model"].(string)
+	return sp != "" || sm != ""
 }
 
 // conversationHistory converts conversation history to LLM context messages. The history slice is shallow-copied so a concurrent AppendHistory (from another message racing the same session) can never mutate the slice the LLM is reading. When provider_settings.max_context_length is set (>0), the history is truncated to the most recent 2*max_context_length entries, keeping user/assistant message pairs together, and a short system hint notes that older history was dropped. maybeCompressContext applies context-limit handling: token-based detection with either llm_compress (LLM summary + keep-recent) or truncate_by_turns. Mirrors Python's context manager (astr_main_agent + agent/context/compressor).

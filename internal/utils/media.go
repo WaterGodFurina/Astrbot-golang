@@ -301,6 +301,26 @@ func TempFilePath(suffix string) string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("astrbot_%d_%s", time.Now().UnixNano(), suffix))
 }
 
+// TempCleanupDelay 是托管临时文件的默认清理延迟：消息在事件总线中同步/异步
+// 处理，回复在数十秒内完成，延迟删除保证媒体在消费期间可用。声明为变量是
+// 为了让测试可以把延时调小（与 lark/mattermost 各包内的同名常量语义一致）。
+var TempCleanupDelay = 30 * time.Minute
+
+// ScheduleTempCleanup 在延迟后删除项目托管的临时文件。供 discord/satori/
+// misskey 等入站语音场景复用（对齐 lark 包 scheduleTempCleanup /
+// mattermost 包 scheduleAttachmentCleanup 的现成模式），延迟取
+// TempCleanupDelay（测试可调小）。
+func ScheduleTempCleanup(path string) {
+	if path == "" {
+		return
+	}
+	time.AfterFunc(TempCleanupDelay, func() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			logger.Debug("清理临时文件失败 %s: %v", path, err)
+		}
+	})
+}
+
 // SaveBase64ToFile saves base64-encoded data to a file.
 func SaveBase64ToFile(b64, path string) error {
 	data, err := base64.StdEncoding.DecodeString(b64)

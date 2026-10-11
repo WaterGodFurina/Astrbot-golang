@@ -7,6 +7,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -158,8 +159,16 @@ func (r *Runner) Run(ctx context.Context, req *provider.ProviderRequest, onDelta
 		return nil
 	})
 	if streamErr != nil && streamErr != errStop {
-		if ctx.Err() == context.DeadlineExceeded {
+		// 对齐 Python：超时发生在 StreamRun 内部派生的 reqCtx（WithTimeout）上，
+		// 父 ctx.Err() 恒为 nil，必须检查返回的 streamErr（问题 C：此前检查父
+		// ctx 导致部分结果+timedOut 路径不可达）。net/http 对超时读的返回错误
+		// 经 Unwrap 链可被 errors.Is(context.DeadlineExceeded) 命中。
+		// 对齐 py deerflow_agent_runner.py except (asyncio.TimeoutError,
+		// TimeoutError) 语义：超时返回部分结果并标注 timed_out（role=err）。
+		// 仅当父 ctx 未取消（非用户主动中断）时才视为超时降级，否则原样报错。
+		if isStreamTimeout(streamErr) && ctx.Err() == nil {
 			state.timedOut = true
+			r.logf("DeerFlow stream timed out after %ds; returning partial result.", int(r.timeout.Seconds()))
 		} else {
 			return nil, streamErr
 		}
@@ -448,6 +457,23 @@ func fingerprintMessage(message map[string]interface{}) string {
 
 // errStop 内部哨兵。
 var errStop = fmt.Errorf("deerflow: stop")
+
+// isStreamTimeout 判定流式请求错误是否由超时引起（对齐 Python
+// except (asyncio.TimeoutError, TimeoutError) 的捕获语义）。
+// StreamRun 内部 reqCtx 超时后，net/http 读取 body 返回的错误经 Unwrap 链
+// 可被 errors.Is 命中 context.DeadlineExceeded；同时兜底匹配常见超时错误
+// 文本（如 Client.Timeout exceeded），避免 SDK/transport 包装差异漏判。
+func isStreamTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Client.Timeout exceeded") ||
+		strings.Contains(msg, "context deadline exceeded")
+}
 
 // 供参数类型转换。
 func coerceInt(v interface{}, def int) int {

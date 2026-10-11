@@ -3283,34 +3283,11 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		if err := r.ParseMultipartForm(64 << 20); err == nil {
-			if r.MultipartForm != nil {
-				for k, vs := range r.MultipartForm.Value {
-					// multipart 表单字段同样可能承载 api_key/key/token
-					// 凭据，必须与 URL query 一样剥离后再转发。
-					if pluginProxyBlockedQuery(k) {
-						continue
-					}
-					req.Query[k] = append(req.Query[k], vs...)
-				}
-				for field, fhs := range r.MultipartForm.File {
-					for _, fh := range fhs {
-						f, ferr := fh.Open()
-						if ferr != nil {
-							continue
-						}
-						content, rerr := io.ReadAll(io.LimitReader(f, 64<<20))
-						_ = f.Close()
-						if rerr != nil {
-							continue
-						}
-						req.Files = append(req.Files, pluginsdk.WebUploadFile{
-							Field:       field,
-							Filename:    fh.Filename,
-							ContentType: fh.Header.Get("Content-Type"),
-							Content:     content,
-						})
-					}
-				}
+			if !collectPluginWebProxyMultipart(r, &req) {
+				// 与历史实现保持一致：超过 64MB 的文件/字段值直接返回 413，
+				// 避免静默截断后把不完整数据转发给插件造成数据损坏。
+				writeJSON(w, http.StatusRequestEntityTooLarge, apiError("文件过大（上限 64MB）"))
+				return
 			}
 		}
 	} else {
@@ -3336,6 +3313,58 @@ func (s *Server) handlePluginWebProxy(w http.ResponseWriter, r *http.Request, pl
 	// #nosec no-direct-write-to-responsewriter -- 插件 Web API 代理：原样透传插件
 	//（管理员安装的受信任扩展）的响应头与响应体，对应 Python register_web_api，非未转义用户输入。
 	_, _ = w.Write(resp.Body) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
+}
+
+// pluginWebProxyMaxPartSize 为插件 Web API 代理单个 multipart 文件/字段值的
+// 上限（64MB，对齐 ParseMultipartForm 的内存阈值语义）。
+const pluginWebProxyMaxPartSize = 64 << 20
+
+// collectPluginWebProxyMultipart 把已解析的 multipart 表单（Value + File）
+// 收集进插件 Web 请求：字段值进 Query（剥离凭据键），文件进 Files。
+// 返回 false 表示存在超过 pluginWebProxyMaxPartSize 的文件/字段值——调用方
+// 必须返回 413，绝不能把被截断的不完整数据继续转发给插件（数据损坏）。
+func collectPluginWebProxyMultipart(r *http.Request, req *pluginsdk.HandleWebRequest) bool {
+	if r.MultipartForm == nil {
+		return true
+	}
+	for k, vs := range r.MultipartForm.Value {
+		// multipart 表单字段同样可能承载 api_key/key/token
+		// 凭据，必须与 URL query 一样剥离后再转发。
+		if pluginProxyBlockedQuery(k) {
+			continue
+		}
+		for _, v := range vs {
+			if len(v) > pluginWebProxyMaxPartSize {
+				return false
+			}
+			req.Query[k] = append(req.Query[k], v)
+		}
+	}
+	for field, fhs := range r.MultipartForm.File {
+		for _, fh := range fhs {
+			f, ferr := fh.Open()
+			if ferr != nil {
+				continue
+			}
+			// 多读 1 字节用于探测超限：LimitReader(64MB+1) 后长度 >64MB
+			// 即视为超限（读满 64MB 时无法区分"恰好 64MB"与"被截断"）。
+			content, rerr := io.ReadAll(io.LimitReader(f, pluginWebProxyMaxPartSize+1))
+			_ = f.Close()
+			if rerr != nil {
+				continue
+			}
+			if len(content) > pluginWebProxyMaxPartSize {
+				return false
+			}
+			req.Files = append(req.Files, pluginsdk.WebUploadFile{
+				Field:       field,
+				Filename:    fh.Filename,
+				ContentType: fh.Header.Get("Content-Type"),
+				Content:     content,
+			})
+		}
+	}
+	return true
 }
 
 func (s *Server) handlePluginDocs(w http.ResponseWriter, r *http.Request, subprocess func(string) string) {

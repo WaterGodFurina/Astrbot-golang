@@ -102,9 +102,14 @@ func resolveProviderFromConfig(config map[string]interface{}, explicitID string)
 			}
 		}
 	}
+	// 首个 enabled 提供商回退：排除遗留 agent_runner 类型条目（对齐
+	// dashboard list_providers 过滤），避免 CreateProvider 报 unknown type。
 	for _, p := range providers {
 		pc, ok := p.(map[string]interface{})
 		if !ok {
+			continue
+		}
+		if pt, _ := pc["provider_type"].(string); pt == "agent_runner" {
 			continue
 		}
 		if enable, _ := pc["enable"].(bool); enable {

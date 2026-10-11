@@ -2141,6 +2141,14 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(data) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
 			return
 		}
+		// 外部目录存在但资产缺失时**不回落 embedded**：embedded 产物可能与
+		// 外部目录版本不一致，静默服务旧版本资产会引发「index.html 引用的
+		// 内容哈希资源不存在」类错配。资产（/assets/* 等具体文件）直接 404；
+		// 非资产路径交由下方 embedded 分支的 SPA fallback（index.html）处理。
+		if isStaticAssetPath(cleanPath) {
+			http.NotFound(w, r)
+			return
+		}
 	}
 
 	// Fall back to embedded dist directory

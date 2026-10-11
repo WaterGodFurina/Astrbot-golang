@@ -2028,6 +2028,9 @@ func (s *ProcessStage) registerToolImage(event *core.Event, rawB64, mime, toolNa
 
 // providerSupportsImages mirrors py's modalities gate: empty list = unconfigured = assume image input is supported.
 func providerSupportsImages(providerCfg map[string]interface{}) bool {
+	if providerCfg == nil {
+		return true
+	}
 	mods := providerModalities(providerCfg)
 	if len(mods) == 0 {
 		return true

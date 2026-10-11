@@ -314,6 +314,8 @@ func createFileComponent(fileInfo map[string]interface{}) (message.Component, st
 // materializeAudioWav 下载远程音频并转 wav，返回本地 wav 路径；
 // 下载/转码失败返回空字符串（调用方降级为原 URL）。
 // 对齐 Python MediaResolver(...).to_path(target_format="wav")。
+// 输出 wav 经 utils.TempFilePath 落盘，此处注册延迟清理防止泄漏；
+// 失败降级路径不受影响。
 func materializeAudioWav(rawURL string) string {
 	if rawURL == "" {
 		return ""
@@ -344,10 +346,13 @@ func materializeAudioWav(rawURL string) string {
 		return ""
 	}
 	if wavPath == inPath {
-		// 输入已是 wav：直接把临时文件作为结果返回。
+		// 输入已是 wav：直接把临时文件作为结果返回，同样注册清理。
+		utils.ScheduleTempCleanup(wavPath)
 		return wavPath
 	}
 	_ = os.Remove(inPath)
+	// 转码产物（EnsureWAV 产生的新 wav）此前无人回收，注册延迟清理。
+	utils.ScheduleTempCleanup(wavPath)
 	return wavPath
 }
 
