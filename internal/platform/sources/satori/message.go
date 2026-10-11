@@ -886,6 +886,8 @@ func imageToDataURL(img *message.Image) (string, error) {
 
 // materializeAudioWav 下载远程音频并转 wav，返回本地 wav 路径；
 // 下载/转码失败返回空字符串（调用方降级为原 URL）。
+// 输出 wav 经 utils.TempFilePath 落盘，此处注册延迟清理防止泄漏；
+// 失败降级路径不受影响。
 func materializeAudioWav(src string) string {
 	if src == "" {
 		return ""
@@ -914,9 +916,13 @@ func materializeAudioWav(src string) string {
 		return ""
 	}
 	if wavPath == inPath {
+		// 输入已是 wav：临时文件直接作为结果返回，同样注册清理。
+		utils.ScheduleTempCleanup(wavPath)
 		return wavPath
 	}
 	_ = os.Remove(inPath)
+	// 转码产物（EnsureWAV 产生的新 wav）此前无人回收，注册延迟清理。
+	utils.ScheduleTempCleanup(wavPath)
 	return wavPath
 }
 

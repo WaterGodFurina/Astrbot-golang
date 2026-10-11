@@ -77,8 +77,10 @@ type Adapter struct {
 
 	// sessionGroup 记录会话是否为群聊（ConvID → isGroup），供流式输出判断
 	// 能否使用 sendMessageDraft（仅私聊，本体 tg_event.py:606-614）。
+	// 值带更新时间戳，入口惰性清理超过 sessionGroupTTL 未更新的条目，
+	// 防止按会话数无界增长。
 	sessionMu    sync.Mutex
-	sessionGroup map[string]bool
+	sessionGroup map[string]*sessionGroupEntry
 
 	// drafts 记录进行中的私聊草稿流（合成 msgID → 草稿信息）。
 	draftsMu    sync.Mutex
@@ -471,15 +473,26 @@ func (a *Adapter) StreamEnd(sessionID, msgID, text string) error {
 	return a.editStreamText(chatID, threadID, msgID, text)
 }
 
+// sessionGroupEntry 记录会话的群聊标记及其最近更新时间。
+type sessionGroupEntry struct {
+	isGroup bool
+	// updatedAt 供惰性清扫判断条目是否过期。
+	updatedAt time.Time
+}
+
+// sessionGroupTTL 是 sessionGroup 条目的保留时限：超过该时间未随入站消息
+// 刷新的会话条目在 publishMsg 入口顺带清理（惰性清扫，无额外 goroutine）。
+const sessionGroupTTL = 24 * time.Hour
+
 // sessionIsGroup 返回会话是否为群聊（未知默认按群聊处理，走更稳妥的 edit）。
 func (a *Adapter) sessionIsGroup(sessionID string) bool {
 	a.sessionMu.Lock()
 	defer a.sessionMu.Unlock()
-	isGroup, ok := a.sessionGroup[sessionID]
+	entry, ok := a.sessionGroup[sessionID]
 	if !ok {
 		return true
 	}
-	return isGroup
+	return entry.isGroup
 }
 
 // tgDraft 记录进行中的私聊草稿流。
@@ -487,9 +500,28 @@ type tgDraft struct {
 	chatID   string
 	threadID string
 	draftID  int
+	// createdAt 是草稿登记时间，供惰性清扫孤儿条目（流中途异常终止——
+	// ctx 取消 / flush 片段失败——时 takeDraft 不会被调用，条目会残留）。
+	createdAt time.Time
 }
 
 const tgDraftIDMax = 1<<31 - 1
+
+// draftOrphanTTL 是草稿孤儿条目的存活上限。正常流式回复在数十秒内结束，
+// 超过该时限仍未被 takeDraft 取走的条目视为泄漏（StreamEnd 未达成的异常
+// 路径），在 startDraft 入口顺带惰性清理，避免 map 只增不减。
+const draftOrphanTTL = 30 * time.Minute
+
+// sweepOrphanDrafts 清理超过 draftOrphanTTL 未被取走的孤儿草稿条目。
+// 调用方需持有 a.draftsMu。在 startDraft 入口顺带执行（惰性清扫），
+// 不额外引入 goroutine 或定时器。
+func (a *Adapter) sweepOrphanDrafts(now time.Time) {
+	for msgID, d := range a.drafts {
+		if now.Sub(d.createdAt) > draftOrphanTTL {
+			delete(a.drafts, msgID)
+		}
+	}
+}
 
 // startDraft 分配 draft_id、登记映射并发送首帧草稿。
 func (a *Adapter) startDraft(chatID, threadID, text string) (string, error) {
@@ -497,13 +529,15 @@ func (a *Adapter) startDraft(chatID, threadID, text string) (string, error) {
 	if a.drafts == nil {
 		a.drafts = map[string]*tgDraft{}
 	}
+	// 惰性清扫：借每次新草稿登记顺带清理历史泄漏的孤儿条目。
+	a.sweepOrphanDrafts(time.Now())
 	a.nextDraftID++
 	if a.nextDraftID <= 0 || a.nextDraftID > tgDraftIDMax {
 		a.nextDraftID = 1
 	}
 	draftID := a.nextDraftID
 	msgID := fmt.Sprintf("tg-draft-%d", draftID)
-	d := &tgDraft{chatID: chatID, threadID: threadID, draftID: draftID}
+	d := &tgDraft{chatID: chatID, threadID: threadID, draftID: draftID, createdAt: time.Now()}
 	a.drafts[msgID] = d
 	a.draftsMu.Unlock()
 
@@ -1416,11 +1450,18 @@ func (a *Adapter) publishMsg(m *tgMsg) {
 	a.sendChatAction(m.ChatID, threadID, chatActionForChain(m.Chain))
 
 	// 记录会话类型，供流式输出判断是否可用 sendMessageDraft（仅私聊）。
+	// 写入口顺带惰性清理超期条目，防止 map 随会话数无界增长。
 	a.sessionMu.Lock()
 	if a.sessionGroup == nil {
-		a.sessionGroup = map[string]bool{}
+		a.sessionGroup = map[string]*sessionGroupEntry{}
 	}
-	a.sessionGroup[m.SessionID] = m.IsGroup
+	now := time.Now()
+	for id, e := range a.sessionGroup {
+		if now.Sub(e.updatedAt) > sessionGroupTTL {
+			delete(a.sessionGroup, id)
+		}
+	}
+	a.sessionGroup[m.SessionID] = &sessionGroupEntry{isGroup: m.IsGroup, updatedAt: now}
 	a.sessionMu.Unlock()
 
 	rawJSONStr := ""

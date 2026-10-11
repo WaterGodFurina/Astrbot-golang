@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -38,10 +39,14 @@ func (e *APIError) Error() string {
 type APIClient struct {
 	apiBase string
 	headers map[string]string
+	proxy   string
 	http    *http.Client
 }
 
 // NewAPIClient 构造。api_base 默认 http://127.0.0.1:2026。
+// proxy 对齐 Python：ClientSession(trust_env=True) + session.post(proxy=...)
+// 语义——配置非空时该客户端的所有请求经此代理；为空时直连
+// （hc.Transport 为 nil 时走 http.DefaultTransport，跟随宿主全局代理配置）。
 func NewAPIClient(apiBase, apiKey, authHeader, proxy string, hc *http.Client) *APIClient {
 	if apiBase == "" {
 		apiBase = "http://127.0.0.1:2026"
@@ -52,10 +57,32 @@ func NewAPIClient(apiBase, apiKey, authHeader, proxy string, hc *http.Client) *A
 	} else if apiKey != "" {
 		headers["Authorization"] = "Bearer " + apiKey
 	}
+	proxy = strings.TrimSpace(proxy)
 	if hc == nil {
 		hc = &http.Client{}
 	}
-	return &APIClient{apiBase: strings.TrimRight(apiBase, "/"), headers: headers, http: hc}
+	// 配置了代理时显式构造 Transport，优先级高于调用方传入的 hc.Transport
+	// （对齐 py：proxy 参数显式传给每个请求）。
+	if u, err := url.Parse(proxy); err == nil && u.Scheme != "" && u.Host != "" {
+		base := http.DefaultTransport
+		if hc.Transport != nil {
+			base = hc.Transport
+		}
+		tr, ok := base.(*http.Transport)
+		if !ok {
+			// DefaultTransport 被替换为非 *http.Transport 时退回克隆官方默认。
+			if dt, ok2 := http.DefaultTransport.(*http.Transport); ok2 {
+				tr = dt.Clone()
+			} else {
+				tr = &http.Transport{ForceAttemptHTTP2: true}
+			}
+		} else {
+			tr = tr.Clone()
+		}
+		tr.Proxy = http.ProxyURL(u)
+		hc.Transport = tr
+	}
+	return &APIClient{apiBase: strings.TrimRight(apiBase, "/"), headers: headers, proxy: proxy, http: hc}
 }
 
 // Close 对齐接口。

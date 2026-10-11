@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"syscall"
 	"unsafe"
 
@@ -26,7 +27,26 @@ import (
 // Go values): requests are the SDK native `native.CABI*Request` envelopes,
 // responses are the JSON of the SDK native result types (sdk.PluginInfo,
 // sdk.HandleCommandResult, ...). No protobuf, no gRPC, no JSON event plane.
-func openNativePlugin(path, pluginID string) (pluginsdk.PluginClient, func() error, error) {
+//
+// 崩溃隔离：AstrBotPluginOpen 内部会执行 SDK 侧的插件登记（含插件包 init
+// 链在 LoadDLL 时已跑），Go 层 panic 在此 recover 转为错误返回，避免击落宿主。
+// 注意：跨 C ABI 的段错误（DLL 内部 SIGSEGV）无法被 recover 捕获，那是 Native
+// 运行方式固有的隔离边界，只能靠重启宿主恢复。
+func openNativePlugin(path, pluginID string) (client pluginsdk.PluginClient, cleanup func() error, err error) {
+	defer func() {
+		// panic → error：失败路径已 Release 的 DLL 不再重复释放；尚未走到
+		// Release 的（LoadDLL 成功后 panic）由下方各失败分支负责，这里只需
+		// 保证不向宿主传播 panic。
+		if r := recover(); r != nil {
+			client, cleanup, err = nil, nil, fmt.Errorf("native plugin %s panic: %v\n%s", path, r, debug.Stack())
+		}
+	}()
+	return openNativePluginRaw(path, pluginID)
+}
+
+// openNativePluginRaw is openNativePlugin's body without the recover wrapper,
+// so its early-return branches keep their plain (client, cleanup, err) shape.
+func openNativePluginRaw(path, pluginID string) (pluginsdk.PluginClient, func() error, error) {
 	dll, err := syscall.LoadDLL(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("LoadDLL(%s): %w", path, err)

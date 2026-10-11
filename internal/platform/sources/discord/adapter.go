@@ -23,6 +23,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/platform"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
 
@@ -340,6 +341,8 @@ func (a *Adapter) convertMessage(s *discordgo.Session, msg *discordgo.Message) *
 // discordAudioComponent 将入站语音附件转成 wav 并落地为本地临时文件，
 // 对齐 Python 入站语音 MediaResolver(target_format="wav") 行为：
 // 下载字节 → convertAudioToWav → 写临时文件；任一步失败都降级为原 URL。
+// 临时文件注册到 utils.ScheduleTempCleanup 延迟删除（此前经 os.CreateTemp("")
+// 落在系统临时目录且无人回收，每条语音泄漏一个文件）。
 func (a *Adapter) discordAudioComponent(url string) *message.Record {
 	fallback := &message.Record{URL: url, File: url}
 	data := a.recordAudioData(url, "", "")
@@ -361,6 +364,8 @@ func (a *Adapter) discordAudioComponent(url string) *message.Record {
 		_ = os.Remove(path)
 		return fallback
 	}
+	// 发布后延迟清理，保证管线/ASR 在消费期间文件可用。
+	utils.ScheduleTempCleanup(path)
 	return &message.Record{URL: url, File: path, Path: path}
 }
 

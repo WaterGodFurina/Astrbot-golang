@@ -256,6 +256,8 @@ func (r *Runner) Run(ctx context.Context, req *provider.ProviderRequest, onDelta
 		return nil, fmt.Errorf("未知的 Dify API 类型：%s", r.apiType)
 	}
 
+	// 对齐 Python：结果为空时 log warning 且不 append（空串 Chat 结果 py 返回
+	// 仅含空 Plain 的 chain；nil 的 "<nil>" 问题在 parseResult 内统一防护）。
 	if result == nil || result == "" {
 		r.logf("Dify 请求结果为空，请查看 Debug 日志。")
 	}
@@ -269,6 +271,12 @@ func (r *Runner) Run(ctx context.Context, req *provider.ProviderRequest, onDelta
 
 // parseResult 对齐 Python parse_dify_result。
 func (r *Runner) parseResult(ctx context.Context, result interface{}) (*message.MessageChain, error) {
+	// 防 "<nil>"：result 为 nil（如 workflow 流结束却无 workflow_finished 事件）
+	// 时 default 分支 fmt.Sprint(nil) 会生成 "<nil>" 文本发给用户；对齐 Python
+	// 结果为空的语义——log warning 且不 append，返回空 chain。
+	if result == nil {
+		return &message.MessageChain{Chain: []message.Component{}}, nil
+	}
 	chain := message.NewMessageChain()
 	switch v := result.(type) {
 	case string:
@@ -287,16 +295,16 @@ func (r *Runner) parseResult(ctx context.Context, result interface{}) (*message.
 			chain.Append(&message.Plain{Text: out})
 		case []interface{}:
 			// 主要适配 Dify HTTP 请求结点的多模态输出。
-			appended := false
+			// 对齐 Python parse_dify_result 的列表分支：全部为 dify file 时
+			// py 同样什么都不 append（该分支仅处理"非文件项"的兜底），因此
+			// 纯文件列表内容为空，最终文本由 data.files 补充（见下方 scan files）。
 			for _, item := range out {
 				im, ok := item.(map[string]interface{})
 				if !ok || im["dify_model_identity"] != "__dify__file__" {
 					chain.Append(&message.Plain{Text: fmt.Sprint(out)})
-					appended = true
 					break
 				}
 			}
-			_ = appended
 		default:
 			if output != nil {
 				chain.Append(&message.Plain{Text: fmt.Sprint(output)})
