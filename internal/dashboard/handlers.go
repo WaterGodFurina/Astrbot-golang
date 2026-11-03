@@ -2022,6 +2022,20 @@ func (s *Server) setBotEnabled(w http.ResponseWriter, r *http.Request) {
 // deleteBot handles DELETE /api/v1/bots/delete.
 func (s *Server) deleteBot(w http.ResponseWriter, r *http.Request) {
 	botID := r.URL.Query().Get("bot_id")
+	// 4.29.4：可选选择性清理该实例的数据（cleanup 可重复，如 ?cleanup=conversations&cleanup=message_history）。
+	targets := map[string]bool{}
+	for _, t := range r.URL.Query()["cleanup"] {
+		if t != "" {
+			targets[t] = true
+		}
+	}
+	if len(targets) > 0 && s.database != nil {
+		if _, err := s.database.CleanupBotData(botID, targets); err != nil {
+			logger.I18nWarn("清理机器人数据 %s 失败: %v", botID, err)
+			writeJSON(w, http.StatusInternalServerError, apiError("清理机器人数据失败: "+err.Error()))
+			return
+		}
+	}
 	if err := s.deleteBotByID(botID); err != nil {
 		logger.I18nWarn("删除机器人 %s 失败: %v", botID, err)
 		writeJSON(w, http.StatusInternalServerError, apiError("删除失败"))
@@ -2286,8 +2300,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, parts []s
 			return
 		}
 		writeJSON(w, http.StatusOK, apiOK(market))
-	case "page":
+	case "page", "view":
 		// 插件自带页面入口（对齐 Python get_plugin_page_entry_config）。
+		// 4.29.0 起 WebUI 改用 views 语义（GET /plugins/view?plugin_id=&page_name=），
+		// 与 pages 入口同构，故复用同一处理函数。
 		s.handlePluginPage(w, r)
 	case "page-content":
 		// 插件页面资产。请求已由 apiAuthAllowed 用 asset_token / 专用
@@ -4153,7 +4169,9 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request, parts []
 			"sessions": convs,
 		}))
 	case "active-umos":
-		writeJSON(w, http.StatusOK, apiOK(s.getActiveUMOs()))
+		writeJSON(w, http.StatusOK, apiOK(s.getActiveUMOs(r.URL.Query().Get("platform_id"))))
+	case "senders":
+		s.handleSessionSenders(w, r)
 	case "provider":
 		if r.Method == http.MethodPatch {
 			s.batchUpdateSessionProvider(w, r)
@@ -4187,6 +4205,50 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request, parts []
 	default:
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
+}
+
+// handleSessionSenders serves GET /api/v1/sessions/senders (4.29.4): sender
+// suggestions for ID selection, backed by the umo_senders table.
+func (s *Server) handleSessionSenders(w http.ResponseWriter, r *http.Request) {
+	if s.database == nil {
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"senders": []interface{}{}}))
+		return
+	}
+	q := r.URL.Query()
+	search := q.Get("search")
+	limit := 50
+	if v, err := strconv.Atoi(q.Get("limit")); err == nil && v >= 1 && v <= 100 {
+		limit = v
+	}
+	page := 1
+	if v, err := strconv.Atoi(q.Get("page")); err == nil && v >= 1 {
+		page = v
+	}
+	var senderIDs []string
+	if raw, ok := q["sender_ids"]; ok && len(raw) > 0 {
+		senderIDs = raw
+	}
+	rows, err := s.database.GetUmoSenders(search, limit, senderIDs, (page-1)*limit)
+	if err != nil {
+		writeJSON(w, http.StatusOK, apiError("获取发送者列表失败: "+err.Error()))
+		return
+	}
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, map[string]interface{}{
+			"umo":         row.UMO,
+			"sender_id":   row.SenderID,
+			"sender_name": row.SenderName,
+			"auto_name":   row.AutoName,
+			"user_alias":  row.UserAlias,
+			"updated_at":  row.UpdatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+		"senders": out,
+		"page":    page,
+		"limit":   limit,
+	}))
 }
 
 // conversationManager returns the conversation manager or nil.
@@ -5075,6 +5137,9 @@ func builtinToolNames() []string {
 		"web_search_tavily", "web_search_baidu", "web_search_bocha",
 		"web_search_brave", "web_search_exa", "web_search_firecrawl",
 		"web_search_anysearch",
+		"web_search_serpapi", "news_search_serpapi", "image_search_serpapi",
+		"finance_search_serpapi", "scholar_search_serpapi",
+		"web_search_deepseek", "deepseek_fetch_web_page",
 		"tavily_extract_web_page", "firecrawl_extract_web_page", "exa_get_contents",
 		"send_message_to_user", "get_group_message_history", "future_task",
 		"astr_kb_search",
@@ -5588,6 +5653,8 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request, parts []stri
 		}))
 	case "live":
 		s.handleLogStream(w, r)
+	case "export":
+		s.handleLogExport(w, r)
 	default:
 		writeJSON(w, http.StatusOK, apiOK([]string{}))
 	}
@@ -7938,7 +8005,15 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request, parts []str
 		}
 		writeJSON(w, http.StatusNotFound, apiError("文件令牌无效"))
 	case "upload":
-		// 兼容 /api/v1/files/upload 写法。
+		// 4.29.0：/files/upload/{init,chunk,complete,abort,status} 分片上传；
+		// 无子路径时兼容单请求上传 /api/v1/files/upload。
+		if len(parts) > 1 {
+			switch parts[1] {
+			case "init", "chunk", "complete", "abort", "status":
+				s.handleChunkedUpload(w, r, parts[1])
+				return
+			}
+		}
 		if r.Method == http.MethodPost {
 			s.uploadWebUIFile(w, r)
 			return
@@ -11121,7 +11196,41 @@ func (s *Server) handleTrace(w http.ResponseWriter, r *http.Request, parts []str
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
 			"trace_enable": traceEnabled,
 		}))
+	case "history":
+		// 4.29.2：分页列出持久化 trace 记录（需 trace_enable 且存储已打开）。
+		if s.traceStore == nil {
+			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{"traces": []interface{}{}, "page": 1, "limit": 50}))
+			return
+		}
+		limit := 50
+		if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v >= 1 {
+			limit = min(v, 100)
+		}
+		page := 1
+		if v, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && v >= 1 {
+			page = v
+		}
+		rows, err := s.traceStore.ListTraces(limit, (page-1)*limit)
+		if err != nil {
+			writeJSON(w, http.StatusOK, apiError("读取 trace 历史失败: "+err.Error()))
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+			"traces": rows,
+			"page":   page,
+			"limit":  limit,
+		}))
 	default:
+		// /trace/{span_id}：返回该 span 的全部记录（按时间升序）。
+		if s.traceStore != nil && sub != "" {
+			if rows, err := s.traceStore.GetTrace(sub); err == nil && len(rows) > 0 {
+				writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{
+					"span_id": sub,
+					"records": rows,
+				}))
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	}
 }

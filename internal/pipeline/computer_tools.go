@@ -25,6 +25,7 @@ import (
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/core"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/knowledgebase"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/procsandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 )
@@ -230,6 +231,190 @@ func (s *ProcessStage) computerAdminDenied(event *core.Event, operation string) 
 		return ""
 	}
 	return "error: Permission denied. " + operation + " is only allowed for admin users. Tell user to set admins in `AstrBot WebUI -> Config -> General Config` by adding their user ID to the admins list if they need this feature. User's ID is: " + event.GetSenderID() + ". User's ID can be found by using /sid command."
+}
+
+// ---- 4.29.0 Local permission policy (role matrix) ----
+
+// LocalPermissionPolicy is the resolved Local computer permission for a caller.
+type LocalPermissionPolicy struct {
+	AllowExecution  bool
+	AllowNetwork    bool
+	FilesystemScope string // "none" | "workspace" | "host"
+}
+
+// RequiresSandbox reports whether execution needs OS-level isolation.
+func (p LocalPermissionPolicy) RequiresSandbox() bool {
+	return !p.AllowNetwork || p.FilesystemScope != "host"
+}
+
+var localExecutionTools = map[string]bool{
+	"astrbot_execute_shell": true, "astrbot_shell_session": true, "astrbot_execute_python": true,
+}
+
+var localFileTools = map[string]bool{
+	"astrbot_file_read_tool": true, "astrbot_file_write_tool": true, "astrbot_file_edit_tool": true,
+	"astrbot_grep_tool": true, "astrbot_upload_file": true, "astrbot_download_file": true,
+}
+
+func (s *ProcessStage) isLocalRuntime() bool {
+	return s.providerConf != nil && s.providerConf.ComputerUseRuntime == "local"
+}
+
+// localPermissionPolicy resolves the Local permission policy for the caller's
+// role (aligned with py v4.29.0 get_local_permission_policy). Unknown roles use
+// the member policy.
+func (s *ProcessStage) localPermissionPolicy(event *core.Event) LocalPermissionPolicy {
+	isAdmin := event.Role == "admin" || event.Source.IsAdmin
+	role := "member"
+	policy := LocalPermissionPolicy{AllowExecution: false, AllowNetwork: false, FilesystemScope: "workspace"}
+	if isAdmin {
+		role = "admin"
+		policy = LocalPermissionPolicy{AllowExecution: true, AllowNetwork: true, FilesystemScope: "host"}
+	}
+
+	var perms map[string]interface{}
+	if s.providerConf != nil {
+		perms = s.providerConf.ComputerUseLocalPermissions
+	}
+	rolePolicy, _ := perms[role].(map[string]interface{})
+	if v, ok := rolePolicy["filesystem_scope"].(string); ok && (v == "none" || v == "workspace" || v == "host") {
+		policy.FilesystemScope = v
+	}
+	if v, ok := rolePolicy["allow_execution"].(bool); ok {
+		policy.AllowExecution = v
+	}
+	if v, ok := rolePolicy["allow_network"].(bool); ok {
+		policy.AllowNetwork = v
+	}
+	// 兼容：配置缺失时，非管理员沿用 computer_use_require_admin 的反义。
+	if perms == nil && role == "member" {
+		requireAdmin := true
+		if s.providerConf != nil && s.providerConf.ComputerUseRequireAdmin != nil {
+			requireAdmin = *s.providerConf.ComputerUseRequireAdmin
+		}
+		if !requireAdmin {
+			policy.AllowExecution = true
+		}
+	}
+	policy.AllowExecution = policy.FilesystemScope != "none" && policy.AllowExecution
+	policy.AllowNetwork = policy.AllowExecution && policy.AllowNetwork
+	return policy
+}
+
+// localToolDenied enforces the Local policy for file/execution tools. Because
+// this Go build has no OS process sandbox, execution that would require one
+// fails closed with a clear message.
+func (s *ProcessStage) localToolDenied(event *core.Event, name string) string {
+	policy := s.localPermissionPolicy(event)
+	if localExecutionTools[name] {
+		if !policy.AllowExecution {
+			return fmt.Sprintf("error: Permission denied. %s is disabled by the Local permission policy for this user role. Enable Local computer access and `Execute code` for this role in AstrBot WebUI -> Config -> AI -> Capabilities -> Agent Computer Use -> Local Permission Policies.", toolDisplayName(name))
+		}
+		if policy.RequiresSandbox() {
+			status := procsandbox.GetProcessSandboxStatus()
+			if status.Status != "detected" {
+				msg := "error: Permission denied. Restricted Local execution is unavailable"
+				if status.Error != "" {
+					msg += ": " + status.Error
+				}
+				return msg + ". Select `Third-party sandbox` under AstrBot WebUI -> Config -> AI -> Capabilities -> Agent Computer Use -> Computer Use Runtime, or grant host execution for this role."
+			}
+		}
+		return ""
+	}
+	if policy.FilesystemScope == "none" {
+		return "error: Permission denied. Local computer tools are disabled for this user role. Enable Local computer access for this role in AstrBot WebUI -> Config -> AI -> Capabilities -> Agent Computer Use -> Local Permission Policies."
+	}
+	return ""
+}
+
+// sandboxSpecFor builds the process-sandbox spec for a local execution call.
+func (s *ProcessStage) sandboxSpecFor(event *core.Event) procsandbox.Spec {
+	policy := s.localPermissionPolicy(event)
+	return procsandbox.Spec{
+		Workspace:         workspaceRoot(event.UnifiedMsgOrigin()),
+		WorkspaceWritable: true,
+		AllowNetwork:      policy.AllowNetwork,
+		FilesystemScope:   policy.FilesystemScope,
+		Limits:            procsandbox.DefaultLimits(),
+	}
+}
+
+// localRequiresSandbox reports whether local execution must run isolated.
+func (s *ProcessStage) localRequiresSandbox(event *core.Event) bool {
+	return s.isLocalRuntime() && s.localPermissionPolicy(event).RequiresSandbox()
+}
+
+// executeSandboxedShell runs a shell command inside the OS process sandbox.
+func (s *ProcessStage) executeSandboxedShell(event *core.Event, command string, background bool, timeout int) string {
+	if strings.TrimSpace(command) == "" {
+		return "Error executing command: `command` must be a non-empty string."
+	}
+	if background {
+		return "Error: background shell sessions are not supported under the Local process sandbox; run a foreground command."
+	}
+	sb, err := procsandbox.CreateProcessSandbox()
+	if err != nil {
+		return "Error executing command: " + err.Error()
+	}
+	if timeout <= 0 {
+		timeout = 300
+	}
+	if timeout > 600 {
+		timeout = 600
+	}
+	res, runErr := sb.Run([]string{"/bin/sh", "-c", command}, s.sandboxSpecFor(event), nil,
+		time.Duration(timeout)*time.Second, maxShellOutput, false)
+	if runErr != nil {
+		if _, ok := runErr.(procsandbox.TimeoutError); ok {
+			return fmt.Sprintf("Error executing command: command timed out after %d seconds.", timeout)
+		}
+		return "Error executing command: " + runErr.Error()
+	}
+	out := string(res.Stdout)
+	if len(res.Stderr) > 0 {
+		if out != "" && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		out += "[stderr]\n" + string(res.Stderr)
+	}
+	if strings.TrimSpace(out) == "" {
+		out = "(no output)"
+	}
+	return fmt.Sprintf("Exit code: %d\n%s", res.ReturnCode, out)
+}
+
+// executeSandboxedPython runs Python code inside the OS process sandbox.
+func (s *ProcessStage) executeSandboxedPython(event *core.Event, code string, timeout int) string {
+	if strings.TrimSpace(code) == "" {
+		return "Error executing code: `code` must be a non-empty string."
+	}
+	sb, err := procsandbox.CreateProcessSandbox()
+	if err != nil {
+		return "Error executing code: " + err.Error()
+	}
+	if timeout <= 0 {
+		timeout = 30
+	}
+	res, runErr := sb.Run([]string{pythonCommand(), "-c", code}, s.sandboxSpecFor(event), nil,
+		time.Duration(timeout)*time.Second, maxShellOutput, false)
+	if runErr != nil {
+		if _, ok := runErr.(procsandbox.TimeoutError); ok {
+			return fmt.Sprintf("Error executing code: timed out after %d seconds.", timeout)
+		}
+		return "Error executing code: " + runErr.Error()
+	}
+	out := string(res.Stdout)
+	if len(res.Stderr) > 0 {
+		if out != "" && !strings.HasSuffix(out, "\n") {
+			out += "\n"
+		}
+		out += string(res.Stderr)
+	}
+	if strings.TrimSpace(out) == "" {
+		out = "(no output)"
+	}
+	return out
 }
 
 // sandboxUploadFile transfers a file FROM the host machine INTO the sandbox

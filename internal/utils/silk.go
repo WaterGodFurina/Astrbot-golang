@@ -114,9 +114,10 @@ func TencentSilkBytesToWAVBytes(silkData []byte, targetRate int) ([]byte, error)
 		targetRate = 24000
 	}
 
-	// 去除可能存在的 QQ/微信 0x02 标记
+	// 去除可能存在的 QQ/微信 0x02 / 0x03 标记（对齐 py v4.29.4
+	// tencent_record_helper：0x02 或 0x03 前缀均需剥离）。
 	cleanData := silkData
-	if cleanData[0] == 0x02 {
+	if cleanData[0] == 0x02 || cleanData[0] == 0x03 {
 		cleanData = cleanData[1:]
 	}
 

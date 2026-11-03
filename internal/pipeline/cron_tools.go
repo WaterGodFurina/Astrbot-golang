@@ -19,7 +19,10 @@ func futureTaskToolSchema() map[string]interface{} {
 				"Use action='create' to schedule a recurring cron task or one-time run_at task. " +
 				"Use action='edit' to update an existing task. " +
 				"Use action='list' to inspect existing tasks. " +
-				"Use action='delete' to remove a task by job_id.",
+				"Use action='delete' to remove a task by job_id. " +
+				"Group members can list all tasks in the current group, including their creators. " +
+				"Only task creators can edit tasks. Group members can delete only their own tasks, " +
+				"while AstrBot admins can also delete other members' tasks in the current group.",
 			"parameters": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -59,8 +62,10 @@ func futureTaskToolSchema() map[string]interface{} {
 	}
 }
 
-// executeFutureTask implements the future_task tool.
-func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, args map[string]interface{}) string {
+// executeFutureTask implements the future_task tool. isGroup/isAdmin drive the
+// 4.29.4 group-sharing rules: group members see every task in the current
+// group; only creators edit; admins may delete others' tasks in the group.
+func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, isGroup, isAdmin bool, args map[string]interface{}) string {
 	if mgr == nil {
 		return "error: cron manager is not available."
 	}
@@ -121,29 +126,64 @@ func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, args map[
 		jobs := mgr.List()
 		var lines []string
 		for _, j := range jobs {
-			// 只列出当前会话当前用户创建的任务，防止泄露其他会话/用户的 note。
-			if !taskOwnedBy(j, umo, senderID) {
+			// 私有会话仍按发送者隔离；群聊内可列出本会话的全部任务（含创建者），
+			// 对齐 py 4.29.4。
+			if !taskOwnedBy(j, umo, senderID) && !(isGroup && jobSession(j) == umo) {
 				continue
 			}
 			next := ""
 			if !j.NextRun.IsZero() {
 				next = j.NextRun.Format(time.RFC3339)
 			}
-			lines = append(lines, fmt.Sprintf("- job_id=%s name=%q cron=%q run_once=%v next_run=%s note=%q",
-				j.ID, j.Name, j.CronExpression, j.RunOnce, next, j.Payload["note"]))
+			line := fmt.Sprintf("- job_id=%s name=%q cron=%q run_once=%v next_run=%s note=%q",
+				j.ID, j.Name, j.CronExpression, j.RunOnce, next, j.Payload["note"])
+			if isGroup {
+				creator := jobSender(j)
+				if creator == "" {
+					creator = "unknown"
+				}
+				line += fmt.Sprintf(" creator=%s", creator)
+			}
+			lines = append(lines, line)
+		}
+		// 私有会话隐藏他人任务时给出说明，避免模型把“被过滤”误判为“任务不存在”。
+		hiddenNote := ""
+		if !isGroup {
+			for _, j := range jobs {
+				if jobSession(j) != umo {
+					continue
+				}
+				if taskOwnedBy(j, umo, senderID) {
+					continue
+				}
+				hiddenNote = "\n\nNote: tasks in this chat that were not created by you are not listed here. Only their creators can edit or delete them."
+				break
+			}
 		}
 		if len(lines) == 0 {
-			return "no future tasks."
+			return "No cron jobs found." + hiddenNote
 		}
-		return strings.Join(lines, "\n")
+		return strings.Join(lines, "\n") + hiddenNote
 	case "delete":
 		jobID := argString(args, "job_id")
 		if jobID == "" {
 			return "error: job_id is required for action=delete."
 		}
-		// 归属校验：只能删除本会话本用户创建的任务。
-		if !taskOwnedBy(mgr.Get(jobID), umo, senderID) {
-			return "error: task not found: " + jobID
+		job := mgr.Get(jobID)
+		if job == nil {
+			return fmt.Sprintf("error: cron job %s not found.", jobID)
+		}
+		sameSession := jobSession(job) == umo
+		canDelete := taskOwnedBy(job, umo, senderID) || (sameSession && isGroup && isAdmin)
+		if !canDelete {
+			if sameSession && jobSender(job) == "" {
+				// Dashboard / legacy 行有会话但无成员创建者，归咎他人不正确。
+				return fmt.Sprintf("error: cron job %s cannot be deleted through the tool.", jobID)
+			}
+			if sameSession && isGroup {
+				return fmt.Sprintf("error: cron job %s was created by another member of this group chat, so you cannot delete it. Only the member who created it or an AstrBot admin can delete it; tell the user to ask that member.", jobID)
+			}
+			return fmt.Sprintf("error: cron job %s was not created by you, so you cannot delete it.", jobID)
 		}
 		mgr.Remove(jobID)
 		return fmt.Sprintf("task deleted: job_id=%s", jobID)
@@ -152,9 +192,20 @@ func executeFutureTask(mgr *cron.CronJobManager, umo, senderID string, args map[
 		if jobID == "" {
 			return "error: job_id is required for action=edit."
 		}
-		// 归属校验：只能修改本会话本用户创建的任务。
-		if !taskOwnedBy(mgr.Get(jobID), umo, senderID) {
+		// 归属校验：只能修改任务创建者本人的任务（4.29.0 细分错误文案）。
+		job := mgr.Get(jobID)
+		if job == nil {
 			return "error: task not found: " + jobID
+		}
+		if !taskOwnedBy(job, umo, senderID) {
+			sameSession := jobSession(job) == umo
+			if sameSession && jobSender(job) == "" {
+				return fmt.Sprintf("error: cron job %s has no chat member as its creator (it was created outside this chat, e.g. from the dashboard), so you cannot edit it here.", jobID)
+			}
+			if sameSession && isGroup {
+				return fmt.Sprintf("error: cron job %s was created by another member of this group chat, so you cannot edit it. Only the member who created it can edit it; tell the user to ask that member.", jobID)
+			}
+			return fmt.Sprintf("error: cron job %s was not created by you, so you cannot edit it. Only whoever created it can edit it.", jobID)
 		}
 		note := strings.TrimSpace(argString(args, "note"))
 		cronExpr := argString(args, "cron_expression")
@@ -213,4 +264,22 @@ func taskOwnedBy(job *cron.Job, umo, senderID string) bool {
 	session, _ := job.Payload["session"].(string)
 	sender, _ := job.Payload["sender_id"].(string)
 	return session == umo && sender == senderID
+}
+
+// jobSession returns the session recorded for a cron job ("" when absent).
+func jobSession(job *cron.Job) string {
+	if job == nil {
+		return ""
+	}
+	s, _ := job.Payload["session"].(string)
+	return s
+}
+
+// jobSender returns the creator sender id recorded for a cron job ("" when absent).
+func jobSender(job *cron.Job) string {
+	if job == nil {
+		return ""
+	}
+	s, _ := job.Payload["sender_id"].(string)
+	return s
 }

@@ -119,6 +119,10 @@ func (s *Server) apiHandler(w http.ResponseWriter, r *http.Request) {
 	case "backups":
 		s.handleBackups(w, r, rest)
 
+	// ── Storage cleanup（4.29.2）─────────────────────────
+	case "storage":
+		s.handleStorage(w, r, rest)
+
 	// ── Cron ──────────────────────────────────────────────
 	case "cron":
 		s.handleCron(w, r, rest)
@@ -313,6 +317,7 @@ var endpointScopeRules = map[string]endpointScope{
 	"updates":      {systemOnly: true},
 	"cron":         {systemOnly: true},
 	"logs":         {systemOnly: true},
+	"storage":      {systemOnly: true},
 	"stat":         {systemOnly: true},
 	"stats":        {systemOnly: true},
 

@@ -486,6 +486,34 @@ func messageToSDKComponentsDepth(chain []message.Component, depth int) []plugins
 			if depth < maxSDKComponentDepth && len(v.Chain) > 0 {
 				pc.Chain = messageToSDKComponentsDepth(v.Chain, depth+1)
 			}
+		case *message.ButtonInteraction:
+			// 4.29.4：宿主用通用字段承载按钮交互（proto 无专用字段）：
+			// id=action_id、text=interaction_id、data={data,source_message_id,
+			// callback_data}。Python SDK 的 component_from_proto 还原为
+			// ButtonInteraction，插件可用 event.get_button_interaction()。
+			pc.ID = v.ActionID
+			pc.Text = v.InteractionID
+			payload := map[string]interface{}{}
+			if v.Data != nil {
+				payload["data"] = v.Data
+			}
+			if v.SourceMessageID != "" {
+				payload["source_message_id"] = v.SourceMessageID
+			}
+			if v.CallbackData != "" {
+				payload["callback_data"] = v.CallbackData
+			}
+			if len(payload) > 0 {
+				pc.Data = payload
+			}
+		case *message.Button:
+			if data, ok := v.ToDict()["data"].(map[string]interface{}); ok {
+				pc.Data = data
+			}
+		case *message.ActionRow:
+			if data, ok := v.ToDict()["data"].(map[string]interface{}); ok {
+				pc.Data = data
+			}
 		}
 		out = append(out, pc)
 	}

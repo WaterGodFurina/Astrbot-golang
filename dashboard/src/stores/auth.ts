@@ -11,7 +11,7 @@ import {
 } from '@/api/v1';
 import { httpClient } from '@/api/http';
 import { getToken, removeToken, setToken } from '@/utils/token';
-import { useCommonStore } from '@/stores/common';
+import { useProviderModelSelection } from '@/composables/useProviderModelSelection';
 
 export const useAuthStore = defineStore("auth", {
   state: () => ({
@@ -183,13 +183,22 @@ export const useAuthStore = defineStore("auth", {
     },
     logout() {
       this.username = '';
-      localStorage.removeItem('user');
-      removeToken();
-      localStorage.removeItem('change_pwd_hint');
-      localStorage.removeItem('md5_pwd_hint');
-      localStorage.removeItem('password_upgrade_required');
-      // 登出后停止日志 SSE，避免后台无限重试
-      useCommonStore().closeEventSource();
+      useProviderModelSelection().setSelection('');
+      try {
+        localStorage.removeItem('user');
+        removeToken();
+        localStorage.removeItem('change_pwd_hint');
+        localStorage.removeItem('md5_pwd_hint');
+        localStorage.removeItem('password_upgrade_required');
+        for (let index = localStorage.length - 1; index >= 0; index--) {
+          const key = localStorage.key(index);
+          if (key?.startsWith('chat.sessionProvider.')) {
+            localStorage.removeItem(key);
+          }
+        }
+      } catch {
+        // Storage availability must not prevent logout or the in-memory reset.
+      }
       void authApi.logout().catch(() => undefined);
       router.push('/auth/login');
     },

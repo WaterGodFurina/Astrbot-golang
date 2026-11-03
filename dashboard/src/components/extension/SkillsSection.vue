@@ -52,6 +52,20 @@
             <h3 class="skills-list-title text-h3">
               {{ tm("status.installed") }}
             </h3>
+            <div class="skills-search-wrap">
+              <v-text-field
+                v-model="skillSearch"
+                :label="tm('skills.searchPlaceholder')"
+                prepend-inner-icon="mdi-magnify"
+                density="compact"
+                variant="solo-filled"
+                flat
+                clearable
+                hide-details
+                single-line
+                class="skills-search-field"
+              />
+            </div>
             <div class="skills-list-actions">
               <template v-if="batchSelectionEnabled">
                 <v-btn
@@ -102,9 +116,14 @@
             </div>
           </div>
 
-          <div class="skills-list">
+          <div v-if="filteredSkills.length === 0" class="text-center pa-8">
+            <v-icon size="64" color="grey-lighten-1">mdi-magnify</v-icon>
+            <p class="text-grey mt-4">{{ tm("skills.noSearchResult") }}</p>
+          </div>
+
+          <div v-else class="skills-list">
             <OutlinedActionListItem
-              v-for="skill in skills"
+              v-for="skill in filteredSkills"
               :key="skill.name"
               :title="skill.name"
               class="skill-list-item"
@@ -137,7 +156,15 @@
               <template #title-extra>
                 <div class="d-flex align-center ga-1">
                   <v-chip
-                    v-if="skill.preset || skill.source_type === 'sandbox_only'"
+                    v-if="skillSourceChip(skill)"
+                    size="x-small"
+                    variant="tonal"
+                    :color="skillSourceChip(skill).color"
+                  >
+                    {{ skillSourceChip(skill).text }}
+                  </v-chip>
+                  <v-chip
+                    v-if="skill.preset"
                     size="x-small"
                     variant="tonal"
                     color="secondary"
@@ -912,11 +939,12 @@
 
 <script>
 import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
-import { VueMonacoEditor } from "@guolao/vue-monaco-editor";
+import { LazyMonacoEditor as VueMonacoEditor } from '@/components/shared/LazyMonacoEditor';
 import { skillApi, systemConfigApi } from "@/api/v1";
 import { useI18n, useModuleI18n } from "@/i18n/composables";
 import OutlinedActionListItem from "@/components/shared/OutlinedActionListItem.vue";
 import { useCustomizerStore } from "@/stores/customizer";
+import { buildSearchQuery, matchesText } from "@/utils/pluginSearch";
 
 const STATUS_WAITING = "waiting";
 const STATUS_UPLOADING = "uploading";
@@ -937,6 +965,7 @@ export default {
 
     const mode = ref("local");
     const skills = ref([]);
+    const skillSearch = ref("");
     const loading = ref(false);
     const runtime = ref("local");
     const sandboxCache = reactive({ ready: false, count: 0, updated_at: null });
@@ -1004,13 +1033,6 @@ export default {
       { title: "stable", value: "stable" },
     ]);
 
-    const deletableSkills = computed(() =>
-      skills.value.filter((skill) => !isReadOnlySourceSkill(skill))
-    );
-    const allDeletableSelected = computed(
-      () => deletableSkills.value.length > 0
-        && deletableSkills.value.every((skill) => selectedSkillNames.value.includes(skill.name))
-    );
     const batchDeleteTargets = computed(() =>
       selectedSkillNames.value.filter((name) =>
         skills.value.some((s) => s.name === name && !isReadOnlySourceSkill(s))
@@ -1124,6 +1146,54 @@ export default {
       isPluginProvidedSkill(skill) && skill?.plugin_active === false;
     const isReadOnlySourceSkill = (skill) =>
       isSandboxPresetSkill(skill) || isPluginProvidedSkill(skill);
+    // Resolve the origin chip for a skill. Plugin skills prefer the plugin's
+    // display name, then its internal source label / name.
+    const skillSourceChip = (skill) => {
+      if (!skill) return null;
+      if (isPluginProvidedSkill(skill)) {
+        const pluginName =
+          skill.plugin_display_name ||
+          skill.source_label ||
+          skill.plugin_name ||
+          "";
+        return {
+          text: tm("skills.sourcePlugin", { plugin: pluginName }),
+          color: "primary",
+        };
+      }
+      if (skill.source_type === "both") {
+        return { text: tm("skills.sourceBoth"), color: "secondary" };
+      }
+      if (skill.source_type === "sandbox_only") {
+        return { text: tm("skills.sourceSandboxOnly"), color: "secondary" };
+      }
+      return { text: tm("skills.sourceLocalOnly"), color: undefined };
+    };
+    const deletableSkills = computed(() =>
+      skills.value.filter((skill) => !isReadOnlySourceSkill(skill)),
+    );
+
+    const filteredSkills = computed(() => {
+      const query = buildSearchQuery(skillSearch.value);
+      if (!query) return skills.value;
+      return skills.value.filter((skill) =>
+        [skill.name, skill.description, skill.path].some((field) =>
+          matchesText(field, query),
+        ),
+      );
+    });
+
+    // Select-all only applies to the currently visible (filtered) deletable skills.
+    const visibleDeletableSkills = computed(() =>
+      filteredSkills.value.filter((skill) => !isReadOnlySourceSkill(skill)),
+    );
+    const allDeletableSelected = computed(
+      () =>
+        visibleDeletableSkills.value.length > 0 &&
+        visibleDeletableSkills.value.every((skill) =>
+          selectedSkillNames.value.includes(skill.name),
+        ),
+    );
 
     const normalizeNeoItemsPayload = (res) => {
       const payload = res?.data?.data || [];
@@ -1387,6 +1457,104 @@ export default {
         showMessage(tm("skills.uploadFailed"), "error");
       } finally {
         uploading.value = false;
+      }
+    };
+
+    const startBatchSelection = () => {
+      selectedSkillNames.value = [];
+      batchDeleteTargets.value = [];
+      batchSelectionEnabled.value = true;
+    };
+
+    const cancelBatchSelection = () => {
+      if (batchDeleting.value) return;
+      batchSelectionEnabled.value = false;
+      selectedSkillNames.value = [];
+      batchDeleteTargets.value = [];
+      batchDeleteDialog.value = false;
+    };
+
+    const toggleSelectAll = () => {
+      if (allDeletableSelected.value) {
+        selectedSkillNames.value = [];
+        return;
+      }
+      selectedSkillNames.value = visibleDeletableSkills.value.map(
+        (skill) => skill.name,
+      );
+    };
+
+    const confirmBatchDelete = () => {
+      const selectedNames = new Set(selectedSkillNames.value);
+      batchDeleteTargets.value = [
+        ...new Set(
+          visibleDeletableSkills.value
+            .filter((skill) => selectedNames.has(skill.name))
+            .map((skill) => skill.name),
+        ),
+      ];
+      if (batchDeleteTargets.value.length === 0) return;
+      batchDeleteDialog.value = true;
+    };
+
+    const deleteSelectedSkills = async () => {
+      if (batchDeleting.value || batchDeleteTargets.value.length === 0) return;
+
+      const targets = [...batchDeleteTargets.value];
+      const failed = [];
+      let succeeded = 0;
+      batchDeleting.value = true;
+
+      try {
+        for (const name of targets) {
+          try {
+            const res = await skillApi.delete(name);
+            if (res?.data?.status === "ok") {
+              succeeded += 1;
+            } else {
+              failed.push(name);
+            }
+          } catch (_err) {
+            failed.push(name);
+          }
+        }
+
+        const refreshed = await fetchSkills();
+        if (refreshed) {
+          const currentDeletableNames = new Set(
+            skills.value
+              .filter((skill) => !isReadOnlySourceSkill(skill))
+              .map((skill) => skill.name),
+          );
+          selectedSkillNames.value = failed.filter((name) =>
+            currentDeletableNames.has(name),
+          );
+        } else {
+          selectedSkillNames.value = failed;
+          batchSelectionEnabled.value = failed.length > 0;
+        }
+        batchDeleteDialog.value = false;
+        batchDeleteTargets.value = [];
+
+        if (!refreshed) return;
+
+        if (failed.length === 0) {
+          batchSelectionEnabled.value = false;
+          showMessage(
+            tm("skills.batchDeleteSuccess", { count: succeeded }),
+            "success",
+          );
+        } else {
+          showMessage(
+            tm("skills.batchDeletePartial", {
+              succeeded,
+              failed: failed.length,
+            }),
+            "warning",
+          );
+        }
+      } finally {
+        batchDeleting.value = false;
       }
     };
 
@@ -1955,6 +2123,16 @@ export default {
       }
     });
 
+    // Keep the batch selection in sync with the active filter so skills hidden
+    // by the search can never be included in a batch delete.
+    watch(visibleDeletableSkills, (visibleSkills) => {
+      if (!batchSelectionEnabled.value) return;
+      const visibleNames = new Set(visibleSkills.map((skill) => skill.name));
+      selectedSkillNames.value = selectedSkillNames.value.filter((name) =>
+        visibleNames.has(name),
+      );
+    });
+
     watch(uploadDialog, (isOpen) => {
       if (!isOpen && !uploading.value) {
         resetUploadState();
@@ -1973,6 +2151,7 @@ export default {
       tm,
       mode,
       skills,
+      skillSearch,
       loading,
       runtime,
       sandboxCache,
@@ -2000,6 +2179,9 @@ export default {
       candidateStatusItems,
       releaseStageItems,
       activeReleaseCount,
+      deletableSkills,
+      filteredSkills,
+      allDeletableSelected,
       candidateHeaders,
       releaseHeaders,
       payloadDialog,
@@ -2047,6 +2229,7 @@ export default {
       isPluginProvidedSkill,
       isInactivePluginSkill,
       isReadOnlySourceSkill,
+      skillSourceChip,
     };
   },
 };
@@ -2059,8 +2242,32 @@ export default {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.skills-list-title {
+.skills-list-header {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
   margin-bottom: 16px;
+}
+
+.skills-list-title {
+  margin: 0 auto 0 0;
+}
+
+.skills-list-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.skills-search-wrap {
+  flex: 0 1 300px;
+  min-width: 200px;
+}
+
+.skills-search-field {
+  width: 100%;
 }
 
 .skill-list-item :deep(.outlined-action-list-item__main) {
@@ -2654,6 +2861,19 @@ export default {
 }
 
 @media (max-width: 640px) {
+  .skills-list-header {
+    align-items: stretch;
+  }
+
+  .skills-search-wrap {
+    flex: 1 1 100%;
+  }
+
+  .skills-list-actions {
+    margin-left: 0;
+    width: 100%;
+  }
+
   .skills-upload-dialog {
     max-height: 92vh;
   }

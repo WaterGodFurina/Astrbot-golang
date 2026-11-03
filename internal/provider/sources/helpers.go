@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -102,6 +103,26 @@ func configInt(config map[string]interface{}, key string, fallback int) int {
 		return int(v)
 	case int:
 		return v
+	}
+	return fallback
+}
+
+// configFloat returns the float value of key, or the fallback when absent.
+// 兼容 WebUI 表单可能提交的字符串/整数形态。
+func configFloat(config map[string]interface{}, key string, fallback float64) float64 {
+	switch v := config[key].(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			return f
+		}
 	}
 	return fallback
 }

@@ -52,7 +52,15 @@ func NewNvidiaRerankSource(config, settings map[string]interface{}) *NvidiaReran
 func (s *NvidiaRerankSource) getEndpoint() string {
 	modelPath := "nvidia"
 	if strings.Contains(s.model, "/") {
-		modelPath = strings.ReplaceAll(strings.Trim(s.model, "/"), ".", "_")
+		modelPath = strings.Trim(s.model, "/")
+		// 仅这些旧模型在 URL 中用下划线替代点，其余保留原始路径（对齐
+		// py v4.29.2 nvidia_rerank_source._get_endpoint）。
+		switch modelPath {
+		case "nvidia/llama-3.2-nv-rerankqa-1b-v1",
+			"nvidia/llama-3.2-nv-rerankqa-1b-v2",
+			"nvidia/llama-3.2-nemoretriever-500m-rerank-v2":
+			modelPath = strings.ReplaceAll(modelPath, ".", "_")
+		}
 	}
 	endpoint := strings.TrimPrefix(s.modelEndpoint, "/")
 	return fmt.Sprintf("%s/%s/%s", s.baseURL, modelPath, endpoint)

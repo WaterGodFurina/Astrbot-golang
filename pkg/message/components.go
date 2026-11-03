@@ -4,6 +4,7 @@ package message
 
 import (
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -35,9 +36,17 @@ const (
 	CompRPS      ComponentType = "RPS"
 	CompUnknown  ComponentType = "Unknown"
 
+	// Portable interactive components (aligned with Python v4.29.x).
+	CompActionRow         ComponentType = "ActionRow"         // a row of interactive controls
+	CompButton            ComponentType = "Button"            // an interactive button
+	CompButtonInteraction ComponentType = "ButtonInteraction" // an inbound button click
+
 	// Deprecated aliases for backward compat
 	CompVoice ComponentType = "Record"
 )
+
+// JSONValue is any JSON-compatible value (aligned with Python JSONValue).
+type JSONValue = interface{}
 
 // Component is the interface every message component implements.
 type Component interface {
@@ -54,6 +63,172 @@ type Plain struct {
 func (p *Plain) Type() ComponentType { return CompPlain }
 func (p *Plain) String() string      { return p.Text }
 func (p *Plain) Clone() Component    { return &Plain{Text: p.Text} }
+
+// ButtonStyle is the portable visual intent for a button.
+// Ported from Python Button.Style.
+type ButtonStyle string
+
+const (
+	ButtonStyleDefault ButtonStyle = "default"
+	ButtonStylePrimary ButtonStyle = "primary"
+	ButtonStyleSuccess ButtonStyle = "success"
+	ButtonStyleDanger  ButtonStyle = "danger"
+)
+
+// ButtonActionType distinguishes callback and url button actions.
+type ButtonActionType string
+
+const (
+	ButtonActionCallback ButtonActionType = "callback"
+	ButtonActionURL      ButtonActionType = "url"
+)
+
+// ButtonAction describes what happens when a portable button is clicked.
+// Aligned with Python Button.CallbackAction / Button.UrlAction.
+type ButtonAction struct {
+	Type ButtonActionType `json:"type"`
+	Data JSONValue        `json:"data,omitempty"`
+	URL  string           `json:"url,omitempty"`
+}
+
+// NewCallbackButtonAction creates a callback action carrying optional context.
+func NewCallbackButtonAction(data JSONValue) ButtonAction {
+	return ButtonAction{Type: ButtonActionCallback, Data: data}
+}
+
+// NewURLButtonAction creates a url action opening the given link.
+func NewURLButtonAction(url string) ButtonAction {
+	return ButtonAction{Type: ButtonActionURL, URL: url}
+}
+
+// Button is a portable interactive button.
+// Ported from Python message/components.py Button.
+type Button struct {
+	ID     string       `json:"id"`
+	Label  string       `json:"label"`
+	Action ButtonAction `json:"action"`
+	Style  ButtonStyle  `json:"style,omitempty"`
+}
+
+func (b *Button) Type() ComponentType { return CompButton }
+func (b *Button) String() string      { return fmt.Sprintf("[Button:%s]", b.Label) }
+func (b *Button) Clone() Component {
+	nb := *b
+	nb.Action.Data = deepCopyJSONValue(b.Action.Data)
+	return &nb
+}
+
+// ToDict serializes the button using the public message component format
+// (aligned with Python Button.toDict).
+func (b *Button) ToDict() map[string]interface{} {
+	style := b.Style
+	if style == "" {
+		style = ButtonStyleDefault
+	}
+	action := map[string]interface{}{"type": string(b.Action.Type)}
+	if b.Action.Type == ButtonActionCallback {
+		if b.Action.Data != nil {
+			action["data"] = b.Action.Data
+		}
+	} else {
+		action["url"] = b.Action.URL
+	}
+	return map[string]interface{}{
+		"type": "button",
+		"data": map[string]interface{}{
+			"id":     b.ID,
+			"label":  b.Label,
+			"action": action,
+			"style":  string(style),
+		},
+	}
+}
+
+// ActionRow is a group of buttons displayed on one row when possible.
+// Ported from Python message/components.py ActionRow.
+type ActionRow struct {
+	Buttons      []*Button `json:"buttons"`
+	FallbackText string    `json:"fallback_text,omitempty"`
+	// ActionTimeout is the shared callback lifetime in seconds; nil = unlimited.
+	ActionTimeout *float64 `json:"action_timeout,omitempty"`
+
+	mu              sync.Mutex
+	actionExpiresAt *float64
+}
+
+func (r *ActionRow) Type() ComponentType { return CompActionRow }
+func (r *ActionRow) String() string      { return "[ActionRow]" }
+func (r *ActionRow) Clone() Component {
+	buttons := make([]*Button, len(r.Buttons))
+	for i, b := range r.Buttons {
+		if b != nil {
+			buttons[i] = b.Clone().(*Button)
+		}
+	}
+	var timeout *float64
+	if r.ActionTimeout != nil {
+		v := *r.ActionTimeout
+		timeout = &v
+	}
+	return &ActionRow{Buttons: buttons, FallbackText: r.FallbackText, ActionTimeout: timeout}
+}
+
+// ActionExpiresAt returns the shared callback deadline, starting on first
+// rendering (aligned with Python ActionRow.action_expires_at). Returns nil when
+// the row has no timeout.
+func (r *ActionRow) ActionExpiresAt() *float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ActionTimeout != nil && r.actionExpiresAt == nil {
+		exp := float64(time.Now().UnixNano())/1e9 + *r.ActionTimeout
+		r.actionExpiresAt = &exp
+	}
+	return r.actionExpiresAt
+}
+
+// ToDict serializes the row using the public message component format
+// (aligned with Python ActionRow.toDict).
+func (r *ActionRow) ToDict() map[string]interface{} {
+	buttons := make([]map[string]interface{}, 0, len(r.Buttons))
+	for _, b := range r.Buttons {
+		if b == nil {
+			continue
+		}
+		if data, ok := b.ToDict()["data"].(map[string]interface{}); ok {
+			buttons = append(buttons, data)
+		}
+	}
+	data := map[string]interface{}{"buttons": buttons}
+	if r.FallbackText != "" {
+		data["fallback_text"] = r.FallbackText
+	}
+	if r.ActionTimeout != nil {
+		data["action_timeout"] = *r.ActionTimeout
+	}
+	return map[string]interface{}{"type": "actionrow", "data": data}
+}
+
+// ButtonInteraction is the normalized inbound event produced by a callback
+// button click. Ported from Python message/components.py ButtonInteraction.
+type ButtonInteraction struct {
+	ActionID        string    `json:"action_id"`
+	Data            JSONValue `json:"data,omitempty"`
+	InteractionID   string    `json:"interaction_id"`
+	SourceMessageID string    `json:"source_message_id,omitempty"`
+	// CallbackData retains the opaque token for expiry validation before
+	// plugin dispatch (aligned with Python callback_data).
+	CallbackData string `json:"callback_data,omitempty"`
+}
+
+func (b *ButtonInteraction) Type() ComponentType { return CompButtonInteraction }
+func (b *ButtonInteraction) String() string {
+	return fmt.Sprintf("[ButtonInteraction:%s]", b.ActionID)
+}
+func (b *ButtonInteraction) Clone() Component {
+	nb := *b
+	nb.Data = deepCopyJSONValue(b.Data)
+	return &nb
+}
 
 // At represents a mention of a user.
 type At struct {

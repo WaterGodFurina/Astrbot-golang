@@ -85,6 +85,9 @@ type FilterContext struct {
 	// event.get_extra("_session_isolated")。只有渠道真正支持并应用了隔离
 	//（waking_check 写入该 extra）时才为 true。
 	SessionIsolated bool
+	// ButtonActionID 是本事件携带的可移植按钮动作 ID（空串表示非按钮点击），
+	// 对齐 py ButtonActionFilter 读取 event.get_button_interaction()。
+	ButtonActionID string
 }
 
 // CommandFilter matches a single command name.
@@ -163,13 +166,19 @@ func (cf *CommandFilter) SetCommandName(name string) {
 	}
 }
 
+// collapseSpaces collapses runs of whitespace into single spaces and trims the
+// result (aligned with py command_group.py re.sub(r"\s+", " ", ...)).
+func collapseSpaces(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 // Match checks if the filter matches the context.
 func (cf *CommandFilter) Match(ctx *FilterContext) bool {
 	if !ctx.IsAtOrWake {
 		return false
 	}
 	names := cf.GetCompleteCommandNames()
-	msg := strings.TrimSpace(ctx.MessageStr)
+	msg := collapseSpaces(ctx.MessageStr)
 	for _, n := range names {
 		if msg == n || strings.HasPrefix(msg, n+" ") {
 			return true
@@ -380,7 +389,7 @@ func (gf *CommandGroupFilter) Match(ctx *FilterContext) bool {
 		return false
 	}
 	names := gf.GetCompleteCommandNames()
-	msg := strings.TrimSpace(ctx.MessageStr)
+	msg := collapseSpaces(ctx.MessageStr)
 	for _, n := range names {
 		if msg == n || strings.HasPrefix(msg, n+" ") {
 			return true

@@ -64,6 +64,8 @@ type PluginMetadata struct {
 	I18n map[string]map[string]string `json:"i18n,omitempty" yaml:"i18n,omitempty"`
 	// Pages 是插件注册的 Pages 元数据列表（metadata.yaml pages）。
 	Pages []interface{} `json:"pages,omitempty" yaml:"pages,omitempty"`
+	// Views 是 4.29.0 起的首选键（metadata.yaml views）；pages 保留为别名。
+	Views []interface{} `json:"views,omitempty" yaml:"views,omitempty"`
 }
 
 // ResolveLanguage determines the plugin's implementation language purely from
@@ -213,9 +215,14 @@ func readMetadataYAML(path string) (*PluginMetadata, error) {
 		AstrbotVersion   string                       `yaml:"astrbot_version"`
 		I18n             map[string]map[string]string `yaml:"i18n"`
 		Pages            []interface{}                `yaml:"pages"`
+		Views            []interface{}                `yaml:"views"`
 	}
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("解析 metadata.yaml 失败: %w", err)
+	}
+	pages := raw.Pages
+	if len(pages) == 0 && len(raw.Views) > 0 {
+		pages = raw.Views
 	}
 	return &PluginMetadata{
 		Name:             raw.Name,
@@ -229,7 +236,8 @@ func readMetadataYAML(path string) (*PluginMetadata, error) {
 		SupportPlatforms: raw.SupportPlatforms,
 		AstrbotVersion:   raw.AstrbotVersion,
 		I18n:             raw.I18n,
-		Pages:            raw.Pages,
+		Pages:            pages,
+		Views:            raw.Views,
 	}, nil
 }
 
@@ -240,6 +248,13 @@ func validateMetadata(meta *PluginMetadata) (*PluginMetadata, error) {
 		return nil, fmt.Errorf("metadata 缺少必填字段 name")
 	}
 	meta.Name = strings.TrimSpace(meta.Name)
+	// 4.29.0：views 为首选键，pages 为别名；互相回填以保证消费者任取其一。
+	if len(meta.Pages) == 0 && len(meta.Views) > 0 {
+		meta.Pages = meta.Views
+	}
+	if len(meta.Views) == 0 && len(meta.Pages) > 0 {
+		meta.Views = meta.Pages
+	}
 	// name 会被拼进 plugins_config/<name>/ 与 plugins/<name>/ 路径，必须是
 	// 安全的目录名，拒绝路径穿越（/、\、..、.、空白）。
 	if err := validatePluginName(meta.Name); err != nil {

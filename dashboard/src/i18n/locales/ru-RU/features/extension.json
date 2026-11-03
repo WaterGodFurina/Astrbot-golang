@@ -61,7 +61,8 @@
     "pin": "Закрепить",
     "unpin": "Открепить",
     "deleteSource": "Удалить источник",
-    "reshuffle": "Мне повезет!"
+    "reshuffle": "Мне повезет!",
+    "openView": "Открыть представление"
   },
   "status": {
     "enabled": "Включен",
@@ -160,7 +161,7 @@
     },
     "showFullName": "Полное имя",
     "devDocs": "Документация для разработчиков",
-    "submitRepo": "Добавить репозиторий",
+    "submitRepo": "Добавить мой плагин",
     "customSource": "Свои источники",
     "source": "Источник",
     "availableSources": "Доступные источники",
@@ -403,7 +404,9 @@
     "pluginValidateSuccess": "Плагин успешно проверен",
     "pluginValidateFailed": "Не удалось проверить плагин",
     "pkgCommandCopied": "Команда скопирована, выполните её в терминале",
-    "pkgCommandCopyFailed": "Не удалось скопировать, скопируйте команду вручную"
+    "pkgCommandCopyFailed": "Не удалось скопировать, скопируйте команду вручную",
+    "pluginViewNotFound": "Представление плагина не найдено",
+    "pluginViewLoadFailed": "Не удалось загрузить представление плагина"
   },
   "upload": {
     "fromFile": "Загрузить файл",
@@ -531,7 +534,9 @@
     "readonly": "Только чтение",
     "unsaved": "Не сохранено",
     "noFileSelected": "Файл не выбран",
-    "discardChanges": "В файле есть несохраненные изменения. Отменить их?"
+    "discardChanges": "В файле есть несохраненные изменения. Отменить их?",
+    "searchPlaceholder": "Поиск навыков...",
+    "noSearchResult": "Подходящие навыки не найдены"
   },
   "card": {
     "actions": {

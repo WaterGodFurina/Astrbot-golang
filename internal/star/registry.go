@@ -215,6 +215,18 @@ func (r *StarHandlerRegistry) Append(h *StarHandlerMetadata) {
 	})
 }
 
+// AppendButtonAction registers a handler that only fires for portable button
+// interactions, optionally constrained to a single action ID (aligned with
+// Python register_button_action). A nil or empty actionID matches every button.
+func (r *StarHandlerRegistry) AppendButtonAction(h *StarHandlerMetadata, actionID *string) {
+	if h == nil {
+		return
+	}
+	h.EventType = EventTypeFilter
+	h.EventFilters = append(h.EventFilters, NewButtonActionFilter(actionID))
+	r.Append(h)
+}
+
 // Remove deletes a handler by full name.
 func (r *StarHandlerRegistry) Remove(fullName string) {
 	r.mu.Lock()

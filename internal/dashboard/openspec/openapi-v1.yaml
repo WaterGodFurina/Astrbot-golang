@@ -5086,6 +5086,398 @@ paths:
         "200":
           description: Webhook accepted
 
+
+  /api/v1/files/upload/init:
+    post:
+      tags: [Files]
+      summary: Initialize chunked file upload
+      operationId: initFileUpload
+      x-astrbot-scope: file
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatUploadInitRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/files/upload/chunk:
+    post:
+      tags: [Files]
+      summary: Upload a file chunk
+      operationId: uploadFileChunk
+      x-astrbot-scope: file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/ChatChunkUploadRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/files/upload/complete:
+    post:
+      tags: [Files]
+      summary: Complete chunked file upload
+      operationId: completeFileUpload
+      x-astrbot-scope: file
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatUploadSessionRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/files/upload/abort:
+    post:
+      tags: [Files]
+      summary: Abort chunked file upload
+      operationId: abortFileUpload
+      x-astrbot-scope: file
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatUploadSessionRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/files/upload/status:
+    post:
+      tags: [Files]
+      summary: Query chunked file upload status
+      operationId: statusFileUpload
+      x-astrbot-scope: file
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatUploadSessionRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/plugins/views:
+    get:
+      tags: [Plugin Views]
+      summary: List plugin views by query ID
+      operationId: listPluginViewsById
+      x-astrbot-scope: plugin
+      parameters:
+        - name: plugin_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/plugins/view:
+    get:
+      tags: [Plugin Views]
+      summary: Get plugin view entry HTML by query ID
+      operationId: getPluginViewById
+      x-astrbot-scope: plugin
+      parameters:
+        - name: plugin_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: page_name
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Html"
+
+
+  /api/v1/plugins/{plugin_id}/views:
+    get:
+      tags: [Plugin Views]
+      summary: List plugin views
+      operationId: listPluginViews
+      x-astrbot-scope: plugin
+      parameters:
+        - $ref: "#/components/parameters/PluginId"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/plugins/{plugin_id}/views/{view_name}:
+    get:
+      tags: [Plugin Views]
+      summary: Get plugin view entry HTML
+      operationId: getPluginView
+      x-astrbot-scope: plugin
+      parameters:
+        - $ref: "#/components/parameters/PluginId"
+        - name: view_name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          $ref: "#/components/responses/Html"
+
+
+  /api/v1/plugins/{plugin_id}/views/{view_name}/_t/{token}/{asset_path}:
+    get:
+      tags: [Plugin Views]
+      summary: Get a plugin view asset via a scoped path token
+      description: >-
+        Serves plugin view assets without URL rewriting. The token is a
+        plugin-page-scoped JWT issued by the view entry config endpoint and
+        travels in the path so relative URLs inherit it through normal path
+        resolution. Use an empty asset_path (trailing slash) for the entry
+        document.
+      operationId: getPluginViewTokenAsset
+      parameters:
+        - $ref: "#/components/parameters/PluginId"
+        - name: view_name
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: token
+          in: path
+          required: true
+          description: Scoped plugin page asset token.
+          schema:
+            type: string
+        - name: asset_path
+          in: path
+          required: true
+          description: URL-encoded relative asset path.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Plugin asset content
+        "401":
+          description: Missing, invalid, expired, or wrongly scoped token
+
+
+  /api/v1/sessions/senders:
+    get:
+      tags: [Sessions]
+      summary: Search known senders with source session names
+      description: >-
+        Search recorded senders, deduplicate by platform instance and sender ID,
+        then paginate in descending update order. Returns senders, page and
+        has_more in the data object. Historical messages are not backfilled.
+      operationId: listSessionSenders
+      x-astrbot-scope: data
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - name: sender_ids
+          in: query
+          description: Resolve the latest record per exact sender ID instead of returning all source sessions.
+          schema:
+            type: array
+            maxItems: 100
+            items:
+              type: string
+        - name: search
+          in: query
+          schema:
+            type: string
+            maxLength: 512
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/conversations/filter-options:
+    get:
+      tags: [Conversations]
+      summary: List available conversation filters
+      operationId: getConversationFilterOptions
+      x-astrbot-scope: data
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/stats/pypi-index/test:
+    post:
+      tags: [Stats]
+      summary: Test a PyPI index (mirror) endpoint
+      operationId: testPypiIndexConnection
+      x-astrbot-scope: system
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PypiIndexTestRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/stats/pypi-index/speed:
+    post:
+      tags: [Stats]
+      summary: Download a wheel from a PyPI index and measure the throughput
+      operationId: measurePypiIndexSpeed
+      x-astrbot-scope: system
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PypiIndexTestRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/stats/ghproxy/speed:
+    post:
+      tags: [Stats]
+      summary: Download a repository file through a GitHub proxy and measure the throughput
+      operationId: measureGhproxySpeed
+      x-astrbot-scope: system
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GhproxyTestRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/backups/upload/status:
+    post:
+      tags: [Backups]
+      summary: Query chunked backup upload status
+      operationId: statusBackupUpload
+      x-astrbot-scope: system
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackupUploadSessionRequest"
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/logs/export:
+    get:
+      tags: [Logs]
+      summary: Export a diagnostic bundle
+      description: Requires a dashboard administrator session. Developer API keys are not accepted. Includes available disk and memory logs, trace history, configuration, plugin status and environment details. Credentials are masked by default; setting redact=false exports original sensitive values.
+      operationId: exportLogs
+      security:
+        - BearerAuth: []
+      x-astrbot-scope: system
+      parameters:
+        - name: redact
+          in: query
+          description: Mask recognized credentials. Disable only for private diagnosis.
+          schema: {type: boolean, default: true}
+        - name: start_time
+          in: query
+          description: Inclusive minimum log timestamp or trace start time, in Unix seconds. Omit for no lower bound. Undated standalone log content is excluded when a time bound is set.
+          schema: {type: integer, minimum: 0}
+        - name: end_time
+          in: query
+          description: Inclusive maximum log timestamp or trace start time, in Unix seconds. Omit for no upper bound. Must not be before start_time. Matching traces retain their complete details.
+          schema: {type: integer, minimum: 0}
+      responses:
+        "200":
+          description: Diagnostic ZIP. With redact=false it contains original sensitive values; personal data may remain in either mode.
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+
+
+  /api/v1/trace/history:
+    get:
+      tags: [Logs]
+      summary: List persisted trace summaries
+      operationId: listTraces
+      x-astrbot-scope: system
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+        - name: cursor
+          description: Legacy keyset cursor; use page for numbered pagination.
+          in: query
+          schema: {type: string, maxLength: 64}
+        - name: page
+          in: query
+          schema: {type: integer, minimum: 1, default: 1}
+        - name: query
+          in: query
+          schema: {type: string, maxLength: 256, default: ""}
+        - name: errors
+          in: query
+          schema: {type: boolean, default: false}
+        - name: models
+          in: query
+          schema: {type: boolean, default: false}
+        - name: plugins
+          in: query
+          schema: {type: boolean, default: false}
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+
+
+  /api/v1/trace/{trace_id}:
+    get:
+      tags: [Logs]
+      summary: Get persisted trace spans and events
+      operationId: getTraceDetail
+      x-astrbot-scope: system
+      parameters:
+        - name: trace_id
+          in: path
+          required: true
+          schema: {type: string, pattern: "^[0-9a-f]{32}$"}
+      responses:
+        "200":
+          $ref: "#/components/responses/Ok"
+        "404":
+          description: Trace not found or already evicted.
+
 components:
   securitySchemes:
     ApiKeyAuth:
@@ -5344,6 +5736,7 @@ components:
         - tts
         - embedding
         - rerank
+        - decision
 
     LoginRequest:
       type: object
@@ -6415,3 +6808,78 @@ components:
         content:
           type: string
       additionalProperties: true
+
+
+    ChatChunkUploadRequest:
+      type: object
+      required: [upload_id, chunk_index, chunk]
+      properties:
+        upload_id:
+          type: string
+        chunk_index:
+          type: integer
+          minimum: 0
+        chunk:
+          type: string
+          format: binary
+
+
+    ChatUploadInitRequest:
+      type: object
+      required: [filename, total_size]
+      properties:
+        filename:
+          type: string
+        total_size:
+          type: integer
+          minimum: 1
+        content_type:
+          type: string
+      additionalProperties: false
+
+
+    ChatUploadSessionRequest:
+      type: object
+      required: [upload_id]
+      properties:
+        upload_id:
+          type: string
+      additionalProperties: false
+
+
+    PypiIndexTestRequest:
+      type: object
+      required: [index_url]
+      properties:
+        index_url:
+          type: string
+      additionalProperties: false
+    BotCleanupTarget:
+      type: string
+      enum: [custom_rules, preferences, routing, cron_jobs, conversations, message_history, traces, stats]
+    RuntimeInfo:
+      type: object
+      description: The AstrBot backend runtime, including when running inside a container. Values are captured at application startup.
+      required: [os, arch, sandbox]
+      properties:
+        os:
+          type: string
+          description: Lowercase platform.system() value, commonly linux, darwin, or windows.
+        arch:
+          type: string
+          description: Unmodified platform.machine() value, such as x86_64, AMD64, arm64, or aarch64. May be empty if unknown.
+        sandbox:
+          type: object
+          description: Local process sandbox startup check, captured when AstrBot starts. It does not verify DNS resolution or every permitted operation.
+          required: [backend, status]
+          properties:
+            backend:
+              type: [string, "null"]
+              enum: [bubblewrap, seatbelt, null]
+            status:
+              type: string
+              enum: [detected, missing, unavailable, unsupported]
+              description: detected means the executable was found and a minimal workspace sandbox launched successfully; missing means the corresponding executable was not found; unavailable means it was found but sandbox startup failed; unsupported means this platform has no Local process sandbox backend. These identifiers are independent of the UI language.
+            error:
+              type: string
+              description: Bounded startup error detail, included when status is unavailable. Restart AstrBot after fixing the environment to refresh the check.

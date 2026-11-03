@@ -3,6 +3,8 @@
 package dashboard
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"embed"
 	"encoding/json"
@@ -37,7 +39,9 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/provider"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/sandbox"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/storage"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/t2i"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/tracestore"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
@@ -85,6 +89,13 @@ type Server struct {
 	// backupTaskMu/backupTasks 跟踪后台备份任务（导出/导入）进度。
 	backupTaskMu sync.Mutex
 	backupTasks  map[string]*backupTaskState
+	// storageCleaner 执行 logs/cache/traces 的磁盘清理（4.29.2）。
+	storageCleaner *storage.Cleaner
+	// traceStore 为独立有界 trace 历史（trace_enable 时由 lifecycle 注入）。
+	traceStore *tracestore.TraceStore
+	// chunkUploads/chunkUploadsMu 跟踪通用分片上传会话（4.29.0 /files/upload/*）。
+	chunkUploadsMu sync.Mutex
+	chunkUploads   map[string]*chunkUploadSession
 	// uploadMu/uploadSessions 跟踪备份分片上传会话。
 	uploadMu       sync.Mutex
 	uploadSessions map[string]*uploadSession
@@ -1231,13 +1242,32 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, parts []stri
 			}))
 		}
 	case "test-ghproxy-connection", "ghproxy":
-		// 前端 openapi 路径为 /api/v1/stats/ghproxy/test（parts=[ghproxy,test]）；
+		// 前端 openapi 路径为 /api/v1/stats/ghproxy/{test,speed}（parts=[ghproxy,test|speed]）；
 		// 旧路径 /api/v1/stat/test-ghproxy-connection 也兼容。
-		if parts[0] == "ghproxy" && (len(parts) < 2 || parts[1] != "test") {
+		if parts[0] == "ghproxy" {
+			if len(parts) > 1 && parts[1] == "speed" {
+				s.handleGhproxySpeed(w, r)
+				return
+			}
+			if len(parts) > 1 && parts[1] == "test" {
+				s.handleGhproxyTest(w, r)
+				return
+			}
 			writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 			return
 		}
 		s.handleGhproxyTest(w, r)
+	case "pypi-index":
+		// 4.29.4：/stats/pypi-index/test 与 /stats/pypi-index/speed。
+		if len(parts) > 1 && parts[1] == "test" {
+			s.handlePypiIndexTest(w, r)
+			return
+		}
+		if len(parts) > 1 && parts[1] == "speed" {
+			s.handlePypiIndexSpeed(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, apiOK(map[string]interface{}{}))
 	case "storage":
 		if len(parts) > 1 && parts[1] == "cleanup" {
 			if r.Method == http.MethodPost {
@@ -2080,6 +2110,16 @@ func (s *Server) SetWebUIDir(dir string) {
 }
 
 // SetRestartFunc 注入进程自重启回调（由 lifecycle 提供），供 WebUI 重启按钮触发。
+// SetStorageCleaner attaches the storage cleaner used by /api/v1/storage/*.
+func (s *Server) SetStorageCleaner(c *storage.Cleaner) {
+	s.storageCleaner = c
+}
+
+// SetTraceStore attaches the independent trace history store.
+func (s *Server) SetTraceStore(t *tracestore.TraceStore) {
+	s.traceStore = t
+}
+
 func (s *Server) SetRestartFunc(fn func()) {
 	s.restartFunc = fn
 }
@@ -2136,9 +2176,8 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 		if data, err := os.ReadFile(fsPath); err == nil {
 			w.Header().Set("Content-Type", contentTypeFor(cleanPath))
 			setWebUICacheControl(w, cleanPath)
-			// #nosec no-direct-write-to-responsewriter -- 静态资源服务：内容为 WebUI 自身构建产物（embed/外部目录），
-			// 路径经穿越校验，Content-Type 按扩展名设置，非用户输入内容。
-			_, _ = w.Write(data) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
+			// 外部目录可能随时变化，不做压缩缓存。
+			writeWebStatic(w, r, cleanPath, data, false)
 			return
 		}
 		// 外部目录存在但资产缺失时**不回落 embedded**：embedded 产物可能与
@@ -2176,9 +2215,63 @@ func (s *Server) serveWebUI(w http.ResponseWriter, r *http.Request) {
 	// Set content type based on file extension
 	w.Header().Set("Content-Type", contentTypeFor(cleanPath))
 	setWebUICacheControl(w, cleanPath)
-	// #nosec no-direct-write-to-responsewriter -- 静态资源服务：内容为 WebUI 自身构建产物（embed/web/dist），
-	// Content-Type 按扩展名设置，非用户输入内容。
+	// 嵌入式产物不可变，压缩结果可缓存。
+	writeWebStatic(w, r, cleanPath, data, true)
+}
+
+// webGzipCache caches gzip-compressed embedded assets (immutable, keyed by path).
+var webGzipCache sync.Map
+
+// writeWebStatic writes a static asset, gzip-encoding it when the client accepts
+// gzip and the file is compressible (aligned with py dashboard static_encoding).
+func writeWebStatic(w http.ResponseWriter, r *http.Request, path string, data []byte, cacheable bool) {
+	w.Header().Set("Vary", "Accept-Encoding")
+	// #nosec no-direct-write-to-responsewriter -- 内容为 WebUI 构建产物（embed/外部目录），非用户输入。
+	if len(data) >= 1024 && webCompressiblePath(path) && clientAcceptsGzip(r) {
+		if cacheable {
+			if v, ok := webGzipCache.Load(path); ok {
+				w.Header().Set("Content-Encoding", "gzip")
+				_, _ = w.Write(v.([]byte)) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
+				return
+			}
+		}
+		var buf bytes.Buffer
+		zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+		if err == nil {
+			_, _ = zw.Write(data)
+			_ = zw.Close()
+			if buf.Len() < len(data) {
+				out := buf.Bytes()
+				if cacheable {
+					webGzipCache.Store(path, out)
+				}
+				w.Header().Set("Content-Encoding", "gzip")
+				_, _ = w.Write(out) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
+				return
+			}
+		}
+	}
 	_, _ = w.Write(data) // nosemgrep: go.lang.security.audit.xss.no-direct-write-to-responsewriter.no-direct-write-to-responsewriter
+}
+
+// webCompressiblePath reports whether a static asset extension compresses well.
+func webCompressiblePath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".html", ".js", ".mjs", ".css", ".json", ".svg", ".xml", ".txt", ".map", ".wasm":
+		return true
+	}
+	return false
+}
+
+// clientAcceptsGzip reports whether the request advertises gzip support.
+func clientAcceptsGzip(r *http.Request) bool {
+	for _, enc := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		e := strings.ToLower(strings.TrimSpace(enc))
+		if e == "gzip" || strings.HasPrefix(e, "gzip;") {
+			return true
+		}
+	}
+	return false
 }
 
 // contentTypeFor returns the MIME type for a file path.
@@ -2392,12 +2485,22 @@ func (s *Server) getConversationList() []interface{} {
 
 // getActiveUMOs returns active session UMOs and their info, mirroring
 // Python's session_management_service.list_active_umos.
-func (s *Server) getActiveUMOs() map[string]interface{} {
+func (s *Server) getActiveUMOs(platformID string) map[string]interface{} {
 	umos := []string{}
 	if s.conversationMgr != nil {
 		if cm, ok := s.conversationMgr.(interface{ ActiveUMOs() []string }); ok {
 			umos = cm.ActiveUMOs()
 		}
+	}
+	// 4.29.4：可选按平台实例 ID 过滤（platform_id 为 umo 首段）。
+	if platformID != "" {
+		filtered := make([]string, 0, len(umos))
+		for _, umo := range umos {
+			if i := strings.Index(umo, ":"); i > 0 && umo[:i] == platformID {
+				filtered = append(filtered, umo)
+			}
+		}
+		umos = filtered
 	}
 	infos := make([]interface{}, 0, len(umos))
 	for _, umo := range umos {

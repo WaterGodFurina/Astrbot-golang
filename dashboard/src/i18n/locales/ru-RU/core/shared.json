@@ -58,7 +58,8 @@
     "manageProviders": "Управление провайдерами",
     "selectProviderPool": "Выбрать пул провайдеров...",
     "selectedModelCount": "Выбрано моделей: {count}",
-    "selectedCount": "Выбрано провайдеров: {count}"
+    "selectedCount": "Выбрано провайдеров: {count}",
+    "defaultModelSubtitle": "Использовать модель по умолчанию выбранного профиля"
   },
   "personaSelector": {
     "notSelected": "Не выбрано",
@@ -151,5 +152,10 @@
   },
   "form": {
     "rootFolder": "Все персоны"
+  },
+  "configProfileDrawer": {
+    "title": "Изменить профиль",
+    "loadFailed": "Не удалось загрузить профиль",
+    "close": "Закрыть"
   }
 }

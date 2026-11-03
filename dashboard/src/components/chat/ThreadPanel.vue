@@ -28,6 +28,7 @@
           :is-dark="isDark"
           :is-streaming="sending"
           variant="thread"
+          @button-click="handleButtonClick"
         />
       </div>
 
@@ -64,11 +65,12 @@ import {
   applyStreamPayloadToRecord,
   buildChatRequestFlags,
   extractReasoningText,
+  markMessageStarted,
   normalizeMessageParts,
   type ChatRecord,
   type ChatThread,
 } from "@/composables/useMessages";
-import { useModuleI18n } from "@/i18n/composables";
+import { useI18n, useModuleI18n } from "@/i18n/composables";
 import { readSseStream } from "@/utils/sse";
 import ChatMessageList from "@/components/chat/ChatMessageList.vue";
 
@@ -86,6 +88,7 @@ const emit = defineEmits<{
 }>();
 
 const { tm } = useModuleI18n("features/chat");
+const { locale } = useI18n();
 const messages = ref<ChatRecord[]>([]);
 const draft = ref("");
 const sending = ref(false);
@@ -161,6 +164,7 @@ async function send() {
         body: JSON.stringify({
           message: [{ type: "plain", text }],
           flags: buildChatRequestFlags(),
+          locale: locale.value,
           selected_provider: selection.providerId,
           selected_model: selection.modelName,
         }),
@@ -180,6 +184,72 @@ async function send() {
       `\n\n${String((error as Error)?.message || error)}`,
     );
     console.error("Failed to send thread message:", error);
+  } finally {
+    sending.value = false;
+  }
+}
+
+async function handleButtonClick(payload: {
+  message: ChatRecord;
+  callbackData: string;
+}) {
+  if (!props.thread || sending.value || !payload.callbackData) return;
+  const messageId = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  const botRecord: ChatRecord = {
+    id: `local-thread-button-bot-${messageId}`,
+    created_at: new Date().toISOString(),
+    content: {
+      type: "bot",
+      message: [],
+      reasoning: "",
+      isLoading: true,
+    },
+  };
+  let visible = false;
+  const showBotRecord = () => {
+    if (visible) return;
+    messages.value.push(botRecord);
+    visible = true;
+    scrollToBottom();
+  };
+
+  sending.value = true;
+  try {
+    const response = await fetchWithAuth(
+      chatApi.sendThreadMessageUrl(props.thread.thread_id),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: [
+            {
+              type: "button_interaction",
+              callback_data: payload.callbackData,
+              source_message_id: payload.message.id,
+            },
+          ],
+          flags: buildChatRequestFlags(),
+        }),
+      },
+    );
+    if (!response.ok || !response.body) {
+      throw new Error(`Thread button request failed: ${response.status}`);
+    }
+    await readSseStream(response.body, (streamPayload) => {
+      const type = streamPayload?.type || streamPayload?.t;
+      if (type !== "end" && type !== "user_message_saved") {
+        showBotRecord();
+      }
+      processPayload(botRecord, undefined, streamPayload);
+      scrollToBottom();
+    });
+  } catch (error) {
+    showBotRecord();
+    appendPlain(
+      botRecord,
+      `\n\n${String((error as Error)?.message || error)}`,
+    );
+    console.error("Failed to send thread button interaction:", error);
   } finally {
     sending.value = false;
   }
@@ -206,8 +276,22 @@ function normalizeRecord(record: any): ChatRecord {
   };
 }
 
-function processPayload(botRecord: ChatRecord, userRecord: ChatRecord, payload: any) {
+function processPayload(
+  botRecord: ChatRecord,
+  userRecord: ChatRecord | undefined,
+  payload: any,
+) {
   applyStreamPayloadToRecord(botRecord, payload, { userRecord });
+
+  const type = payload?.type || payload?.t;
+  const data = payload?.data ?? "";
+  if (type === "actionrow" && data && typeof data === "object") {
+    markMessageStarted(botRecord);
+    botRecord.content.message.push({
+      type: "actionrow",
+      ...(data as Record<string, unknown>),
+    });
+  }
 }
 
 function scrollToBottom() {

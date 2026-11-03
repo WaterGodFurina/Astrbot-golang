@@ -367,6 +367,27 @@ func (d *Database) initSchema() error {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(conflict_key, handler_full_name)
 		)`,
+
+		// button_callbacks 持久化可移植按钮回调令牌（对齐 Python
+		// button_interaction.py 自建的 button_callbacks 表），使点击在宿主重启后
+		// 仍可解析。
+		`CREATE TABLE IF NOT EXISTS button_callbacks (
+			token TEXT PRIMARY KEY,
+			payload TEXT NOT NULL
+		)`,
+
+		// umo_senders 记录每个统一消息来源下最新观测到的发送者名称（对齐 py
+		// v4.29.4 db/po.py UmoSender），供 WebUI 会话/发送者来源选择器展示。
+		`CREATE TABLE IF NOT EXISTS umo_senders (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			umo TEXT NOT NULL,
+			sender_id TEXT NOT NULL,
+			sender_name TEXT NOT NULL DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(umo, sender_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS ix_umo_senders_updated ON umo_senders(updated_at DESC, id DESC)`,
 	}
 
 	for _, stmt := range statements {
@@ -1600,6 +1621,132 @@ func (d *Database) UpsertUmoAutoName(umo, creatorSenderID, autoName string) erro
 	})
 }
 
+// SaveButtonCallback upserts a portable button callback payload behind its
+// compact token (implements platform.ButtonCallbackStore).
+func (d *Database) SaveButtonCallback(token, payload string) error {
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO button_callbacks(token, payload) VALUES (?, ?)
+			 ON CONFLICT(token) DO UPDATE SET payload = excluded.payload`,
+			token, payload,
+		)
+		return err
+	})
+}
+
+// GetButtonCallback loads the payload stored for a button callback token.
+// found=false means the token is unknown.
+func (d *Database) GetButtonCallback(token string) (string, bool, error) {
+	var payload string
+	err := d.db.QueryRow(
+		`SELECT payload FROM button_callbacks WHERE token = ?`, token,
+	).Scan(&payload)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return payload, true, nil
+}
+
+// UpsertUmoSender 对齐 py v4.29.4 sqlite.upsert_umo_sender：插入发送者或在
+// 名称发生变化（且新名称非空）时更新 sender_name。sender_id 为空时跳过。
+func (d *Database) UpsertUmoSender(umo, senderID, senderName string) error {
+	if senderID == "" {
+		return nil
+	}
+	return d.withRetry(func() error {
+		_, err := d.db.Exec(
+			`INSERT INTO umo_senders (umo, sender_id, sender_name, created_at, updated_at)
+			 VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			 ON CONFLICT(umo, sender_id) DO UPDATE SET
+			   sender_name = excluded.sender_name,
+			   updated_at = CURRENT_TIMESTAMP
+			 WHERE excluded.sender_name != ''
+			   AND umo_senders.sender_name IS NOT excluded.sender_name`,
+			umo, senderID, senderName,
+		)
+		return err
+	})
+}
+
+// UmoSenderRow 对齐 py (UmoSender, UmoAlias|None)：发送者名称 + 会话别名。
+type UmoSenderRow struct {
+	UMO        string `json:"umo"`
+	SenderID   string `json:"sender_id"`
+	SenderName string `json:"sender_name"`
+	AutoName   string `json:"auto_name"`
+	UserAlias  string `json:"user_alias"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+// GetUmoSenders 对齐 py v4.29.4 sqlite.get_umo_senders：搜索发送者元数据并
+// outer join 会话别名。senderIDs 非 nil 时按精确 ID 各取最新一条，否则按
+// (平台实例, sender_id) 去重取最新；按 updated_at 降序分页。
+func (d *Database) GetUmoSenders(search string, limit int, senderIDs []string, offset int) ([]UmoSenderRow, error) {
+	if senderIDs != nil && len(senderIDs) == 0 {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	partitionKey := "substr(u.umo, 1, instr(u.umo || ':', ':') - 1), u.sender_id"
+	if senderIDs != nil {
+		partitionKey = "u.sender_id"
+	}
+
+	var args []interface{}
+	innerWhere := ""
+	if senderIDs != nil {
+		placeholders := make([]string, len(senderIDs))
+		for i, id := range senderIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		innerWhere = "WHERE u.sender_id IN (" + strings.Join(placeholders, ",") + ")"
+	}
+
+	query := `SELECT s.umo, s.sender_id, s.sender_name,
+		COALESCE(a.auto_name, ''), COALESCE(a.user_alias, ''), s.updated_at
+		FROM umo_senders s
+		LEFT JOIN umo_aliases a ON s.umo = a.umo
+		WHERE s.id IN (
+			SELECT id FROM (
+				SELECT u.id, ROW_NUMBER() OVER (
+					PARTITION BY ` + partitionKey + `
+					ORDER BY u.updated_at DESC, u.id DESC
+				) AS rn
+				FROM umo_senders u
+				` + innerWhere + `
+			) ranked WHERE ranked.rn = 1
+		)`
+
+	if strings.TrimSpace(search) != "" {
+		like := "%" + search + "%"
+		query += ` AND (s.sender_id LIKE ? OR s.sender_name LIKE ? OR s.umo LIKE ?
+			OR a.auto_name LIKE ? OR a.user_alias LIKE ?)`
+		args = append(args, like, like, like, like, like)
+	}
+	query += " ORDER BY s.updated_at DESC, s.id DESC LIMIT ? OFFSET ?"
+	args = append(args, limit, offset)
+
+	rows, err := d.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []UmoSenderRow
+	for rows.Next() {
+		var r UmoSenderRow
+		if err := rows.Scan(&r.UMO, &r.SenderID, &r.SenderName, &r.AutoName, &r.UserAlias, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
 // GetConversationPlatformIDs 对齐 Python v4.28.0 sqlite.get_conversation_platform_ids： 返回 conversations 表中 distinct platform_id 的有序列表。
 func (d *Database) GetConversationPlatformIDs() ([]string, error) {
 	rows, err := d.db.Query(`SELECT DISTINCT platform_id FROM conversations ORDER BY platform_id`)
@@ -1618,4 +1765,102 @@ func (d *Database) GetConversationPlatformIDs() ([]string, error) {
 		}
 	}
 	return result, rows.Err()
+}
+
+// execCount runs a write statement and returns the affected row count.
+func (d *Database) execCount(query string, args ...interface{}) (int, error) {
+	var n int
+	err := d.withRetry(func() error {
+		res, err := d.db.Exec(query, args...)
+		if err != nil {
+			return err
+		}
+		c, _ := res.RowsAffected()
+		n = int(c)
+		return nil
+	})
+	return n, err
+}
+
+// CleanupBotData removes data owned by one platform adapter instance, aligned
+// with py v4.29.4 dashboard bot_cleanup_service.delete_bot_data. Only the given
+// targets are touched; shared resources and other adapters are preserved. The
+// returned map holds per-target deleted row counts.
+//
+// targets keys: "cron_jobs", "preferences", "custom_rules", "conversations",
+// "message_history", "stats". ("custom_rules" and "preferences" both purge the
+// instance's umo-scoped preferences/preferences rows.)
+func (d *Database) CleanupBotData(botID string, targets map[string]bool) (map[string]int, error) {
+	counts := map[string]int{}
+	if botID == "" {
+		return counts, fmt.Errorf("bot_id is required")
+	}
+	prefix := botID + ":"
+
+	if targets["cron_jobs"] {
+		rows, err := d.db.Query(`SELECT job_id, payload FROM cron_jobs`)
+		if err != nil {
+			return counts, err
+		}
+		var ids []string
+		for rows.Next() {
+			var jobID, payload string
+			if rows.Scan(&jobID, &payload) != nil {
+				continue
+			}
+			var p map[string]interface{}
+			if json.Unmarshal([]byte(payload), &p) != nil {
+				continue
+			}
+			if s, _ := p["session"].(string); strings.HasPrefix(s, prefix) {
+				ids = append(ids, jobID)
+			}
+		}
+		rows.Close()
+		for _, id := range ids {
+			if err := d.DeleteCronJob(id); err == nil {
+				counts["cron_jobs"]++
+			}
+		}
+	}
+
+	if targets["preferences"] || targets["custom_rules"] {
+		n, err := d.execCount(`DELETE FROM preferences WHERE scope = 'umo' AND substr(scope_id, 1, ?) = ?`, len(prefix), prefix)
+		if err != nil {
+			return counts, err
+		}
+		counts["preferences"] = n
+	}
+
+	if targets["conversations"] {
+		n, err := d.execCount(`DELETE FROM conversations WHERE platform_id = ?`, botID)
+		if err != nil {
+			return counts, err
+		}
+		counts["conversations"] = n
+	}
+
+	if targets["message_history"] {
+		n, err := d.execCount(`DELETE FROM platform_message_history WHERE platform_id = ?`, botID)
+		if err != nil {
+			return counts, err
+		}
+		counts["message_history"] = n
+		if c, err := d.execCount(`DELETE FROM umo_aliases WHERE substr(umo, 1, ?) = ?`, len(prefix), prefix); err == nil {
+			counts["umo_aliases"] = c
+		}
+		if c, err := d.execCount(`DELETE FROM umo_senders WHERE substr(umo, 1, ?) = ?`, len(prefix), prefix); err == nil {
+			counts["umo_senders"] = c
+		}
+	}
+
+	if targets["stats"] {
+		n, err := d.execCount(`DELETE FROM provider_stats WHERE substr(umo, 1, ?) = ?`, len(prefix), prefix)
+		if err != nil {
+			return counts, err
+		}
+		counts["stats"] = n
+	}
+
+	return counts, nil
 }

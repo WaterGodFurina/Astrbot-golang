@@ -18,7 +18,7 @@ func TestExecuteFutureTaskEditUpdatesInPlace(t *testing.T) {
 	m := cron.NewCronJobManager(nil)
 	m.RegisterHandler("active_agent", func(ctx context.Context, j *cron.Job) error { return nil })
 
-	created := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{
+	created := executeFutureTask(m, "qq:group:1", "u1", false, false, map[string]interface{}{
 		"action": "create", "name": "t", "cron_expression": "0 8 * * *", "note": "old",
 	})
 	if !strings.Contains(created, "task created: job_id=") {
@@ -27,7 +27,7 @@ func TestExecuteFutureTaskEditUpdatesInPlace(t *testing.T) {
 	id := strings.TrimPrefix(strings.Split(created, "job_id=")[1], "job_")
 	id = "job_" + strings.TrimSpace(id[:strings.Index(id, " ")])
 
-	updated := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{
+	updated := executeFutureTask(m, "qq:group:1", "u1", false, false, map[string]interface{}{
 		"action": "edit", "job_id": id, "note": "new", "cron_expression": "0 9 * * *",
 	})
 	if !strings.Contains(updated, "task updated: job_id="+id) {
@@ -58,7 +58,7 @@ func TestExecuteFutureTaskEditUpdatesInPlace(t *testing.T) {
 // and never creates a new job (M-17).
 func TestExecuteFutureTaskEditMissingJob(t *testing.T) {
 	m := cron.NewCronJobManager(nil)
-	got := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{
+	got := executeFutureTask(m, "qq:group:1", "u1", false, false, map[string]interface{}{
 		"action": "edit", "job_id": "job_missing", "note": "x",
 	})
 	if !strings.Contains(got, "task not found") {
@@ -72,7 +72,7 @@ func TestExecuteFutureTaskOwnershipIsolation(t *testing.T) {
 	m := cron.NewCronJobManager(nil)
 	m.RegisterHandler("active_agent", func(ctx context.Context, j *cron.Job) error { return nil })
 
-	created := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{
+	created := executeFutureTask(m, "qq:group:1", "u1", false, false, map[string]interface{}{
 		"action": "create", "name": "t", "cron_expression": "0 8 * * *", "note": "u1 secret",
 	})
 	if !strings.Contains(created, "task created: job_id=") {
@@ -82,31 +82,31 @@ func TestExecuteFutureTaskOwnershipIsolation(t *testing.T) {
 	id = "job_" + strings.TrimSpace(id[:strings.Index(id, " ")])
 
 	// 同一会话的另一用户：list 看不到，delete/edit 被拒绝。
-	otherList := executeFutureTask(m, "qq:group:1", "u2", map[string]interface{}{"action": "list"})
+	otherList := executeFutureTask(m, "qq:group:1", "u2", false, false, map[string]interface{}{"action": "list"})
 	if strings.Contains(otherList, "u1 secret") || strings.Contains(otherList, id) {
 		t.Fatalf("other user in same session must not see the task: %q", otherList)
 	}
-	if got := executeFutureTask(m, "qq:group:1", "u2", map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "task not found") {
+	if got := executeFutureTask(m, "qq:group:1", "u2", false, false, map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "was not created by you") {
 		t.Fatalf("other user must not delete the task: %q", got)
 	}
-	if got := executeFutureTask(m, "qq:group:1", "u2", map[string]interface{}{"action": "edit", "job_id": id, "note": "hijacked"}); !strings.Contains(got, "task not found") {
+	if got := executeFutureTask(m, "qq:group:1", "u2", false, false, map[string]interface{}{"action": "edit", "job_id": id, "note": "hijacked"}); !strings.Contains(got, "was not created by you") {
 		t.Fatalf("other user must not edit the task: %q", got)
 	}
 
 	// 其他会话的同一用户：同样不可见不可操作。
-	if got := executeFutureTask(m, "qq:group:2", "u1", map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "task not found") {
+	if got := executeFutureTask(m, "qq:group:2", "u1", false, false, map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "was not created by you") {
 		t.Fatalf("other session must not delete the task: %q", got)
 	}
 
 	// 创建者本人：list 可见、edit 可改、delete 可删。
-	ownList := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{"action": "list"})
+	ownList := executeFutureTask(m, "qq:group:1", "u1", false, false, map[string]interface{}{"action": "list"})
 	if !strings.Contains(ownList, id) {
 		t.Fatalf("owner must see the task in list: %q", ownList)
 	}
-	if got := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{"action": "edit", "job_id": id, "note": "mine"}); !strings.Contains(got, "task updated") {
+	if got := executeFutureTask(m, "qq:group:1", "u1", false, false, map[string]interface{}{"action": "edit", "job_id": id, "note": "mine"}); !strings.Contains(got, "task updated") {
 		t.Fatalf("owner edit failed: %q", got)
 	}
-	if got := executeFutureTask(m, "qq:group:1", "u1", map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "task deleted") {
+	if got := executeFutureTask(m, "qq:group:1", "u1", false, false, map[string]interface{}{"action": "delete", "job_id": id}); !strings.Contains(got, "task deleted") {
 		t.Fatalf("owner delete failed: %q", got)
 	}
 }
