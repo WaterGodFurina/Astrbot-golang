@@ -1,0 +1,1 @@
+import{P as e,e as a,w as t,ap as o,h as s,B as n,ao as r,o as p}from"./index-BHprFgx-.js";const f=e({__name:"BlankLayout",setup(c){return(u,_)=>(p(),a(o,null,{default:t(()=>[s(n(r))]),_:1}))}});export{f as default};

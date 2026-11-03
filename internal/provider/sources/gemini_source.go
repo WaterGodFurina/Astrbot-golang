@@ -492,10 +492,48 @@ func (s *GeminiSource) buildRequestBody(req *provider.ProviderRequest, stream bo
 			}
 		}
 	}
+	// 对齐 py v4.29.2：从 custom_extra_body 读取生成参数注入 generationConfig。
+	s.applyGenerationConfig(body)
 	// 对齐 Python #9881/_prepare_query_config：按模型系列门控注入 thinking
 	// （2.5 系列 thinkingBudget，3.x thinkingLevel）。
 	s.applyThinkingConfig(body)
 	return body
+}
+
+// applyGenerationConfig 对齐 py v4.29.2 Gemini _prepare_query_config：生成参数
+// 支持 snake_case / OpenAI / camelCase 三种别名，仅注入已设置的字段（保留零值
+// 语义）。上游遇到 custom_extra_body 中的未知键会报错；Go 侧忽略未知键，避免
+// 因历史配置混入无关字段而中断请求。
+func (s *GeminiSource) applyGenerationConfig(body map[string]interface{}) {
+	cfg := s.Config()
+	extra, _ := cfg["custom_extra_body"].(map[string]interface{})
+	if len(extra) == 0 {
+		return
+	}
+	aliases := map[string][]string{
+		"temperature":      {"temperature"},
+		"maxOutputTokens":  {"max_output_tokens", "max_tokens", "maxOutputTokens"},
+		"topP":             {"top_p", "topP"},
+		"topK":             {"top_k", "topK"},
+		"frequencyPenalty": {"frequency_penalty", "frequencyPenalty"},
+		"presencePenalty":  {"presence_penalty", "presencePenalty"},
+		"stopSequences":    {"stop_sequences", "stop", "stopSequences"},
+		"responseLogprobs": {"response_logprobs", "responseLogprobs"},
+		"logprobs":         {"logprobs"},
+		"seed":             {"seed"},
+	}
+	gen := map[string]interface{}{}
+	for field, names := range aliases {
+		for _, name := range names {
+			if v, ok := extra[name]; ok {
+				gen[field] = v
+				break
+			}
+		}
+	}
+	if len(gen) > 0 {
+		body["generationConfig"] = gen
+	}
 }
 
 // gemini25ThinkingModels 为仅支持 thinkingBudget、不支持 thinkingLevel 的
@@ -649,6 +687,45 @@ func geminiConvertSchema(schema map[string]interface{}) map[string]interface{} {
 	for _, k := range geminiSchemaSupportFields {
 		if v, ok := schema[k]; ok {
 			result[k] = v
+		}
+	}
+
+	// 4.29.2：Gemini 仅接受字符串枚举（"enum: only allowed for STRING type"）。
+	// 字符串类型保留 enum（非字符串值 JSON 化）；其它类型把允许集合写进
+	// description 并移除 enum，保留原始类型（对齐 py ToolSet.google_schema）。
+	if enumRaw, ok := result["enum"].([]interface{}); ok {
+		delete(result, "enum")
+		values := make([]interface{}, 0, len(enumRaw))
+		hasNull := false
+		for _, v := range enumRaw {
+			if v == nil {
+				hasNull = true
+				continue
+			}
+			values = append(values, v)
+		}
+		if hasNull {
+			result["nullable"] = true
+		}
+		if result["type"] == "STRING" {
+			converted := make([]interface{}, 0, len(values))
+			for _, v := range values {
+				if s, ok := v.(string); ok {
+					converted = append(converted, s)
+				} else if raw, err := json.Marshal(v); err == nil {
+					converted = append(converted, string(raw))
+				}
+			}
+			result["enum"] = converted
+		} else {
+			parts := make([]string, 0, len(values))
+			for _, v := range values {
+				if raw, err := json.Marshal(v); err == nil {
+					parts = append(parts, string(raw))
+				}
+			}
+			desc, _ := result["description"].(string)
+			result["description"] = strings.TrimSpace(desc + "\nAllowed values: " + strings.Join(parts, ", "))
 		}
 	}
 

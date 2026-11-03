@@ -19,7 +19,79 @@ const (
 	CapTextToSpeech   ProviderCapabilityType = "text_to_speech"
 	CapEmbedding      ProviderCapabilityType = "embedding"
 	CapRerank         ProviderCapabilityType = "rerank"
+	// CapDecision 对齐 py ProviderType.DECISION（4.29.4 决策模型）。
+	CapDecision ProviderCapabilityType = "decision"
 )
+
+// DecisionChoiceQuestion is a decision question with a fixed set of choices
+// (aligned with py DecisionChoiceQuestion).
+type DecisionChoiceQuestion struct {
+	Instructions string
+	Criteria     map[string]string
+}
+
+// DecisionBooleanQuestion asks for the probability of a statement being true.
+type DecisionBooleanQuestion struct {
+	Instructions string
+}
+
+// DecisionScoreQuestion is scored against ordered levels (2–10 entries).
+type DecisionScoreQuestion struct {
+	Instructions string
+	Criteria     []string
+}
+
+// DecisionQuestion is a DecisionChoiceQuestion / DecisionBooleanQuestion /
+// DecisionScoreQuestion (aligned with py DecisionQuestion union).
+type DecisionQuestion interface{ isDecisionQuestion() }
+
+func (DecisionChoiceQuestion) isDecisionQuestion()  {}
+func (DecisionBooleanQuestion) isDecisionQuestion() {}
+func (DecisionScoreQuestion) isDecisionQuestion()   {}
+
+// DecisionState is the context forwarded to a decision provider
+// (string | []Any | map[string]Any). Nil means no state.
+type DecisionState = interface{}
+
+// DecisionChoiceAnswer is the normalized answer for a choice question.
+type DecisionChoiceAnswer struct {
+	Choice        string
+	Probability   float64
+	Probabilities map[string]float64
+	Confidence    float64
+}
+
+// DecisionBooleanAnswer is the normalized answer for a boolean question.
+type DecisionBooleanAnswer struct {
+	Probability float64
+}
+
+// DecisionScoreAnswer is the normalized answer for a score question.
+type DecisionScoreAnswer struct {
+	Score         float64
+	Legend        map[string]string
+	Probabilities map[string]float64
+	Confidence    float64
+}
+
+// DecisionAnswer is a DecisionChoiceAnswer / DecisionBooleanAnswer /
+// DecisionScoreAnswer (aligned with py DecisionAnswer union).
+type DecisionAnswer interface{ isDecisionAnswer() }
+
+func (DecisionChoiceAnswer) isDecisionAnswer()  {}
+func (DecisionBooleanAnswer) isDecisionAnswer() {}
+func (DecisionScoreAnswer) isDecisionAnswer()   {}
+
+// DecisionError is raised when a decision provider is unavailable or returns an
+// invalid answer (aligned with py DecisionError).
+type DecisionError struct{ Message string }
+
+func (e *DecisionError) Error() string { return e.Message }
+
+// NewDecisionError creates a decision error.
+func NewDecisionError(format string, args ...interface{}) *DecisionError {
+	return &DecisionError{Message: fmt.Sprintf(format, args...)}
+}
 
 // ProviderMeta is the basic metadata of a provider instance.
 type ProviderMeta struct {

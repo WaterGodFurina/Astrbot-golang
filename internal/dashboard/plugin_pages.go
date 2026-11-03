@@ -162,10 +162,22 @@ func (s *Server) pluginPageRoot(pluginID, page string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	root, err := filepath.Abs(filepath.Join(pluginsRoot, safePluginDirID(pluginID), pluginPageRootName, page))
+	base, err := filepath.Abs(filepath.Join(pluginsRoot, safePluginDirID(pluginID)))
 	if err != nil {
 		return "", err
 	}
+	// 4.29.0：优先 views 目录，回退 pages（保持向后兼容）。
+	for _, dir := range []string{"views", pluginPageRootName} {
+		root := filepath.Join(base, dir, page)
+		if !strings.HasPrefix(root, pluginsRoot+string(os.PathSeparator)) {
+			return "", errors.New("非法的插件目录")
+		}
+		if info, err := os.Stat(root); err == nil && info.IsDir() {
+			return root, nil
+		}
+	}
+	// 都不存在时返回 pages 路径，交由调用方按“页面不存在”处理。
+	root := filepath.Join(base, pluginPageRootName, page)
 	if !strings.HasPrefix(root, pluginsRoot+string(os.PathSeparator)) {
 		return "", errors.New("非法的插件目录")
 	}

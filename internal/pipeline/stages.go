@@ -1091,6 +1091,9 @@ func (s *ProcessStage) Process(ctx context.Context, event *core.Event) (*StageRe
 	case doomNotConsumed:
 		// normal message
 	}
+	// 4.29.2：事件进入管线即建立 trace span 并记录 event_received（对齐 py
+	// AstrMessageEvent.__init__ 的 trace.record），使 on_message 等钩子也可被追踪。
+	s.ensureEventTrace(event)
 	// Run subprocess plugin on_message hooks (mirrors Python's @filter.on_message): plugins observe every incoming message.
 	dispatchSubprocessHooks(s.subPlugins, event, "on_message")
 	// Push serialized events to plugins that registered a bridge hook (botpy/telegram compat layers); no-op unless a plugin opted in.
@@ -1241,6 +1244,13 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 	result := []*star.StarHandlerMetadata{}
 	denied := false
 
+	// 本事件携带的可移植按钮动作 ID（空串表示非按钮点击），供
+	// ButtonActionFilter 匹配（对齐 py event.get_button_interaction()）。
+	buttonActionID := ""
+	if bi := event.GetButtonInteraction(); bi != nil {
+		buttonActionID = bi.ActionID
+	}
+
 	logger.Debug("[dbg] findMatchingHandlers: %d 个 filter handler, msg=%q wake=%v", len(all), event.MessageStr, event.IsAtOrWakeCommand)
 	for _, handler := range all {
 		// 经快照读取 filters/Enabled：dashboard 可能在运行期经写锁修改 EventFilters/Enabled（SetHandlerPermission/Enable/Disable）， 直接遍历共享切片会与写者并发构成数据竞争。
@@ -1263,6 +1273,7 @@ func (s *ProcessStage) findMatchingHandlers(event *core.Event) (handlers []*star
 			EventRole:       event.Role,
 			IsGroup:         event.Source.IsGroup,
 			SessionIsolated: sessionIsolated,
+			ButtonActionID:  buttonActionID,
 		}
 		// All non-permission filters must pass (AND); a failing permission filter marks the event as permission-denied.
 		passed := true
@@ -1319,6 +1330,50 @@ func (s *ProcessStage) scheduleUmoAutoName(event *core.Event) {
 	if s.umoAutoNameRecorder != nil {
 		s.umoAutoNameRecorder.Schedule(event)
 	}
+}
+
+// ensureEventTrace creates the event-level trace span at pipeline entry and
+// records event_received (4.29.2). No-op when tracing is disabled or a span
+// already exists.
+func (s *ProcessStage) ensureEventTrace(event *core.Event) {
+	if event == nil || event.Trace != nil {
+		return
+	}
+	if v, ok := s.config["trace_enable"].(bool); !ok || !v {
+		return
+	}
+	outline := truncateRunes(extractPlainText(event.Message), 200)
+	event.Trace = log.NewTraceSpan("astr_main_agent", event.UnifiedMsgOrigin(),
+		event.Source.SenderName, truncateRunes(outline, 60), nil)
+	event.Trace.Record("event_received", map[string]interface{}{
+		"kind":          "message",
+		"platform_id":   event.Source.PlatformID,
+		"platform_name": event.Source.Platform,
+		"message_type":  event.GetMessageType(),
+		"message":       outline,
+	})
+}
+
+// traceHook records handler_start / handler_end spans for a subprocess plugin
+// hook (aligned with py call_event_hook). No-op when tracing is off.
+func traceHook(event *core.Event, pluginName, handlerName, hookEvent, status string) {
+	if event == nil || event.Trace == nil {
+		return
+	}
+	fields := map[string]interface{}{
+		"kind":                "plugin_handler",
+		"status":              status,
+		"plugin":              pluginName,
+		"plugin_display_name": pluginName,
+		"handler":             handlerName,
+		"handler_category":    "hook",
+		"hook":                hookEvent,
+	}
+	action := "handler_end"
+	if status == "running" {
+		action = "handler_start"
+	}
+	event.Trace.Record(action, fields)
 }
 
 func (s *ProcessStage) filterHandlersBySession(event *core.Event, handlers []*star.StarHandlerMetadata) []*star.StarHandlerMetadata {
@@ -1521,10 +1576,10 @@ func (s *ProcessStage) resolveAgentContext(event *core.Event) (*agentRequest, er
 			return false
 		}
 		event.Trace = log.NewTraceSpan("astr_main_agent", event.UnifiedMsgOrigin(), event.Source.SenderName, truncateRunes(prompt, 60), traceEnabled)
-		event.Trace.Record("astr_agent_prepare", map[string]interface{}{
-			"persona_id": personaIDOrDefault(s.config),
-		})
 	}
+	event.Trace.Record("astr_agent_prepare", map[string]interface{}{
+		"persona_id": personaIDOrDefault(s.config),
+	})
 
 	providerCfg, providerSettings, err := s.resolveProvider()
 	if err != nil {
@@ -3026,11 +3081,15 @@ func dispatchSubprocessHooksPayload(sub *plugin.SubprocessManager, event *core.E
 				continue
 			}
 			// 钩子为被动广播，不计入活动时间（否则带钩子插件永不休眠）。
+			traceHook(event, inst.Name, h.Name, hookEvent, "running")
 			rpcCtx, rpcCancel := context.WithTimeout(context.Background(), pluginRPCTimeout)
 			res, err := inst.Client.HandleHookWithPayload(rpcCtx, h.Name, sdkEvent, nil, payload)
 			rpcCancel()
 			if err != nil {
 				logger.I18nWarn("插件 %s 钩子 %s (%s) 执行失败: %v", inst.Name, h.Name, hookEvent, err)
+				traceHook(event, inst.Name, h.Name, hookEvent, "error")
+			} else {
+				traceHook(event, inst.Name, h.Name, hookEvent, "success")
 			}
 			if res.Result.Sent && event != nil {
 				// 插件在钩子中主动发送过（对齐 Python _has_send_oper）。
@@ -3278,6 +3337,17 @@ func (s *ProcessStage) collectTools(computerUseRuntime, umo string) []map[string
 		case "anysearch":
 			// 对齐 Python v4.28.0 #9767 AnySearch：支持匿名调用，key 列表 为空时也注入工具（执行时会发一次无 Authorization 的请求）。
 			tools = append(tools, anySearchToolSchema())
+		case "serpapi":
+			// 4.29.1/#10599：SerpApi 系列（web/news/image/finance/scholar）。
+			if len(serpapiKeys(s.config)) > 0 {
+				tools = append(tools, serpApiWebSearchToolSchema(), serpApiNewsSearchToolSchema(),
+					serpApiImageSearchToolSchema(), serpApiFinanceSearchToolSchema(), serpApiScholarSearchToolSchema())
+			}
+		case "deepseek":
+			// 4.29.1/#10601：DeepSeek web search + fetch web page。
+			if len(deepseekKeys(s.config)) > 0 {
+				tools = append(tools, deepseekWebSearchToolSchema(), deepseekFetchToolSchema())
+			}
 		}
 	}
 
@@ -3885,6 +3955,13 @@ var coreBuiltinToolSet = map[string]bool{
 	"web_search_baidu":                 true,
 	"web_search_exa":                   true,
 	"web_search_anysearch":             true,
+	"web_search_serpapi":               true,
+	"news_search_serpapi":              true,
+	"image_search_serpapi":             true,
+	"finance_search_serpapi":           true,
+	"scholar_search_serpapi":           true,
+	"web_search_deepseek":              true,
+	"deepseek_fetch_web_page":          true,
 	"tavily_extract_web_page":          true,
 	"firecrawl_extract_web_page":       true,
 	"exa_get_contents":                 true,
@@ -3982,7 +4059,13 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 
 	// Host-side tool permission guard: a tool marked admin-only in tool_permissions refuses to run for member events. Checked before any dispatch so neither the executors nor the on_tool_call hooks observe a denied invocation.
 	if computerToolAdminSet[name] {
-		if msg := s.computerAdminDenied(event, toolDisplayName(name)); msg != "" {
+		// 4.29.0：Local 运行时按角色权限矩阵（文件/执行工具）判定；其余
+		// （浏览器/技能/非 Local 运行时）沿用管理员门禁。
+		if s.isLocalRuntime() && (localExecutionTools[name] || localFileTools[name]) {
+			if msg := s.localToolDenied(event, name); msg != "" {
+				return msg
+			}
+		} else if msg := s.computerAdminDenied(event, toolDisplayName(name)); msg != "" {
 			return msg
 		}
 	}
@@ -4093,11 +4176,19 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 				restrictedLocal := s.computerUseRestricted(event)
 				switch name {
 				case "astrbot_execute_shell":
-					result = executeLocalShell(umo, event.GetSenderID(), argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
+					if s.localRequiresSandbox(event) {
+						result = s.executeSandboxedShell(event, argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
+					} else {
+						result = executeLocalShell(umo, event.GetSenderID(), argString(args, "command"), argBool(args, "background"), argInt(args, "timeout", 300))
+					}
 				case "astrbot_shell_session":
 					result = executeShellSession(umo, event.GetSenderID(), argString(args, "action"), argString(args, "session_id"), argString(args, "data"))
 				case "astrbot_execute_python":
-					result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
+					if s.localRequiresSandbox(event) {
+						result = s.executeSandboxedPython(event, argString(args, "code"), argInt(args, "timeout", 30))
+					} else {
+						result = executeLocalPython(umo, argString(args, "code"), argInt(args, "timeout", 30))
+					}
 				case "astrbot_file_read_tool":
 					rdText, rdImg, rdMime := executeFileRead(argString(args, "path"), umo, argInt(args, "offset", 0), argInt(args, "limit", 0), restrictedLocal)
 					if rdImg != "" {
@@ -4129,7 +4220,8 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 			}
 		case "future_task":
 			// 存三段式 unified_msg_origin（platform_id:MessageType:session_id）， 保证 WebUI/Python future_task 解析时 message_type 与 session_id 对位。
-			result = executeFutureTask(s.cronMgr, event.PythonUMO(), event.GetSenderID(), args)
+			result = executeFutureTask(s.cronMgr, event.PythonUMO(), event.GetSenderID(),
+				event.Source.IsGroup, event.Role == "admin" || event.Source.IsAdmin, args)
 		case "web_search_tavily":
 			result = executeWebSearchTavily(s.config, args)
 		case "web_search_bocha":
@@ -4144,6 +4236,20 @@ func (s *ProcessStage) executeTool(ctx context.Context, event *core.Event, runti
 			result = executeWebSearchExa(s.config, args)
 		case "web_search_anysearch":
 			result = executeWebSearchAnySearch(s.config, args)
+		case "web_search_serpapi":
+			result = executeWebSearchSerpApi(s.config, args)
+		case "news_search_serpapi":
+			result = executeNewsSearchSerpApi(s.config, args)
+		case "image_search_serpapi":
+			result = executeImageSearchSerpApi(s.config, args)
+		case "finance_search_serpapi":
+			result = executeFinanceSearchSerpApi(s.config, args)
+		case "scholar_search_serpapi":
+			result = executeScholarSearchSerpApi(s.config, args)
+		case "web_search_deepseek":
+			result = executeWebSearchDeepSeek(s.config, args)
+		case "deepseek_fetch_web_page":
+			result = executeDeepSeekFetch(s.config, args)
 		case "tavily_extract_web_page":
 			result = executeTavilyExtract(s.config, args)
 		case "firecrawl_extract_web_page":
@@ -5340,6 +5446,9 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 				}
 			}
 		}
+		if event.Result != nil {
+			recordResponseSent(event, event.Result.ToMessageChain().Chain, true)
+		}
 		return &StageResult{Continue: false}, nil
 	}
 
@@ -5411,11 +5520,33 @@ func (s *RespondStage) Process(ctx context.Context, event *core.Event) (*StageRe
 				dispatchSubprocessHooks(s.subPlugins, event, "on_after_message_sent")
 			}
 		}
+		recordResponseSent(event, validChain, false)
 	}
 
 	// Clear the result
 	event.Result = nil
 	return &StageResult{Continue: false}, nil
+}
+
+// recordResponseSent records a response_sent trace span (aligned with py
+// respond/stage.py 4.29.2). No-op when tracing is off.
+func recordResponseSent(event *core.Event, chain []message.Component, streaming bool) {
+	if event == nil || event.Trace == nil || len(chain) == 0 {
+		return
+	}
+	var b strings.Builder
+	for _, comp := range chain {
+		b.WriteString(comp.String())
+	}
+	outline := truncateRunes(b.String(), 4096)
+	if strings.TrimSpace(outline) == "" {
+		return
+	}
+	fields := map[string]interface{}{"kind": "response", "message": outline}
+	if streaming {
+		fields["streaming"] = true
+	}
+	event.Trace.Record("response_sent", fields)
 }
 
 // segReplyRequired mirrors respond/stage.py is_seg_reply_required: enabled + (not only_llm_result or the result is a model result) + platform allowed.

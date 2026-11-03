@@ -1,0 +1,2 @@
+const __vite__mapDeps=(i,m=__vite__mapDeps,d=(m.f||(m.f=["assets/yaml-DecSzI2o.js","assets/editor.api-CxMavR3u.js","assets/index-BHprFgx-.js","assets/index-cIAqcrlW.css","assets/editor-DyX1CsEw.css"])))=>i.map(i=>d[i]);
+import{aQ as a}from"./index-BHprFgx-.js";import{r as m}from"./_.contribution-BCorUMoM.js";import"./editor.api-CxMavR3u.js";m({id:"yaml",extensions:[".yaml",".yml"],aliases:["YAML","yaml","YML","yml"],mimetypes:["application/x-yaml","text/x-yaml"],loader:()=>a(()=>import("./yaml-DecSzI2o.js"),__vite__mapDeps([0,1,2,3,4]))});

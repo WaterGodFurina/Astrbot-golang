@@ -65,6 +65,8 @@ var sdkTarballSHA256 = map[string]string{
 	"0.9.10": "1ed753c27bc6126ecdc6a1b885710dcff614f04371798fdbb5d366e2fddc193e",
 	// v0.14.2 官方归档 sha256（2026-10-06 从 GitHub tag v0.14.2 下载两次核对一致）。
 	"0.14.2": "d2e0587d4cc798b1f4c760b8ea258945e4f7d0a2b2a0708962b7ad46e1f7ec5e",
+	// v0.14.3 官方归档 sha256（2026-11-03 从 GitHub tag v0.14.3 下载核对；GitHub tag 归档确定性）。
+	"0.14.3": "d9bf9007c052d2e4d77985b86c55e889d9edbd971ed64076497477eb16b565c9",
 }
 
 // SetSDKGitHubProxy overrides the GitHub accelerator prefix used for the SDK

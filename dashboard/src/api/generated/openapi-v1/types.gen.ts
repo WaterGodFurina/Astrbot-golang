@@ -45,6 +45,8 @@ export type BatchSessionServiceRequest = UmoListRequest & {
     tts_enabled?: boolean;
 };
 
+export type BotCleanupTarget = 'custom_rules' | 'preferences' | 'routing' | 'cron_jobs' | 'conversations' | 'message_history' | 'traces' | 'stats';
+
 export type BotConfigRequest = {
     id?: string;
     name?: string;
@@ -67,6 +69,12 @@ export type BotRegistrationRequest = {
 
 export type action = 'start' | 'poll';
 
+export type ChatChunkUploadRequest = {
+    upload_id: string;
+    chunk_index: number;
+    chunk: (Blob | File);
+};
+
 /**
  * Per-request ChatUI feature flags. A value here takes priority over its legacy top-level field, followed by the documented default.
  */
@@ -83,10 +91,6 @@ export type ChatFlags = {
      * Enable streaming model output for this request. This value takes priority over the legacy top-level enable_streaming field.
      */
     enable_streaming?: boolean;
-    /**
-     * Display reasoning content for this WebChat request independently of the global display_reasoning_text setting.
-     */
-    enable_reasoning?: boolean;
 };
 
 export type ChatMessagePatchRequest = {
@@ -188,6 +192,16 @@ export type ChatThreadMessageRequest = {
      */
     enable_streaming?: boolean;
     flags?: ChatFlags;
+};
+
+export type ChatUploadInitRequest = {
+    filename: string;
+    total_size: number;
+    content_type?: string;
+};
+
+export type ChatUploadSessionRequest = {
+    upload_id: string;
 };
 
 export type CommandPatchRequest = {
@@ -524,11 +538,6 @@ export type PluginRepositoryInstallRequest = {
     install_method?: string;
     registry_url?: (string) | null;
     market_plugin_id?: string;
-    /**
-     * Python dependency install mode choice (lazy / full).
-     * 宿主后端已支持，待 openapi spec 更新后随 generate:api 重新生成。
-     */
-    deps_choice?: string;
 };
 
 export type PluginSourceBindRequest = {
@@ -562,11 +571,6 @@ export type PluginUrlInstallRequest = {
     install_method?: string;
     registry_url?: (string) | null;
     market_plugin_id?: string;
-    /**
-     * Python dependency install mode choice (lazy / full).
-     * 宿主后端已支持，待 openapi spec 更新后随 generate:api 重新生成。
-     */
-    deps_choice?: string;
 };
 
 export type PluginValidateRepoRequest = {
@@ -579,7 +583,7 @@ export type PluginVersionSupportRequest = {
     astrbot_version?: string;
 };
 
-export type ProviderCapability = 'chat' | 'agent' | 'stt' | 'tts' | 'embedding' | 'rerank';
+export type ProviderCapability = 'chat' | 'agent' | 'stt' | 'tts' | 'embedding' | 'rerank' | 'decision';
 
 export type ProviderConfigRequest = {
     id?: string;
@@ -594,6 +598,10 @@ export type ProviderSourceConfigRequest = {
     config: DynamicConfig;
 };
 
+export type PypiIndexTestRequest = {
+    index_url: string;
+};
+
 export type RenameRequest = {
     name: string;
 };
@@ -605,6 +613,41 @@ export type ReorderRequest = {
         sort_order: number;
     }>;
 };
+
+/**
+ * The AstrBot backend runtime, including when running inside a container. Values are captured at application startup.
+ */
+export type RuntimeInfo = {
+    /**
+     * Lowercase platform.system() value, commonly linux, darwin, or windows.
+     */
+    os: string;
+    /**
+     * Unmodified platform.machine() value, such as x86_64, AMD64, arm64, or aarch64. May be empty if unknown.
+     */
+    arch: string;
+    /**
+     * Local process sandbox startup check, captured when AstrBot starts. It does not verify DNS resolution or every permitted operation.
+     */
+    sandbox: {
+        backend: ('bubblewrap' | 'seatbelt') | null;
+        /**
+         * detected means the executable was found and a minimal workspace sandbox launched successfully; missing means the corresponding executable was not found; unavailable means it was found but sandbox startup failed; unsupported means this platform has no Local process sandbox backend. These identifiers are independent of the UI language.
+         */
+        status: 'detected' | 'missing' | 'unavailable' | 'unsupported';
+        /**
+         * Bounded startup error detail, included when status is unavailable. Restart AstrBot after fixing the environment to refresh the check.
+         */
+        error?: string;
+    };
+};
+
+export type backend = 'bubblewrap' | 'seatbelt';
+
+/**
+ * detected means the executable was found and a minimal workspace sandbox launched successfully; missing means the corresponding executable was not found; unavailable means it was found but sandbox startup failed; unsupported means this platform has no Local process sandbox backend. These identifiers are independent of the UI language.
+ */
+export type status = 'detected' | 'missing' | 'unavailable' | 'unsupported';
 
 export type SessionGroupRequest = {
     name?: string;
@@ -624,6 +667,9 @@ export type SetupAuthRequest = {
     username: string;
     password: string;
     confirm_password: string;
+    /**
+     * Initial password printed to the console at first install / reset (required while password_change_required is true).
+     */
     old_password?: string;
 };
 
@@ -1390,10 +1436,6 @@ export type BatchDeleteChatSessionsError = unknown;
 export type GetChatSessionData = {
     path: {
         session_id: string;
-    };
-    query?: {
-        page?: number;
-        page_size?: number;
     };
 };
 
@@ -3697,3 +3739,206 @@ export type ReceivePlatformWebhookData = {
 export type ReceivePlatformWebhookResponse = (unknown);
 
 export type ReceivePlatformWebhookError = unknown;
+
+export type InitFileUploadData = {
+    body: ChatUploadInitRequest;
+};
+
+export type InitFileUploadResponse = (SuccessEnvelope);
+
+export type InitFileUploadError = unknown;
+
+export type UploadFileChunkData = {
+    body: ChatChunkUploadRequest;
+};
+
+export type UploadFileChunkResponse = (SuccessEnvelope);
+
+export type UploadFileChunkError = unknown;
+
+export type CompleteFileUploadData = {
+    body: ChatUploadSessionRequest;
+};
+
+export type CompleteFileUploadResponse = (SuccessEnvelope);
+
+export type CompleteFileUploadError = unknown;
+
+export type AbortFileUploadData = {
+    body: ChatUploadSessionRequest;
+};
+
+export type AbortFileUploadResponse = (SuccessEnvelope);
+
+export type AbortFileUploadError = unknown;
+
+export type StatusFileUploadData = {
+    body: ChatUploadSessionRequest;
+};
+
+export type StatusFileUploadResponse = (SuccessEnvelope);
+
+export type StatusFileUploadError = unknown;
+
+export type ListPluginViewsByIdData = {
+    query: {
+        plugin_id: string;
+    };
+};
+
+export type ListPluginViewsByIdResponse = (SuccessEnvelope);
+
+export type ListPluginViewsByIdError = unknown;
+
+export type GetPluginViewByIdData = {
+    query: {
+        page_name: string;
+        plugin_id: string;
+    };
+};
+
+export type GetPluginViewByIdResponse = (string);
+
+export type GetPluginViewByIdError = unknown;
+
+export type ListPluginViewsData = {
+    path: {
+        plugin_id: string;
+    };
+};
+
+export type ListPluginViewsResponse = (SuccessEnvelope);
+
+export type ListPluginViewsError = unknown;
+
+export type GetPluginViewData = {
+    path: {
+        plugin_id: string;
+        view_name: string;
+    };
+};
+
+export type GetPluginViewResponse = (string);
+
+export type GetPluginViewError = unknown;
+
+export type GetPluginViewTokenAssetData = {
+    path: {
+        /**
+         * URL-encoded relative asset path.
+         */
+        asset_path: string;
+        plugin_id: string;
+        /**
+         * Scoped plugin page asset token.
+         */
+        token: string;
+        view_name: string;
+    };
+};
+
+export type GetPluginViewTokenAssetResponse = (unknown);
+
+export type GetPluginViewTokenAssetError = (unknown);
+
+export type ListSessionSendersData = {
+    query?: {
+        limit?: number;
+        page?: number;
+        search?: string;
+        /**
+         * Resolve the latest record per exact sender ID instead of returning all source sessions.
+         */
+        sender_ids?: Array<(string)>;
+    };
+};
+
+export type ListSessionSendersResponse = (SuccessEnvelope);
+
+export type ListSessionSendersError = unknown;
+
+export type GetConversationFilterOptionsResponse = (SuccessEnvelope);
+
+export type GetConversationFilterOptionsError = unknown;
+
+export type TestPypiIndexConnectionData = {
+    body: PypiIndexTestRequest;
+};
+
+export type TestPypiIndexConnectionResponse = (SuccessEnvelope);
+
+export type TestPypiIndexConnectionError = unknown;
+
+export type MeasurePypiIndexSpeedData = {
+    body: PypiIndexTestRequest;
+};
+
+export type MeasurePypiIndexSpeedResponse = (SuccessEnvelope);
+
+export type MeasurePypiIndexSpeedError = unknown;
+
+export type MeasureGhproxySpeedData = {
+    body: GhproxyTestRequest;
+};
+
+export type MeasureGhproxySpeedResponse = (SuccessEnvelope);
+
+export type MeasureGhproxySpeedError = unknown;
+
+export type StatusBackupUploadData = {
+    body: BackupUploadSessionRequest;
+};
+
+export type StatusBackupUploadResponse = (SuccessEnvelope);
+
+export type StatusBackupUploadError = unknown;
+
+export type ExportLogsData = {
+    query?: {
+        /**
+         * Inclusive maximum log timestamp or trace start time, in Unix seconds. Omit for no upper bound. Must not be before start_time. Matching traces retain their complete details.
+         */
+        end_time?: number;
+        /**
+         * Mask recognized credentials. Disable only for private diagnosis.
+         */
+        redact?: boolean;
+        /**
+         * Inclusive minimum log timestamp or trace start time, in Unix seconds. Omit for no lower bound. Undated standalone log content is excluded when a time bound is set.
+         */
+        start_time?: number;
+    };
+};
+
+export type ExportLogsResponse = ((Blob | File));
+
+export type ExportLogsError = unknown;
+
+export type ListTracesData = {
+    query?: {
+        /**
+         * Legacy keyset cursor; use page for numbered pagination.
+         */
+        cursor?: string;
+        errors?: boolean;
+        limit?: number;
+        models?: boolean;
+        page?: number;
+        plugins?: boolean;
+        query?: string;
+    };
+};
+
+export type ListTracesResponse = (SuccessEnvelope);
+
+export type ListTracesError = unknown;
+
+export type GetTraceDetailData = {
+    path: {
+        trace_id: string;
+    };
+};
+
+export type GetTraceDetailResponse = (SuccessEnvelope);
+
+export type GetTraceDetailError = (unknown);

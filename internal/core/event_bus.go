@@ -258,6 +258,27 @@ func (e *Event) GetMessages() *message.MessageChain {
 	return e.Message
 }
 
+// IsButtonInteraction reports whether this event represents a portable button
+// click (aligned with Python AstrMessageEvent.is_button_interaction).
+func (e *Event) IsButtonInteraction() bool {
+	return e.GetButtonInteraction() != nil
+}
+
+// GetButtonInteraction returns the normalized button click carried by this
+// event, or nil when there is none (aligned with Python
+// AstrMessageEvent.get_button_interaction).
+func (e *Event) GetButtonInteraction() *message.ButtonInteraction {
+	if e.Message == nil {
+		return nil
+	}
+	for _, comp := range e.Message.Chain {
+		if bi, ok := comp.(*message.ButtonInteraction); ok {
+			return bi
+		}
+	}
+	return nil
+}
+
 // GetMessageType returns "GroupMessage" or "FriendMessage".
 func (e *Event) GetMessageType() string {
 	if e.Source.IsGroup {

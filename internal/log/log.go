@@ -52,6 +52,22 @@ type Logger struct {
 	useColor     bool
 	history      []LogEntry
 	historyBytes int
+	// traceSink, when set, persists trace records to the independent bounded
+	// trace store (4.29.2). nil disables persistence.
+	traceSink TraceSink
+}
+
+// TraceSink persists trace records (implemented by internal/tracestore). Kept
+// as an interface so the log package does not depend on a SQLite driver.
+type TraceSink interface {
+	Append(payload map[string]interface{}) bool
+}
+
+// SetTraceSink attaches (or clears) the trace persistence sink.
+func (l *Logger) SetTraceSink(s TraceSink) {
+	l.mu.Lock()
+	l.traceSink = s
+	l.mu.Unlock()
 }
 
 // maxHistory caps the number of buffered log entries returned by History().
@@ -402,7 +418,13 @@ func (l *Logger) PublishTrace(payload map[string]interface{}) {
 	l.historyBytes += entrySize(entry)
 	subs := make([]chan LogEntry, len(l.subscribers))
 	copy(subs, l.subscribers)
+	sink := l.traceSink
 	l.mu.Unlock()
+
+	// Persist to the independent bounded trace store (non-blocking, drop-safe).
+	if sink != nil {
+		sink.Append(payload)
+	}
 
 	for _, ch := range subs {
 		select {

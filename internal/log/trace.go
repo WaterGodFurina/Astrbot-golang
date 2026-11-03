@@ -57,10 +57,8 @@ func (s *TraceSpan) Record(action string, fields map[string]interface{}) {
 		"message_outline": s.MessageOutline,
 		"action":          action,
 	}
-	if fields != nil {
-		payload["fields"] = fields
-	} else {
-		payload["fields"] = map[string]interface{}{}
-	}
+	// 4.29.2 telemetry：trace 字段做有界化（UTF-8 字节预算），避免超宽/深嵌套
+	// 属性把日志与存储撑爆（对齐 py bounded_attributes）。
+	payload["fields"] = BoundedAttributes(fields, MaxAttributeBytes)
 	GetDefault().PublishTrace(payload)
 }

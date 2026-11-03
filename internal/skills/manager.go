@@ -670,9 +670,10 @@ func BuildSkillsPrompt(list []*SkillInfo) string {
 		"*Never silently skip a matching skill* — either use it or briefly " +
 		"explain why you chose not to.\n" +
 		"3. **Mandatory grounding** — Before executing any skill you MUST " +
-		"first read its `SKILL.md` by running a shell command compatible " +
-		"with the current runtime shell and using the **absolute path** " +
-		"shown above (e.g. `" + exampleCommand + "`). " +
+		"first read its `SKILL.md` in full using the **absolute path** " +
+		"shown above. Use an available, permitted file-reading tool first, " +
+		"or an available, permitted shell command compatible with the " +
+		"current runtime shell (e.g. `" + exampleCommand + "`). " +
 		"Never rely on memory or assumptions about a skill's content.\n" +
 		"4. **Progressive disclosure** — Load only what is directly " +
 		"referenced from `SKILL.md`:\n" +

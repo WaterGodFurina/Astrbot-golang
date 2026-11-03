@@ -93,6 +93,38 @@ func (f *PermissionFilter) FilterType() string { return "permission" }
 // Permission returns the required permission level.
 func (f *PermissionFilter) Permission() PermissionType { return f.permission }
 
+// ButtonActionFilter matches portable button interactions, optionally by
+// action ID. Ported from astrbot/core/star/filter/button_action.py
+type ButtonActionFilter struct {
+	actionID    string
+	hasActionID bool
+}
+
+// NewButtonActionFilter creates a button action filter. Pass nil (or an empty
+// string pointer) to match every button interaction regardless of action ID.
+func NewButtonActionFilter(actionID *string) *ButtonActionFilter {
+	f := &ButtonActionFilter{}
+	if actionID != nil && *actionID != "" {
+		f.actionID = *actionID
+		f.hasActionID = true
+	}
+	return f
+}
+
+// Match returns whether the event carries the requested button action.
+func (f *ButtonActionFilter) Match(ctx *FilterContext) bool {
+	if ctx == nil || ctx.ButtonActionID == "" {
+		return false
+	}
+	return !f.hasActionID || ctx.ButtonActionID == f.actionID
+}
+
+// FilterType returns the filter type name.
+func (f *ButtonActionFilter) FilterType() string { return "button_action" }
+
+// ActionID returns the configured action ID and whether one is set.
+func (f *ButtonActionFilter) ActionID() (string, bool) { return f.actionID, f.hasActionID }
+
 // PlatformAdapterTypeFilter matches based on platform adapter type.
 // Ported from astrbot/core/star/filter/platform_adapter_type.py
 type PlatformAdapterTypeFilter struct {

@@ -70,6 +70,14 @@ type RerankProvider interface {
 	Rerank(ctx context.Context, query string, documents []string, topN int) ([]*RerankResult, error)
 }
 
+// DecisionProvider handles low-latency, structured decisions.
+// Ported from astrbot/core/provider/provider.py DecisionProvider (4.29.4).
+type DecisionProvider interface {
+	AbstractProvider
+	// Ask answers multiple decision questions in one provider request.
+	Ask(ctx context.Context, questions map[string]DecisionQuestion, state DecisionState, requestMaxRetries int) (map[string]DecisionAnswer, error)
+}
+
 // BaseProvider provides common provider state.
 type BaseProvider struct {
 	mu               sync.RWMutex
@@ -199,6 +207,7 @@ type ProviderManager struct {
 	ttsProvID  string   // default TTS provider ID
 	embProvID  string   // default embedding provider ID
 	rerankID   string   // default rerank provider ID
+	decisionID string   // default decision provider ID
 }
 
 // NewProviderManager creates a manager.
@@ -384,6 +393,31 @@ func (pm *ProviderManager) SetDefaultRerankProvider(id string) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.rerankID = id
+}
+
+// GetDecisionProvider returns the default decision provider (aligned with py
+// ProviderManager provider_type == DECISION selection).
+func (pm *ProviderManager) GetDecisionProvider() DecisionProvider {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	if pm.decisionID != "" {
+		if p, ok := pm.providers[pm.decisionID].(DecisionProvider); ok {
+			return p
+		}
+	}
+	for _, id := range pm.order {
+		if dp, ok := pm.providers[id].(DecisionProvider); ok {
+			return dp
+		}
+	}
+	return nil
+}
+
+// SetDefaultDecisionProvider sets the default decision provider ID.
+func (pm *ProviderManager) SetDefaultDecisionProvider(id string) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.decisionID = id
 }
 
 // All returns all provider IDs in registration order.

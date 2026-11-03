@@ -269,6 +269,24 @@ func (e *AstrMessageEvent) GetMessages() []message.Component {
 	return nil
 }
 
+// IsButtonInteraction reports whether this event represents a portable button
+// click (aligned with Python AstrMessageEvent.is_button_interaction).
+func (e *AstrMessageEvent) IsButtonInteraction() bool {
+	return e.GetButtonInteraction() != nil
+}
+
+// GetButtonInteraction returns the normalized button click carried by this
+// event, or nil when there is none (aligned with Python
+// AstrMessageEvent.get_button_interaction).
+func (e *AstrMessageEvent) GetButtonInteraction() *message.ButtonInteraction {
+	for _, comp := range e.GetMessages() {
+		if bi, ok := comp.(*message.ButtonInteraction); ok {
+			return bi
+		}
+	}
+	return nil
+}
+
 // GetMessageType returns the message type.
 func (e *AstrMessageEvent) GetMessageType() MessageType {
 	if e.MessageObj != nil && e.MessageObj.Type != "" {

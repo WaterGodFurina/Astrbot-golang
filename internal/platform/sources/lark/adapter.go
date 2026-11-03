@@ -588,6 +588,41 @@ func (a *Adapter) isGroupConv(sessionID string) bool {
 	return false
 }
 
+// GetGroupInfo fetches live chat metadata (ported from py v4.29.4
+// sources/lark/lark_group_info.py): name, avatar, owner and member count.
+func (a *Adapter) GetGroupInfo(ctx context.Context, groupID string) (*platform.Group, error) {
+	if groupID == "" {
+		return nil, nil
+	}
+	if a.client == nil {
+		return nil, fmt.Errorf("lark: client not ready")
+	}
+	req := larkim.NewGetChatReqBuilder().ChatId(groupID).Build()
+	resp, err := a.client.Im.Chat.Get(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.Success() || resp.Data == nil {
+		return nil, fmt.Errorf("lark: get chat %s failed: code=%d msg=%s", groupID, resp.Code, resp.Msg)
+	}
+	g := &platform.Group{GroupID: groupID}
+	if resp.Data.Name != nil {
+		g.GroupName = *resp.Data.Name
+	}
+	if resp.Data.Avatar != nil {
+		g.GroupAvatar = *resp.Data.Avatar
+	}
+	if resp.Data.OwnerId != nil {
+		g.GroupOwner = *resp.Data.OwnerId
+	}
+	if resp.Data.UserCount != nil && *resp.Data.UserCount != "" {
+		if n, err := strconv.Atoi(*resp.Data.UserCount); err == nil {
+			g.MemberCount = &n
+		}
+	}
+	return g, nil
+}
+
 // WebhookUUID returns the unified-webhook uuid for webhook mode.
 func (a *Adapter) WebhookUUID() string {
 	return a.webhookID

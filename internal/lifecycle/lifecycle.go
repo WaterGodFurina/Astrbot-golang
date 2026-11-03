@@ -39,7 +39,9 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/skills"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/star/builtin"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/storage"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/toolchain"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/tracestore"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/utils"
 	"github.com/WaterGodFurina/Astrbot-golang/pkg/message"
 )
@@ -70,6 +72,10 @@ type Lifecycle struct {
 	webuiDir        string
 	cancel          context.CancelFunc
 	startedAt       time.Time
+	// consoleSink 为 4.29.4 引入的控制台背压有界队列（卸载时 flush 关闭）。
+	consoleSink *log.BoundedConsoleSink
+	// traceStore 为 4.29.2 引入的独立有界 SQLite trace 历史（trace_enable 时启用）。
+	traceStore *tracestore.TraceStore
 }
 
 // New creates a Lifecycle.
@@ -109,6 +115,10 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}
 	l.database = database
 	logger.I18nInfo("数据库已打开（连接池 5，WAL 模式）")
+
+	// 启用可移植按钮回调令牌的持久化（对齐 Python
+	// configure_button_callback_registry：核心数据库初始化后开启）。
+	platform.ConfigureButtonCallbackStore(database)
 
 	// 2. Load config
 	cfg := config.NewConfig(utils.DataPath("cmd_config.json"))
@@ -156,6 +166,27 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 		if lvl := cfg.GetString("log_level"); lvl != "" {
 			log.GetDefault().SetLevel(log.ParseLevel(lvl))
 			logger.I18nInfo("已按配置设置日志级别: %s", lvl)
+		}
+	}
+
+	// 4.29.4 控制台背压：把 stdout 包进有界队列（对齐 py BoundedConsoleSink），
+	// 避免慢终端/日志采集器拖住事件循环；队列满时仅丢弃控制台副本并计数。
+	l.consoleSink = log.NewBoundedConsoleSink(os.Stdout, 512)
+	log.GetDefault().SetOutput(l.consoleSink)
+
+	// 4.29.2 trace 历史：trace_enable 时打开独立有界 SQLite 存储，把 trace
+	// 记录持久化（与主库分离，避免撑大主库）。
+	if cfg.GetBool("trace_enable") {
+		tracePath := cfg.GetString("trace_db_path")
+		if tracePath == "" {
+			tracePath = utils.DataPath("logs/traces.db")
+		}
+		if store, err := tracestore.Open(tracePath); err != nil {
+			logger.I18nWarn("打开 trace 存储失败: %v", err)
+		} else {
+			l.traceStore = store
+			log.GetDefault().SetTraceSink(store)
+			logger.I18nInfo("trace 存储已启用: %s", tracePath)
 		}
 	}
 
@@ -504,6 +535,17 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	if l.webuiDir != "" {
 		l.dashboard.SetWebUIDir(l.webuiDir)
 	}
+	// 4.29.2 存储清理：logs/cache/traces 目标；trace 目标复用已打开的存储实例。
+	cleanerCfg := map[string]interface{}{
+		"log_file_path":    cfg.GetString("log_file_path"),
+		"log_file_enable":  cfg.GetBool("log_file_enable"),
+		"trace_log_path":   cfg.GetString("trace_log_path"),
+		"trace_log_enable": cfg.GetBool("trace_log_enable"),
+		"trace_db_path":    cfg.GetString("trace_db_path"),
+	}
+	l.dashboard.SetStorageCleaner(storage.NewCleaner(
+		cleanerCfg, utils.AstrbotDataDir(), filepath.Join(os.TempDir(), "astrbot"), l.traceStore))
+	l.dashboard.SetTraceStore(l.traceStore)
 	// WebUI"重启"按钮：spawn 新实例 → 优雅停机 → 退出当前进程。
 	l.dashboard.SetRestartFunc(l.Restart)
 	l.dashboard.SetOnPlatformsChanged(func() {
@@ -877,6 +919,16 @@ func (l *Lifecycle) Stop() {
 		_ = l.database.Close()
 	}
 	logger.I18nInfo("AstrBot Go 已停止")
+	// 先关闭 trace 存储（解除 sink 并 flush），再关闭控制台队列，保证停机日志已落盘。
+	if l.traceStore != nil {
+		log.GetDefault().SetTraceSink(nil)
+		l.traceStore.Close()
+		l.traceStore = nil
+	}
+	if l.consoleSink != nil {
+		l.consoleSink.Close()
+		l.consoleSink = nil
+	}
 }
 
 // Uptime returns time since start.

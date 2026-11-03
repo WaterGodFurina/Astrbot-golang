@@ -1,7 +1,22 @@
 <template>
-  <div class="w-100">
+  <div class="w-100" :class="{ 'config-field--full-width': itemMeta?.full_width }">
     <!-- Special handling for specific metadata types -->
-    <template v-if="itemMeta?._special === 'select_provider'">
+    <template v-if="itemMeta?._special === 'umo'">
+      <UmoSelector
+        :model-value="modelValue"
+        :multiple="itemMeta?.type === 'list'"
+        :readonly="Boolean(itemMeta?.readonly)"
+        @update:model-value="emitUpdate"
+      />
+    </template>
+    <template v-else-if="itemMeta?._special === 'sender_id'">
+      <SenderSelector
+        :model-value="modelValue"
+        :readonly="Boolean(itemMeta?.readonly)"
+        @update:model-value="emitUpdate"
+      />
+    </template>
+    <template v-else-if="itemMeta?._special === 'select_provider'">
       <ProviderSelector :model-value="modelValue" @update:model-value="emitUpdate" :provider-type="'chat_completion'" />
     </template>
     <template v-else-if="itemMeta?._special === 'select_provider_stt'">
@@ -41,6 +56,12 @@
       <DashboardTotpManager
         :model-value="Boolean(modelValue)"
         :config-root="configRoot"
+        @update:model-value="emitUpdate"
+      />
+    </template>
+    <template v-else-if="itemMeta?._special === 'local_permission_matrix'">
+      <LocalPermissionMatrix
+        :model-value="modelValue"
         @update:model-value="emitUpdate"
       />
     </template>
@@ -152,14 +173,14 @@
         </span>
 
         <v-slider :model-value="toNumber(numericTemp ?? modelValue)"
-          @update:model-value="val => { numericTemp = val; emitUpdate(toNumber(val)) }" 
+          @update:model-value="val => { numericTemp = val; emitUpdate(toNumber(val)) }"
           @end="numericTemp = null"
-          :min="itemMeta?.slider?.min ?? 0" 
-          :max="itemMeta?.slider?.max ?? 100" 
+          :min="itemMeta?.slider?.min ?? 0"
+          :max="itemMeta?.slider?.max ?? 100"
           :step="itemMeta?.slider?.step ?? 1"
-          color="primary" 
-          density="compact" 
-          hide-details 
+          color="primary"
+          density="compact"
+          hide-details
           style="flex: 1"></v-slider>
 
         <span style="min-width: 5px; text-align: left;">
@@ -246,8 +267,10 @@
 </template>
 
 <script setup>
-import { VueMonacoEditor } from '@guolao/vue-monaco-editor'
+import { LazyMonacoEditor as VueMonacoEditor } from '@/components/shared/LazyMonacoEditor';
 import ListConfigItem from './ListConfigItem.vue'
+import SenderSelector from './SenderSelector.vue'
+import UmoSelector from './UmoSelector.vue'
 import FileConfigItem from './FileConfigItem.vue'
 import ObjectEditor from './ObjectEditor.vue'
 import ProviderSelector from './ProviderSelector.vue'
@@ -256,6 +279,7 @@ import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
 import PluginSetSelector from './PluginSetSelector.vue'
 import T2ITemplateEditor from './T2ITemplateEditor.vue'
 import DashboardTotpManager from './DashboardTotpManager.vue'
+import LocalPermissionMatrix from './LocalPermissionMatrix.vue'
 import { computed, ref } from 'vue'
 import { useI18n, useModuleI18n } from '@/i18n/composables'
 import { usePluginI18n } from '@/utils/pluginI18n'
@@ -304,7 +328,7 @@ const { t } = useI18n()
 const { getRaw } = useModuleI18n('features/config-metadata')
 const { configText } = usePluginI18n()
 
-function emitUpdate(val) {
+async function emitUpdate(val) {
   val = validateNumericConfig(props.itemMeta?.type, val)
   if (
     props.itemMeta?._special === 'agent_runner_type'
@@ -316,6 +340,7 @@ function emitUpdate(val) {
     )
   }
   emit('update:modelValue', val)
+
 }
 
 const listSelectItems = computed(() =>
@@ -397,10 +422,30 @@ function getTranslatedLabels(itemMeta) {
 
 function getSelectItems(itemMeta) {
   const labels = getTranslatedLabels(itemMeta)
-  if (labels && itemMeta.options) {
+  let subtitles = itemMeta?.subtitles
+  if (
+    props.pluginName
+    && props.configKey
+    && props.pluginI18n
+    && Object.keys(props.pluginI18n).length > 0
+  ) {
+    const translatedSubtitles = configText(props.pluginI18n, props.configKey, 'subtitles', null)
+    if (Array.isArray(translatedSubtitles)) {
+      subtitles = translatedSubtitles
+    }
+  }
+  if (typeof subtitles === 'string') {
+    subtitles = getRaw(subtitles)
+  }
+  if (!Array.isArray(subtitles)) subtitles = null
+
+  if ((labels || subtitles) && itemMeta.options) {
     return itemMeta.options.map((value, index) => ({
-      title: labels[index] || value,
-      value: value
+      title: labels?.[index] || value,
+      value: value,
+      props: {
+        subtitle: typeof subtitles?.[index] === 'string' ? subtitles[index] : undefined
+      }
     }))
   }
   return itemMeta.options || []

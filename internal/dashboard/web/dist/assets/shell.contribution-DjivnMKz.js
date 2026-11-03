@@ -1,0 +1,1 @@
+import{aQ as r}from"./index-BHprFgx-.js";import{r as e}from"./_.contribution-BCorUMoM.js";import"./editor.api-CxMavR3u.js";e({id:"shell",extensions:[".sh",".bash"],aliases:["Shell","sh"],loader:()=>r(()=>import("./shell-CX-rkNHf.js"),[])});

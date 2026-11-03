@@ -1583,9 +1583,51 @@ func (a *Adapter) convertToCQFormat(mc *message.MessageChain) []map[string]inter
 				"type": "json",
 				"data": map[string]interface{}{"data": c.Data},
 			})
+		case *message.ActionRow:
+			// OneBot v11 无便携按钮段：URL 动作降级为纯文本链接，回调动作显式标注
+			// 不可用（对齐 Python aiocqhttp_message_event.py）。
+			var lines []string
+			if strings.TrimSpace(c.FallbackText) != "" {
+				lines = append(lines, strings.TrimSpace(c.FallbackText))
+			}
+			for _, b := range c.Buttons {
+				if t := buttonDegradeText(b); t != "" {
+					lines = append(lines, t)
+				}
+			}
+			if len(lines) > 0 {
+				segments = append(segments, map[string]interface{}{
+					"type": "text",
+					"data": map[string]interface{}{"text": strings.Join(lines, "\n")},
+				})
+			}
+		case *message.Button:
+			if t := buttonDegradeText(c); t != "" {
+				segments = append(segments, map[string]interface{}{
+					"type": "text",
+					"data": map[string]interface{}{"text": t},
+				})
+			}
 		}
 	}
 	return segments
+}
+
+// buttonDegradeText renders a portable button as plain text for platforms
+// without native button support (aligned with Python
+// aiocqhttp_message_event.py). Returns "" for unknown action types.
+func buttonDegradeText(b *message.Button) string {
+	if b == nil {
+		return ""
+	}
+	switch b.Action.Type {
+	case message.ButtonActionURL:
+		return fmt.Sprintf("%s: %s", b.Label, b.Action.URL)
+	case message.ButtonActionCallback:
+		return fmt.Sprintf("[Button unavailable] %s", b.Label)
+	default:
+		return ""
+	}
 }
 
 // GetGroupInfo enriches group metadata via OneBot get_group_info +
