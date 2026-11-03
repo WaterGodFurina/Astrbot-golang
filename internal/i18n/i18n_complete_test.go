@@ -60,10 +60,10 @@ func containsCJK(s string) bool {
 	return false
 }
 
-// TestScopedI18nKeysTranslated 防回归：§3.8 子系统（sandbox/cron/lifecycle）
-// 源码中以字符串字面量出现的 I18n* 日志 key，必须都能在 en_US.json 找到译文
-// （否则英文环境下会回退输出中文原文）。历史上 lifecycle/cron/sandbox 里这
-// 14 条日志就是这样漏译的。仅扫描字面量：动态拼接的 key 无法静态判定，跳过。
+// TestScopedI18nKeysTranslated 防回归：全仓源码中以字符串字面量出现的 I18n*
+// 日志 key，必须都能在 en_US.json 找到译文（否则英文环境下会回退输出中文
+// 原文）。历史上 lifecycle/cron/sandbox 及其它子系统都出现过漏译。仅扫描字面
+// 量：动态拼接的 key 无法静态判定，跳过。跳过 _test.go 与 vendor/testdata。
 func TestScopedI18nKeysTranslated(t *testing.T) {
 	enData, err := os.ReadFile("locales/en_US.json")
 	if err != nil {
@@ -75,13 +75,20 @@ func TestScopedI18nKeysTranslated(t *testing.T) {
 	}
 
 	fset := token.NewFileSet()
-	for _, pkgDir := range []string{"sandbox", "cron", "lifecycle"} {
+	for _, pkgDir := range []string{".."} {
 		root := filepath.Join("..", pkgDir)
 		err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
 			if walkErr != nil {
 				return walkErr
 			}
-			if info.IsDir() || !strings.HasSuffix(path, ".go") {
+			if info.IsDir() {
+				switch info.Name() {
+				case ".git", "node_modules", "vendor", "testdata":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 				return nil
 			}
 			f, parseErr := parser.ParseFile(fset, path, nil, 0)
