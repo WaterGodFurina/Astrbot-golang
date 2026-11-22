@@ -23,6 +23,7 @@ import (
 
 	"github.com/WaterGodFurina/Astrbot-golang/internal/log"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/netguard"
+	"github.com/WaterGodFurina/Astrbot-golang/internal/plugin"
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
@@ -189,7 +190,21 @@ func (s *Server) fetchGithubReleasesRobust(proxy string) ([]map[string]interface
 
 // resourceForPlatform 把 GOOS/GOARCH 映射到 release 资产的后缀（对齐
 // .github/workflows/release.yml 的 matrix resource 命名）。
+//
+// Linux 必须区分 libc：Alpine/musl 主机只能下载 -musl 资产，否则会拿到
+// glibc 链接的二进制，在缺少 /lib64/ld-linux-*.so.* 的宿主上 exec 失败
+// （"no such file or directory"）。libc 由 plugin.HostLibc() 运行时探测。
 func resourceForPlatform(goos, goarch string) string {
+	libc := "gnu"
+	if goos == "linux" {
+		libc = plugin.HostLibc()
+	}
+	return resourceForPlatformLibc(goos, goarch, libc)
+}
+
+// resourceForPlatformLibc 是 resourceForPlatform 的纯函数内核：libc 仅对
+// Linux 生效（"musl" 或 "gnu"），便于单测覆盖两种分支。
+func resourceForPlatformLibc(goos, goarch, libc string) string {
 	switch goos {
 	case "windows":
 		if goarch == "arm64" {
@@ -204,13 +219,17 @@ func resourceForPlatform(goos, goarch string) string {
 	case "android":
 		return "android-aarch64"
 	case "linux":
+		suffix := "gnu"
+		if libc == "musl" {
+			suffix = "musl"
+		}
 		switch goarch {
 		case "arm64":
-			return "linux-aarch64-gnu"
+			return "linux-aarch64-" + suffix
 		case "loong64":
-			return "linux-loongarch64-gnu"
+			return "linux-loongarch64-" + suffix
 		default:
-			return "linux-x86_64-gnu"
+			return "linux-x86_64-" + suffix
 		}
 	}
 	return ""

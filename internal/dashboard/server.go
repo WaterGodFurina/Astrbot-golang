@@ -45,7 +45,7 @@ import (
 	"github.com/WaterGodFurina/Astrbot-golang/internal/version"
 )
 
-//go:embed web/dist/*
+//go:embed all:web/dist
 var webFS embed.FS
 
 var logger = log.GetDefault().WithComponent("Dashboard")

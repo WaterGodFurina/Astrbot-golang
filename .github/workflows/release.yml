@@ -94,28 +94,49 @@ jobs:
         env:
           PYTHON_VERSION: ${{ inputs.python_version }}
 
-      - name: 探测最新 release 版本（GitHub API，不绑定特定版本号）
+      - name: 探测最新 release/tag 版本（GitHub API，无需手动指定 ref）
         id: meta
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_REF: ${{ inputs.ref }}
           GITHUB_REPO: ${{ github.repository }}
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           KIND="release"
           REF="$INPUT_REF"
           VERSION=""
-          if [ -z "$REF" ]; then
-            # 自动取 GitHub 最新 release 的 tag（非特定版本号）
-            if TAG=$(gh api "repos/$GITHUB_REPO/releases/latest" --jq .tag_name 2>/dev/null); then
+          if [ -z "$REF" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            # 由 tag push 触发：直接用被推送的 tag，避免 releases/latest 指到旧版本。
+            KIND="tag"
+            REF="$GITHUB_REF_NAME"
+            VERSION="$REF"
+            echo "tag push 触发，使用当前 tag: ${REF}"
+          elif [ -z "$REF" ]; then
+            # 1) 最新非 draft release（含 prerelease；releases/latest 会忽略预发布）
+            if TAG=$(gh api "repos/$GITHUB_REPO/releases?per_page=20" \
+                       --jq '[.[] | select(.draft == false)][0].tag_name // empty' 2>/dev/null) \
+               && [ -n "$TAG" ]; then
               REF="$TAG"
               VERSION="$TAG"
-              echo "已自动定位到最新 release: ${TAG}"
+              echo "已自动定位到最新 release（含预发布）: ${TAG}"
+            # 2) 再退到官方 latest（列表接口失败时的兜底）
+            elif TAG=$(gh api "repos/$GITHUB_REPO/releases/latest" --jq .tag_name 2>/dev/null) \
+                 && [ -n "$TAG" ]; then
+              REF="$TAG"
+              VERSION="$TAG"
+              echo "已自动定位到 latest release: ${TAG}"
             else
-              # 无 release 时回退到最近 tag，再退到当前 commit
+              # 3) 回退到按创建时间最新的 tag（覆盖只有 tag、没有 release 的情况）
               KIND="tag"
-              REF="$(git describe --tags --abbrev=0 2>/dev/null || echo "${GITHUB_SHA}")"
+              REF="$(git for-each-ref --sort=-creatordate --format='%(refname:short)' refs/tags | head -n1)"
+              if [ -z "$REF" ]; then
+                REF="${GITHUB_SHA}"
+                echo "无 release/tag，回退到当前 commit: ${REF}"
+              else
+                echo "无 release，回退到最新 tag: ${REF}"
+              fi
               VERSION="$REF"
-              echo "无 GitHub release，回退到最近 tag: ${REF}"
             fi
           else
             VERSION="$REF"
@@ -146,7 +167,7 @@ jobs:
           - { runner: ubuntu-latest,  target: loongarch64-unknown-linux-gnu,  resource: linux-loongarch64-gnu,  goos: linux, goarch: loong64, ext: '', libc: gnu }
           - { runner: ubuntu-latest,  target: loongarch64-unknown-linux-musl, resource: linux-loongarch64-musl, goos: linux, goarch: loong64, ext: '', libc: musl }
           - { runner: macos-15-intel, target: x86_64-apple-darwin,   resource: macos-x86_64,   goos: darwin, goarch: amd64,  ext: '', libc: '' }
-          - { runner: macos-14,       target: aarch64-apple-darwin,  resource: macos-aarch64,  goos: darwin, goarch: arm64,  ext: '', libc: '' }
+          - { runner: macos-15,       target: aarch64-apple-darwin,  resource: macos-aarch64,  goos: darwin, goarch: arm64,  ext: '', libc: '' }
           - { runner: ubuntu-24.04-arm, target: aarch64-linux-android, resource: android-aarch64, goos: android, goarch: arm64, ext: '',   libc: bionic }
 
     steps:
@@ -203,10 +224,14 @@ jobs:
           curl -fL --retry 5 --retry-delay 3 "$URL" -o "$A.$EXT"
           if [ "$EXT" = "zip" ]; then
             powershell -NoProfile -Command "Expand-Archive -LiteralPath '$A.$EXT' -DestinationPath . -Force"
+            # Windows runner 的 PATH 必须是原生路径；$PWD 是 Git Bash 的
+            # MSYS 路径（/d/a/...），直接写进 GITHUB_PATH 会让后续 cgo
+            # 报 `exec: "zig": executable file not found in %PATH%`。
+            echo "$(cygpath -w "$PWD/$A")" >> "$GITHUB_PATH"
           else
             tar -xf "$A.$EXT"
+            echo "$PWD/$A" >> "$GITHUB_PATH"
           fi
-          echo "$PWD/$A" >> "$GITHUB_PATH"
           "$PWD/$A/zig" version 2>/dev/null || "$PWD/$A/zig.exe" version
 
       - name: 交叉编译 AstrBot（全平台 CGO_ENABLED=1，各目标 C 工具链见上方安装步骤）

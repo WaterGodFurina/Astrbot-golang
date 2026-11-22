@@ -23,3 +23,8 @@ func hostLibc() string {
 	}
 	return "gnu"
 }
+
+// HostLibc exposes the host libc ("musl" or "gnu") to other packages. The
+// dashboard update logic must pick the matching release asset on Linux, since
+// a glibc-linked binary cannot exec on an Alpine/musl host.
+func HostLibc() string { return hostLibc() }
